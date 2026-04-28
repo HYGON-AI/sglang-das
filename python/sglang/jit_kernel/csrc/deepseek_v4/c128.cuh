@@ -242,7 +242,7 @@ SGL_DEVICE void c128_forward(
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
-C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
+C128_KERNEL void flash_c128_decode(const Compress128DecodeParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
@@ -297,7 +297,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
 
 // compress kernel
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kWrite, bool kUsePDL>
-C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
+C128_KERNEL void flash_c128_prefill(const Compress128PrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
@@ -366,7 +366,8 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress128Kernel {
-  static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, InFloat, OutFloat, kUsePDL>;
+  using DecodeKernelType = decltype(&flash_c128_decode<kHeadDim, InFloat, OutFloat, kUsePDL>);
+  static constexpr DecodeKernelType decode_kernel = flash_c128_decode<kHeadDim, InFloat, OutFloat, kUsePDL>;
   template <bool kWrite>
   static constexpr auto prefill_kernel = flash_c128_prefill<kHeadDim, InFloat, OutFloat, kWrite, kUsePDL>;
   static constexpr auto prefill_c_kernel = prefill_kernel</*kWrite=*/false>;
@@ -389,7 +390,7 @@ struct FlashCompress128Kernel {
     // this should not happen in practice
     auto B = SymbolicSize{"batch_size"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLROCM>();
 
     TensorMatcher({-1, 128, kHeadDim * 2})  // kv score
         .with_dtype<InFloat>()
@@ -448,7 +449,7 @@ struct FlashCompress128Kernel {
     auto X = SymbolicSize{"compress_tokens"};
     auto Y = SymbolicSize{"write_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLROCM>();
 
     TensorMatcher({-1, 128, kHeadDim * 2})  // kv score
         .with_dtype<InFloat>()

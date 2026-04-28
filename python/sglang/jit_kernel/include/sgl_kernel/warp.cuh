@@ -36,7 +36,11 @@ SGL_DEVICE T reduce_sum(T value, uint32_t active_mask = kFullMask) {
   static_assert(std::has_single_bit(kNumThreads), "must be pow of 2");
 #pragma unroll
   for (auto mask = kThreads >> 1; mask > 0; mask >>= 1)
-    value = value + shfl_xor(active_mask, value, mask, kWarpThreads);
+#ifdef USE_ROCM
+    value = value + __shfl_xor(value, mask, 32);
+#else
+    value = value + __shfl_xor_sync(active_mask, value, mask, 32);
+#endif
   return value;
 }
 
@@ -59,7 +63,11 @@ SGL_DEVICE T reduce_max(T value, uint32_t active_mask = kFullMask) {
   static_assert(std::has_single_bit(kNumThreads), "must be pow of 2");
 #pragma unroll
   for (auto mask = kThreads >> 1; mask > 0; mask >>= 1)
+#ifdef USE_ROCM
+    value = math::max(value, __shfl_xor(value, mask, 32));
+#else
     value = math::max(value, shfl_xor(active_mask, value, mask, kWarpThreads));
+#endif
   return value;
 }
 

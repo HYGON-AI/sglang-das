@@ -212,7 +212,7 @@ SGL_DEVICE void c4_forward(
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, PageMode kMode, bool kUsePDL>
-C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams params) {
+C4_KERNEL void flash_c4_decode(const Compress4DecodeParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 128
@@ -273,7 +273,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, PageMode kMode, bool kWrite, bool kUsePDL>
-C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+C4_KERNEL void flash_c4_prefill(const Compress4PrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 128
@@ -388,7 +388,7 @@ struct FlashCompress4Kernel {
     // this should not happen in practice
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLROCM>();
     const auto extra_ptr = _get_extra_pointer(B, device_, extra);
     const auto page_size = extra_ptr != nullptr ? 4 : 8;
 
@@ -452,7 +452,7 @@ struct FlashCompress4Kernel {
     auto X = SymbolicSize{"compress_tokens"};
     auto Y = SymbolicSize{"write_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLROCM>();
     const auto extra_ptr = _get_extra_pointer(B, device_, extra, /*is_prefill=*/true);
     const auto page_size = extra_ptr != nullptr ? 4 : 8;
 
