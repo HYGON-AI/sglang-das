@@ -115,6 +115,126 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
+def _sinkhorn_matrix_torch(
+    comb: torch.Tensor,
+    sinkhorn_iters: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    row_max = comb.max(dim=2, keepdim=True).values
+    comb = torch.exp(comb - row_max)
+    comb = comb / comb.sum(dim=2, keepdim=True) + eps
+    comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
+
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=2, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
+    return comb
+
+
+def hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    assert mixes.dim() == 3
+    assert mixes.size(-1) == (2 + hc_mult) * hc_mult
+
+    batch, seq_len, _ = mixes.shape
+    mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
+
+    pre = torch.sigmoid(
+        mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + eps
+    post = 2 * torch.sigmoid(
+        mixes_flat[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
+    )
+
+    comb = mixes_flat[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult) * hc_scale[2]
+    comb = comb + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+    comb = _sinkhorn_matrix_torch(comb, sinkhorn_iters, eps)
+
+    pre = pre.view(batch, seq_len, hc_mult)
+    post = post.view(batch, seq_len, hc_mult)
+    comb = comb.view(batch, seq_len, hc_mult, hc_mult)
+    return pre, post, comb
+
+
+def mhc_pre_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    hc_mult: int = 4,
+):
+    assert residual.dtype == torch.bfloat16
+    assert fn.dtype == torch.float32
+    assert hc_scale.dtype == torch.float32
+    assert hc_base.dtype == torch.float32
+
+    hidden_size = residual.shape[-1]
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    assert fn.shape == (hc_mult3, hc_mult * hidden_size)
+
+    outer_shape = residual.shape[:-2]
+    residual_flat = residual.view(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+
+    x_flat = residual_flat.view(num_tokens, hc_mult * hidden_size).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
+    mixes = torch.matmul(x_flat, fn.t()) * rsqrt
+
+    pre = torch.sigmoid(
+        mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + hc_pre_eps
+    post = (
+        2
+        * torch.sigmoid(
+            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult]
+        )
+        * hc_post_mult_value
+    )
+    comb = mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
+    comb = comb + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+    comb = _sinkhorn_matrix_torch(comb, sinkhorn_repeat, hc_sinkhorn_eps)
+
+    layer_input = torch.einsum(
+        "nh,nhd->nd", pre, residual_flat.float()
+    )
+    post_mix = post.view(*outer_shape, hc_mult, 1)
+    comb_mix = comb.view(*outer_shape, hc_mult, hc_mult)
+    layer_input = layer_input.view(*outer_shape, hidden_size).to(torch.bfloat16)
+    return post_mix, comb_mix, layer_input
+
+
+def mhc_post_torch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return torch.empty(
+            (0, residual.shape[1], residual.shape[2]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+    out = post_layer_mix.unsqueeze(-1) * x.unsqueeze(1)
+    out = out + torch.einsum("nij,njk->nik", comb_res_mix, residual)
+    return out
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -157,7 +277,7 @@ def mhc_pre_big_fuse_tilelang(
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(num_tokens, threads=96) as i:
+    with T.Kernel(num_tokens, threads=128) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -177,7 +297,7 @@ def mhc_pre_big_fuse_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 32:
+        if T.get_thread_binding() < 64:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -219,7 +339,7 @@ def mhc_pre_big_fuse_tilelang(
             for j, k in T.Parallel(hc_mult, hc_mult):
                 comb_mix[i, j * hc_mult + k] = cm[j, k]
         else:
-            pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
+            pre_mix_shared = T.alloc_fragment(hc_mult, T.float32)
             for j in T.Parallel(hc_mult):
                 pre_mix_shared[j] = (
                     T.sigmoid(
@@ -227,11 +347,11 @@ def mhc_pre_big_fuse_tilelang(
                     )
                     + hc_pre_eps
                 )
-            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
-                xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=0):
+                # xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
-                T.copy(residual[i, 0, i0_h * hidden_block], xs)
-                T.copy(xs, xl)
+                T.copy(residual[i, 0, i0_h * hidden_block], xl)
+                # T.copy(xs, xl)
 
                 ol = T.alloc_fragment(hidden_block, T.float32)
                 T.clear(ol)
@@ -332,7 +452,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     num_tokens = T.dynamic("num_tokens")
 
-    ENABLE_PDL = is_arch_support_pdl()
+    ENABLE_PDL = False #is_arch_support_pdl()
 
     @tilelang.jit
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
@@ -355,20 +475,26 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
-                x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
+            for pz in T.Pipelined(split_size // hidden_block, num_stages=0):
+                # x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
+                
+                x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+                x_f = T.alloc_shared((token_block, hidden_block), T.float32)
 
                 T.annotate_layout(
-                    {x_smem: tilelang.layout.make_swizzled_layout(x_smem)}
+                    # {x_smem: tilelang.layout.make_swizzled_layout(x_smem)}
+                    {x_f: tilelang.layout.make_hcu_swizzled_layout(x_f)}
                 )
 
-                T.copy(x[px * token_block, k_base + pz * hidden_block], x_smem)
+                # T.copy(x[px * token_block, k_base + pz * hidden_block], x_smem)
+                
+                T.copy(x[px * token_block, k_base + pz * hidden_block], x_f16)
                 T.copy(fn[0, k_base + pz * hidden_block], fn_smem)
 
-                x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                T.copy(x_smem, x_f16)
-                x_f = T.alloc_fragment((token_block, hidden_block), T.float32)
+                # x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+                # T.copy(x_smem, x_f16)
+                # x_f = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_f16, x_f)
 
                 for jj in T.serial(hidden_block // 4):

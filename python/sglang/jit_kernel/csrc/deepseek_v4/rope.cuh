@@ -32,7 +32,11 @@ struct FusedQKRopeParams {
 
 template <bool kUsePDL, bool kInverse, typename IndexType>
 __global__ __launch_bounds__(kBlockSize, 16)  //
+#ifdef USE_ROCM
+    void deepseek_rope_kernel(const FusedQKRopeParams param) {
+#else
     void deepseek_rope_kernel(const __grid_constant__ FusedQKRopeParams param) {
+#endif
   using namespace device;
   using DType2 = packed_t<DType>;
 
@@ -60,11 +64,15 @@ __global__ __launch_bounds__(kBlockSize, 16)  //
   const auto input = static_cast<DType2*>(pointer::offset(base_ptr, batch_id * stride_batch, local_head * stride_head));
 
   const auto freq_ptr = reinterpret_cast<const fp32x2_t*>(freqs_cis + position * kRopeDim);
-  const auto [f_real, f_imag] = freq_ptr[lane_id];
+  const auto freq = freq_ptr[lane_id];
+  const auto f_real = freq.x;
+  const auto f_imag = freq.y;
   PDLWaitPrimary<kUsePDL>();
 
   const auto data = input[lane_id];
-  const auto [x_real, x_imag] = cast<fp32x2_t>(data);
+  const auto x = cast<fp32x2_t>(data);
+  const auto x_real = x.x;
+  const auto x_imag = x.y;
   fp32x2_t output;
   if constexpr (kInverse) {
     // (a + bi) * (c - di) = (ac + bd) + (bc - ad)i
@@ -105,7 +113,11 @@ struct FusedQKRopeKernel {
     auto K = SymbolicSize{"num_k_heads"};
     constexpr auto D = kRopeDim;
     auto device_ = SymbolicDevice{};
+#ifdef USE_ROCM
+    device_.set_options<kDLROCM>();
+#else
     device_.set_options<kDLCUDA>();
+#endif
 
     TensorMatcher({B, Q, D})  //
         .with_strides({-1, -1, 1})

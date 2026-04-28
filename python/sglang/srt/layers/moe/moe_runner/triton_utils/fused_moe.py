@@ -1128,13 +1128,13 @@ def fused_experts_impl(
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
-        use_fused_moe_sum_all_reduce = (
-            get_global_server_args().enable_fused_moe_sum_all_reduce
-            and (not no_combine)
-            and (curr_topk_ids.shape[1] > 2)
-            and (not use_int8_w8a16)
-            and (not use_int4_w4a16)
-        )
+        # use_fused_moe_sum_all_reduce = (
+        #     get_global_server_args().enable_fused_moe_sum_all_reduce
+        #     and (not no_combine)
+        #     and (curr_topk_ids.shape[1] > 2)
+        #     and (not use_int8_w8a16)
+        #     and (not use_int4_w4a16)
+        # )
         if _use_lightop:
             sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(
                 curr_topk_ids, config["BLOCK_SIZE_M"], E
@@ -1172,6 +1172,7 @@ def fused_experts_impl(
         )
 
         # Activation function with multiplication
+        print(f"activation: {activation} is_gated: {is_gated} gemm1_alpha: {gemm1_alpha} gemm1_limit: {gemm1_limit} filter_expert: {filter_expert} down_moe_use_tma: {down_moe_use_tma} _is_cuda or _is_hip or _is_xpu: {_is_cuda or _is_hip or _is_xpu}")
         if activation == "silu" and is_gated:
             # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
             # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
@@ -1198,6 +1199,7 @@ def fused_experts_impl(
                         expert_ids,
                         down_moe_use_tma,
                         activation,
+                        swiglu_limit,
                     )
             else:
                 if _has_vllm_ops:

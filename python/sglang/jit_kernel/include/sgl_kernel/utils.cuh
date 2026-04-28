@@ -46,7 +46,21 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaLaunchKernel hipLaunchKernel
 #endif
 
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __hip_bfloat16;
+using fp8_e4m3_t = __hip_fp8_e4m3;
+using fp8_e5m2_t = __hip_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __hip_bfloat162;
+using fp8x2_e4m3_t = __hip_fp8x2_e4m3;
+using fp8x2_e5m2_t = __hip_fp8x2_e5m2;
+
+using fp32x4_t = float4;
+#else
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -198,9 +212,81 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 namespace host {
 
-/**
- * \brief Check the CUDA error code and panic with location info on failure.
- */
+#ifdef USE_ROCM
+inline void RuntimeDeviceCheck(::hipError_t error, DebugInfo location = {}) {
+  if (error != ::hipSuccess) {
+    [[unlikely]];
+    ::host::panic(location, "HIP error: ", ::hipGetErrorString(error));
+  }
+}
+
+inline void RuntimeDeviceCheck(DebugInfo location = {}) {
+  return RuntimeDeviceCheck(::hipGetLastError(), location);
+}
+
+struct LaunchKernel {
+ public:
+  explicit LaunchKernel(
+      dim3 grid_dim,
+      dim3 block_dim,
+      DLDevice device,
+      std::size_t dynamic_shared_mem_bytes = 0,
+      DebugInfo location = {}) noexcept
+      : m_stream(resolve_device(device)),
+        m_grid_dim(grid_dim),
+        m_block_dim(block_dim),
+        m_dynamic_shared_mem_bytes(dynamic_shared_mem_bytes),
+        m_location(location) {}
+
+  explicit LaunchKernel(
+      dim3 grid_dim,
+      dim3 block_dim,
+      hipStream_t stream,
+      std::size_t dynamic_shared_mem_bytes = 0,
+      DebugInfo location = {}) noexcept
+      : m_stream(stream),
+        m_grid_dim(grid_dim),
+        m_block_dim(block_dim),
+        m_dynamic_shared_mem_bytes(dynamic_shared_mem_bytes),
+        m_location(location) {}
+
+  LaunchKernel(const LaunchKernel&) = delete;
+  LaunchKernel& operator=(const LaunchKernel&) = delete;
+
+  static auto resolve_device(DLDevice device) -> hipStream_t {
+    return static_cast<hipStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+  }
+
+  auto enable_pdl(bool enabled = true) -> LaunchKernel& {
+    // PDL not supported in HIP
+    return *this;
+  }
+
+  auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
+    // Cluster not supported in HIP
+    return *this;
+  }
+
+  template <typename T, typename... Args>
+  auto operator()(T&& kernel, Args&&... args) const -> void {
+    void* kernel_args[] = {const_cast<void*>(static_cast<const void*>(std::addressof(args)))...};
+    RuntimeDeviceCheck(::hipLaunchKernel(
+        reinterpret_cast<const void*>(kernel),
+        m_grid_dim,
+        m_block_dim,
+        kernel_args,
+        m_dynamic_shared_mem_bytes,
+        m_stream), m_location);
+  }
+
+ private:
+  hipStream_t m_stream;
+  dim3 m_grid_dim;
+  dim3 m_block_dim;
+  std::size_t m_dynamic_shared_mem_bytes;
+  const DebugInfo m_location;
+};
+#else
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
@@ -315,5 +401,6 @@ struct LaunchKernel {
   const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
 };
+#endif
 
 }  // namespace host

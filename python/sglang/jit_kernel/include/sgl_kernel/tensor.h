@@ -35,6 +35,13 @@
 #include <sgl_kernel/utils.cuh>
 #endif
 
+#ifdef USE_ROCM
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
+#endif
+
 namespace host {
 
 namespace details {
@@ -77,6 +84,21 @@ struct _dtype_trait<bf16_t> {
 };
 template <>
 struct _dtype_trait<fp8_e4m3_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
+};
+#endif
+
+#ifdef USE_ROCM
+template <>
+struct _dtype_trait<__half> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct _dtype_trait<__hip_bfloat16> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct _dtype_trait<__hip_fp8_e4m3> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 #endif

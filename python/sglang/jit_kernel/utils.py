@@ -88,7 +88,9 @@ def _resolve_kernel_path() -> pathlib.Path:
 
 KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
-DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
+DEFAULT_CFLAGS = ["-std=c++20", "-O3", "-Wno-return-type"]
+# DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "-DUSE_ROCM", "-Wno-return-type"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
 
@@ -307,9 +309,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
-        return False
-    return get_jit_cuda_arch().major >= 9
+    return False
 
 
 def _find_package_root(package: str) -> Optional[pathlib.Path]:

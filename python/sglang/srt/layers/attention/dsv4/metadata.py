@@ -106,12 +106,13 @@ class PagedIndexerMetadata:
         if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             self.deep_gemm_metadata = None
         else:
-            import deep_gemm
+            import deepgemm as deep_gemm
 
             if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+                # from deep_gemm import get_paged_mqa_logits_metadata
+                from lightop.gemmopt import get_paged_mqa_logits_metadata
 
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
@@ -119,7 +120,8 @@ class PagedIndexerMetadata:
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
                 _c4,
                 self.c4_page_size,
-                deep_gemm.get_num_sms(),
+                # deep_gemm.get_num_sms(),
+                72, # 暂时写死
             )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)

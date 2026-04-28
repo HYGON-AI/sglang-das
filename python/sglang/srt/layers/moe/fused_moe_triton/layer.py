@@ -1181,8 +1181,8 @@ class FusedMoE(torch.nn.Module):
                 return self.quant_method.apply(
                     layer=self,
                     dispatch_output=dispatch_output,
-                    i_q=i_q,
-                    i_s=i_s,
+                    # i_q=i_q,
+                    # i_s=i_s,
                 )
             except TypeError:
                 return self.quant_method.apply(

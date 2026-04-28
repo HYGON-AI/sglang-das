@@ -696,7 +696,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre
+            from sglang.srt.layers.mhc import mhc_pre, mhc_pre_torch
 
             norm_kwargs = {}
             if norm is not None:
@@ -704,6 +704,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_kwargs["norm_eps"] = norm.variance_epsilon
 
             post, comb, y = mhc_pre(
+            # post, comb, y = mhc_pre_torch(
                 residual=x,
                 fn=hc_fn,
                 hc_scale=hc_scale,
@@ -718,7 +719,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post.squeeze(-1), comb, norm is not None
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            import deep_gemm
+            # import deep_gemm
+            import deepgemm as deep_gemm
 
             x_flat = x.flatten(1).bfloat16()
 
@@ -761,9 +763,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
+            from sglang.srt.layers.mhc import mhc_post, mhc_post_torch
 
             return mhc_post(x, residual, post, comb)
+            # return mhc_post_torch(x, residual, post, comb)
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -862,6 +865,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+
+        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            # print(f"deepseek_v4_moe_code_path_checker.observed: {deepseek_v4_moe_code_path_checker.observed}")
+            assert deepseek_v4_moe_code_path_checker.observed == 1
+            deepseek_v4_moe_code_path_checker.observed = 0
 
         return hidden_states
 
