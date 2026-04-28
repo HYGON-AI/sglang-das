@@ -210,6 +210,12 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace device
 
+#ifdef USE_ROCM
+#define SGL_GRID_CONSTANT
+#else
+#define SGL_GRID_CONSTANT __grid_constant__
+#endif
+
 namespace host {
 
 #ifdef USE_ROCM

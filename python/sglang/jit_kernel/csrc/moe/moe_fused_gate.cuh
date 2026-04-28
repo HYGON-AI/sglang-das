@@ -50,7 +50,7 @@ __device__ __forceinline__ float compute_score(float x) {
 }
 
 template <uint32_t kWarpsPerToken, ScoringFunc kScoringFunc>
-__global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __grid_constant__ params) {
+__global__ void moe_fused_gate_kernel_small_token(const SGL_GRID_CONSTANT MoEFusedGateParams params) {
   const auto& [input, bias, output, indices, num_rows, num_experts, topk, num_fused_shared_experts, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output] =
       params;
 
@@ -100,8 +100,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, warp_max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, warp_max_expert, offset);
+      float other_val = device::warp::shfl_down(0xFFFFFFFF, warp_max_val, offset);
+      int other_expert = device::warp::shfl_down(0xFFFFFFFF, warp_max_expert, offset);
       if (other_val > warp_max_val) {
         warp_max_val = other_val;
         warp_max_expert = other_expert;
@@ -121,8 +121,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 
 #pragma unroll
       for (int offset = 16; offset > 0; offset /= 2) {
-        float other_val = __shfl_down_sync(0xFFFFFFFF, final_max, offset);
-        int other_expert = __shfl_down_sync(0xFFFFFFFF, final_expert, offset);
+        float other_val = device::warp::shfl_down(0xFFFFFFFF, final_max, offset);
+        int other_expert = device::warp::shfl_down(0xFFFFFFFF, final_expert, offset);
         if (other_val > final_max) {
           final_max = other_val;
           final_expert = other_expert;
@@ -172,7 +172,7 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 }
 
 template <ScoringFunc kScoringFunc>
-__global__ void moe_fused_gate_kernel(const MoEFusedGateParams __grid_constant__ params) {
+__global__ void moe_fused_gate_kernel(const SGL_GRID_CONSTANT MoEFusedGateParams params) {
   const auto& [input, bias, output, indices, num_rows, num_experts, topk, num_fused_shared_experts, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output] =
       params;
 
@@ -215,8 +215,8 @@ __global__ void moe_fused_gate_kernel(const MoEFusedGateParams __grid_constant__
     }
 
     for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
+      float other_val = device::warp::shfl_down(0xFFFFFFFF, max_val, offset);
+      int other_expert = device::warp::shfl_down(0xFFFFFFFF, max_expert, offset);
 
       if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
         max_val = other_val;
@@ -298,7 +298,11 @@ struct MoEFusedGateKernel {
     auto K = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
     K.set_value(topk);
+#ifdef USE_ROCM
+    device.set_options<kDLROCM>();
+#else
     device.set_options<kDLCUDA>();
+#endif
 
     TensorMatcher({N, E}).with_dtype<float>().with_device(device).verify(input);
     TensorMatcher({E}).with_dtype<float>().with_device(device).verify(bias);

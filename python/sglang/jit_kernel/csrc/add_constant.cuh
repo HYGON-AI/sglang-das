@@ -29,11 +29,16 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   // 1. Validate input tensors
   SymbolicSize N = {"num_elements"};
   SymbolicDevice device_;
-  TensorMatcher({N})                  // 1D tensor, must be contiguous
-      .with_dtype<int32_t>()          // must be int32
-      .with_device<kDLCUDA>(device_)  // must be on CUDA device
-      .verify(dst)                    // check tensor dst
-      .verify(src);                   // check tensor src
+#ifdef USE_ROCM
+  device_.set_options<kDLROCM>();
+#else
+  device_.set_options<kDLCUDA>();
+#endif
+  TensorMatcher({N})          // 1D tensor, must be contiguous
+      .with_dtype<int32_t>()  // must be int32
+      .with_device(device_)
+      .verify(dst)   // check tensor dst
+      .verify(src);  // check tensor src
 
   // 2. Extract required parameters, prepare for kernel launch
   const size_t num_elements = N.unwrap();
@@ -42,7 +47,7 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   [[maybe_unused]]  // optional, can be omitted
   const size_t dynamic_smem = 0;
   [[maybe_unused]]  // optional, LaunchKernel can auto determine stream from device
-  const cudaStream_t stream = LaunchKernel::resolve_device(device);
+  const auto stream = LaunchKernel::resolve_device(device);
   // some extra runtime checks using host::RuntimeCheck
   RuntimeCheck(num_elements > 0, "We only support non-empty tensors, got num_elements = ", num_elements);
 

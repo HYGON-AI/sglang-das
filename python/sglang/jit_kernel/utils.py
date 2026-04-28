@@ -89,10 +89,53 @@ def _resolve_kernel_path() -> pathlib.Path:
 KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3", "-Wno-return-type"]
-# DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "-DUSE_ROCM", "-Wno-return-type"]
+DEFAULT_CUDA_CFLAGS = [
+    "-std=c++20",
+    "-O3",
+    "--expt-relaxed-constexpr",
+    "-Wno-return-type",
+]
+DEFAULT_HIP_CFLAGS = ["-std=c++20", "-O3", "-DUSE_ROCM", "-Wno-return-type"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
+
+
+def _is_rocm_build() -> bool:
+    return torch.version.hip is not None
+
+
+def _default_device_cflags() -> List[str]:
+    if not _is_rocm_build():
+        return DEFAULT_CUDA_CFLAGS
+
+    flags = list(DEFAULT_HIP_CFLAGS)
+    amdgpu_targets = os.environ.get("AMDGPU_TARGET") or os.environ.get(
+        "PYTORCH_ROCM_ARCH"
+    )
+    if not amdgpu_targets and torch.cuda.is_available():
+        try:
+            amdgpu_targets = torch.cuda.get_device_properties(0).gcnArchName.split(
+                ":"
+            )[0]
+        except Exception:
+            amdgpu_targets = None
+
+    normalized_targets = []
+    if amdgpu_targets:
+        for target in amdgpu_targets.replace(";", ",").split(","):
+            target = target.strip().split(":")[0]
+            if target:
+                normalized_targets.append(target)
+                flags.append(f"--amdgpu-target={target}")
+    if normalized_targets:
+        use_fnuz = any(
+            target.startswith(
+                ("gfx90a", "gfx936", "gfx938", "gfx940", "gfx941", "gfx942")
+            )
+            for target in normalized_targets
+        )
+        flags.append("-DHIP_FP8_TYPE_FNUZ" if use_fnuz else "-DHIP_FP8_TYPE_E4M3")
+    return flags
 
 
 class CPPArgList(list[str]):
