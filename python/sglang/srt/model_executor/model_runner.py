@@ -3363,8 +3363,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
-        if dumper.may_enable:
-            dumper.step()
+        # if dumper.may_enable:
+        #     dumper.step()
 
         if self.msprobe_debugger is not None:
             self.msprobe_debugger.stop()

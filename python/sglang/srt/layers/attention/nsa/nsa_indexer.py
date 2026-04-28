@@ -319,13 +319,21 @@ def get_hadamard_matrix(dim, device=None, dtype=torch.float32):
     """获取缓存的 Hadamard 矩阵"""
     global _HADAMARD_CACHE
     key = (dim, str(device), str(dtype))
-
     if key not in _HADAMARD_CACHE:
         log_dim = math.ceil(math.log2(dim))
         dim_padded = 2 ** log_dim
         h = hadamard(dim_padded, dtype=float)
         _HADAMARD_CACHE[key] = torch.tensor(h, dtype=dtype, device=device)
     return _HADAMARD_CACHE[key]
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    # from sgl_kernel import hadamard_transform
+    # if _is_hip or _is_sm103:
+    #     from fast_hadamard_transform import hadamard_transform
+    # else:
+    #     from sgl_kernel import hadamard_transform
+
+    return x
 
 def hadamard_transform_optimized(x, scale=1.0):
     """

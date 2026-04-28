@@ -867,7 +867,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            # print(f"deepseek_v4_moe_code_path_checker.observed: {deepseek_v4_moe_code_path_checker.observed}")
+            print(f"deepseek_v4_moe_code_path_checker.observed: {deepseek_v4_moe_code_path_checker.observed}")
             assert deepseek_v4_moe_code_path_checker.observed == 1
             deepseek_v4_moe_code_path_checker.observed = 0
 

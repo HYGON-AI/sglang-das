@@ -1035,6 +1035,9 @@ def act_and_mul_triton(
     expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
     has_swiglu_limit = swiglu_limit is not None
+    print(f"swiglu_limit: {swiglu_limit} has_swiglu_limit: {has_swiglu_limit}")
+    if has_swiglu_limit:
+        deepseek_v4_moe_code_path_checker.observed += 1
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,

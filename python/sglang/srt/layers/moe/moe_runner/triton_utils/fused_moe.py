@@ -1172,7 +1172,7 @@ def fused_experts_impl(
         )
 
         # Activation function with multiplication
-        print(f"activation: {activation} is_gated: {is_gated} gemm1_alpha: {gemm1_alpha} gemm1_limit: {gemm1_limit} filter_expert: {filter_expert} down_moe_use_tma: {down_moe_use_tma} _is_cuda or _is_hip or _is_xpu: {_is_cuda or _is_hip or _is_xpu}")
+        print(f"activation: {activation} is_gated: {is_gated} gemm1_alpha: {gemm1_alpha} gemm1_limit: {gemm1_limit} filter_expert: {filter_expert} swiglu_limit: {swiglu_limit} _is_cuda or _is_hip or _is_xpu: {_is_cuda or _is_hip or _is_xpu}")
         if activation == "silu" and is_gated:
             # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
             # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
@@ -1187,20 +1187,20 @@ def fused_experts_impl(
                 )
             elif _use_lightop:
                 fuse_silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            elif _is_cuda or _is_hip or _is_xpu:
-                if not filter_expert:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-                else:
-                    act_and_mul_triton(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        config,
-                        curr_topk_ids,
-                        expert_ids,
-                        down_moe_use_tma,
-                        activation,
-                        swiglu_limit,
-                    )
+            # elif _is_cuda or _is_hip or _is_xpu:
+            #     if not filter_expert:
+            #         silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            #     else:
+            #         act_and_mul_triton(
+            #             intermediate_cache1.view(-1, N),
+            #             intermediate_cache2,
+            #             config,
+            #             curr_topk_ids,
+            #             expert_ids,
+            #             down_moe_use_tma,
+            #             activation,
+            #             swiglu_limit,
+            #         )
             else:
                 if _has_vllm_ops:
                     vllm_ops.silu_and_mul(
