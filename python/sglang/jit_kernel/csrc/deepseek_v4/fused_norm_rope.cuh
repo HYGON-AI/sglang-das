@@ -39,7 +39,7 @@ enum class ForwardMode {
 };
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, ForwardMode kMode, bool kUsePDL>
-__global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams params) {
+__global__ void fused_norm_rope(const FusedNormRopeParams params) {
   using namespace device;
   using enum ForwardMode;
 
@@ -145,7 +145,11 @@ __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams para
       }
     }
 
+#ifdef USE_ROCM
+    __syncthreads();
+#else
     __syncwarp();
+#endif
   }
 
   // part 2: rope
@@ -154,8 +158,11 @@ __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams para
     using DTypex2_t = packed_t<DType>;
     const auto mem_elem = tile::Memory<DTypex2_t>::warp();
     const auto elem = mem_elem.load(s_rope_input[warp_id]);
-    const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
-    const auto [freq_real, freq_imag] = freq;
+    const auto x = cast<fp32x2_t>(elem);
+    const auto x_real = x.x;
+    const auto x_imag = x.y;
+    const auto freq_real = freq.x;
+    const auto freq_imag = freq.y;
     const fp32x2_t output = {
         x_real * freq_real - x_imag * freq_imag,
         x_real * freq_imag + x_imag * freq_real,
@@ -187,7 +194,11 @@ struct FusedNormRopeKernel {
     auto B = SymbolicSize{"num_q_tokens"};
     auto N = SymbolicSize{"num_compress_tokens"};
     auto device_ = SymbolicDevice{};
+#ifdef USE_ROCM
+    device_.set_options<kDLROCM>();
+#else
     device_.set_options<kDLCUDA>();
+#endif
 
     TensorMatcher({B, kHeadDim})  // input
         .with_dtype<DType>()

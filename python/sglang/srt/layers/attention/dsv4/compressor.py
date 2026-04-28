@@ -100,7 +100,7 @@ class CompressorBackendMixin:
         compress_fused_norm_rope_inplace(
             kv_compressed,
             norm.weight,
-            norm.variance_epsilon,
+            norm.eps,
             freqs_cis_cache,
             plan,
         )
