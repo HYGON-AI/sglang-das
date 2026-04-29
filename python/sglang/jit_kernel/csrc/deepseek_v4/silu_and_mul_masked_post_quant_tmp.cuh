@@ -85,7 +85,7 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantParams& params) {
 
 template <bool kScaleUE8M0, bool kTransposed, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_quant_kernel(const SiluMulQuantParams __grid_constant__ params) {
+    silu_mul_quant_kernel(const SiluMulQuantParams SGL_GRID_CONSTANT params) {
   using namespace device;
 
   constexpr uint32_t kGroupSize = 128u;
@@ -209,7 +209,7 @@ struct SiluAndMulClampParams {
 
 template <typename DType, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_clamp_kernel(const SiluAndMulClampParams __grid_constant__ params) {
+    silu_mul_clamp_kernel(const SiluAndMulClampParams SGL_GRID_CONSTANT params) {
   using namespace device;
   static_assert(sizeof(DType) == 2, "only fp16/bf16 supported");
   using DType2 = packed_t<DType>;

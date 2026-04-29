@@ -29,7 +29,7 @@ struct RMSNormSelfParams {
 
 template <typename DType, int64_t kHeadDim, bool kUsePDL>
 __global__ __launch_bounds__(kBlockSize, 20)  //
-    void rmsnorm_self(const __grid_constant__ RMSNormSelfParams params) {
+    void rmsnorm_self(const SGL_GRID_CONSTANT RMSNormSelfParams params) {
   using namespace device;
   constexpr int64_t kVecSize = 16 / sizeof(DType);
   constexpr uint32_t kNumLoop = kHeadDim / (kVecSize * kWarpThreads);

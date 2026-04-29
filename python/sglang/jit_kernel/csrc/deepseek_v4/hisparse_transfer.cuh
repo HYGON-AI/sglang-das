@@ -27,7 +27,7 @@ struct OffloadParams {
   uint32_t num_layers;
 };
 
-OFFLOAD_KERNEL void offload_to_cpu(const __grid_constant__ OffloadParams params) {
+OFFLOAD_KERNEL void offload_to_cpu(const SGL_GRID_CONSTANT OffloadParams params) {
   using namespace device::hisparse;
   const auto [gpu_caches, cpu_caches, gpu_indices, cpu_indices, num_items, num_layers] = params;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;

@@ -71,8 +71,8 @@ SGL_DEVICE void all_reduce_impl(const AllReduceParams& params, DType* (&input)[k
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
 CUSTOM_AR_KERNEL void all_reduce_one_shot_kernel(
     const AllReduceData* __restrict__ data,
-    const AllReduceParams __grid_constant__ params,
-    const PullController __grid_constant__ ctrl) {
+    const AllReduceParams SGL_GRID_CONSTANT params,
+    const PullController SGL_GRID_CONSTANT ctrl) {
   /// NOTE: we assume the data array is ready before the previous kernel
   DType* input[kNumGPU];
   prefetch_uniform_ptr(data);
@@ -91,8 +91,8 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_kernel(
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
 CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(
     const AllReduceData* __restrict__ data,
-    const AllReduceParams __grid_constant__ params,
-    const PullController __grid_constant__ ctrl) {
+    const AllReduceParams SGL_GRID_CONSTANT params,
+    const PullController SGL_GRID_CONSTANT ctrl) {
   // get the range of this rank
   using device::kWarpThreads, device::div_ceil;
 

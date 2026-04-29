@@ -86,7 +86,7 @@ SGL_DEVICE void copy_kv_warp(
  * \tparam T The data type of the indices (`int32_t` or `int64_t`).
  */
 template <int64_t kElementBytes, int kSplit, bool kUsePDL, typename T>
-__global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params) {
+__global__ void store_kvcache(const SGL_GRID_CONSTANT StoreKVCacheParams params) {
   using namespace device;
   constexpr auto kSplitSize = kElementBytes / kSplit;
   const uint32_t warp_id = blockIdx.x * kNumWarps + threadIdx.x / kWarpThreads;

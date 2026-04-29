@@ -32,7 +32,7 @@ struct MoEHashTopKParams {
 };
 
 template <auto Fn, bool kUsePDL>
-__global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ params) {
+__global__ void moe_hash_topk_fused(const MoEHashTopKParams SGL_GRID_CONSTANT params) {
   using namespace device;
   const auto& [
     router_logits, input_id, tid2eid, topk_ids, topk_weights, // pointers
@@ -77,7 +77,7 @@ struct TopKParams {
   uint32_t num_tokens;
 };
 
-__global__ void mask_topk_ids_padded_region(const TopKParams __grid_constant__ params) {
+__global__ void mask_topk_ids_padded_region(const TopKParams SGL_GRID_CONSTANT params) {
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t warp_id = tid / device::kWarpThreads;
   const uint32_t lane_id = tid % device::kWarpThreads;

@@ -37,7 +37,7 @@ struct MegaMoEPreDispatchParams {
 // kGroupSize must match sglang_per_token_group_quant_fp8_ue8m0(group_size=).
 template <uint32_t kGroupSize, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  //
-    mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
+    mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams SGL_GRID_CONSTANT params) {
   using namespace device;
 
   constexpr uint32_t kVecElems = 8;  // 8 bf16 = 16B load per thread

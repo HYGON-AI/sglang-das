@@ -224,7 +224,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 }
 
 template <bool kUsePDL>
-__global__ void topk_1024_transform(const __grid_constant__ TopK1024Params params) {
+__global__ void topk_1024_transform(const SGL_GRID_CONSTANT TopK1024Params params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits // sizes

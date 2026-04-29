@@ -228,7 +228,7 @@ PLAN_KERNEL void topk_plan(
 }
 
 SMALL_TOPK_KERNEL void  // short context
-topk_short_transform(const __grid_constant__ TopKParams params) {
+topk_short_transform(const SGL_GRID_CONSTANT TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
   __shared__ int32_t s_topk_indices[K];
   const auto batch_id = blockIdx.x;
@@ -245,7 +245,7 @@ topk_short_transform(const __grid_constant__ TopKParams params) {
 }
 
 LARGE_TOPK_STAGE_1 void  // long context, middle to large batch size
-topk_combine_preprocess(const __grid_constant__ TopKParams params) {
+topk_combine_preprocess(const SGL_GRID_CONSTANT TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
   __shared__ int32_t s_topk_indices[K];
   uint32_t work_id = blockIdx.x;
@@ -292,7 +292,7 @@ topk_combine_preprocess(const __grid_constant__ TopKParams params) {
 }
 
 LARGE_TOPK_STAGE_2 void  // long context, middle to large batch size
-topk_combine_transform(const __grid_constant__ TopKParams params) {
+topk_combine_transform(const SGL_GRID_CONSTANT TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
   __shared__ int32_t s_topk_indices[K];
   const auto batch_id = blockIdx.x;
@@ -320,7 +320,7 @@ topk_combine_transform(const __grid_constant__ TopKParams params) {
 }
 
 FUSED_COMBINE_KERNEL void  // long context, small batch size
-topk_fused_transform(const __grid_constant__ TopKParams params) {
+topk_fused_transform(const SGL_GRID_CONSTANT TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
   __shared__ int32_t s_topk_indices[K];
   const auto batch_id = blockIdx.x;

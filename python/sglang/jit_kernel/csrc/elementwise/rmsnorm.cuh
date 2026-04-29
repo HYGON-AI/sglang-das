@@ -23,7 +23,7 @@ struct RMSNormParams {
 };
 
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ void rmsnorm_cta(const RMSNormParams __grid_constant__ params) {
+__global__ void rmsnorm_cta(const RMSNormParams SGL_GRID_CONSTANT params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kDim>;
 

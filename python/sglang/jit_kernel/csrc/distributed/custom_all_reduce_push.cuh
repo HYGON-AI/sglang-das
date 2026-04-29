@@ -166,8 +166,8 @@ SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_
 
 template <typename DType, uint32_t kNumGPU, bool kUsePDL>
 CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(
-    const AllReducePushData __grid_constant__ params,  //
-    const PushController __grid_constant__ ctrl) {
+    const AllReducePushData SGL_GRID_CONSTANT params,  //
+    const PushController SGL_GRID_CONSTANT ctrl) {
   using namespace device;
 
   const auto [buffer, input, output, rank, num_items, buffer_bytes, epoch_bytes] = params;
