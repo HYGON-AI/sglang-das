@@ -200,7 +200,7 @@ __global__ void moe_fused_gate_kernel(const SGL_GRID_CONSTANT MoEFusedGateParams
     shared_original_scores[e] = score_val;
   }
 
-  __syncwarp();
+  device::warp::sync();
 
   // only select topk_routed experts
   for (uint32_t k = 0; k < topk_routed; k++) {
@@ -231,7 +231,7 @@ __global__ void moe_fused_gate_kernel(const SGL_GRID_CONSTANT MoEFusedGateParams
       }
     }
 
-    __syncwarp();
+    device::warp::sync();
   }
 
   static_assert(kMaxTopK <= device::kWarpThreads);

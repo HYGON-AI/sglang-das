@@ -10,6 +10,14 @@ namespace device::warp {
 /// \brief Full 32-thread active mask.
 static constexpr uint32_t kFullMask = 0xffffffffu;
 
+SGL_DEVICE void sync(uint32_t active_mask = kFullMask) {
+#ifdef USE_ROCM
+  __syncwarp(static_cast<unsigned long long>(active_mask));
+#else
+  __syncwarp(active_mask);
+#endif
+}
+
 template <typename T>
 SGL_DEVICE T shfl_down(uint32_t active_mask, T value, int delta, int width = kWarpThreads) {
 #ifdef USE_ROCM
