@@ -339,7 +339,7 @@ def mhc_pre_big_fuse_tilelang(
             for j, k in T.Parallel(hc_mult, hc_mult):
                 comb_mix[i, j * hc_mult + k] = cm[j, k]
         else:
-            pre_mix_shared = T.alloc_fragment(hc_mult, T.float32)
+            pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
             for j in T.Parallel(hc_mult):
                 pre_mix_shared[j] = (
                     T.sigmoid(
@@ -421,7 +421,7 @@ def mhc_pre_gemm_sqrsum_tilelang(
                 out_frag,
                 transpose_A=False,
                 transpose_B=True,
-                wg_wait=0,
+                # wg_wait=0,
                 clear_accum=False,
             )
         sqrsum_l = T.alloc_fragment(token_block, T.float32)
@@ -452,7 +452,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     num_tokens = T.dynamic("num_tokens")
 
-    ENABLE_PDL = False #is_arch_support_pdl()
+    ENABLE_PDL = is_arch_support_pdl()
 
     @tilelang.jit
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
@@ -475,31 +475,25 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=0):
-                # x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
+            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
+                x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
-                
-                x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                x_f = T.alloc_shared((token_block, hidden_block), T.float32)
 
                 T.annotate_layout(
-                    # {x_smem: tilelang.layout.make_swizzled_layout(x_smem)}
-                    {x_f: tilelang.layout.make_hcu_swizzled_layout(x_f)}
+                    {x_smem: tilelang.layout.make_swizzled_layout(x_smem)}
                 )
 
-                # T.copy(x[px * token_block, k_base + pz * hidden_block], x_smem)
-                
-                T.copy(x[px * token_block, k_base + pz * hidden_block], x_f16)
+                T.copy(x[px * token_block, k_base + pz * hidden_block], x_smem)
                 T.copy(fn[0, k_base + pz * hidden_block], fn_smem)
 
-                # x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                # T.copy(x_smem, x_f16)
-                # x_f = T.alloc_fragment((token_block, hidden_block), T.float32)
+                x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+                T.copy(x_smem, x_f16)
+                x_f = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_f16, x_f)
 
-                for jj in T.serial(hidden_block // 4):
-                    for i, j in T.Parallel(token_block, 4):
-                        v = x_f[i, jj * 4 + j]
+                for jj in T.serial(hidden_block // 8):
+                    for i, j in T.Parallel(token_block, 8):
+                        v = x_f[i, jj * 8 + j]
                         sq_part4[i, j] += v * v
 
                 T.gemm(
@@ -508,7 +502,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
+                    # wg_wait=0,
                     clear_accum=False,
                 )
 
