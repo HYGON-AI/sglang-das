@@ -54,6 +54,10 @@
 #include <sstream>
 #include <utility>
 
+#if defined(USE_ROCM) && !defined(__grid_constant__)
+#define __grid_constant__
+#endif
+
 namespace host {
 
 template <typename>

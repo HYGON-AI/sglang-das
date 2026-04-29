@@ -464,17 +464,17 @@ class CompressorPrefillPlan(NamedTuple):
             device=seq_lens.device,
             pin_memory=seq_lens.is_cpu,
         )
-        # module = _jit_common_module()
-        # is_overlap = compress_ratio == 4
-        # plan_lens = module.plan_compress_prefill(
-        #     extend_lens,
-        #     seq_lens,
-        #     plan_tensor[0],
-        #     plan_tensor[1],
-        #     compress_ratio,
-        #     is_overlap,
-        #     use_cuda_graph,
-        # )
+        module = _jit_common_module()
+        is_overlap = compress_ratio == 4
+        plan_lens = module.plan_compress_prefill(
+            extend_lens,
+            seq_lens,
+            plan_tensor[0],
+            plan_tensor[1],
+            compress_ratio,
+            is_overlap,
+            use_cuda_graph,
+        )
         plan_lens = [0, 0]
         return CompressorPrefillPlan(
             compress_ratio,
