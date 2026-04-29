@@ -113,6 +113,7 @@ class PagedIndexerMetadata:
             else:
                 # from deep_gemm import get_paged_mqa_logits_metadata
                 from lightop.gemmopt import get_paged_mqa_logits_metadata
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
 
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
@@ -121,7 +122,7 @@ class PagedIndexerMetadata:
                 _c4,
                 self.c4_page_size,
                 # deep_gemm.get_num_sms(),
-                72, # 暂时写死
+                props.multi_processor_count, # 暂时写死
             )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)

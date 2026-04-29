@@ -1931,7 +1931,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
-        print('0' * 100)
         topk_weights, topk_ids, _ = topk_output
         if self.block_quant and SGLANG_USE_AITER_FP8_ASM_MOE:
             return fused_experts_asm_impl(x,

@@ -11,9 +11,18 @@
 
 namespace {
 
+// Support both CUDA and HIP compilation
+#if defined(USE_ROCM)
+  #define GRID_CONSTANT_ATTR
+#else
+  #define GRID_CONSTANT_ATTR __grid_constant__
+#endif
+
 constexpr uint32_t kTopK = 512;
 constexpr uint32_t kTopKBlockSize = 512;
-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+// Dynamic SMEM for double buffer: need 2 * kTopK elements = 2 * 512 * 4 = 4KB
+// Total SMEM budget for HIP is 64KB, so we use 4KB for dynamic SMEM
+constexpr uint32_t kSMEM = 2 * kTopK * sizeof(uint32_t);  // 4KB (bytes) - double buffer for topk512
 
 struct TopK512Params {
   const float* __restrict__ scores;
@@ -263,7 +272,11 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
+#if defined(USE_ROCM)
+    return ::hipFuncSetAttribute(fptr, ::hipFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#else
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }
@@ -327,8 +340,9 @@ struct TopK512Kernel {
         .page_table_stride = P.unwrap(),
         .page_bits = page_bits,
     };
-    constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
-    setup_kernel_smem_once<kernel, kSMEM_>();
+    // constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
+    constexpr auto kSMEM_ = kSMEM;  // align up a little
+    // setup_kernel_smem_once<kernel, kSMEM_>();
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
   }
 };

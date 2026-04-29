@@ -1172,7 +1172,7 @@ def fused_experts_impl(
         )
 
         # Activation function with multiplication
-        print(f"activation: {activation} is_gated: {is_gated} gemm1_alpha: {gemm1_alpha} gemm1_limit: {gemm1_limit} filter_expert: {filter_expert} swiglu_limit: {swiglu_limit} _is_cuda or _is_hip or _is_xpu: {_is_cuda or _is_hip or _is_xpu}")
+        # print(f"activation: {activation} is_gated: {is_gated} gemm1_alpha: {gemm1_alpha} gemm1_limit: {gemm1_limit} filter_expert: {filter_expert} swiglu_limit: {swiglu_limit} _is_cuda or _is_hip or _is_xpu: {_is_cuda or _is_hip or _is_xpu}")
         if activation == "silu" and is_gated:
             # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
             # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
