@@ -12,7 +12,7 @@ static constexpr uint32_t kFullMask = 0xffffffffu;
 
 SGL_DEVICE void sync(uint32_t active_mask = kFullMask) {
 #ifdef USE_ROCM
-  __syncwarp(static_cast<unsigned long long>(active_mask));
+  __syncthreads();
 #else
   __syncwarp(active_mask);
 #endif
