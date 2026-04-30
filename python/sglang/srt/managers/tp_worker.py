@@ -553,6 +553,7 @@ class TpModelWorker(BaseTpWorker):
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         if logits_output:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            logger.info(f"Sampled next_token_ids: {next_token_ids}")
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(

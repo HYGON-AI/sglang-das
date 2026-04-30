@@ -88,6 +88,59 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_DSV4_NAN_TRACE = os.environ.get("SGLANG_DSV4_NAN_TRACE", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_DSV4_NAN_DUMP_DIR = os.environ.get("SGLANG_DSV4_NAN_DUMP_DIR", "")
+_DSV4_NAN_DUMPED_TAGS = set()
+
+
+def _trace_nan(tag: str, tensor: Any, forward_batch: "ForwardBatch", layer_id=None):
+    if not _DSV4_NAN_TRACE or not torch.is_tensor(tensor) or tensor.numel() == 0:
+        return
+    if torch.isfinite(tensor).all().item():
+        return
+
+    mode = getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode))
+    logger.error(
+        "DSV4 NaN trace: mode=%s layer=%s tag=%s shape=%s dtype=%s nan=%d inf=%d",
+        mode,
+        layer_id,
+        tag,
+        tuple(tensor.shape),
+        tensor.dtype,
+        int(torch.isnan(tensor).sum().item()),
+        int(torch.isinf(tensor).sum().item()),
+    )
+
+
+def _dump_dsv4_nan_repro(
+    tag: str,
+    payload: dict,
+    forward_batch: "ForwardBatch",
+    layer_id=None,
+):
+    if not _DSV4_NAN_TRACE or not _DSV4_NAN_DUMP_DIR:
+        return
+
+    mode = getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode))
+    dump_key = (tag, layer_id, mode, os.getpid())
+    if dump_key in _DSV4_NAN_DUMPED_TAGS:
+        return
+    _DSV4_NAN_DUMPED_TAGS.add(dump_key)
+
+    os.makedirs(_DSV4_NAN_DUMP_DIR, exist_ok=True)
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "unknown"))
+    safe_tag = tag.replace(".", "_").replace("/", "_")
+    path = os.path.join(
+        _DSV4_NAN_DUMP_DIR,
+        f"dsv4_nan_{safe_tag}_layer{layer_id}_{mode}_rank{rank}_pid{os.getpid()}.pt",
+    )
+    torch.save(payload, path)
+    logger.error("DSV4 NaN repro dumped: %s", path)
 
 
 if TYPE_CHECKING:
@@ -686,6 +739,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             return x_flat, mixes
 
         shape, dtype = x.size(), x.dtype
+        if forward_batch is not None:
+            _trace_nan(f"{trace_tag}.input", x, forward_batch, self.layer_id)
+            _trace_nan(f"{trace_tag}.hc_fn", hc_fn, forward_batch, self.layer_id)
+            _trace_nan(f"{trace_tag}.hc_scale", hc_scale, forward_batch, self.layer_id)
+            _trace_nan(f"{trace_tag}.hc_base", hc_base, forward_batch, self.layer_id)
 
         if x.shape[0] == 0:
             y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
@@ -731,10 +789,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             deep_gemm.tf32_hc_prenorm_gemm(
                 x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
             )
+            if forward_batch is not None:
+                _trace_nan(
+                    f"{trace_tag}.deepgemm.d_out",
+                    d_out,
+                    forward_batch,
+                    self.layer_id,
+                )
+                _trace_nan(
+                    f"{trace_tag}.deepgemm.s_out",
+                    s_out,
+                    forward_batch,
+                    self.layer_id,
+                )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+        if forward_batch is not None:
+            _trace_nan(f"{trace_tag}.x_flat", x_flat, forward_batch, self.layer_id)
+            _trace_nan(f"{trace_tag}.mixes", mixes, forward_batch, self.layer_id)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
@@ -746,6 +820,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+        if forward_batch is not None:
+            _trace_nan(
+                f"{trace_tag}.hc_split_sinkhorn.pre",
+                pre,
+                forward_batch,
+                self.layer_id,
+            )
+            _trace_nan(
+                f"{trace_tag}.hc_split_sinkhorn.post",
+                post,
+                forward_batch,
+                self.layer_id,
+            )
+            _trace_nan(
+                f"{trace_tag}.hc_split_sinkhorn.comb",
+                comb,
+                forward_batch,
+                self.layer_id,
+            )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
@@ -805,8 +898,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
         )
+        _trace_nan("decoder.self_attn", hidden_states, forward_batch, self.layer_id)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        _trace_nan("decoder.attn_hc_post", hidden_states, forward_batch, self.layer_id)
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -855,16 +950,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        _trace_nan("decoder.mlp", hidden_states, forward_batch, self.layer_id)
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            _trace_nan("decoder.mlp_dp_scatter", hidden_states, forward_batch, self.layer_id)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
+            _trace_nan(
+                "decoder.mlp_attn_tp_all_gather",
+                hidden_states,
+                forward_batch,
+                self.layer_id,
+            )
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        _trace_nan("decoder.ffn_hc_post", hidden_states, forward_batch, self.layer_id)
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             assert deepseek_v4_moe_code_path_checker.observed == 1
@@ -1001,6 +1105,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
+            _trace_nan("layer.out", hidden_states, forward_batch, layer_id=i)
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
@@ -1010,6 +1115,7 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            _trace_nan("cp_all_gather.out", hidden_states, forward_batch)
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -1020,7 +1126,9 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
+        _trace_nan("hc_head.out", hidden_states, forward_batch)
         hidden_states = self.norm(hidden_states)
+        _trace_nan("final_norm.out", hidden_states, forward_batch)
 
         return hidden_states, pre_hc_head
 
@@ -1141,6 +1249,15 @@ class DeepseekV4ForCausalLM(nn.Module):
             aux_hidden_states,
             hidden_states_before_norm=pre_hc_head,
         )
+        if hasattr(logits, "next_token_logits"):
+            _trace_nan("logits.next_token_logits", logits.next_token_logits, forward_batch)
+        if hasattr(logits, "input_token_logprobs"):
+            _trace_nan(
+                "logits.input_token_logprobs",
+                logits.input_token_logprobs,
+                forward_batch,
+            )
+        return logits
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout

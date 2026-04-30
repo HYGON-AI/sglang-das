@@ -475,7 +475,6 @@ class CompressorPrefillPlan(NamedTuple):
             is_overlap,
             use_cuda_graph,
         )
-        plan_lens = [0, 0]
         return CompressorPrefillPlan(
             compress_ratio,
             plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
