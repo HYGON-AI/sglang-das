@@ -5,7 +5,11 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
+#ifdef USE_ROCM
+#include <hip/hip_fp8.h>
+#else
 #include <cuda_fp8.h>
+#endif
 
 // Small helpers shared by the DeepSeek-V4 FP8/UE8M0 quantization kernels
 // (silu_and_mul_masked_post_quant, store, mega_moe_pre_dispatch, ...).
