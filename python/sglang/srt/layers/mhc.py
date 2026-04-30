@@ -395,7 +395,7 @@ def mhc_pre_gemm_sqrsum_tilelang(
         T.clear(sqrsum_part)
         if ENABLE_PDL:
             T.pdl_sync()
-        for pz in T.Pipelined(hc_hidden_size // hidden_block, num_stages=2):
+        for pz in T.Pipelined(hc_hidden_size // hidden_block, num_stages=0):
             x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
             fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -411,9 +411,9 @@ def mhc_pre_gemm_sqrsum_tilelang(
             x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
             T.copy(x_frag_16, x_frag)
 
-            for jj in T.serial(hidden_block // 4):
-                for i, j in T.Parallel(token_block, 4):
-                    sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
+            for jj in T.serial(hidden_block // 8):
+                for i, j in T.Parallel(token_block, 8):
+                    sqrsum_part[i, j] += x_frag[i, jj * 8 + j] * x_frag[i, jj * 8 + j]
 
             T.gemm(
                 x_frag,
@@ -475,7 +475,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(split_size // hidden_block, num_stages=0):
                 x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -529,12 +529,12 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
         out: T.Tensor[(num_tokens, hc_mult3), T.float32],
         sqrsum: T.Tensor[(num_tokens,), T.float32],
     ):
-        warps_per_cta = threads // 32
-        num_reduce = T.ceildiv(split_k, 32)
+        warps_per_cta = threads // 64
+        num_reduce = T.ceildiv(split_k, 64)
         with T.Kernel(T.ceildiv(num_tokens, warps_per_cta), threads=threads) as (px,):
             tx = T.get_thread_binding()
-            warp = tx // 32
-            lane = tx % 32
+            warp = tx // 64
+            lane = tx % 64
             t = px * warps_per_cta + warp
             s = T.alloc_local((1,), T.float32)
             acc = T.alloc_local((1,), T.float32)
@@ -545,7 +545,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
             if t < num_tokens:
                 for r in T.serial(num_reduce):
-                    bz = r * 32 + lane
+                    bz = r * 64 + lane
                     s[0] += T.if_then_else(bz < split_k, sqrsum_partial[bz, t], 0.0)
                 sqrsum[t] = T.warp_reduce_sum(s[0])
                 if lane < hc_mult3:
