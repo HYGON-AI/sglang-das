@@ -808,7 +808,7 @@ class Indexer(MultiPlatformOp):
                     seqlens_32_2d, blocksize, self.sm_count
                 )
         elif _is_dcu: #nhb
-             schedule_metadata = None
+            schedule_metadata = None
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now

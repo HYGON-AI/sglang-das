@@ -858,10 +858,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_fused_shared_experts = self.model.num_fused_shared_experts
         else:
             num_fused_shared_experts = 0
+        debug_moe_trace = os.environ.get("SGLANG_DEBUG_MOE_TRACE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                enable=get_global_server_args().enable_return_routed_experts
+                or debug_moe_trace,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
@@ -2473,7 +2480,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise ValueError(f"Invalid attention backend: {backend_str}")
         self.init_new_workspace = init_new_workspace
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
-        return attn_backend_wrapper(self, full_attention_backend)
+        wrapped_backend = attn_backend_wrapper(self, full_attention_backend)
+        logger.info(
+            "Attention backend created: backend=%s, full_backend_cls=%s, "
+            "wrapped_backend_cls=%s",
+            backend_str,
+            full_attention_backend.__class__.__name__,
+            wrapped_backend.__class__.__name__,
+        )
+        return wrapped_backend
 
     def kernel_warmup(self):
         """

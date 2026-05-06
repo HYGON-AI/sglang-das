@@ -3,6 +3,8 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
+import warnings
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -67,6 +69,9 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+_FLASH_MLA_ENTRYPOINT_DEBUG = os.environ.get(
+    "SGLANG_FLASH_MLA_ENTRYPOINT_DEBUG", ""
+).lower() in {"1", "true", "yes", "on"}
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
@@ -84,6 +89,52 @@ def _create_flashmla_metadata():
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
+
+
+def _flash_mla_arg_summary(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return {
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if isinstance(value, (tuple, list)):
+        return [_flash_mla_arg_summary(v) for v in value]
+    if dataclasses.is_dataclass(value):
+        return {
+            "type": value.__class__.__name__,
+            "fields": {
+                field.name: _flash_mla_arg_summary(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            },
+        }
+    if hasattr(value, "__dict__") and not isinstance(value, type):
+        return {
+            "type": value.__class__.__name__,
+            "attrs": {
+                k: _flash_mla_arg_summary(v)
+                for k, v in vars(value).items()
+                if not k.startswith("_")
+            },
+        }
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return {"type": value.__class__.__name__}
+
+
+def _log_flash_mla_entrypoint_args(input_dict, backend, compress_ratio, layer_id):
+    if not _FLASH_MLA_ENTRYPOINT_DEBUG:
+        return
+    logger.warning(
+        "flash_mla_with_kvcache_entrypoint args: backend=%s layer=%s "
+        "compress_ratio=%s args=%s",
+        backend,
+        layer_id,
+        compress_ratio,
+        {k: _flash_mla_arg_summary(v) for k, v in input_dict.items()},
+    )
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
