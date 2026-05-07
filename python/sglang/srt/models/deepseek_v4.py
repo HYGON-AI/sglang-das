@@ -1297,6 +1297,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
 
+        def maybe_remap_compressed_tensors_scale_name(param_name: str) -> str:
+            if (
+                self.quant_config is None
+                or self.quant_config.get_name() != "compressed_tensors"
+            ):
+                return param_name
+
+            compressed_tensors_names = []
+            if param_name.endswith(".weight_scale_inv"):
+                compressed_tensors_names.append(
+                    param_name.replace(".weight_scale_inv", ".weight_scale")
+                )
+            if param_name.endswith("_weight_scale_inv"):
+                compressed_tensors_names.append(
+                    param_name.replace("_weight_scale_inv", "_weight_scale")
+                )
+
+            for compressed_tensors_name in compressed_tensors_names:
+                if compressed_tensors_name in params_dict:
+                    return compressed_tensors_name
+            return param_name
+
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names_out_of_layer = [
@@ -1391,6 +1413,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         if ("mlp.experts." in name) and name not in params_dict:
                             continue
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            name = maybe_remap_compressed_tensors_scale_name(name)
                         if name.endswith(".bias") and name not in params_dict:
                             continue
                         if name not in params_dict and name.startswith("mtp"):
@@ -1414,6 +1438,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if _is_npu:
                                 name = name.replace("weight_packed", "weight")
                             name = name.replace(weight_name, param_name)
+                            if name not in params_dict:
+                                name = maybe_remap_compressed_tensors_scale_name(name)
                             if name not in params_dict:
                                 continue
                             param = params_dict[name]
@@ -1495,7 +1521,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 param_name = name.replace(
                                     ".wq_a." if is_q else ".wkv.", ".wqkv_a."
                                 )
-                                bucket = cache_wqkv_a_weight.setdefault(param_name, {})
+                                cache_key = param_name
+                                bucket = cache_wqkv_a_weight.setdefault(cache_key, {})
                                 shard_key = "q" if is_q else "kv"
                                 assert (
                                     shard_key not in bucket
@@ -1504,6 +1531,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 if len(bucket) == 2:
                                     fused_weight = torch.cat(
                                         [bucket["q"], bucket["kv"]], dim=0
+                                    )
+                                    param_name = maybe_remap_compressed_tensors_scale_name(
+                                        param_name
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
@@ -1515,7 +1545,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func_args=(param, fused_weight),
                                     )
                                     loaded_params.add(param_name)
-                                    cache_wqkv_a_weight.pop(param_name)
+                                    cache_wqkv_a_weight.pop(cache_key)
                             else:
                                 if (
                                     "k_scale" in name or "v_scale" in name
@@ -1526,6 +1556,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                                 f"{scale[0]}_proj", "attn_mqa"
                                             )
                                             break
+                                if name not in params_dict:
+                                    name = maybe_remap_compressed_tensors_scale_name(
+                                        name
+                                    )
                                 if name not in params_dict:
                                     if not name.startswith("mtp"):
                                         logger.warning(
@@ -1544,7 +1578,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 loaded_params.add(name)
                 except Exception as e:
-                    e.add_note(f"{name=} {loaded_weight.shape=}")
+                    context = f"name={name!r} loaded_weight.shape={loaded_weight.shape}"
+                    if hasattr(e, "add_note"):
+                        e.add_note(context)
                     raise
 
             for future in concurrent.futures.as_completed(futures):
