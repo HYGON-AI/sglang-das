@@ -881,6 +881,14 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        self.num_expert_group = getattr(config, "n_group", None)
+        self.topk_group = getattr(config, "topk_group", None)
+        self.use_grouped_topk = (
+            self.num_expert_group is not None
+            and self.topk_group is not None
+            and self.num_expert_group > self.topk_group
+        )
+
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -1010,8 +1018,6 @@ class DeepseekV2MoE(nn.Module):
                 + get_global_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
-            self.topk_group = config.topk_group
-            self.num_expert_group = config.n_group
             self.correction_bias = (
                 self.gate.e_score_correction_bias.data
                 if self.gate.e_score_correction_bias is not None
