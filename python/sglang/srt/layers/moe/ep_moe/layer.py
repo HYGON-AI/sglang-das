@@ -782,6 +782,21 @@ class DeepEPMoE(FusedMoE):
             dtype=torch.bfloat16,
         )
 
+        if '0' in str(hidden_states_device):
+            logger.info(
+                'DeepEPMoE forward ---> %s - input_tensor[0] shape: %s, dtype: %s\n'
+                'DeepEPMoE forward ---> %s - input_tensor[1] shape: %s, dtype: %s\n'
+                'DeepEPMoE forward ---> %s - w13_weight_fp8[0] shape: %s, dtype: %s\n'
+                'DeepEPMoE forward ---> %s - w13_weight_fp8[1] shape: %s, dtype: %s\n'
+                'DeepEPMoE forward ---> %s - gateup_output shape: %s, dtype: %s\n'
+                'DeepEPMoE forward ---> %s - m_indices shape: %s, dtype: %s',
+                hidden_states_device, input_tensor[0].shape, input_tensor[0].dtype,
+                hidden_states_device, input_tensor[1].shape, input_tensor[1].dtype,
+                hidden_states_device, w13_weight_fp8[0].shape, w13_weight_fp8[0].dtype,
+                hidden_states_device, w13_weight_fp8[1].shape, w13_weight_fp8[1].dtype,
+                hidden_states_device, gateup_output.shape, gateup_output.dtype,
+                hidden_states_device, m_indices.shape, m_indices.dtype,
+            )
         m_grouped_fp8_gemm_nt_contiguous(
             input_tensor,
             w13_weight_fp8,

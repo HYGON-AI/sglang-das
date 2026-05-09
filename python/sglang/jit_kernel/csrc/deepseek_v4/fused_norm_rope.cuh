@@ -77,6 +77,7 @@ __global__ void fused_norm_rope(const FusedNormRopeParams params) {
   } else if constexpr (kMode == CompressDecode) {
     input = static_cast<DType*>(_input) + work_id * kHeadDim;
     const auto seq_len = static_cast<const int32_t*>(handle)[work_id];
+    // if (seq_len < static_cast<int32_t>(compress_ratio) || seq_len % compress_ratio != 0) return;
     if (seq_len % compress_ratio != 0) return;
     position = seq_len - compress_ratio;
   } else if constexpr (kMode == DefaultForward) {

@@ -161,14 +161,17 @@ inline PlanResult plan_prefill(
   auto N = SymbolicSize{"batch_size"};
   auto M = SymbolicSize{"num_tokens"};
   auto device = SymbolicDevice{};
-  const bool is_cuda = [&] {
-    if (extend_lens.device().device_type == kDLCUDA) {
-      device.set_options<kDLCUDA>();
-      return true;
-    } else {
-      device.set_options<kDLCPU, kDLCUDAHost>();
-      return false;
-    }
+  const bool is_gpu = [&] {
+      if (extend_lens.device().device_type == kDLCUDA) {
+          device.set_options<kDLCUDA>();
+          return true;
+      } else if (extend_lens.device().device_type == kDLROCM) {
+          device.set_options<kDLROCM>();
+          return true;
+      } else {
+          device.set_options<kDLCPU, kDLCUDAHost>();
+          return false;
+      }
   }();
   TensorMatcher({N})  // extend_lens and seq_lens
       .with_dtype<int64_t>()
@@ -192,7 +195,7 @@ inline PlanResult plan_prefill(
       .is_overlap = is_overlap,
   };
 
-  if (!is_cuda) return plan_prefill_host(params, use_cuda_graph);
+  if (!is_gpu) return plan_prefill_host(params, use_cuda_graph);
   /// NOTE: cuda kernel plan is naturally compatible with cuda graph
   LaunchKernel(1, kBlockSize, device.unwrap())(plan_prefill_cuda, params);
   return PlanResult{params.num_tokens, params.num_tokens};
