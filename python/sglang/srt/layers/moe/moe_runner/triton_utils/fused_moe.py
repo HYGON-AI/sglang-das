@@ -1220,7 +1220,8 @@ def fused_experts_impl(
                 intermediate_cache2 = _swiglu_silu_clamp_mul(
                     intermediate_cache1.view(-1, N), gemm1_limit
                 )
-            elif _use_lightop:
+            # elif _use_lightop:
+            elif False: #暂时关闭，开启后性能会很差
                 fuse_silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             # elif _is_cuda or _is_hip or _is_xpu:
             #     if not filter_expert:
