@@ -988,6 +988,241 @@ class DeepseekV4AttnBackend(
                 raw_metadata=self.forward_metadata,
             )
 
+    def _call_flash_mla_with_kvcache(
+        self,
+        *,
+        input_dict: Dict[str, object],
+        compress_ratio: Literal[0, 4, 128],
+        layer_id: int,
+    ) -> torch.Tensor:
+        backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+        _log_flash_mla_entrypoint_args(
+            input_dict=input_dict,
+            backend=backend,
+            compress_ratio=compress_ratio,
+            layer_id=layer_id,
+        )
+        return flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+
+    def _build_flash_mla_input_dict(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        flashmla_metadata,
+        attn_sink: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+    ) -> Dict[str, object]:
+        return dict(
+            q=q,
+            k_cache=swa_k_cache,
+            head_dim_v=self.head_dim_v,
+            block_table=None,
+            cache_seqlens=None,
+            tile_scheduler_metadata=flashmla_metadata,
+            softmax_scale=self.softmax_scale,
+            is_fp8_kvcache=True,
+            indices=swa_page_indices,
+            topk_length=swa_topk_lengths,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices,
+            extra_topk_length=extra_topk_lengths,
+        )
+
+    def _reshape_prefill_flash_mla_inputs_to_seq_layout(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]
+    ]:
+        if q.ndim != 3:
+            return None
+        if getattr(forward_batch, "nsa_cp_metadata", None) is not None:
+            return None
+
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if not extend_lens_cpu:
+            return None
+        if len(set(extend_lens_cpu)) != 1:
+            return None
+
+        batch_size = len(extend_lens_cpu)
+        seq_len_q = extend_lens_cpu[0]
+        if batch_size <= 0 or seq_len_q <= 0:
+            return None
+
+        expected_num_tokens = batch_size * seq_len_q
+        if q.shape[0] != expected_num_tokens:
+            return None
+        if swa_page_indices.shape[0] != expected_num_tokens:
+            return None
+        if swa_topk_lengths.shape[0] != expected_num_tokens:
+            return None
+        if extra_indices is not None and extra_indices.shape[0] != expected_num_tokens:
+            return None
+        if (
+            extra_topk_lengths is not None
+            and extra_topk_lengths.shape[0] != expected_num_tokens
+        ):
+            return None
+
+        q = q.view(batch_size, seq_len_q, *q.shape[1:])
+
+        if swa_page_indices.ndim == 2:
+            swa_page_indices = swa_page_indices.view(batch_size, seq_len_q, -1)
+        elif swa_page_indices.ndim == 3 and swa_page_indices.shape[1] == 1:
+            swa_page_indices = swa_page_indices.view(batch_size, seq_len_q, -1)
+        else:
+            return None
+
+        if swa_topk_lengths.ndim == 1:
+            swa_topk_lengths = swa_topk_lengths.view(batch_size, seq_len_q)
+        elif swa_topk_lengths.ndim == 2 and swa_topk_lengths.shape[1] == 1:
+            swa_topk_lengths = swa_topk_lengths.view(batch_size, seq_len_q)
+        else:
+            return None
+
+        if extra_indices is not None:
+            if extra_indices.ndim == 2:
+                extra_indices = extra_indices.view(batch_size, seq_len_q, -1)
+            elif extra_indices.ndim == 3 and extra_indices.shape[1] == 1:
+                extra_indices = extra_indices.view(batch_size, seq_len_q, -1)
+            else:
+                return None
+
+        if extra_topk_lengths is not None:
+            if extra_topk_lengths.ndim == 1:
+                extra_topk_lengths = extra_topk_lengths.view(batch_size, seq_len_q)
+            elif extra_topk_lengths.ndim == 2 and extra_topk_lengths.shape[1] == 1:
+                extra_topk_lengths = extra_topk_lengths.view(batch_size, seq_len_q)
+            else:
+                return None
+
+        return q, swa_page_indices, swa_topk_lengths, extra_indices, extra_topk_lengths
+
+    def _forward_flash_mla_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        flashmla_metadata,
+        attn_sink: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        compress_ratio: Literal[0, 4, 128],
+        layer_id: int,
+    ) -> torch.Tensor:
+        if q.ndim == 3:
+            q = q.unsqueeze(1)
+        if swa_page_indices.ndim == 2:
+            swa_page_indices = swa_page_indices.unsqueeze(1)
+        if extra_indices is not None and extra_indices.ndim == 2:
+            extra_indices = extra_indices.unsqueeze(1)
+
+        input_dict = self._build_flash_mla_input_dict(
+            q=q,
+            swa_k_cache=swa_k_cache,
+            swa_page_indices=swa_page_indices,
+            swa_topk_lengths=swa_topk_lengths,
+            flashmla_metadata=flashmla_metadata,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices=extra_indices,
+            extra_topk_lengths=extra_topk_lengths,
+        )
+        o = self._call_flash_mla_with_kvcache(
+            input_dict=input_dict,
+            compress_ratio=compress_ratio,
+            layer_id=layer_id,
+        )
+        return o.squeeze(1)
+
+    def _forward_flash_mla_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        flashmla_metadata,
+        attn_sink: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        compress_ratio: Literal[0, 4, 128],
+        layer_id: int,
+    ) -> torch.Tensor:
+        seq_layout_inputs = self._reshape_prefill_flash_mla_inputs_to_seq_layout(
+            q=q,
+            swa_page_indices=swa_page_indices,
+            swa_topk_lengths=swa_topk_lengths,
+            extra_indices=extra_indices,
+            extra_topk_lengths=extra_topk_lengths,
+            forward_batch=forward_batch,
+        )
+
+        if seq_layout_inputs is None:
+            return self._forward_flash_mla_decode(
+                q=q,
+                swa_k_cache=swa_k_cache,
+                swa_page_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                flashmla_metadata=flashmla_metadata,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_lengths,
+                compress_ratio=compress_ratio,
+                layer_id=layer_id,
+            )
+
+        (
+            q,
+            swa_page_indices,
+            swa_topk_lengths,
+            extra_indices,
+            extra_topk_lengths,
+        ) = seq_layout_inputs
+
+        input_dict = self._build_flash_mla_input_dict(
+            q=q,
+            swa_k_cache=swa_k_cache,
+            swa_page_indices=swa_page_indices,
+            swa_topk_lengths=swa_topk_lengths,
+            flashmla_metadata=flashmla_metadata,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices=extra_indices,
+            extra_topk_lengths=extra_topk_lengths,
+        )
+        o = self._call_flash_mla_with_kvcache(
+            input_dict=input_dict,
+            compress_ratio=compress_ratio,
+            layer_id=layer_id,
+        )
+        return o.reshape(-1, o.shape[-2], o.shape[-1])
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1063,13 +1298,6 @@ class DeepseekV4AttnBackend(
                         swa_topk_lengths, q.shape[0], value=1
                     )
 
-            if q.ndim == 3:
-                q = q.unsqueeze(1)
-            if swa_page_indices.ndim == 2:
-                swa_page_indices = swa_page_indices.unsqueeze(1)
-            if extra_indices is not None and extra_indices.ndim == 2:
-                extra_indices = extra_indices.unsqueeze(1)
-
             assert attn_sink is not None
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
@@ -1082,27 +1310,57 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            if not envs.SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA.get():
+                return self._forward_flash_mla_decode(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    flashmla_metadata=flashmla_metadata,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    compress_ratio=compress_ratio,
+                    layer_id=layer_id,
+                )
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+            if forward_batch.forward_mode.is_decode_or_idle() or (
+                forward_batch.forward_mode.is_target_verify()
+            ):
+                return self._forward_flash_mla_decode(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    flashmla_metadata=flashmla_metadata,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    compress_ratio=compress_ratio,
+                    layer_id=layer_id,
+                )
 
-            o = o.squeeze(1)
-            return o
+            if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+                return self._forward_flash_mla_prefill(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    flashmla_metadata=flashmla_metadata,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    forward_batch=forward_batch,
+                    compress_ratio=compress_ratio,
+                    layer_id=layer_id,
+                )
+
+            raise NotImplementedError(
+                f"unsupported mode {forward_batch.forward_mode=} for DeepSeekV4 FlashMLA"
+            )
 
         raise NotImplementedError("ragged attention")
 

@@ -446,7 +446,12 @@ def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
 def _down_moe_use_tma():
     return support_tensor_descriptor()
 
-def fused_experts_impl_w4a16(
+
+def _shape_str(tensor: Optional[torch.Tensor]) -> str:
+    return "None" if tensor is None else str(tuple(tensor.shape))
+
+
+def fused_experts_impl_aiter(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -462,12 +467,30 @@ def fused_experts_impl_w4a16(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
+    quant_type: Optional[MoeQuantType] = None,
 ):
     M, K = hidden_states.shape
     E, N1, _ = w1.shape
     _, N2, _ = w2.shape
+    is_channelwise_w8a8 = quant_type == MoeQuantType.FP8_W8A8 and block_shape is None
+    if not is_channelwise_w8a8 and (block_shape is None or len(block_shape) < 2):
+        raise ValueError(
+            "AITER MoE requires block_shape with two dimensions for this "
+            "quantization mode, but got "
+            f"{block_shape}. "
+            f"M={M}, K={K}, E={E}, N1={N1}, N2={N2}, "
+            f"top_k={topk_ids.shape[1]}, dtype={hidden_states.dtype}, "
+            f"quant_type={quant_type}, "
+            f"hidden_states_shape={_shape_str(hidden_states)}, "
+            f"w1_shape={_shape_str(w1)}, w2_shape={_shape_str(w2)}, "
+            f"w1_scale_shape={_shape_str(w1_scale)}, "
+            f"w2_scale_shape={_shape_str(w2_scale)}, "
+            f"a1_scale_shape={_shape_str(a1_scale)}, "
+            f"a2_scale_shape={_shape_str(a2_scale)}"
+        )
+    block_size = 0 if is_channelwise_w8a8 else block_shape[1]
     status, moe_cfg = get_aiter_moe_config(
-        M=M, E=E, N1=N1, N2=N2, K=K, top_k=topk_ids.shape[1], block_size=block_shape[1], dtype=hidden_states.dtype, quant_type=MoeQuantType.W4A16,
+        M=M, E=E, N1=N1, N2=N2, K=K, top_k=topk_ids.shape[1], block_size=block_size, dtype=hidden_states.dtype, quant_type=quant_type,
     )
     if status:
         assert moe_cfg.solution_type is not None, \
@@ -478,8 +501,16 @@ def fused_experts_impl_w4a16(
             MoeSolutionType.MOE_C,
             MoeSolutionType.ASM,
             MoeSolutionType.TRITON,
+            MoeSolutionType.CK,
         ), f"Unexpected solution_type: {moe_cfg.solution_type}"
-        assert moe_cfg.quant_type == MoeQuantType.W4A16
+        assert moe_cfg.quant_type in (
+            MoeQuantType.W4A16,
+            MoeQuantType.FP8_W8A8,
+        ), \
+            f"Unexpected quant_type: {moe_cfg.quant_type}"
+        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+        if is_2604b:
+            deepseek_v4_moe_code_path_checker.observed += 1
         # print(
         #     f"[get_config_w4a16] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_shape[1]}, dtype={hidden_states.dtype} "
         #     f"solution={moe_cfg.solution_type}, "
@@ -491,11 +522,11 @@ def fused_experts_impl_w4a16(
         assert moe_cfg.config is None, \
             "status=False but config is not None"
         print(
-            f"[get_config_w4a16] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_shape[1]}, dtype={hidden_states.dtype} "
+            f"[get_config_aiter_moe] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_size}, dtype={hidden_states.dtype}, quant_type={quant_type} "
             f"no solution found (expected on unsupported configs)"
         )
 
-    return aiter_moe(hidden_states, w1, w2, topk_weights, topk_ids, moe_cfg, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, E, None, routed_scaling_factor)
+    return aiter_moe(hidden_states, w1, w2, topk_weights, topk_ids, moe_cfg, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, E, None, routed_scaling_factor, output_dtype=hidden_states.dtype)
 
 def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
@@ -977,8 +1008,12 @@ def fused_experts_impl(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
 ):
-    if _use_aiter_moe and use_int4_w4a16 and hidden_states.dtype == torch.bfloat16:
-        return fused_experts_impl_w4a16(hidden_states, w1, w2, topk_weights, topk_ids, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, routed_scaling_factor)
+    if _use_aiter_moe and (use_int4_w4a16 or use_int8_w8a8 or use_fp8_w8a8) and hidden_states.dtype == torch.bfloat16:
+        if use_int4_w4a16:
+            quant_type = MoeQuantType.W4A16
+        else:
+            quant_type = MoeQuantType.FP8_W8A8
+        return fused_experts_impl_aiter(hidden_states, w1, w2, topk_weights, topk_ids, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, routed_scaling_factor, quant_type)
 
     from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
     if isinstance(activation, int):
