@@ -511,7 +511,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded(model_runner.server_args):
+        if enable_num_token_non_padded():
             ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).pin_memory().to(
                 device, non_blocking=True
             )
@@ -1280,3 +1280,11 @@ def compute_position_torch(
 
 def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+# if is_cuda() or is_hip():
+#     from sglang.jit_kernel.clamp_position import clamp_position_cuda
+
+#     clamp_position = clamp_position_cuda
+# else:
+clamp_position = _clamp_position_native

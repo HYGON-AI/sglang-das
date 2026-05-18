@@ -199,26 +199,27 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
-        if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-                get_scheduler_metadata,
-            )
+        # if self.fa_impl_ver == 3:
+        #     from sgl_kernel.flash_attn import (
+        #         flash_attn_varlen_func,
+        #         flash_attn_with_kvcache,
+        #         get_scheduler_metadata,
+        #     )
 
-            self._get_scheduler_metadata = get_scheduler_metadata
-        elif self.fa_impl_ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-            )
+        #     self._get_scheduler_metadata = get_scheduler_metadata
+        # elif self.fa_impl_ver == 4:
+        #     from sglang.jit_kernel.flash_attention_v4 import (
+        #         flash_attn_varlen_func,
+        #         flash_attn_with_kvcache,
+        #     )
 
-            self._get_scheduler_metadata = None
-        else:
-            raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
+        #     self._get_scheduler_metadata = None
+        # else:
+        #     raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        self._get_scheduler_metadata = None
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim

@@ -1001,120 +1001,120 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         return scheme.apply_weights(**apply_kwargs)
 
 
-# class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
+class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
-#     def __init__(self, quantization_config: CompressedTensorsConfig):
-#         self.quantization_config = quantization_config
-#         self.quant_config = quantization_config
+    def __init__(self, quantization_config: CompressedTensorsConfig):
+        self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
-#     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-#         layer.scheme.process_weights_after_loading(layer)
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
 
-#     def create_weights(
-#         self,
-#         layer: torch.nn.Module,
-#         num_experts: int,
-#         hidden_size: int,
-#         intermediate_size_per_partition: int,
-#         params_dtype: torch.dtype,
-#         **extra_weight_attrs,
-#     ):
-#         """
-#         Use the CompressedTensorsScheme associated with each layer to create
-#         the necessary parameters for the layer. See LinearMethodBase for param
-#         details
-#         """
-#         layer.scheme.create_weights(
-#             layer=layer,
-#             num_experts=num_experts,
-#             hidden_size=hidden_size,
-#             intermediate_size_per_partition=intermediate_size_per_partition,
-#             params_dtype=params_dtype,
-#             **extra_weight_attrs,
-#         )
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """
+        Use the CompressedTensorsScheme associated with each layer to create
+        the necessary parameters for the layer. See LinearMethodBase for param
+        details
+        """
+        layer.scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
 
-#     def create_moe_runner(
-#         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-#     ):
-#         layer.scheme.create_moe_runner(layer, moe_runner_config)
-#         if hasattr(layer.scheme, "runner"):
-#             self.runner = layer.scheme.runner
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        layer.scheme.create_moe_runner(layer, moe_runner_config)
+        if hasattr(layer.scheme, "runner"):
+            self.runner = layer.scheme.runner
 
-    # def get_triton_quant_info(self, layer: torch.nn.Module):
-    #     return layer.scheme.get_triton_quant_info(layer)
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_triton_quant_info(layer)
 
-    # def get_marlin_quant_info(self, layer: torch.nn.Module):
-    #     return layer.scheme.get_marlin_quant_info(layer)
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_marlin_quant_info(layer)
 
-#     def apply(
-#         self,
-#         layer: torch.nn.Module,
-#         dispatch_output: StandardDispatchOutput,
-#         bias: Optional[torch.Tensor] = None,
-#         i_q: Optional[torch.Tensor] = None,
-#         i_s: Optional[torch.Tensor] = None,
-#     ) -> CombineInput:
-#         """
-#         Use the output of create_weights and the CompressedTensorsScheme
-#         associated with the layer to apply the forward pass with the
-#         layer input.  See LinearMethodBase for param details
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+        bias: Optional[torch.Tensor] = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
+    ) -> CombineInput:
+        """
+        Use the output of create_weights and the CompressedTensorsScheme
+        associated with the layer to apply the forward pass with the
+        layer input.  See LinearMethodBase for param details
 
-#         """
+        """
 
-#         scheme = layer.scheme
-#         if scheme is None:
-#             raise ValueError("A scheme must be defined for each layer")
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
 
-#         apply_kwargs = {
-#             "layer": layer,
-#             "dispatch_output": dispatch_output,
-#         }
+        apply_kwargs = {
+            "layer": layer,
+            "dispatch_output": dispatch_output,
+        }
 
-#         supported_kwargs = getattr(scheme, "_apply_weights_supported_kwargs", None)
-#         if supported_kwargs is None:
-#             supported_kwargs = frozenset(inspect.signature(scheme.apply_weights).parameters)
-#             scheme._apply_weights_supported_kwargs = supported_kwargs
+        supported_kwargs = getattr(scheme, "_apply_weights_supported_kwargs", None)
+        if supported_kwargs is None:
+            supported_kwargs = frozenset(inspect.signature(scheme.apply_weights).parameters)
+            scheme._apply_weights_supported_kwargs = supported_kwargs
 
-#         supports_bias = "bias" in supported_kwargs
-#         supports_prequant_input = "i_q" in supported_kwargs and "i_s" in supported_kwargs
+        supports_bias = "bias" in supported_kwargs
+        supports_prequant_input = "i_q" in supported_kwargs and "i_s" in supported_kwargs
 
-#         if bias is not None and supports_bias:
-#             apply_kwargs["bias"] = bias
-#         if i_q is not None and i_s is not None and supports_prequant_input:
-#             apply_kwargs["i_q"] = i_q
-#             apply_kwargs["i_s"] = i_s
+        if bias is not None and supports_bias:
+            apply_kwargs["bias"] = bias
+        if i_q is not None and i_s is not None and supports_prequant_input:
+            apply_kwargs["i_q"] = i_q
+            apply_kwargs["i_s"] = i_s
 
-#         return scheme.apply_weights(**apply_kwargs)
+        return scheme.apply_weights(**apply_kwargs)
 
-#         #return scheme.apply_weights(layer, dispatch_output, bias, i_q, i_s)
+        #return scheme.apply_weights(layer, dispatch_output, bias, i_q, i_s)
 
-#     def apply_weights_with_router_logits(
-#         self,
-#         layer: torch.nn.Module,
-#         dispatch_output: StandardDispatchOutput,
-#     ) -> torch.Tensor:
-#         scheme = layer.scheme
-#         if scheme is None:
-#             raise ValueError("A scheme must be defined for each layer")
-#         return scheme.apply_weights_with_router_logits(layer, dispatch_output)
+    def apply_weights_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights_with_router_logits(layer, dispatch_output)
 
-#     def apply_without_routing_weights(
-#         self,
-#         layer,
-#         hidden_states,
-#         hidden_states_scale,
-#         group_list_type,
-#         group_list,
-#         output_dtype,
-#     ):
-#         return layer.scheme.apply_without_routing_weights(
-#             layer,
-#             hidden_states,
-#             hidden_states_scale,
-#             group_list_type,
-#             group_list,
-#             output_dtype,
-#         )
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return layer.scheme.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )
     
 class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
     """

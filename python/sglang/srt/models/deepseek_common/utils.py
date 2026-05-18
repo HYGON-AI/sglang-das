@@ -33,8 +33,6 @@ from sglang.srt.utils import (
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
     is_xpu,
-    is_nvidia_cublas_cu12_version_ge_12_9,
-    # is_nvidia_cublas_version_ge_12_9,
     is_dcu,
 )
 
