@@ -369,6 +369,11 @@ class Envs:
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
+    # DCU
+    SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = EnvBool(False)
+    SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = EnvBool(False)
+    SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = EnvBool(False)
+    
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)

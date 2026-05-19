@@ -19,7 +19,15 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, is_hip, is_dcu, get_bool_env_var
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+# from sglang.srt.layers.attention.compressed.metadata import (
+#     PagedCoreMetadata,
+#     PagedIndexerMetadata,
+# )
+# from sglang.srt.layers.attention.indexer_topk_capturer import (
+#     get_global_indexer_capturer,
+# )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -30,7 +38,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+_use_lightop_group_fp8_quant = get_bool_env_var("SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT")
+_is_dcu = is_dcu()
 if is_hip():
     FP8_DTYPE = torch.float8_e4m3fnuz
     FP8_MAX = torch.finfo(FP8_DTYPE).max
@@ -294,6 +305,42 @@ class C4IndexerBackendMixin:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
+        q = c4_indexer.compute_q(q_lora, positions=positions)
+
+        if _is_dcu and _use_lightop_group_fp8_quant:
+            from lightop import op as ops
+            def act_quant_group_lightop(
+                x: torch.Tensor,
+                block_size: int = 128,
+                scale_fmt=None,
+                quant_dtype: torch.dtype = fp8_dtype,
+            ):
+                assert x.is_cuda
+                assert x.is_contiguous()
+                assert x.size(-1) % block_size == 0
+
+                N = x.size(-1)
+                groups = N // block_size
+
+                y = torch.empty_like(x, dtype=quant_dtype)
+                s = torch.empty(*x.shape[:-1], groups, dtype=torch.float32, device=x.device)
+
+                ops.per_token_group_quant_fp8(
+                    y.view(-1, N),
+                    x.view(-1, N),
+                    s.view(-1, groups),
+                    block_size,
+                    1e-4,
+                    scale_fmt is not None,
+                )
+
+                return y, s
+
+            q_fp8, q_scale = act_quant_group_lightop(q)
+    
+        else:
+            q_fp8, q_scale = act_quant(q) # init
+        
         weights = c4_indexer.compute_weights(x, skip_scale=True)
         q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
         self.forward_indexer_compressor(
