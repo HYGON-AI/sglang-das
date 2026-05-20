@@ -82,9 +82,10 @@ class Fp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized: bool = False,
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
-        weight_block_size: List[int] = None,
+        weight_block_size: Optional[List[int]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
+        super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             logger.info("Detected fp8 checkpoint.")
@@ -129,18 +130,28 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        packed_modules_mapping = (
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
+        )
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
         if ignored_layers:
-            # hacking ministral
-            ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
+            # Keep both forms so prefix matching works for models that include
+            # or omit the leading "model." in state-dict names.
+            normalized = []
+            for layer in ignored_layers:
+                base = layer.removeprefix("model.")
+                normalized.append(base)
+                normalized.append(f"model.{base}")
+            ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     def get_quant_method(
