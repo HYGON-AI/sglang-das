@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Iterable,
     List,
     Literal,
@@ -68,6 +71,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
 )
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -887,6 +891,7 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
+        self.first_k_dense_replace = config.first_k_dense_replace
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
