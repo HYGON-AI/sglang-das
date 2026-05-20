@@ -2682,7 +2682,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
-            hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
+            pp_proxy_hidden_states_shape=get_pp_proxy_hidden_states_shape(
+                num_tokens=num_tokens,
+                hidden_size=self.model_config.hidden_size,
+                model_config=self.model_config,
+            ),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -2870,9 +2874,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and "pp_proxy_tensors"
                 in inspect.signature(self.model.forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             if not self.is_generation:
                 kwargs["get_embedding"] = True
 

@@ -470,9 +470,21 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
     ):
         # for per channel weight quantization
+        if loaded_weight.dim() == 2 and loaded_weight.shape[-1] == 1:
+            loaded_weight = loaded_weight.squeeze(-1)
+
         if shard_id == "w2":
+            if expert_data.dim() == 1 and loaded_weight.dim() == 1:
+                expert_data.copy_(loaded_weight)
+                return
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
+            if expert_data.dim() == 1 and loaded_weight.dim() == 1:
+                shard_size = expert_data.shape[0] // 2
+                start = shard_size if shard_id == "w3" else 0
+                loaded_weight = loaded_weight.narrow(0, shard_size * tp_rank, shard_size)
+                expert_data.narrow(0, start, shard_size).copy_(loaded_weight)
+                return
             self._load_w13(
                 shard_id=shard_id,
                 shard_dim=shard_dim,

@@ -111,6 +111,8 @@ class HashTopK(nn.Module):
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.jit_kernel.deepseek_v4 import hash_topk
 
+            if input_ids.dtype is not torch.int64:
+                input_ids = input_ids.to(torch.int64)
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
                 input_ids=input_ids,

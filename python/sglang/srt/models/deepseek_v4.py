@@ -4,17 +4,7 @@ import concurrent.futures
 import logging
 import os
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -72,13 +62,14 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -925,8 +916,8 @@ class DeepseekV4Model(nn.Module):
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
+        hc_dim = hc_mult * config.hidden_size
         if self.pp_group.is_last_rank:
-            hc_dim = hc_mult * config.hidden_size
             self.hc_head_fn = nn.Parameter(
                 torch.empty(hc_mult, hc_dim, dtype=torch.float32)
             )
@@ -972,7 +963,10 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -1048,30 +1042,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_pp_group()
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-                )
-        else:
+        if not self.pp_group.is_last_rank:
             self.lm_head = PPMissingLayer()
+        elif config.tie_word_embeddings and self.pp_group.world_size == 1:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(
-                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
-                )
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
             }
         )
 
@@ -1133,7 +1125,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
-        if not self.pp_group.is_last_rank:
+        if isinstance(hidden_states, PPProxyTensors):
             return hidden_states
 
         aux_hidden_states = None
@@ -1181,8 +1173,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
-        for layer_id in range(self.model.start_layer, self.model.end_layer):
-            layer = self.model.layers[layer_id]
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             self_attn = layer.self_attn
             if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
                 self_attn.compressor.apply_ape_hotfix()
@@ -1521,8 +1514,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wkv.weight_scale")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
@@ -1598,6 +1593,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        if os.environ.get("SGLANG_DSV4_CHANNEL_FP8_SCALE", "0") == "1":
+            skipped_checking_patterns.extend(
+                ["mlp.experts.w13_weight_scale", "mlp.experts.w2_weight_scale"]
+            )
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:
