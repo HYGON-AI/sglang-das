@@ -13,6 +13,43 @@ from sglang.srt.layers.utils.common import strict_contiguous
 
 tilelang.set_log_level("WARNING")
 
+
+def _patch_tilelang_decouple_type_cast_for_rocm() -> None:
+    if torch.version.hip is None:
+        return
+    try:
+        from tilelang.transform import decouple_type_cast as _dtc
+    except Exception:
+        return
+    if getattr(_dtc, "_sglang_rocm_bool_alloc_patch", False):
+        return
+
+    original_allocate = _dtc.Allocate
+
+    def _is_bool_expr(expr) -> bool:
+        try:
+            dtype = expr.dtype
+            if callable(dtype):
+                dtype = dtype()
+            return str(dtype) == "bool8"
+        except Exception:
+            return False
+
+    def _allocate(data, dtype, extents, condition, body, annotations=None, span=None):
+        if not _is_bool_expr(condition):
+            condition = _dtc.tir.const(1) == _dtc.tir.const(1)
+        if annotations is None:
+            return original_allocate(data, dtype, extents, condition, body)
+        if span is None:
+            return original_allocate(data, dtype, extents, condition, body, annotations)
+        return original_allocate(data, dtype, extents, condition, body, annotations, span)
+
+    _dtc.Allocate = _allocate
+    _dtc._sglang_rocm_bool_alloc_patch = True
+
+
+_patch_tilelang_decouple_type_cast_for_rocm()
+
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -297,7 +334,7 @@ def mhc_pre_big_fuse_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 64:
+        if True:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -338,7 +375,7 @@ def mhc_pre_big_fuse_tilelang(
 
             for j, k in T.Parallel(hc_mult, hc_mult):
                 comb_mix[i, j * hc_mult + k] = cm[j, k]
-        else:
+        if True:
             pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
             for j in T.Parallel(hc_mult):
                 pre_mix_shared[j] = (
@@ -642,7 +679,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 64:
+        if True:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -683,7 +720,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
 
             for j, k in T.Parallel(hc_mult, hc_mult):
                 comb_mix[i, j * hc_mult + k] = cm[j, k]
-        else:
+        if True:
             pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
             for j in T.Parallel(hc_mult):
                 pre_mix_shared[j] = (

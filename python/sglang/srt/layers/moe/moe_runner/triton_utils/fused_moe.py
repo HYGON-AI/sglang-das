@@ -508,7 +508,11 @@ def fused_experts_impl_aiter(
             MoeQuantType.FP8_W8A8,
         ), \
             f"Unexpected quant_type: {moe_cfg.quant_type}"
-        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+        dsv4_2604_submode = getattr(envs, "SGLANG_DSV4_2604_SUBMODE", None)
+        is_2604b = (
+            dsv4_2604_submode is not None
+            and dsv4_2604_submode.get() == "2604B"
+        )
         if is_2604b:
             deepseek_v4_moe_code_path_checker.observed += 1
         # print(

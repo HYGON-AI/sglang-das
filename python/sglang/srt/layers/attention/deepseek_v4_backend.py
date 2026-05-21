@@ -3,7 +3,6 @@ from __future__ import annotations
 import enum
 import functools
 import logging
-import os
 import warnings
 from dataclasses import dataclass, field
 from typing import (
@@ -49,6 +48,9 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+    flash_mla_with_kvcache_entrypoint,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -69,9 +71,6 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
-_FLASH_MLA_ENTRYPOINT_DEBUG = os.environ.get(
-    "SGLANG_FLASH_MLA_ENTRYPOINT_DEBUG", ""
-).lower() in {"1", "true", "yes", "on"}
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
@@ -89,52 +88,6 @@ def _create_flashmla_metadata():
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
-
-
-def _flash_mla_arg_summary(value):
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        return {
-            "shape": tuple(value.shape),
-            "dtype": str(value.dtype),
-            "device": str(value.device),
-        }
-    if isinstance(value, (tuple, list)):
-        return [_flash_mla_arg_summary(v) for v in value]
-    if dataclasses.is_dataclass(value):
-        return {
-            "type": value.__class__.__name__,
-            "fields": {
-                field.name: _flash_mla_arg_summary(getattr(value, field.name))
-                for field in dataclasses.fields(value)
-            },
-        }
-    if hasattr(value, "__dict__") and not isinstance(value, type):
-        return {
-            "type": value.__class__.__name__,
-            "attrs": {
-                k: _flash_mla_arg_summary(v)
-                for k, v in vars(value).items()
-                if not k.startswith("_")
-            },
-        }
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    return {"type": value.__class__.__name__}
-
-
-def _log_flash_mla_entrypoint_args(input_dict, backend, compress_ratio, layer_id):
-    if not _FLASH_MLA_ENTRYPOINT_DEBUG:
-        return
-    logger.warning(
-        "flash_mla_with_kvcache_entrypoint args: backend=%s layer=%s "
-        "compress_ratio=%s args=%s",
-        backend,
-        layer_id,
-        compress_ratio,
-        {k: _flash_mla_arg_summary(v) for k, v in input_dict.items()},
-    )
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -996,12 +949,6 @@ class DeepseekV4AttnBackend(
         layer_id: int,
     ) -> torch.Tensor:
         backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-        _log_flash_mla_entrypoint_args(
-            input_dict=input_dict,
-            backend=backend,
-            compress_ratio=compress_ratio,
-            layer_id=layer_id,
-        )
         return flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
     def _build_flash_mla_input_dict(

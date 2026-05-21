@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     pass
@@ -108,12 +107,12 @@ class PagedIndexerMetadata:
         else:
             import deepgemm as deep_gemm
 
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
             if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
                 # from deep_gemm import get_paged_mqa_logits_metadata
                 from lightop.gemmopt import get_paged_mqa_logits_metadata
-                props = torch.cuda.get_device_properties(torch.cuda.current_device())
 
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
@@ -127,9 +126,9 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and torch.version.hip is None:
+            from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
@@ -149,11 +148,12 @@ class PagedIndexerMetadata:
         return self.page_table.shape[1] * self.c4_page_size
 
     def copy_(self, other: "PagedIndexerMetadata"):
-        if is_hip():
-            copy_fields = ["page_table", "c4_seq_lens"]
-        else:
-            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
-        copy_fields += ["topk_metadata"]
+        copy_fields = [
+            "page_table",
+            "c4_seq_lens",
+            "deep_gemm_metadata",
+            "topk_metadata",
+        ]
         copy_metadata(
             src=other,
             dst=self,

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import importlib.util
 import logging
 import os
 import pathlib
+import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -62,7 +64,7 @@ def cache_once(fn: F) -> F:
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
-    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, (+{kernel_name}));"
 
 
 @cache_once
@@ -222,8 +224,6 @@ def load_jit(
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load, load_inline
-
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
     extra_cflags = extra_cflags or []
@@ -239,8 +239,16 @@ def load_jit(
             raise ValueError(f"Dependency {dep} is not registered.")
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
-    module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    backend = "hip" if _is_rocm_build() else "cuda"
+    module_name = (
+        "sgl_kernel_jit_" + backend + "_" + "_".join(str(arg) for arg in args)
+    )
+    default_device_cflags = _default_device_cflags()
     if header_only:
+        if _is_rocm_build():
+            _patch_tvm_ffi_load_inline_for_hip()
+        from tvm_ffi.cpp import load_inline
+
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
         cpp_sources = [f'#include "{path}"' for path in cpp_files]
@@ -255,12 +263,14 @@ def load_jit(
                 cpp_sources=cpp_sources,
                 cuda_sources=cuda_sources,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=default_device_cflags + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
             )
     else:
+        from tvm_ffi.cpp import load
+
         assert cpp_wrappers is None and cuda_wrappers is None
         with _jit_compile_context():
             return load(
@@ -268,7 +278,7 @@ def load_jit(
                 cpp_files=cpp_files,
                 cuda_files=cuda_files,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=default_device_cflags + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
@@ -330,6 +340,132 @@ def _get_default_target_flags() -> List[str]:
             "-O3",
             "--expt-relaxed-constexpr",
         ]
+
+
+def _find_hipcc() -> str:
+    candidates = [
+        os.environ.get("HIPCC"),
+        "/opt/dtk/bin/hipcc",
+        "/opt/dtk/hip/bin/hipcc",
+        shutil.which("hipcc"),
+    ]
+    for candidate in candidates:
+        if candidate and pathlib.Path(candidate).exists():
+            return str(candidate)
+    raise RuntimeError(
+        "Cannot find hipcc for ROCm JIT compilation. "
+        "Please set HIPCC or install hipcc under /opt/dtk/bin."
+    )
+
+
+def _patch_tvm_ffi_load_inline_for_hip() -> None:
+    """Teach CUDA-only tvm_ffi.cpp.load_inline builds to use hipcc on ROCm."""
+    load_inline_mod = importlib.import_module("tvm_ffi.cpp.load_inline")
+    if getattr(load_inline_mod, "_sglang_hipcc_patched", False):
+        return
+
+    def _generate_hip_ninja_build(
+        name: str,
+        build_dir: str,
+        with_cuda: bool,
+        extra_cflags,
+        extra_cuda_cflags,
+        extra_ldflags,
+        extra_include_paths,
+    ) -> str:
+        default_include_paths = [
+            load_inline_mod.find_include_path(),
+            load_inline_mod.find_dlpack_include_path(),
+        ]
+
+        tvm_ffi_lib = load_inline_mod.find_libtvm_ffi()
+        tvm_ffi_lib_path = str(pathlib.Path(tvm_ffi_lib).parent)
+        tvm_ffi_lib_name = pathlib.Path(tvm_ffi_lib).stem
+
+        hipcc = _find_hipcc()
+        default_cflags = ["-std=c++17", "-fPIC", "-O2"]
+        default_cuda_cflags = ["-x", "hip", "-fPIC", "-std=c++17", "-O2"]
+        default_ldflags = [
+            "-shared",
+            f"-L{tvm_ffi_lib_path}",
+            f"-l{tvm_ffi_lib_name.removeprefix('lib')}",
+        ]
+
+        cflags = default_cflags + [flag.strip() for flag in extra_cflags]
+        cuda_cflags = default_cuda_cflags + [
+            flag.strip() for flag in extra_cuda_cflags
+        ]
+        ldflags = default_ldflags + [flag.strip() for flag in extra_ldflags]
+        include_paths = default_include_paths + [
+            str(pathlib.Path(path).resolve()) for path in extra_include_paths
+        ]
+
+        for path in include_paths:
+            cflags.append("-I{}".format(path.replace(":", "$:")))
+            cuda_cflags.append("-I{}".format(path.replace(":", "$:")))
+
+        ninja = [
+            "ninja_required_version = 1.3",
+            "cxx = {}".format(os.environ.get("CXX", hipcc)),
+            "hipcc = {}".format(hipcc),
+            "cflags = {}".format(" ".join(cflags)),
+        ]
+        if with_cuda:
+            ninja.append("cuda_cflags = {}".format(" ".join(cuda_cflags)))
+        ninja.append("ldflags = {}".format(" ".join(ldflags)))
+        ninja.extend(
+            [
+                "",
+                "rule compile",
+                "  depfile = $out.d",
+                "  deps = gcc",
+                "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out",
+                "",
+            ]
+        )
+        if with_cuda:
+            ninja.extend(
+                [
+                    "rule compile_cuda",
+                    "  depfile = $out.d",
+                    "  deps = gcc",
+                    "  command = $hipcc -MMD -MF $out.d $cuda_cflags -c $in -o $out",
+                    "",
+                ]
+            )
+        ninja.extend(
+            [
+                "rule link",
+                "  command = $cxx $in $ldflags -o $out",
+                "",
+                "build main.o: compile {}".format(
+                    str((pathlib.Path(build_dir) / "main.cpp").resolve()).replace(
+                        ":", "$:"
+                    )
+                ),
+            ]
+        )
+        if with_cuda:
+            ninja.append(
+                "build cuda.o: compile_cuda {}".format(
+                    str((pathlib.Path(build_dir) / "cuda.cu").resolve()).replace(
+                        ":", "$:"
+                    )
+                )
+            )
+        ext = ".so"
+        ninja.append(
+            "build {}{}: link main.o{}".format(
+                name, ext, " cuda.o" if with_cuda else ""
+            )
+        )
+        ninja.append("")
+        ninja.append(f"default {name}{ext}")
+        ninja.append("")
+        return "\n".join(ninja)
+
+    load_inline_mod._generate_ninja_build = _generate_hip_ninja_build
+    load_inline_mod._sglang_hipcc_patched = True
 
 
 @contextmanager

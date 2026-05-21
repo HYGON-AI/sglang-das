@@ -63,8 +63,12 @@ SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
     up = __hmax2(up, {-limit, -limit});
     up = __hmin2(up, {limit, limit});
   }
-  const auto [g0, g1] = cast<fp32x2_t>(gate);
-  const auto [u0, u1] = cast<fp32x2_t>(up);
+  const auto g_pair = cast<fp32x2_t>(gate);
+  const auto u_pair = cast<fp32x2_t>(up);
+  const auto g0 = g_pair.x;
+  const auto g1 = g_pair.y;
+  const auto u0 = u_pair.x;
+  const auto u1 = u_pair.y;
   const auto silu0 = g0 / (1.0f + __expf(-g0));
   const auto silu1 = g1 / (1.0f + __expf(-g1));
   const float val0 = silu0 * u0;

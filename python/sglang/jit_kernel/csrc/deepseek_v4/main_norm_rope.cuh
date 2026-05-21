@@ -138,8 +138,11 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   using DType2 = packed_t<DType>;
   const auto mem_elem = tile::Memory<DType2>{lane_id, kWarpThreads};
   const auto elem = mem_elem.load(s_rope[warp_id]);
-  const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
-  const auto [freq_real, freq_imag] = freq;
+  const auto x_pair = cast<fp32x2_t>(elem);
+  const auto x_real = x_pair.x;
+  const auto x_imag = x_pair.y;
+  const auto freq_real = freq.x;
+  const auto freq_imag = freq.y;
   const fp32x2_t rotated = {
       x_real * freq_real - x_imag * freq_imag,
       x_real * freq_imag + x_imag * freq_real,

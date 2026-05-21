@@ -57,6 +57,7 @@ if _use_aiter and not _is_dcu:
 
 logger = logging.getLogger(__name__)
 
+
 def is_moe_prefill():
     args = get_global_server_args()
     return args.disaggregation_mode == "prefill"
@@ -550,6 +551,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     hidden_states_fp8_input=i_q if use_prequant_input else None,
                     hidden_states_scale_fp8_input=i_s if use_prequant_input else None,
                 )
+                from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
                 return StandardCombineInput(hidden_states=output)
         elif  _is_dcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe:
             if isinstance(layer.w13_weight,tuple):
@@ -640,6 +643,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 global_num_experts=E,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             )
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
             return StandardCombineInput(hidden_states=output)
         else:
             quant_info = TritonMoeQuantInfo(

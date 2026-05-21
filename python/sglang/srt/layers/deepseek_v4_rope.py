@@ -2,17 +2,9 @@ import math
 from functools import lru_cache
 from typing import Optional
 
-import tilelang
 import torch
 import triton
 import triton.language as tl
-
-tilelang.set_log_level("WARNING")
-
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"

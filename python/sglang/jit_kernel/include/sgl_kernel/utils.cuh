@@ -22,7 +22,9 @@
 
 #include <concepts>
 #include <cstddef>
+#include <memory>
 #include <type_traits>
+#include <utility>
 #ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -31,6 +33,7 @@
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #ifndef __grid_constant__
 #define __grid_constant__
@@ -43,7 +46,16 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaLaunchKernel hipLaunchKernel
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define __syncwarp(...) __syncthreads()
+#define __shfl_sync(mask, var, src_lane, ...) __shfl(var, src_lane, ##__VA_ARGS__)
+#define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta, ##__VA_ARGS__)
+#define __shfl_xor_sync(mask, var, lane_mask, ...) __shfl_xor(var, lane_mask, ##__VA_ARGS__)
 #endif
 
 #ifdef USE_ROCM
@@ -73,18 +85,6 @@ using bf16x2_t = __nv_bfloat162;
 using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 
-using fp32x4_t = float4;
-#else
-using fp32_t = float;
-using fp16_t = __half;
-using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = uint8_t;
-using fp8_e5m2_t = uint8_t;
-using fp32x2_t = float2;
-using fp16x2_t = half2;
-using bf16x2_t = __hip_bfloat162;
-using fp8x2_e4m3_t = uint16_t;
-using fp8x2_e5m2_t = uint16_t;
 using fp32x4_t = float4;
 #endif
 

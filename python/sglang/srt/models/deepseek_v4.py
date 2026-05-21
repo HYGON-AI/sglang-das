@@ -26,7 +26,10 @@ from sglang.jit_kernel.deepseek_v4 import (
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -696,7 +699,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre, mhc_pre_torch
+            from sglang.srt.layers.mhc import mhc_pre
 
             norm_kwargs = {}
             if norm is not None:
@@ -704,7 +707,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_kwargs["norm_eps"] = norm.variance_epsilon
 
             post, comb, y = mhc_pre(
-            # post, comb, y = mhc_pre_torch(
                 residual=x,
                 fn=hc_fn,
                 hc_scale=hc_scale,
@@ -763,10 +765,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post, mhc_post_torch
+            from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
-            # return mhc_post_torch(x, residual, post, comb)
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -866,7 +867,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        dsv4_2604_submode = getattr(envs, "SGLANG_DSV4_2604_SUBMODE", None)
+        if dsv4_2604_submode is not None and dsv4_2604_submode.get() == "2604B":
             # assert deepseek_v4_moe_code_path_checker.observed == 1
             deepseek_v4_moe_code_path_checker.observed = 0
 

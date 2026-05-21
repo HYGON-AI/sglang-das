@@ -357,7 +357,8 @@ def hadamard_transform_optimized(x, scale=1.0):
     return out[..., :dim].reshape(*x_shape)
 
 def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
+    # DSV4 compressor kernels may return a non-bf16 staging dtype on DCU.
+    # The older working dpskv4 branch intentionally allowed this path.
     # from sgl_kernel import hadamard_transform
     # if _is_hip:
     #     from fast_hadamard_transform import hadamard_transform

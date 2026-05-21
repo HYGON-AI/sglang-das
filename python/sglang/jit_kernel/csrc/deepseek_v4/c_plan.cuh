@@ -304,7 +304,9 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
   }
 
   if (!plan_w.is_invalid()) {  // 1. in bound. 2. not masked
-    const auto [ragged_id, batch_id] = unpack_w(plan_w);
+    const auto packed_w = unpack_w(plan_w);
+    const auto ragged_id = packed_w.x;
+    const auto batch_id = packed_w.y;
     const auto rid = params.rid_ptr[batch_id];
     const auto mapping = params.r2t_ptr + rid * params.stride_r2t;
     // `seq_len` (`write_loc`) may not be aligned here
@@ -379,7 +381,9 @@ __global__ void plan_compress_prefill_legacy_kernel(const Prefill1ParamsLegacy p
   }
 
   if (!plan_w.is_invalid()) {
-    const auto [ragged_id, batch_id] = unpack_w(plan_w);
+    const auto packed_w = unpack_w(plan_w);
+    const auto ragged_id = packed_w.x;
+    const auto batch_id = packed_w.y;
     const auto rid = static_cast<int32_t>(params.rid_ptr[batch_id]);
     // `write_loc` carries (position + 1) at this stage; may not be ratio-aligned
     const auto position = static_cast<int32_t>(plan_w.write_loc) - 1;

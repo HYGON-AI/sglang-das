@@ -380,7 +380,13 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
+            dg_paged_mqa_chunk_size = getattr(
+                envs, "SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE", None
+            )
+            if (
+                dg_paged_mqa_chunk_size is not None
+                and dg_paged_mqa_chunk_size.get() != -1
+            ):
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
                     fp8_paged_mqa_logits_chunked as fn,
                 )
@@ -431,7 +437,11 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and torch.version.hip is None
+            and raw_indices is None
+        ):
             topk_transform_512_v2(
                 logits,
                 indexer_metadata.c4_seq_lens,
