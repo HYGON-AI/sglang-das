@@ -69,6 +69,121 @@ if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
 
+def resolve_wan_attention_type(
+    config_attention_type: str, attention_backend: str | None
+) -> str:
+    if config_attention_type != "original" or attention_backend is None:
+        return config_attention_type
+
+    backend = attention_backend.lower()
+    if backend == "sla_attn":
+        return "sla"
+    if backend == "sage_sla_attn":
+        return "sagesla"
+    return config_attention_type
+
+
+def _get_attention_backend_config_value(
+    attention_backend_config: Any | None, keys: tuple[str, ...]
+) -> Any | None:
+    if not attention_backend_config:
+        return None
+
+    for key in keys:
+        try:
+            if key in attention_backend_config:
+                return attention_backend_config[key]
+        except TypeError:
+            pass
+        if hasattr(attention_backend_config, key):
+            return getattr(attention_backend_config, key)
+    return None
+
+
+def resolve_wan_sla_topk(
+    config_sla_topk: float,
+    attention_type: str,
+    attention_backend_config: Any | None,
+) -> float:
+    if attention_type not in ("sla", "sagesla"):
+        return config_sla_topk
+
+    raw_topk = _get_attention_backend_config_value(
+        attention_backend_config, ("sla_topk", "topk")
+    )
+    if raw_topk is None:
+        return config_sla_topk
+
+    try:
+        sla_topk = float(raw_topk)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"sla_topk must be a float in (0, 1], got {raw_topk!r}") from err
+
+    if not 0 < sla_topk <= 1:
+        raise ValueError(f"sla_topk must be in (0, 1], got {sla_topk}")
+    return sla_topk
+
+
+def resolve_wan_sla_local_blocks(
+    config_sla_local_blocks: int,
+    attention_type: str,
+    attention_backend_config: Any | None,
+) -> int:
+    if attention_type not in ("sla", "sagesla"):
+        return config_sla_local_blocks
+
+    raw_local_blocks = _get_attention_backend_config_value(
+        attention_backend_config, ("sla_local_blocks", "local_blocks")
+    )
+    if raw_local_blocks is None:
+        return config_sla_local_blocks
+
+    try:
+        sla_local_blocks = int(raw_local_blocks)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"sla_local_blocks must be a non-negative integer, got {raw_local_blocks!r}"
+        ) from err
+
+    if sla_local_blocks < 0:
+        raise ValueError(
+            f"sla_local_blocks must be a non-negative integer, got {sla_local_blocks}"
+        )
+    return sla_local_blocks
+
+
+def resolve_wan_sla_skip_linear(
+    config_sla_skip_linear: bool,
+    attention_type: str,
+    attention_backend_config: Any | None,
+) -> bool:
+    if attention_type not in ("sla", "sagesla"):
+        return config_sla_skip_linear
+
+    raw_skip_linear = _get_attention_backend_config_value(
+        attention_backend_config,
+        ("sla_skip_linear", "skip_linear_branch", "skip_linear"),
+    )
+    if raw_skip_linear is None:
+        return config_sla_skip_linear
+
+    if isinstance(raw_skip_linear, bool):
+        return raw_skip_linear
+    if isinstance(raw_skip_linear, int):
+        if raw_skip_linear in (0, 1):
+            return bool(raw_skip_linear)
+    if isinstance(raw_skip_linear, str):
+        normalized = raw_skip_linear.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+
+    raise ValueError(
+        f"sla_skip_linear must be a boolean, got {raw_skip_linear!r}"
+    )
+
+
 class WanImageEmbedding(torch.nn.Module):
 
     def __init__(self, in_features: int, out_features: int):
@@ -349,6 +464,8 @@ class WanTransformerBlock(nn.Module):
         prefix: str = "",
         attention_type: str = "original",
         sla_topk: float = 0.1,
+        sla_local_blocks: int = 0,
+        sla_skip_linear_branch: bool = True,
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
@@ -403,6 +520,8 @@ class WanTransformerBlock(nn.Module):
                 head_size=dim // num_heads,
                 attention_type=attention_type,
                 topk=sla_topk,
+                local_blocks=sla_local_blocks,
+                skip_linear_branch=sla_skip_linear_branch,
                 supported_attention_backends={
                     AttentionBackendEnum.SLA_ATTN,
                     AttentionBackendEnum.SAGE_SLA_ATTN,
@@ -897,7 +1016,37 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 3. Transformer blocks
-        attn_backend = get_global_server_args().attention_backend
+        server_args = get_global_server_args()
+        attn_backend = server_args.attention_backend
+        attention_type = resolve_wan_attention_type(config.attention_type, attn_backend)
+        if attention_type != config.attention_type:
+            logger.info(
+                "Using Wan attention_type=%s for attention_backend=%s",
+                attention_type,
+                attn_backend,
+            )
+        sla_topk = resolve_wan_sla_topk(
+            config.sla_topk, attention_type, server_args.attention_backend_config
+        )
+        if sla_topk != config.sla_topk:
+            logger.info("Using Wan sla_topk=%s from attention_backend_config", sla_topk)
+        sla_local_blocks = resolve_wan_sla_local_blocks(
+            getattr(config, "sla_local_blocks", 0),
+            attention_type,
+            server_args.attention_backend_config,
+        )
+        if sla_local_blocks:
+            logger.info(
+                "Using Wan sla_local_blocks=%s from attention_backend_config",
+                sla_local_blocks,
+            )
+        sla_skip_linear_branch = resolve_wan_sla_skip_linear(
+            getattr(config, "sla_skip_linear_branch", True),
+            attention_type,
+            server_args.attention_backend_config,
+        )
+        if attention_type in ("sla", "sagesla"):
+            logger.info("Using Wan sla_skip_linear=%s", sla_skip_linear_branch)
         transformer_block = (
             WanTransformerBlock_VSA
             if (attn_backend and attn_backend.lower() == "video_sparse_attn")
@@ -916,8 +1065,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"blocks.{i}",
-                    attention_type=config.attention_type,
-                    sla_topk=config.sla_topk,
+                    attention_type=attention_type,
+                    sla_topk=sla_topk,
+                    sla_local_blocks=sla_local_blocks,
+                    sla_skip_linear_branch=sla_skip_linear_branch,
                     quant_config=quant_config,
                 )
                 for i in range(config.num_layers)

@@ -49,6 +49,7 @@ _QUANTIZED_DTYPES = (
     torch.int8,
 )
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
+SYNTHESIZED_ZERO_INIT_PARAM_PATTERNS = ("local_attn.proj_l.",)
 
 
 def _format_dtype_mismatch_summary(
@@ -63,6 +64,21 @@ def _format_dtype_mismatch_summary(
             part += f" (e.g. {', '.join(examples)})"
         parts.append(part)
     return "; ".join(parts)
+
+
+def _resolve_missing_param_init(
+    param_name: str, actual_param: torch.nn.Parameter | None
+) -> str | None:
+    missing_param_init = (
+        getattr(actual_param, "missing_param_init", None)
+        if actual_param is not None
+        else None
+    )
+    if missing_param_init is None and any(
+        pattern in param_name for pattern in SYNTHESIZED_ZERO_INIT_PARAM_PATTERNS
+    ):
+        return "zeros"
+    return missing_param_init
 
 
 def _make_param_like(
@@ -620,11 +636,7 @@ def load_model_from_full_model_state_dict(
         meta_sharded_param = meta_sd.get(new_param_name)
         meta_sharded_param_dtype = meta_sharded_param.dtype
         actual_param = param_dict.get(new_param_name)
-        missing_param_init = (
-            getattr(actual_param, "missing_param_init", None)
-            if actual_param is not None
-            else None
-        )
+        missing_param_init = _resolve_missing_param_init(new_param_name, actual_param)
 
         if missing_param_init is None and not any(
             pattern in new_param_name for pattern in LEGACY_ALLOWED_NEW_PARAM_PATTERNS

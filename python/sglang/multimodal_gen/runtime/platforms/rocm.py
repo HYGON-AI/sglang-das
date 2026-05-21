@@ -128,6 +128,16 @@ class RocmPlatform(Platform):
                     dtype,
                 )
 
+        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.warning(
+                    "ROCm SLA backend works best with bf16/fp16 inputs but got dtype=%s. "
+                    "Proceeding with SLA anyway.",
+                    dtype,
+                )
+            logger.info("Using ROCm sparse linear attention backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn.RocmSparseLinearAttentionBackend"
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,

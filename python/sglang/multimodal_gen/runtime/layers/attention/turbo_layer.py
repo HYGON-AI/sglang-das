@@ -12,11 +12,15 @@ from torch.nn import Module
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn import (
+    RocmSparseLinearAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn import (
     SageSparseLinearAttentionBackend,
     SparseLinearAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
@@ -233,6 +237,8 @@ class MinimalA2AAttnOp(DistributedAttention):
         head_size: int,
         attention_type: str,
         topk: float,
+        local_blocks: int = 0,
+        skip_linear_branch: bool = True,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
     ):
@@ -242,6 +248,7 @@ class MinimalA2AAttnOp(DistributedAttention):
         )
         # Maintained for compatibility purposes; can be removed when CI allows setting Attention_backend or when TurboWan supports FA.
         if attn_backend not in (
+            RocmSparseLinearAttentionBackend,
             SparseLinearAttentionBackend,
             SageSparseLinearAttentionBackend,
         ):
@@ -257,6 +264,8 @@ class MinimalA2AAttnOp(DistributedAttention):
             num_heads=num_heads,
             head_size=head_size,
             topk_ratio=topk,
+            local_blocks=local_blocks,
+            skip_linear_branch=skip_linear_branch,
             prefix=f"{prefix}.impl",
         )
         super(MinimalA2AAttnOp, self).__init__(local_attn)
@@ -265,10 +274,41 @@ class MinimalA2AAttnOp(DistributedAttention):
         del ranks
         super().set_context_parallel_group(process_group, stream)
 
+    def _maybe_bind_sequence_parallel_group(
+        self, query: Tensor, sequence_shard_enabled: bool
+    ) -> None:
+        if self.pg is not None or not sequence_shard_enabled:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        try:
+            sp_group = get_sp_group()
+            process_group = getattr(sp_group, "ulysses_group", None)
+            world_size = getattr(sp_group, "ulysses_world_size", None)
+            if world_size is None and process_group is not None:
+                world_size = dist.get_world_size(process_group)
+        except Exception:
+            logger.debug("Unable to bind SLA attention to sequence parallel group.")
+            return
+
+        if process_group is None or world_size is None or world_size < 2:
+            return
+
+        stream = self.stream
+        if stream is None and query.is_cuda:
+            stream = torch.cuda.Stream(device=query.device)
+        self.set_context_parallel_group(process_group, None, stream)
+
     def forward(
         self, query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs
     ) -> Tensor:
         forward_context: ForwardContext = get_forward_context()
+        forward_batch = getattr(forward_context, "forward_batch", None)
+        sequence_shard_enabled = bool(
+            getattr(forward_batch, "enable_sequence_shard", False)
+        )
+        self._maybe_bind_sequence_parallel_group(query, sequence_shard_enabled)
         ctx_attn_metadata = forward_context.attn_metadata
         results = super().forward(query, key, value, ctx_attn_metadata)
         return rearrange(results, "b ... h l -> b ... (h l)")
