@@ -50,6 +50,16 @@ from sglang.srt.utils import is_dcu
 _is_dcu = is_dcu()
 
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+_use_aiter_w16a16_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
+if _use_aiter_w16a16_moe :
+    import aiter
+    from aiter.moe import (
+        get_aiter_moe_config,
+        aiter_moe,
+        MoeSolutionType,
+        MoeQuantType,
+            )
+
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
@@ -323,7 +333,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
-        if (_is_dcu and _use_marlin_w16a16_moe
+        if (_is_dcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe
             and not self.use_deepep
             and not getattr(layer, "use_nn_moe", False)
             and not getattr(layer, "_marlin_w16a16_moe_packed", False)):
@@ -401,7 +411,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     # If packing dependencies are unavailable, fall back to the
                     # standard (non-Marlin) layouts.
                     pass
-
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
@@ -507,7 +516,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-
+        topk_output = dispatch_output.topk_output
         moe_runner_config = self.moe_runner_config
 
         backend = self.runner.runner_backend
@@ -604,7 +613,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     expert_mask=layer.expert_mask_gpu,
                 )
                 return StandardCombineInput(hidden_states=output)
-            elif _is_dcu and _use_marlin_w16a16_moe:
+            elif _is_dcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe:
                     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe_w16a16
                     K = x.size(1)
 
@@ -646,6 +655,98 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                             inplace=True,
                         )
                         return StandardCombineInput(hidden_states=output)
+            elif _is_dcu and _use_aiter_w16a16_moe and not _use_marlin_w16a16_moe:
+                w1 = layer.w13_weight[0] if isinstance(layer.w13_weight, tuple) else layer.w13_weight
+                w2 = layer.w2_weight[0] if isinstance(layer.w2_weight, tuple) else layer.w2_weight
+                topk_weights, topk_ids, _ = topk_output
+                if moe_runner_config.apply_router_weight_on_input:
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be (num_tokens, topk)"
+                    _, tk = topk_weights.shape
+                    assert (
+                        tk == 1
+                    ), "DCU AITER W16A16 path: apply_router_weight_on_input requires topk=1"
+                    x = x * topk_weights.to(x.dtype)
+                    topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
+
+                if x.dim() != 2:
+                    raise RuntimeError(
+                        f"AITER W16A16 MoE expects 2D hidden_states, got shape={tuple(x.shape)}"
+                    )
+                if w1.dim() != 3 or w2.dim() != 3:
+                    raise RuntimeError(
+                        "AITER W16A16 MoE expects 3D expert weights, "
+                        f"got w1.shape={tuple(w1.shape)}, w2.shape={tuple(w2.shape)}"
+                    )
+
+                M, K = x.shape
+                E = self.moe_runner_config.num_experts
+                if w1.shape[0] != E or w2.shape[0] != E:
+                    raise RuntimeError(
+                        "AITER W16A16 MoE expert count mismatch: "
+                        f"E={E}, w1.shape={tuple(w1.shape)}, w2.shape={tuple(w2.shape)}"
+                    )
+                if w1.shape[2] != K or w2.shape[1] != K:
+                    raise RuntimeError(
+                        "AITER W16A16 MoE K dimension mismatch: "
+                        f"K={K}, w1.shape={tuple(w1.shape)}, w2.shape={tuple(w2.shape)}"
+                    )
+
+                top_k = topk_ids.shape[1]
+                N1 = w1.shape[1]
+                N2 = w2.shape[2]
+                activation = "silu" if moe_runner_config.activation == "silu" else "gelu"
+                routed_scaling_factor = (
+                    1.0
+                    if moe_runner_config.routed_scaling_factor is None
+                    else moe_runner_config.routed_scaling_factor
+                )
+
+                status, moe_cfg = get_aiter_moe_config(
+                    M=M,
+                    E=E,
+                    N1=N1,
+                    N2=N2,
+                    K=K,
+                    top_k=top_k,
+                    block_size=0,
+                    dtype=x.dtype,
+                    quant_type=MoeQuantType.W16A16,
+                )
+                if not status:
+                    raise RuntimeError(
+                        "[aiter_moe_w16a16] no suitable backend found: "
+                        f"M={M}, N1={N1}, N2={N2}, K={K}, E={E}, topk={top_k}"
+                    )
+                if moe_cfg.solution_type not in {
+                    MoeSolutionType.ASM,
+                    MoeSolutionType.TRITON,
+                    MoeSolutionType.CK,
+                }:
+                    raise RuntimeError(
+                        f"Unsupported solution_type: {moe_cfg.solution_type}"
+                    )
+                if moe_cfg.quant_type != MoeQuantType.W16A16:
+                    raise RuntimeError(f"Unexpected quant_type: {moe_cfg.quant_type}")
+
+                output = aiter_moe(
+                    hidden_states=x,
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    moe_config=moe_cfg,
+                    inplace=True,
+                    w1_scale=None,
+                    w2_scale=None,
+                    activation=activation,
+                    block_shape=None,
+                    global_num_experts=E,
+                    routed_scaling_factor=routed_scaling_factor,
+                )
+                return StandardCombineInput(hidden_states=output)
+
             else:
                 quant_info = TritonMoeQuantInfo(
                     w13_weight=layer.w13_weight,
