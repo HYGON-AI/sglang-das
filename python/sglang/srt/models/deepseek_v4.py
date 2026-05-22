@@ -80,8 +80,19 @@ from sglang.srt.utils import (
     add_prefix,
     log_info_on_rank0,
     make_layers,
+    is_dcu, 
+    get_bool_env_var
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_dcu = is_dcu()
+_use_dpskv4_lightop_rmsnorm = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM")
+_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
+
+if _is_dcu:
+    from lightop import op
+    if _use_aiter_tilelang_mhc:
+        from aiter.ops.tilelang import mhc_post_fwd, mhc_pre_big_fuse
 
 logger = logging.getLogger(__name__)
 
@@ -694,25 +705,39 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre
+            if _is_dcu and _use_aiter_tilelang_mhc:
+                post, comb, y = mhc_pre_big_fuse(
+                    residual=x,
+                    fn=hc_fn,
+                    mhc_scale=hc_scale,
+                    mhc_base=hc_base,
+                    rms_eps=self.rms_norm_eps,
+                    mhc_pre_eps=self.hc_eps,
+                    mhc_sinkhorn_eps=self.hc_eps,
+                    mhc_post_mult_value=2.0,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                    n_splits=16,
+                )
+            else:
+                from sglang.srt.layers.mhc import mhc_pre
 
-            norm_kwargs = {}
-            if norm is not None:
-                norm_kwargs["norm_weight"] = norm.weight.data
-                norm_kwargs["norm_eps"] = norm.variance_epsilon
+                norm_kwargs = {}
+                if norm is not None:
+                    norm_kwargs["norm_weight"] = norm.weight.data
+                    norm_kwargs["norm_eps"] = norm.variance_epsilon
 
-            post, comb, y = mhc_pre(
-                residual=x,
-                fn=hc_fn,
-                hc_scale=hc_scale,
-                hc_base=hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=2.0,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-                **norm_kwargs,
-            )
+                post, comb, y = mhc_pre(
+                    residual=x,
+                    fn=hc_fn,
+                    hc_scale=hc_scale,
+                    hc_base=hc_base,
+                    rms_eps=self.rms_norm_eps,
+                    hc_pre_eps=self.hc_eps,
+                    hc_sinkhorn_eps=self.hc_eps,
+                    hc_post_mult_value=2.0,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                    **norm_kwargs,
+                )
             return y, post.squeeze(-1), comb, norm is not None
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
@@ -760,9 +785,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
-
-            return mhc_post(x, residual, post, comb)
+            if _is_dcu and _use_aiter_tilelang_mhc:
+                out = mhc_post_fwd(
+                    x.unsqueeze(0), # [n0, n1, h]
+                    residual.unsqueeze(0), # [n0, n1, mhc_mult, h]
+                    post.unsqueeze(0).unsqueeze(-1), # [n0, n1, mhc_mult, 1]
+                    comb.unsqueeze(0), # [n0, n1, mhc_mult, mhc_mult]
+                )
+                return out.squeeze(0)
+            else:
+                from sglang.srt.layers.mhc import mhc_post
+                return mhc_post(x, residual, post, comb)
+                # return mhc_post_torch(x, residual, post, comb)
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)

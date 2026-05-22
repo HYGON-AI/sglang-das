@@ -373,6 +373,7 @@ class Envs:
     SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = EnvBool(False)
+    SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
