@@ -1593,10 +1593,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
-        if os.environ.get("SGLANG_DSV4_CHANNEL_FP8_SCALE", "0") == "1":
-            skipped_checking_patterns.extend(
-                ["mlp.experts.w13_weight_scale", "mlp.experts.w2_weight_scale"]
-            )
         if not self.pp_group.is_first_rank:
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:
