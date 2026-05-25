@@ -721,13 +721,19 @@ class DeepEPMoE(FusedMoE):
 
         M, K = hidden_states.size()
         N = self.w13_weight.size(1)
+        # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
+        # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
         w13_weight_fp8 = (
-            self.w13_weight,
-            (self.w13_weight_scale),
+            self.w13_weight_deepgemm,
+            # self.w13_weight,
+            self.w13_weight_scale,
         )
+
         w2_weight_fp8 = (
-            self.w2_weight,
-            (self.w2_weight_scale),
+            self.w2_weight_deepgemm,
+            # self.w2_weight,
+            self.w2_weight_scale,
         )
 
         hidden_states_shape = hidden_states.shape
@@ -777,26 +783,11 @@ class DeepEPMoE(FusedMoE):
         )
 
         gateup_output = torch.zeros(
-            (all_tokens, N * 16),
+            (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
 
-        if '0' in str(hidden_states_device):
-            logger.info(
-                'DeepEPMoE forward ---> %s - input_tensor[0] shape: %s, dtype: %s\n'
-                'DeepEPMoE forward ---> %s - input_tensor[1] shape: %s, dtype: %s\n'
-                'DeepEPMoE forward ---> %s - w13_weight_fp8[0] shape: %s, dtype: %s\n'
-                'DeepEPMoE forward ---> %s - w13_weight_fp8[1] shape: %s, dtype: %s\n'
-                'DeepEPMoE forward ---> %s - gateup_output shape: %s, dtype: %s\n'
-                'DeepEPMoE forward ---> %s - m_indices shape: %s, dtype: %s',
-                hidden_states_device, input_tensor[0].shape, input_tensor[0].dtype,
-                hidden_states_device, input_tensor[1].shape, input_tensor[1].dtype,
-                hidden_states_device, w13_weight_fp8[0].shape, w13_weight_fp8[0].dtype,
-                hidden_states_device, w13_weight_fp8[1].shape, w13_weight_fp8[1].dtype,
-                hidden_states_device, gateup_output.shape, gateup_output.dtype,
-                hidden_states_device, m_indices.shape, m_indices.dtype,
-            )
         m_grouped_fp8_gemm_nt_contiguous(
             input_tensor,
             w13_weight_fp8,
@@ -1339,16 +1330,23 @@ class DeepEPMoE(FusedMoE):
         num_groups, m, k = hidden_states.size()
         expected_m = min(m, expected_m)
 
+        # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
+        # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
+        
         # ---- weights & scales ----
-        w13_weight = self.w13_weight
+        # w13_weight = self.w13_weight
+        w13_weight = self.w13_weight_deepgemm
         w13_scales = self.w13_weight_scale
-        w2_weight = self.w2_weight
+        # w2_weight = self.w2_weight
+        w2_weight = self.w2_weight_deepgemm
         w2_scales = self.w2_weight_scale
 
         n1 = w13_scales.size(1)
         gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
-        # ---- first GEMM ----
-        m_grouped_fp8_gemm_nt_masked(
+
+        from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+        m_grouped_fp8_gemm_nt_masked_ll(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -1372,7 +1370,7 @@ class DeepEPMoE(FusedMoE):
         if enable_overlap:
             down_gemm_overlap_args.start_event.record()
 
-        m_grouped_fp8_gemm_nt_masked(
+        m_grouped_fp8_gemm_nt_masked_ll(
             (q_a2_all, q_a2_scale),
             (w2_weight, w2_scales),
             down_output,
