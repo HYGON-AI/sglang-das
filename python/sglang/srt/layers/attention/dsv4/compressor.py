@@ -16,7 +16,7 @@ from sglang.jit_kernel.deepseek_v4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
+    quant_to_nope_fp8_rope_bf16_pack_triton, quant_to_nope_fp8_rope_bf16_pack_lightop
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
@@ -27,6 +27,11 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils import get_bool_env_var, is_dcu
+_is_dcu = is_dcu()
+_use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
+if _is_dcu:
+    from lightop import op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -138,7 +143,10 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+            if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
+                pack = quant_to_nope_fp8_rope_bf16_pack_lightop(new_compressed_kv.bfloat16(), 1e-8)
+            else:
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(

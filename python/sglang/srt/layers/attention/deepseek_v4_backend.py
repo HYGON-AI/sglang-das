@@ -58,10 +58,16 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
 )
+from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    quant_to_nope_fp8_rope_bf16_pack_triton, quant_to_nope_fp8_rope_bf16_pack_lightop
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_dcu
+
+_is_dcu = is_dcu()
+_use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -925,7 +931,10 @@ class DeepseekV4AttnBackend(
                 cache_k=swa_k,
             )
         else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+            if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
+                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_lightop(swa_k)
+            else:   
+                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
                 raw_loc=raw_loc,

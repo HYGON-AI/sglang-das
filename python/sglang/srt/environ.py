@@ -374,6 +374,8 @@ class Envs:
     SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = EnvBool(False)
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
+    SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
+    SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
     
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)

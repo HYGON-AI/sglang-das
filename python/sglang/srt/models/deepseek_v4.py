@@ -358,11 +358,28 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if q_out is None:
-            q_out = torch.empty_like(q)
-        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
+        # if q_out is None:
+        #     q_out = torch.empty_like(q)
+        # # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        # fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        # return q_out
+        if self.use_jit_norm:
+            q = rmsnorm_self(q, self.eps)
+        else:
+            if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+                op.rms_norm_no_weight(None, q, None, self.eps)
+            else:
+                q = rms_normalize_triton(q, self.eps)
+        if positions is not None:
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+        else:
+            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+        return q
 
     def _compute_kv_to_cache(
         self,
@@ -485,10 +502,23 @@ class MQALayer(nn.Module):
             qkv_a, _ = self.wqkv_a(x)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
-            q_lora, _ = self.wq_a(x)
-            qkv_a = None
-        q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
+        #     q_lora, _ = self.wq_a(x)
+        #     qkv_a = None
+        # q_lora = self.q_norm(q_lora)
+        # q = self._compute_q_b(q_lora, positions, q_out)
+            kv, _ = self.wkv(x)
+            q, _ = self.wq_a(x)
+        q = self.q_norm(q)
+        q_lora = q
+        q, _ = self.wq_b(q)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.use_jit_norm:
+            q = rmsnorm_self(q, self.eps)
+        else:
+            if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+                op.rms_norm_no_weight(None, q, None, self.eps)
+            else:
+                q = rms_normalize_triton(q, self.eps)
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
