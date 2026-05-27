@@ -376,6 +376,7 @@ class Envs:
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
+    SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
