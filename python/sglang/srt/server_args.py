@@ -205,6 +205,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "lightop",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -3158,6 +3159,16 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "lightop":
+            assert is_dcu(), "lightop MoE runner backend is only supported on DCU."
+            assert (
+                self.quantization == "w8a8_int8"
+            ), "lightop MoE runner backend currently supports only w8a8_int8 quantization."
+            assert self.moe_a2a_backend == "none", (
+                "lightop MoE runner backend currently supports only "
+                "moe_a2a_backend='none'."
             )
 
         if envs.SGLANG_CUTLASS_MOE.get():
