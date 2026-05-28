@@ -29,7 +29,13 @@ class TestDCUStageBFlowZero(CustomTestCase):
 
         import sglang
 
-        self.assertIn("/sglang-checkout/python/sglang", os.path.realpath(sglang.__file__))
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        checkout_python = pythonpath.split(os.pathsep)[0]
+        self.assertTrue(checkout_python, "PYTHONPATH must prefer the checkout")
+        self.assertIn(
+            os.path.join(os.path.realpath(checkout_python), "sglang"),
+            os.path.realpath(sglang.__file__),
+        )
 
 
 if __name__ == "__main__":

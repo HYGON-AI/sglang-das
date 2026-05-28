@@ -39,13 +39,18 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 
 
 def _load_ci_register():
+    module_name = "sglang.test.ci.ci_register"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
     path = os.path.join(
         REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
     )
-    spec = importlib.util.spec_from_file_location("run_suite_ci_register", path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load ci_register from {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
