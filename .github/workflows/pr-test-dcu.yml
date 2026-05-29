@@ -252,6 +252,8 @@ jobs:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_a
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
     steps:
       - name: Checkout code
@@ -280,6 +282,9 @@ jobs:
         if: always()
         run: |
           if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
+            host_uid="$(id -u)"
+            host_gid="$(id -g)"
+            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
             docker rm -f "${DCU_CI_CONTAINER_NAME}"
           fi
 
@@ -301,6 +306,8 @@ jobs:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
     steps:
       - name: Checkout code
@@ -333,6 +340,9 @@ jobs:
         if: always()
         run: |
           if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
+            host_uid="$(id -u)"
+            host_gid="$(id -g)"
+            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
             docker rm -f "${DCU_CI_CONTAINER_NAME}"
           fi
 

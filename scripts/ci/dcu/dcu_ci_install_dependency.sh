@@ -13,10 +13,29 @@ set -euo pipefail
 #   3. install sglang in editable mode against the checkout
 
 CONTAINER="${DCU_CI_CONTAINER:-${DCU_CI_CONTAINER_NAME:-ci_sglang}}"
+SKIP_DEPENDENCY_INSTALL="${DCU_CI_SKIP_DEPENDENCY_INSTALL:-0}"
+SKIP_REQUIREMENTS_INSTALL="${DCU_CI_SKIP_REQUIREMENTS_INSTALL:-0}"
 SKIP_SGLANG_BUILD="${DCU_CI_SKIP_SGLANG_BUILD:-0}"
 
 run_in_container() {
   docker exec "${CONTAINER}" bash -c "$*"
+}
+
+print_python_status() {
+  echo "[dcu-ci] Python dependency status:"
+  docker exec -i "${CONTAINER}" python - <<'PY_STATUS' || true
+import importlib
+import sys
+
+print(f"python {sys.version.split()[0]}")
+for name in ["sglang", "torch", "pytest", "tabulate", "sgl_kernel"]:
+    try:
+        module = importlib.import_module(name)
+        version = getattr(module, "__version__", "unknown")
+        print(f"{name}: OK ({version})")
+    except Exception as exc:
+        print(f"{name}: MISSING ({type(exc).__name__}: {exc})")
+PY_STATUS
 }
 
 install_with_retry() {
@@ -36,6 +55,12 @@ install_with_retry() {
   done
 }
 
+if [[ "${SKIP_DEPENDENCY_INSTALL}" == "1" || "${SKIP_DEPENDENCY_INSTALL}" == "true" ]]; then
+  echo "[dcu-ci] DCU_CI_SKIP_DEPENDENCY_INSTALL=${SKIP_DEPENDENCY_INSTALL}; skipping all dependency installation"
+  print_python_status
+  exit 0
+fi
+
 if [[ "${SKIP_SGLANG_BUILD}" == "1" || "${SKIP_SGLANG_BUILD}" == "true" ]]; then
   echo "[dcu-ci] DCU_CI_SKIP_SGLANG_BUILD=${SKIP_SGLANG_BUILD}; keeping image-installed sglang packages"
 else
@@ -49,7 +74,9 @@ echo "[dcu-ci] Clearing python cache under /sglang-checkout"
 run_in_container "find /sglang-checkout -name '*.pyc' -delete || true"
 run_in_container "find /sglang-checkout -name '__pycache__' -type d -exec rm -rf {} + || true"
 
-if docker exec "${CONTAINER}" test -f /sglang-checkout/requirements_dcu.txt; then
+if [[ "${SKIP_REQUIREMENTS_INSTALL}" == "1" || "${SKIP_REQUIREMENTS_INSTALL}" == "true" ]]; then
+  echo "[dcu-ci] DCU_CI_SKIP_REQUIREMENTS_INSTALL=${SKIP_REQUIREMENTS_INSTALL}; skipping requirements_dcu.txt"
+elif docker exec "${CONTAINER}" test -f /sglang-checkout/requirements_dcu.txt; then
   echo "[dcu-ci] Installing requirements_dcu.txt"
   install_with_retry docker exec "${CONTAINER}" \
     pip install --cache-dir=/sgl-data/pip-cache -r /sglang-checkout/requirements_dcu.txt
@@ -71,3 +98,4 @@ fi
 
 echo "[dcu-ci] Installed sglang version:"
 run_in_container "python -c 'import sglang, sys; print(sglang.__version__); sys.exit(0)' || true"
+print_python_status
