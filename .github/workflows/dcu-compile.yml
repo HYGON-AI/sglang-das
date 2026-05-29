@@ -1,0 +1,209 @@
+# =============================================================================
+# DCU (ROCm/HIP) 编译 & 打包 CI
+# =============================================================================
+#
+# 触发条件:
+#   push / pull_request: 仅当 python/, sgl-kernel/, sgl-model-gateway/,
+#                        requirements_dcu.txt 或本文件变更时触发
+#   workflow_dispatch:   手动触发，可指定 PyTorch 版本和跳过 gateway
+#
+# 增量编译策略:
+#   通过 dorny/paths-filter 检测变更路径，只编译有变化的组件:
+#     - python/** 变更          → 只编 sglang
+#     - sgl-kernel/** 变更      → 只编 sgl-kernel
+#     - sgl-model-gateway/**    → 只编 gateway
+#     - requirements_dcu.txt    → 编 sglang + sgl-kernel
+#     - workflow_dispatch       → 全量编译
+#
+# 产物:
+#   每个 Python 版本独立上传 artifact: dcu-wheels-py3.10 / py3.11 / py3.12
+#
+# Runner:
+#   使用自托管 dcu-runner，预装 ROCm/HIP 工具链和 GPU
+# =============================================================================
+
+name: DCU Compile
+
+on:
+  # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
+  push:
+    branches:
+      - main
+    paths:
+      - 'python/**'
+      - 'sgl-kernel/**'
+      - 'sgl-model-gateway/**'
+      - 'requirements_dcu.txt'
+      - '.github/workflows/dcu-compile.yml'
+
+  # ---- PR 时触发（同样限定路径） ----
+  pull_request:
+    paths:
+      - 'python/**'
+      - 'sgl-kernel/**'
+      - 'sgl-model-gateway/**'
+      - 'requirements_dcu.txt'
+      - '.github/workflows/dcu-compile.yml'
+
+  # ---- 手动触发，可传参 ----
+  workflow_dispatch:
+    inputs:
+      torch_version:
+        description: 'PyTorch version to install'
+        required: false
+        default: '2.5.1'
+        type: string
+      skip_gateway:
+        description: 'Skip sgl-model-gateway build'
+        required: false
+        default: false
+        type: boolean
+
+# ---- 并发控制: 同一分支 + 同一事件 + 同一 Python 版本的 job 只保留最新一个 ----
+concurrency:
+  group: dcu-compile-${{ github.ref }}-${{ github.event_name }}-py${{ matrix.python-version }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    # ---- 自托管 DCU runner（预装 ROCm/HIP + GPU） ----
+    runs-on: dcu-runner
+    timeout-minutes: 180
+
+    # ---- Matrix: 3 个 Python 版本并行编译 ----
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    env:
+      TORCH_VERSION: ${{ inputs.torch_version || '2.5.1' }}
+      SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
+
+    steps:
+      # =======================================================================
+      # 环境准备
+      # =======================================================================
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system deps
+        run: |
+          pip install --upgrade pip setuptools wheel build
+
+      # 注意: 以下包依赖 DCU 环境的特殊构建版本
+      - name: Install runtime dependencies
+        run: |
+          pip install amdsmi
+          pip install cupy
+          # DCU 定制的 gemm/moe 算子包，--no-deps 避免拉错上游依赖
+          pip install grouped_gemm==0.5.0 grouped_gemm_int4==0.5.0 \
+            moe_w8a8==0.0.1 moe_w8a8_prefill_gemm==0.0.1 --no-deps
+          pip install torch==${TORCH_VERSION} triton flash_attn torchvision \
+            lmslim flash_mla lightop vllm
+          pip install -r requirements_dcu.txt
+
+      - name: Setup protoc
+        run: |
+          wget -q https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-x86_64.zip
+          unzip -o protoc-24.4-linux-x86_64.zip -d /usr/local/
+          chmod +x /usr/local/bin/protoc
+          ln -sf /usr/local/bin/protoc /usr/bin/protoc
+
+      # =======================================================================
+      # 路径检测: 决定哪些组件需要编译
+      # =======================================================================
+
+      - name: Check changed paths
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            sgl-kernel:
+              - 'sgl-kernel/**'
+              - 'requirements_dcu.txt'
+            sglang:
+              - 'python/**'
+              - 'requirements_dcu.txt'
+            gateway:
+              - 'sgl-model-gateway/**'
+
+      # =======================================================================
+      # 编译阶段: 按检测结果增量编译
+      # workflow_dispatch 时忽略检测结果，全量编译
+      # =======================================================================
+
+      # Rust 工具链仅在需要编译 gateway 时安装
+      - name: Setup Rust
+        if: steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Build sgl-kernel (HIP)
+        if: steps.changes.outputs.sgl-kernel == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          cd sgl-kernel
+          python setup_hip.py bdist_wheel
+          echo "=== sgl-kernel wheel ==="
+          ls -lh dist/*.whl
+
+      - name: Build sglang python package
+        if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          cd python
+          python -m build --wheel --no-isolation -Cfeatures=all_hip
+          echo "=== sglang wheel ==="
+          ls -lh dist/*.whl
+
+      # gateway 额外受 SKIP_GATEWAY 环境变量控制
+      - name: Build sgl-model-gateway
+        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          cd sgl-model-gateway
+          cargo build --release
+          cd bindings/python
+          pip install maturin
+          maturin build --release
+          echo "=== sgl-model-gateway wheel ==="
+          ls -lh target/wheels/*.whl
+
+      # =======================================================================
+      # 收集 & 上传产物
+      # =======================================================================
+
+      - name: Collect wheels
+        run: |
+          mkdir -p /tmp/dcu-wheels
+          # 2>/dev/null || true: 某组件未编译时不会让整个步骤失败
+          cp sgl-kernel/dist/*.whl /tmp/dcu-wheels/ 2>/dev/null || true
+          cp python/dist/*.whl /tmp/dcu-wheels/ 2>/dev/null || true
+          cp sgl-model-gateway/bindings/python/target/wheels/*.whl /tmp/dcu-wheels/ 2>/dev/null || true
+          echo "=== All DCU wheels ==="
+          ls -lh /tmp/dcu-wheels/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          # 每个 Python 版本独立命名，避免互相覆盖
+          name: dcu-wheels-py${{ matrix.python-version }}
+          path: /tmp/dcu-wheels/*.whl
+          if-no-files-found: warn
+
+      # =======================================================================
+      # 冒烟测试: 安装 wheel 并 import 验证
+      # 仅在至少有一个组件被编译时运行
+      # =======================================================================
+
+      - name: Smoke test
+        if: steps.changes.outputs.sglang == 'true' || steps.changes.outputs.sgl-kernel == 'true' || steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          pip install /tmp/dcu-wheels/*.whl --no-deps
+          python -c "import sglang; print('sglang version:', sglang.__version__)"
+          python -c "import sgl_kernel; print('sgl_kernel imported successfully')"
