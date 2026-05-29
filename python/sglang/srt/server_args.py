@@ -3162,6 +3162,9 @@ class ServerArgs:
             )
 
         if self.moe_runner_backend == "lightop":
+            logger.warning(
+                "LightOp MoE runner is a transitional backend and may be deprecated in future releases. Please use AITER MoE runner."
+            )
             assert is_dcu(), "lightop MoE runner backend is only supported on DCU."
             assert (
                 self.quantization == "w8a8_int8"
