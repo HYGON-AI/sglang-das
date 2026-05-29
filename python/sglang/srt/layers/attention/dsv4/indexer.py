@@ -110,90 +110,51 @@ def topk_transform_512_pytorch_vectorized(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-
     TOPK = 512
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
     device = scores.device
-
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
-
-    positions = (
-        torch.arange(max_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    sequential_indices = torch.arange(TOPK, device=device, dtype=torch.int32).unsqueeze(
+        0
     )
-    valid_mask = positions < seq_lens.unsqueeze(1)
-
-    masked_scores = scores.clone()
-    masked_scores[~valid_mask] = float("-inf")
-
-    actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
-    )
-    raw_indices = raw_indices.to(torch.int32)
-
-    if actual_k < TOPK:
-        padding = torch.zeros(
-            (batch_size, TOPK - actual_k), dtype=torch.int32, device=device
-        )
-        raw_indices = torch.cat([raw_indices, padding], dim=1)
-
-    batch_indices = (
-        torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, TOPK)
-    )
-    gathered_scores = scores[
-        batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-    ].view(batch_size, TOPK)
-
-    valid_topk = gathered_scores != float("-inf")
-    if actual_k < TOPK:
-        pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
-        valid_topk = valid_topk & ~pad_mask
-
-    needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
-
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    negative_indices = torch.full_like(sequential_indices, -1)
+    if max_seq_len <= TOPK:
         raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
+            sequential_valid, sequential_indices, negative_indices
+        )
+        valid_topk = sequential_valid
+    else:
+        positions = torch.arange(max_seq_len, device=device).unsqueeze(0)
+        valid_mask = positions < seq_lens.unsqueeze(1)
+        masked_scores = scores.masked_fill(~valid_mask, float("-inf"))
+        _, raw_indices = torch.topk(
+            masked_scores, k=TOPK, dim=1, largest=True, sorted=False
+        )
+        raw_indices = raw_indices.to(torch.int32)
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+        gathered_scores = scores[batch_indices, raw_indices]
+        valid_topk = gathered_scores != float("-inf")
+        needs_sequential = (seq_lens <= TOPK).unsqueeze(1)
+        raw_indices = torch.where(
+            needs_sequential,
+            torch.where(sequential_valid, sequential_indices, negative_indices),
             raw_indices,
         )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
-
+        valid_topk = torch.where(needs_sequential, sequential_valid, valid_topk)
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
-
     page_idx_clamped = torch.clamp(page_idx, min=0)
     physical_pages = torch.gather(page_tables, dim=1, index=page_idx_clamped.long())
-
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
-
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
-
+    page_indices = torch.where(valid_topk, page_indices, negative_indices)
     out_page_indices.copy_(page_indices)
-
     if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
+        raw_indices = torch.where(valid_topk, raw_indices, negative_indices)
         out_raw_indices.copy_(raw_indices)
-
 
 @triton.jit
 def _fused_scale_kernel(

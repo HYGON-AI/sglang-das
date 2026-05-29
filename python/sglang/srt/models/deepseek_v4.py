@@ -1328,7 +1328,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
-                logger.info("Skip dequant fp8 wo_a")
+                weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -1357,11 +1357,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             return getattr(module, "weight_loader", default_weight_loader)
 
         def maybe_remap_compressed_tensors_scale_name(param_name: str) -> str:
-            if (
-                self.quant_config is None
-                or self.quant_config.get_name() != "compressed_tensors"
-            ):
-                return param_name
+            # if (
+            #     self.quant_config is None
+            #     or self.quant_config.get_name() != "compressed_tensors"
+            # ):
+            #     return param_name
 
             compressed_tensors_names = []
             if param_name.endswith(".weight_scale_inv"):
