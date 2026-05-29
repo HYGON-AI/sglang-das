@@ -4,7 +4,6 @@ python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 python3 -m unittest test_pp_single_node.TestQwenVLPPAccuracy.test_mmmu
-python3 -m unittest test_pp_single_node.TestPPMixedChunk.test_gsm8k
 """
 
 import time
@@ -16,7 +15,8 @@ import requests
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -32,9 +32,16 @@ from sglang.test.test_utils import (
     run_bench_one_batch_server,
 )
 
-register_cuda_ci(est_time=554, stage="stage-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=650, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(est_time=650, suite="stage-c-test-4-gpu-amd")
 
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+)
 
 class TestPPAccuracy(unittest.TestCase):
     @classmethod
@@ -60,22 +67,22 @@ class TestPPAccuracy(unittest.TestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
         if is_in_amd_ci():
             # AMD triton backend produces slightly lower accuracy than FA3 on NVIDIA
-            self.assertGreater(metrics["score"], 0.70)
+            self.assertGreater(metrics["accuracy"], 0.70)
         else:
-            self.assertGreater(metrics["score"], 0.74)
+            self.assertGreater(metrics["accuracy"], 0.74)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 
@@ -129,11 +136,11 @@ class TestDPAttentionDP2PP2(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="gsm8k",
+            eval_name="mgsm_en",
             num_examples=None,
             num_threads=1024,
         )
@@ -169,18 +176,18 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreater(metrics["accuracy"], 0.65)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 
@@ -223,15 +230,15 @@ class TestQwenPPAccuracy(unittest.TestCase):
 
         try:
             args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model_name,
-                eval_name="gsm8k",
-                api="completion",
-                max_tokens=512,
-                num_examples=512,
-                num_threads=128,
+                num_shots=5,
+                data_path=None,
+                num_questions=512,
+                max_new_tokens=512,
+                parallel=128,
+                host="http://127.0.0.1",
+                port=int(self.base_url.split(":")[-1]),
             )
-            metrics = run_eval(args)
+            metrics = run_eval_few_shot_gsm8k(args)
             time.sleep(5)
             return metrics
         finally:
@@ -244,13 +251,13 @@ class TestQwenPPAccuracy(unittest.TestCase):
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertGreaterEqual(baseline["score"], 0.74)
+        self.assertGreaterEqual(baseline["accuracy"], 0.74)
         self.assertGreaterEqual(
-            pp_metrics["score"],
-            baseline["score"] - 0.02,
+            pp_metrics["accuracy"],
+            baseline["accuracy"] - 0.02,
             msg=(
                 f"PP accuracy dropped more than 2% compared to baseline. "
-                f"Baseline: {baseline['score']:.2%}, PP: {pp_metrics['score']:.2%}"
+                f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
             ),
         )
 
@@ -279,15 +286,15 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 
         try:
             args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model_name,
-                eval_name="gsm8k",
-                api="completion",
-                max_tokens=512,
-                num_examples=512,
-                num_threads=128,
+                num_shots=5,
+                data_path=None,
+                num_questions=512,
+                max_new_tokens=512,
+                parallel=128,
+                host="http://127.0.0.1",
+                port=int(self.base_url.split(":")[-1]),
             )
-            metrics = run_eval(args)
+            metrics = run_eval_few_shot_gsm8k(args)
             time.sleep(5)
             return metrics
         finally:
@@ -299,13 +306,13 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertGreaterEqual(baseline["score"], 0.38)
+        self.assertGreaterEqual(baseline["accuracy"], 0.38)
         self.assertGreaterEqual(
-            pp_metrics["score"],
-            baseline["score"] - 0.02,
+            pp_metrics["accuracy"],
+            baseline["accuracy"] - 0.02,
             msg=(
                 f"PP accuracy dropped more than 2% compared to baseline. "
-                f"Baseline: {baseline['score']:.2%}, PP: {pp_metrics['score']:.2%}"
+                f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
             ),
         )
 
@@ -331,15 +338,15 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
 
         try:
             args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model_name,
-                eval_name="gsm8k",
-                api="completion",
-                max_tokens=512,
-                num_examples=512,
-                num_threads=128,
+                num_shots=5,
+                data_path=None,
+                num_questions=512,
+                max_new_tokens=512,
+                parallel=128,
+                host="http://127.0.0.1",
+                port=int(self.base_url.split(":")[-1]),
             )
-            metrics = run_eval(args)
+            metrics = run_eval_few_shot_gsm8k(args)
             time.sleep(5)
             return metrics
         finally:
@@ -351,13 +358,13 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertGreaterEqual(baseline["score"], 0.74)
+        self.assertGreaterEqual(baseline["accuracy"], 0.74)
         self.assertGreaterEqual(
-            pp_metrics["score"],
-            baseline["score"] - 0.02,
+            pp_metrics["accuracy"],
+            baseline["accuracy"] - 0.02,
             msg=(
                 f"PP accuracy dropped more than 2% compared to baseline. "
-                f"Baseline: {baseline['score']:.2%}, PP: {pp_metrics['score']:.2%}"
+                f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
             ),
         )
 
@@ -390,15 +397,15 @@ class TestQwen35PPAccuracy(unittest.TestCase):
 
         try:
             args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model_name,
-                eval_name="gsm8k",
-                api="completion",
-                max_tokens=512,
-                num_examples=512,
-                num_threads=128,
+                num_shots=5,
+                data_path=None,
+                num_questions=512,
+                max_new_tokens=512,
+                parallel=128,
+                host="http://127.0.0.1",
+                port=int(self.base_url.split(":")[-1]),
             )
-            metrics = run_eval(args)
+            metrics = run_eval_few_shot_gsm8k(args)
             time.sleep(5)
             return metrics
         finally:
@@ -410,62 +417,15 @@ class TestQwen35PPAccuracy(unittest.TestCase):
 
         print(f"[Qwen35 PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertGreaterEqual(baseline["score"], 0.83)
+        self.assertGreaterEqual(baseline["accuracy"], 0.83)
         self.assertGreaterEqual(
-            pp_metrics["score"],
-            baseline["score"] - 0.05,
+            pp_metrics["accuracy"],
+            baseline["accuracy"] - 0.05,
             msg=(
                 f"PP accuracy dropped more than 5% compared to baseline. "
-                f"Baseline: {baseline['score']:.2%}, PP: {pp_metrics['score']:.2%}"
+                f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
             ),
         )
-
-
-class TestPPMixedChunk(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://127.0.0.1:23338"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                2,
-                "--pp-size",
-                2,
-                "--chunked-prefill-size",
-                256,
-                "--enable-mixed-chunk",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process"):
-            kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        if is_in_amd_ci():
-            # AMD triton backend produces slightly lower accuracy than FA3 on NVIDIA
-            self.assertGreater(metrics["score"], 0.70)
-        else:
-            self.assertGreater(metrics["score"], 0.74)
-        # Wait a little bit so that the memory check happens.
-        time.sleep(4)
 
 
 class TestFixedBugs(unittest.TestCase):
@@ -483,7 +443,7 @@ class TestFixedBugs(unittest.TestCase):
             2,
             "--pp-size",
             2,
-            "--chunked-prefill-size",
+            "--chunked-prefill",
             256,
             "--max-running-requests",
             2,

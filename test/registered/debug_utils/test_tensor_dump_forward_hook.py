@@ -15,18 +15,23 @@ from sglang.srt.layers.linear import LinearBase
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import add_prefix
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
 register_cuda_ci(
     est_time=9,
-    stage="stage-b",
-    runner_config="1-gpu-small",
+    suite="stage-b-test-1-gpu-small",
     disabled="Test uses pytest-style function without TestCase class - see #17145",
 )
 register_amd_ci(
     est_time=15,
     suite="stage-b-test-1-gpu-small-amd",
     disabled="Test uses pytest-style function without TestCase class - see #17145",
+)
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
 )
 
 TEST_HIDDEN_SIZE = 32

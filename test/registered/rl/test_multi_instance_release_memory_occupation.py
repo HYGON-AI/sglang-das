@@ -12,7 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -20,11 +20,18 @@ from sglang.test.test_utils import (
     find_available_port,
 )
 
-register_cuda_ci(est_time=57, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=64, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(
     est_time=64,
     suite="stage-c-test-4-gpu-amd",
     disabled="torch_memory_saver incompatible with ROCm (libcuda.so.1 not found)",
+)
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU PR baseline deferred: RL runtime path needs BW1000 memory/model validation before required CI.",
 )
 
 TEST_SUITE = dict(

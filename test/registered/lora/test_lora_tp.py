@@ -17,7 +17,7 @@ import os
 import unittest
 from typing import List, Optional
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
@@ -30,9 +30,8 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(
-    est_time=230,
-    stage="stage-c",
-    runner_config="8-gpu-h200",
+    est_time=116,
+    suite="stage-b-test-2-gpu-large",
 )
 register_amd_ci(
     est_time=116,
@@ -40,6 +39,13 @@ register_amd_ci(
     disabled="see https://github.com/sgl-project/sglang/issues/13107",
 )
 
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+)
 
 class TestLoRATP(CustomTestCase):
 
@@ -66,7 +72,6 @@ class TestLoRATP(CustomTestCase):
                         max_new_tokens=32,
                         enable_lora_overlap_loading=enable_lora_overlap_loading,
                         test_tag=f"tp={tp_size}, enable_lora_overlap_loading={enable_lora_overlap_loading}",
-                        attention_backend="fa3",
                     )
 
     def test_ci_lora_models(self):

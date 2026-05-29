@@ -1,20 +1,30 @@
+import os
 import unittest
 
 import sglang as sgl
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=29, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
 
+
+# DCU BW1000 validated on 10.16.1.66/dxl-sglang: local Qwen2-VL external model path passed three runs.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+)
 
 class TestExternalModels(CustomTestCase):
     def test_external_model(self):
         envs.SGLANG_EXTERNAL_MODEL_PACKAGE.set("sglang.test.external_models")
         envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.set("sglang.test.external_models")
         prompt = "Today is a sunny day and I like"
-        model_path = "Qwen/Qwen2-VL-2B-Instruct"
+        model_path = os.environ.get(
+            "SGLANG_TEST_EXTERNAL_MODEL_NAME",
+            "/public/opendas/DL_DATA/llm-models/qwen2/Qwen2-VL-2B-Instruct",
+        )
 
         engine = sgl.Engine(
             model_path=model_path,

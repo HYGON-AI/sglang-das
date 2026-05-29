@@ -8,9 +8,8 @@ from pathlib import Path
 
 from sglang.bench_serving import run_benchmark
 from sglang.benchmark.utils import parse_custom_headers
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -21,6 +20,12 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=300, suite="nightly-amd-1-gpu", nightly=True)
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu-perf",
+    nightly=True,
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 NUM_CONVERSATIONS, NUM_TURNS = 4, 3
@@ -74,18 +79,14 @@ class TestBenchServingFunctionality(CustomTestCase):
     def _verify_multi_turn_logs(self, content: str):
         reqs = []
         for line in content.splitlines():
-            idx = line.find("{")
-            if idx == -1:
+            if not line.startswith("{"):
                 continue
-            try:
-                obj = json.loads(line[idx:])
-            except json.JSONDecodeError:
-                continue
+            obj = json.loads(line)
             if obj.get("event") != "request.finished":
                 continue
             text = obj.get("obj", {}).get("text")
             rid = obj.get("rid", "")
-            if text and not rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            if text and not rid.startswith("HEALTH_CHECK"):
                 reqs.append(text)
 
         self.assertGreaterEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)

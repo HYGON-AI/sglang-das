@@ -8,9 +8,8 @@ from pathlib import Path
 
 import requests
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -20,6 +19,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
+
+register_dcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-dcu")
 
 TEST_ROUTING_KEY = "test-routing-key-12345"
 TEST_CUSTOM_HEADER_NAME = "X-Test-Header"
@@ -190,16 +191,15 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         received_found = False
         finished_found = False
         for line in content.splitlines():
-            idx = line.find("{")
-            if idx == -1:
+            if not line.strip() or not line.startswith("{"):
                 continue
             try:
-                data = json.loads(line[idx:])
+                data = json.loads(line)
             except json.JSONDecodeError:
                 continue
 
             rid = data.get("rid", "")
-            if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            if rid.startswith("HEALTH_CHECK"):
                 continue
 
             if data.get("event") == "request.received":
@@ -228,11 +228,10 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     def _verify_openai_logs(self, content: str, source_name: str):
         openai_received_found = False
         for line in content.splitlines():
-            idx = line.find("{")
-            if idx == -1:
+            if not line.strip() or not line.startswith("{"):
                 continue
             try:
-                data = json.loads(line[idx:])
+                data = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if data.get("event") != "request.received.openai":

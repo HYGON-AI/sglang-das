@@ -7,18 +7,24 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
-register_cuda_ci(est_time=6, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=3, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 
+
+# DCU BW1000 validated on 10.16.1.66/dxl-sglang: build_eagle_tree unit path passed three runs.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+)
 
 class TestBuildEagleTree(unittest.TestCase):
     """Unit tests for build_eagle_tree functionality."""
 
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
-        bonus_tokens = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
+        verified_id = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
         score_list = [
             torch.tensor(
                 [
@@ -244,7 +250,7 @@ class TestBuildEagleTree(unittest.TestCase):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            bonus_tokens=bonus_tokens,
+            verified_id=verified_id,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,

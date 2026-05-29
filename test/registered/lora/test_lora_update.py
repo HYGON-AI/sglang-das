@@ -23,7 +23,7 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -36,8 +36,15 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=487,
-    stage="stage-b",
-    runner_config="1-gpu-large",
+    suite="stage-b-test-1-gpu-large",
+)
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=116,
+    suite="stage-b-test-1-gpu-small-dcu",
+    nightly=False,
+    disabled="DCU CSV CI placeholder: LoRA update path needs BW1000 local adapter/model validation before enabling.",
 )
 
 PROMPTS = [

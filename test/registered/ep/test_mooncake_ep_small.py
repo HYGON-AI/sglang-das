@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -15,11 +15,20 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=82, stage="stage-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=660, suite="stage-c-test-deepep-4-gpu-h100")
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=660,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: Mooncake EP path needs BW1000 multi-device validation before enabling.",
+)
 
 ib_devices = get_rdma_devices_args()
 
 
+@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep is flaky.")
 class TestTP(CustomTestCase):
     extra_args = []
 
@@ -69,21 +78,21 @@ class TestTP(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["score"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
+@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep is flaky.")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",
