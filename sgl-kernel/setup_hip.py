@@ -44,6 +44,7 @@ sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/topk.cu",

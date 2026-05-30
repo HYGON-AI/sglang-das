@@ -61,6 +61,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
+    m.def(
+      "normal_decode_metadata_general(Tensor seq_lens, Tensor req_to_token, Tensor req_pool_indices, "
+      "Tensor! cache_seqlens_int32, Tensor! cu_seqlens_k, Tensor! page_table, Tensor? swa_page_table, "
+      "Tensor? full_to_swa_mapping, int max_seq_pages, int page_size, int seq_len_delta, bool use_swa) -> ()");
+  m.impl("normal_decode_metadata_general", torch::kCUDA, &normal_decode_metadata_general);
+  
   /*
    * From csrc/allreduce
    */
