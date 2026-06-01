@@ -249,7 +249,14 @@ jobs:
     if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     env:
-      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig
+      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}
+      GIT_CONFIG_NOSYSTEM: "1"
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      all_proxy: ""
+      ALL_PROXY: ""
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_a
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
@@ -304,7 +311,14 @@ jobs:
       matrix:
         part: [0, 1]
     env:
-      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig
+      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}
+      GIT_CONFIG_NOSYSTEM: "1"
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      all_proxy: ""
+      ALL_PROXY: ""
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}

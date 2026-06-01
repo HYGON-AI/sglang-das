@@ -265,7 +265,14 @@ jobs:
             timeout_per_file: 7800
             timeout_minutes: 300
     env:
-      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig
+      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}
+      GIT_CONFIG_NOSYSTEM: "1"
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      all_proxy: ""
+      ALL_PROXY: ""
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
