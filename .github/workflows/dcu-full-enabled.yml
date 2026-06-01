@@ -63,7 +63,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action || '' }}
           EVENT_LABEL: ${{ github.event.label.name || '' }}
-          HAS_FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-dcu-full') }}
+          HAS_FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-dcu-full') || contains(github.event.pull_request.labels.*.name, 'run-ci') }}
         run: |
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             echo "should_run=true" >> "${GITHUB_OUTPUT}"
@@ -71,7 +71,7 @@ jobs:
           fi
 
           if [[ "${HAS_FULL_LABEL}" != "true" ]]; then
-            echo "DCU full enabled run is disabled. Add the 'run-dcu-full' label to this PR."
+            echo "DCU full enabled run is disabled. Add the 'run-dcu-full' label to this PR, or use the temporary 'run-ci' compatibility gate on the dcu-ci-pr validation branch."
             echo "should_run=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
