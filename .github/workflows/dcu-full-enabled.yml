@@ -265,14 +265,6 @@ jobs:
             timeout_per_file: 7800
             timeout_minutes: 300
     env:
-      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}
-      GIT_CONFIG_NOSYSTEM: "1"
-      http_proxy: ""
-      https_proxy: ""
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      all_proxy: ""
-      ALL_PROXY: ""
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
@@ -281,9 +273,23 @@ jobs:
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+        env:
+          CHECKOUT_REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/".[!.]* "${GITHUB_WORKSPACE:?}/"..?* 2>/dev/null || true
+          git init "${GITHUB_WORKSPACE}"
+          cd "${GITHUB_WORKSPACE}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Setup DCU container
         run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
