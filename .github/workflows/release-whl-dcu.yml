@@ -19,10 +19,12 @@
 #   每个 Python 版本独立上传 artifact: dcu-wheels-py3.10 / py3.11 / py3.12
 #
 # Runner:
-#   使用自托管 dcu-runner，预装 ROCm/HIP 工具链和 GPU
+#   自托管 dcu-runner + Docker 容器隔离运行
+#   Docker 镜像内预装: ROCm/DTK, gcc 10.3, cmake 3.29, mpi 5.0, mkl
+#   GPU 通过 --device=/dev/kfd --device=/dev/dri 透传
 # =============================================================================
 
-name: DCU Compile
+name: Release DCU Wheels
 
 on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
@@ -34,7 +36,7 @@ on:
       - 'sgl-kernel/**'
       - 'sgl-model-gateway/**'
       - 'requirements_dcu.txt'
-      - '.github/workflows/dcu-compile.yml'
+      - '.github/workflows/release-whl-dcu.yml'
 
   # ---- PR 时触发（同样限定路径） ----
   pull_request:
@@ -43,7 +45,7 @@ on:
       - 'sgl-kernel/**'
       - 'sgl-model-gateway/**'
       - 'requirements_dcu.txt'
-      - '.github/workflows/dcu-compile.yml'
+      - '.github/workflows/release-whl-dcu.yml'
 
   # ---- 手动触发，可传参 ----
   workflow_dispatch:
@@ -51,7 +53,7 @@ on:
       torch_version:
         description: 'PyTorch version to install'
         required: false
-        default: '2.5.1'
+        default: '2.10.0'
         type: string
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
@@ -61,19 +63,30 @@ on:
 
 # ---- 并发控制: 同一分支 + 同一事件 + 同一 Python 版本的 job 只保留最新一个 ----
 concurrency:
-  group: dcu-compile-${{ github.ref }}-${{ github.event_name }}-py${{ matrix.python-version }}
+  group: release-whl-dcu-${{ github.ref }}-py${{ matrix.python-version }}
   cancel-in-progress: true
 
 jobs:
   compile:
-    # ---- 自托管 DCU runner（预装 ROCm/HIP + GPU） ----
-    runs-on: dcu-runner
+    # ---- 自托管 DCU runner，在 Docker 容器内运行以隔离环境 ----
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 180
+
+    # Docker 容器镜像: rockylinux 8.6 + mpi 5.0 + gcc 10.3 + cmake 3.29 +
+    #                    Python 3.10 + mkl 2020.4.304 + DTK/ROCm
+    container:
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      # 透传 DCU GPU 设备给容器
+      options: --device=/dev/kfd --device=/dev/dri --group-add video
+      # 如需私有镜像仓库认证，配置 GitHub Secrets:
+      # credentials:
+      #   username: ${{ secrets.DOCKER_REGISTRY_USER }}
+      #   password: ${{ secrets.DOCKER_REGISTRY_PASS }}
 
     # ---- Matrix: 3 个 Python 版本并行编译 ----
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12']
+        python-version: ['3.10']
 
     env:
       TORCH_VERSION: ${{ inputs.torch_version || '2.5.1' }}
