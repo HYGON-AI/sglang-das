@@ -233,6 +233,9 @@ jobs:
           if [[ "${CONTINUE_ON_ERROR}" == "true" ]]; then
             continue_on_error_flag="--continue-on-error"
           fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            continue_on_error_flag="--continue-on-error"
+          fi
 
           echo "runner_label=${runner_label}" >> "${GITHUB_OUTPUT}"
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
@@ -290,8 +293,7 @@ jobs:
             python3 run_suite.py \
               --hw dcu \
               --suite stage-a-test-1-gpu-small-dcu \
-              --include-file registered/dcu/interface/test_dcu_smoke.py \
-              --timeout-per-file 120 \
+              --timeout-per-file 1200 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
       - name: Cleanup DCU container
@@ -305,19 +307,56 @@ jobs:
           fi
 
   stage-b-test-1-gpu-small-dcu:
-    name: Stage B DCU smoke (${{ matrix.part }})
+    name: Stage B DCU full (${{ matrix.name }})
     needs:
       - check-changes
       - call-gate
       - validate-config
       - stage-a-test-1-gpu-small-dcu
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.stage-a-test-1-gpu-small-dcu.result == 'success' || needs.stage-a-test-1-gpu-small-dcu.result == 'skipped') && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1]
+        include:
+          - name: stage-b-small-0
+            suite: stage-b-test-1-gpu-small-dcu
+            part: 0
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-small-1
+            suite: stage-b-test-1-gpu-small-dcu
+            part: 1
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-small-2
+            suite: stage-b-test-1-gpu-small-dcu
+            part: 2
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-small-3
+            suite: stage-b-test-1-gpu-small-dcu
+            part: 3
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-large
+            suite: stage-b-test-1-gpu-large-dcu
+            part: 0
+            parts: 1
+            timeout_per_file: 2400
+            timeout_minutes: 150
+          - name: stage-b-2gpu
+            suite: stage-b-test-2-gpu-large-dcu
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
@@ -353,18 +392,15 @@ jobs:
         run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
 
       - name: Run stage-b-test-1-gpu-small-dcu partition
-        timeout-minutes: 30
         run: |
-          echo "Running stage-b-test-1-gpu-small-dcu partition ${{ matrix.part }}/2"
+          echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }}"
           bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
-              --suite stage-b-test-1-gpu-small-dcu \
-              --include-file registered/dcu/interface/test_dcu_stage_b_flow_0.py \
-              --include-file registered/dcu/interface/test_dcu_stage_b_flow_1.py \
+              --suite "${{ matrix.suite }}" \
               --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 2 \
-              --timeout-per-file 120 \
+              --auto-partition-size ${{ matrix.parts }} \
+              --timeout-per-file ${{ matrix.timeout_per_file }} \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
       - name: Cleanup DCU container
