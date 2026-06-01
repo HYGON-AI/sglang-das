@@ -265,7 +265,7 @@ jobs:
             timeout_per_file: 7800
             timeout_minutes: 300
     env:
-      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/dcu-gitconfig
+      GIT_CONFIG_GLOBAL: /tmp/dcu-actions-gitconfig
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
