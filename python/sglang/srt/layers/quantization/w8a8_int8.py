@@ -319,7 +319,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_dcu and self.runner.runner_backend.is_lightop():
+        if _is_dcu and self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                process_weights_after_loading_aiter_w8a8_int8,
+            )
+
+            process_weights_after_loading_aiter_w8a8_int8(layer)
+        elif _is_dcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,
             )
@@ -346,7 +352,9 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
 
-        if moe_runner_backend.is_lightop() and _is_dcu:
+        if moe_runner_backend.is_aiter() and _is_dcu:
+            self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+        elif moe_runner_backend.is_lightop() and _is_dcu:
             self.runner = MoeRunner(MoeRunnerBackend.LIGHTOP, moe_runner_config)
         elif moe_runner_backend.is_triton():
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
@@ -369,6 +377,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -398,12 +407,26 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 None,  # block_size
                 True,  # is_vnni
             )
+            if bias is not None:
+                output = output + bias
             return StandardCombineInput(hidden_states=output)
 
         quant_info = self.get_triton_quant_info(layer)
 
-        if _is_dcu and self.runner.runner_backend.is_lightop():
+        if _is_dcu and self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_int8_quant_info,
+            )
+
+            quant_info = get_aiter_w8a8_int8_quant_info(layer)
+        elif _is_dcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import get_lightop_quant_info
+
             quant_info = get_lightop_quant_info(layer)
-            
-        return self.runner.run(dispatch_output, quant_info)
+
+        combine_input = self.runner.run(dispatch_output, quant_info)
+        if bias is not None:
+            return StandardCombineInput(
+                hidden_states=combine_input.hidden_states + bias
+            )
+        return combine_input

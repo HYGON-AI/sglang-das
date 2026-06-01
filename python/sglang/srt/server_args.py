@@ -3174,6 +3174,16 @@ class ServerArgs:
                 "moe_a2a_backend='none'."
             )
 
+        if self.moe_runner_backend == "aiter" and self.quantization == "w8a8_int8":
+            assert is_dcu(), (
+                "aiter MoE runner backend with w8a8_int8 quantization is only "
+                "supported on DCU."
+            )
+            assert self.moe_a2a_backend == "none", (
+                "aiter MoE runner backend with w8a8_int8 quantization currently "
+                "supports only moe_a2a_backend='none'."
+            )
+
         if envs.SGLANG_CUTLASS_MOE.get():
             logger.warning(
                 "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
