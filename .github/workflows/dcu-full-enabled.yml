@@ -109,6 +109,10 @@ jobs:
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
         run: |
           runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
+          if [[ "${runner_label}" == "dcu-ci-pr" ]]; then
+            echo "Routing validation runner label dcu-ci-pr to dcu-ci-pr-2 for nmz4 test runner."
+            runner_label="dcu-ci-pr-2"
+          fi
           image="${INPUT_IMAGE:-${VAR_IMAGE}}"
           continue_on_error="${CONTINUE_ON_ERROR:-true}"
 
