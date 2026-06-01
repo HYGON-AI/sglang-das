@@ -318,7 +318,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2, 3]
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
@@ -356,16 +356,66 @@ jobs:
       - name: Run stage-b-test-1-gpu-small-dcu partition
         timeout-minutes: 30
         run: |
-          echo "Running stage-b-test-1-gpu-small-dcu partition ${{ matrix.part }}/2"
+          echo "Running stage-b-test-1-gpu-small-dcu partition ${{ matrix.part }}/4"
           bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
               --suite stage-b-test-1-gpu-small-dcu \
               --include-file registered/dcu/interface/test_dcu_stage_b_flow_0.py \
               --include-file registered/dcu/interface/test_dcu_stage_b_flow_1.py \
+              --include-file registered/spec/utils/test_build_eagle_tree.py \
+              --include-file registered/unit/function_call/test_json_schema_constraint.py \
+              --include-file registered/unit/observability/test_metrics_utils.py \
+              --include-file registered/unit/parser/test_harmony_parser.py \
+              --include-file registered/unit/parser/test_jinja_template_utils.py \
+              --include-file registered/unit/parser/test_reasoning_parser.py \
+              --include-file registered/unit/server_args/test_server_args.py \
+              --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
+              --include-file registered/attention/test_triton_attention_kernels.py \
+              --include-file registered/quant/test_triton_scaled_mm.py \
+              --include-file registered/layers/mamba/test_mamba_ssm.py \
+              --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
+              --include-file registered/rl/test_fp32_lm_head.py \
+              --include-file registered/model_loading/test_external_models.py \
+              --include-file registered/openai_server/function_call/test_openai_function_calling.py \
+              --include-file registered/embedding/test_input_embeddings.py \
+              --include-file registered/embedding/test_openai_embedding.py \
+              --include-file registered/vlm/test_evs.py \
+              --include-file registered/openai_server/features/test_enable_thinking.py \
+              --include-file registered/openai_server/features/test_reasoning_content.py \
+              --include-file registered/attention/test_create_kvindices.py \
+              --include-file registered/layers/mamba/test_causal_conv1d.py \
+              --include-file registered/openai_server/basic/test_protocol.py \
+              --include-file registered/unit/utils/test_profile_merger.py \
+              --include-file registered/unit/managers/test_prefill_adder.py \
+              --include-file registered/unit/managers/test_io_struct.py \
+              --include-file registered/unit/managers/test_profile_merger_http_api.py \
+              --include-file registered/unit/mem_cache/test_swa_unittest.py \
+              --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
+              --include-file registered/unit/mem_cache/test_mamba_unittest.py \
+              --include-file registered/ops/test_repeat_interleave.py \
+              --include-file registered/core/test_page_size.py \
+              --include-file registered/openai_server/features/test_openai_server_ebnf.py \
+              --include-file registered/openai_server/basic/test_serving_chat.py \
+              --include-file registered/openai_server/basic/test_serving_completions.py \
+              --include-file registered/openai_server/validation/test_large_max_new_tokens.py \
+              --include-file registered/openai_server/validation/test_openai_server_ignore_eos.py \
+              --include-file registered/sampling/test_original_logprobs.py \
+              --include-file registered/openai_server/validation/test_request_length_validation.py \
+              --include-file registered/sampling/test_pytorch_sampling_backend.py \
+              --include-file registered/sampling/test_penalty.py \
+              --include-file registered/openai_server/basic/test_serving_rerank.py \
+              --include-file registered/unit/model_executor/test_model_hooks.py \
+              --include-file registered/unit/model_loader/test_modelopt_export.py \
+              --include-file registered/core/test_hidden_states.py \
+              --include-file registered/openai_server/basic/test_anthropic_server.py \
+              --include-file registered/constrained_decoding/test_constrained_decoding.py \
+              --include-file registered/openai_server/features/test_json_mode.py \
+              --include-file registered/metrics/test_priority_metrics.py \
+              --include-file registered/dcu/srt/bw1000/test_qwen25_0p5b_server_dcu.py \
               --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 2 \
-              --timeout-per-file 120 \
+              --auto-partition-size 4 \
+              --timeout-per-file 300 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
       - name: Cleanup DCU container
