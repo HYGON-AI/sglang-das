@@ -11,6 +11,7 @@ on:
       - ready_for_review
     branches:
       - v0.5.12_dev
+      - dcu-ci-pr
       - main
     paths:
       - ".github/workflows/pr-test-dcu.yml"
