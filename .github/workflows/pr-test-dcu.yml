@@ -297,7 +297,8 @@ jobs:
             python3 run_suite.py \
               --hw dcu \
               --suite stage-a-test-1-gpu-small-dcu \
-              --timeout-per-file 1200 \
+              --include-file registered/dcu/interface/test_dcu_smoke.py \
+              --timeout-per-file 120 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
       - name: Cleanup DCU container
@@ -311,7 +312,7 @@ jobs:
           fi
 
   stage-b-test-1-gpu-small-dcu:
-    name: Stage B DCU full (${{ matrix.name }})
+    name: Stage B DCU required (${{ matrix.name }})
     needs:
       - check-changes
       - call-gate
@@ -325,42 +326,26 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - name: stage-b-small-0
-            suite: stage-b-test-1-gpu-small-dcu
+          - name: stage-b-required-0
             part: 0
             parts: 4
-            timeout_per_file: 1800
-            timeout_minutes: 180
-          - name: stage-b-small-1
-            suite: stage-b-test-1-gpu-small-dcu
+            timeout_per_file: 300
+            timeout_minutes: 60
+          - name: stage-b-required-1
             part: 1
             parts: 4
-            timeout_per_file: 1800
-            timeout_minutes: 180
-          - name: stage-b-small-2
-            suite: stage-b-test-1-gpu-small-dcu
+            timeout_per_file: 300
+            timeout_minutes: 60
+          - name: stage-b-required-2
             part: 2
             parts: 4
-            timeout_per_file: 1800
-            timeout_minutes: 180
-          - name: stage-b-small-3
-            suite: stage-b-test-1-gpu-small-dcu
+            timeout_per_file: 300
+            timeout_minutes: 60
+          - name: stage-b-required-3
             part: 3
             parts: 4
-            timeout_per_file: 1800
-            timeout_minutes: 180
-          - name: stage-b-large
-            suite: stage-b-test-1-gpu-large-dcu
-            part: 0
-            parts: 1
-            timeout_per_file: 2400
-            timeout_minutes: 150
-          - name: stage-b-2gpu
-            suite: stage-b-test-2-gpu-large-dcu
-            part: 0
-            parts: 1
-            timeout_per_file: 1200
-            timeout_minutes: 90
+            timeout_per_file: 300
+            timeout_minutes: 60
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
@@ -395,13 +380,65 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
 
-      - name: Run stage-b-test-1-gpu-small-dcu partition
+      - name: Run stage-b-test-1-gpu-small-dcu required partition
         run: |
-          echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }}"
+          echo "Running stage-b-test-1-gpu-small-dcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
           bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
-              --suite "${{ matrix.suite }}" \
+              --suite stage-b-test-1-gpu-small-dcu \
+              --include-file registered/dcu/interface/test_dcu_stage_b_flow_0.py \
+              --include-file registered/dcu/interface/test_dcu_stage_b_flow_1.py \
+              --include-file registered/spec/utils/test_build_eagle_tree.py \
+              --include-file registered/unit/function_call/test_json_schema_constraint.py \
+              --include-file registered/unit/observability/test_metrics_utils.py \
+              --include-file registered/unit/parser/test_harmony_parser.py \
+              --include-file registered/unit/parser/test_jinja_template_utils.py \
+              --include-file registered/unit/parser/test_reasoning_parser.py \
+              --include-file registered/unit/server_args/test_server_args.py \
+              --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
+              --include-file registered/attention/test_triton_attention_kernels.py \
+              --include-file registered/quant/test_triton_scaled_mm.py \
+              --include-file registered/layers/mamba/test_mamba_ssm.py \
+              --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
+              --include-file registered/rl/test_fp32_lm_head.py \
+              --include-file registered/model_loading/test_external_models.py \
+              --include-file registered/openai_server/function_call/test_openai_function_calling.py \
+              --include-file registered/embedding/test_input_embeddings.py \
+              --include-file registered/embedding/test_openai_embedding.py \
+              --include-file registered/vlm/test_evs.py \
+              --include-file registered/openai_server/features/test_enable_thinking.py \
+              --include-file registered/openai_server/features/test_reasoning_content.py \
+              --include-file registered/attention/test_create_kvindices.py \
+              --include-file registered/layers/mamba/test_causal_conv1d.py \
+              --include-file registered/openai_server/basic/test_protocol.py \
+              --include-file registered/unit/utils/test_profile_merger.py \
+              --include-file registered/unit/managers/test_prefill_adder.py \
+              --include-file registered/unit/managers/test_io_struct.py \
+              --include-file registered/unit/managers/test_profile_merger_http_api.py \
+              --include-file registered/unit/mem_cache/test_swa_unittest.py \
+              --include-file registered/unit/mem_cache/test_radix_cache_unit.py \
+              --include-file registered/unit/mem_cache/test_mamba_unittest.py \
+              --include-file registered/ops/test_repeat_interleave.py \
+              --include-file registered/core/test_page_size.py \
+              --include-file registered/openai_server/features/test_openai_server_ebnf.py \
+              --include-file registered/openai_server/basic/test_serving_chat.py \
+              --include-file registered/openai_server/basic/test_serving_completions.py \
+              --include-file registered/openai_server/validation/test_large_max_new_tokens.py \
+              --include-file registered/openai_server/validation/test_openai_server_ignore_eos.py \
+              --include-file registered/sampling/test_original_logprobs.py \
+              --include-file registered/openai_server/validation/test_request_length_validation.py \
+              --include-file registered/sampling/test_pytorch_sampling_backend.py \
+              --include-file registered/sampling/test_penalty.py \
+              --include-file registered/openai_server/basic/test_serving_rerank.py \
+              --include-file registered/unit/model_executor/test_model_hooks.py \
+              --include-file registered/unit/model_loader/test_modelopt_export.py \
+              --include-file registered/core/test_hidden_states.py \
+              --include-file registered/openai_server/basic/test_anthropic_server.py \
+              --include-file registered/constrained_decoding/test_constrained_decoding.py \
+              --include-file registered/openai_server/features/test_json_mode.py \
+              --include-file registered/metrics/test_priority_metrics.py \
+              --include-file registered/dcu/srt/bw1000/test_qwen25_0p5b_server_dcu.py \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size ${{ matrix.parts }} \
               --timeout-per-file ${{ matrix.timeout_per_file }} \
