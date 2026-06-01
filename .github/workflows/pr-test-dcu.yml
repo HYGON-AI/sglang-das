@@ -13,7 +13,6 @@ on:
       - v0.5.12_dev
       - dcu-ci-pr
       - main
-      - dcu-ci-pr
     paths:
       - ".github/workflows/pr-test-dcu.yml"
       - ".github/workflows/pr-gate.yml"
@@ -218,6 +217,10 @@ jobs:
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || false }}
         run: |
           runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
+          if [[ "${runner_label}" == "dcu-ci-pr" ]]; then
+            echo "Routing validation runner label dcu-ci-pr to dcu-ci-pr-2 for nmz4 test runner."
+            runner_label="dcu-ci-pr-2"
+          fi
           image="${INPUT_IMAGE:-${VAR_IMAGE}}"
 
           if [[ -z "${runner_label}" ]]; then
@@ -232,6 +235,9 @@ jobs:
 
           continue_on_error_flag=""
           if [[ "${CONTINUE_ON_ERROR}" == "true" ]]; then
+            continue_on_error_flag="--continue-on-error"
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             continue_on_error_flag="--continue-on-error"
           fi
 
@@ -255,8 +261,8 @@ jobs:
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_a
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '1' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '1' }}
+      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
       - name: Checkout code
@@ -306,26 +312,47 @@ jobs:
           fi
 
   stage-b-test-1-gpu-small-dcu:
-    name: Stage B DCU smoke (${{ matrix.part }})
+    name: Stage B DCU required (${{ matrix.name }})
     needs:
       - check-changes
       - call-gate
       - validate-config
       - stage-a-test-1-gpu-small-dcu
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.stage-a-test-1-gpu-small-dcu.result == 'success' || needs.stage-a-test-1-gpu-small-dcu.result == 'skipped') && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1, 2, 3]
+        include:
+          - name: stage-b-required-0
+            part: 0
+            parts: 4
+            timeout_per_file: 300
+            timeout_minutes: 60
+          - name: stage-b-required-1
+            part: 1
+            parts: 4
+            timeout_per_file: 300
+            timeout_minutes: 60
+          - name: stage-b-required-2
+            part: 2
+            parts: 4
+            timeout_per_file: 300
+            timeout_minutes: 60
+          - name: stage-b-required-3
+            part: 3
+            parts: 4
+            timeout_per_file: 300
+            timeout_minutes: 60
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '1' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '1' }}
+      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
       - name: Checkout code
@@ -353,10 +380,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
 
-      - name: Run stage-b-test-1-gpu-small-dcu partition
-        timeout-minutes: 30
+      - name: Run stage-b-test-1-gpu-small-dcu required partition
         run: |
-          echo "Running stage-b-test-1-gpu-small-dcu partition ${{ matrix.part }}/4"
+          echo "Running stage-b-test-1-gpu-small-dcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
           bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
@@ -414,8 +440,8 @@ jobs:
               --include-file registered/metrics/test_priority_metrics.py \
               --include-file registered/dcu/srt/bw1000/test_qwen25_0p5b_server_dcu.py \
               --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 4 \
-              --timeout-per-file 300 \
+              --auto-partition-size ${{ matrix.parts }} \
+              --timeout-per-file ${{ matrix.timeout_per_file }} \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
       - name: Cleanup DCU container

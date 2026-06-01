@@ -22,11 +22,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=32, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(
-    est_time=32,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: metrics endpoint starts with local Qwen3-0.6B on BW1000, but metrics output is missing sglang:cached_tokens_total; needs metrics/runtime validation before required CI.",
-)
+register_dcu_ci(est_time=32, suite="stage-b-test-1-gpu-small-dcu")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
