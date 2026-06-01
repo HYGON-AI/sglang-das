@@ -1,4 +1,5 @@
 name: PR Test (DCU)
+# Temporary test-branch touch: keep PR path filter active for DCU workflow validation.
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
