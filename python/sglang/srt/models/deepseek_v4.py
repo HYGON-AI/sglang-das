@@ -87,6 +87,9 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_dcu = is_dcu()
 _use_dpskv4_lightop_rmsnorm = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM")
+_use_fused_qnorm_rope_kv_rope_quant = get_bool_env_var(
+    "SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT"
+)
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 
 if _is_dcu:
@@ -228,6 +231,15 @@ class MQALayer(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
+
+        self.register_buffer("cos_sin_cache_fused", None, persistent=False)
+        self.cos_sin_cache_fused: Optional[torch.Tensor]
+        if _is_dcu and _use_fused_qnorm_rope_kv_rope_quant:
+            freqs_real = torch.view_as_real(self.freqs_cis)  # [max_pos, 32, 2]
+            cos_sin_cache = torch.cat(
+                [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
+            ).contiguous()  # [max_pos, 64], first 32 cos, last 32 sin
+            self.cos_sin_cache_fused = cos_sin_cache
 
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
             self.alt_streams = alt_streams[:3]
@@ -510,33 +522,82 @@ class MQALayer(nn.Module):
         q_lora = q
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if _is_dcu and _use_dpskv4_lightop_rmsnorm:
-            op.rms_norm_no_weight(None, q, None, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
 
-        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
-        kv: Optional[torch.Tensor]
-        if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-            kv = cp_all_gather_rerange_output(
-                kv.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv,
-                forward_batch=forward_batch,
+        _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _use_lightop_qnorm_rope = (
+            _use_fused_qnorm_rope_kv_rope_quant and _is_dcu
+        )
+        if _use_lightop_qnorm_rope:
+            cos_sin_cache_fused = self.cos_sin_cache_fused
+            assert cos_sin_cache_fused is not None
+        else:
+            cos_sin_cache_fused = None
+
+        if _use_lightop_qnorm_rope and not _cp_enabled:
+            # Fused kernel: Q no-weight RMSNorm + Q RoPE + KV RMSNorm +
+            # K RoPE + K FP8 quant + cache insert.
+            pool = forward_batch.token_to_kv_pool
+            swa_pool = pool.swa_kv_pool
+            layer_idx = self.layer_id - pool._stage_start
+            k_cache = swa_pool.kv_buffer[layer_idx]
+            cache_block_size = swa_pool.page_size
+            raw_loc = forward_batch.out_cache_loc
+            slot_mapping = pool.translate_loc_from_full_to_swa(raw_loc)
+
+            op.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
+                q, kv, self.kv_norm.weight, k_cache, slot_mapping,
+                positions, cos_sin_cache_fused,
+                self.eps, cache_block_size,
             )
         else:
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
-            kv = None
+            if _use_lightop_qnorm_rope:
+                # CP must all-gather/rerange KV before cache insert, so only fuse
+                # the local Q norm/RoPE and local KV norm/RoPE here.
+                op.fused_deepseek_v4_qnorm_rope_kvnorm_rope(
+                    q,
+                    kv,
+                    self.kv_norm.weight,
+                    positions,
+                    cos_sin_cache_fused,
+                    self.eps,
+                )
+            else:
+                kv = self.kv_norm(kv)
+                if self.use_jit_norm:
+                    q = rmsnorm_self(q, self.eps)
+                else:
+                    if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+                        op.rms_norm_no_weight(None, q, None, self.eps)
+                    else:
+                        q = rms_normalize_triton(q, self.eps)
 
-        del qkv_a
+                fused_rope(
+                    q[..., -self.qk_rope_head_dim :],
+                    kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                    self.freqs_cis,
+                    positions=positions,
+                )
+
+            if _cp_enabled:
+                kv = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
+                    assert_tensor_identical_across_cp_ranks(
+                        kv,
+                        tag=f"kv_after_allgather layer_id={self.layer_id}",
+                        forward_batch=forward_batch,
+                    )
+
+            if self.overlap_store_cache:
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -598,6 +659,13 @@ class MQALayer(nn.Module):
         # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
+        _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _fused_cache_insert_path = (
+            _use_fused_qnorm_rope_kv_rope_quant
+            and not _cp_enabled
+            and _is_dcu
+            and not enable_multi_stream
+        )
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
             k=attn_k,
@@ -606,7 +674,7 @@ class MQALayer(nn.Module):
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=False,
+            save_kv_cache=not (self.overlap_store_cache or _fused_cache_insert_path),
         )
         o = o[:, tp_slice, :]
         fused_rope_inplace(
