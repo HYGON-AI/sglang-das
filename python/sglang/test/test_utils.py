@@ -850,7 +850,7 @@ def _with_dcu_ci_server_defaults(args: list[str], env: dict) -> list[str]:
     defaults = shlex.split(
         env.get(
             "SGLANG_TEST_DCU_DEFAULT_SERVER_ARGS",
-            "--attention-backend fa3 --page-size 64 --trust-remote-code",
+            "--attention-backend fa3 --trust-remote-code",
         )
     )
     result = list(args)

@@ -42,8 +42,6 @@ def _apply_dcu_ci_runtime_defaults(kwargs):
     attn_keys = ("attention_backend", "decode_attention_backend", "prefill_attention_backend")
     if all(kwargs.get(key) is None for key in attn_keys):
         kwargs["attention_backend"] = "fa3"
-    if kwargs.get("page_size") is None:
-        kwargs["page_size"] = 64
     kwargs.setdefault("trust_remote_code", True)
 
 
