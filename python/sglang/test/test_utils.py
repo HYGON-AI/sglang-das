@@ -836,6 +836,58 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def _has_cli_option(args: list[str], names: set[str]) -> bool:
+    return any(
+        arg in names or any(arg.startswith(f"{name}=") for name in names)
+        for arg in args
+    )
+
+
+def _with_dcu_ci_server_defaults(args: list[str], env: dict) -> list[str]:
+    if env.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return args
+
+    defaults = shlex.split(
+        env.get(
+            "SGLANG_TEST_DCU_DEFAULT_SERVER_ARGS",
+            "--attention-backend fa3 --page-size 64 --trust-remote-code",
+        )
+    )
+    result = list(args)
+
+    if not _has_cli_option(
+        result,
+        {
+            "--attention-backend",
+            "--prefill-attention-backend",
+            "--decode-attention-backend",
+        },
+    ):
+        index = 0
+        while index < len(defaults):
+            option = defaults[index]
+            if option == "--attention-backend":
+                result.extend(defaults[index : index + 2])
+                index += 2
+            else:
+                index += 1
+
+    if not _has_cli_option(result, {"--page-size"}):
+        index = 0
+        while index < len(defaults):
+            option = defaults[index]
+            if option == "--page-size":
+                result.extend(defaults[index : index + 2])
+                index += 2
+            else:
+                index += 1
+
+    if "--trust-remote-code" in defaults and "--trust-remote-code" not in result:
+        result.append("--trust-remote-code")
+
+    return result
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -896,6 +948,7 @@ def popen_launch_server(
     # Build server command
     _, host, port = base_url.split(":")
     host = host[2:]
+    other_args = _with_dcu_ci_server_defaults(other_args, env)
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
