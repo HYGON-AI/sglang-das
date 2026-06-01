@@ -13,6 +13,7 @@ set -euo pipefail
 # Optional env:
 #   DCU_CI_CONTAINER / DCU_CI_CONTAINER_NAME  Container name. Defaults to ci_sglang.
 #   DCU_DEVICE_FLAGS / DCU_CI_DEVICE_FLAGS    Additional `--device ...` flags.
+#   DCU_CI_VISIBLE_DEVICES                    Comma-separated DCU devices to expose.
 #   DCU_CACHE_HOST / DCU_CI_CACHE_HOST         Host-side cache directory mounted into /sgl-data.
 
 CUSTOM_IMAGE=""
@@ -50,8 +51,18 @@ fi
 
 # DCU exposes /dev/kfd + /dev/dri the same way ROCm does. Allow override.
 DEVICE_FLAGS="${DCU_DEVICE_FLAGS:-${DCU_CI_DEVICE_FLAGS:---device=/dev/kfd --device=/dev/dri}}"
+VISIBLE_DEVICES="${DCU_CI_VISIBLE_DEVICES:-}"
 DTK_ROOT="${DCU_DTK_ROOT:-/opt/dtk}"
 DCU_LD_LIBRARY_PATH="${DCU_LD_LIBRARY_PATH:-${DTK_ROOT}/hip/lib:${DTK_ROOT}/lib:${DTK_ROOT}/lib64:${DTK_ROOT}/hsa/lib:${DTK_ROOT}/llvm/lib:${DTK_ROOT}/dcc/gcvm/lib:${DTK_ROOT}/.hyhal/lib:${DTK_ROOT}/.hyhal/lib64:${DTK_ROOT}/.hyhal/rocm_smi/lib:${DTK_ROOT}/.hyhal/hydm/lib:/opt/hyhal/lib:/opt/hyhal/lib64}"
+
+VISIBLE_ENV_ARGS=()
+if [[ -n "${VISIBLE_DEVICES}" ]]; then
+  VISIBLE_ENV_ARGS+=(
+    -e "HIP_VISIBLE_DEVICES=${VISIBLE_DEVICES}"
+    -e "ROCR_VISIBLE_DEVICES=${VISIBLE_DEVICES}"
+    -e "CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES}"
+  )
+fi
 
 CACHE_HOST="${DCU_CACHE_HOST:-${DCU_CI_CACHE_HOST:-/home/runner/sgl-data}}"
 if [[ -d "${CACHE_HOST}" ]]; then
@@ -89,6 +100,7 @@ docker run -dt --user root --privileged \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e ROCM_PATH="${DTK_ROOT}" \
   -e LD_LIBRARY_PATH="${DCU_LD_LIBRARY_PATH}" \
+  "${VISIBLE_ENV_ARGS[@]}" \
   -e SGLANG_IS_IN_CI=1 \
   -e SGLANG_IS_IN_CI_DCU=1 \
   -e SGLANG_USE_AITER=0 \

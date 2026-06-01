@@ -11,6 +11,7 @@ on:
       - ready_for_review
     branches:
       - v0.5.12_dev
+      - dcu-ci-pr
       - main
       - dcu-ci-pr
     paths:
@@ -256,6 +257,7 @@ jobs:
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '1' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '1' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
       - name: Checkout code
         env:
@@ -324,6 +326,7 @@ jobs:
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '1' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '1' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
       - name: Checkout code
         env:

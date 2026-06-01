@@ -48,17 +48,32 @@ from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
 # General test models
-DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "Qwen/Qwen3-Reranker-0.6B"
+DEFAULT_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_MODEL_NAME",
+    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct",
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME", "meta-llama/Llama-3.2-1B-Instruct"
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_BASE", "meta-llama/Llama-3.2-1B"
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE", "Qwen/Qwen3-Reranker-0.6B"
+)
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME",
+    "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+)
+DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME",
+    "cross-encoder/ms-marco-MiniLM-L6-v2",
+)
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
