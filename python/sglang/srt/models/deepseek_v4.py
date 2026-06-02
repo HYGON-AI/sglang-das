@@ -14,6 +14,8 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
+    fused_rope,
+    rmsnorm_self,
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
@@ -301,6 +303,7 @@ class MQALayer(nn.Module):
                 prefix=add_prefix("wkv", prefix),
             )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.use_jit_norm = False
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -511,16 +514,12 @@ class MQALayer(nn.Module):
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
             q_lora = qkv_a[..., : self.q_lora_rank]
+            kv = qkv_a[..., self.q_lora_rank :]
         else:
-        #     q_lora, _ = self.wq_a(x)
-        #     qkv_a = None
-        # q_lora = self.q_norm(q_lora)
-        # q = self._compute_q_b(q_lora, positions, q_out)
+            q_lora, _ = self.wq_a(x)
             kv, _ = self.wkv(x)
-            q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        q, _ = self.wq_b(q)
+        q_lora = self.q_norm(q_lora)
+        q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
 
         _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
@@ -592,7 +591,7 @@ class MQALayer(nn.Module):
                         forward_batch=forward_batch,
                     )
 
-            if self.overlap_store_cache:
+            if getattr(self, "overlap_store_cache", False):
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -654,10 +653,7 @@ class MQALayer(nn.Module):
                 x, positions, forward_batch, attn_backend, q_out
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
+        # Skip backend cache write only when the prepare path already wrote it.
         attn_k = kv if kv is not None else q
         _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _fused_cache_insert_path = (
@@ -665,6 +661,11 @@ class MQALayer(nn.Module):
             and not _cp_enabled
             and _is_dcu
             and not enable_multi_stream
+        )
+        _cache_already_written = (
+            enable_multi_stream
+            or _fused_cache_insert_path
+            or getattr(self, "overlap_store_cache", False)
         )
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
@@ -674,7 +675,7 @@ class MQALayer(nn.Module):
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=not (self.overlap_store_cache or _fused_cache_insert_path),
+            save_kv_cache=not _cache_already_written,
         )
         o = o[:, tp_slice, :]
         fused_rope_inplace(

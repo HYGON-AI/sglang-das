@@ -245,8 +245,6 @@ def load_jit(
     )
     default_device_cflags = _default_device_cflags()
     if header_only:
-        if _is_rocm_build():
-            _patch_tvm_ffi_load_inline_for_hip()
         from tvm_ffi.cpp import load_inline
 
         cpp_wrappers = cpp_wrappers or []
@@ -283,6 +281,7 @@ def load_jit(
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
             )
+
 
 
 @dataclass

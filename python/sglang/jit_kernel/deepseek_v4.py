@@ -13,9 +13,6 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.utils import (
     is_dcu,
     get_bool_env_var
@@ -242,7 +239,7 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant (no norm)."""
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        make_name("main_q_indexer_rope_hadamard_quant"),
+        make_name("main_q_indexer_rope_hadamard_quant_u8"),
         *args,
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
@@ -684,15 +681,28 @@ def fused_q_indexer_rope_hadamard_quant(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    # tvm_ffi converts torch tensors through DLPack, which does not support
+    # torch.float8 dtypes. Pass uint8 storage to the JIT wrapper and reinterpret
+    # the one-byte fp8 payload for downstream consumers.
+    q_fp8_storage = torch.empty(q_input.shape, dtype=torch.uint8, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
     module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
     module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
+        q_input,
+        q_fp8_storage,
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
     )
+    q_fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+    q_fp8 = q_fp8_storage.view(q_fp8_dtype)
     return q_fp8, weights_out
 
 
