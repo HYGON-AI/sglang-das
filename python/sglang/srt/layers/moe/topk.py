@@ -138,6 +138,9 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
+_use_lightop_topk_ids_postprocess = get_bool_env_var(
+    "SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS", "false"
+)
 simulated_expert_balance = get_bool_env_var("SGLANG_SIMULATED_EXPERT_BALANCE")
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
 
@@ -1046,12 +1049,87 @@ def _mask_topk_ids_padded_region(
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def _biased_grouped_topk_postprocess(
+def _topk_ids_postprocess_torch(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
+
+
+def _try_lightop_topk_ids_postprocess(
+    topk_ids: torch.Tensor,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    num_token_non_padded: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if (
+        not _use_lightop
+        or not _use_lightop_topk_ids_postprocess
+        or "op" not in globals()
+        or not hasattr(op, "topk_ids_postprocess")
+        or topk_ids.numel() == 0
+        or not topk_ids.is_cuda
+        or not topk_ids.is_contiguous()
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+
+    logical_to_physical_map = None
+    if expert_location_dispatch_info is not None:
+        if expert_location_dispatch_info.ep_dispatch_algorithm != "static":
+            return None
+        logical_to_physical_map = (
+            expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+        )
+        if (
+            logical_to_physical_map is None
+            or logical_to_physical_map.device != topk_ids.device
+            or not logical_to_physical_map.is_contiguous()
+            or logical_to_physical_map.dtype not in (torch.int32, torch.int64)
+        ):
+            return None
+
+    if num_token_non_padded is not None and (
+        num_token_non_padded.device != topk_ids.device
+        or not num_token_non_padded.is_contiguous()
+        or num_token_non_padded.dtype not in (torch.int32, torch.int64)
+        or num_token_non_padded.numel() == 0
+    ):
+        return None
+
+    if logical_to_physical_map is None and num_token_non_padded is None:
+        return topk_ids
+
+    op.topk_ids_postprocess(
+        topk_ids, logical_to_physical_map, num_token_non_padded
+    )
+    return topk_ids
+
+
+def _topk_ids_postprocess(
+    topk_ids: torch.Tensor,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    num_token_non_padded: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if expert_location_dispatch_info is None and num_token_non_padded is None:
+        return topk_ids
+
+    lightop_output = _try_lightop_topk_ids_postprocess(
+        topk_ids, expert_location_dispatch_info, num_token_non_padded
+    )
+    if lightop_output is not None:
+        return lightop_output
+    return _topk_ids_postprocess_torch(
+        topk_ids, expert_location_dispatch_info, num_token_non_padded
+    )
+
+
+def _biased_grouped_topk_postprocess(
+    topk_ids, expert_location_dispatch_info, num_token_non_padded
+):
+    return _topk_ids_postprocess(
+        topk_ids, expert_location_dispatch_info, num_token_non_padded
+    )
 
 
 def biased_grouped_topk_gpu(
@@ -1190,6 +1268,12 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts, 
             routed_scaling_factor,
         )
+        if (expert_location_dispatch_info is not None) or (
+            num_token_non_padded is not None
+        ):
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
         return topk_weights, topk_ids
     else:
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)

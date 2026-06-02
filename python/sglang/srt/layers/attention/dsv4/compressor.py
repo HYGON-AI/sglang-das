@@ -143,6 +143,17 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
+            if (
+                _is_dcu
+                and _use_dpskv4_lightop_quant_k_cache
+                and hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store")
+            ):
+                token_to_kv_pool.set_extra_key_buffer_lightop_fused(
+                    layer_id=layer_id,
+                    loc=out_loc,
+                    cache_k=new_compressed_kv.bfloat16(),
+                )
+                return
             if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
                 pack = quant_to_nope_fp8_rope_bf16_pack_lightop(new_compressed_kv.bfloat16(), 1e-8)
             else:

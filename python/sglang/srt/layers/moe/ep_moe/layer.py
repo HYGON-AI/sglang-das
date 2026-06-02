@@ -71,6 +71,7 @@ from deepgemm import m_grouped_w4a8_gemm_nt_masked, m_grouped_w8a8_gemm_nt_maske
     m_grouped_bf16_gemm_nt_contiguous
 from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_fp8_quant_ep, fuse_silu_and_mul, \
     fuse_silu_mul_fp8_quant
+from lightop import op as lightop_op
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 _is_hip = is_hip()
@@ -80,6 +81,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+_use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
+_use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
+_use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
 
 if _use_aiter and not _is_dcu:
     from aiter import ActivationType, QuantType
@@ -88,6 +92,203 @@ elif _is_npu:
     import torch_npu
 
 logger = logging.getLogger(__name__)
+
+
+def _can_use_lightop_ep_scatter(
+    recv_x: torch.Tensor,
+    recv_x_scale: Optional[torch.Tensor],
+    recv_topk: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    *,
+    counts_are_aligned: bool,
+    scale_ue8m0: bool = False,
+) -> bool:
+    # lightop's ep_scatter is a byte scatter: int8 and FP8 activations share
+    # the same copy path as long as scales are per-token fp32.
+    return (
+        _use_lightop_ep_scatter
+        and recv_x.element_size() == 1
+        and output_tensor.element_size() == 1
+        and recv_x_scale is not None
+        and recv_x_scale.dtype == torch.float32
+        and output_tensor_scale.dtype == torch.float32
+        and (recv_x_scale.dim() == 1 or recv_x_scale.shape[-1] == 1)
+        and (output_tensor_scale.dim() == 1 or output_tensor_scale.shape[-1] == 1)
+        and recv_topk.dtype == torch.int64
+        and counts_are_aligned
+        and not scale_ue8m0
+    )
+
+
+def _can_use_lightop_ep_moe_align(
+    topk_ids: torch.Tensor,
+    device: torch.device,
+    num_experts: int,
+    total_elements: Optional[int],
+    block_size: int,
+    counts_are_aligned: bool,
+) -> bool:
+    return (
+        _use_lightop_ep_moe_align
+        and hasattr(lightop_op, "ep_build_m_indices")
+        and counts_are_aligned
+        and total_elements is not None
+        and total_elements > 0
+        and total_elements % block_size == 0
+        and topk_ids.device == device
+        and topk_ids.dtype == torch.int64
+        and topk_ids.is_contiguous()
+        and 0 < num_experts <= 1024
+        and block_size > 0
+    )
+
+
+@torch.no_grad()
+def _build_m_indices_with_optional_lightop(
+    topk_ids: torch.Tensor,
+    device: torch.device,
+    num_experts: int,
+    *,
+    total_elements: Optional[int] = None,
+    block_size: int = 256,
+    counts_are_aligned: bool = False,
+) -> torch.Tensor:
+    if _can_use_lightop_ep_moe_align(
+        topk_ids,
+        device,
+        num_experts,
+        total_elements,
+        block_size,
+        counts_are_aligned,
+    ):
+        m_indices = torch.empty(
+            (total_elements,), device=device, dtype=torch.int32
+        )
+        lightop_op.ep_build_m_indices(
+            topk_ids, m_indices, num_experts, block_size
+        )
+        return m_indices
+
+    return build_m_indices_triton(topk_ids, device, num_experts)
+
+
+def _can_use_lightop_ep_gather(
+    input_tensor: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    input_index: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> bool:
+    return (
+        _use_lightop_ep_gather
+        and hasattr(lightop_op, "ep_gather")
+        and input_tensor.dim() == 2
+        and output_tensor.dim() == 2
+        and input_tensor.shape[1] == output_tensor.shape[1]
+        and input_tensor.dtype == output_tensor.dtype
+        and input_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and topk_ids.dtype == torch.int64
+        and topk_weights.dtype == torch.float32
+        and input_index.dtype == torch.int32
+        and topk_ids.shape == topk_weights.shape
+        and topk_ids.shape == input_index.shape
+        and topk_ids.shape[1] <= 8
+        and input_tensor.is_contiguous()
+        and output_tensor.is_contiguous()
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and input_index.is_contiguous()
+    )
+
+
+@torch.no_grad()
+def _ep_gather_with_optional_lightop(
+    input_tensor: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    input_index: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    if _can_use_lightop_ep_gather(
+        input_tensor, topk_ids, topk_weights, input_index, output_tensor
+    ):
+        lightop_op.ep_gather(
+            input_tensor, topk_ids, topk_weights, input_index, None, output_tensor
+        )
+        return
+
+    ep_gather(input_tensor, topk_ids, topk_weights, input_index, output_tensor)
+
+
+@torch.no_grad()
+def _ep_scatter_with_optional_lightop(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    all_tokens: int,
+    *,
+    counts_are_aligned: bool,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    local_num_expert = num_recv_tokens_per_expert.shape[0]
+
+    if _can_use_lightop_ep_scatter(
+        recv_x,
+        recv_x_scale,
+        recv_topk,
+        output_tensor,
+        output_tensor_scale,
+        counts_are_aligned=counts_are_aligned,
+        scale_ue8m0=scale_ue8m0,
+    ):
+        output_index = torch.empty(
+            recv_topk.shape, device=recv_topk.device, dtype=torch.int32
+        )
+        m_indices = torch.empty((all_tokens,), device=recv_x.device, dtype=torch.int32)
+        lightop_op.ep_scatter(
+            recv_x,
+            recv_x_scale,
+            recv_topk,
+            None,
+            num_recv_tokens_per_expert,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+            local_num_expert,
+            256,
+        )
+        return m_indices, output_index
+
+    output_index = torch.full(
+        recv_topk.shape, -1, device=recv_topk.device, dtype=torch.int32
+    )
+    expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert)
+    m_indices = _build_m_indices_with_optional_lightop(
+        recv_topk,
+        recv_x.device,
+        local_num_expert,
+        total_elements=all_tokens if counts_are_aligned else None,
+        block_size=256,
+        counts_are_aligned=counts_are_aligned,
+    )
+    ep_scatter(
+        recv_x,
+        recv_x_scale,
+        recv_topk,
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        output_tensor,
+        output_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=scale_ue8m0,
+    )
+    return m_indices, output_index
 
 
 # ------ custom op for lightop
@@ -753,8 +954,6 @@ class DeepEPMoE(FusedMoE):
                 )
             ),
         ]
-        output_index = torch.full_like(topk_ids, -1)
-
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -766,23 +965,22 @@ class DeepEPMoE(FusedMoE):
                 pin_memory=True,
                 device="cpu",
             ).cuda(non_blocking=True)
-        expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
-        local_num_expert = num_recv_tokens_per_expert_gpu.shape[0]
-        m_indices = build_m_indices_triton(topk_ids, hidden_states.device, local_num_expert)
-
-        ep_scatter(
+        counts_are_aligned = all(
+            count % 256 == 0 for count in num_recv_tokens_per_expert
+        )
+        m_indices, output_index = _ep_scatter_with_optional_lightop(
             hidden_states,
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
-            expert_start_loc,
             input_tensor[0],
             input_tensor[1],
-            m_indices,
-            output_index,
+            all_tokens,
+            counts_are_aligned=counts_are_aligned,
         )
 
-        gateup_output = torch.zeros(
+        gateup_output_factory = torch.empty if counts_are_aligned else torch.zeros
+        gateup_output = gateup_output_factory(
             (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
@@ -812,13 +1010,15 @@ class DeepEPMoE(FusedMoE):
             m_indices,
         )
 
-        gather_out = torch.zeros(
+        gather_out = torch.empty(
             hidden_states_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
 
-        ep_gather(down_output, topk_ids, topk_weights, output_index, gather_out)
+        _ep_gather_with_optional_lightop(
+            down_output, topk_ids, topk_weights, output_index, gather_out
+        )
         del down_output
 
         return gather_out
@@ -849,8 +1049,6 @@ class DeepEPMoE(FusedMoE):
         hidden_states_device = hidden_states.device
 
         input_tensor = torch.empty((all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype)
-        output_index = torch.full_like(topk_ids, -1)
-
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -864,7 +1062,20 @@ class DeepEPMoE(FusedMoE):
             ).cuda(non_blocking=True)
         expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
         local_num_expert = num_recv_tokens_per_expert_gpu.shape[0]
-        m_indices = build_m_indices_triton(topk_ids, hidden_states.device, local_num_expert)
+        counts_are_aligned = all(
+            count % 256 == 0 for count in num_recv_tokens_per_expert
+        )
+        m_indices = _build_m_indices_with_optional_lightop(
+            topk_ids,
+            hidden_states.device,
+            local_num_expert,
+            total_elements=all_tokens if counts_are_aligned else None,
+            block_size=256,
+            counts_are_aligned=counts_are_aligned,
+        )
+        output_index = torch.full(
+            topk_ids.shape, -1, device=topk_ids.device, dtype=torch.int32
+        )
 
         ep_scatter_no_scale(
             hidden_states,
@@ -905,13 +1116,15 @@ class DeepEPMoE(FusedMoE):
             m_indices,
         )
 
-        gather_out = torch.zeros(
+        gather_out = torch.empty(
             hidden_states_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
 
-        ep_gather(down_output, topk_ids, topk_weights, output_index, gather_out)
+        _ep_gather_with_optional_lightop(
+            down_output, topk_ids, topk_weights, output_index, gather_out
+        )
         del down_output
 
         return gather_out
@@ -965,8 +1178,6 @@ class DeepEPMoE(FusedMoE):
                 )
             ),
         ]
-        output_index = torch.full_like(topk_ids, -1)
-
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -978,20 +1189,17 @@ class DeepEPMoE(FusedMoE):
                 pin_memory=True,
                 device="cpu",
             ).cuda(non_blocking=True)
-        expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
-        local_num_expert = num_recv_tokens_per_expert_gpu.shape[0]
-        m_indices = build_m_indices_triton(topk_ids, hidden_states.device, local_num_expert)
-
-        ep_scatter(
+        m_indices, output_index = _ep_scatter_with_optional_lightop(
             hidden_states,
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
-            expert_start_loc,
             input_tensor[0],
             input_tensor[1],
-            m_indices,
-            output_index,
+            all_tokens,
+            counts_are_aligned=all(
+                count % 256 == 0 for count in num_recv_tokens_per_expert
+            ),
         )
 
         gateup_output = torch.zeros(
@@ -1024,13 +1232,15 @@ class DeepEPMoE(FusedMoE):
             m_indices,
         )
 
-        gather_out = torch.zeros(
+        gather_out = torch.empty(
             hidden_states_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
 
-        ep_gather(down_output, topk_ids, topk_weights, output_index, gather_out)
+        _ep_gather_with_optional_lightop(
+            down_output, topk_ids, topk_weights, output_index, gather_out
+        )
         del down_output
 
         return gather_out
@@ -1077,6 +1287,10 @@ class DeepEPMoE(FusedMoE):
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
         hidden_states_dtype = hidden_states.dtype
+        scale_hidden_size = K // 128
+        counts_are_aligned = all(
+            count % 128 == 0 for count in num_recv_tokens_per_expert
+        )
 
         input_tensor = [
             torch.empty(
@@ -1093,7 +1307,7 @@ class DeepEPMoE(FusedMoE):
                 ).transpose(0, 1)
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                 else torch.empty(
-                    (all_tokens, K // 128),
+                    (all_tokens, scale_hidden_size),
                     device=hidden_states.device,
                     dtype=torch.float32,
                 )
@@ -1102,7 +1316,6 @@ class DeepEPMoE(FusedMoE):
         m_indices = torch.empty(
             all_tokens, device=hidden_states.device, dtype=torch.int32
         )
-        output_index = torch.empty_like(topk_ids)
 
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
@@ -1115,8 +1328,10 @@ class DeepEPMoE(FusedMoE):
                 pin_memory=True,
                 device="cpu",
             ).cuda(non_blocking=True)
+        output_index = torch.empty(
+            topk_ids.shape, device=topk_ids.device, dtype=torch.int32
+        )
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
-
         ep_scatter(
             hidden_states,
             hidden_states_scale,
@@ -1180,7 +1395,9 @@ class DeepEPMoE(FusedMoE):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        ep_gather(down_output, topk_ids, topk_weights, output_index, gather_out)
+        _ep_gather_with_optional_lightop(
+            down_output, topk_ids, topk_weights, output_index, gather_out
+        )
 
         return gather_out
 
