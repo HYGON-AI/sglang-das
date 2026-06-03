@@ -27,6 +27,7 @@ else:
         cutlass_mla_decode,
         cutlass_mla_get_workspace_size,
         merge_state_v2,
+        normal_decode_metadata_general,
     )
     from sgl_kernel.cutlass_moe import (
         cutlass_w4a8_moe_mm,
