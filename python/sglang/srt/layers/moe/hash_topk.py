@@ -17,9 +17,11 @@ from sglang.srt.layers.moe.topk import (
     _maybe_override_topk_ids_random,
     _topk_ids_postprocess,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_compiler_backend, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 class HashTopK(nn.Module):

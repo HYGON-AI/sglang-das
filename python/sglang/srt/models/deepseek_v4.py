@@ -881,12 +881,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             if _is_dcu and _use_aiter_tilelang_mhc:
                 out = mhc_post_fwd(
-                    x.unsqueeze(0), # [n0, n1, h]
-                    residual.unsqueeze(0), # [n0, n1, mhc_mult, h]
-                    post.unsqueeze(0).unsqueeze(-1), # [n0, n1, mhc_mult, 1]
-                    comb.unsqueeze(0), # [n0, n1, mhc_mult, mhc_mult]
+                    x, 
+                    residual,
+                    post, 
+                    comb, 
                 )
-                return out.squeeze(0)
+                return out
             else:
                 from sglang.srt.layers.mhc import mhc_post
                 return mhc_post(x, residual, post, comb)
