@@ -57,7 +57,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
-
+  m.def(
+      "normal_decode_metadata_general(Tensor seq_lens, Tensor req_to_token, Tensor req_pool_indices, "
+      "Tensor! cache_seqlens_int32, Tensor! cu_seqlens_k, Tensor! page_table, Tensor? swa_page_table, "
+      "Tensor? full_to_swa_mapping, int max_seq_pages, int page_size, int seq_len_delta, bool use_swa) -> ()");
+  m.impl("normal_decode_metadata_general", torch::kCUDA, &normal_decode_metadata_general);
+  
   /*
    * From csrc/elementwise
    */

@@ -722,12 +722,12 @@ class DeepEPMoE(FusedMoE):
         M, K = hidden_states.size()
         N = self.w13_weight.size(1)
         w13_weight_fp8 = (
-            self.w13_weight,
-            (self.w13_weight_scale),
+            self.w13_weight_deepgemm,
+            self.w13_weight_scale,
         )
         w2_weight_fp8 = (
-            self.w2_weight,
-            (self.w2_weight_scale),
+            self.w2_weight_deepgemm,
+            self.w2_weight_scale,
         )
 
         hidden_states_shape = hidden_states.shape
@@ -777,7 +777,7 @@ class DeepEPMoE(FusedMoE):
         )
 
         gateup_output = torch.zeros(
-            (all_tokens, N * 16),
+            (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
@@ -1340,15 +1340,16 @@ class DeepEPMoE(FusedMoE):
         expected_m = min(m, expected_m)
 
         # ---- weights & scales ----
-        w13_weight = self.w13_weight
+        w13_weight = self.w13_weight_deepgemm
         w13_scales = self.w13_weight_scale
-        w2_weight = self.w2_weight
+        w2_weight = self.w2_weight_deepgemm
         w2_scales = self.w2_weight_scale
 
         n1 = w13_scales.size(1)
         gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
         # ---- first GEMM ----
-        m_grouped_fp8_gemm_nt_masked(
+        from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+        m_grouped_fp8_gemm_nt_masked_ll(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -1372,7 +1373,7 @@ class DeepEPMoE(FusedMoE):
         if enable_overlap:
             down_gemm_overlap_args.start_event.record()
 
-        m_grouped_fp8_gemm_nt_masked(
+        m_grouped_fp8_gemm_nt_masked_ll(
             (q_a2_all, q_a2_scale),
             (w2_weight, w2_scales),
             down_output,

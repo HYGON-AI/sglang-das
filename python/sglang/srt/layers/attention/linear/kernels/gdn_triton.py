@@ -198,8 +198,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            from aiter.ops.triton.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
-            return fused_sigmoid_gating_delta_rule_update(
+            from aiter.ops.triton.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update as aiter_fused_sigmoid_gating_delta_rule_update
+            return aiter_fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,
                 dt_bias=dt_bias,
                 q=q,

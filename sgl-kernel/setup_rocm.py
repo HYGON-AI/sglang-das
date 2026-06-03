@@ -44,6 +44,7 @@ sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/topk.cu",
@@ -70,9 +71,9 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+if amdgpu_target not in ["gfx938", "gfx942", "gfx950"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx938', 'gfx942', or 'gfx950'."
     )
     sys.exit(1)
 
