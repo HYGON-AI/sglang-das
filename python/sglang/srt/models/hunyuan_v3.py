@@ -123,6 +123,16 @@ class HYV3MoEFused(nn.Module):
             params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
+        self.experts = FusedMoE(
+            num_experts=self.n_routed_experts,
+            top_k=top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            reduce_results=False,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+        )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             use_grouped_topk=True,
@@ -132,7 +142,7 @@ class HYV3MoEFused(nn.Module):
             scoring_func=scoring_func,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=self.router_scaling_factor,
-            apply_routed_scaling_factor_on_output=True,
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
 
         if getattr(config, "num_shared_experts", 0) > 0:
@@ -148,16 +158,6 @@ class HYV3MoEFused(nn.Module):
         else:
             self.shared_mlp = None
 
-        self.experts = FusedMoE(
-            num_experts=self.n_routed_experts,
-            top_k=top_k,
-            hidden_size=config.hidden_size,
-            intermediate_size=intermediate_size,
-            reduce_results=False,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
-        )
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:

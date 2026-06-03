@@ -63,7 +63,6 @@ elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-    print(f"YYYY: _use_lightop: {_use_lightop}")
     if _use_lightop:
         from lightop import op as ops
         from lightop import fuse_silu_and_mul, fuse_silu_mul_fp8_quant
