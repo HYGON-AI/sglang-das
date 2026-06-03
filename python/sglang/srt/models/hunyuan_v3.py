@@ -47,8 +47,19 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_cuda
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_dcu = is_dcu()
+_use_fused_hunyuan_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
+
+if _is_dcu:
+    from lightop import rms_rotary_embedding_fuse_with_kv_store
 
 
 class HYV3FeedForward(nn.Module):
@@ -314,6 +325,15 @@ class HYV3Attention(nn.Module):
             rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
             self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
+        self.page_size = 64
+        if get_global_server_args().kv_cache_dtype == "fp8_e4m3":
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        elif get_global_server_args().kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_dtype = torch.float8_e5m2
+        elif get_global_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
+        else:
+            self.kv_cache_dtype = None
 
     def forward(
         self,
@@ -324,14 +344,86 @@ class HYV3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.use_qk_norm:
+        can_fuse_set_kv = (
+            self.head_dim == self.rotary_emb.rotary_dim
+            and enable_fused_set_kv_buffer(forward_batch)
+        )
+
+        if (
+            _is_dcu
+            and _use_fused_hunyuan_rotary
+            and self.use_qk_norm
+            and can_fuse_set_kv
+        ):
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
+                cos_sin_cache = cos_sin_cache.to(
+                    q.device, dtype=q.dtype, non_blocking=True
+                )
+                self.rotary_emb.cos_sin_cache = cos_sin_cache
+
+            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+                self.attn.layer_id
+            )
+            kv_cache_dtype = self.kv_cache_dtype or k_buffer.dtype
+            q, k, v = rms_rotary_embedding_fuse_with_kv_store(
+                positions,
+                q,
+                k,
+                v,
+                cos_sin_cache,
+                self.head_dim,
+                self.page_size,
+                k_buffer,
+                v_buffer,
+                forward_batch.out_cache_loc,
+                is_neox=True,
+                weight_q=self.q_norm.weight,
+                weight_k=self.k_norm.weight,
+                output_dtype=kv_cache_dtype,
+                residual_q=None,
+                residual_k=None,
+                k_scale=None,
+                v_scale=None,
+                epsilon=self.q_norm.variance_epsilon,
+            )
+        elif self.use_qk_norm:
             q = self.q_norm(q.reshape(-1, self.head_dim))
             q = q.view(-1, self.q_size)
             k = self.k_norm(k.reshape(-1, self.head_dim))
             k = k.view(-1, self.kv_size)
-
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if can_fuse_set_kv
+                    else None
+                ),
+            )
+        else:
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if can_fuse_set_kv
+                    else None
+                ),
+            )
+        attn_output = self.attn(
+            q, k, v, forward_batch, save_kv_cache=not can_fuse_set_kv
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
