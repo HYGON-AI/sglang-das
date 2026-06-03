@@ -104,7 +104,7 @@ concurrency:
 jobs:
   check-changes:
     name: Check changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && (inputs.runner_label || vars.DCU_CI_RUNNER_LABEL) || 'ubuntu-latest' }}
     outputs:
       dcu: ${{ steps.filter.outputs.dcu || steps.run-mode.outputs.run_all_tests }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
@@ -196,7 +196,7 @@ jobs:
       - check-changes
       - call-gate
     if: always() && needs.check-changes.outputs.dcu == 'true' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && (inputs.runner_label || vars.DCU_CI_RUNNER_LABEL) || 'ubuntu-latest' }}
     outputs:
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
@@ -242,7 +242,29 @@ jobs:
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify DCU registration
+        if: github.event_name != 'workflow_dispatch'
         run: python3 scripts/ci/dcu/verify_dcu_registration.py
+
+      - name: Setup DCU validation container
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
+          DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+          DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+
+      - name: Verify DCU registration in container
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
+        run: bash scripts/ci/dcu/dcu_ci_exec.sh --container-name "${DCU_CI_CONTAINER_NAME}" -w /sglang-checkout -- python3 scripts/ci/dcu/verify_dcu_registration.py
+
+      - name: Cleanup DCU validation container
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
+        run: docker rm -f "${DCU_CI_CONTAINER_NAME}" >/dev/null 2>&1 || true
 
   stage-a-test-1-gpu-small-dcu:
     name: Stage A DCU smoke
@@ -443,7 +465,7 @@ jobs:
       - stage-a-test-1-gpu-small-dcu
       - stage-b-test-1-gpu-small-dcu
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && (inputs.runner_label || vars.DCU_CI_RUNNER_LABEL) || 'ubuntu-latest' }}
     steps:
       - name: Check all dependent job statuses
         run: |
