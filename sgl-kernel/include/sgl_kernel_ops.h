@@ -23,6 +23,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <tuple>
+#include <optional>
 #include <vector>
 
 #include "scalar_type.hpp"
@@ -124,7 +125,20 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t num_batches,
     int64_t sm_count = 0,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
-
+void normal_decode_metadata_general(
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& req_to_token,
+    const torch::Tensor& req_pool_indices,
+    torch::Tensor& cache_seqlens_int32,
+    torch::Tensor& cu_seqlens_k,
+    torch::Tensor& page_table,
+    std::optional<torch::Tensor> swa_page_table,
+    std::optional<torch::Tensor> full_to_swa_mapping,
+    int64_t max_seq_pages,
+    int64_t page_size,
+    int64_t seq_len_delta,
+    bool use_swa);
+    
 /*
  * From csrc/elementwise
  */

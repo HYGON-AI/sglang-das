@@ -12,6 +12,9 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper
 
+from sglang.srt.utils import get_bool_env_var
+_use_prefill_aiter_linear_attn = get_bool_env_var("SGLANG_USE_AITER_LINEAR_ATTN")
+
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
@@ -148,27 +151,50 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=128,
-        BV=64,
-        USE_G=g is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
-    )
+    if not _use_prefill_aiter_linear_attn:
+        chunk_fwd_kernel_o[grid](
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            cu_seqlens,
+            chunk_indices,
+            scale,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=128,
+            BV=64,
+            USE_G=g is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        from aiter.ops.triton.fla.sglang.chunk_o import launch_chunk_fwd_kernel_o
+        launch_chunk_fwd_kernel_o(
+            q=q,
+            k=k,
+            v=v,
+            h=h,
+            g=g,
+            o=o,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            NT=NT,
+            B=B,
+            kernel_cfg=None,
+        )
     return o
