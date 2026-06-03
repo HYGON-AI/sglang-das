@@ -264,7 +264,13 @@ jobs:
         if: always() && github.event_name == 'workflow_dispatch'
         env:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
-        run: docker rm -f "${DCU_CI_CONTAINER_NAME}" >/dev/null 2>&1 || true
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
+            host_uid="$(id -u)"
+            host_gid="$(id -g)"
+            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
+            docker rm -f "${DCU_CI_CONTAINER_NAME}"
+          fi
 
   stage-a-test-1-gpu-small-dcu:
     name: Stage A DCU smoke
