@@ -38,6 +38,7 @@ else:
 
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
+    _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,

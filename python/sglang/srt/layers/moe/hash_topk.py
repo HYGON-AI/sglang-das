@@ -14,7 +14,6 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
-    _maybe_override_topk_ids_random,
     _topk_ids_postprocess,
 )
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu
@@ -131,7 +130,7 @@ class HashTopK(nn.Module):
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
 
-        topk_ids = _maybe_override_topk_ids_random(topk_ids, self.num_experts)
+        # topk_ids = _maybe_override_topk_ids_random(topk_ids, self.num_experts)
         topk_ids = _topk_ids_postprocess(
             topk_ids, expert_location_dispatch_info, num_token_non_padded
         )
