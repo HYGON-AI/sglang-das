@@ -16,6 +16,7 @@ CONTAINER="${DCU_CI_CONTAINER:-${DCU_CI_CONTAINER_NAME:-ci_sglang}}"
 SKIP_DEPENDENCY_INSTALL="${DCU_CI_SKIP_DEPENDENCY_INSTALL:-0}"
 SKIP_REQUIREMENTS_INSTALL="${DCU_CI_SKIP_REQUIREMENTS_INSTALL:-0}"
 SKIP_SGLANG_BUILD="${DCU_CI_SKIP_SGLANG_BUILD:-0}"
+SKIP_COMPAT_INSTALL="${DCU_CI_SKIP_COMPAT_INSTALL:-0}"
 
 run_in_container() {
   docker exec "${CONTAINER}" bash -c "$*"
@@ -28,7 +29,7 @@ import importlib
 import sys
 
 print(f"python {sys.version.split()[0]}")
-for name in ["sglang", "torch", "pytest", "tabulate", "sgl_kernel"]:
+for name in ["sglang", "torch", "pytest", "tabulate", "sgl_kernel", "kernels", "tvm_ffi"]:
     try:
         module = importlib.import_module(name)
         version = getattr(module, "__version__", "unknown")
@@ -55,8 +56,16 @@ install_with_retry() {
   done
 }
 
+if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; then
+  echo "[dcu-ci] DCU_CI_SKIP_COMPAT_INSTALL=${SKIP_COMPAT_INSTALL}; skipping DCU compatibility pins"
+else
+  echo "[dcu-ci] Installing DCU compatibility pins"
+  install_with_retry docker exec "${CONTAINER}" \
+    pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.9" tabulate
+fi
+
 if [[ "${SKIP_DEPENDENCY_INSTALL}" == "1" || "${SKIP_DEPENDENCY_INSTALL}" == "true" ]]; then
-  echo "[dcu-ci] DCU_CI_SKIP_DEPENDENCY_INSTALL=${SKIP_DEPENDENCY_INSTALL}; skipping all dependency installation"
+  echo "[dcu-ci] DCU_CI_SKIP_DEPENDENCY_INSTALL=${SKIP_DEPENDENCY_INSTALL}; skipping regular dependency installation"
   print_python_status
   exit 0
 fi
