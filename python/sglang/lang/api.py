@@ -43,6 +43,7 @@ def _apply_dcu_ci_runtime_defaults(kwargs):
     if all(kwargs.get(key) is None for key in attn_keys):
         kwargs["attention_backend"] = "fa3"
     kwargs.setdefault("trust_remote_code", True)
+    kwargs.setdefault("page_size", 64)
 
 
 def Runtime(*args, **kwargs):
@@ -55,6 +56,8 @@ def Runtime(*args, **kwargs):
 
 
 def Engine(*args, **kwargs):
+    _apply_dcu_ci_runtime_defaults(kwargs)
+
     # Avoid importing unnecessary dependency
     from sglang.srt.entrypoints.engine import Engine
 
