@@ -260,7 +260,7 @@ def test_moe_align_block_size_compare_implementations(
 @pytest.mark.parametrize("topk", [2, 6])
 @pytest.mark.parametrize("k", [128, 511, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
+@pytest.mark.skipif(_is_hip, reason="Skip for DCU/ROCm GPU")
 def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
     input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
     actual = torch.empty((m, k), device="cuda", dtype=dtype)

@@ -429,7 +429,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         if not _use_aiter:
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
-                "but AITER is not available. AITER requires AMD GPUs with "
+                "but AITER is not available. AITER requires DCU/ROCm GPUs with "
                 "SGLANG_USE_AITER=1 environment variable set."
             )
         return aiter_w8a8_block_fp8_linear

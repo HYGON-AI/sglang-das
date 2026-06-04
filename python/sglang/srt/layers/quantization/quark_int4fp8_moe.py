@@ -143,7 +143,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         if not _is_hip:
             raise NotImplementedError(
-                "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+                "The quark_int4fp8_moe online quantization scheme is only supported on DCU/ROCm GPUs."
             )
 
     def get_weight_loader(self, layer, original_weight_loader):

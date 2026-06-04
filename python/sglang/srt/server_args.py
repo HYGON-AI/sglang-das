@@ -4414,12 +4414,12 @@ class ServerArgs:
         if is_hip():
             if not self.disable_cuda_graph:
                 logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                    "Cuda graph is disabled for diffusion LLM inference on DCU/ROCm GPUs"
                 )
                 self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                    "Attention backend is set to triton for diffusion LLM inference on DCU/ROCm GPUs"
                 )
                 self.attention_backend = "triton"
         elif is_npu():
@@ -6530,7 +6530,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for DCU/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
