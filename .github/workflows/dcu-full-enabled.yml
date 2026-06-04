@@ -54,7 +54,7 @@ concurrency:
 jobs:
   check-full-trigger:
     name: Check full trigger
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
     outputs:
       should_run: ${{ steps.trigger.outputs.should_run }}
     steps:
@@ -89,7 +89,7 @@ jobs:
     name: Validate DCU full config
     needs: check-full-trigger
     if: needs.check-full-trigger.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
     outputs:
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
@@ -143,7 +143,7 @@ jobs:
     name: Full enabled DCU (${{ matrix.name }})
     needs: validate-config
     if: needs.validate-config.result == 'success'
-    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -338,7 +338,7 @@ jobs:
       - validate-config
       - full-enabled-dcu
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
     steps:
       - name: Check all dependent job statuses
         run: |
