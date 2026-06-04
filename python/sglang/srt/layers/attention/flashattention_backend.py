@@ -50,6 +50,8 @@ _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
 
+_is_dcu = is_dcu()
+
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_dcu():
         props = torch.cuda.get_device_properties(0)
@@ -3017,66 +3019,97 @@ def normal_decode_set_metadata(
             num_stages=3,
         )
     else:
-        # General kernel for page_size > 1 or SWA cases
-        # SWA parameters
-        if use_swa:
-            assert isinstance(token_to_kv_pool, SWAKVPool)
-            swa_page_table = swa_page_table.contiguous()
-            swa_page_table_stride_0 = swa_page_table.stride(0)
-            swa_page_table_stride_1 = swa_page_table.stride(1)
-            # Extract the full_to_swa_index_mapping from token_to_kv_pool
-            full_to_swa_mapping = (
-                token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+        if _is_dcu:
+            from sgl_kernel import normal_decode_metadata_general as normal_decode_metadata_general_sgl
+            # General kernel for page_size > 1 or SWA cases
+            # SWA parameters
+            if use_swa:
+                assert isinstance(token_to_kv_pool, SWAKVPool)
+                swa_page_table = swa_page_table.contiguous()
+                # Extract the full_to_swa_index_mapping from token_to_kv_pool
+                full_to_swa_mapping = (
+                    token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+                )
+            else:
+                # Dummy tensors (not used)
+                swa_page_table = torch.empty(0, dtype=torch.int32, device=device)
+                full_to_swa_mapping = torch.empty(0, dtype=torch.int32, device=device)
+
+            normal_decode_metadata_general_sgl(
+                seq_lens,
+                req_to_token,
+                req_pool_indices,
+                cache_seqlens_int32,
+                cu_seqlens_k,
+                page_table,
+                swa_page_table,
+                full_to_swa_mapping,
+                max_seq_pages,
+                page_size,
+                seq_len_delta,
+                use_swa,
             )
-            full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
         else:
-            # Dummy tensors (not used)
-            swa_page_table = torch.empty(0, dtype=torch.int32, device=device)
-            swa_page_table_stride_0 = 0
-            swa_page_table_stride_1 = 0
-            full_to_swa_mapping = torch.empty(0, dtype=torch.int32, device=device)
-            full_to_swa_mapping_stride_0 = 0
+            # General kernel for page_size > 1 or SWA cases
+            # SWA parameters
+            if use_swa:
+                assert isinstance(token_to_kv_pool, SWAKVPool)
+                swa_page_table = swa_page_table.contiguous()
+                swa_page_table_stride_0 = swa_page_table.stride(0)
+                swa_page_table_stride_1 = swa_page_table.stride(1)
+                # Extract the full_to_swa_index_mapping from token_to_kv_pool
+                full_to_swa_mapping = (
+                    token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+                )
+                full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
+            else:
+                # Dummy tensors (not used)
+                swa_page_table = torch.empty(0, dtype=torch.int32, device=device)
+                swa_page_table_stride_0 = 0
+                swa_page_table_stride_1 = 0
+                full_to_swa_mapping = torch.empty(0, dtype=torch.int32, device=device)
+                full_to_swa_mapping_stride_0 = 0
 
-        # Kernel configuration
-        BLOCK_COLS = 128
-        shift = (page_size).bit_length() - 1 if page_size > 1 else 0
+            # Kernel configuration
+            BLOCK_COLS = 128
+            shift = (page_size).bit_length() - 1 if page_size > 1 else 0
 
-        if max_seq_pages == 0:
-            grid = (1, 1)
-        else:
-            num_blocks_j = triton.cdiv(max_seq_pages, BLOCK_COLS)
-            grid = (batch_size, num_blocks_j)
+            if max_seq_pages == 0:
+                grid = (1, 1)
+            else:
+                num_blocks_j = triton.cdiv(max_seq_pages, BLOCK_COLS)
+                grid = (batch_size, num_blocks_j)
 
-        _fused_metadata_kernel_general[grid](
-            seq_lens,
-            seq_lens_stride_0,
-            req_to_token,
-            req_to_token_stride_0,
-            req_to_token_stride_1,
-            req_pool_indices,
-            req_pool_indices_stride_0,
-            cache_seqlens_int32,
-            cache_seqlens_int32_stride_0,
-            cu_seqlens_k,
-            cu_seqlens_k_stride_0,
-            page_table,
-            page_table_stride_0,
-            page_table_stride_1,
-            swa_page_table,
-            swa_page_table_stride_0,
-            swa_page_table_stride_1,
-            full_to_swa_mapping,
-            full_to_swa_mapping_stride_0,
-            batch_size,
-            max_seq_pages,
-            page_size,
-            seq_len_delta,
-            use_swa,
-            shift,
-            BLOCK_COLS=BLOCK_COLS,
-            num_warps=4,
-            num_stages=3,
-        )
+            _fused_metadata_kernel_general[grid](
+                seq_lens,
+                seq_lens_stride_0,
+                req_to_token,
+                req_to_token_stride_0,
+                req_to_token_stride_1,
+                req_pool_indices,
+                req_pool_indices_stride_0,
+                cache_seqlens_int32,
+                cache_seqlens_int32_stride_0,
+                cu_seqlens_k,
+                cu_seqlens_k_stride_0,
+                page_table,
+                page_table_stride_0,
+                page_table_stride_1,
+                swa_page_table,
+                swa_page_table_stride_0,
+                swa_page_table_stride_1,
+                full_to_swa_mapping,
+                full_to_swa_mapping_stride_0,
+                batch_size,
+                max_seq_pages,
+                page_size,
+                seq_len_delta,
+                use_swa,
+                shift,
+                BLOCK_COLS=BLOCK_COLS,
+                num_warps=4,
+                num_stages=3,
+            )
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

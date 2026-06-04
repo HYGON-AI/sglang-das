@@ -347,53 +347,26 @@ def chunk_gated_delta_rule_fwd_h(
             NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         )
     else:
-        if _is_dcu:
-            from aiter.ops.triton.fla.sglang.chunk_delta_h import launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64
-            launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
-                k=k,
-                u=u,
-                w=w,
-                v_new=v_new,
-                g=g,
-                gk=gk,
-                h=h,
-                initial_state=initial_state,
-                initial_state_indices=initial_state_indices,
-                cu_seqlens=cu_seqlens,
-                chunk_offsets=chunk_offsets,
-                N=N,
-                T=T,
-                H=H,
-                Hg=Hg,
-                K=K,
-                V=V,
-                BT=BT,
-                kernel_cfg=None,
-            )
-        else:
-            from aiter.ops.triton.fla.chunk_delta_h import launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64
-            launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
-                k=k,
-                u=u,
-                w=w,
-                v_new=v_new,
-                g=g,
-                gk=gk,
-                h=h,
-                initial_state=initial_state,
-                initial_state_indices=initial_state_indices,
-                final_state=None,
-                cu_seqlens=cu_seqlens,
-                chunk_offsets=chunk_offsets,
-                N=N,
-                T=T,
-                H=H,
-                Hg=Hg,
-                K=K,
-                V=V,
-                BT=BT,
-                use_exp2=False,
-                transpose_state_layout=True,
-                kernel_cfg=None,
-            )
+        from aiter.ops.triton.fla.sglang.chunk_delta_h import launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+        launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
+            k=k,
+            u=u,
+            w=w,
+            v_new=v_new,
+            g=g,
+            gk=gk,
+            h=h,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
+            N=N,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            kernel_cfg=None,
+        )
     return h, v_new

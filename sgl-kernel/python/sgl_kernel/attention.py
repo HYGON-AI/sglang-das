@@ -111,3 +111,32 @@ def cutlass_mla_get_workspace_size(
     return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count, num_kv_splits
     )
+
+def normal_decode_metadata_general(
+    seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table: torch.Tensor,
+    swa_page_table: Optional[torch.Tensor],
+    full_to_swa_mapping: Optional[torch.Tensor],
+    max_seq_pages: int,
+    page_size: int,
+    seq_len_delta: int,
+    use_swa: bool,
+) -> None:
+    torch.ops.sgl_kernel.normal_decode_metadata_general.default(
+        seq_lens,
+        req_to_token,
+        req_pool_indices,
+        cache_seqlens_int32,
+        cu_seqlens_k,
+        page_table,
+        swa_page_table,
+        full_to_swa_mapping,
+        max_seq_pages,
+        page_size,
+        seq_len_delta,
+        use_swa,
+    )
