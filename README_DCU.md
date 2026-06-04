@@ -235,4 +235,10 @@ curl -X POST http://localhost:30002/v1/completions \
 - [README_ORIGIN](README_ORIGIN.md)
 - [https://github.com/sgl-project/sglang](https://github.com/sgl-project/sglang)
 
+## License
 
+本仓库基于 [SGLang](https://github.com/sgl-project/sglang) `v0.5.12` 版本进行 DCU 平台适配和优化，上游项目采用 Apache License, Version 2.0。
+
+Hygon Information Technology Co., Ltd. 对 DCU 适配、修改和新增贡献部分同样采用 Apache License, Version 2.0。
+
+本仓库保留上游 SGLang 项目的版权声明和许可证条款，详见 `LICENSE` 和 `THIRD_PARTY_NOTICES.md`。
