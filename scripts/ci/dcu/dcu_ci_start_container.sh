@@ -59,9 +59,15 @@ VISIBLE_ENV_ARGS=()
 if [[ -n "${VISIBLE_DEVICES}" ]]; then
   VISIBLE_ENV_ARGS+=(
     -e "HIP_VISIBLE_DEVICES=${VISIBLE_DEVICES}"
-    -e "ROCR_VISIBLE_DEVICES=${VISIBLE_DEVICES}"
     -e "CUDA_VISIBLE_DEVICES=${VISIBLE_DEVICES}"
   )
+  # On DTK/PyTorch, setting HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES to
+  # the same numeric ordinal can make torch fail GPU initialization. HIP is
+  # enough for SGLang CI device selection; expose ROCR only when explicitly
+  # requested for lower-level runtime diagnostics.
+  if [[ "${DCU_CI_SET_ROCR_VISIBLE_DEVICES:-0}" == "1" ]]; then
+    VISIBLE_ENV_ARGS+=(-e "ROCR_VISIBLE_DEVICES=${VISIBLE_DEVICES}")
+  fi
 fi
 
 CACHE_HOST="${DCU_CACHE_HOST:-${DCU_CI_CACHE_HOST:-/home/runner/sgl-data}}"
