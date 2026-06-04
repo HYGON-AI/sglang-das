@@ -50,7 +50,7 @@ from sglang.utils import get_exception_traceback, normalize_base_url
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = os.environ.get(
     "SGLANG_TEST_DEFAULT_MODEL_NAME",
-    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
 )
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = os.environ.get(
     "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME", "meta-llama/Llama-3.2-1B-Instruct"
@@ -151,7 +151,7 @@ DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = os.environ.get(
 )
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = os.environ.get(
     "SGLANG_TEST_DEFAULT_REASONING_MODEL_NAME",
-    "/public/opendas/DL_DATA/llm-models/deepseek-r1/DeepSeek-R1-Distill-Qwen-7B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
 )
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
@@ -160,7 +160,7 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = os.environ.get(
     "SGLANG_TEST_DEFAULT_ENABLE_THINKING_MODEL_NAME",
-    "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B",
+    "Qwen/Qwen3-30B-A3B",
 )
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"

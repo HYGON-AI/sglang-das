@@ -18,9 +18,7 @@ from sglang.test.test_utils import (
 
 register_dcu_ci(est_time=600, suite="stage-b-test-1-gpu-small-dcu")
 
-DEFAULT_QWEN25_0P5B_MODEL = (
-    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-0.5B-Instruct"
-)
+DEFAULT_QWEN25_0P5B_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 def _get_model_path() -> str:

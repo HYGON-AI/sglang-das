@@ -18,10 +18,7 @@ from sglang.test.test_utils import (
 
 register_dcu_ci(est_time=1200, suite="stage-b-test-1-gpu-small-dcu")
 
-DEFAULT_DCU_EMBEDDING_MODEL = (
-    "/public/opendas/DL_DATA/llm-models/vllm-optest-models/Qwen/"
-    "Qwen3-Embedding-0.6B"
-)
+DEFAULT_DCU_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 
 class TestBW1000QwenEmbeddingDCU(unittest.TestCase):

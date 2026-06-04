@@ -48,7 +48,7 @@ register_dcu_ci(
 if os.environ.get("SGLANG_IS_IN_CI_DCU"):
     _dcu_embedding_model = os.environ.get(
         "SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME",
-        "/public/opendas/DL_DATA/llm-models/vllm-optest-models/Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
     )
     MODEL_TO_CONFIG = {_dcu_embedding_model: (1, 1e-5)}
 else:

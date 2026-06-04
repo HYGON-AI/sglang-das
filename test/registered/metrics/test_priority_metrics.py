@@ -30,7 +30,7 @@ register_dcu_ci(
 
 _MODEL_NAME = os.environ.get(
     "SGLANG_TEST_PRIORITY_METRICS_MODEL",
-    "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B",
+    "Qwen/Qwen3-0.6B",
 )
 
 

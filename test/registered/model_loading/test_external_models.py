@@ -23,7 +23,7 @@ class TestExternalModels(CustomTestCase):
         prompt = "Today is a sunny day and I like"
         model_path = os.environ.get(
             "SGLANG_TEST_EXTERNAL_MODEL_NAME",
-            "/public/opendas/DL_DATA/llm-models/qwen2/Qwen2-VL-2B-Instruct",
+            "Qwen/Qwen2-VL-2B-Instruct",
         )
 
         engine = sgl.Engine(

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True)
 
-DEFAULT_QWEN3_MOE_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-30B-A3B"
+DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
 
 
 class TestBW1000Qwen3ThirtyBMoEServerDCU(unittest.TestCase):

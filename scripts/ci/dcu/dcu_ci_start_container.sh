@@ -73,6 +73,7 @@ fi
 
 MODEL_HOST_PATH="${DCU_MODEL_HOST_PATH:-/public/opendas/DL_DATA/llm-models}"
 if [[ -d "${MODEL_HOST_PATH}" ]]; then
+  # This mount also exposes the default DCU accuracy datasets under llm-models.
   MODEL_VOLUME="-v ${MODEL_HOST_PATH}:${MODEL_HOST_PATH}:ro"
 else
   MODEL_VOLUME=""

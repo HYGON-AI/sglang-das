@@ -77,8 +77,7 @@ TRANSFORMERS_BASE_VERSION = Version(TRANSFORMERS_VERSION).base_version
 if os.environ.get("SGLANG_IS_IN_CI_DCU"):
     _dcu_mrope_models = os.environ.get(
         "SGLANG_TEST_DCU_MROPE_MODELS",
-        "/public/opendas/DL_DATA/llm-models/qwen2/Qwen2-VL-2B-Instruct,"
-        "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-VL-3B-Instruct",
+        "Qwen/Qwen2-VL-2B-Instruct,Qwen/Qwen2.5-VL-3B-Instruct",
     )
     MODELS_TO_TEST = [
         MRoPETestInfo(model_name=model.strip())

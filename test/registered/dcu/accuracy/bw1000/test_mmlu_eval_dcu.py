@@ -31,7 +31,7 @@ DEFAULT_DCU_SERVER_ARGS = [
     "--trust-remote-code",
 ]
 
-DEFAULT_DCU_MMLU_DATASET_PATH = "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
+DEFAULT_DCU_MMLU_DATASET_PATH = ""
 
 
 def _get_int_env(name: str, default: int) -> int:
@@ -61,7 +61,9 @@ def _get_model_env(name: str, default: str) -> str:
 def _get_optional_dataset_path_env(name: str) -> str | None:
     value = os.environ.get(name)
     if not value:
-        if os.path.exists(DEFAULT_DCU_MMLU_DATASET_PATH):
+        if DEFAULT_DCU_MMLU_DATASET_PATH and os.path.exists(
+            DEFAULT_DCU_MMLU_DATASET_PATH
+        ):
             return DEFAULT_DCU_MMLU_DATASET_PATH
         return None
     if not os.path.exists(value):

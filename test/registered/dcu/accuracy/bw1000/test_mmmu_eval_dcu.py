@@ -34,13 +34,11 @@ DEFAULT_DCU_VLM_SERVER_ARGS = [
 ]
 
 DEFAULT_DCU_MMMU_MODEL_CANDIDATES = [
-    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-VL-3B-Instruct",
-    "/public/opendas/DL_DATA/llm-models/qwen2/Qwen2-VL-2B-Instruct",
+    "Qwen/Qwen2.5-VL-3B-Instruct",
+    "Qwen/Qwen2-VL-2B-Instruct",
 ]
 
-DEFAULT_DCU_MMMU_DATASET_PATH = (
-    "/public/opendas/DL_DATA/llm-models/multimodal-datasets/MMMU"
-)
+DEFAULT_DCU_MMMU_DATASET_PATH = ""
 
 
 def _get_int_env(name: str, default: int) -> int:
@@ -56,13 +54,7 @@ def _get_float_env(name: str, default: float) -> float:
 def _get_model_env(name: str) -> str:
     model = os.environ.get(name, "")
     if not model:
-        for candidate in DEFAULT_DCU_MMMU_MODEL_CANDIDATES:
-            if os.path.exists(candidate):
-                return candidate
-        raise unittest.SkipTest(
-            f"{name} is required for DCU MMMU evaluation when no default local "
-            "VLM model path exists."
-        )
+        return DEFAULT_DCU_MMMU_MODEL_CANDIDATES[0]
     if model.startswith(("/", ".")) and not os.path.exists(model):
         raise AssertionError(f"{name} points to a missing local model path: {model}")
     return model
@@ -71,7 +63,9 @@ def _get_model_env(name: str) -> str:
 def _get_optional_path_env(name: str) -> str | None:
     path = os.environ.get(name)
     if not path:
-        if os.path.exists(DEFAULT_DCU_MMMU_DATASET_PATH):
+        if DEFAULT_DCU_MMMU_DATASET_PATH and os.path.exists(
+            DEFAULT_DCU_MMMU_DATASET_PATH
+        ):
             return DEFAULT_DCU_MMMU_DATASET_PATH
         return None
     if not os.path.exists(path):

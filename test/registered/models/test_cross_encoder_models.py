@@ -27,7 +27,7 @@ if os.environ.get("SGLANG_IS_IN_CI_DCU"):
         (
             os.environ.get(
                 "SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME",
-                "/public/opendas/DL_DATA/llm-models/vllm-optest-models/BAAI/bge-reranker-base",
+                "BAAI/bge-reranker-base",
             ),
             1,
             1e-2,
