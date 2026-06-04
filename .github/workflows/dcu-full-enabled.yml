@@ -136,8 +136,30 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify DCU registration
-        run: python3 scripts/ci/dcu/verify_dcu_registration.py
+      - name: Setup DCU validation container
+        env:
+          DCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+          DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+          DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+
+      - name: Verify DCU registration in container
+        env:
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+        run: bash scripts/ci/dcu/dcu_ci_exec.sh --container-name "${DCU_CI_CONTAINER_NAME}" -w /sglang-checkout -- python3 scripts/ci/dcu/verify_dcu_registration.py
+
+      - name: Cleanup DCU validation container
+        if: always()
+        env:
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
+            host_uid="$(id -u)"
+            host_gid="$(id -g)"
+            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
+            docker rm -f "${DCU_CI_CONTAINER_NAME}"
+          fi
 
   full-enabled-dcu:
     name: Full enabled DCU (${{ matrix.name }})
