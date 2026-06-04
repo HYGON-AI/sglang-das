@@ -10,6 +10,7 @@ on:
     branches:
       - v0.5.12_dev
       - main
+      - dcu-ci-pr
     paths:
       - ".github/workflows/dcu-full-enabled.yml"
       - ".github/workflows/pr-test-dcu.yml"
