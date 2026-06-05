@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Note: PYTHONPATH=python should be set when running tests
@@ -30,8 +30,11 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
-register_cuda_ci(est_time=11, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
 
+
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because modelopt_fp8 is unsupported on ROCm/HIP.
+register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled="DCU Stage-B deferred: modelopt_fp8 quantization is not supported in ROCm/HIP; BW1100 run failed 6 tests in test_modelopt_loader.py.")
 
 class TestModelOptModelLoader(CustomTestCase):
     """Test cases for ModelOptModelLoader functionality."""

@@ -1209,12 +1209,12 @@ class Glm4MoeForCausalLM(nn.Module):
         ):
             disable_reason = (
                 "Only GLM-4.5 on NV-platform with capability >= 80 "
-                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+                "or DCU/ROCm-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
         elif get_moe_expert_parallel_world_size() > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            disable_reason = "Only GLM-4.5 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
+            disable_reason = "Only GLM-4.5 on DCU/ROCm-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
         ):

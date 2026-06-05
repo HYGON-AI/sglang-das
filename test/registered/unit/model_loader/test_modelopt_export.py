@@ -17,10 +17,16 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader.loader import ModelOptModelLoader
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
-register_cuda_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+)
 
 # Note: PYTHONPATH=python should be set when running tests
 
@@ -321,10 +327,11 @@ class TestModelOptExportIntegration(unittest.TestCase):
 
         model_config = ModelConfig(
             model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            quantization="modelopt_fp8",
+            modelopt_quant="fp8",
+            modelopt_export_path=self.export_dir,
         )
 
-        load_config = LoadConfig(modelopt_export_path=self.export_dir)
+        load_config = LoadConfig()
         device_config = DeviceConfig()
 
         # Mock the quantization and export process

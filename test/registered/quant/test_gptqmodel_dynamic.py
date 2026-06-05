@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -14,8 +14,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=102, suite="stage-b-test-1-gpu-large")
 
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: vLLM dependency GPTQModel path needs DCU dependency validation before enabling.",
+)
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig

@@ -124,6 +124,19 @@ def _repo_relative_path(p: str) -> str:
     return p[idx + len(marker) :] if idx >= 0 else p
 
 
+def _is_dcu_ci_files(files: Union[List[TestFile], List[CIRegistry]]) -> bool:
+    return any(
+        isinstance(file, CIRegistry) and getattr(file.backend, "name", None) == "DCU"
+        for file in files
+    )
+
+
+def _sanitize_dcu_log_text(text: str, dcu_mode: bool) -> str:
+    if not dcu_mode:
+        return text
+    return text.replace("AMD", "DCU").replace("amd", "dcu")
+
+
 def run_unittest_files(
     files: Union[List[TestFile], List[CIRegistry]],
     timeout_per_file: float,
@@ -149,6 +162,7 @@ def run_unittest_files(
     if coredump_enabled:
         cuda_coredump.cleanup_dump_dir()
 
+    dcu_mode = _is_dcu_ci_files(files)
     tic = time.perf_counter()
     success = True
     passed_tests = []
@@ -173,13 +187,17 @@ def run_unittest_files(
 
             full_path = os.path.join(os.getcwd(), filename)
             logger.info(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
+                _sanitize_dcu_log_text(
+                    f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n",
+                    dcu_mode,
+                )
             )
             file_tic = time.perf_counter()
 
             cmd = ["python3", full_path, "-f"]
+            should_capture_output = capture_output or dcu_mode
 
-            if capture_output:
+            if should_capture_output:
                 # Capture output for retry decision
                 process = subprocess.Popen(
                     cmd,
@@ -190,7 +208,7 @@ def run_unittest_files(
                 )
                 output_lines = []
                 for line in process.stdout:
-                    logger.info(line.rstrip())
+                    logger.info(_sanitize_dcu_log_text(line.rstrip(), dcu_mode))
                     output_lines.append(line)
                 process.wait()
             else:
@@ -201,7 +219,10 @@ def run_unittest_files(
             file_elapsed[filename] = elapsed
 
             logger.info(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
+                _sanitize_dcu_log_text(
+                    f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                    dcu_mode,
+                )
             )
             return process.returncode
 
@@ -213,7 +234,10 @@ def run_unittest_files(
         while attempt <= (max_attempts if enable_retry else 1):
             if attempt > 1:
                 logger.info(
-                    f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n"
+                    _sanitize_dcu_log_text(
+                        f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n",
+                        dcu_mode,
+                    )
                 )
                 was_retried = True
 
@@ -229,7 +253,10 @@ def run_unittest_files(
                     file_passed = True
                     if was_retried:
                         logger.info(
-                            f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n"
+                            _sanitize_dcu_log_text(
+                                f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n",
+                                dcu_mode,
+                            )
                         )
                         retried_tests.append((filename, attempt, "passed"))
                     passed_tests.append(filename)
@@ -241,7 +268,12 @@ def run_unittest_files(
                         is_retriable, reason = is_retriable_failure(output)
 
                         if is_retriable:
-                            logger.info(f"\n[CI Retry] {filename} failed with {reason}")
+                            logger.info(
+                                _sanitize_dcu_log_text(
+                                    f"\n[CI Retry] {filename} failed with {reason}",
+                                    dcu_mode,
+                                )
+                            )
                             logger.info(
                                 f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n"
                             )
@@ -250,12 +282,18 @@ def run_unittest_files(
                             continue
                         else:
                             logger.info(
-                                f"\n[CI Retry] {filename} failed with {reason} - not retrying\n"
+                                _sanitize_dcu_log_text(
+                                    f"\n[CI Retry] {filename} failed with {reason} - not retrying\n",
+                                    dcu_mode,
+                                )
                             )
 
                     # No retry or not retriable
                     logger.info(
-                        f"\n✗ FAILED: {filename} returned exit code {ret_code}\n"
+                        _sanitize_dcu_log_text(
+                            f"\n✗ FAILED: {filename} returned exit code {ret_code}\n",
+                            dcu_mode,
+                        )
                     )
                     if was_retried:
                         retried_tests.append((filename, attempt, "failed"))
@@ -270,7 +308,10 @@ def run_unittest_files(
                 # appears in the TIMINGS block below.
                 file_elapsed[filename] = float(timeout_per_file)
                 logger.info(
-                    f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
+                    _sanitize_dcu_log_text(
+                        f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n",
+                        dcu_mode,
+                    )
                 )
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
@@ -301,15 +342,19 @@ def run_unittest_files(
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
-            logger.info(f"  {test}")
+            logger.info(_sanitize_dcu_log_text(f"  {test}", dcu_mode))
     if failed_tests:
         logger.info("\n✗ FAILED:")
         for test, reason in failed_tests:
-            logger.info(f"  {test} ({reason})")
+            logger.info(_sanitize_dcu_log_text(f"  {test} ({reason})", dcu_mode))
     if retried_tests:
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
-            logger.info(f"  {test} ({attempts} attempts, {result})")
+            logger.info(
+                _sanitize_dcu_log_text(
+                    f"  {test} ({attempts} attempts, {result})", dcu_mode
+                )
+            )
     logger.info(f"{'='*60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
@@ -321,15 +366,14 @@ def run_unittest_files(
     passed_set = set(passed_tests)
     logger.info("========== TIMINGS BEGIN ==========")
     for fname, elapsed in file_elapsed.items():
-        logger.info(
-            json.dumps(
-                {
-                    "file": _repo_relative_path(fname),
-                    "passed": fname in passed_set,
-                    "elapsed": round(elapsed),
-                }
-            )
+        timing_line = json.dumps(
+            {
+                "file": _repo_relative_path(fname),
+                "passed": fname in passed_set,
+                "elapsed": round(elapsed),
+            }
         )
+        logger.info(_sanitize_dcu_log_text(timing_line, dcu_mode))
     logger.info("========== TIMINGS END ==========")
 
     # Write GitHub Step Summary only if retries occurred
@@ -341,6 +385,7 @@ def run_unittest_files(
             summary += f"- ✓ Passed on retry: {', '.join(passed_on_retry)}\n"
         if failed_after_retry:
             summary += f"- ✗ Still failed: {', '.join(failed_after_retry)}\n"
+        summary = _sanitize_dcu_log_text(summary, dcu_mode)
         write_github_step_summary(summary)
 
     return 0 if success else -1

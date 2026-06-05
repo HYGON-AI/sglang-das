@@ -9,15 +9,20 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
 from sglang.test.test_utils import is_in_amd_ci
 
-register_cuda_ci(est_time=207, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=278, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
+register_dcu_ci(
+    est_time=278,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Stage-B deferred: deterministic suite spans flashinfer/fa3/triton backends; needs BW1100 backend repeat validation with local Qwen3-8B.",
+)
 
 
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")

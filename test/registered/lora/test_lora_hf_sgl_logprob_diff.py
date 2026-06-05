@@ -35,19 +35,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(
     est_time=150,
-    stage="stage-b",
-    runner_config="1-gpu-small",
+    suite="stage-b-test-1-gpu-small",
 )
 register_amd_ci(
     est_time=250,
     suite="stage-b-test-1-gpu-small-amd",
 )
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="BW1100 quick validation failed: Llama-2 local path is a broken /models symlink in sgl-test, and available TinyLlama LoRA lacks a compatible local base model.",
+)
+
 # Test configuration constants
 BASE_MODEL = "meta-llama/Llama-2-7b-hf"
 LORA_PATHS = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
