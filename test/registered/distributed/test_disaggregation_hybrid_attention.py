@@ -20,7 +20,7 @@ register_dcu_ci(
     est_time=500,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: disaggregation hybrid-attention path needs BW1000 multi-device validation before enabling.",
+    disabled="DCU CSV CI placeholder: disaggregation hybrid-attention path needs BW1100 multi-device validation before enabling.",
 )
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")

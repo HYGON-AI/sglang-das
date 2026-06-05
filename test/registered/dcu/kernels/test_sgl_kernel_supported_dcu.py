@@ -38,7 +38,7 @@ def _sanitize_dcu_log_text(text: str) -> str:
     return text.replace("AMD", "DCU").replace("amd", "dcu")
 
 
-class TestBW1000SupportedSGLKernelDCU(unittest.TestCase):
+class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
     def test_supported_kernel_whitelist(self):
         test_set = os.environ.get("SGLANG_DCU_KERNEL_TEST_SET", "nightly")
         if test_set not in KERNEL_TEST_SETS:

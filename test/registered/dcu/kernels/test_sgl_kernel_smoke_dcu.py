@@ -25,7 +25,7 @@ def _sanitize_dcu_log_text(text: str) -> str:
     return text.replace("AMD", "DCU").replace("amd", "dcu")
 
 
-class TestBW1000SmokeSGLKernelDCU(unittest.TestCase):
+class TestBW1100SmokeSGLKernelDCU(unittest.TestCase):
     def test_smoke_kernel_whitelist(self):
         repo_root = repo_root_from_test_file(__file__)
         kernel_root = repo_root / "sgl-kernel"

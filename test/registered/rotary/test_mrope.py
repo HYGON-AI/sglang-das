@@ -29,7 +29,7 @@ register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local Qwen2/Qwen2.5 VL configs load offline, but Qwen2VLTextConfig/Qwen2_5_VLTextConfig lack rope_theta and all 32 MRoPE parameterized cases fail on BW1000.",
+    disabled="DCU Stage-B deferred: local Qwen2/Qwen2.5 VL configs load offline, but Qwen2VLTextConfig/Qwen2_5_VLTextConfig lack rope_theta and all 32 MRoPE parameterized cases fail on BW1100.",
 )
 
 _is_cuda = is_cuda()

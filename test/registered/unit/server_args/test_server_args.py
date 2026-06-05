@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
 register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
 
 # Mock get_device() so all tests run on CPU-only CI runners

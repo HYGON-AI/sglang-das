@@ -29,7 +29,7 @@ register_amd_ci(est_time=132, suite="stage-b-test-1-gpu-small-amd-nondeterminist
 register_dcu_ci(
     est_time=132,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: reward-model matrix uses remote HF models; local reward model mapping is not yet validated on BW1000.",
+    disabled="DCU Stage-B deferred: reward-model matrix uses remote HF models; local reward model mapping is not yet validated on BW1100.",
 )
 
 MODELS = [

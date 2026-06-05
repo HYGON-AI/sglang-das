@@ -19,7 +19,7 @@ register_dcu_ci(
     est_time=30,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: INT8 kernel path needs BW1000 numeric validation before enabling.",
+    disabled="DCU CSV CI placeholder: INT8 kernel path needs BW1100 numeric validation before enabling.",
 )
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):

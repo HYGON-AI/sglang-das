@@ -23,7 +23,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: flashinfer MLA path is not a BW1000 quick framework target.",
+    disabled="DCU CSV CI placeholder: flashinfer MLA path is not a BW1100 quick framework target.",
 )
 
 class TestFlashinferMLA(CustomTestCase):

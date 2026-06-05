@@ -30,7 +30,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: EAGLE speculative decoding path needs BW1000 draft/target model mapping before enabling.",
+    disabled="DCU CSV CI placeholder: EAGLE speculative decoding path needs BW1100 draft/target model mapping before enabling.",
 )
 
 class TestEAGLEServerBasic(EagleServerBase):

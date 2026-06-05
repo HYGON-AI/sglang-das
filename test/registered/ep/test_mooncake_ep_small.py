@@ -22,7 +22,7 @@ register_dcu_ci(
     est_time=660,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: Mooncake EP path needs BW1000 multi-device validation before enabling.",
+    disabled="DCU CSV CI placeholder: Mooncake EP path needs BW1100 multi-device validation before enabling.",
 )
 
 ib_devices = get_rdma_devices_args()

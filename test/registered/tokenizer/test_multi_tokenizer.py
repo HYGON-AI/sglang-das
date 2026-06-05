@@ -20,7 +20,7 @@ register_cuda_ci(est_time=230, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: keep disabled because TTFT/latency gate failed on local Qwen2.5-7B.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because TTFT/latency gate failed on local Qwen2.5-7B.
 register_dcu_ci(
     est_time=345,
     suite="stage-b-test-1-gpu-small-dcu",

@@ -25,7 +25,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: standalone speculative decoding path needs BW1000 draft model validation before enabling.",
+    disabled="DCU CSV CI placeholder: standalone speculative decoding path needs BW1100 draft model validation before enabling.",
 )
 
 GSM_DATASET_PATH = None

@@ -22,7 +22,7 @@ register_dcu_ci(
     est_time=100,
     suite="stage-b-test-1-gpu-small-dcu",
     disabled=(
-        "DCU PR baseline deferred: timed out after 900s on BW1000 "
+        "DCU PR baseline deferred: timed out after 900s on BW1100 "
         "sgl-test stage-b-dcu partition 0; keep in nightly/manual until "
         "radix-cache server integration is repeatable within PR budget."
     ),

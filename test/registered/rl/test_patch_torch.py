@@ -18,7 +18,7 @@ register_cuda_ci(est_time=19, suite="stage-b-test-2-gpu-large")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: multiprocessing CUDA tensor transfer failed on BW1000 with HIP_VISIBLE_DEVICES=2,3; 1 subtest passed and 3 subtests failed, then wrapper timed out during cleanup.",
+    disabled="DCU Stage-B deferred: multiprocessing CUDA tensor transfer failed on BW1100 with HIP_VISIBLE_DEVICES=2,3; 1 subtest passed and 3 subtests failed, then wrapper timed out during cleanup.",
 )
 
 class TestReleaseMemoryOccupation(unittest.TestCase):

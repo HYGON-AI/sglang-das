@@ -6,14 +6,14 @@ the convention used by `test/registered/amd/` and `test/registered/ascend/`.
 ## Layout
 
 - `interface/`       Smoke / API / health-check level tests.
-- `accuracy/bw1000/` GSM8K / MMLU / MMMU style accuracy evaluation.
-- `srt/bw1000/`      Dense text model server smoke tests.
-- `vlm_models/bw1000/` VLM server smoke tests.
-- `moe/bw1000/`      MoE model server smoke tests.
-- `embedding/bw1000/` Embedding OpenAI API smoke tests.
-- `reranker/bw1000/` Reranker OpenAI API smoke tests.
+- `accuracy/bw1100/` GSM8K / MMLU / MMMU style accuracy evaluation.
+- `srt/bw1100/`      Dense text model server smoke tests.
+- `vlm_models/bw1100/` VLM server smoke tests.
+- `moe/bw1100/`      MoE model server smoke tests.
+- `embedding/bw1100/` Embedding OpenAI API smoke tests.
+- `reranker/bw1100/` Reranker OpenAI API smoke tests.
 - `kernels/`         DCU-supported `sgl-kernel` whitelist tests.
-- `perf/`           Reserved for future BW1000 throughput / TTFT / TPOT / ITL benchmarks.
+- `perf/`           Reserved for future BW1100 throughput / TTFT / TPOT / ITL benchmarks.
 - `disaggregation/`  Reserved for PD-disaggregation tests that need DCU-specific impls.
 
 Broad DCU registrations for existing `test/registered/**` files live in their
@@ -24,10 +24,10 @@ tests.
 ## sglang-tly merge note
 
 The broad DCU registration set was merged from `sglang-tly` into the current
-BW1000 suite names. Historical `stage-a-dcu`, `stage-b-dcu`, and `k100/` names
+BW1100 suite names. Historical `stage-a-dcu`, `stage-b-dcu`, and `k100/` names
 from that repo are not used as current suite or directory names. Disabled and
 unverified registrations keep their original reasons so registration coverage is
-not mistaken for BW1000 pass status.
+not mistaken for BW1100 pass status.
 
 ## Registering a test
 
@@ -43,8 +43,8 @@ For nightly tests, set `nightly=True` and use a `nightly-dcu-*` suite.
 
 ## Accuracy tests
 
-DCU accuracy tests are organized by hardware generation.  BW1000 tests live in
-`accuracy/bw1000/` and currently cover:
+DCU accuracy tests are organized by hardware generation.  BW1100 tests live in
+`accuracy/bw1100/` and currently cover:
 
 - `test_gsm8k_eval_dcu.py`: text math reasoning accuracy.
 - `test_mmlu_eval_dcu.py`: text general knowledge accuracy.
@@ -56,24 +56,24 @@ Use `SGLANG_DCU_*` environment variables from `accuracy/README.md` to select
 models, sample sizes, thresholds, and launch arguments.
 
 Older planning notes may refer to this hardware target as K100. The current
-implementation and baseline documents use BW1000 for the accuracy directory and
+implementation and baseline documents use BW1100 for the accuracy directory and
 test class names.
 
-## BW1000 smoke model coverage
+## BW1100 smoke model coverage
 
-The first BW1000 registered smoke layer intentionally checks only startup and
-small API requests.  Accuracy thresholds stay in `accuracy/bw1000/`.
+The first BW1100 registered smoke layer intentionally checks only startup and
+small API requests.  Accuracy thresholds stay in `accuracy/bw1100/`.
 
 - Dense text: Qwen2.5-0.5B-Instruct, Qwen2.5-1.5B-Instruct, and
-  Qwen2.5-7B-Instruct in `srt/bw1000/`.
-- VLM: Qwen2.5-VL-3B-Instruct in `vlm_models/bw1000/`.
-- MoE: Qwen3-30B-A3B base and instruct variants in `moe/bw1000/`; BW1000 smoke defaults to TP2 (`--tp-size 2`).
-- Embedding: Qwen3-Embedding-0.6B in `embedding/bw1000/`; gte-Qwen2 remains an override candidate after tokenizer compatibility is fixed.
-- Reranker: Qwen3-Reranker-0.6B in `reranker/bw1000/`.
-- Kernels: only the known BW1000-supported `sgl-kernel` pytest whitelist in
+  Qwen2.5-7B-Instruct in `srt/bw1100/`.
+- VLM: Qwen2.5-VL-3B-Instruct in `vlm_models/bw1100/`.
+- MoE: Qwen3-30B-A3B base and instruct variants in `moe/bw1100/`; BW1100 smoke defaults to TP2 (`--tp-size 2`).
+- Embedding: Qwen3-Embedding-0.6B in `embedding/bw1100/`; gte-Qwen2 remains an override candidate after tokenizer compatibility is fixed.
+- Reranker: Qwen3-Reranker-0.6B in `reranker/bw1100/`.
+- Kernels: only the known BW1100-supported `sgl-kernel` pytest whitelist in
   `kernels/`.
 
-Default DCU server arguments follow the BW1000 cookbook/smoke baseline:
+Default DCU server arguments follow the BW1100 cookbook/smoke baseline:
 
 ```text
 --attention-backend fa3 --page-size 64 --trust-remote-code

@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 # Triton attention backend integration test with latency benchmark and MMLU eval
 register_cuda_ci(est_time=200, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(est_time=1400, suite="stage-b-test-1-gpu-large-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
+register_dcu_ci(est_time=1400, suite="stage-b-test-1-gpu-large-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestTritonAttnBackend(CustomTestCase):

@@ -19,7 +19,7 @@ register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local bge-reranker-base mapping added, but HFRunner/SRTRunner cross-encoder comparison hung before DCU allocation on BW1000.",
+    disabled="DCU Stage-B deferred: local bge-reranker-base mapping added, but HFRunner/SRTRunner cross-encoder comparison hung before DCU allocation on BW1100.",
 )
 
 if os.environ.get("SGLANG_IS_IN_CI_DCU"):

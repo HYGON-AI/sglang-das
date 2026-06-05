@@ -24,7 +24,7 @@ register_dcu_ci(
     est_time=200,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: local attention multi-device path needs BW1000 validation before enabling.",
+    disabled="DCU CSV CI placeholder: local attention multi-device path needs BW1100 validation before enabling.",
 )
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")

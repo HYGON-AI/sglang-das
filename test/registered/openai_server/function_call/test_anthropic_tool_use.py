@@ -32,7 +32,7 @@ register_dcu_ci(
     est_time=140,
     suite="stage-b-test-1-gpu-small-dcu",
     disabled=(
-        "BW1000 Llama3.2 local server starts with fa3, but Anthropic "
+        "BW1100 Llama3.2 local server starts with fa3, but Anthropic "
         "tool_choice/tool_use requests return 500/error events; 2/10 pass."
     ),
 )

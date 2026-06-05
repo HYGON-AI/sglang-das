@@ -20,7 +20,7 @@ register_dcu_ci(est_time=900, suite="stage-b-test-1-gpu-small-dcu")
 DEFAULT_QWEN25_1P5B_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 
-class TestBW1000Qwen25OnePointFiveBServerDCU(unittest.TestCase):
+class TestBW1100Qwen25OnePointFiveBServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = get_model_path(

@@ -50,7 +50,7 @@ register_amd_ci(est_time=103, suite="stage-b-test-2-gpu-large-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: RL runtime path needs BW1000 memory/model validation before required CI.",
+    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
 )
 
 mp.set_start_method("spawn", force=True)

@@ -47,7 +47,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled="BW1000 quick validation failed: Qwen/Qwen3-30B-A3B launches with --tp 2 while quick run exposes one GPU, causing HIP invalid device ordinal and server exit code -9.",
+    disabled="BW1100 quick validation failed: Qwen/Qwen3-30B-A3B launches with --tp 2 while quick run exposes one GPU, causing HIP invalid device ordinal and server exit code -9.",
 )
 
 MODEL = "Qwen/Qwen3-30B-A3B"

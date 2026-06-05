@@ -15,12 +15,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
+register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
 
 
-class TestBW1000Qwen3ThirtyBMoEServerDCU(unittest.TestCase):
+class TestBW1100Qwen3ThirtyBMoEServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = get_model_path("SGLANG_DCU_QWEN3_MOE_MODEL", DEFAULT_QWEN3_MOE_MODEL)

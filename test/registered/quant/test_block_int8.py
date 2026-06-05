@@ -18,7 +18,7 @@ register_amd_ci(est_time=22, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=22,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="BW1000 quick validation failed: W8A8 Block INT8 Fused MoE segfaults in the Triton JIT path; needs quant/MoE specialty validation.",
+    disabled="BW1100 quick validation failed: W8A8 Block INT8 Fused MoE segfaults in the Triton JIT path; needs quant/MoE specialty validation.",
 )
 
 # For test

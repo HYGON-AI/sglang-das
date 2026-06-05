@@ -20,7 +20,7 @@ register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: fused_moe_triton aborts/segfaults on BW1000 in fused_experts_impl/Triton launcher; keep disabled until backend crash is fixed.",
+    disabled="DCU Stage-B deferred: fused_moe_triton aborts/segfaults on BW1100 in fused_experts_impl/Triton launcher; keep disabled until backend crash is fixed.",
 )
 
 _is_hip = is_hip()

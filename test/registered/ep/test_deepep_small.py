@@ -24,7 +24,7 @@ register_dcu_ci(
     est_time=531,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: DeepEP small path needs BW1000 multi-device validation before enabling.",
+    disabled="DCU CSV CI placeholder: DeepEP small path needs BW1100 multi-device validation before enabling.",
 )
 
 class TestPureDP(CustomTestCase):

@@ -78,7 +78,7 @@ def _get_server_args_env(name: str) -> list[str]:
     return list(DEFAULT_DCU_SERVER_ARGS)
 
 
-class TestBW1000MMLUEvalDCU(unittest.TestCase):
+class TestBW1100MMLUEvalDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = _get_model_env("SGLANG_DCU_MMLU_MODEL", DEFAULT_MODEL_NAME_FOR_TEST)

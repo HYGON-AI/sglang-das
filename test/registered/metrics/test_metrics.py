@@ -25,7 +25,7 @@ register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=32,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: metrics endpoint starts with local Qwen3-0.6B on BW1000, but metrics output is missing sglang:cached_tokens_total; needs metrics/runtime validation before required CI.",
+    disabled="DCU Stage-B deferred: metrics endpoint starts with local Qwen3-0.6B on BW1100, but metrics output is missing sglang:cached_tokens_total; needs metrics/runtime validation before required CI.",
 )
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"

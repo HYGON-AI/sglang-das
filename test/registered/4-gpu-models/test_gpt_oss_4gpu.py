@@ -12,7 +12,7 @@ register_dcu_ci(
     est_time=300,
     suite="nightly-dcu-4-gpu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: 4-GPU GPT-OSS path needs BW1000 large-model validation before enabling.",
+    disabled="DCU CSV CI placeholder: 4-GPU GPT-OSS path needs BW1100 large-model validation before enabling.",
 )
 
 class TestGptOss4Gpu(BaseTestGptOss):

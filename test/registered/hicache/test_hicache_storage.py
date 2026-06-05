@@ -7,7 +7,7 @@ register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=300,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: hierarchical cache server fails during BW1000 startup with VMFault, scheduler exit -6/EOFError before MMLU begins.",
+    disabled="DCU Stage-B deferred: hierarchical cache server fails during BW1100 startup with VMFault, scheduler exit -6/EOFError before MMLU begins.",
 )
 
 import time

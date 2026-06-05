@@ -17,7 +17,7 @@ register_amd_ci(est_time=275, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: scheduler path needs BW1000 repeat validation before required CI.",
+    disabled="DCU PR baseline deferred: scheduler path needs BW1100 repeat validation before required CI.",
 )
 
 class TestOverlapSchedule(CustomTestCase):

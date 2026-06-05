@@ -36,7 +36,7 @@ def _get_model_path() -> str:
     return model_path
 
 
-class TestBW1000Qwen25HalfBServerDCU(unittest.TestCase):
+class TestBW1100Qwen25HalfBServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = _get_model_path()

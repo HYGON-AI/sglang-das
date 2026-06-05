@@ -41,7 +41,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.',
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
 )
 
 class HiCacheStorageBaseMixin:

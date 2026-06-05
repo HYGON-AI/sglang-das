@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=600, suite="stage-b-test-2-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-2-gpu-large-amd")
-register_dcu_ci(est_time=1100, suite="nightly-dcu-perf", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
+register_dcu_ci(est_time=1100, suite="nightly-dcu-perf", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestBenchServing2GPU(CustomTestCase):

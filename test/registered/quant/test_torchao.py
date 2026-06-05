@@ -10,7 +10,7 @@ register_amd_ci(est_time=230, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=230,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: torchao is not installed in the BW1000 CI container; quantization path needs dependency and runtime validation.",
+    disabled="DCU Stage-B deferred: torchao is not installed in the BW1100 CI container; quantization path needs dependency and runtime validation.",
 )
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree

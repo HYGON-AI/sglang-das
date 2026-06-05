@@ -26,7 +26,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu-accuracy",
     nightly=True,
-    disabled="DCU accuracy registration placeholder; needs BW1000 accuracy baseline, thresholds, and local dataset/model paths.",
+    disabled="DCU accuracy registration placeholder; needs BW1100 accuracy baseline, thresholds, and local dataset/model paths.",
 )
 
 class TestMoEEvalAccuracyLarge(CustomTestCase, MMLUMixin, HumanEvalMixin, MGSMEnMixin):

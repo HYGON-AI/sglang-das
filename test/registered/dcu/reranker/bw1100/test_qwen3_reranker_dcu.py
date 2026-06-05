@@ -28,7 +28,7 @@ def _default_reranker_args() -> list[str]:
     return DCU_TEXT_SERVER_ARGS + ["--chat-template", str(template)]
 
 
-class TestBW1000Qwen3RerankerDCU(unittest.TestCase):
+class TestBW1100Qwen3RerankerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = get_model_path(

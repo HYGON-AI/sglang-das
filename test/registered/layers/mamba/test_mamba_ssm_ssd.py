@@ -3,7 +3,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 register_cuda_ci(est_time=15, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=34, suite="stage-b-test-1-gpu-small-amd")
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: mamba chunk scan path passed three runs.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: mamba chunk scan path passed three runs.
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",

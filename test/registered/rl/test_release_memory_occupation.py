@@ -64,7 +64,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: release-memory occupation path needs BW1000 runtime validation before enabling.",
+    disabled="DCU CSV CI placeholder: release-memory occupation path needs BW1100 runtime validation before enabling.",
 )
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly

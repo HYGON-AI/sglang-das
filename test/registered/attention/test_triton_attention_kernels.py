@@ -28,7 +28,7 @@ register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: triton attention kernels passed three runs.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: triton attention kernels passed three runs.
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",

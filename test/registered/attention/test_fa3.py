@@ -27,7 +27,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: FA3 attention path needs BW1000 backend validation before enabling.",
+    disabled="DCU CSV CI placeholder: FA3 attention path needs BW1100 backend validation before enabling.",
 )
 
 GSM_DATASET_PATH = None

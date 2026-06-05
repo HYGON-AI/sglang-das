@@ -33,7 +33,7 @@ register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=100,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: LoRA path needs local base/adapter mapping and dedicated BW1000 validation.",
+    disabled="DCU PR baseline deferred: LoRA path needs local base/adapter mapping and dedicated BW1100 validation.",
 )
 
 class TestMultiLoRABackend(CustomTestCase):

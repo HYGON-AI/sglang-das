@@ -6,7 +6,7 @@ register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="BW1000 quick validation timed out after 900s: inclusionAI/LLaDA2.0-mini server stayed running with flashinfer/DLLM path and did not finish the first pytest item.",
+    disabled="BW1100 quick validation timed out after 900s: inclusionAI/LLaDA2.0-mini server stayed running with flashinfer/DLLM path and did not finish the first pytest item.",
 )
 
 import unittest

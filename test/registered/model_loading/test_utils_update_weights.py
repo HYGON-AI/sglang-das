@@ -20,7 +20,7 @@ register_dcu_ci(
     est_time=60,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: update-weights utility path needs BW1000 model-loading validation before enabling.",
+    disabled="DCU CSV CI placeholder: update-weights utility path needs BW1100 model-loading validation before enabling.",
 )
 
 class AsyncEngine(Engine):

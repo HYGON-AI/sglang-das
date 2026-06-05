@@ -42,7 +42,7 @@ register_cuda_ci(est_time=73, suite="stage-b-test-1-gpu-small")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local gte-Qwen2 mapping added, but HFRunner/SRTRunner logits comparison hung before DCU allocation on BW1000; OpenAI embedding API smoke is enabled separately.",
+    disabled="DCU Stage-B deferred: local gte-Qwen2 mapping added, but HFRunner/SRTRunner logits comparison hung before DCU allocation on BW1100; OpenAI embedding API smoke is enabled separately.",
 )
 
 if os.environ.get("SGLANG_IS_IN_CI_DCU"):

@@ -6,7 +6,7 @@ register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=106,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: generation model matrix includes gated/remote models; needs a BW1000 local-model matrix before enabling.",
+    disabled="DCU Stage-B deferred: generation model matrix includes gated/remote models; needs a BW1100 local-model matrix before enabling.",
 )
 
 # Copyright 2023-2024 SGLang Team

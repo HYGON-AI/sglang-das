@@ -36,7 +36,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: encoder embedding model matrix needs BW1000 local model mapping before enabling.",
+    disabled="DCU CSV CI placeholder: encoder embedding model matrix needs BW1100 local model mapping before enabling.",
 )
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]

@@ -22,7 +22,7 @@ register_dcu_ci(
     est_time=900,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: DeepSeek-V3.2 large-model path needs BW1000 8-GPU validation before enabling.",
+    disabled="DCU CSV CI placeholder: DeepSeek-V3.2 large-model path needs BW1100 8-GPU validation before enabling.",
 )
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"

@@ -25,7 +25,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu-perf",
     nightly=True,
-    disabled="DCU benchmark registration placeholder; needs BW1000 performance baseline, thresholds, and local model path validation.",
+    disabled="DCU benchmark registration placeholder; needs BW1100 performance baseline, thresholds, and local model path validation.",
 )
 
 class TestBenchServing1GPULarge(CustomTestCase):

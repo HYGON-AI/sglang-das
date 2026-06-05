@@ -27,7 +27,7 @@ register_dcu_ci(
     est_time=520,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: W4A8 DeepSeek-V3 quant path needs BW1000 large-model validation before enabling.",
+    disabled="DCU CSV CI placeholder: W4A8 DeepSeek-V3 quant path needs BW1100 large-model validation before enabling.",
 )
 
 class TestDeepseekV3W4afp8(CustomTestCase):

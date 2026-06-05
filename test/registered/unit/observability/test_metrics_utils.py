@@ -9,7 +9,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_dcu_ci
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
 register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
 
 class TestMetricsUtils(unittest.TestCase):

@@ -28,7 +28,7 @@ register_amd_ci(
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: MLA path needs BW1000 numeric/backend validation before required CI.",
+    disabled="DCU PR baseline deferred: MLA path needs BW1100 numeric/backend validation before required CI.",
 )
 
 class TestMLADeepseekV3(CustomTestCase):

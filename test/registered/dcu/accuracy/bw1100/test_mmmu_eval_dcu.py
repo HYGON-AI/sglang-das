@@ -80,7 +80,7 @@ def _get_server_args_env(name: str) -> list[str]:
     return list(DEFAULT_DCU_VLM_SERVER_ARGS)
 
 
-class TestBW1000MMMUEvalDCU(unittest.TestCase):
+class TestBW1100MMMUEvalDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = _get_model_env("SGLANG_DCU_MMMU_MODEL")

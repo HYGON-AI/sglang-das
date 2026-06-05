@@ -18,11 +18,11 @@ register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: local Llama3.2-1B passed three runs.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: local Llama3.2-1B passed three runs.
 register_dcu_ci(
     est_time=73,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.',
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
 )
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):

@@ -31,7 +31,7 @@ register_amd_ci(
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: upstream TestReturnRoutedExperts class is unittest.skip flaky; BW1000 collection reports 3 skipped, so it is not a PR-gate candidate yet.",
+    disabled="DCU Stage-B deferred: upstream TestReturnRoutedExperts class is unittest.skip flaky; BW1100 collection reports 3 skipped, so it is not a PR-gate candidate yet.",
 )
 
 SHAREGPT_URL = (

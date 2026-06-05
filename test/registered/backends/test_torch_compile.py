@@ -23,7 +23,7 @@ register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: test is registered for DCU coverage but lacks three-pass BW1000 PR-gate repeat evidence.",
+    disabled="DCU PR baseline deferred: test is registered for DCU coverage but lacks three-pass BW1100 PR-gate repeat evidence.",
 )
 
 class TestTorchCompile(CustomTestCase, MMLUMixin):

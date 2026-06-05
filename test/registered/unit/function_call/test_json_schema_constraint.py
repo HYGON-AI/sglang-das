@@ -21,8 +21,8 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_dcu_ci
 register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
-register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
+register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 class TestJsonSchemaConstraint(unittest.TestCase):
     """Test JSON schema constraint generation for tool choices"""

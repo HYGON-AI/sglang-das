@@ -10,7 +10,7 @@ register_cuda_ci(est_time=20, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: EVS unit/doctest path passed three runs.
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: EVS unit/doctest path passed three runs.
 register_dcu_ci(
     est_time=20,
     suite="stage-b-test-1-gpu-small-dcu",

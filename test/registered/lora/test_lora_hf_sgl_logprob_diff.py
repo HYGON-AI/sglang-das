@@ -52,7 +52,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled="BW1000 quick validation failed: Llama-2 local path is a broken /models symlink in sgl-test, and available TinyLlama LoRA lacks a compatible local base model.",
+    disabled="BW1100 quick validation failed: Llama-2 local path is a broken /models symlink in sgl-test, and available TinyLlama LoRA lacks a compatible local base model.",
 )
 
 # Test configuration constants

@@ -27,7 +27,7 @@ register_cuda_ci(est_time=210, suite="stage-b-test-1-gpu-large", disabled="see #
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: RL runtime path needs BW1000 memory/model validation before required CI.",
+    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
 )
 
 ###############################################################################

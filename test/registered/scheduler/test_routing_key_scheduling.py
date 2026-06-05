@@ -24,7 +24,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled="BW1000 routing-key scheduling did not finish within the quick-validation window even after reducing long requests; needs scheduler专项 validation.",
+    disabled="BW1100 routing-key scheduling did not finish within the quick-validation window even after reducing long requests; needs scheduler专项 validation.",
 )
 
 class TestRoutingKeyScheduling(CustomTestCase):

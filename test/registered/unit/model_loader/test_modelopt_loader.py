@@ -33,8 +33,8 @@ DEFAULT_DEVICE = "cuda:0"
 register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
 
 
-# DCU BW1000 validated on 10.16.1.66/dxl-sglang: keep disabled because modelopt_fp8 is unsupported on ROCm/HIP.
-register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled="DCU Stage-B deferred: modelopt_fp8 quantization is not supported in ROCm/HIP; BW1000 run failed 6 tests in test_modelopt_loader.py.")
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because modelopt_fp8 is unsupported on ROCm/HIP.
+register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled="DCU Stage-B deferred: modelopt_fp8 quantization is not supported in ROCm/HIP; BW1100 run failed 6 tests in test_modelopt_loader.py.")
 
 class TestModelOptModelLoader(CustomTestCase):
     """Test cases for ModelOptModelLoader functionality."""

@@ -11,7 +11,7 @@ register_amd_ci(est_time=750, suite="stage-b-test-1-gpu-small-amd-mi35x")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: core/server path needs BW1000 model-runtime repeat validation before required CI.",
+    disabled="DCU PR baseline deferred: core/server path needs BW1100 model-runtime repeat validation before required CI.",
 )
 
 class TestGptOss1Gpu(BaseTestGptOss):

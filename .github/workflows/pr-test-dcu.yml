@@ -448,7 +448,7 @@ jobs:
               --include-file registered/constrained_decoding/test_constrained_decoding.py \
               --include-file registered/openai_server/features/test_json_mode.py \
               --include-file registered/metrics/test_priority_metrics.py \
-              --include-file registered/dcu/srt/bw1000/test_qwen25_0p5b_server_dcu.py \
+              --include-file registered/dcu/srt/bw1100/test_qwen25_0p5b_server_dcu.py \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size ${{ matrix.parts }} \
               --timeout-per-file ${{ matrix.timeout_per_file }} \

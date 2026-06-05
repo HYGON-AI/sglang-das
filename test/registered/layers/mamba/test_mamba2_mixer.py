@@ -22,7 +22,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: Mamba2 mixer path needs BW1000 backend validation before enabling.",
+    disabled="DCU CSV CI placeholder: Mamba2 mixer path needs BW1100 backend validation before enabling.",
 )
 
 NUM_GPUS = 2

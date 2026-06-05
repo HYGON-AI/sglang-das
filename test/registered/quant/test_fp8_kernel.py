@@ -17,7 +17,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: FP8 kernel path needs BW1000 numeric validation before enabling.",
+    disabled="DCU CSV CI placeholder: FP8 kernel path needs BW1100 numeric validation before enabling.",
 )
 
 class TestFP8Base(CustomTestCase):
