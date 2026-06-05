@@ -111,6 +111,7 @@ jobs:
       run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
     steps:
       - name: Checkout code
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
@@ -202,6 +203,13 @@ jobs:
       image: ${{ steps.resolve.outputs.image }}
       continue_on_error_flag: ${{ steps.resolve.outputs.continue_on_error_flag }}
     steps:
+      - name: Restore workspace ownership
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -289,6 +297,13 @@ jobs:
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
+      - name: Restore workspace ownership
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
+          fi
+
       - name: Checkout code
         env:
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
@@ -379,6 +394,13 @@ jobs:
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
+      - name: Restore workspace ownership
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
+          fi
+
       - name: Checkout code
         env:
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
