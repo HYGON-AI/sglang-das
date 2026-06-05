@@ -216,9 +216,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/".[!.]* "${GITHUB_WORKSPACE:?}/"..?* 2>/dev/null || true
-          git init "${GITHUB_WORKSPACE}"
-          cd "${GITHUB_WORKSPACE}"
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-validate"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
@@ -274,13 +277,21 @@ jobs:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
           DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
           DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
-        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+        run: |
+          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
+              --image "${DCU_CI_IMAGE}" \
+              --container-name "${DCU_CI_CONTAINER_NAME}"
 
       - name: Verify DCU registration in container
         if: github.event_name == 'workflow_dispatch'
         env:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
-        run: bash scripts/ci/dcu/dcu_ci_exec.sh --container-name "${DCU_CI_CONTAINER_NAME}" -w /sglang-checkout -- python3 scripts/ci/dcu/verify_dcu_registration.py
+        run: |
+          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" \
+            --container-name "${DCU_CI_CONTAINER_NAME}" \
+            -w /sglang-checkout \
+            -- python3 scripts/ci/dcu/verify_dcu_registration.py
 
       - name: Cleanup DCU validation container
         if: always() && github.event_name == 'workflow_dispatch'
@@ -311,22 +322,18 @@ jobs:
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
-      - name: Restore workspace ownership
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          if command -v sudo >/dev/null 2>&1; then
-            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
-          fi
-
       - name: Checkout code
         env:
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/".[!.]* "${GITHUB_WORKSPACE:?}/"..?* 2>/dev/null || true
-          git init "${GITHUB_WORKSPACE}"
-          cd "${GITHUB_WORKSPACE}"
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-stage-a"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
@@ -338,15 +345,19 @@ jobs:
           git checkout --force FETCH_HEAD
 
       - name: Setup DCU container
-        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+        run: |
+          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
+              --image "${DCU_CI_IMAGE}" \
+              --container-name "${DCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
 
       - name: Run stage-a-test-1-gpu-small-dcu
         timeout-minutes: 30
         run: |
-          bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
               --suite stage-a-test-1-gpu-small-dcu \
@@ -408,22 +419,18 @@ jobs:
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
     steps:
-      - name: Restore workspace ownership
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          if command -v sudo >/dev/null 2>&1; then
-            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
-          fi
-
       - name: Checkout code
         env:
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/".[!.]* "${GITHUB_WORKSPACE:?}/"..?* 2>/dev/null || true
-          git init "${GITHUB_WORKSPACE}"
-          cd "${GITHUB_WORKSPACE}"
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-stage-b-${{ matrix.part }}"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
@@ -435,15 +442,19 @@ jobs:
           git checkout --force FETCH_HEAD
 
       - name: Setup DCU container
-        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+        run: |
+          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
+              --image "${DCU_CI_IMAGE}" \
+              --container-name "${DCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
 
       - name: Run stage-b-test-1-gpu-small-dcu required partition
         run: |
           echo "Running stage-b-test-1-gpu-small-dcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
-          bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
               --suite stage-b-test-1-gpu-small-dcu \
