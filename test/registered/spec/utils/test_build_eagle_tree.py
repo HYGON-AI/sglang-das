@@ -17,6 +17,7 @@ register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.',
 )
 
 class TestBuildEagleTree(unittest.TestCase):

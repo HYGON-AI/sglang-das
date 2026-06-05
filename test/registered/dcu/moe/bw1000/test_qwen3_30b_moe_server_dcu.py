@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
 
 DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
 

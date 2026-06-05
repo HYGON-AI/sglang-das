@@ -24,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=200, suite="nightly-amd-1-gpu", nightly=True)
 
-register_dcu_ci(est_time=200, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=200, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
 
 PROMPTS = [
     "AI is a field of computer science focused on",

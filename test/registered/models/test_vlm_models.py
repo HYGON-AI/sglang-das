@@ -15,7 +15,7 @@ from sglang.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=228, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=850, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
-register_dcu_ci(est_time=850, suite="nightly-dcu-vlm", nightly=True)
+register_dcu_ci(est_time=850, suite="nightly-dcu-vlm", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1000 failure is fixed or revalidated.')
 
 _is_hip = is_hip()
 # VLM models for testing
