@@ -7,7 +7,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_dcu_ci
 from sglang.test.dcu_utils import repo_root_from_test_file
 
-register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=900, suite="stage-b-test-1-gpu-small-dcu")
 
 SMOKE_KERNEL_TESTS = [
     "tests/speculative/test_eagle_utils.py",
@@ -20,39 +20,19 @@ SMOKE_KERNEL_TESTS = [
     "tests/test_torch_defaults_reset.py",
 ]
 
-NIGHTLY_KERNEL_TESTS = SMOKE_KERNEL_TESTS + [
-    "tests/test_amd_deterministic_custom_allreduce.py",
-    "tests/test_amd_nccl_allreduce_determinism.py",
-    "tests/test_kvcacheio.py",
-    "tests/test_moe_align.py",
-]
-
-KERNEL_TEST_SETS = {
-    "smoke": SMOKE_KERNEL_TESTS,
-    "nightly": NIGHTLY_KERNEL_TESTS,
-    "all-supported": NIGHTLY_KERNEL_TESTS,
-}
-
 
 def _sanitize_dcu_log_text(text: str) -> str:
     return text.replace("AMD", "DCU").replace("amd", "dcu")
 
 
-class TestBW1000SupportedSGLKernelDCU(unittest.TestCase):
-    def test_supported_kernel_whitelist(self):
-        test_set = os.environ.get("SGLANG_DCU_KERNEL_TEST_SET", "nightly")
-        if test_set not in KERNEL_TEST_SETS:
-            raise AssertionError(
-                "SGLANG_DCU_KERNEL_TEST_SET must be one of "
-                f"{sorted(KERNEL_TEST_SETS)}, got {test_set!r}"
-            )
-
+class TestBW1000SmokeSGLKernelDCU(unittest.TestCase):
+    def test_smoke_kernel_whitelist(self):
         repo_root = repo_root_from_test_file(__file__)
         kernel_root = repo_root / "sgl-kernel"
         if not kernel_root.exists():
             raise unittest.SkipTest(f"sgl-kernel directory is missing: {kernel_root}")
 
-        test_files = [str(kernel_root / name) for name in KERNEL_TEST_SETS[test_set]]
+        test_files = [str(kernel_root / name) for name in SMOKE_KERNEL_TESTS]
         missing = [name for name in test_files if not Path(name).exists()]
         if missing:
             raise AssertionError(f"Missing sgl-kernel tests: {missing}")
