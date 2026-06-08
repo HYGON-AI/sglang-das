@@ -56,7 +56,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8, per_token_quant_fp8
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -315,6 +315,8 @@ class MQALayer(nn.Module):
             tp_size=attn_tp_size,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
+        if _FP8_WO_A_GEMM and quant_config is not None:
+            quant_config.ignore = [i for i in quant_config.ignore if 'wo_a' not in i]
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -327,8 +329,9 @@ class MQALayer(nn.Module):
         )
         if _FP8_WO_A_GEMM:
             assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+                self.wo_a, "weight_scale"
+            ), "FP8 quant_config must create weight_scale"
+            self.wo_a.weight_scale_inv = self.wo_a.weight_scale
             self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -694,19 +697,39 @@ class MQALayer(nn.Module):
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
-            import deep_gemm
+            import deepgemm as deep_gemm
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
+
+            o_fp8, o_s = per_token_quant_fp8(
                 o.reshape(T * G, D).contiguous(),
-                group_size=128,
             )
+
+            lhs_fp8 = o_fp8.view(T, G, D)
+            lhs_scale = o_s.view(T, G)
+
+            w = self.wo_a.weight
+            if tuple(w.shape) == (D, G * R):
+                rhs_fp8 = w.t().contiguous().view(G, R, D)
+            elif tuple(w.shape) == (G * R, D):
+                rhs_fp8 = w.contiguous().view(G, R, D)
+            else:
+                raise RuntimeError(
+                    f"unexpected wo_a.weight shape={tuple(w.shape)}, expected {(D, G * R)} or {(G * R, D)}"
+                )
+
+            weight_scale = getattr(self.wo_a, "weight_scale", None)
+            if weight_scale is None:
+                weight_scale = self.wo_a.weight_scale_inv
+            rhs_scale = weight_scale.data.reshape(G, R).contiguous()
+
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                (lhs_fp8, lhs_scale),
+                (rhs_fp8, rhs_scale),
                 output,
                 recipe=(1, 1, 128),
             )
@@ -1309,8 +1332,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM:
-            self._setup_fp8_wo_a_scales(is_nextn)
+        # if _FP8_WO_A_GEMM:
+        #     self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
             return
@@ -1454,6 +1477,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 compressed_tensors_names.append(
                     param_name.replace("_weight_scale_inv", "_weight_scale")
                 )
+            if param_name.endswith(".scale") and not param_name.endswith(
+                ".weight_scale"
+            ):
+                base = param_name[: -len(".scale")]
+                compressed_tensors_names.append(base + ".weight_scale_inv")
+                compressed_tensors_names.append(base + ".weight_scale")
 
             for compressed_tensors_name in compressed_tensors_names:
                 if compressed_tensors_name in params_dict:
