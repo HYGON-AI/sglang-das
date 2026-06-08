@@ -47,10 +47,12 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     use_int8_w8a8: bool = False
+    use_fp8_w8a8: bool = False
     global_num_experts: Optional[int] = None
     expert_map: Optional[torch.Tensor] = None
     moe_config_cache: Optional[dict] = None
     weight_cache: Optional[dict] = None
+    moe_c_weight_layout: bool = False
     layer: Optional[torch.nn.Module] = None
 
 
@@ -88,12 +90,73 @@ def process_weights_after_loading_aiter_w8a8_int8(layer: torch.nn.Module) -> Non
             "apply_router_weight_on_input=True."
         )
 
-    layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-    layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
-    setattr(layer, "_aiter_w8a8_int8_moe_c_w13_weight", None)
-    setattr(layer, "_aiter_w8a8_int8_moe_c_w2_weight", None)
+    with torch.no_grad():
+        w13_weight = moe_layout_shuffle_gemm1(layer.w13_weight).view(
+            *layer.w13_weight.shape
+        )
+    layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+
+    with torch.no_grad():
+        w2_weight = moe_layout_shuffle_gemm2(layer.w2_weight).view(
+            *layer.w2_weight.shape
+        )
+    layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+    setattr(layer, "_aiter_w8a8_int8_moe_c_w13_weight", layer.w13_weight)
+    setattr(layer, "_aiter_w8a8_int8_moe_c_w2_weight", layer.w2_weight)
     setattr(layer, "_aiter_w8a8_int8_moe_config_cache", {})
     setattr(layer, "_aiter_w8a8_int8_weight_cache", {})
+    setattr(layer, "_aiter_w8a8_int8_moe_c_weight_layout", True)
+
+
+def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None:
+    try:
+        from aiter.moe import (  # noqa: F401
+            MoeQuantType,
+            aiter_moe,
+            get_aiter_moe_config,
+        )
+        from aiter.ops.shuffle import (  # noqa: F401
+            moe_layout_shuffle_gemm1,
+            moe_layout_shuffle_gemm2,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "AITER FP8 W8A8 MoE is enabled but required aiter modules are "
+            "unavailable."
+        ) from exc
+
+    if not hasattr(MoeQuantType, "FP8_W8A8"):
+        raise RuntimeError(
+            "The installed aiter package does not expose MoeQuantType.FP8_W8A8."
+        )
+    moe_runner_config = getattr(layer, "moe_runner_config", None)
+    if getattr(layer, "apply_router_weight_on_input", False) or (
+        moe_runner_config is not None
+        and moe_runner_config.apply_router_weight_on_input
+    ):
+        raise RuntimeError(
+            "AITER FP8 W8A8 MoE does not support "
+            "apply_router_weight_on_input=True."
+        )
+
+    with torch.no_grad():
+        w13_weight = moe_layout_shuffle_gemm1(layer.w13_weight).view(
+            *layer.w13_weight.shape
+        )
+    layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+
+    with torch.no_grad():
+        w2_weight = moe_layout_shuffle_gemm2(layer.w2_weight).view(
+            *layer.w2_weight.shape
+        )
+    layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+    setattr(layer, "_aiter_w8a8_fp8_moe_c_w13_weight", layer.w13_weight)
+    setattr(layer, "_aiter_w8a8_fp8_moe_c_w2_weight", layer.w2_weight)
+    setattr(layer, "_aiter_w8a8_fp8_moe_config_cache", {})
+    setattr(layer, "_aiter_w8a8_fp8_weight_cache", {})
+    setattr(layer, "_aiter_w8a8_fp8_moe_c_weight_layout", True)
 
 
 def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
@@ -116,17 +179,48 @@ def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
         expert_map=expert_map,
         moe_config_cache=getattr(layer, "_aiter_w8a8_int8_moe_config_cache", None),
         weight_cache=getattr(layer, "_aiter_w8a8_int8_weight_cache", None),
+        moe_c_weight_layout=getattr(
+            layer, "_aiter_w8a8_int8_moe_c_weight_layout", False
+        ),
         layer=layer,
     )
 
 
-def _get_aiter_w8a8_quant_type():
+def get_aiter_w8a8_fp8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
+    dispatcher = getattr(layer, "dispatcher", None)
+    expert_map = (
+        getattr(dispatcher, "local_expert_mapping", None)
+        if getattr(dispatcher, "expert_mask_gpu", None) is not None
+        else None
+    )
+
+    return AiterMoeQuantInfo(
+        w13_weight=layer.w13_weight,
+        w2_weight=layer.w2_weight,
+        w13_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        a13_scale=layer.w13_input_scale,
+        a2_scale=layer.w2_input_scale,
+        use_fp8_w8a8=True,
+        global_num_experts=getattr(layer, "num_experts", None),
+        expert_map=expert_map,
+        moe_config_cache=getattr(layer, "_aiter_w8a8_fp8_moe_config_cache", None),
+        weight_cache=getattr(layer, "_aiter_w8a8_fp8_weight_cache", None),
+        moe_c_weight_layout=getattr(
+            layer, "_aiter_w8a8_fp8_moe_c_weight_layout", False
+        ),
+        layer=layer,
+    )
+
+
+def _get_aiter_w8a8_quant_type(use_fp8_w8a8: bool = False):
     from aiter.moe import MoeQuantType
 
-    quant_type = getattr(MoeQuantType, "W8A8", None)
+    quant_type_name = "FP8_W8A8" if use_fp8_w8a8 else "W8A8"
+    quant_type = getattr(MoeQuantType, quant_type_name, None)
     if quant_type is None:
         raise RuntimeError(
-            "The installed aiter package does not expose MoeQuantType.W8A8."
+            f"The installed aiter package does not expose MoeQuantType.{quant_type_name}."
         )
     return quant_type
 
@@ -143,12 +237,12 @@ def _get_aiter_w8a8_moe_config(
 
     if hidden_states.dim() != 2:
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE expects 2D hidden_states, got "
+            "AITER W8A8 MoE expects 2D hidden_states, got "
             f"shape={tuple(hidden_states.shape)}."
         )
     if w1.dim() != 3 or w2.dim() != 3:
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE expects 3D expert weights, got "
+            "AITER W8A8 MoE expects 3D expert weights, got "
             f"w1.shape={tuple(w1.shape)}, w2.shape={tuple(w2.shape)}."
         )
 
@@ -157,7 +251,7 @@ def _get_aiter_w8a8_moe_config(
     E2, N2, _ = w2.shape
     if E != E2 or K != K1 or K != N2:
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE shape mismatch: "
+            "AITER W8A8 MoE shape mismatch: "
             f"hidden_states={tuple(hidden_states.shape)}, "
             f"w1={tuple(w1.shape)}, w2={tuple(w2.shape)}."
         )
@@ -169,7 +263,7 @@ def _get_aiter_w8a8_moe_config(
         if moe_config is not None:
             return moe_config
 
-    quant_type = _get_aiter_w8a8_quant_type()
+    quant_type = _get_aiter_w8a8_quant_type(quant_info.use_fp8_w8a8)
     config_kwargs = dict(
         M=M,
         E=E,
@@ -188,10 +282,9 @@ def _get_aiter_w8a8_moe_config(
         config_kwargs.pop("activation", None)
         status, moe_config = get_aiter_moe_config(**config_kwargs)
 
-
     if not status:
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE did not find a valid backend config: "
+            "AITER W8A8 MoE did not find a valid backend config: "
             f"M={M}, N1={N1}, N2={N2}, K={K}, E={E}, topk={top_k}, "
             f"dtype={hidden_states.dtype}."
         )
@@ -222,12 +315,24 @@ def _get_aiter_w8a8_weights_for_solution(
     from aiter.ops.shuffle import moe_layout_shuffle_gemm1, moe_layout_shuffle_gemm2
 
     if solution_type != MoeSolutionType.MOE_C:
+        if quant_info.moe_c_weight_layout:
+            raise RuntimeError(
+                "AITER W8A8 weights were converted to MOE_C layout during "
+                "weight loading, but AITER selected a non-MOE_C solution: "
+                f"{solution_type}."
+            )
         return quant_info.w13_weight, quant_info.w2_weight
 
+    if quant_info.moe_c_weight_layout:
+        return quant_info.w13_weight, quant_info.w2_weight
+
+    cache_prefix = (
+        "_aiter_w8a8_fp8" if quant_info.use_fp8_w8a8 else "_aiter_w8a8_int8"
+    )
     layer = quant_info.layer
     if layer is not None:
-        w1_moe_c = getattr(layer, "_aiter_w8a8_int8_moe_c_w13_weight", None)
-        w2_moe_c = getattr(layer, "_aiter_w8a8_int8_moe_c_w2_weight", None)
+        w1_moe_c = getattr(layer, f"{cache_prefix}_moe_c_w13_weight", None)
+        w2_moe_c = getattr(layer, f"{cache_prefix}_moe_c_w2_weight", None)
         if w1_moe_c is not None and w2_moe_c is not None:
             return w1_moe_c, w2_moe_c
 
@@ -246,15 +351,15 @@ def _get_aiter_w8a8_weights_for_solution(
         )
 
     if layer is not None:
-        setattr(layer, "_aiter_w8a8_int8_moe_c_w13_weight", w1_moe_c)
-        setattr(layer, "_aiter_w8a8_int8_moe_c_w2_weight", w2_moe_c)
+        setattr(layer, f"{cache_prefix}_moe_c_w13_weight", w1_moe_c)
+        setattr(layer, f"{cache_prefix}_moe_c_w2_weight", w2_moe_c)
     if quant_info.weight_cache is not None:
         quant_info.weight_cache["moe_c_w13_weight"] = w1_moe_c
         quant_info.weight_cache["moe_c_w2_weight"] = w2_moe_c
     return w1_moe_c, w2_moe_c
 
 
-def _fused_experts_none_to_aiter_w8a8_int8(
+def _fused_experts_none_to_aiter_w8a8(
     dispatch_output: StandardDispatchOutput,
     quant_info: AiterMoeQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -266,7 +371,7 @@ def _fused_experts_none_to_aiter_w8a8_int8(
     assert not runner_config.no_combine, "no_combine=True is not supported by AITER"
     if runner_config.apply_router_weight_on_input:
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE does not support "
+            "AITER W8A8 MoE does not support "
             "apply_router_weight_on_input=True."
         )
 
@@ -326,15 +431,15 @@ def fused_experts_none_to_aiter(
     quant_info: AiterMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    if quant_info.use_int8_w8a8:
+    if quant_info.use_int8_w8a8 or quant_info.use_fp8_w8a8:
         if _is_dcu:
-            return _fused_experts_none_to_aiter_w8a8_int8(
+            return _fused_experts_none_to_aiter_w8a8(
                 dispatch_output,
                 quant_info,
                 runner_config,
             )
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE is only supported on DCU. "
+            "AITER W8A8 MoE is only supported on DCU. "
             "Use the native AITER path for other quantization modes."
         )
 
