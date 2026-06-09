@@ -233,7 +233,7 @@ def _get_aiter_w8a8_moe_config(
     activation: str,
     quant_info: AiterMoeQuantInfo,
 ):
-    from aiter.moe import MoeSolutionType, get_aiter_moe_config
+    from aiter.moe import AiterMoeConfig, MoeSolutionType, get_aiter_moe_config
 
     if hidden_states.dim() != 2:
         raise RuntimeError(

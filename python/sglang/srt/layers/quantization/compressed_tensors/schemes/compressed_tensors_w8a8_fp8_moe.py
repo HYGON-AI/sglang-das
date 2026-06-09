@@ -360,7 +360,17 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            _is_dcu
+            and self.runner.runner_backend.is_aiter()
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        ):
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                process_weights_after_loading_aiter_w8a8_fp8,
+            )
+
+            process_weights_after_loading_aiter_w8a8_fp8(layer)
+        elif self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -502,7 +512,28 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         moe_runner_config = self.moe_runner_config
 
-        if self.runner.runner_backend.is_aiter():
+        if (
+            _is_dcu
+            and self.runner.runner_backend.is_aiter()
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        ):
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_fp8_quant_info,
+            )
+
+            assert not moe_runner_config.no_combine, "unsupported"
+            quant_info = get_aiter_w8a8_fp8_quant_info(layer)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            if bias is not None:
+                from sglang.srt.layers.moe.token_dispatcher import (
+                    StandardCombineInput,
+                )
+
+                return StandardCombineInput(
+                    hidden_states=combine_input.hidden_states + bias
+                )
+            return combine_input
+        elif self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
                 AiterQuantType,
