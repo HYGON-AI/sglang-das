@@ -73,10 +73,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Prefer the current checkout over any preinstalled sglang package in the
-# container.  This keeps registered tests reproducible when iterating from a
-# mounted source tree.
-if [[ -z "${ENV_MAP[PYTHONPATH]+x}" ]]; then
+# Prefer the current checkout over any preinstalled sglang package in source
+# mode.  Wheel mode deliberately avoids this so tests import site-packages.
+if [[ "${DCU_CI_USE_INSTALLED_WHEELS:-0}" == "1" || "${DCU_CI_USE_INSTALLED_WHEELS:-0}" == "true" ]]; then
+  echo "[dcu-ci] DCU_CI_USE_INSTALLED_WHEELS=${DCU_CI_USE_INSTALLED_WHEELS}; not injecting /sglang-checkout/python into PYTHONPATH"
+elif [[ -z "${ENV_MAP[PYTHONPATH]+x}" ]]; then
   if [[ "$(basename "${WORKDIR}")" == "test" ]]; then
     SOURCE_ROOT="$(dirname "${WORKDIR}")"
   else

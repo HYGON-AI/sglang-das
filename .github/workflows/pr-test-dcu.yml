@@ -63,6 +63,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_wheel_mode:
+        description: "Force waiting for and installing DCU wheels"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -90,6 +95,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_wheel_mode:
+        description: "Force waiting for and installing DCU wheels"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: write
@@ -109,6 +119,8 @@ jobs:
       dcu: ${{ steps.filter.outputs.dcu || steps.run-mode.outputs.run_all_tests }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
       run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
+      wheel_required: ${{ steps.wheel.outputs.wheel_required }}
+      gateway_wheel_required: ${{ steps.wheel.outputs.gateway_wheel_required }}
     steps:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
@@ -180,6 +192,50 @@ jobs:
 
           echo "run_stage_a=${run_stage_a}" >> "${GITHUB_OUTPUT}"
           echo "run_stage_b=${run_stage_b}" >> "${GITHUB_OUTPUT}"
+
+      - name: Classify DCU wheel sync mode
+        id: wheel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_WHEEL_MODE: ${{ inputs.force_wheel_mode || false }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${FORCE_WHEEL_MODE}" == "true" ]]; then
+            echo "wheel_required=true" >> "${GITHUB_OUTPUT}"
+            echo "gateway_wheel_required=false" >> "${GITHUB_OUTPUT}"
+            echo "Wheel mode forced by workflow input."
+            exit 0
+          fi
+
+          if [[ "${EVENT_NAME}" != "pull_request" || -z "${BASE_SHA}" ]]; then
+            echo "wheel_required=false" >> "${GITHUB_OUTPUT}"
+            echo "gateway_wheel_required=false" >> "${GITHUB_OUTPUT}"
+            echo "Wheel mode disabled for non-PR run without force_wheel_mode."
+            exit 0
+          fi
+
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          echo "${changed_files}"
+
+          wheel_required=false
+          gateway_wheel_required=false
+
+          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py)'; then
+            wheel_required=true
+          fi
+
+          if echo "${changed_files}" | grep -Eq '^sgl-model-gateway/'; then
+            wheel_required=true
+            gateway_wheel_required=true
+          fi
+
+          echo "wheel_required=${wheel_required}" >> "${GITHUB_OUTPUT}"
+          echo "gateway_wheel_required=${gateway_wheel_required}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_required=${wheel_required}, gateway_wheel_required=${gateway_wheel_required}"
 
   call-gate:
     name: Call PR gate
@@ -305,13 +361,132 @@ jobs:
             docker rm -f "${DCU_CI_CONTAINER_NAME}"
           fi
 
+  wait-dcu-wheels:
+    name: Wait DCU wheels
+    needs:
+      - check-changes
+      - call-gate
+      - validate-config
+    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.wheel_required == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    outputs:
+      wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
+    env:
+      DCU_WHEEL_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
+      CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Resolve wheel target SHA
+        id: sha
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Using wheel short SHA: ${short_sha}"
+
+      - name: Wait for current commit DCU wheels
+        id: wait
+        run: |
+          set -euo pipefail
+          short_sha="${{ steps.sha.outputs.short_sha }}"
+          export CHECKOUT_REF="${short_sha}"
+          echo "Waiting for DCU wheels with g${short_sha}"
+
+          python3 - <<'PY_WAIT' | tee /tmp/dcu_wheel_urls.out
+          import html.parser
+          import os
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
+
+          base = os.environ["DCU_WHEEL_INDEX_URL"].rstrip("/") + "/"
+          short_sha = os.environ["CHECKOUT_REF"][:12]
+          gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
+          timeout_s = int(os.environ.get("DCU_WHEEL_WAIT_TIMEOUT", "3600"))
+          interval_s = int(os.environ.get("DCU_WHEEL_WAIT_INTERVAL", "60"))
+
+          class LinkParser(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag != "a":
+                      return
+                  for key, value in attrs:
+                      if key == "href":
+                          self.links.append(value)
+
+          def fetch_links(project):
+              url = urllib.parse.urljoin(base, project.strip("/") + "/")
+              with urllib.request.urlopen(url, timeout=30) as resp:
+                  parser = LinkParser()
+                  parser.feed(resp.read().decode("utf-8", errors="replace"))
+              return [urllib.parse.urljoin(url, link) for link in parser.links]
+
+          def find_wheel(projects, prefixes):
+              marker = f"g{short_sha}"
+              for project in projects:
+                  try:
+                      links = fetch_links(project)
+                  except Exception as exc:
+                      print(f"[wait-dcu-wheels] {project}: {type(exc).__name__}: {exc}", file=sys.stderr)
+                      continue
+                  for link in links:
+                      filename = urllib.parse.unquote(link.rsplit("/", 1)[-1].split("#", 1)[0])
+                      normalized = filename.replace("-", "_")
+                      if not filename.endswith(".whl") or marker not in filename:
+                          continue
+                      if any(normalized.startswith(prefix.replace("-", "_")) for prefix in prefixes):
+                          return link
+              return None
+
+          requirements = [
+              ("sglang", ["sglang"], ["sglang_"]),
+              ("sgl-kernel", ["sgl-kernel", "sglang-kernel", "sgl_kernel", "sglang_kernel"], ["sgl_kernel_", "sglang_kernel_"]),
+          ]
+          if gateway_required:
+              requirements.append(("sgl-model-gateway", ["sgl-model-gateway", "sgl_model_gateway"], ["sgl_model_gateway_"]))
+
+          deadline = time.time() + timeout_s
+          found = {}
+          while time.time() < deadline:
+              missing = []
+              for name, projects, prefixes in requirements:
+                  if name in found:
+                      continue
+                  wheel = find_wheel(projects, prefixes)
+                  if wheel:
+                      found[name] = wheel
+                      print(f"[wait-dcu-wheels] found {name}: {wheel}", file=sys.stderr)
+                  else:
+                      missing.append(name)
+              if len(found) == len(requirements):
+                  print(" ".join(found[name] for name, _, _ in requirements))
+                  sys.exit(0)
+              print(f"[wait-dcu-wheels] missing {missing}; sleep {interval_s}s", file=sys.stderr)
+              time.sleep(interval_s)
+
+          print(f"Timed out waiting for current commit wheels g{short_sha}; found={found}", file=sys.stderr)
+          sys.exit(1)
+          PY_WAIT
+          wheel_urls="$(tail -n 1 /tmp/dcu_wheel_urls.out)"
+          echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
+
   stage-a-test-1-gpu-small-dcu:
     name: Stage A DCU smoke
     needs:
       - check-changes
       - call-gate
       - validate-config
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      - wait-dcu-wheels
+    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-dcu-wheels.result == 'success' || needs.wait-dcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
@@ -321,6 +496,8 @@ jobs:
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
+      DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -382,7 +559,8 @@ jobs:
       - call-gate
       - validate-config
       - stage-a-test-1-gpu-small-dcu
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      - wait-dcu-wheels
+    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-dcu-wheels.result == 'success' || needs.wait-dcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
@@ -418,6 +596,8 @@ jobs:
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
+      DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -517,6 +697,7 @@ jobs:
       - check-changes
       - call-gate
       - validate-config
+      - wait-dcu-wheels
       - stage-a-test-1-gpu-small-dcu
       - stage-b-test-1-gpu-small-dcu
     if: always()
