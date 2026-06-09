@@ -77,6 +77,7 @@ done
 # mode.  Wheel mode deliberately avoids this so tests import site-packages.
 if [[ "${DCU_CI_USE_INSTALLED_WHEELS:-0}" == "1" || "${DCU_CI_USE_INSTALLED_WHEELS:-0}" == "true" ]]; then
   echo "[dcu-ci] DCU_CI_USE_INSTALLED_WHEELS=${DCU_CI_USE_INSTALLED_WHEELS}; not injecting /sglang-checkout/python into PYTHONPATH"
+  ENV_MAP[DCU_CI_USE_INSTALLED_WHEELS]="${DCU_CI_USE_INSTALLED_WHEELS}"
 elif [[ -z "${ENV_MAP[PYTHONPATH]+x}" ]]; then
   if [[ "$(basename "${WORKDIR}")" == "test" ]]; then
     SOURCE_ROOT="$(dirname "${WORKDIR}")"
