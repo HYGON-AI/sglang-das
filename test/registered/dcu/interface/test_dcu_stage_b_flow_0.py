@@ -27,6 +27,9 @@ class TestDCUStageBFlowZero(CustomTestCase):
         if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
             self.skipTest("Not running inside DCU CI container; skipping PYTHONPATH check.")
 
+        if os.environ.get("DCU_CI_USE_INSTALLED_WHEELS") == "1":
+            self.skipTest("Wheel mode: using installed package, not checkout source.")
+
         import sglang
 
         pythonpath = os.environ.get("PYTHONPATH", "")
