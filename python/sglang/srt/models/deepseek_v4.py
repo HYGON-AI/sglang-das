@@ -392,6 +392,8 @@ class MQALayer(nn.Module):
             )
         else:
             apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+        if q_out is not None:
+            q_out.copy_(q)
         return q
 
     def _compute_kv_to_cache(
@@ -608,6 +610,8 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
+        if q_out is not None:
+            q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -776,8 +780,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm: Optional[nn.Module] = None,
     ):
-        """If *norm* is given and the TileLang path is active, the returned
-        hidden_states are already post-norm (the norm is fused into the kernel)."""
+        """Return MHC-pre outputs and whether the optional RMSNorm was fused."""
 
         @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
@@ -812,6 +815,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     sinkhorn_repeat=self.hc_sinkhorn_iters,
                     n_splits=16,
                 )
+                # AITER MHC pre does not fuse the decoder-layer RMSNorm.
+                norm_fused = False
             else:
                 from sglang.srt.layers.mhc import mhc_pre
 
@@ -832,7 +837,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     sinkhorn_repeat=self.hc_sinkhorn_iters,
                     **norm_kwargs,
                 )
-            return y, post.squeeze(-1), comb, norm is not None
+                norm_fused = norm is not None
+            return y, post.squeeze(-1), comb, norm_fused
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # import deep_gemm

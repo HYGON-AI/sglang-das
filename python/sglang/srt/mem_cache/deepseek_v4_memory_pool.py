@@ -814,7 +814,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         return self.swa_kv_pool.set_key_buffer_lightop_fused(
-            self._swa_layer_id(layer_id), swa_loc, cache_k, eps
+            self._swa_local_layer_id(layer_id), swa_loc, cache_k, eps
         )
 
     def set_extra_key_buffer_fused(

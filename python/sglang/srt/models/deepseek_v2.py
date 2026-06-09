@@ -1407,7 +1407,6 @@ class DeepseekV2MoE(nn.Module):
             i_s = None
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
