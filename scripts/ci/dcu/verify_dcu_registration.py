@@ -25,10 +25,6 @@ from collections import defaultdict
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
-def _sanitize_dcu_log_text(text: str) -> str:
-    return text.replace("AMD", "DCU").replace("amd", "dcu")
-
-
 def _load_ci_register():
     """Load ci_register.py directly, bypassing sglang/__init__.py.
 
@@ -133,7 +129,7 @@ def main() -> int:
     for suite in sorted(by_suite):
         print(f"  [{suite}]")
         for line in by_suite[suite]:
-            print(_sanitize_dcu_log_text(f"    - {line}"))
+            print(f"    - {line}")
     print()
 
     unknown_suites = [

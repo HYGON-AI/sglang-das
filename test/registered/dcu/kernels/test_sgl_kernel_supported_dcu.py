@@ -34,10 +34,6 @@ KERNEL_TEST_SETS = {
 }
 
 
-def _sanitize_dcu_log_text(text: str) -> str:
-    return text.replace("AMD", "DCU").replace("amd", "dcu")
-
-
 class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
     def test_supported_kernel_whitelist(self):
         test_set = os.environ.get("SGLANG_DCU_KERNEL_TEST_SET", "nightly")
@@ -73,9 +69,9 @@ class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
 
         if result.returncode != 0:
             print("sgl-kernel stdout:")
-            print(_sanitize_dcu_log_text(result.stdout))
+            print(result.stdout)
             print("sgl-kernel stderr:")
-            print(_sanitize_dcu_log_text(result.stderr))
+            print(result.stderr)
         self.assertEqual(result.returncode, 0)
 
 

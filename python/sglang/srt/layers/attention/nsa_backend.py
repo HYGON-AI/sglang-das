@@ -62,7 +62,7 @@ if _is_hip and not _is_dcu:
         from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
     except ImportError:
         print(
-            "aiter is a DCU/ROCm kernel library. Please make sure aiter is installed on your DCU device."
+            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
     # from sglang.jit_kernel.flash_attention import (

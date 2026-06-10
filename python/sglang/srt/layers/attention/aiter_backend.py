@@ -49,7 +49,7 @@ try:
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
     print(
-        "aiter is a DCU/ROCm kernel library. Please make sure aiter is installed on your DCU device."
+        "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
 from sglang.srt.configs.model_config import AttentionArch

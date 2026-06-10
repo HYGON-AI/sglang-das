@@ -265,12 +265,6 @@ def filter_tests(
     return enabled_tests, skipped_tests
 
 
-def _sanitize_dcu_log_text(text: str, hw: HWBackend) -> str:
-    if hw != HWBackend.DCU:
-        return text
-    return text.replace("AMD", "DCU").replace("amd", "dcu")
-
-
 def _include_file_keys(filename: str, repo_root: str, test_root: str) -> set[str]:
     filename = os.path.normpath(os.path.abspath(filename))
     keys = {filename}
@@ -370,7 +364,7 @@ def pretty_print_tests(
         for t in ci_tests:
             msg += f"  - {t.filename} (est_time={t.est_time})\n"
 
-    print(_sanitize_dcu_log_text(msg, hw), flush=True)
+    print(msg, flush=True)
 
 
 def load_live_est(

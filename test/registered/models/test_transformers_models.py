@@ -79,7 +79,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
         self.assertGreater(metrics["accuracy"], self.gsm8k_lower_bound)
 
 
-@unittest.skipIf(is_hip(), "TorchAO int4wo quantization is not supported on DCU/ROCm GPUs")
+@unittest.skipIf(is_hip(), "TorchAO int4wo quantization is not supported on AMD GPUs")
 class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
     @classmethod
     def setUpClass(cls):
