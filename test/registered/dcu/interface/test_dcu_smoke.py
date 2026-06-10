@@ -38,3 +38,4 @@ class TestDCUSmoke(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+# CI auto-trigger verification: 20260610T103733Z
