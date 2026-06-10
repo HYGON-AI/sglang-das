@@ -114,7 +114,7 @@ concurrency:
 jobs:
   check-changes:
     name: Check changes
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && (inputs.runner_label || vars.DCU_CI_RUNNER_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       dcu: ${{ steps.filter.outputs.dcu || steps.run-mode.outputs.run_all_tests }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
@@ -253,7 +253,7 @@ jobs:
       - check-changes
       - call-gate
     if: always() && needs.check-changes.outputs.dcu == 'true' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && (inputs.runner_label || vars.DCU_CI_RUNNER_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
@@ -701,7 +701,7 @@ jobs:
       - stage-a-test-1-gpu-small-dcu
       - stage-b-test-1-gpu-small-dcu
     if: always()
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && (inputs.runner_label || vars.DCU_CI_RUNNER_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Check all dependent job statuses
         run: |
