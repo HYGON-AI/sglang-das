@@ -1477,12 +1477,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 compressed_tensors_names.append(
                     param_name.replace("_weight_scale_inv", "_weight_scale")
                 )
-            if param_name.endswith(".scale") and not param_name.endswith(
-                ".weight_scale"
-            ):
-                base = param_name[: -len(".scale")]
-                compressed_tensors_names.append(base + ".weight_scale_inv")
-                compressed_tensors_names.append(base + ".weight_scale")
+            if _FP8_WO_A_GEMM:
+                if param_name.endswith(".scale") and not param_name.endswith(
+                    ".weight_scale"
+                ):
+                    base = param_name[: -len(".scale")]
+                    compressed_tensors_names.append(base + ".weight_scale_inv")
+                    compressed_tensors_names.append(base + ".weight_scale")
 
             for compressed_tensors_name in compressed_tensors_names:
                 if compressed_tensors_name in params_dict:
