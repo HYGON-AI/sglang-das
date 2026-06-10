@@ -1,5 +1,9 @@
 name: Release DCU Wheels
 
+permissions:
+  contents: read
+  pull-requests: read
+
 on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
   push:
