@@ -42,6 +42,7 @@ _is_hip = is_hip()
 _is_dcu = is_dcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_aiter_fp8_w8a8_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
 if _use_aiter_fp8_w8a8_moe:
     import aiter
@@ -253,6 +254,37 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    @staticmethod
+    def _register_runtime_buffer(
+        layer: torch.nn.Module, name: str, value: torch.Tensor
+    ) -> None:
+        if name in layer._buffers:
+            layer._buffers[name] = value
+            layer._non_persistent_buffers_set.add(name)
+            return
+
+        if hasattr(layer, name):
+            delattr(layer, name)
+        layer.register_buffer(name, value, persistent=False)
+
+    def _prepare_dsv4_channel_fp8_deepgemm_weights(
+        self, layer: torch.nn.Module
+    ) -> None:
+        if getattr(layer, "_dsv4_channel_fp8_deepgemm_repacked", False):
+            return
+
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+
+        with torch.no_grad():
+            w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
+            w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+
+        self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
+        self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
+        layer._dsv4_channel_fp8_deepgemm_repacked = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
@@ -341,7 +373,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
-        if (_use_fp8_w8a8_moe and _is_dcu
+        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_deepgemm_moe and _is_dcu:
+            self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
+
+        elif (_use_fp8_w8a8_moe and _is_dcu
             and not getattr(layer, "_w8a8_fp8_packed", False)):
             w1 = layer.w13_weight
             w2 = layer.w2_weight

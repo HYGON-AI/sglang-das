@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -88,6 +89,13 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
+
+
+def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+    return not nsa_use_prefill_cp(forward_batch) and (
+        q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    )
 
 
 def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -1032,7 +1040,7 @@ class DeepseekV4AttnBackend(
     ]:
         if q.ndim != 3:
             return None
-        if getattr(forward_batch, "nsa_cp_metadata", None) is not None:
+        if nsa_use_prefill_cp(forward_batch):
             return None
 
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -1183,7 +1191,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadataRadix,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
-        if getattr(forward_batch, "nsa_cp_metadata", None) is not None:
+        if nsa_use_prefill_cp(forward_batch):
             raise RuntimeError("DSV4 sparse prefill is not enabled for CP yet")
 
         try:
@@ -1386,13 +1394,7 @@ class DeepseekV4AttnBackend(
                 )
 
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
-                if (
-                    getattr(forward_batch, "nsa_cp_metadata", None) is None
-                    and (
-                        q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                    )
-                ):
+                if _should_use_sparse_prefill(q, forward_batch):
                     return self._forward_prefill_sparse(
                         q=q,
                         layer_id=layer_id,

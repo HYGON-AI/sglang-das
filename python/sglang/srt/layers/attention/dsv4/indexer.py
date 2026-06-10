@@ -434,6 +434,12 @@ class C4IndexerBackendMixin:
         elif getattr(core_metadata, "c4_sparse_raw_indices", None) is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
+        if raw_indices is not None:
+            assert raw_indices.shape[0] == logits.shape[0], (
+                "C4 topk raw_indices must use the same local batch as logits, "
+                f"got raw_indices.shape={raw_indices.shape}, logits.shape={logits.shape}"
+            )
+
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
                 logits,
