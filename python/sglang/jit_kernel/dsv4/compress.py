@@ -74,7 +74,7 @@ def _jit_compress_128_online_module(head_dim: int) -> Module:
 @cache_once
 def _jit_compress_plan_module() -> Module:
     return load_jit(
-        make_name(f"compress_plan_out"),
+        make_name(f"compress_plan_out_rocm_v2"),
         cuda_files=[f"deepseek_v4/c_plan.cuh"],
         cuda_wrappers=[
             ("plan_prefill", "plan_compress_prefill"),

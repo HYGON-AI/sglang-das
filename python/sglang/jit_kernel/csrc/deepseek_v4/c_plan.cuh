@@ -457,8 +457,8 @@ inline PrefillPlan plan_compress_prefill(
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu_or_gpu = SymbolicDevice{};
   auto device_ = SymbolicDevice{};
-  cpu_or_gpu.set_options<kDLCPU, kDLCUDA>();
-  device_.set_options<kDLCUDA>();
+  cpu_or_gpu.set_options<kDLCPU, kDLCUDA, kDLROCM>();
+  device_.set_options<kDLCUDA, kDLROCM>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -504,7 +504,8 @@ inline PrefillPlan plan_compress_prefill(
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
-  if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
+  const auto input_device_type = cpu_or_gpu.unwrap().device_type;
+  if (input_device_type == kDLCUDA || input_device_type == kDLROCM) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
     // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
     // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
@@ -549,7 +550,14 @@ inline PrefillPlan plan_compress_prefill(
 
   // CPU input path: only here do we need the pinned scratch buffer.
   const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
-  RuntimeCheck(pin_buffer_bytes >= num_q_tokens * (sizeof(PlanC) + sizeof(PlanW)));
+  const auto required_pin_buffer_bytes = num_q_tokens * (sizeof(PlanC) + sizeof(PlanW));
+  RuntimeCheck(
+      pin_buffer_bytes >= required_pin_buffer_bytes,
+      "Pinned planner buffer is too small: got ",
+      pin_buffer_bytes,
+      " bytes, expected at least ",
+      required_pin_buffer_bytes,
+      " bytes");
   const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
   const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
 
@@ -641,8 +649,8 @@ inline PlanLens plan_compress_prefill_out(
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu_or_gpu = SymbolicDevice{};
   auto device_ = SymbolicDevice{};
-  cpu_or_gpu.set_options<kDLCPU, kDLCUDA>();
-  device_.set_options<kDLCUDA>();
+  cpu_or_gpu.set_options<kDLCPU, kDLCUDA, kDLROCM>();
+  device_.set_options<kDLCUDA, kDLROCM>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -698,7 +706,8 @@ inline PlanLens plan_compress_prefill_out(
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
-  if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
+  const auto input_device_type = cpu_or_gpu.unwrap().device_type;
+  if (input_device_type == kDLCUDA || input_device_type == kDLROCM) {
     RuntimeCheck(batch_size <= kMaxPrefillBatchSize, "GPU plan only support batch size up to ", kMaxPrefillBatchSize);
     const auto params0 = Prefill0Params{
         .plan_c = C,
@@ -736,7 +745,14 @@ inline PlanLens plan_compress_prefill_out(
   }
 
   const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
-  RuntimeCheck(pin_buffer_bytes >= num_q_tokens * (sizeof(PlanC) + sizeof(PlanW)));
+  const auto required_pin_buffer_bytes = num_q_tokens * (sizeof(PlanC) + sizeof(PlanW));
+  RuntimeCheck(
+      pin_buffer_bytes >= required_pin_buffer_bytes,
+      "Pinned planner buffer is too small: got ",
+      pin_buffer_bytes,
+      " bytes, expected at least ",
+      required_pin_buffer_bytes,
+      " bytes");
   const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
   const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
 
