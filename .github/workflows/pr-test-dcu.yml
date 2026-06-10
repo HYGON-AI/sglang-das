@@ -324,7 +324,7 @@ jobs:
 
       - name: Verify DCU registration
         if: github.event_name != 'workflow_dispatch'
-        run: python3 scripts/ci/dcu/verify_dcu_registration.py
+        run: python3.9 scripts/ci/dcu/verify_dcu_registration.py || python3 scripts/ci/dcu/verify_dcu_registration.py
 
       - name: Setup DCU validation container
         if: github.event_name == 'workflow_dispatch'
