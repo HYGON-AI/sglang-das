@@ -6,7 +6,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -17,9 +17,16 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=353, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=311, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=600,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU PR baseline deferred: scheduler path needs BW1100 repeat validation before required CI.",
+)
 
 class TestRetractDecode(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecode"""
@@ -31,10 +38,9 @@ class TestRetractDecode(CustomTestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = ["--chunked-prefill-size", "128"] + cls.other_args
-        with (
-            envs.SGLANG_TEST_RETRACT.override(True),
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
-        ):
+        with envs.SGLANG_TEST_RETRACT.override(
+            True
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

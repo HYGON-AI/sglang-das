@@ -1,8 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -12,8 +12,16 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=500, suite="stage-c-test-8-gpu-h200")
 
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=500,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: disaggregation hybrid-attention path needs BW1100 multi-device validation before enabling.",
+)
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
@@ -74,18 +82,18 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["score"], 0.93)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
@@ -150,19 +158,18 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        # TODO: Fix PD disaggregation accuracy issue (https://github.com/sgl-project/sglang/issues/21744) and increase the threshold back to 0.93.
-        self.assertGreater(metrics["score"], 0.90)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase):
@@ -229,19 +236,18 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        # TODO: Fix PD disaggregation accuracy issue (https://github.com/sgl-project/sglang/issues/21744) and increase the threshold back to 0.93.
-        self.assertGreater(metrics["score"], 0.90)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 if __name__ == "__main__":

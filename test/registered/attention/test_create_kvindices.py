@@ -5,13 +5,15 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Triton kernel unit test for KV indices creation
-register_cuda_ci(est_time=7, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
+
+register_dcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-dcu")
 
 class TestCreateKvIndices(CustomTestCase):
     @classmethod

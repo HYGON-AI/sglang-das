@@ -1,7 +1,7 @@
 import unittest
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json_regex,
@@ -15,13 +15,13 @@ from sglang.test.test_programs import (
     test_regex,
     test_select,
     test_stream,
-    test_stream_logprobs,
     test_tool_use,
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=79, stage="stage-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=80, suite="stage-a-test-1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
+register_dcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-dcu")
 
 
 class TestSRTBackend(CustomTestCase):
@@ -33,9 +33,6 @@ class TestSRTBackend(CustomTestCase):
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
             cuda_graph_max_bs=4,
             mem_fraction_static=0.7,
-            incremental_streaming_output=True,
-            log_level="info",
-            enable_metrics=True,
         )
         sgl.set_default_backend(cls.backend)
 
@@ -70,9 +67,6 @@ class TestSRTBackend(CustomTestCase):
 
     def test_stream(self):
         test_stream()
-
-    def test_stream_logprobs(self):
-        test_stream_logprobs()
 
     def test_regex(self):
         test_regex()

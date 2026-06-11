@@ -6,7 +6,7 @@ import unittest
 import aiohttp
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -19,6 +19,13 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="BW1100 routing-key scheduling did not finish within the quick-validation window even after reducing long requests; needs scheduler专项 validation.",
+)
 
 class TestRoutingKeyScheduling(CustomTestCase):
     @classmethod

@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN,
@@ -20,13 +20,16 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs).
-# Per-commit EAGLE + DP-attn coverage on CUDA is provided by
-# test_eagle_infer_beta_dp_attention.py (B200 4-gpu), so this H100 variant
-# is gated to extra-b only.
-register_cuda_ci(est_time=99, stage="extra-b", runner_config="4-gpu-h100")
+# EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs)
+register_cuda_ci(est_time=200, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
+
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU RL/speculative path needs local model mapping and quick validation before enabling.",
+)
 
 class TestEAGLE3EngineDPAttention(CustomTestCase):
     @classmethod
@@ -60,10 +63,9 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--cuda-graph-max-bs",
             "64",
         ]
-        with (
-            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
-            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
-        ):
+        with envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -80,18 +82,18 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/server_info")
+        server_info = requests.get(self.base_url + "/get_server_info")
         server_data = server_info.json()
 
         # Try to get avg_spec_accept_length
@@ -108,14 +110,14 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (EAGLE3 DP Attention)\n"
-                f'{metrics["score"]=:.3f}\n'
+                f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
             if is_in_amd_ci():
                 # AMD triton backend produces slightly lower accuracy than FA3 on NVIDIA
-                self.assertGreater(metrics["score"], 0.88)
+                self.assertGreater(metrics["accuracy"], 0.88)
             else:
-                self.assertGreater(metrics["score"], 0.91)
+                self.assertGreater(metrics["accuracy"], 0.91)
             if avg_spec_accept_length is not None:
                 if is_in_amd_ci():
                     # AMD triton backend produces slightly lower accept length than FA3 on NVIDIA

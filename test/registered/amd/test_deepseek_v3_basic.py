@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_dcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -16,6 +16,14 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(est_time=952, suite="stage-c-test-large-8-gpu-amd")
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=600,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: DeepSeek-V3 large-model path needs BW1100 8-GPU validation before enabling.",
+)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 

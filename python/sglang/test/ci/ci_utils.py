@@ -178,7 +178,6 @@ def run_unittest_files(
             file_tic = time.perf_counter()
 
             cmd = ["python3", full_path, "-f"]
-
             if capture_output:
                 # Capture output for retry decision
                 process = subprocess.Popen(

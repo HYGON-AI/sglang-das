@@ -1,0 +1,203 @@
+name: Release DCU Wheels
+
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
+  push:
+    branches:
+      - dcu-ci-pr
+      - v0.5.12_dev
+    paths:
+      - 'python/**'
+      - 'sgl-kernel/**'
+      - 'sgl-model-gateway/**'
+      - 'requirements_dcu.txt'
+      - '.github/workflows/release-whl-dcu.yml'
+
+  # ---- PR 时触发（同样限定路径） ----
+  pull_request:
+    paths:
+      - 'python/**'
+      - 'sgl-kernel/**'
+      - 'sgl-model-gateway/**'
+      - 'requirements_dcu.txt'
+      - '.github/workflows/release-whl-dcu.yml'
+
+  # ---- 手动触发，可传参 ----
+  workflow_dispatch:
+    inputs:
+      torch_version:
+        description: 'PyTorch version to install'
+        required: false
+        default: '2.10.0'
+        type: string
+      skip_gateway:
+        description: 'Skip sgl-model-gateway build'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  compile:
+    # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
+    concurrency:
+      group: release-whl-dcu-${{ github.ref }}-py${{ matrix.python-version }}
+      cancel-in-progress: true
+    # ---- 自托管 DCU runner，在 Docker 容器内执行 ----
+    runs-on: [self-hosted, dcu, nmz4]
+    timeout-minutes: 180
+
+    container:
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      options: >
+        --device=/dev/kfd --device=/dev/dri/ --group-add video
+        -v /opt/hyhal/:/opt/hyhal/:ro
+        --shm-size=80G
+        --cap-add=SYS_PTRACE
+        --security-opt seccomp=unconfined
+        --privileged=true
+
+    # ---- Matrix: 3 个 Python 版本并行编译 ----
+    strategy:
+      matrix:
+        python-version: ['3.10']
+
+    env:
+      TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
+      SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
+      PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
+      PIP_TRUSTED_HOST: 10.16.1.201
+      RESOURCE_SERVER: http://10.16.1.201:8000/
+
+    steps:
+      # =======================================================================
+      # 环境准备
+      # =======================================================================
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
+      - name: Install build deps
+        run: |
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
+          wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
+          unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
+          chmod +x /usr/local/bin/protoc
+          ln -s /usr/local/bin/protoc /usr/bin/protoc
+          wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/rustup-init.sh
+          export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
+          export RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+          bash rustup-init.sh -y
+          rm -rf ${HOME}/.cargo/config
+          mkdir -p ${HOME}/.cargo
+          cat > ${HOME}/.cargo/config << 'EOF'
+          [source.crates-io]
+          replace-with = 'rsproxy-sparse'
+
+          [source.tuna-sparse]
+          registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+          [source.rsproxy-sparse]
+          registry = "sparse+https://rsproxy.cn/index/"
+
+          [net]
+          retry = 5
+          git-fetch-with-cli = true
+
+          [http]
+          low-speed-limit = 1
+          EOF
+
+      - name: Install DTK
+        run: |
+          DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+          cd /opt
+          wget -q $DTK_PKG_URL
+          tar -xzf $(basename $DTK_PKG_URL)
+          mv dtk-* dtk
+
+      # =======================================================================
+      # 路径检测: 决定哪些组件需要编译
+      # =======================================================================
+
+      - name: Check changed paths
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            sgl-kernel:
+              - 'sgl-kernel/**'
+            sglang:
+              - 'python/**'
+            gateway:
+              - 'sgl-model-gateway/**'
+
+      # =======================================================================
+      # 编译阶段: 按检测结果增量编译
+      # workflow_dispatch 时忽略检测结果，全量编译
+      # =======================================================================
+
+      - name: Build sgl-kernel (HIP)
+        run: |
+          source /opt/dtk/env.sh
+          cd sgl-kernel && python setup_hip.py bdist_wheel
+          echo "=== sgl-kernel wheel ==="
+          ls -lh dist/*.whl
+
+      - name: Build sglang python package
+        # if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.5.12"
+        run: |
+          source /opt/dtk/env.sh
+          source $HOME/.cargo/env
+          cd python
+          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}"
+          python -m build --wheel --no-isolation -Cfeatures=all_hip
+          echo "=== sglang wheel ==="
+          ls -lh dist/*.whl
+
+      - name: Build sgl-model-gateway
+        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          source /opt/dtk/env.sh
+          source $HOME/.cargo/env
+          export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+          export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+          cd sgl-model-gateway && cargo build --release
+          cd bindings/python && maturin build --release --skip-auditwheel
+          echo "=== sgl-model-gateway wheel ==="
+          ls -lh target/wheels/*.whl
+
+      # =======================================================================
+      # 修复 (auditwheel) & 上传产物
+      # =======================================================================
+
+      - name: Apply DAS local version to wheels
+        run: |
+          source /opt/dtk/env.sh
+          DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+          DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+          TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=12 HEAD)"
+          echo "Local version: ${LOCAL_VER}"
+          mkdir -p output
+          for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
+            [ -f "$whl" ] || continue
+            CIUpload --repair --torch_version $TORCH_VERSION --set_local_version $LOCAL_VER --outputdir output -f "$whl"
+          done
+          echo "=== Repaired wheels ==="
+          ls -lh output/
+          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcu-wheels-py${{ matrix.python-version }}
+          path: output/*.whl
+          if-no-files-found: warn

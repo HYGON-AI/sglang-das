@@ -5,7 +5,7 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,9 +14,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 
+
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: local Llama3.2-1B passed three runs.
+register_dcu_ci(
+    est_time=73,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+)
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
     # NOTE: this system_message is for Llama3.2 system prompt. Without this,
@@ -416,10 +423,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
     def test_function_call_required(self):
         """
-        Test: Whether tool_choice: "required" works as expected.
-        - When tool_choice == "required", the model MUST return one or more tool_calls.
-        - The model may choose ANY of the provided tools; we only verify that
-          a tool call exists and the selected name is among the candidates.
+        Test: Whether tool_choice: "required" works as expected
+        - When tool_choice == "required", the model should return one or more tool_calls.
         """
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -461,42 +466,47 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
-                    "strict": True,
                 },
             },
         ]
 
-        valid_tool_names = {t["function"]["name"] for t in tools}
-
-        messages = [{"role": "user", "content": "Tell me about Paris"}]
+        messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
             messages=messages,
-            temperature=0,
+            temperature=0.8,
+            top_p=0.8,
             stream=False,
             tools=tools,
             tool_choice="required",
         )
 
         tool_calls = response.choices[0].message.tool_calls
-        self.assertIsNotNone(
-            tool_calls, "tool_choice='required' must produce tool_calls"
-        )
-        self.assertGreater(len(tool_calls), 0, "tool_calls list should be non-empty")
-
+        self.assertIsNotNone(tool_calls, "No tool_calls in the response")
         function_name = tool_calls[0].function.name
-        self.assertIn(
-            function_name,
-            valid_tool_names,
-            f"Function name '{function_name}' is not among the provided tools: {valid_tool_names}",
-        )
-
-        # Verify the arguments are parseable JSON
         arguments = tool_calls[0].function.arguments
         args_obj = json.loads(arguments)
+
+        self.assertEqual(
+            function_name,
+            "get_weather",
+            f"Function name should be 'get_weather', got: {function_name}",
+        )
+        self.assertIn(
+            "city", args_obj, f"Function arguments should have 'city', got: {args_obj}"
+        )
+
+        # Make the test more robust by checking type and accepting valid responses
+        city_value = args_obj["city"]
         self.assertIsInstance(
-            args_obj, dict, "Function arguments should be a JSON object"
+            city_value,
+            str,
+            f"Parameter city should be a string, got: {type(city_value)}",
+        )
+        self.assertTrue(
+            "Paris" in city_value or "France" in city_value,
+            f"Parameter city should contain either 'Paris' or 'France', got: {city_value}",
         )
 
     def test_function_call_specific(self):
@@ -544,7 +554,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
-                    "strict": True,
                 },
             },
         ]
