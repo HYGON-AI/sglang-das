@@ -682,11 +682,11 @@ jobs:
               --include-file registered/openai_server/basic/test_serving_completions.py \
               --include-file registered/openai_server/validation/test_large_max_new_tokens.py \
               --include-file registered/openai_server/validation/test_openai_server_ignore_eos.py \
-              --include-file registered/sampling/test_original_logprobs.py \
+              --include-file registered/dcu/sampling/bw1100/test_original_logprobs_dcu.py \
               --include-file registered/openai_server/validation/test_request_length_validation.py \
               --include-file registered/sampling/test_pytorch_sampling_backend.py \
               --include-file registered/sampling/test_penalty.py \
-              --include-file registered/core/test_hidden_states.py \
+              --include-file registered/dcu/core/bw1100/test_hidden_states_dcu.py \
               --include-file registered/openai_server/basic/test_anthropic_server.py \
               --include-file registered/constrained_decoding/test_constrained_decoding.py \
               --include-file registered/openai_server/features/test_json_mode.py \
