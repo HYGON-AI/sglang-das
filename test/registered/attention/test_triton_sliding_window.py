@@ -5,6 +5,14 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Stage-B deferred: sliding-window cuda-graph subtest uses google/gemma-3-4b-it and failed with gated HF 401; needs local model mapping before enabling.",
+)
+
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,16 +24,9 @@ from sglang.test.test_utils import (
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=93, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
-
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: sliding-window cuda-graph subtest uses google/gemma-3-4b-it and failed with gated HF 401; needs local model mapping before enabling.",
-)
 
 class TestSlidingWindowAttentionTriton(CustomTestCase):
     """Test sliding window attention functionality with triton backend."""

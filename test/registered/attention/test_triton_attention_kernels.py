@@ -20,12 +20,6 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
-
-# Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-large")
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
-
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: triton attention kernels passed three runs.
@@ -33,6 +27,13 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
 )
+
+from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
+
+# Triton attention kernel unit tests (decode, extend, prefill)
+register_cuda_ci(est_time=19, stage="stage-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+
 
 def extend_attention_fwd_torch(
     q: torch.Tensor,  # [extend_tokens, H_Q, D]

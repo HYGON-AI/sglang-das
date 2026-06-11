@@ -25,6 +25,15 @@ import torch.multiprocessing as mp
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+)
+
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -38,17 +47,9 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=72, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
 
-
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=120,
-    suite="nightly-dcu",
-    nightly=True,
-    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
-)
 
 def verify_params_close(params1, params2, error_msg):
     """Verify if two parameter arrays are close enough."""
@@ -203,9 +204,7 @@ def init_process_dst(
             remote_instance_weight_loader_send_weights_group_ports=ports,
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
-            remote_instance_weight_loader_start_seed_via_transfer_engine=(
-                remote_instance_loader_backend == "transfer_engine"
-            ),
+            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -236,6 +235,8 @@ def init_process_dst(
                 "--remote-instance-weight-loader-backend",
                 remote_instance_loader_backend,
                 "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+                "--engine-info-bootstrap-port",
+                str(6789 + rank),
             ),
         )
     torch.cuda.synchronize()
@@ -364,6 +365,7 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
+            # FIXME: refactor this test to have less random behavior
             mode = random.choice(["Engine", "Server"])
             remote_instance_loader_backend = random.choice(["nccl", "transfer_engine"])
             test_suits = [

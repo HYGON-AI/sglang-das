@@ -8,6 +8,15 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_amd_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=300,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: disaggregation basic path needs BW1100 multi-device validation before enabling.",
+)
+
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -20,14 +29,6 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
 
-
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=300,
-    suite="nightly-dcu",
-    nightly=True,
-    disabled="DCU CSV CI placeholder: disaggregation basic path needs BW1100 multi-device validation before enabling.",
-)
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod

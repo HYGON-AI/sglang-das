@@ -6,6 +6,14 @@ import unittest
 
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu-perf",
+    nightly=True,
+    disabled="DCU benchmark registration placeholder; needs BW1100 performance baseline, thresholds, and local model path validation.",
+)
+
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
@@ -17,16 +25,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=286, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-large-amd")
 
-
-register_dcu_ci(
-    est_time=120,
-    suite="nightly-dcu-perf",
-    nightly=True,
-    disabled="DCU benchmark registration placeholder; needs BW1100 performance baseline, thresholds, and local model path validation.",
-)
 
 class TestBenchServing1GPULarge(CustomTestCase):
     def test_offline_throughput_default_fp8(self):

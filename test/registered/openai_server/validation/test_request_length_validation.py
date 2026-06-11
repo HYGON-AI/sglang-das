@@ -4,6 +4,9 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(est_time=90, suite="stage-b-test-1-gpu-small-dcu")
+
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,11 +15,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=38, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=49, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=31, suite="stage-b-test-1-gpu-small-amd")
 
-
-register_dcu_ci(est_time=90, suite="stage-b-test-1-gpu-small-dcu")
 
 class TestRequestLengthValidation(CustomTestCase):
     @classmethod
@@ -65,6 +66,23 @@ class TestRequestLengthValidation(CustomTestCase):
                     {"role": "user", "content": long_text},
                 ],
                 temperature=0,
+            )
+
+        self.assertIn("is longer than the model's context length", str(cm.exception))
+
+    def test_input_length_longer_than_context_length_streaming(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+
+        long_text = "hello " * 1200
+
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.chat.completions.create(
+                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                messages=[
+                    {"role": "user", "content": long_text},
+                ],
+                temperature=0,
+                stream=True,
             )
 
         self.assertIn("is longer than the model's context length", str(cm.exception))

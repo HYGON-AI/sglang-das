@@ -32,23 +32,7 @@ def function(
     return decorator
 
 
-def _apply_dcu_ci_runtime_defaults(kwargs):
-    import os
-
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
-        return
-
-    # Keep in-process Runtime tests on the same DCU backend defaults as CI server launches.
-    attn_keys = ("attention_backend", "decode_attention_backend", "prefill_attention_backend")
-    if all(kwargs.get(key) is None for key in attn_keys):
-        kwargs["attention_backend"] = "fa3"
-    kwargs.setdefault("trust_remote_code", True)
-    kwargs.setdefault("page_size", 64)
-
-
 def Runtime(*args, **kwargs):
-    _apply_dcu_ci_runtime_defaults(kwargs)
-
     # Avoid importing unnecessary dependency
     from sglang.lang.backend.runtime_endpoint import Runtime
 
@@ -56,8 +40,6 @@ def Runtime(*args, **kwargs):
 
 
 def Engine(*args, **kwargs):
-    _apply_dcu_ci_runtime_defaults(kwargs)
-
     # Avoid importing unnecessary dependency
     from sglang.srt.entrypoints.engine import Engine
 

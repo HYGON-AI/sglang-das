@@ -9,6 +9,13 @@ import requests
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
+)
+
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -21,14 +28,10 @@ from sglang.test.test_utils import (
 register_amd_ci(
     est_time=210, suite="stage-b-test-1-gpu-small-amd", disabled="see #14021"
 )
-register_cuda_ci(est_time=210, suite="stage-b-test-1-gpu-large", disabled="see #14021")
-
-
-register_dcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
+register_cuda_ci(
+    est_time=210, stage="stage-b", runner_config="1-gpu-large", disabled="see #14021"
 )
+
 
 ###############################################################################
 # Engine Mode Tests (Single-configuration)

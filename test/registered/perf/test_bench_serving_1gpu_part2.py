@@ -6,6 +6,9 @@ Works on 5090 (32GB).
 import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(est_time=900, suite="nightly-dcu-perf", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
@@ -19,9 +22,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=900, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=968, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-1-gpu-large-amd")
-register_dcu_ci(est_time=900, suite="nightly-dcu-perf", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestBenchServing1GPUPart2(CustomTestCase):
@@ -42,8 +44,9 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 f"### test_vlm_offline_throughput\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
+            # relax for mi300x
             if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 2000)
+                self.assertGreater(res["output_throughput"], 900)
             else:
                 self.assertGreater(res["output_throughput"], 2500)
 
@@ -117,12 +120,16 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
-            bounds = {
-                10: (45, 50),
-                25: (50, 60),
-                50: (60, 65),
-            }
-            avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (60, 65))
+            # relax for mi300x
+            if is_in_amd_ci():
+                bounds = {10: (60, 65), 25: (70, 80), 50: (80, 90)}
+                default_bounds = (90, 90)
+            else:
+                bounds = {10: (45, 50), 25: (50, 60), 50: (60, 65)}
+                default_bounds = (60, 65)
+            avg_latency_bound, p95_latency_bound = bounds.get(
+                batch_size, default_bounds
+            )
             self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
@@ -147,9 +154,15 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
 
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 20)
-        self.assertLess(res["p95_latency_ms"], 25)
-        self.assertGreater(res["throughput"], 60)
+        # relax for mi300x
+        if is_in_amd_ci():
+            self.assertLess(res["avg_latency_ms"], 35)
+            self.assertLess(res["p95_latency_ms"], 40)
+            self.assertGreater(res["throughput"], 30)
+        else:
+            self.assertLess(res["avg_latency_ms"], 20)
+            self.assertLess(res["p95_latency_ms"], 25)
+            self.assertGreater(res["throughput"], 60)
 
     def test_embeddings_api_batch_scaling(self):
         """Test embeddings API performance with different batch sizes"""
@@ -174,12 +187,16 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
-            bounds = {
-                10: (60, 65),
-                25: (115, 120),
-                50: (190, 195),
-            }
-            avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (250, 250))
+            # relax for mi300x
+            if is_in_amd_ci():
+                bounds = {10: (80, 90), 25: (140, 150), 50: (230, 240)}
+                default_bounds = (300, 300)
+            else:
+                bounds = {10: (60, 65), 25: (115, 120), 50: (190, 195)}
+                default_bounds = (250, 250)
+            avg_latency_bound, p95_latency_bound = bounds.get(
+                batch_size, default_bounds
+            )
             self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 

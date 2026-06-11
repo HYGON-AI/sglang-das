@@ -20,11 +20,6 @@ from typing import Dict, List, Tuple
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import CustomTestCase
-
-register_cuda_ci(est_time=224, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=224, suite="stage-b-test-1-gpu-small-amd")
 
 # DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
@@ -32,6 +27,12 @@ register_dcu_ci(
     suite="stage-b-test-1-gpu-small-dcu",
     disabled="DCU PR baseline deferred: LoRA path needs local base/adapter mapping and dedicated BW1100 validation.",
 )
+
+from sglang.test.runners import SRTRunner
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=263, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=224, suite="stage-b-test-1-gpu-small-amd")
 
 PROMPTS = [
     "AI is a field of computer science focused on",

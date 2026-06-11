@@ -5,17 +5,6 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
-
-register_cuda_ci(est_time=42, suite="stage-b-test-1-gpu-large")
-register_amd_ci(est_time=42, suite="stage-b-test-1-gpu-small-amd")
-
 
 # DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
@@ -23,6 +12,18 @@ register_dcu_ci(
     suite="stage-b-test-1-gpu-small-dcu",
     disabled="DCU PR baseline deferred: model matrix path needs local model mapping and BW1100 repeat validation.",
 )
+
+from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_cuda_ci(est_time=65, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=42, suite="stage-b-test-1-gpu-small-amd")
+
 
 class TestCompressedTensorsLlama3FP8(CustomTestCase):
     @classmethod
@@ -42,21 +43,21 @@ class TestCompressedTensorsLlama3FP8(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
         if is_hip():
             # Lower threshold for AMD because FP8 dtype differs (fp8_fnuz)
-            self.assertGreaterEqual(metrics["accuracy"], 0.40)
+            self.assertGreaterEqual(metrics["score"], 0.40)
         else:
-            self.assertGreaterEqual(metrics["accuracy"], 0.45)
+            self.assertGreaterEqual(metrics["score"], 0.45)
 
 
 if __name__ == "__main__":

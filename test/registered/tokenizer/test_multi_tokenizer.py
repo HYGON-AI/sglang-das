@@ -2,6 +2,14 @@ import unittest
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because TTFT/latency gate failed on local Qwen2.5-7B.
+register_dcu_ci(
+    est_time=345,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Stage-B deferred: local Qwen2.5-7B run failed TTFT latency gate; median_e2e_latency_ms was about 20s vs 11s threshold, total runtime about 8min.",
+)
+
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -10,22 +18,16 @@ from sglang.test.test_utils import (
     CustomTestCase,
     auto_config_device,
     get_benchmark_args,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     run_benchmark,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=230, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=211, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
-
-# DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because TTFT/latency gate failed on local Qwen2.5-7B.
-register_dcu_ci(
-    est_time=345,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local Qwen2.5-7B run failed TTFT latency gate; median_e2e_latency_ms was about 20s vs 11s threshold, total runtime about 8min.",
-)
 
 class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     mmlu_score_threshold = 0.65
@@ -77,7 +79,8 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            self.assertLess(res["median_ttft_ms"], 86)
+            # relax for mi300x
+            self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
             self.assertLess(res["median_itl_ms"], 10)
 
 

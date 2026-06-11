@@ -6,16 +6,6 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
-
-register_cuda_ci(est_time=160, suite="stage-b-test-1-gpu-large")
-
 
 # DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_dcu_ci(
@@ -24,6 +14,17 @@ register_dcu_ci(
     nightly=False,
     disabled="DCU CSV CI placeholder: W8A8 quantization path needs BW1100 validation before enabling.",
 )
+
+from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_cuda_ci(est_time=232, stage="extra-a", runner_config="1-gpu-large")
+
 
 class BaseW8A8Test(CustomTestCase):
     model: str = None
@@ -59,17 +60,17 @@ class BaseW8A8Test(CustomTestCase):
             self.skipTest("gsm8k_accuracy_threshold not set for this test")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(metrics)
-        self.assertGreater(metrics["accuracy"], self.gsm8k_accuracy_threshold)
+        self.assertGreater(metrics["score"], self.gsm8k_accuracy_threshold)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(

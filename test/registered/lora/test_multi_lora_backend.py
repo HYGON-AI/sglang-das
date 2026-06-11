@@ -17,6 +17,14 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=100,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU PR baseline deferred: LoRA path needs local base/adapter mapping and dedicated BW1100 validation.",
+)
+
 from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
@@ -25,16 +33,9 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=99, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 
-
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=100,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: LoRA path needs local base/adapter mapping and dedicated BW1100 validation.",
-)
 
 class TestMultiLoRABackend(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):

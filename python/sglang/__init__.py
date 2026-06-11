@@ -76,6 +76,7 @@ VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
 
 # Runtime Engine APIs
 ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
+Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
 
 __all__ = [
     "Engine",

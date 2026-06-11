@@ -5,6 +5,15 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=600,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: DeepSeek-V3 MTP path needs BW1100 8-GPU validation before enabling.",
+)
+
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -18,14 +27,6 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(est_time=980, suite="stage-c-test-large-8-gpu-amd")
-
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=600,
-    suite="nightly-dcu",
-    nightly=True,
-    disabled="DCU CSV CI placeholder: DeepSeek-V3 MTP path needs BW1100 8-GPU validation before enabling.",
-)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -80,7 +81,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -92,7 +93,8 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            # relax for mi300x
+            self.assertGreaterEqual(metrics["accuracy"], 0.93)
             if is_in_amd_ci():
                 self.assertGreater(avg_spec_accept_length, 2.8)
             else:

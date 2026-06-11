@@ -41,6 +41,15 @@ from sglang.srt.constants import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: release-memory occupation path needs BW1100 runtime validation before enabling.",
+)
+
 from sglang.test.test_utils import (
     DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -55,16 +64,9 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=200,
-    suite="stage-c-test-4-gpu-h100",
+    stage="stage-c",
+    runner_config="4-gpu-h100",
     disabled="Temporarily disabled - needs investigation",
-)
-
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=120,
-    suite="nightly-dcu",
-    nightly=True,
-    disabled="DCU CSV CI placeholder: release-memory occupation path needs BW1100 runtime validation before enabling.",
 )
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly

@@ -1,9 +1,19 @@
+import os
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=600,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: disaggregation different-TP path needs BW1100 multi-device validation before enabling.",
+)
+
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -15,16 +25,8 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=600, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=375, stage="stage-c", runner_config="8-gpu-h20")
 
-
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=600,
-    suite="nightly-dcu",
-    nightly=True,
-    disabled="DCU CSV CI placeholder: disaggregation different-TP path needs BW1100 multi-device validation before enabling.",
-)
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
@@ -55,6 +57,8 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -76,6 +80,8 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -87,18 +93,18 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
@@ -130,6 +136,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "2",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -151,6 +159,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -162,18 +172,18 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
@@ -205,6 +215,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -226,6 +238,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -237,18 +251,18 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
@@ -280,6 +294,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "2",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -301,6 +317,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -312,18 +330,187 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
+
+
+STAGING_ENV = {
+    "SGLANG_DISAGG_STAGING_BUFFER": "1",
+    "SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB": "64",
+    "SGLANG_DISAGG_STAGING_POOL_SIZE_MB": "1024",
+}
+
+
+class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
+    """Prefill TP=4 -> Decode TP=2 with staging buffer enabled (MHA model)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        env = {**os.environ, **STAGING_ENV}
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+            env=env,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "2",
+            "--base-gpu-id",
+            "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        env = {**os.environ, **STAGING_ENV}
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+            env=env,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[Staging PrefillLargerTP] Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], 0.60)
+
+
+class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
+    """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MHA model)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "2",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        env = {**os.environ, **STAGING_ENV}
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+            env=env,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "4",
+            "--base-gpu-id",
+            "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        env = {**os.environ, **STAGING_ENV}
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+            env=env,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[Staging DecodeLargerTP] Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], 0.60)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,11 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
+)
+
 
 """Test distributed weight updates.
 
@@ -43,15 +50,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import terminate_process
 
-register_cuda_ci(est_time=103, suite="stage-b-test-2-gpu-large")
-register_amd_ci(est_time=103, suite="stage-b-test-2-gpu-large-amd")
-
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
-)
+register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 mp.set_start_method("spawn", force=True)
 

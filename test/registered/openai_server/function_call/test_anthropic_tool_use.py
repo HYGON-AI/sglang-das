@@ -17,16 +17,6 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
-
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-large")
-register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 register_dcu_ci(
     est_time=140,
@@ -36,6 +26,17 @@ register_dcu_ci(
         "tool_choice/tool_use requests return 500/error events; 2/10 pass."
     ),
 )
+
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_cuda_ci(est_time=50, stage="stage-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 # System message to guide Llama3.2 to produce proper tool call format
 SYSTEM_MESSAGE = (

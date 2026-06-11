@@ -5,6 +5,14 @@ VLM Performance tests that work on 5090 (32GB) - VLM offline throughput and onli
 import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu-vlm",
+    nightly=True,
+    disabled="DCU benchmark registration placeholder; needs BW1100 performance baseline, thresholds, and local model path validation.",
+)
+
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -13,16 +21,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=406, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=500, suite="stage-b-test-1-gpu-small-amd")
 
-
-register_dcu_ci(
-    est_time=120,
-    suite="nightly-dcu-vlm",
-    nightly=True,
-    disabled="DCU benchmark registration placeholder; needs BW1100 performance baseline, thresholds, and local model path validation.",
-)
 
 class TestVLMPerf5090(CustomTestCase):
     def test_vlm_offline_throughput(self):

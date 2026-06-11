@@ -8,7 +8,6 @@ on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
   push:
     branches:
-      - dcu-ci-pr
       - v0.5.12_dev
     paths:
       - 'python/**'

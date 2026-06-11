@@ -7,13 +7,14 @@ from sglang.srt.parser.jinja_template_utils import (
     process_content_for_template_format,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_dcu_ci
+
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
+register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
+
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
 
-
-# DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
-register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
 
 class TestTemplateContentFormatDetection(CustomTestCase):
     """Test template content format detection functionality."""
