@@ -55,6 +55,10 @@ class MoeRunner:
                 self.runner_core = MarlinLoraRunnerCore(config)
             else:
                 self.runner_core = None  # Marlin only supports fused path
+        elif runner_backend.is_lightop():
+            from sglang.srt.layers.moe.moe_runner.lightop import LightOpRunnerCore
+
+            self.runner_core = LightOpRunnerCore(config)
         elif (
             runner_backend.is_flashinfer_trtllm()
             or runner_backend.is_flashinfer_trtllm_routed()

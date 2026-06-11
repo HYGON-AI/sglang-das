@@ -22,10 +22,12 @@ from sglang.srt.utils import (
     is_cpu,
     is_npu,
     next_power_of_2,
+    get_bool_env_var,
 )
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
+_use_prefill_layer_norm_fwd = get_bool_env_var("SGLANG_USE_LAYER_NORM_FWD")
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
@@ -241,29 +243,54 @@ def _layer_norm_fwd(
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     with device_context(x.device):
-        _layer_norm_fwd_1pass_kernel[grid](
-            x,
-            out,
-            weight,
-            bias,
-            z,
-            mean,
-            rstd,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0) if z is not None else 0,
-            M,
-            group_size,
-            eps,
-            BLOCK_N=BLOCK_N,
-            ROWS_PER_BLOCK=rows_per_block,
-            HAS_BIAS=bias is not None,
-            HAS_Z=z is not None,
-            NORM_BEFORE_GATE=norm_before_gate,
-            IS_RMS_NORM=is_rms_norm,
-            num_warps=num_warps,
-            ACTIVATION=activation,
-        )
+        if not _use_prefill_layer_norm_fwd:
+            _layer_norm_fwd_1pass_kernel[grid](
+                x,
+                out,
+                weight,
+                bias,
+                z,
+                mean,
+                rstd,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0) if z is not None else 0,
+                M,
+                group_size,
+                eps,
+                BLOCK_N=BLOCK_N,
+                ROWS_PER_BLOCK=rows_per_block,
+                HAS_BIAS=bias is not None,
+                HAS_Z=z is not None,
+                NORM_BEFORE_GATE=norm_before_gate,
+                IS_RMS_NORM=is_rms_norm,
+                num_warps=num_warps,
+                ACTIVATION=activation,
+            )
+        else:
+            from lightop import op
+            op.layer_norm_fwd_1pass_opt(
+                x,
+                out,
+                weight,
+                bias,
+                z,
+                mean,
+                rstd,
+                x.stride(0),
+                out.stride(0),
+                z.stride(0) if z is not None else 0,
+                M,
+                group_size,
+                eps,
+                BLOCK_N=BLOCK_N,
+                ROWS_PER_BLOCK=rows_per_block,
+                HAS_BIAS=bias is not None,
+                HAS_Z=z is not None,
+                NORM_BEFORE_GATE=norm_before_gate,
+                IS_RMS_NORM=is_rms_norm,
+                ACTIVATION=activation,
+            )
     return out, mean, rstd
 
 

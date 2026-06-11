@@ -6,6 +6,15 @@ from flash_attn import (
 )
 from typing import Optional, Union
 from sglang.srt.utils import is_dcu
+from sglang.srt.utils.common import get_bool_env_var
+_use_triton_vllm_fa = get_bool_env_var("SGLANG_USE_TRITON_VLLM_FA")
+_is_dcu = is_dcu()
+
+if _is_dcu and _use_triton_vllm_fa:
+    from sglang.srt.layers.attention.triton_vllm_flash_attn import (
+        triton_vllm_flash_attn_varlen_func,
+        triton_vllm_flash_attn_with_kvcache,
+    )
 
 import torch
 
@@ -108,6 +117,22 @@ def vllm_flash_attn_with_kvcache(
     sinks=None,
     ver=3,
 ):
+    if _is_dcu and _use_triton_vllm_fa:
+        return triton_vllm_flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=page_table,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softcap=softcap,
+            return_softmax_lse=return_softmax_lse,
+        )
     
     return vllm_flash_attn_with_kvcache_interface(
             q=q,
@@ -211,6 +236,25 @@ def vllm_flash_attn_varlen_func(
     k_descale,
     v_descale,
 ):
+    if _is_dcu and _use_triton_vllm_fa:
+        return triton_vllm_flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_table,
+            fa_version=fa_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
     return vllm_flash_attn_varlen_func_interface(
         q=q,
         k=k,

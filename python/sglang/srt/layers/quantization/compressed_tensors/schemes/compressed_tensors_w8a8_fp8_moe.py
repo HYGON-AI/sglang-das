@@ -58,10 +58,9 @@ if _use_aiter and not _is_dcu:
 
 logger = logging.getLogger(__name__)
 
-
-def is_moe_prefill():
+def is_moe_prefill_or_normal():
     args = get_global_server_args()
-    return args.disaggregation_mode == "prefill"
+    return (args.disaggregation_mode == "prefill" or args.deepep_mode == "normal")
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
@@ -275,6 +274,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
+
         from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
 
         with torch.no_grad():
@@ -413,7 +413,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 def _pack_per_expert_deepep(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        if is_moe_prefill() :
+                        if is_moe_prefill_or_normal():
                             new_expert = weight8bit_nt_kpack2_marlin(
                                 weight[i]).contiguous()
                         else:
