@@ -70,7 +70,7 @@ if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
   echo "[dcu-ci] DCU_CI_INSTALL_WHEEL_URLS=${INSTALL_WHEEL_URLS}"
   run_in_container "python3 -m pip uninstall -y sglang sgl-kernel sglang-kernel sgl-model-gateway || true"
   install_with_retry docker exec "${CONTAINER}" \
-    python3 -m pip install --no-cache-dir ${INSTALL_WHEEL_URLS}
+    python3 -m pip install --no-cache-dir --no-deps ${INSTALL_WHEEL_URLS}
   echo "[dcu-ci] Installed wheel import paths:"
   run_in_container "python3 -c 'import sglang; print(\"sglang:\", sglang.__file__)'"
   run_in_container "python3 -c 'import sgl_kernel; print(\"sgl_kernel:\", sgl_kernel.__file__)'"
