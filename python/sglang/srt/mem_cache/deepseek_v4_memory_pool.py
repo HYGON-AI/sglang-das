@@ -143,6 +143,23 @@ class DeepSeekV4SingleKVPool(KVCache):
             type="flashmla",
         )
 
+    def set_key_buffer_lightop_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> None:
+        from lightop import op
+
+        op.quantize_nope_fp8_rope_bf16_pack_store(
+            cache_k,
+            self.kv_buffer[layer_id],
+            loc,
+            self.page_size,
+            eps,
+        )
+
     def get_key_buffer(self, layer_id: int):
         return self.kv_buffer[layer_id]
 
@@ -783,6 +800,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_kv_pool.page_size,
         )
 
+    def set_swa_key_buffer_radix_lightop_fused(
+        self,
+        layer_id: int,
+        raw_loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> None:
+        if self._should_cache_swa:
+            if layer_id == self.start_layer or self.cached_loc is None:
+                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
+            swa_loc = self.cached_loc
+        else:
+            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        return self.swa_kv_pool.set_key_buffer_lightop_fused(
+            self._swa_local_layer_id(layer_id), swa_loc, cache_k, eps
+        )
+
     def set_extra_key_buffer_fused(
         self,
         layer_id: int,
@@ -792,6 +826,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
+
+    def set_extra_key_buffer_lightop_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> None:
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.set_key_buffer_lightop_fused(
+            compress_layer_id, loc, cache_k, eps
+        )
 
     def set_index_k_fused(
         self,

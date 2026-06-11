@@ -31,7 +31,8 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_dcu
+    is_dcu,
+    get_bool_env_var
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,11 @@ if not _is_dcu:
         can_use_nsa_fused_store,
         fused_store_index_k_cache,
     )
+
+_use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
+if _is_dcu and _use_fast_hadamard_transform:
+    from fast_hadamard_transform import hadamard_transform
+    
 if _is_cuda:
     try:
         import deep_gemm
@@ -370,7 +376,11 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     
     scale = hidden_size**-0.5 if apply_scale else 1.0
-    return  hadamard_transform_optimized(x, scale=scale) 
+    
+    if _is_dcu and _use_fast_hadamard_transform:
+        return  hadamard_transform(x, scale=scale) 
+    else:
+        return  hadamard_transform_optimized(x, scale=scale) 
 
 
 @triton.jit

@@ -2,16 +2,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from typing import (
-    TYPE_CHECKING,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -21,6 +14,8 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
+    fused_rope,
+    rmsnorm_self,
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
@@ -29,6 +24,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -60,7 +56,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8, per_token_quant_fp8
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -68,13 +64,15 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
 )
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -85,8 +83,22 @@ from sglang.srt.utils import (
     add_prefix,
     log_info_on_rank0,
     make_layers,
+    is_dcu, 
+    get_bool_env_var
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_dcu = is_dcu()
+_use_dpskv4_lightop_rmsnorm = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM")
+_use_fused_qnorm_rope_kv_rope_quant = get_bool_env_var(
+    "SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT"
+)
+_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
+
+if _is_dcu:
+    from lightop import op
+    if _use_aiter_tilelang_mhc:
+        from aiter.ops.tilelang import mhc_post_fwd, mhc_pre_big_fuse
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +235,15 @@ class MQALayer(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+        self.register_buffer("cos_sin_cache_fused", None, persistent=False)
+        self.cos_sin_cache_fused: Optional[torch.Tensor]
+        if _is_dcu and _use_fused_qnorm_rope_kv_rope_quant:
+            freqs_real = torch.view_as_real(self.freqs_cis)  # [max_pos, 32, 2]
+            cos_sin_cache = torch.cat(
+                [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
+            ).contiguous()  # [max_pos, 64], first 32 cos, last 32 sin
+            self.cos_sin_cache_fused = cos_sin_cache
+
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
             self.alt_streams = alt_streams[:3]
             self.alt_streams_indexer = alt_streams[-2:]
@@ -283,6 +304,7 @@ class MQALayer(nn.Module):
                 prefix=add_prefix("wkv", prefix),
             )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.use_jit_norm = False
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -293,6 +315,8 @@ class MQALayer(nn.Module):
             tp_size=attn_tp_size,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
+        if _FP8_WO_A_GEMM and quant_config is not None:
+            quant_config.ignore = [i for i in quant_config.ignore if 'wo_a' not in i]
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -305,8 +329,9 @@ class MQALayer(nn.Module):
         )
         if _FP8_WO_A_GEMM:
             assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+                self.wo_a, "weight_scale"
+            ), "FP8 quant_config must create weight_scale"
+            self.wo_a.weight_scale_inv = self.wo_a.weight_scale
             self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -352,11 +377,28 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if q_out is None:
-            q_out = torch.empty_like(q)
-        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
+        # if q_out is None:
+        #     q_out = torch.empty_like(q)
+        # # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        # fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        # return q_out
+
+        if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+            op.rms_norm_no_weight(None, q, None, self.eps)
+        else:
+            q = rms_normalize_triton(q, self.eps)
+        if positions is not None:
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+        else:
+            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+        if q_out is not None:
+            q_out.copy_(q)
+        return q
 
     def _compute_kv_to_cache(
         self,
@@ -478,34 +520,89 @@ class MQALayer(nn.Module):
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
             q_lora = qkv_a[..., : self.q_lora_rank]
+            kv = qkv_a[..., self.q_lora_rank :]
         else:
             q_lora, _ = self.wq_a(x)
-            qkv_a = None
+            kv, _ = self.wkv(x)
         q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q, _ = self.wq_b(q_lora)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
 
-        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
-        kv: Optional[torch.Tensor]
-        if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-            kv = cp_all_gather_rerange_output(
-                kv.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv,
-                forward_batch=forward_batch,
+        _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _use_lightop_qnorm_rope = (
+            _use_fused_qnorm_rope_kv_rope_quant and _is_dcu
+        )
+        if _use_lightop_qnorm_rope:
+            cos_sin_cache_fused = self.cos_sin_cache_fused
+            assert cos_sin_cache_fused is not None
+        else:
+            cos_sin_cache_fused = None
+
+        if _use_lightop_qnorm_rope and not _cp_enabled:
+            # Fused kernel: Q no-weight RMSNorm + Q RoPE + KV RMSNorm +
+            # K RoPE + K FP8 quant + cache insert.
+            pool = forward_batch.token_to_kv_pool
+            swa_pool = pool.swa_kv_pool
+            layer_idx = self.layer_id - pool._stage_start
+            k_cache = swa_pool.kv_buffer[layer_idx]
+            cache_block_size = swa_pool.page_size
+            raw_loc = forward_batch.out_cache_loc
+            slot_mapping = pool.translate_loc_from_full_to_swa(raw_loc)
+
+            op.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
+                q, kv, self.kv_norm.weight, k_cache, slot_mapping,
+                positions, cos_sin_cache_fused,
+                self.eps, cache_block_size,
             )
         else:
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
-            kv = None
+            if _use_lightop_qnorm_rope:
+                # CP must all-gather/rerange KV before cache insert, so only fuse
+                # the local Q norm/RoPE and local KV norm/RoPE here.
+                op.fused_deepseek_v4_qnorm_rope_kvnorm_rope(
+                    q,
+                    kv,
+                    self.kv_norm.weight,
+                    positions,
+                    cos_sin_cache_fused,
+                    self.eps,
+                )
+            else:
+                kv = self.kv_norm(kv)
+                if self.use_jit_norm:
+                    q = rmsnorm_self(q, self.eps)
+                else:
+                    if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+                        op.rms_norm_no_weight(None, q, None, self.eps)
+                    else:
+                        q = rms_normalize_triton(q, self.eps)
 
-        del qkv_a
+                fused_rope(
+                    q[..., -self.qk_rope_head_dim :],
+                    kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                    self.freqs_cis,
+                    positions=positions,
+                )
+
+            if _cp_enabled:
+                kv = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                # if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
+                #     assert_tensor_identical_across_cp_ranks(
+                #         kv,
+                #         tag=f"kv_after_allgather layer_id={self.layer_id}",
+                #         forward_batch=forward_batch,
+                #     )
+
+            if getattr(self, "overlap_store_cache", False):
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -517,6 +614,8 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
+        if q_out is not None:
+            q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -562,11 +661,20 @@ class MQALayer(nn.Module):
                 x, positions, forward_batch, attn_backend, q_out
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
+        # Skip backend cache write only when the prepare path already wrote it.
         attn_k = kv if kv is not None else q
+        _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _fused_cache_insert_path = (
+            _use_fused_qnorm_rope_kv_rope_quant
+            and not _cp_enabled
+            and _is_dcu
+            and not enable_multi_stream
+        )
+        _cache_already_written = (
+            enable_multi_stream
+            or _fused_cache_insert_path
+            or getattr(self, "overlap_store_cache", False)
+        )
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
             k=attn_k,
@@ -575,7 +683,7 @@ class MQALayer(nn.Module):
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=False,
+            save_kv_cache=not _cache_already_written,
         )
         o = o[:, tp_slice, :]
         fused_rope_inplace(
@@ -589,19 +697,39 @@ class MQALayer(nn.Module):
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
-            import deep_gemm
+            import deepgemm as deep_gemm
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
+
+            o_fp8, o_s = per_token_quant_fp8(
                 o.reshape(T * G, D).contiguous(),
-                group_size=128,
             )
+
+            lhs_fp8 = o_fp8.view(T, G, D)
+            lhs_scale = o_s.view(T, G)
+
+            w = self.wo_a.weight
+            if tuple(w.shape) == (D, G * R):
+                rhs_fp8 = w.t().contiguous().view(G, R, D)
+            elif tuple(w.shape) == (G * R, D):
+                rhs_fp8 = w.contiguous().view(G, R, D)
+            else:
+                raise RuntimeError(
+                    f"unexpected wo_a.weight shape={tuple(w.shape)}, expected {(D, G * R)} or {(G * R, D)}"
+                )
+
+            weight_scale = getattr(self.wo_a, "weight_scale", None)
+            if weight_scale is None:
+                weight_scale = self.wo_a.weight_scale_inv
+            rhs_scale = weight_scale.data.reshape(G, R).contiguous()
+
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                (lhs_fp8, lhs_scale),
+                (rhs_fp8, rhs_scale),
                 output,
                 recipe=(1, 1, 128),
             )
@@ -676,8 +804,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm: Optional[nn.Module] = None,
     ):
-        """If *norm* is given and the TileLang path is active, the returned
-        hidden_states are already post-norm (the norm is fused into the kernel)."""
+        """Return MHC-pre outputs and whether the optional RMSNorm was fused."""
 
         @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
@@ -699,26 +826,43 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            from sglang.srt.layers.mhc import mhc_pre
+            if _is_dcu and _use_aiter_tilelang_mhc:
+                post, comb, y = mhc_pre_big_fuse(
+                    residual=x,
+                    fn=hc_fn,
+                    mhc_scale=hc_scale,
+                    mhc_base=hc_base,
+                    rms_eps=self.rms_norm_eps,
+                    mhc_pre_eps=self.hc_eps,
+                    mhc_sinkhorn_eps=self.hc_eps,
+                    mhc_post_mult_value=2.0,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                    n_splits=16,
+                )
+                # AITER MHC pre does not fuse the decoder-layer RMSNorm.
+                norm_fused = False
+            else:
+                from sglang.srt.layers.mhc import mhc_pre
 
-            norm_kwargs = {}
-            if norm is not None:
-                norm_kwargs["norm_weight"] = norm.weight.data
-                norm_kwargs["norm_eps"] = norm.variance_epsilon
+                norm_kwargs = {}
+                if norm is not None:
+                    norm_kwargs["norm_weight"] = norm.weight.data
+                    norm_kwargs["norm_eps"] = norm.variance_epsilon
 
-            post, comb, y = mhc_pre(
-                residual=x,
-                fn=hc_fn,
-                hc_scale=hc_scale,
-                hc_base=hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=2.0,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-                **norm_kwargs,
-            )
-            return y, post.squeeze(-1), comb, norm is not None
+                post, comb, y = mhc_pre(
+                    residual=x,
+                    fn=hc_fn,
+                    hc_scale=hc_scale,
+                    hc_base=hc_base,
+                    rms_eps=self.rms_norm_eps,
+                    hc_pre_eps=self.hc_eps,
+                    hc_sinkhorn_eps=self.hc_eps,
+                    hc_post_mult_value=2.0,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                    **norm_kwargs,
+                )
+                norm_fused = norm is not None
+            return y, post.squeeze(-1), comb, norm_fused
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # import deep_gemm
@@ -765,9 +909,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
-
-            return mhc_post(x, residual, post, comb)
+            if _is_dcu and _use_aiter_tilelang_mhc:
+                out = mhc_post_fwd(
+                    x, 
+                    residual,
+                    post, 
+                    comb, 
+                )
+                return out
+            else:
+                from sglang.srt.layers.mhc import mhc_post
+                return mhc_post(x, residual, post, comb)
+                # return mhc_post_torch(x, residual, post, comb)
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -841,7 +994,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -857,7 +1013,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids_global=input_ids_global,
         )
         if _use_tp_moe_gather:
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
@@ -887,6 +1046,7 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
+        self.first_k_dense_replace = config.first_k_dense_replace
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -920,8 +1080,8 @@ class DeepseekV4Model(nn.Module):
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
+        hc_dim = hc_mult * config.hidden_size
         if self.pp_group.is_last_rank:
-            hc_dim = hc_mult * config.hidden_size
             self.hc_head_fn = nn.Parameter(
                 torch.empty(hc_mult, hc_dim, dtype=torch.float32)
             )
@@ -967,7 +1127,10 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -1043,30 +1206,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_pp_group()
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-                )
-        else:
+        if not self.pp_group.is_last_rank:
             self.lm_head = PPMissingLayer()
+        elif config.tie_word_embeddings and self.pp_group.world_size == 1:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(
-                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
-                )
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
             }
         )
 
@@ -1116,7 +1277,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     metadata = forward_batch.attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
                             forward_batch.attn_backend.init_forward_metadata_indexer(
@@ -1128,7 +1289,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
-        if not self.pp_group.is_last_rank:
+        if isinstance(hidden_states, PPProxyTensors):
             return hidden_states
 
         aux_hidden_states = None
@@ -1171,13 +1332,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM:
-            self._setup_fp8_wo_a_scales(is_nextn)
+        # if _FP8_WO_A_GEMM:
+        #     self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
             return
-        for layer_id in range(self.model.start_layer, self.model.end_layer):
-            layer = self.model.layers[layer_id]
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             self_attn = layer.self_attn
             if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
                 self_attn.compressor.apply_ape_hotfix()
@@ -1271,7 +1433,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
-                logger.info("Skip dequant fp8 wo_a")
+                weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -1300,11 +1462,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             return getattr(module, "weight_loader", default_weight_loader)
 
         def maybe_remap_compressed_tensors_scale_name(param_name: str) -> str:
-            if (
-                self.quant_config is None
-                or self.quant_config.get_name() != "compressed_tensors"
-            ):
-                return param_name
+            # if (
+            #     self.quant_config is None
+            #     or self.quant_config.get_name() != "compressed_tensors"
+            # ):
+            #     return param_name
 
             compressed_tensors_names = []
             if param_name.endswith(".weight_scale_inv"):
@@ -1315,6 +1477,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 compressed_tensors_names.append(
                     param_name.replace("_weight_scale_inv", "_weight_scale")
                 )
+            if _FP8_WO_A_GEMM:
+                if param_name.endswith(".scale") and not param_name.endswith(
+                    ".weight_scale"
+                ):
+                    base = param_name[: -len(".scale")]
+                    compressed_tensors_names.append(base + ".weight_scale_inv")
+                    compressed_tensors_names.append(base + ".weight_scale")
 
             for compressed_tensors_name in compressed_tensors_names:
                 if compressed_tensors_name in params_dict:
@@ -1516,8 +1685,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wkv.weight_scale")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(

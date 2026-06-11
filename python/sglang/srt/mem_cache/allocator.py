@@ -525,6 +525,20 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            # Page 0 is reserved as a dummy/padding page and is never allocated.
+            # Also keep repeated frees from corrupting the free-list accounting.
+            free_page_indices = free_page_indices[free_page_indices > 0]
+            if free_page_indices.numel() == 0:
+                return
+            free_page_indices = free_page_indices[
+                ~torch.isin(free_page_indices, self.free_pages)
+            ]
+            if self.release_pages.numel() > 0:
+                free_page_indices = free_page_indices[
+                    ~torch.isin(free_page_indices, self.release_pages)
+                ]
+            if free_page_indices.numel() == 0:
+                return
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
