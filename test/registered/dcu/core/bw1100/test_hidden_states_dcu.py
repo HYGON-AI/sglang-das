@@ -34,6 +34,8 @@ class TestHiddenState(CustomTestCase):
             random_seed=42,
             skip_tokenizer_init=True,
             enable_return_hidden_states=True,
+            attention_backend="fa3",
+            page_size=64,
         )
         outputs = engine.generate(
             input_ids=input_ids,
@@ -108,6 +110,8 @@ class TestHiddenState(CustomTestCase):
             random_seed=42,
             skip_tokenizer_init=True,
             enable_return_hidden_states=True,
+            attention_backend="fa3",
+            page_size=64,
         )
         outputs_completion_first_round = engine.generate(
             input_ids=input_ids,

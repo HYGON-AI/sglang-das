@@ -141,6 +141,8 @@ class TestOriginalLogprob(unittest.TestCase):
                     skip_tokenizer_init=True,
                     trust_remote_code=True,
                     mem_fraction_static=0.60,
+                    attention_backend="fa3",
+                    page_size=64,
                 )
 
                 for prompt in PROMPTS:
