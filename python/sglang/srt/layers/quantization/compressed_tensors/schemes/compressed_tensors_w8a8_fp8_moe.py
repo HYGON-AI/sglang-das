@@ -360,17 +360,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if (
-            _is_dcu
-            and self.runner.runner_backend.is_aiter()
-            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-        ):
-            from sglang.srt.layers.moe.moe_runner.aiter import (
-                process_weights_after_loading_aiter_w8a8_fp8,
-            )
-
-            process_weights_after_loading_aiter_w8a8_fp8(layer)
-        elif self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
