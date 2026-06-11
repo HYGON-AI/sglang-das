@@ -285,6 +285,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
         layer._dsv4_channel_fp8_deepgemm_repacked = True
 
+        # Clean up weights that won't be used
+        del layer.w13_weight
+        del layer.w2_weight
+        torch.cuda.empty_cache()
+
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
