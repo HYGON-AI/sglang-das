@@ -264,6 +264,7 @@ jobs:
     with:
       require-run-ci: true
       cool-down-minutes: 0
+      runner_label: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     secrets: inherit
 
   validate-config:
