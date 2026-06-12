@@ -260,12 +260,45 @@ jobs:
     name: Call PR gate
     needs: check-changes
     if: github.event_name == 'pull_request' && needs.check-changes.outputs.dcu == 'true'
-    uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
-      cool-down-minutes: 0
-      runner_label: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
-    secrets: inherit
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Fetch latest PR info
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput("labels", JSON.stringify(pr.data.labels.map(l => l.name)));
+            core.setOutput("draft", pr.data.draft);
+            core.setOutput("user", pr.data.user.login);
+
+      - name: Log PR info
+        run: |
+          echo "===== DCU PR Gate Info ====="
+          echo "PR Event: ${{ github.event_name }}"
+          echo "PR Labels: ${{ steps.pr.outputs.labels }}"
+          echo "PR Draft: ${{ steps.pr.outputs.draft }}"
+          echo "PR User: ${{ steps.pr.outputs.user }}"
+          echo "Require run-ci: true"
+          echo "============================"
+
+      - name: Block draft PR
+        if: fromJson(steps.pr.outputs.draft)
+        run: |
+          echo "PR is draft. Blocking DCU CI."
+          exit 1
+
+      - name: Require run-ci label
+        run: |
+          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
+            echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
+            exit 1
+          fi
 
   validate-config:
     name: Validate DCU config

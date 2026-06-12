@@ -9,16 +9,12 @@ on:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
         default: 120
-      runner_label:
-        description: "Runner label used for PR gate checks"
-        type: string
-        default: ubuntu-latest
 
 jobs:
   pr-gate:
     # 1. for commits on main: no gating needed
     # 2. for workflow_dispatch: this can only be triggered by users with write access
-    runs-on: ${{ inputs.runner_label }}
+    runs-on: ubuntu-latest
     steps:
       - name: Fetch latest PR info
         if: github.event_name == 'pull_request'
