@@ -2,6 +2,8 @@
 
 [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for LLM inference engines
 
+<!-- DCU CI wheel-mode trigger for PR validation. -->
+
 <div align="center">
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/sgl-project/sglang/blob/main/LICENSE)
