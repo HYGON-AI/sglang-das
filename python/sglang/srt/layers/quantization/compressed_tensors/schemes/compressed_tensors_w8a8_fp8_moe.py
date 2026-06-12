@@ -285,6 +285,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
         layer._dsv4_channel_fp8_deepgemm_repacked = True
 
+        # Save original weight shapes before deletion — needed by
+        # DeepEPMoE.forward_groupgemm_w8a8_fp8_contiguous for N dimension
+        layer._dsv4_w13_weight_shape = tuple(w13.shape)
+        layer._dsv4_w2_weight_shape = tuple(w2.shape)
+
         # Clean up weights that won't be used
         del layer.w13_weight
         del layer.w2_weight

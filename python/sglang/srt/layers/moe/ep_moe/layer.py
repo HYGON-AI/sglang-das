@@ -921,7 +921,11 @@ class DeepEPMoE(FusedMoE):
             return hidden_states.bfloat16()
 
         M, K = hidden_states.size()
-        N = self.w13_weight.size(1)
+        w13_shape = getattr(self, "_dsv4_w13_weight_shape", None)
+        if w13_shape is not None:
+            N = w13_shape[1]
+        else:
+            N = self.w13_weight.size(1)
         # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
         # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
         # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
@@ -1550,7 +1554,7 @@ class DeepEPMoE(FusedMoE):
         # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
         # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
         # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
-        
+
         # ---- weights & scales ----
         # w13_weight = self.w13_weight
         w13_weight = self.w13_weight_deepgemm
