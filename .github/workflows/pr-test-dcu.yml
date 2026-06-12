@@ -124,9 +124,26 @@ jobs:
     steps:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+        env:
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-check"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Determine run mode
         id: run-mode
@@ -147,6 +164,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          cd "${DCU_CI_CHECKOUT_DIR}"
           if [[ -z "${BASE_SHA}" ]]; then
             echo "dcu=true" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -202,6 +220,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          cd "${DCU_CI_CHECKOUT_DIR}"
 
           if [[ "${FORCE_WHEEL_MODE}" == "true" ]]; then
             echo "wheel_required=true" >> "${GITHUB_OUTPUT}"
@@ -261,9 +280,26 @@ jobs:
     steps:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+        env:
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-validate"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Checkout code for workflow_dispatch
         if: github.event_name == 'workflow_dispatch'
@@ -324,7 +360,9 @@ jobs:
 
       - name: Verify DCU registration
         if: github.event_name != 'workflow_dispatch'
-        run: python3.9 scripts/ci/dcu/verify_dcu_registration.py || python3 scripts/ci/dcu/verify_dcu_registration.py
+        run: |
+          cd "${DCU_CI_CHECKOUT_DIR}"
+          python3.9 scripts/ci/dcu/verify_dcu_registration.py || python3 scripts/ci/dcu/verify_dcu_registration.py
 
       - name: Setup DCU validation container
         if: github.event_name == 'workflow_dispatch'
@@ -353,13 +391,7 @@ jobs:
         if: always() && github.event_name == 'workflow_dispatch'
         env:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   wait-dcu-wheels:
     name: Wait DCU wheels
@@ -560,13 +592,7 @@ jobs:
 
       - name: Cleanup DCU container
         if: always()
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   stage-b-test-1-gpu-small-dcu:
     name: Stage B DCU required (${{ matrix.name }})
@@ -699,13 +725,7 @@ jobs:
 
       - name: Cleanup DCU container
         if: always()
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   pr-test-dcu-finish:
     name: PR Test (DCU) finish

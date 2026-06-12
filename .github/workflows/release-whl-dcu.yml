@@ -70,11 +70,17 @@ jobs:
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
+      DCU_RUNNER_HOST_UID: ${{ vars.DCU_RUNNER_HOST_UID || '1000' }}
+      DCU_RUNNER_HOST_GID: ${{ vars.DCU_RUNNER_HOST_GID || '1000' }}
 
     steps:
       # =======================================================================
       # 环境准备
       # =======================================================================
+
+      - name: Normalize workspace ownership before checkout
+        run: |
+          chown -R "${DCU_RUNNER_HOST_UID}:${DCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
 
       - uses: actions/checkout@v4
         with:
@@ -200,3 +206,8 @@ jobs:
           name: dcu-wheels-py${{ matrix.python-version }}
           path: output/*.whl
           if-no-files-found: warn
+
+      - name: Normalize workspace ownership
+        if: always()
+        run: |
+          chown -R "${DCU_RUNNER_HOST_UID}:${DCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
