@@ -1,25 +1,6 @@
 name: DCU Full Enabled
 
 on:
-  pull_request:
-    types:
-      - labeled
-      - synchronize
-      - reopened
-      - ready_for_review
-    branches:
-      - v0.5.12_dev
-      - main
-      - dcu-ci-pr
-    paths:
-      - ".github/workflows/dcu-full-enabled.yml"
-      - ".github/workflows/pr-test-dcu.yml"
-      - "scripts/ci/dcu/**"
-      - "python/pyproject*.toml"
-      - "python/sglang/**"
-      - "test/run_suite.py"
-      - "test/registered/**"
-      - "sgl-kernel/**"
   workflow_dispatch:
     inputs:
       ref:
