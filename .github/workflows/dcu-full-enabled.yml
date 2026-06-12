@@ -1,0 +1,384 @@
+name: DCU Full Enabled
+
+on:
+  pull_request:
+    types:
+      - labeled
+      - synchronize
+      - reopened
+      - ready_for_review
+    branches:
+      - v0.5.12_dev
+      - main
+      - dcu-ci-pr
+    paths:
+      - ".github/workflows/dcu-full-enabled.yml"
+      - ".github/workflows/pr-test-dcu.yml"
+      - "scripts/ci/dcu/**"
+      - "python/pyproject*.toml"
+      - "python/sglang/**"
+      - "test/run_suite.py"
+      - "test/registered/**"
+      - "sgl-kernel/**"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref, branch, tag, or SHA to test"
+        required: false
+        type: string
+        default: ""
+      runner_label:
+        description: "DCU runner label override"
+        required: false
+        type: string
+        default: ""
+      image:
+        description: "DCU CI container image override"
+        required: false
+        type: string
+        default: ""
+      continue_on_error:
+        description: "Continue running remaining files after a test failure"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: dcu-full-enabled-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.ref || 'current' }}
+  cancel-in-progress: true
+
+jobs:
+  check-full-trigger:
+    name: Check full trigger
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    outputs:
+      should_run: ${{ steps.trigger.outputs.should_run }}
+    steps:
+      - name: Check run-dcu-full label
+        id: trigger
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action || '' }}
+          EVENT_LABEL: ${{ github.event.label.name || '' }}
+          HAS_FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-dcu-full') || contains(github.event.pull_request.labels.*.name, 'run-ci') }}
+        run: |
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${HAS_FULL_LABEL}" != "true" ]]; then
+            echo "DCU full enabled run is disabled. Add the 'run-dcu-full' label to this PR, or use the temporary 'run-ci' compatibility gate on the dcu-ci-pr validation branch."
+            echo "should_run=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${EVENT_ACTION}" == "labeled" && "${EVENT_LABEL}" != "run-dcu-full" ]]; then
+            echo "Ignoring unrelated label event: ${EVENT_LABEL}"
+            echo "should_run=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "should_run=true" >> "${GITHUB_OUTPUT}"
+
+  validate-config:
+    name: Validate DCU full config
+    needs: check-full-trigger
+    if: needs.check-full-trigger.outputs.should_run == 'true'
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    outputs:
+      runner_label: ${{ steps.resolve.outputs.runner_label }}
+      image: ${{ steps.resolve.outputs.image }}
+      continue_on_error_flag: ${{ steps.resolve.outputs.continue_on_error_flag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+
+      - name: Resolve DCU runner and image
+        id: resolve
+        env:
+          INPUT_RUNNER_LABEL: ${{ inputs.runner_label || '' }}
+          INPUT_IMAGE: ${{ inputs.image || '' }}
+          VAR_RUNNER_LABEL: ${{ vars.DCU_CI_RUNNER_LABEL || '' }}
+          VAR_IMAGE: ${{ vars.DCU_CI_IMAGE || '' }}
+          CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
+        run: |
+          runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
+          if [[ "${runner_label}" == "dcu-ci-pr" ]]; then
+            echo "Routing validation runner label dcu-ci-pr to dcu-ci-pr-2 for nmz4 test runner."
+            runner_label="dcu-ci-pr-2"
+          fi
+          image="${INPUT_IMAGE:-${VAR_IMAGE}}"
+          continue_on_error="${CONTINUE_ON_ERROR:-true}"
+
+          if [[ -z "${runner_label}" ]]; then
+            echo "::error::DCU runner label is required. Set vars.DCU_CI_RUNNER_LABEL or workflow input runner_label."
+            exit 1
+          fi
+
+          if [[ -z "${image}" ]]; then
+            echo "::error::DCU CI image is required. Set vars.DCU_CI_IMAGE or workflow input image."
+            exit 1
+          fi
+
+          continue_on_error_flag=""
+          if [[ "${continue_on_error}" == "true" ]]; then
+            continue_on_error_flag="--continue-on-error"
+          fi
+
+          echo "runner_label=${runner_label}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup DCU validation container
+        env:
+          DCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+          DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+          DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+
+      - name: Verify DCU registration in container
+        env:
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+        run: bash scripts/ci/dcu/dcu_ci_exec.sh --container-name "${DCU_CI_CONTAINER_NAME}" -w /sglang-checkout -- python3 scripts/ci/dcu/verify_dcu_registration.py
+
+      - name: Cleanup DCU validation container
+        if: always()
+        env:
+          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
+            host_uid="$(id -u)"
+            host_gid="$(id -g)"
+            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
+            docker rm -f "${DCU_CI_CONTAINER_NAME}"
+          fi
+
+  full-enabled-dcu:
+    name: Full enabled DCU (${{ matrix.name }})
+    needs: validate-config
+    if: needs.validate-config.result == 'success'
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - name: stage-a
+            suite: stage-a-test-1-gpu-small-dcu
+            nightly: "false"
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
+          - name: stage-b-small-0
+            suite: stage-b-test-1-gpu-small-dcu
+            nightly: "false"
+            part: 0
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-small-1
+            suite: stage-b-test-1-gpu-small-dcu
+            nightly: "false"
+            part: 1
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-small-2
+            suite: stage-b-test-1-gpu-small-dcu
+            nightly: "false"
+            part: 2
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-small-3
+            suite: stage-b-test-1-gpu-small-dcu
+            nightly: "false"
+            part: 3
+            parts: 4
+            timeout_per_file: 1800
+            timeout_minutes: 180
+          - name: stage-b-large
+            suite: stage-b-test-1-gpu-large-dcu
+            nightly: "false"
+            part: 0
+            parts: 1
+            timeout_per_file: 2400
+            timeout_minutes: 150
+          - name: stage-b-2gpu
+            suite: stage-b-test-2-gpu-large-dcu
+            nightly: "false"
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
+          - name: nightly-dcu-0
+            suite: nightly-dcu
+            nightly: "true"
+            part: 0
+            parts: 3
+            timeout_per_file: 3000
+            timeout_minutes: 180
+          - name: nightly-dcu-1
+            suite: nightly-dcu
+            nightly: "true"
+            part: 1
+            parts: 3
+            timeout_per_file: 3000
+            timeout_minutes: 180
+          - name: nightly-dcu-2
+            suite: nightly-dcu
+            nightly: "true"
+            part: 2
+            parts: 3
+            timeout_per_file: 3000
+            timeout_minutes: 180
+          - name: nightly-dcu-1gpu
+            suite: nightly-dcu-1-gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
+          - name: accuracy-0
+            suite: nightly-dcu-accuracy
+            nightly: "true"
+            part: 0
+            parts: 2
+            timeout_per_file: 4200
+            timeout_minutes: 180
+          - name: accuracy-1
+            suite: nightly-dcu-accuracy
+            nightly: "true"
+            part: 1
+            parts: 2
+            timeout_per_file: 4200
+            timeout_minutes: 180
+          - name: perf-0
+            suite: nightly-dcu-perf
+            nightly: "true"
+            part: 0
+            parts: 2
+            timeout_per_file: 2400
+            timeout_minutes: 150
+          - name: perf-1
+            suite: nightly-dcu-perf
+            nightly: "true"
+            part: 1
+            parts: 2
+            timeout_per_file: 2400
+            timeout_minutes: 150
+          - name: vlm-0
+            suite: nightly-dcu-vlm
+            nightly: "true"
+            part: 0
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: vlm-1
+            suite: nightly-dcu-vlm
+            nightly: "true"
+            part: 1
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+    env:
+      DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
+      DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
+      DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+    steps:
+      - name: Checkout code
+        env:
+          CHECKOUT_REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/".[!.]* "${GITHUB_WORKSPACE:?}/"..?* 2>/dev/null || true
+          git init "${GITHUB_WORKSPACE}"
+          cd "${GITHUB_WORKSPACE}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
+
+      - name: Setup DCU container
+        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+
+      - name: Install dependencies
+        run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
+
+      - name: Run full enabled DCU suite
+        run: |
+          nightly_flag=""
+          if [[ "${{ matrix.nightly }}" == "true" ]]; then
+            nightly_flag="--nightly"
+          fi
+
+          echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }} nightly=${{ matrix.nightly }}"
+          bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+            python3 run_suite.py \
+              --hw dcu \
+              --suite "${{ matrix.suite }}" \
+              ${nightly_flag} \
+              --auto-partition-id "${{ matrix.part }}" \
+              --auto-partition-size "${{ matrix.parts }}" \
+              --timeout-per-file "${{ matrix.timeout_per_file }}" \
+              ${{ needs.validate-config.outputs.continue_on_error_flag }}
+
+      - name: Cleanup DCU container
+        if: always()
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
+            host_uid="$(id -u)"
+            host_gid="$(id -g)"
+            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
+            docker rm -f "${DCU_CI_CONTAINER_NAME}"
+          fi
+
+  dcu-full-enabled-finish:
+    name: DCU Full Enabled finish
+    needs:
+      - check-full-trigger
+      - validate-config
+      - full-enabled-dcu
+    if: always()
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "${json_needs}" | jq -r 'keys_unsorted[]')
+
+          for job in ${job_names}; do
+            result=$(echo "${json_needs}" | jq -r --arg j "${job}" '.[$j].result')
+            echo "${job}: ${result}"
+
+            if [[ "${job}" == "check-full-trigger" && "${result}" == "success" ]]; then
+              continue
+            fi
+
+            if [[ "${result}" == "failure" || "${result}" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+
+          echo "All DCU full enabled jobs completed successfully or were skipped."

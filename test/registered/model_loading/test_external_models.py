@@ -2,7 +2,15 @@ import unittest
 
 import sglang as sgl
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+# DCU BW1100 validated on 10.16.1.66/dxl-sglang: local Qwen2-VL external model path passed three runs.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+)
+
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=29, stage="stage-b", runner_config="1-gpu-small")

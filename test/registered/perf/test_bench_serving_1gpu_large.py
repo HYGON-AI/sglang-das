@@ -5,7 +5,15 @@ Performance tests for single GPU that need H200 (80GB) - FP8 and EAGLE tests.
 import unittest
 
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu-perf",
+    nightly=True,
+    disabled="DCU benchmark registration placeholder; needs BW1100 performance baseline, thresholds, and local model path validation.",
+)
+
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,

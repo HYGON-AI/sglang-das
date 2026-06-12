@@ -3,7 +3,15 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu-vlm",
+    nightly=True,
+    disabled="DCU multi-device/VLM path needs local model mapping and dedicated real-device validation.",
+)
+
 from sglang.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
 from sglang.test.test_utils import is_in_ci
 

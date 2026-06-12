@@ -6,7 +6,16 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    nightly=False,
+    disabled="DCU CSV CI placeholder: FP8 kernel path needs BW1100 numeric validation before enabling.",
+)
+
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large")

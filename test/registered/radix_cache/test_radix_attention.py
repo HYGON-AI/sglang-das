@@ -1,7 +1,18 @@
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=100,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled=(
+        "DCU PR baseline deferred: timed out after 900s on BW1100 "
+        "sgl-test stage-b-dcu partition 0; keep in nightly/manual until "
+        "radix-cache server integration is repeatable within PR budget."
+    ),
+)
+
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

@@ -40,7 +40,15 @@ from sglang.srt.debug_utils.dumper import (
 )
 from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+)
+
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
