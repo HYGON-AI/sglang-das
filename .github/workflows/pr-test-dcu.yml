@@ -220,7 +220,6 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          cd "${DCU_CI_CHECKOUT_DIR}"
 
           if [[ "${FORCE_WHEEL_MODE}" == "true" ]]; then
             echo "wheel_required=true" >> "${GITHUB_OUTPUT}"
@@ -235,6 +234,8 @@ jobs:
             echo "Wheel mode disabled for non-PR run without force_wheel_mode."
             exit 0
           fi
+
+          cd "${DCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
 
           git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
