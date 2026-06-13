@@ -25,6 +25,8 @@ on:
       - "test/run_suite.py"
       - "test/registered/**"
       - "sgl-kernel/**"
+      - "sgl-model-gateway/**"
+      - "requirements_dcu.txt"
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -179,17 +181,15 @@ jobs:
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/(pr-test-dcu|pr-gate|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/)'; then
+          dcu_path_pattern='^(\.github/workflows/(pr-test-dcu|pr-gate|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_dcu\.txt$)'
+
+          if echo "${changed_files}" | grep -Eq "${dcu_path_pattern}"; then
             echo "dcu=true" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=true" >> "${GITHUB_OUTPUT}"
           else
             echo "dcu=false" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
           fi
-
-          auto_run_ci=false
-          if [[ -n "${changed_files}" ]] && ! echo "${changed_files}" | grep -Ev '^(\.github/workflows/(pr-test-dcu|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml$|scripts/ci/dcu/|test/registered/dcu/|python/sglang/test/dcu_utils\.py$)' >/dev/null; then
-            auto_run_ci=true
-          fi
-          echo "auto_run_ci=${auto_run_ci}" >> "${GITHUB_OUTPUT}"
 
       - name: Select DCU stages
         id: plan
@@ -255,7 +255,7 @@ jobs:
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py|python/sglang/test/dcu_utils\.py)'; then
+          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt$|python/pyproject.*\.toml|python/sglang/)'; then
             wheel_required=true
           fi
 
@@ -317,7 +317,7 @@ jobs:
           fi
 
           if [[ "${AUTO_RUN_CI}" == "true" ]]; then
-            echo "Auto-run DCU CI because only DCU-owned paths changed."
+            echo "Auto-run DCU CI because DCU-impact paths changed."
             exit 0
           fi
 
