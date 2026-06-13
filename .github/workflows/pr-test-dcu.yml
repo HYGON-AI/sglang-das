@@ -16,6 +16,9 @@ on:
     paths:
       - ".github/workflows/pr-test-dcu.yml"
       - ".github/workflows/pr-gate.yml"
+      - ".github/workflows/release-pr-dcu.yml"
+      - ".github/workflows/dcu-full-enabled.yml"
+      - ".github/workflows/release-pypi-nightky-dcu.yml"
       - "scripts/ci/dcu/**"
       - "python/pyproject*.toml"
       - "python/sglang/**"
@@ -117,6 +120,7 @@ jobs:
     runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       dcu: ${{ steps.filter.outputs.dcu || steps.run-mode.outputs.run_all_tests }}
+      auto_run_ci: ${{ steps.filter.outputs.auto_run_ci || 'false' }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
       run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
       wheel_required: ${{ steps.wheel.outputs.wheel_required }}
@@ -167,18 +171,25 @@ jobs:
           cd "${DCU_CI_CHECKOUT_DIR}"
           if [[ -z "${BASE_SHA}" ]]; then
             echo "dcu=true" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/pr-test-dcu\.yml|\.github/workflows/pr-gate\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/)'; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/(pr-test-dcu|pr-gate|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/)'; then
             echo "dcu=true" >> "${GITHUB_OUTPUT}"
           else
             echo "dcu=false" >> "${GITHUB_OUTPUT}"
           fi
+
+          auto_run_ci=false
+          if [[ -n "${changed_files}" ]] && ! echo "${changed_files}" | grep -Ev '^(\.github/workflows/(pr-test-dcu|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml$|scripts/ci/dcu/|test/registered/dcu/|python/sglang/test/dcu_utils\.py$)' >/dev/null; then
+            auto_run_ci=true
+          fi
+          echo "auto_run_ci=${auto_run_ci}" >> "${GITHUB_OUTPUT}"
 
       - name: Select DCU stages
         id: plan
@@ -220,7 +231,6 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          cd "${DCU_CI_CHECKOUT_DIR}"
 
           if [[ "${FORCE_WHEEL_MODE}" == "true" ]]; then
             echo "wheel_required=true" >> "${GITHUB_OUTPUT}"
@@ -236,14 +246,16 @@ jobs:
             exit 0
           fi
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          cd "${DCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
+
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py)'; then
+          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py|python/sglang/test/dcu_utils\.py)'; then
             wheel_required=true
           fi
 
@@ -285,6 +297,7 @@ jobs:
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: true"
+          echo "Auto run DCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
           echo "============================"
 
       - name: Block draft PR
@@ -293,12 +306,23 @@ jobs:
           echo "PR is draft. Blocking DCU CI."
           exit 1
 
-      - name: Require run-ci label
+      - name: Require run-ci label or DCU auto-run
+        env:
+          AUTO_RUN_CI: ${{ needs.check-changes.outputs.auto_run_ci || 'false' }}
+          HAS_RUN_CI_LABEL: ${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}
         run: |
-          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
-            exit 1
+          if [[ "${HAS_RUN_CI_LABEL}" == "true" ]]; then
+            echo "Found run-ci label. Proceeding with DCU CI."
+            exit 0
           fi
+
+          if [[ "${AUTO_RUN_CI}" == "true" ]]; then
+            echo "Auto-run DCU CI because only DCU-owned paths changed."
+            exit 0
+          fi
+
+          echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
+          exit 1
 
   validate-config:
     name: Validate DCU config

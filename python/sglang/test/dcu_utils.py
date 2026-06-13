@@ -7,6 +7,7 @@ import openai
 import requests
 
 
+# DCU CI-owned helpers can auto-run the DCU PR gate.
 DCU_TEXT_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
