@@ -255,7 +255,7 @@ jobs:
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py)'; then
+          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py|python/sglang/test/dcu_utils\.py)'; then
             wheel_required=true
           fi
 
