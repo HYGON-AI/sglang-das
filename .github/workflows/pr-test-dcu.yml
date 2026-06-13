@@ -175,7 +175,7 @@ jobs:
             exit 0
           fi
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
@@ -248,7 +248,7 @@ jobs:
 
           cd "${DCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
