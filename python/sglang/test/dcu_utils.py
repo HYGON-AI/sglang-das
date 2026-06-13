@@ -8,6 +8,7 @@ import requests
 
 
 # DCU CI-owned helpers can auto-run the DCU PR gate.
+# Post-merge DCU PR validation touches this helper to exercise wheel mode.
 DCU_TEXT_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
