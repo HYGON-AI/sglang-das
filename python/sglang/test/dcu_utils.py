@@ -7,6 +7,7 @@ import openai
 import requests
 
 
+# DCU PR validation helper defaults live here to avoid runtime-code changes.
 DCU_TEXT_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
