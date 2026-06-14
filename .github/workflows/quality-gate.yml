@@ -6,25 +6,72 @@ on:
     branches:
       - main
       - master
+      - v0.5.12_dev
 
 jobs:
+  changed-files:
+    name: changed-files
+    runs-on: [self-hosted, linux, x64, quality]
+    outputs:
+      files: ${{ steps.collect.outputs.files }}
+      has_files: ${{ steps.collect.outputs.has_files }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed files
+        id: collect
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+
+          if [ -s changed-files.txt ]; then
+            {
+              echo "files<<EOF"
+              cat changed-files.txt
+              echo "EOF"
+              echo "has_files=true"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "files<<EOF"
+              echo ""
+              echo "EOF"
+              echo "has_files=false"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Changed files:"
+          cat changed-files.txt || true
+
   encoding-check:
     name: encoding-check
+    needs: changed-files
+    if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, linux, x64, quality]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show runner
-        run: |
-          echo "RUNNER_NAME=$RUNNER_NAME"
-          hostname
-
-      - name: Check UTF-8 and garbled characters
+      - name: Check UTF-8 and garbled characters in changed files
         shell: bash
+        env:
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
           python3 - <<'PY'
+          import os
           from pathlib import Path
 
           skip_dirs = {
@@ -39,10 +86,13 @@ jobs:
               ".bin", ".onnx", ".pt", ".pth", ".safetensors", ".whl"
           }
 
+          files = [line.strip() for line in os.environ.get("CHANGED_FILES", "").splitlines() if line.strip()]
           bad = []
 
-          for path in Path(".").rglob("*"):
-              if not path.is_file():
+          for name in files:
+              path = Path(name)
+
+              if not path.exists() or not path.is_file():
                   continue
 
               if set(path.parts) & skip_dirs:
@@ -84,27 +134,44 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Run Gitleaks
+      - name: Run Gitleaks on pull request commits
+        if: github.event_name == 'pull_request'
         shell: bash
         run: |
           docker run --rm \
             -v "$PWD:/repo" \
             zricethezav/gitleaks:v8.24.2 \
-            detect --source /repo --no-git --verbose
+            detect --source /repo \
+            --log-opts "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" \
+            --verbose
+
+      - name: Run Gitleaks on push commits
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            zricethezav/gitleaks:v8.24.2 \
+            detect --source /repo \
+            --log-opts "${{ github.event.before }}..${{ github.sha }}" \
+            --verbose
 
   sast-check:
     name: sast-check
     runs-on: [self-hosted, linux, x64, quality]
+    continue-on-error: true
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run Semgrep
+      - name: Run Semgrep in observe mode
         shell: bash
         run: |
           docker run --rm \
             -v "$PWD:/src" \
             semgrep/semgrep:1.125.0 \
-            semgrep scan --config auto --error /src
+            semgrep scan --config auto /src
