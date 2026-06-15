@@ -776,6 +776,17 @@ jobs:
               --include-file registered/openai_server/features/test_json_mode.py \
               --include-file registered/metrics/test_priority_metrics.py \
               --include-file registered/dcu/srt/bw1100/test_qwen25_0p5b_server_dcu.py \
+              --include-file registered/dcu/openai_server/test_function_calling_dcu.py \
+              --include-file registered/dcu/openai_server/test_hidden_states_base_dcu.py \
+              --include-file registered/dcu/openai_server/test_protocol_dcu.py \
+              --include-file registered/dcu/openai_server/test_serving_chat_dcu.py \
+              --include-file registered/dcu/openai_server/test_tool_choice_dcu.py \
+              --include-file registered/dcu/reranker/bw1100/test_qwen3_reranker_dcu.py \
+              --include-file registered/dcu/rotary/test_mrope_smoke_dcu.py \
+              --include-file registered/dcu/spec/test_build_eagle_tree_dcu.py \
+              --include-file registered/dcu/unit/function_call/test_json_schema_constraint_dcu.py \
+              --include-file registered/dcu/unit/test_profile_merger_dcu.py \
+              --include-file registered/dcu/vlm_models/bw1100/test_qwen25_vl_3b_server_dcu.py \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size ${{ matrix.parts }} \
               --timeout-per-file ${{ matrix.timeout_per_file }} \
