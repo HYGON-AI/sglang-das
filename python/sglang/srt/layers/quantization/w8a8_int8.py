@@ -319,13 +319,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_dcu and self.runner.runner_backend.is_aiter():
-            from sglang.srt.layers.moe.moe_runner.aiter import (
-                process_weights_after_loading_aiter_w8a8_int8,
-            )
-
-            process_weights_after_loading_aiter_w8a8_int8(layer)
-        elif _is_dcu and self.runner.runner_backend.is_lightop():
+        if _is_dcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,
             )
