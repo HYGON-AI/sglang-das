@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  lint:
+  lint-dcu:
     runs-on: [self-hosted, dcu, nmz4]
     timeout-minutes: 30
 
