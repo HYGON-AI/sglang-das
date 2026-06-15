@@ -44,10 +44,9 @@ class MoeRunner:
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_aiter():
-            # Side-effect import: registers the ("none", "aiter") fused func.
-            from sglang.srt.layers.moe.moe_runner import aiter  # noqa: F401
+            from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 
-            self.runner_core = None  # AITER only supports fused path
+            self.runner_core = AiterRunnerCore(config)
         elif runner_backend.is_marlin():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
@@ -55,6 +54,10 @@ class MoeRunner:
                 self.runner_core = MarlinLoraRunnerCore(config)
             else:
                 self.runner_core = None  # Marlin only supports fused path
+        elif runner_backend.is_lightop():
+            from sglang.srt.layers.moe.moe_runner.lightop import LightOpRunnerCore
+
+            self.runner_core = LightOpRunnerCore(config)
         elif (
             runner_backend.is_flashinfer_trtllm()
             or runner_backend.is_flashinfer_trtllm_routed()

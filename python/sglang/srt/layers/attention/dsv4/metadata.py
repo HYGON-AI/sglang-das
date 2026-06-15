@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 
+from sglang.srt.utils import is_dcu
+
+_is_dcu = is_dcu()
+
 if TYPE_CHECKING:
     pass
 
@@ -48,6 +52,7 @@ Some other notes:
                all related length will be clipped to 512.
 """
 
+_LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 def copy_metadata(
     *,
@@ -102,16 +107,13 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_dcu:
             self.deep_gemm_metadata = None
-        else:
-            import deepgemm as deep_gemm
-
+        else: # lightop support get_paged_mqa_logits_metadata but has other potential issues, skip it in dcu
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
-                # from deep_gemm import get_paged_mqa_logits_metadata
                 from lightop.gemmopt import get_paged_mqa_logits_metadata
 
             _c4 = self.c4_seq_lens.to(torch.int32)
@@ -120,8 +122,7 @@ class PagedIndexerMetadata:
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
                 _c4,
                 self.c4_page_size,
-                # deep_gemm.get_num_sms(),
-                props.multi_processor_count, # 暂时写死
+                props.multi_processor_count,
             )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)

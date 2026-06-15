@@ -221,6 +221,7 @@ _use_fused_mla_cat = get_bool_env_var("SGLANG_USE_FUSED_MLA_CAT")
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _rms_quant_path = get_int_env_var('SGLANG_USE_RMS_QUANT_PATH')
+_use_fused_dpskv4_silu_mul_fp8_quant = get_bool_env_var("SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT")
 if _use_fused_rmsnorm_rope:
     from lightop import fused_rms_norm_rope_contiguous
     fused_rms_norm_rope_contiguous = torch._dynamo.disable(fused_rms_norm_rope_contiguous)
@@ -674,6 +675,30 @@ class DeepseekV2MLP(nn.Module):
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x
+        # if _use_fused_rms_quant and rms_weight is not None and residual is not None:
+        #     gate_up, new_resi, i_q, _scales, _ = self.gate_up_proj(x, rms_weight, residual, update_hd=update_hd)
+        #     if _use_fused_silu_mul_quant:
+        #         x, _ = self.down_proj(gate_up, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter, use_fused_silu_mul_quant=True)
+        #     elif _use_fused_dpskv4_silu_mul_fp8_quant:
+        #         x, _ = self.down_proj(gate_up, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter, use_fused_silu_mul_fp8_quant=True)
+        #     else:
+        #         x = self.act_fn(gate_up)
+        #         x, _ = self.down_proj(
+        #             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        #         )
+        #     return x, new_resi, i_q, _scales
+        # else:
+        #     gate_up, _ = self.gate_up_proj(x)
+        #     if _use_fused_silu_mul_quant:
+        #         x, _ = self.down_proj(gate_up, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter, use_fused_silu_mul_quant=True)
+        #     elif _use_fused_dpskv4_silu_mul_fp8_quant:
+        #         x, _ = self.down_proj(gate_up, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter, use_fused_silu_mul_fp8_quant=True)
+        #     else:
+        #         x = self.act_fn(gate_up)
+        #         x, _ = self.down_proj(
+        #             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        #         )
+        #     return x
 
 
 class MoEGate(nn.Module):
@@ -1080,6 +1105,7 @@ class DeepseekV2MoE(nn.Module):
                     * (get_global_server_args().speculative_num_draft_tokens or 1)
                 )
             ):
+                # print("进入到了self.forward_normal_dual_stream")
                 return self.forward_normal_dual_stream(
                     hidden_states,
                     should_allreduce_fusion,
@@ -1091,6 +1117,7 @@ class DeepseekV2MoE(nn.Module):
                     residual = residual,
                 )
             else:
+                # print("进入到了self.forward_normal")
                 return self.forward_normal(
                     hidden_states,
                     should_allreduce_fusion,
@@ -1102,7 +1129,13 @@ class DeepseekV2MoE(nn.Module):
                     residual = residual,
                 )
         else:
-            return self.forward_deepep(hidden_states, forward_batch, rms_weight=rms_weight, residual=residual,)
+            return self.forward_deepep(
+                hidden_states,
+                forward_batch,
+                input_ids_global=input_ids_global,
+                rms_weight=rms_weight,
+                residual=residual,
+            )
 
     def forward_normal_dual_stream(
         self,
@@ -1258,10 +1291,11 @@ class DeepseekV2MoE(nn.Module):
                 post_combine_hook_handle = (
                     self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
                 )
+            # input_hidden_states = hidden_states.detach().clone() #lj
             final_hidden_states = self.experts(
             hidden_states,
             topk_output,
-        )
+            )
         if (
             not _is_cuda
             and not _is_musa
@@ -1378,7 +1412,6 @@ class DeepseekV2MoE(nn.Module):
             i_q = None
             i_s = None
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:

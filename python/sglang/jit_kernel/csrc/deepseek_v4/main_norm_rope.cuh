@@ -571,7 +571,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .verify(q_input);
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
-        .with_dtype<fp8_e4m3_t>()
+        .with_dtype<uint8_t>()
         .with_device(device_)
         .verify(q_fp8);
     TensorMatcher({B, H})  //

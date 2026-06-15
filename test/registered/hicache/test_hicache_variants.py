@@ -1,4 +1,11 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+register_dcu_ci(
+    est_time=120,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU LoRA/HiCache path needs local model/storage mapping and dedicated validation.",
+)
+
 
 register_cuda_ci(est_time=450, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")

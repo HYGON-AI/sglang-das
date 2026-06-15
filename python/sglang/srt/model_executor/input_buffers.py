@@ -2,13 +2,31 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from sglang.srt.utils import is_npu
 
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
+
+
+def get_pp_proxy_hidden_states_shape(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    model_config,
+) -> Tuple[int, ...]:
+    architectures = getattr(getattr(model_config, "hf_config", None), "architectures", [])
+    if any(
+        arch in ("DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN")
+        for arch in architectures
+    ):
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        hc_mult = getattr(hf_text_config, "hc_mult", getattr(hf_config, "hc_mult", 1))
+        return (num_tokens, hc_mult, hidden_size)
+    return (num_tokens, hidden_size)
 
 
 @dataclass

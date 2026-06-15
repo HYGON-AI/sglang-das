@@ -1,4 +1,10 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+register_dcu_ci(
+    est_time=106,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Stage-B deferred: generation model matrix includes gated/remote models; needs a BW1100 local-model matrix before enabling.",
+)
+
 
 # Generation model tests (CUDA only)
 register_cuda_ci(est_time=150, stage="extra-a", runner_config="1-gpu-large")

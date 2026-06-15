@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 # from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
@@ -29,6 +30,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
 from lmslim import quant_ops
 
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
@@ -316,7 +319,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu_amx_available:
+        if _is_dcu and self.runner.runner_backend.is_lightop():
+            from sglang.srt.layers.moe.moe_runner.lightop import (
+                process_weights_after_loading_lightop,
+            )
+
+            process_weights_after_loading_lightop(layer)
+        elif _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
@@ -331,8 +340,20 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend.is_aiter() and _is_dcu:
+            self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+        elif moe_runner_backend.is_lightop() and _is_dcu:
+            self.runner = MoeRunner(MoeRunnerBackend.LIGHTOP, moe_runner_config)
+        elif moe_runner_backend.is_triton():
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        else:
+            raise ValueError(f"Unsupported MoE runner backend: {moe_runner_backend}")
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -350,6 +371,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -379,7 +401,26 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 None,  # block_size
                 True,  # is_vnni
             )
+            if bias is not None:
+                output = output + bias
             return StandardCombineInput(hidden_states=output)
 
         quant_info = self.get_triton_quant_info(layer)
-        return self.runner.run(dispatch_output, quant_info)
+
+        if _is_dcu and self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_int8_quant_info,
+            )
+
+            quant_info = get_aiter_w8a8_int8_quant_info(layer)
+        elif _is_dcu and self.runner.runner_backend.is_lightop():
+            from sglang.srt.layers.moe.moe_runner.lightop import get_lightop_quant_info
+
+            quant_info = get_lightop_quant_info(layer)
+
+        combine_input = self.runner.run(dispatch_output, quant_info)
+        if bias is not None:
+            return StandardCombineInput(
+                hidden_states=combine_input.hidden_states + bias
+            )
+        return combine_input

@@ -21,7 +21,8 @@ from sglang.srt.layers.attention.fla.utils import (
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_dcu
+_is_dcu = is_dcu()
 _use_prefill_aiter_linear_attn = get_bool_env_var("SGLANG_USE_AITER_LINEAR_ATTN")
 
 @triton.autotune(

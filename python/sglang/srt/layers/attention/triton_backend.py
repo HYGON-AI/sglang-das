@@ -145,6 +145,7 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
+            self.swa_v_head_dim = None
             if hasattr(model_runner.token_to_kv_pool, 'v_head_dim'):
                 self.v_head_dim = model_runner.token_to_kv_pool.v_head_dim #nhb
             elif hasattr(model_runner.token_to_kv_pool, 'get_value_buffer'):

@@ -1,6 +1,15 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    nightly=False,
+    disabled="DCU CSV CI placeholder: hybrid attention backend needs BW1100 validation before enabling.",
+)
+
 from sglang.test.server_fixtures.hybrid_attn_backend_fixture import (
     TestHybridAttnBackendBase,
 )

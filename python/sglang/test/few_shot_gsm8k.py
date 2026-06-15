@@ -99,7 +99,14 @@ def run_eval(args):
         s += sgl.gen(
             "answer",
             max_tokens=args.max_new_tokens,
-            stop=["Question", "Assistant:", "<|separator|>"],
+            stop=[
+                "Question",
+                "Assistant:",
+                "<|separator|>",
+                "<｜end▁of▁file｜>",
+                "<｜begin▁of▁file｜>",
+                "<｜begin▁of▁file▁name｜>",
+            ],
         )
 
     #####################################

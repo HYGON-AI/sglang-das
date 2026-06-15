@@ -5,7 +5,16 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=563,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU CSV CI placeholder: DeepEP large path needs BW1100 8-GPU validation before enabling.",
+)
+
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
