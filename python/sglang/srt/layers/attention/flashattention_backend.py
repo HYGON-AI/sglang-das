@@ -1251,7 +1251,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q = metadata.cu_seqlens_q
                 max_seqlen_q = metadata.max_seq_len_q
                 max_seqlen_k = metadata.max_seq_len_k
-                page_table = metadata.page_table
+                # page_table = metadata.page_table
                 cu_seqlens_k = metadata.cu_seqlens_k
                 cache_seqlens = metadata.cache_seqlens_int32
                 if not _kv_layout_dcu_fa:
