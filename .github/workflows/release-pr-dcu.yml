@@ -190,12 +190,10 @@ jobs:
           ls -lh output/
           CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
 
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: dcu-wheels-py${{ matrix.python-version }}
-          path: output/*.whl
-          if-no-files-found: warn
+      - name: Skip GitHub artifact upload
+        run: |
+          echo "DCU PR wheels are uploaded to internal devpi in the previous step."
+          echo "Skipping GitHub artifact upload to avoid blocking PR CI on repository artifact quota."
 
       - name: Normalize workspace ownership
         if: always()
