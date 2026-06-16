@@ -84,7 +84,7 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
                                fused_mapping=self.packed_modules_mapping):
             return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
-            scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
             layer.scheme = scheme
