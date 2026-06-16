@@ -194,3 +194,109 @@ def get_valid_kv_indices(
         bs,
         topk,
     )
+
+
+@triton.jit
+def _hadamard_transform_kernel(
+    x_ptr,
+    out_ptr,
+    scale: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < dim
+    row_offset = row * dim
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    for k in tl.static_range(0, BLOCK_D):
+        x_k = tl.load(x_ptr + row_offset + k, mask=k < dim, other=0.0).to(tl.float32)
+        parity = tl.popcount(cols & k) & 1
+        sign = tl.where(parity == 0, 1.0, -1.0)
+        acc += x_k * sign
+
+    tl.store(out_ptr + row_offset + cols, acc * scale, mask=mask)
+
+
+def hadamard_transform_optimized(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """
+    x: (..., dim) - dim must be a power of 2
+    """
+    x_shape = x.shape
+    dim = x.shape[-1]
+    assert (
+        dim & (dim - 1)
+    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+
+    x_2d = x.contiguous().view(-1, dim)
+    out = torch.empty_like(x_2d)
+    block_d = triton.next_power_of_2(dim)
+    num_warps = min(max(block_d // 32, 1), 8)
+    _hadamard_transform_kernel[(x_2d.shape[0],)](
+        x_2d,
+        out,
+        float(scale),
+        dim,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+    )
+    return out.view(*x_shape)
+
+
+@triton.jit
+def _fused_gate_scale_kernel(
+    weights_ptr,
+    q_scale_ptr,
+    out_ptr,
+    scale,
+    M,
+    K,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    w = tl.load(weights_ptr + pid_m)
+    w_scaled = w * scale
+    row_start_idx = pid_m * K
+    for k_offset in range(0, K, BLOCK_K):
+        cols = k_offset + tl.arange(0, BLOCK_K)
+        mask = cols < K
+
+        q_ptrs = q_scale_ptr + row_start_idx + cols
+        out_ptrs = out_ptr + row_start_idx + cols
+        q = tl.load(q_ptrs, mask=mask)
+        out = w_scaled * q
+        tl.store(out_ptrs, out, mask=mask)
+
+
+def fused_get_logits_head_gate_triton(
+    weights: torch.Tensor,
+    q_scale: torch.Tensor,
+    n_heads: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    weights = weights.contiguous()
+    q_scale = q_scale.contiguous()
+
+    K = q_scale.size(-1)
+    M = weights.numel()
+
+    out_dtype = torch.promote_types(weights.dtype, q_scale.dtype)
+    out = torch.empty_like(q_scale, dtype=out_dtype)
+
+    scale = softmax_scale * (n_heads**-0.5)
+    block_k = triton.next_power_of_2(K)
+    if block_k > 1024:
+        block_k = 1024
+
+    grid = (M,)
+    _fused_gate_scale_kernel[grid](
+        weights,
+        q_scale,
+        out,
+        scale,
+        M,
+        K,
+        BLOCK_K=block_k,
+    )
+    return out
