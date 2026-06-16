@@ -15,6 +15,7 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
+import os
 import logging
 from contextlib import nullcontext
 from functools import lru_cache
@@ -117,6 +118,27 @@ if _is_dcu:
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
+
+_FP32GEMM_GATE = None
+
+def _gate_fp32gemm(
+    hidden_states: torch.Tensor, weight: torch.Tensor,
+) -> torch.Tensor:
+    global _FP32GEMM_GATE
+    if _FP32GEMM_GATE is None:
+        if os.environ.get("SGLANG_USE_FP32GEMM_GATE_CUSTOM", "0") == "1":
+            try:
+                import fp32gemm
+                _FP32GEMM_GATE = fp32gemm
+            except ImportError:
+                _FP32GEMM_GATE = False
+        else:
+            _FP32GEMM_GATE = False
+
+    if _FP32GEMM_GATE is not False and hidden_states.dtype == torch.bfloat16:
+        return _FP32GEMM_GATE.gemm_abt(hidden_states, weight)
+
+    return F.linear(hidden_states.float(), weight, bias=None)
 
 
 @triton.jit
@@ -606,7 +628,7 @@ class MiniMaxM2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = _gate_fp32gemm(hidden_states, self.gate.weight)
             topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -632,9 +654,7 @@ class MiniMaxM2MoE(nn.Module):
         adtype = hidden_states.dtype
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        router_logits = F.linear(
-            hidden_states.to(torch.float32), self.gate.weight, bias=None
-        )
+        router_logits = _gate_fp32gemm(hidden_states, self.gate.weight)
         topk_output = self.topk(hidden_states, router_logits)
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
@@ -687,7 +707,7 @@ class MiniMaxM2MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = _gate_fp32gemm(hidden_states, self.gate.weight)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -712,6 +732,9 @@ class MiniMaxM2MoE(nn.Module):
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):  # router_logits: (num_tokens, num_experts)
             state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            # state.router_logits = _gate_fp32gemm(
+            #     state.hidden_states_mlp_input, self.gate.weight
+            # )
         else:
             state.router_logits = None
 
