@@ -111,6 +111,8 @@ _is_cuda = is_cuda()
 _is_dcu = is_dcu()
 _is_npu = is_npu()
 
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 if _is_dcu:
@@ -968,13 +970,15 @@ class MiniMaxM2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ):
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, rms_weight=rms_weight, residual=residual)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self.qk_norm_impl.forward(q, k)
@@ -987,6 +991,8 @@ class MiniMaxM2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
@@ -995,7 +1001,7 @@ class MiniMaxM2Attention(nn.Module):
         attn_tp_size = attn_tp_group.world_size
         tokens_per_rank = hidden_states.shape[0]
 
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, rms_weight=rms_weight, residual=residual)
         q, k, v = qkv.split(
             [self.q_size_full, self.kv_size_full, self.kv_size_full], dim=-1
         )
@@ -1098,12 +1104,16 @@ class MiniMaxM2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_global_server_args().minimax_opt:
             s = self.forward_prepare_opt(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                rms_weight=rms_weight,
+                residual=residual,
             )
             return self.forward_core_opt(s)
 
@@ -1112,6 +1122,8 @@ class MiniMaxM2Attention(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                rms_weight=rms_weight,
+                residual=residual,
             )
         else:
             s = self.forward_prepare_npu(
@@ -1213,27 +1225,49 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 residual=residual,
             )
 
-        # Self Attention
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
+        if _use_fused_rms_quant:
+            pre_norm = hidden_states.clone() if residual is None else residual
+            hidden_states, _ = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch, skip_layernorm=True
             )
-        )
-        if not forward_batch.forward_mode.is_idle():
+            if residual is not None:
+                assert residual.shape[0] == hidden_states.shape[0], (
+                    f"Fused RMS quant requires hidden_states ({hidden_states.shape[0]}) "
+                    f"and residual ({residual.shape[0]}) to have the same token count. "
+                    f"Set SGLANG_USE_FUSED_RMS_QUANT=0 or disable --moe-a2a-backend."
+                )
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                rms_weight=self.input_layernorm.weight,
+                residual=residual,
             )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, pre_norm, forward_batch
+            )
+        else:
+            # Self Attention
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                )
+            )
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
-        # Fully Connected (MLP or MoE)
+            # Fully Connected (MLP or MoE)
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -1268,19 +1302,35 @@ class MiniMaxM2DecoderLayer(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if _use_fused_rms_quant:
+            pre_norm = hidden_states.clone() if residual is None else residual
+            if residual is not None:
+                assert residual.shape[0] == hidden_states.shape[0], (
+                    f"Fused RMS quant requires hidden_states ({hidden_states.shape[0]}) "
+                    f"and residual ({residual.shape[0]}) to have the same token count."
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                rms_weight=self.input_layernorm.weight,
+                residual=residual,
+            )
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, pre_norm)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual, None)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual, None)
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
         return hidden_states, residual
 
