@@ -134,7 +134,7 @@ class FutureMap:
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            if draft_input is None : #nhb
+            if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices

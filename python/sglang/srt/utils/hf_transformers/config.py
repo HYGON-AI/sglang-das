@@ -71,6 +71,10 @@ class HfModelConfigParser(ModelConfigParserBase):
             config.architectures is not None
             and config.architectures[0] == "GlmMoeDsaForCausalLM"
         ):
+            # GlmMoeDsaConfig drops/clobbers raw checkpoint fields the DSA path
+            # needs, so re-read them from config.json and restore. Fixed upstream
+            # by https://github.com/huggingface/transformers/pull/46338; remove
+            # this block once SGLang requires transformers >= 5.10.
             from transformers import PretrainedConfig
 
             raw_config, _ = PretrainedConfig.get_config_dict(

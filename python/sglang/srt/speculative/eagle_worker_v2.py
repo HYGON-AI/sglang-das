@@ -60,8 +60,6 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
-    #nhb
-    generate_token_bitmask
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,

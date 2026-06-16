@@ -561,7 +561,7 @@ def select_top_k_tokens_tmp(
 
     return input_ids, hidden_states, scores, tree_info
 
-#nhb
+
 def assign_extend_cache_locs_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,

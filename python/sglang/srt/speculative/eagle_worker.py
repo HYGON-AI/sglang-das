@@ -878,6 +878,10 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        # Reuse NSA/DSA topk_indices from the first draft forward step for
+        # subsequent steps, analogous to skip_topk in deepseek_v2.py layers.
+        # Only safe with topk == 1: select_top_k_tokens reorders candidate rows
+        # each step, which would desync the cached indices from their rows.
         index_share_for_mtp_iteration = (
             getattr(
                 self.model_config.hf_config, "index_share_for_mtp_iteration", False

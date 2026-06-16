@@ -246,8 +246,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
         return is_bs_supported
-    
-    #nhb
+
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
 
