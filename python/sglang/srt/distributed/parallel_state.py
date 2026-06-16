@@ -766,6 +766,24 @@ class GroupCoordinator:
             )
         return output
 
+    def _all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+    ) -> torch.Tensor:
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            with pynccl_comm.change_state(enable=True, stream=get_current_device_stream_fast()):
+                pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
+        return output
+
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> torch.Tensor:
+        return self._all_to_all_single(output, input)
+
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)

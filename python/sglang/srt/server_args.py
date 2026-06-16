@@ -775,6 +775,8 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    # MiniMax M2 optimization: sequence-parallel prefill over TP ranks.
+    minimax_opt: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
@@ -6800,6 +6802,11 @@ class ServerArgs:
             "--enable-attn-tp-input-scattered",
             action="store_true",
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        )
+        parser.add_argument(
+            "--minimax-opt",
+            action="store_true",
+            help="Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
         )
         parser.add_argument(
             "--enable-nsa-prefill-context-parallel",

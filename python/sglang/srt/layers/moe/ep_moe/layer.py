@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
     per_token_quant_int8_triton_opt,
     build_m_indices_triton,
+    build_m_indices_and_ep_scatter,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -960,21 +961,16 @@ class DeepEPMoE(FusedMoE):
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
         hidden_states_dtype = hidden_states.dtype
-        input_tensor = [
-            torch.empty(
-                (all_tokens, K),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            ),
-            (
-                torch.empty(
-                    (all_tokens, hidden_states_scale.shape[-1]),
-                    device=hidden_states.device,
-                    dtype=torch.float32,
-                )
-            ),
-        ]
-        output_index = torch.full_like(topk_ids, -1)
+        a_int8 = torch.empty(
+            (all_tokens, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        a_scale = torch.empty(
+            (all_tokens, hidden_states_scale.shape[-1]),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
 
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
@@ -987,27 +983,26 @@ class DeepEPMoE(FusedMoE):
                 pin_memory=True,
                 device="cpu",
             ).cuda(non_blocking=True)
-        expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
         local_num_expert = num_recv_tokens_per_expert_gpu.shape[0]
-        m_indices = build_m_indices_triton(topk_ids, hidden_states.device, local_num_expert)
+        m_indices = torch.full(
+            (all_tokens,),
+            -1,
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
+        output_index = torch.full_like(topk_ids, -1)
 
-        ep_scatter(
+        build_m_indices_and_ep_scatter(
             hidden_states,
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
-            expert_start_loc,
-            input_tensor[0],
-            input_tensor[1],
+            a_int8,
+            a_scale,
             m_indices,
             output_index,
+            local_num_expert,
         )
-
-        # hidden_states is already int8 quantized from dispatch_a.
-        # Use the scattered int8 data and scales directly (no re-quantization).
-        a_int8 = input_tensor[0]
-        a_scale = input_tensor[1]
-        del input_tensor
 
         gateup_output = torch.zeros(
             (all_tokens, N * 16),
