@@ -16,12 +16,17 @@ on:
     paths:
       - ".github/workflows/pr-test-dcu.yml"
       - ".github/workflows/pr-gate.yml"
+      - ".github/workflows/release-pr-dcu.yml"
+      - ".github/workflows/dcu-full-enabled.yml"
+      - ".github/workflows/release-pypi-nightky-dcu.yml"
       - "scripts/ci/dcu/**"
       - "python/pyproject*.toml"
       - "python/sglang/**"
       - "test/run_suite.py"
       - "test/registered/**"
       - "sgl-kernel/**"
+      - "sgl-model-gateway/**"
+      - "requirements_dcu.txt"
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -117,6 +122,7 @@ jobs:
     runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       dcu: ${{ steps.filter.outputs.dcu || steps.run-mode.outputs.run_all_tests }}
+      auto_run_ci: ${{ steps.filter.outputs.auto_run_ci || 'false' }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
       run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
       wheel_required: ${{ steps.wheel.outputs.wheel_required }}
@@ -124,9 +130,26 @@ jobs:
     steps:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+        env:
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-check"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Determine run mode
         id: run-mode
@@ -147,19 +170,25 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          cd "${DCU_CI_CHECKOUT_DIR}"
           if [[ -z "${BASE_SHA}" ]]; then
             echo "dcu=true" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/pr-test-dcu\.yml|\.github/workflows/pr-gate\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/)'; then
+          dcu_path_pattern='^(\.github/workflows/(pr-test-dcu|pr-gate|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_dcu\.txt$)'
+
+          if echo "${changed_files}" | grep -Eq "${dcu_path_pattern}"; then
             echo "dcu=true" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=true" >> "${GITHUB_OUTPUT}"
           else
             echo "dcu=false" >> "${GITHUB_OUTPUT}"
+            echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Select DCU stages
@@ -217,14 +246,16 @@ jobs:
             exit 0
           fi
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}"
+          cd "${DCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
+
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(sgl-kernel/|requirements_dcu\.txt|python/pyproject.*\.toml|python/sglang/srt/layers/|python/sglang/srt/_custom_ops\.py)'; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-dcu\.yml$|sgl-kernel/|requirements_dcu\.txt$|python/pyproject.*\.toml|python/sglang/)'; then
             wheel_required=true
           fi
 
@@ -241,11 +272,57 @@ jobs:
     name: Call PR gate
     needs: check-changes
     if: github.event_name == 'pull_request' && needs.check-changes.outputs.dcu == 'true'
-    uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
-      cool-down-minutes: 0
-    secrets: inherit
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Fetch latest PR info
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput("labels", JSON.stringify(pr.data.labels.map(l => l.name)));
+            core.setOutput("draft", pr.data.draft);
+            core.setOutput("user", pr.data.user.login);
+
+      - name: Log PR info
+        run: |
+          echo "===== DCU PR Gate Info ====="
+          echo "PR Event: ${{ github.event_name }}"
+          echo "PR Labels: ${{ steps.pr.outputs.labels }}"
+          echo "PR Draft: ${{ steps.pr.outputs.draft }}"
+          echo "PR User: ${{ steps.pr.outputs.user }}"
+          echo "Require run-ci: true"
+          echo "Auto run DCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
+          echo "============================"
+
+      - name: Block draft PR
+        if: fromJson(steps.pr.outputs.draft)
+        run: |
+          echo "PR is draft. Blocking DCU CI."
+          exit 1
+
+      - name: Require run-ci label or DCU auto-run
+        env:
+          AUTO_RUN_CI: ${{ needs.check-changes.outputs.auto_run_ci || 'false' }}
+          HAS_RUN_CI_LABEL: ${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}
+        run: |
+          if [[ "${HAS_RUN_CI_LABEL}" == "true" ]]; then
+            echo "Found run-ci label. Proceeding with DCU CI."
+            exit 0
+          fi
+
+          if [[ "${AUTO_RUN_CI}" == "true" ]]; then
+            echo "Auto-run DCU CI because DCU-impact paths changed."
+            exit 0
+          fi
+
+          echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
+          exit 1
 
   validate-config:
     name: Validate DCU config
@@ -261,9 +338,26 @@ jobs:
     steps:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+        env:
+          CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-validate"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Checkout code for workflow_dispatch
         if: github.event_name == 'workflow_dispatch'
@@ -324,7 +418,9 @@ jobs:
 
       - name: Verify DCU registration
         if: github.event_name != 'workflow_dispatch'
-        run: python3.9 scripts/ci/dcu/verify_dcu_registration.py || python3 scripts/ci/dcu/verify_dcu_registration.py
+        run: |
+          cd "${DCU_CI_CHECKOUT_DIR}"
+          python3.9 scripts/ci/dcu/verify_dcu_registration.py || python3 scripts/ci/dcu/verify_dcu_registration.py
 
       - name: Setup DCU validation container
         if: github.event_name == 'workflow_dispatch'
@@ -353,13 +449,7 @@ jobs:
         if: always() && github.event_name == 'workflow_dispatch'
         env:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   wait-dcu-wheels:
     name: Wait DCU wheels
@@ -560,13 +650,7 @@ jobs:
 
       - name: Cleanup DCU container
         if: always()
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   stage-b-test-1-gpu-small-dcu:
     name: Stage B DCU required (${{ matrix.name }})
@@ -699,13 +783,7 @@ jobs:
 
       - name: Cleanup DCU container
         if: always()
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   pr-test-dcu-finish:
     name: PR Test (DCU) finish

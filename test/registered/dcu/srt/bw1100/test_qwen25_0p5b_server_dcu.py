@@ -52,7 +52,7 @@ class TestBW1100Qwen25HalfBServerDCU(unittest.TestCase):
             env={
                 "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
                 "SGLANG_USE_MODELSCOPE": os.environ.get("SGLANG_USE_MODELSCOPE", "1"),
-                "SGLANG_USE_LIGHTOP": os.environ.get("SGLANG_USE_LIGHTOP", "1"),
+                "SGLANG_USE_LIGHTOP": os.environ.get("SGLANG_USE_LIGHTOP", "0"),
             },
         )
 

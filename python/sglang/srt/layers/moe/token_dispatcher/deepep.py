@@ -635,6 +635,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
+            topk_weights,
         )
         return (
             hidden_states,
@@ -681,6 +682,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
@@ -725,6 +727,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
+                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type = 2,
@@ -738,6 +741,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
+                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type = 0,
@@ -751,6 +755,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
+                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type=1,
@@ -764,6 +769,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 buffer.low_latency_dispatch(
                     hidden_states,
                     topk_ids,
+                    topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
                     quant_type = 0,

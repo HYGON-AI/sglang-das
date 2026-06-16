@@ -1,8 +1,4 @@
-name: Release DCU Wheels
-
-permissions:
-  contents: read
-  pull-requests: read
+name: Release DCU Nightly Wheels
 
 on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
@@ -14,16 +10,7 @@ on:
       - 'sgl-kernel/**'
       - 'sgl-model-gateway/**'
       - 'requirements_dcu.txt'
-      - '.github/workflows/release-whl-dcu.yml'
-
-  # ---- PR 时触发（同样限定路径） ----
-  pull_request:
-    paths:
-      - 'python/**'
-      - 'sgl-kernel/**'
-      - 'sgl-model-gateway/**'
-      - 'requirements_dcu.txt'
-      - '.github/workflows/release-whl-dcu.yml'
+      - '.github/workflows/release-pypi-nightky-dcu.yml'
 
   # ---- 手动触发，可传参 ----
   workflow_dispatch:
@@ -43,7 +30,7 @@ jobs:
   compile:
     # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
     concurrency:
-      group: release-whl-dcu-${{ github.ref }}-py${{ matrix.python-version }}
+      group: release-nightly-dcu-${{ github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 DCU runner，在 Docker 容器内执行 ----
     runs-on: [self-hosted, dcu, nmz4]
@@ -142,6 +129,7 @@ jobs:
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
+        if: steps.changes.outputs.sgl-kernel == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           source /opt/dtk/env.sh
           cd sgl-kernel && python setup_hip.py bdist_wheel
@@ -183,7 +171,7 @@ jobs:
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=12 HEAD)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=6 HEAD)"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do

@@ -1,25 +1,17 @@
-name: Release DCU Wheels
+name: Release PR DCU Wheels
+
+permissions:
+  contents: read
+  pull-requests: read
 
 on:
-  # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
-  push:
-    branches:
-      - v0.5.12_dev
-    paths:
-      - 'python/**'
-      - 'sgl-kernel/**'
-      - 'sgl-model-gateway/**'
-      - 'requirements_dcu.txt'
-      - '.github/workflows/release-whl-dcu.yml'
-
-  # ---- PR 时触发（同样限定路径） ----
   pull_request:
     paths:
       - 'python/**'
       - 'sgl-kernel/**'
       - 'sgl-model-gateway/**'
       - 'requirements_dcu.txt'
-      - '.github/workflows/release-whl-dcu.yml'
+      - '.github/workflows/release-pr-dcu.yml'
 
   # ---- 手动触发，可传参 ----
   workflow_dispatch:
@@ -39,7 +31,7 @@ jobs:
   compile:
     # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
     concurrency:
-      group: release-whl-dcu-${{ github.ref }}-py${{ matrix.python-version }}
+      group: release-pr-dcu-${{ github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 DCU runner，在 Docker 容器内执行 ----
     runs-on: [self-hosted, dcu, nmz4]
@@ -66,14 +58,22 @@ jobs:
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
+      DCU_RUNNER_HOST_UID: ${{ vars.DCU_RUNNER_HOST_UID || '1000' }}
+      DCU_RUNNER_HOST_GID: ${{ vars.DCU_RUNNER_HOST_GID || '1000' }}
+      WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
       # =======================================================================
       # 环境准备
       # =======================================================================
 
+      - name: Normalize workspace ownership before checkout
+        run: |
+          chown -R "${DCU_RUNNER_HOST_UID}:${DCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
 
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
@@ -138,7 +138,6 @@ jobs:
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
-        if: steps.changes.outputs.sgl-kernel == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           source /opt/dtk/env.sh
           cd sgl-kernel && python setup_hip.py bdist_wheel
@@ -180,7 +179,7 @@ jobs:
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=6 HEAD)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
@@ -191,10 +190,12 @@ jobs:
           ls -lh output/
           CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
 
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: dcu-wheels-py${{ matrix.python-version }}
-          path: output/*.whl
-          if-no-files-found: warn
+      - name: Skip GitHub artifact upload
+        run: |
+          echo "DCU PR wheels are uploaded to internal devpi in the previous step."
+          echo "Skipping GitHub artifact upload to avoid blocking PR CI on repository artifact quota."
 
+      - name: Normalize workspace ownership
+        if: always()
+        run: |
+          chown -R "${DCU_RUNNER_HOST_UID}:${DCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
