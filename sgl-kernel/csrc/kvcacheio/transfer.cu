@@ -16,6 +16,31 @@
 #include "utils.h"  // WARP_SIZE
 #endif
 
+#ifdef USE_ROCM
+namespace {
+
+void* get_rocm_kernel_accessible_ptr(const at::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return nullptr;
+  }
+
+  void* ptr = tensor.data_ptr();
+  if (tensor.is_cuda() || ptr == nullptr) {
+    return ptr;
+  }
+
+  void* device_ptr = nullptr;
+  cudaError_t err = cudaHostGetDevicePointer(&device_ptr, ptr, 0);
+  TORCH_CHECK(
+      err == cudaSuccess,
+      "cudaHostGetDevicePointer failed for ROCm KV cache transfer host tensor: ",
+      cudaGetErrorString(err));
+  return device_ptr;
+}
+
+}  // namespace
+#endif
+
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
@@ -295,6 +320,14 @@ void transfer_kv_launcher(
   void* dst_k_ptr = dst_k.defined() ? dst_k.data_ptr() : nullptr;
   const void* src_v_ptr = IsMLA || !src_v.defined() ? nullptr : src_v.data_ptr();
   void* dst_v_ptr = IsMLA || !dst_v.defined() ? nullptr : dst_v.data_ptr();
+#ifdef USE_ROCM
+  src_k_ptr = get_rocm_kernel_accessible_ptr(src_k);
+  dst_k_ptr = get_rocm_kernel_accessible_ptr(dst_k);
+  if constexpr (!IsMLA) {
+    src_v_ptr = get_rocm_kernel_accessible_ptr(src_v);
+    dst_v_ptr = get_rocm_kernel_accessible_ptr(dst_v);
+  }
+#endif
   const uintptr_t* src_k_tbl_ptr = src_k_layers.defined() ? src_k_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* dst_k_tbl_ptr = dst_k_layers.defined() ? dst_k_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* src_v_tbl_ptr = IsMLA || !src_v_layers.defined() ? nullptr : src_v_layers.data_ptr<uintptr_t>();

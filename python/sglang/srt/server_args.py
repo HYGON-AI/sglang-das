@@ -1824,6 +1824,19 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
+                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+                if self.enable_two_batch_overlap and (
+                    index_topk_freq > 1
+                    or (
+                        index_topk_pattern is not None
+                        and "S" in index_topk_pattern
+                    )
+                ):
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with DSA topk indices sharing yet."
+                    )
+
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(

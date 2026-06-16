@@ -63,6 +63,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_dcu,
+    is_dcu_native_fp8_supported,
     next_power_of_2,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1864,7 +1865,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
+        if _is_hip and not _is_dcu and self.use_nsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -2137,11 +2138,18 @@ class NSATokenToKVPool(MLATokenToKVPool):
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
-        self.use_fp8_index_k_cache = not (
-            _is_dcu and dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if _is_dcu:
+            self.use_fp8_index_k_cache = dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ) and is_dcu_native_fp8_supported()
+        else:
+            self.use_fp8_index_k_cache = True
+        self.index_k_buffer_dtype = (
+            torch.bfloat16 if _is_dcu and not self.use_fp8_index_k_cache else self.dtype
         )
 
-        if _is_hip and  not _is_dcu: #and  not _is_dcu:nhb
+        if _is_hip and not _is_dcu: #and  not _is_dcu:nhb
             assert self.page_size == 1
         else:
             assert self.page_size == 64
@@ -2183,7 +2191,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                             1,
                             self.index_head_dim,
                         ),
-                        dtype=self.store_dtype,
+                        dtype=self.index_k_buffer_dtype,
                         device=device,
                     )
                     for _ in range(layer_num)
@@ -2205,8 +2213,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.index_k_buffer[layer_id - self.start_layer]
 
     def get_index_k_continuous(
@@ -2215,6 +2221,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        if not self.use_fp8_index_k_cache:
+            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            buf = self.get_index_k_buffer(layer_id)
+            return buf[page_indices[:num_pages]].view(-1, 1, self.index_head_dim)[
+                :seq_len
+            ]
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
@@ -2280,12 +2292,17 @@ class NSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices):
-        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # NSA keeps a page-indexed indexer cache alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
-        # set_index_k_scale_buffer, so we must offload it here too -- otherwise
+        # indexer cache writes, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
         # NSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices)
+        index_k_cache = (
+            self.index_k_with_scale_buffer
+            if self.use_fp8_index_k_cache
+            else self.index_k_buffer
+        )
 
         page_indices = indices[:: self.page_size] // self.page_size
         torch.cuda.synchronize()
@@ -2296,9 +2313,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.index_k_with_scale_buffer[layer_id][
-                    chunk_page_indices
-                ].to("cpu", non_blocking=True)
+                idx_cpu = index_k_cache[layer_id][chunk_page_indices].to(
+                    "cpu", non_blocking=True
+                )
                 index_k_cpu[-1].append(idx_cpu)
         torch.cuda.synchronize()
 
@@ -2309,6 +2326,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
+        index_k_cache = (
+            self.index_k_with_scale_buffer
+            if self.use_fp8_index_k_cache
+            else self.index_k_buffer
+        )
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
@@ -2318,10 +2340,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
                 idx_chunk = idx_cpu.to(
-                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                    index_k_cache[0].device, non_blocking=True
                 )
-                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+                index_k_cache[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
+
     def set_index_k_buffer(
         self,
         layer_id: int,
@@ -2329,11 +2352,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
     ) -> None:
         assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        if index_k.dtype != self.index_k_buffer_dtype:
+            index_k = index_k.to(self.index_k_buffer_dtype)
 
         self.index_k_buffer[layer_id - self.start_layer][
             loc // self.page_size, loc % self.page_size

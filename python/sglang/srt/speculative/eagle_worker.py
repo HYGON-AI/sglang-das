@@ -878,6 +878,16 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        index_share_for_mtp_iteration = (
+            getattr(
+                self.model_config.hf_config, "index_share_for_mtp_iteration", False
+            )
+            and self.topk == 1
+        )
+        if index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = True
+            forward_batch.topk_indices = None
+
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -921,6 +931,10 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
+
+        if index_share_for_mtp_iteration:
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens

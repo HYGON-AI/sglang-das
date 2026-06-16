@@ -333,6 +333,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Position information
     positions: torch.Tensor = None
 
+    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: Optional[bool] = False
+
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
