@@ -1003,6 +1003,12 @@ class DeepEPMoE(FusedMoE):
             output_index,
         )
 
+        # hidden_states is already int8 quantized from dispatch_a.
+        # Use the scattered int8 data and scales directly (no re-quantization).
+        a_int8 = input_tensor[0]
+        a_scale = input_tensor[1]
+        del input_tensor
+
         gateup_output = torch.zeros(
             (all_tokens, N * 16),
             device=hidden_states_device,
@@ -1010,12 +1016,11 @@ class DeepEPMoE(FusedMoE):
         )
 
         m_grouped_i8_gemm_nt_contiguous(
-            input_tensor,
+            (a_int8, a_scale),
             w13_weight_int8,
             gateup_output,
             m_indices,
         )
-        del input_tensor
 
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
