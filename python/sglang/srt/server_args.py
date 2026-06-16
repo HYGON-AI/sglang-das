@@ -580,6 +580,9 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    pack_paged_kv_to_varlen: Literal["auto", "on", "off"] = "auto"
+    pack_paged_kv_to_varlen_min_kv_tokens: int = 16384
+    pack_paged_kv_to_varlen_min_q_tokens: int = 8192
     mamba_backend: str = "triton"
 
     # Speculative decoding
@@ -5777,6 +5780,30 @@ class ServerArgs:
             type=str,
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--pack-paged-kv-to-varlen",
+            type=str,
+            choices=["auto", "on", "off"],
+            default=ServerArgs.pack_paged_kv_to_varlen,
+            help=(
+                "Control the optional path that packs paged KV cache into "
+                "contiguous varlen K/V and calls upstream flash_attn_varlen_func. "
+                "'auto' uses shape/platform heuristics, 'on' bypasses performance "
+                "heuristics but keeps correctness guards, and 'off' disables it."
+            ),
+        )
+        parser.add_argument(
+            "--pack-paged-kv-to-varlen-min-kv-tokens",
+            type=int,
+            default=ServerArgs.pack_paged_kv_to_varlen_min_kv_tokens,
+            help="Minimum total KV tokens required by the packed paged-KV varlen auto policy.",
+        )
+        parser.add_argument(
+            "--pack-paged-kv-to-varlen-min-q-tokens",
+            type=int,
+            default=ServerArgs.pack_paged_kv_to_varlen_min_q_tokens,
+            help="Minimum query tokens required by the packed paged-KV varlen auto policy.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
