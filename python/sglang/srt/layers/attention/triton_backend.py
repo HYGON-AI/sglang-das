@@ -146,9 +146,9 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         else:
             self.swa_v_head_dim = None
-            if hasattr(model_runner.token_to_kv_pool, 'v_head_dim'):
-                self.v_head_dim = model_runner.token_to_kv_pool.v_head_dim #nhb
-            elif hasattr(model_runner.token_to_kv_pool, 'get_value_buffer'):
+            if hasattr(model_runner.token_to_kv_pool, "v_head_dim"):
+                self.v_head_dim = model_runner.token_to_kv_pool.v_head_dim
+            elif hasattr(model_runner.token_to_kv_pool, "get_value_buffer"):
                 try:
                     self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
                 except KeyError:

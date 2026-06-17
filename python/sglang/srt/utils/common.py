@@ -170,6 +170,18 @@ def is_dcu() -> bool:
         logger.warning("DCU detection failed (not a DCU or HIP misconfigured): %s", e)
         return False
 
+
+@lru_cache(maxsize=1)
+def is_dcu_native_fp8_supported() -> bool:
+    if not is_dcu():
+        return False
+    try:
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        return "gfx938" in gcn_arch
+    except Exception as e:
+        logger.warning("DCU native FP8 detection failed: %s", e)
+        return False
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
