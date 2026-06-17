@@ -627,14 +627,7 @@ class DeepEPMoE(FusedMoE):
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
-        if _use_aiter:
-            assert DispatchOutputChecker.format_is_deepep(dispatch_output)
-            # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
-            output = self.forward_aiter(dispatch_output)
-        elif _is_npu:
-            assert DispatchOutputChecker.format_is_deepep(dispatch_output)
-            output = self.forward_npu(dispatch_output)
-        elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             # assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
                 output = self.forward_deepgemm_contiguous(dispatch_output)
@@ -673,6 +666,13 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_groupgemm_bf16_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
+        elif _use_aiter:
+            assert DispatchOutputChecker.format_is_deepep(dispatch_output)
+            # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
+            output = self.forward_aiter(dispatch_output)
+        elif _is_npu:
+            assert DispatchOutputChecker.format_is_deepep(dispatch_output)
+            output = self.forward_npu(dispatch_output)
 
         combine_input_wrapper = (
             DeepEPNormalCombineInput
