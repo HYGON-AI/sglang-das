@@ -723,11 +723,11 @@ class DeepEPMoE(FusedMoE):
         M, K = hidden_states.size()
         N = self.w13_weight.size(1)
         w13_weight_fp8 = (
-            self.w13_weight_deepgemm,
+            self.w13_weight,
             self.w13_weight_scale,
         )
         w2_weight_fp8 = (
-            self.w2_weight_deepgemm,
+            self.w2_weight,
             self.w2_weight_scale,
         )
 
@@ -748,8 +748,6 @@ class DeepEPMoE(FusedMoE):
                 )
             ),
         ]
-        output_index = torch.full_like(topk_ids, -1)
-
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -761,20 +759,25 @@ class DeepEPMoE(FusedMoE):
                 pin_memory=True,
                 device="cpu",
             ).cuda(non_blocking=True)
-        expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
         local_num_expert = num_recv_tokens_per_expert_gpu.shape[0]
-        m_indices = build_m_indices_triton(topk_ids, hidden_states.device, local_num_expert)
+        m_indices = torch.full(
+            (all_tokens,),
+            -1,
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
+        output_index = torch.full_like(topk_ids, -1)
 
-        ep_scatter(
+        build_m_indices_and_ep_scatter(
             hidden_states,
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
-            expert_start_loc,
             input_tensor[0],
             input_tensor[1],
             m_indices,
             output_index,
+            local_num_expert,
         )
 
         gateup_output = torch.zeros(
@@ -783,8 +786,8 @@ class DeepEPMoE(FusedMoE):
             dtype=torch.bfloat16,
         )
 
-        if '0' in str(hidden_states_device):
-            logger.info(
+        if logger.isEnabledFor(logging.DEBUG) and "0" in str(hidden_states_device):
+            logger.debug(
                 'DeepEPMoE forward ---> %s - input_tensor[0] shape: %s, dtype: %s\n'
                 'DeepEPMoE forward ---> %s - input_tensor[1] shape: %s, dtype: %s\n'
                 'DeepEPMoE forward ---> %s - w13_weight_fp8[0] shape: %s, dtype: %s\n'

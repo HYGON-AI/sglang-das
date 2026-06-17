@@ -661,6 +661,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
+        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        if scheme_dict is not None:
+            weight_quant = scheme_dict.get("weights")
+            input_quant = scheme_dict.get("input_activations")
+            if self._is_fp8_w8a8(weight_quant, input_quant):
+                logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
+                return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+
         unfused_names = [
             layer_name + proj_name
             for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
