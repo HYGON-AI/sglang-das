@@ -723,11 +723,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         _deepep_precompile_tp_barrier()
         if use_groupgemm:
             if _use_fp8_w8a8_moe:
+                #  #topk_weights, #新版要传
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
-                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type = 2,
