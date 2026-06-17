@@ -425,6 +425,7 @@ __global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy para
 }
 
 using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
+using PlanLens = tvm::ffi::Tuple<uint32_t, uint32_t>;
 
 /**
  * \brief Build c4/c128 prefill plan tensors. CPU-resident.
@@ -456,8 +457,8 @@ inline PrefillPlan plan_compress_prefill(
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu_or_gpu = SymbolicDevice{};
   auto device_ = SymbolicDevice{};
-  cpu_or_gpu.set_options<kDLCPU, kDLCUDA>();
-  device_.set_options<kDLCUDA>();
+  cpu_or_gpu.set_options<kDLCPU, kDLCUDA, kDLROCM>();
+  device_.set_options<kDLCUDA, kDLROCM>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -503,7 +504,8 @@ inline PrefillPlan plan_compress_prefill(
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
-  if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
+  const auto input_device_type = cpu_or_gpu.unwrap().device_type;
+  if (input_device_type == kDLCUDA || input_device_type == kDLROCM) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
     // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
     // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
@@ -548,7 +550,14 @@ inline PrefillPlan plan_compress_prefill(
 
   // CPU input path: only here do we need the pinned scratch buffer.
   const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
-  RuntimeCheck(pin_buffer_bytes >= num_q_tokens * (sizeof(PlanC) + sizeof(PlanW)));
+  const auto required_pin_buffer_bytes = num_q_tokens * (sizeof(PlanC) + sizeof(PlanW));
+  RuntimeCheck(
+      pin_buffer_bytes >= required_pin_buffer_bytes,
+      "Pinned planner buffer is too small: got ",
+      pin_buffer_bytes,
+      " bytes, expected at least ",
+      required_pin_buffer_bytes,
+      " bytes");
   const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
   const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
 
@@ -622,6 +631,198 @@ inline PrefillPlan plan_compress_prefill(
   return PrefillPlan{std::move(C), std::move(W)};
 }
 
+inline PlanLens plan_compress_prefill_out(
+    const tvm::ffi::TensorView req_pool_indices,  // GPU
+    const tvm::ffi::TensorView req_to_token,      // GPU
+    const tvm::ffi::TensorView full_to_swa,       // GPU
+    const tvm::ffi::TensorView seq_lens,          // CPU/GPU
+    const tvm::ffi::TensorView extend_lens,       // CPU/GPU
+    const tvm::ffi::TensorView pin_buffer,        // CPU
+    const tvm::ffi::TensorView plan_c_out,        // GPU
+    const tvm::ffi::TensorView plan_w_out,        // GPU
+    const uint32_t num_q_tokens,
+    const int32_t compress_ratio,
+    const int32_t swa_page_size,
+    const int32_t ring_size,
+    const bool use_cuda_graph) {
+  auto B = SymbolicSize{"batch_size"};
+  auto N = SymbolicSize{"num_q_tokens"};
+  auto cpu_or_gpu = SymbolicDevice{};
+  auto device_ = SymbolicDevice{};
+  cpu_or_gpu.set_options<kDLCPU, kDLCUDA, kDLROCM>();
+  device_.set_options<kDLCUDA, kDLROCM>();
+
+  TensorMatcher({B})  //
+      .with_dtype<RID_T>()
+      .with_device(device_)
+      .verify(req_pool_indices);
+  TensorMatcher({-1, -1})  //
+      .with_dtype<R2T_T>()
+      .with_device(device_)
+      .verify(req_to_token);
+  TensorMatcher({-1})  //
+      .with_dtype<F2S_T>()
+      .with_device(device_)
+      .verify(full_to_swa);
+  TensorMatcher({B})  //
+      .with_dtype<IDX_T>()
+      .with_device(cpu_or_gpu)
+      .verify(seq_lens)
+      .verify(extend_lens);
+  TensorMatcher({-1})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCPU>()
+      .verify(pin_buffer);
+  TensorMatcher({N, sizeof(PlanC)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_c_out);
+  TensorMatcher({N, sizeof(PlanW)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_w_out);
+
+  const bool is_overlap = (compress_ratio == 4);
+  const int32_t window_size = compress_ratio * (is_overlap ? 2 : 1);
+
+  const auto seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr());
+  const auto ext_ptr = static_cast<const IDX_T*>(extend_lens.data_ptr());
+  const auto rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr());
+  const auto r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr());
+  const auto f2s_ptr = static_cast<const F2S_T*>(full_to_swa.data_ptr());
+
+  const auto batch_size = static_cast<uint32_t>(B.unwrap());
+  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
+  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(static_cast<uint32_t>(N.unwrap()) == num_q_tokens);
+  RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
+
+  auto C = static_cast<PlanC*>(plan_c_out.data_ptr());
+  auto W = static_cast<PlanW*>(plan_w_out.data_ptr());
+  const auto device = device_.unwrap();
+  const auto stream = LaunchKernel::resolve_device(device);
+
+  constexpr int32_t kMaxMTPDraftTokens = 4;
+  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
+
+  const auto input_device_type = cpu_or_gpu.unwrap().device_type;
+  if (input_device_type == kDLCUDA || input_device_type == kDLROCM) {
+    RuntimeCheck(batch_size <= kMaxPrefillBatchSize, "GPU plan only support batch size up to ", kMaxPrefillBatchSize);
+    const auto params0 = Prefill0Params{
+        .plan_c = C,
+        .plan_w = W,
+        .seq_lens_ptr = seq_ptr,
+        .extend_lens_ptr = ext_ptr,
+        .batch_size = batch_size,
+        .num_q_tokens = num_q_tokens,
+        .compress_ratio = compress_ratio,
+        .swa_page_size = swa_page_size,
+        .mtp_pad = mtp_pad,
+    };
+    LaunchKernel(1, kMaxPrefillBatchSize, device)(plan_compress_prefill_kernel0, params0);
+
+    const auto params1 = Prefill1Params{
+        .plan_c = C,
+        .plan_w = W,
+        .rid_ptr = rid_ptr,
+        .r2t_ptr = r2t_ptr,
+        .f2s_ptr = f2s_ptr,
+        .stride_r2t = req_to_token.stride(0),
+        .num_c = num_q_tokens,
+        .num_w = num_q_tokens,
+        .num_c_padded = num_q_tokens,
+        .num_w_padded = num_q_tokens,
+        .num_work = num_q_tokens,
+        .swa_page_size = swa_page_size,
+        .ring_size = ring_size,
+        .compress_ratio = compress_ratio,
+    };
+    const auto block_size_1 = 256;
+    const auto num_blocks_1 = div_ceil(params1.num_work, block_size_1);
+    LaunchKernel(num_blocks_1, block_size_1, device)(plan_compress_prefill_kernel_1, params1);
+    return PlanLens{num_q_tokens, num_q_tokens};
+  }
+
+  const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
+  const auto required_pin_buffer_bytes = num_q_tokens * (sizeof(PlanC) + sizeof(PlanW));
+  RuntimeCheck(
+      pin_buffer_bytes >= required_pin_buffer_bytes,
+      "Pinned planner buffer is too small: got ",
+      pin_buffer_bytes,
+      " bytes, expected at least ",
+      required_pin_buffer_bytes,
+      " bytes");
+  const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
+  const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
+
+  uint32_t counter = 0;
+  uint32_t counter_c = 0;
+  uint32_t counter_w = 0;
+
+  const auto should_compress = [=](int32_t position) { return (position + 1) % compress_ratio == 0; };
+  for (const auto i : irange(batch_size)) {
+    const int32_t seq_len = seq_ptr[i];
+    const int32_t extend_len = ext_ptr[i];
+    const int32_t prefix_len = seq_len - extend_len;
+    const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
+    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    RuntimeCheck(0 < extend_len && extend_len <= seq_len);
+    const auto should_write = [=](int32_t position) {
+      if (position >= first_w_pos) return true;
+      return is_overlap && position % swa_page_size >= (swa_page_size - compress_ratio);
+    };
+    for (const auto j : irange(extend_len)) {
+      const int32_t position = prefix_len + j;
+      const int32_t ragged_id = counter + j;
+      if (should_compress(position)) {
+        const auto buffer_len = window_size - std::min(j + 1, window_size);
+        plan_c_ptr[counter_c++] = {
+            .seq_len = static_cast<uint32_t>(position + 1),
+            .ragged_id = static_cast<uint16_t>(ragged_id),
+            .buffer_len = static_cast<uint16_t>(buffer_len),
+            .read_page_0 = -1,
+            .read_page_1 = static_cast<int32_t>(i),
+        };
+      }
+      if (should_write(position)) {
+        plan_w_ptr[counter_w++] = pack_w(ragged_id, i, position + 1);
+      }
+    }
+    counter += extend_len;
+  }
+  RuntimeCheck(counter == num_q_tokens);
+
+  const auto copy_to_device = [stream](void* cuda_ptr, auto* host_ptr, size_t count) {
+    const auto size_bytes = count * sizeof(*host_ptr);
+    RuntimeDeviceCheck(cudaMemcpyAsync(cuda_ptr, host_ptr, size_bytes, cudaMemcpyHostToDevice, stream));
+  };
+  const auto num_c_padded = use_cuda_graph ? num_q_tokens : counter_c;
+  const auto num_w_padded = use_cuda_graph ? num_q_tokens : counter_w;
+  copy_to_device(C, plan_c_ptr, counter_c);
+  copy_to_device(W, plan_w_ptr, counter_w);
+  const auto params = Prefill1Params{
+      .plan_c = C,
+      .plan_w = W,
+      .rid_ptr = rid_ptr,
+      .r2t_ptr = r2t_ptr,
+      .f2s_ptr = f2s_ptr,
+      .stride_r2t = req_to_token.stride(0),
+      .num_c = counter_c,
+      .num_w = counter_w,
+      .num_c_padded = num_c_padded,
+      .num_w_padded = num_w_padded,
+      .num_work = std::max(num_c_padded, num_w_padded),
+      .swa_page_size = swa_page_size,
+      .ring_size = ring_size,
+      .compress_ratio = compress_ratio,
+  };
+  const auto block_size = 256;
+  const auto num_blocks = div_ceil(params.num_work, block_size);
+  LaunchKernel(num_blocks, block_size, device)(plan_compress_prefill_kernel_1, params);
+  return PlanLens{num_c_padded, num_w_padded};
+}
+
 inline tvm::ffi::Tensor plan_compress_decode(
     const tvm::ffi::TensorView req_pool_indices,  // GPU
     const tvm::ffi::TensorView req_to_token,      // GPU
@@ -670,6 +871,62 @@ inline tvm::ffi::Tensor plan_compress_decode(
   const auto num_blocks = div_ceil(batch_size, block_size);
   LaunchKernel(num_blocks, block_size, device)(plan_compress_decode_kernel, params);
   return D;
+}
+
+inline uint32_t plan_compress_decode_out(
+    const tvm::ffi::TensorView req_pool_indices,  // GPU
+    const tvm::ffi::TensorView req_to_token,      // GPU
+    const tvm::ffi::TensorView full_to_swa,       // GPU
+    const tvm::ffi::TensorView seq_lens,          // CPU/GPU
+    const tvm::ffi::TensorView plan_d_out,        // GPU
+    const int32_t compress_ratio,
+    const int32_t swa_page_size,
+    const int32_t ring_size) {
+  auto B = SymbolicSize{"batch_size"};
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLCUDA>();
+
+  TensorMatcher({B})  //
+      .with_dtype<RID_T>()
+      .with_device(device_)
+      .verify(req_pool_indices);
+  TensorMatcher({-1, -1})  //
+      .with_dtype<R2T_T>()
+      .with_device(device_)
+      .verify(req_to_token);
+  TensorMatcher({-1})  //
+      .with_dtype<F2S_T>()
+      .with_device(device_)
+      .verify(full_to_swa);
+  TensorMatcher({B})  //
+      .with_dtype<IDX_T>()
+      .with_device(device_)
+      .verify(seq_lens);
+  TensorMatcher({B, sizeof(PlanD)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_d_out);
+
+  const auto batch_size = static_cast<uint32_t>(B.unwrap());
+  const auto device = device_.unwrap();
+  const auto params = DecodeParams{
+      .plan_d = static_cast<PlanD*>(plan_d_out.data_ptr()),
+      .rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr()),
+      .r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr()),
+      .f2s_ptr = static_cast<const F2S_T*>(full_to_swa.data_ptr()),
+      .seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr()),
+      .stride_r2t = req_to_token.stride(0),
+      .batch_size = batch_size,
+      .swa_page_size = swa_page_size,
+      .ring_size = ring_size,
+      .compress_ratio = compress_ratio,
+  };
+  RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
+  RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
+  const auto block_size = 256;
+  const auto num_blocks = div_ceil(batch_size, block_size);
+  LaunchKernel(num_blocks, block_size, device)(plan_compress_decode_kernel, params);
+  return batch_size;
 }
 
 /**

@@ -15,7 +15,14 @@ from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Stage-B deferred: upstream TestReturnRoutedExperts class is unittest.skip flaky; BW1100 collection reports 3 skipped, so it is not a PR-gate candidate yet.",
+)
+
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

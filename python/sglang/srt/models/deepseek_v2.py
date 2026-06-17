@@ -168,6 +168,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -199,7 +200,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed import (
     parallel_state,
 )
-from enum import IntEnum, auto
 import tqdm
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
@@ -345,205 +345,6 @@ def add_forward_absorb_core_attention_backend(backend_name):
     if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
         FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
-
-
-class AttnForwardMethod(IntEnum):
-    # Use multi-head attention
-    MHA = auto()
-
-    # Use absorbed multi-latent attention
-    MLA = auto()
-
-    # Use multi-head attention, but with KV cache chunked.
-    # This method can avoid OOM when prefix lengths are long.
-    MHA_CHUNKED_KV = auto()
-
-    # Use multi-head attention, execute the MHA for prefix and extended kv in one shot
-    # when the sequence lengths are below the threshold.
-    MHA_ONE_SHOT = auto()
-
-    # Use MLA but with fused RoPE
-    MLA_FUSED_ROPE = auto()
-
-    # Use MLA with fused RoPE kernel for CPU
-    MLA_FUSED_ROPE_CPU = auto()
-
-    # Use multi-head attention for NPU
-    MHA_NPU = auto()
-
-    # Use absorbed multi-latent attention for NPU
-    MLA_NPU = auto()
-
-    # Use Deepseek V3.2 sparse multi-latent attention for NPU
-    DSA_NPU = auto()
-
-
-def _dispatch_mla_subtype(attn, forward_batch):
-    if _is_hip:
-        if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
-            return AttnForwardMethod.MLA_FUSED_ROPE
-        else:
-            return AttnForwardMethod.MLA
-    else:
-        if hasattr(attn, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(attn):
-            return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-        else:
-            return AttnForwardMethod.MLA
-
-
-class AttentionBackendRegistry:
-    _handlers = {}
-
-    @classmethod
-    def register(cls, backend_name, handler_func):
-        cls._handlers[backend_name] = handler_func
-
-    @classmethod
-    def get_handler(cls, backend_name):
-        return cls._handlers.get(backend_name, cls._handlers.get("triton"))
-
-
-def handle_attention_ascend(attn, forward_batch):
-    if (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-    ):
-        if hasattr(attn, "indexer"):
-            return AttnForwardMethod.DSA_NPU
-        else:
-            return AttnForwardMethod.MHA_NPU
-    else:
-        if hasattr(attn, "indexer"):
-            return AttnForwardMethod.DSA_NPU
-        else:
-            return AttnForwardMethod.MLA_NPU
-
-
-def _get_sum_extend_prefix_lens(forward_batch):
-    return (
-        sum(forward_batch.extend_prefix_lens_cpu)
-        if forward_batch.extend_prefix_lens_cpu is not None
-        else 0
-    )
-
-
-def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
-    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
-    sum_seq_lens = (
-        sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
-    )
-    return attn_supported and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
-
-
-def _handle_attention_backend(
-    attn: DeepseekV2AttentionMLA, forward_batch, backend_name
-):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    disable_ragged = (
-        backend_name in ["flashinfer", "flashmla"]
-    ) and attn.flashinfer_mla_disable_ragged
-
-    if (
-        not disable_ragged
-        and forward_batch.forward_mode.is_extend_without_speculative()
-        and (
-            (
-                sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
-                and not attn.disable_chunked_prefix_cache
-            )
-            or sum_extend_prefix_lens == 0
-        )
-    ):
-        if _support_mha_one_shot(attn, forward_batch, backend_name):
-            return AttnForwardMethod.MHA_ONE_SHOT
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-
-def handle_attention_flashinfer(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "flashinfer")
-
-
-def handle_attention_fa3(attn, forward_batch):
-    # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-    else:
-        return _handle_attention_backend(attn, forward_batch, "fa3")
-
-
-def handle_attention_flashmla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "flashmla")
-
-
-def handle_attention_dcu_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "dcu_mla")
-
-
-def handle_attention_cutlass_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
-
-
-def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
-    return AttnForwardMethod.MHA_CHUNKED_KV
-
-
-def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if forward_batch.forward_mode.is_extend_without_speculative() and (
-        not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
-    ):
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-
-def handle_attention_aiter(attn, forward_batch):
-    if forward_batch.forward_mode.is_extend_without_speculative():
-        return AttnForwardMethod.MHA
-    else:
-        return AttnForwardMethod.MLA
-
-
-def handle_attention_nsa(attn, forward_batch):
-    """
-    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
-    in init_forward_metadata. Read the decision from backend.use_mha.
-    """
-
-    backend = forward_batch.attn_backend
-    if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-        backend = backend.primary
-    if hasattr(backend, "use_mha") and backend.use_mha:
-        return AttnForwardMethod.MHA_ONE_SHOT
-    return AttnForwardMethod.MLA
-
-
-def handle_attention_triton(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-    if (
-        forward_batch.forward_mode.is_extend_without_speculative()
-        and sum(forward_batch.extend_prefix_lens_cpu) == 0
-    ):
-        return AttnForwardMethod.MHA
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1379,7 +1180,6 @@ class DeepseekV2MoE(nn.Module):
             i_s = None
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1747,6 +1547,7 @@ class DeepseekV2AttentionMLA(
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
+        self.is_nextn = is_nextn
         self.input_layernorm = input_layernorm  # this is from other place
         # self.input_layernorm_weight = input_layernorm_weight
         attn_tp_rank = get_attention_tp_rank()
@@ -1834,12 +1635,33 @@ class DeepseekV2AttentionMLA(
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
             if is_nextn:
-                self.skip_topk = False
-                self.next_skip_topk = False
+                self.skip_topk = True
+                self.next_skip_topk = True
             else:
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                if self.index_topk_pattern is None:
+                self.index_skip_topk_offset = getattr(
+                    config, "index_skip_topk_offset", None
+                )
+                if (
+                    self.index_topk_pattern is None
+                    and self.index_skip_topk_offset is not None
+                ):
+                    assert self.index_skip_topk_offset > 0, (
+                        "index_skip_topk_offset must be positive; offset <= 0 "
+                        "marks layer 0 as skip_topk with no prior topk to reuse"
+                    )
+                    self.skip_topk = (
+                        max(layer_id - self.index_skip_topk_offset + 1, 0)
+                        % self.index_topk_freq
+                        != 0
+                    )
+                    self.next_skip_topk = (
+                        max(layer_id - self.index_skip_topk_offset + 2, 0)
+                        % self.index_topk_freq
+                        != 0
+                    )
+                elif self.index_topk_pattern is None:
                     self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
                     self.next_skip_topk = layer_id % self.index_topk_freq != 0
                 else:
@@ -2202,6 +2024,7 @@ class DeepseekV2AttentionMLA(
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
         global _use_fused_rmsnorm_rope
@@ -2293,13 +2116,18 @@ class DeepseekV2AttentionMLA(
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
+                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+                else:
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if not _use_fused_rmsnorm_rope:
@@ -2310,13 +2138,20 @@ class DeepseekV2AttentionMLA(
                     q = self.q_b_proj(q, rms_weight=self.q_a_layernorm.weight.data, residual=None,
                                     update_hd=False)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
+                    if not self.skip_topk or (
+                        self.is_nextn and prev_topk_indices is None
+                    ):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -2650,7 +2485,11 @@ class DeepseekV2AttentionMLA(
                 # )
         output, _ = self.o_proj(attn_bmm_output)
         # 如果第一维是1才 squeeze
-        return output
+        if self.next_skip_topk is None:
+            return output
+        if not self.next_skip_topk:
+            return output, None
+        return output, topk_indices
 
     def forward_absorb_fused_mla_rope_prepare(
         self,

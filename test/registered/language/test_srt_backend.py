@@ -1,7 +1,10 @@
 import unittest
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-dcu")
+
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json_regex,

@@ -9,7 +9,16 @@ from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.weight_sync.utils import update_weights
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=60,
+    suite="stage-b-test-1-gpu-small-dcu",
+    nightly=False,
+    disabled="DCU CSV CI placeholder: update-weights utility path needs BW1100 model-loading validation before enabling.",
+)
+
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=32, stage="stage-b", runner_config="1-gpu-large")

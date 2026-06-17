@@ -2,7 +2,15 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
+register_dcu_ci(
+    est_time=120,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU PR baseline deferred: quantization path needs BW1100 numeric/backend validation before required CI.",
+)
+
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,

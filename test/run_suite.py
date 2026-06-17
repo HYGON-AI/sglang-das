@@ -1,25 +1,81 @@
 import argparse
 import glob
+import importlib.util
 import json
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import tabulate
+try:
+    import tabulate
+except ModuleNotFoundError:
 
-from sglang.test.ci.ci_register import (
-    CIRegistry,
-    HWBackend,
-    auto_partition,
-    collect_tests,
-)
-from sglang.test.ci.ci_utils import run_unittest_files
+    class _TabulateFallback:
+        @staticmethod
+        def tabulate(rows, headers=(), tablefmt=None):
+            table = [list(headers)] if headers else []
+            table.extend(rows)
+            if not table:
+                return ""
+            widths = [
+                max(len(str(row[i])) for row in table)
+                for i in range(max(len(row) for row in table))
+            ]
+
+            def fmt(row):
+                return " | ".join(
+                    str(row[i]).ljust(widths[i]) for i in range(len(widths))
+                )
+
+            lines = [fmt(row) for row in table]
+            if headers:
+                lines.insert(1, "-+-".join("-" * width for width in widths))
+            return "\n".join(lines)
+
+    tabulate = _TabulateFallback()
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+
+def _load_ci_register():
+    module_name = "sglang.test.ci.ci_register"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    path = os.path.join(
+        REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load ci_register from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_ci_utils():
+    python_dir = os.path.join(REPO_ROOT, "python")
+    if python_dir not in sys.path:
+        sys.path.insert(0, python_dir)
+    from sglang.test.ci.ci_utils import run_unittest_files
+
+    return run_unittest_files
+
+
+_ci_register = _load_ci_register()
+CIRegistry = _ci_register.CIRegistry
+HWBackend = _ci_register.HWBackend
+auto_partition = _ci_register.auto_partition
+collect_tests = _ci_register.collect_tests
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
     "npu": HWBackend.NPU,
+    "dcu": HWBackend.DCU,
 }
 
 # Per-commit test suites (run on every PR)
@@ -74,6 +130,13 @@ PER_COMMIT_SUITES = {
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
     ],
+    HWBackend.DCU: [
+        "stage-a-test-1-gpu-small-dcu",
+        "stage-b-test-1-gpu-small-dcu",
+        "stage-b-test-1-gpu-large-dcu",
+        "stage-b-test-2-gpu-large-dcu",
+        "stage-c-test-large-8-gpu-dcu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -124,6 +187,15 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
+    HWBackend.DCU: [
+        "nightly-dcu",
+        "nightly-dcu-1-gpu",
+        "nightly-dcu-4-gpu",
+        "nightly-dcu-8-gpu",
+        "nightly-dcu-accuracy",
+        "nightly-dcu-perf",
+        "nightly-dcu-vlm",
+    ],
 }
 
 
@@ -152,12 +224,13 @@ def _valid_suites_by_backend() -> dict:
     return result
 
 
-def validate_all_suites(all_tests: List[CIRegistry]):
+def validate_all_suites(all_tests: List[CIRegistry], checked_backends=None):
     """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    checked_backends = checked_backends or _SUITE_CHECKED_BACKENDS
     valid_by_backend = _valid_suites_by_backend()
     errors = []
     for t in all_tests:
-        if t.backend not in _SUITE_CHECKED_BACKENDS:
+        if t.backend not in checked_backends:
             continue
         valid = valid_by_backend.get(t.backend, set())
         if t.effective_suite not in valid:
@@ -190,6 +263,69 @@ def filter_tests(
     skipped_tests = [t for t in ci_tests if t.disabled is not None]
 
     return enabled_tests, skipped_tests
+
+
+def _include_file_keys(filename: str, repo_root: str, test_root: str) -> set[str]:
+    filename = os.path.normpath(os.path.abspath(filename))
+    keys = {filename}
+
+    for root in (repo_root, test_root):
+        root = os.path.normpath(os.path.abspath(root))
+        relpath = os.path.normpath(os.path.relpath(filename, root))
+        if relpath != os.pardir and not relpath.startswith(os.pardir + os.sep):
+            keys.add(relpath)
+
+    return keys
+
+
+def _matches_include_file(
+    test: CIRegistry, include_file: str, repo_root: str, test_root: str
+) -> bool:
+    include_file = os.path.normpath(include_file)
+    return include_file in _include_file_keys(test.filename, repo_root, test_root)
+
+
+def filter_include_files(
+    ci_tests: List[CIRegistry],
+    skipped_tests: List[CIRegistry],
+    include_files: List[str],
+    repo_root: str,
+    test_root: str,
+) -> Tuple[List[CIRegistry], List[CIRegistry], Optional[str]]:
+    include_files = [os.path.normpath(path) for path in include_files if path]
+    if not include_files:
+        return ci_tests, skipped_tests, None
+
+    selected_tests = [
+        test
+        for test in ci_tests
+        if any(
+            _matches_include_file(test, include_file, repo_root, test_root)
+            for include_file in include_files
+        )
+    ]
+    selected_skipped_tests = [
+        test
+        for test in skipped_tests
+        if any(
+            _matches_include_file(test, include_file, repo_root, test_root)
+            for include_file in include_files
+        )
+    ]
+
+    matched = {
+        include_file
+        for include_file in include_files
+        for test in ci_tests + skipped_tests
+        if _matches_include_file(test, include_file, repo_root, test_root)
+    }
+    missing = sorted(set(include_files) - matched)
+    if missing:
+        return selected_tests, selected_skipped_tests, (
+            "\n".join(f"{path} was not found in the selected suite." for path in missing)
+        )
+
+    return selected_tests, selected_skipped_tests, None
 
 
 def pretty_print_tests(
@@ -262,8 +398,8 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     # Use absolute paths so the script works from any working directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(script_dir)
+    script_dir = SCRIPT_DIR
+    repo_root = REPO_ROOT
 
     # Registered tests under test/registered/
     files = [
@@ -289,8 +425,14 @@ def run_a_suite(args):
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
-    validate_all_suites(all_tests)
+    validate_all_suites(all_tests, checked_backends={hw})
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
+    ci_tests, skipped_tests, include_error = filter_include_files(
+        ci_tests, skipped_tests, args.include_file, repo_root, script_dir
+    )
+    if include_error:
+        print(include_error, file=sys.stderr)
+        return 1
 
     if auto_partition_size:
         live_est = load_live_est(args.partition_model_file, suite, repo_root)
@@ -310,11 +452,15 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    if args.list:
+        return 0
+
     # Add extra timeout when retry is enabled
     timeout = args.timeout_per_file
     if args.enable_retry:
         timeout += args.retry_timeout_increase
 
+    run_unittest_files = _load_ci_utils()
     return run_unittest_files(
         ci_tests,
         timeout_per_file=timeout,
@@ -393,6 +539,17 @@ def main():
         type=str,
         default=None,
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
+    )
+    parser.add_argument(
+        "--include-file",
+        action="append",
+        default=[],
+        help="Restrict execution to a registered file. May be repeated.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Only list selected tests; do not execute them.",
     )
     args = parser.parse_args()
 

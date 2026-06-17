@@ -29,9 +29,37 @@ bool _is_weak_contiguous_det(torch::Tensor& t) {
          (t.storage().nbytes() - t.storage_offset() * t.element_size() == t.numel() * t.element_size());
 }
 
-// Deterministic all-reduce for registered buffers (ROCm)
-// Uses the 1-stage kernel which is deterministic (fixed ordering)
-void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out) {
+template <typename T, int ngpus>
+void launch_deterministic_1stage(
+    sglang::CustomAllreduce* fa,
+    sglang::RankData* ptrs,
+    T* output,
+    int size,
+    int input_fence_mode,
+    int blocks,
+    int threads,
+    hipStream_t stream) {
+  auto sg = fa->sg_;
+  auto self_sg = fa->self_sg_;
+  auto rank = fa->rank_;
+  void* kernelArgs[] = {&ptrs, &sg, &self_sg, &output, &rank, &size, &input_fence_mode};
+  hipExtLaunchKernel(
+      (void*)sglang::cross_device_reduce_1stage<T, ngpus>,
+      blocks,
+      threads,
+      kernelArgs,
+      0,
+      stream,
+      nullptr,
+      fa->stopEvent,
+      0);
+}
+
+void deterministic_all_reduce_impl(
+    fptr_t _fa,
+    torch::Tensor& inp,
+    torch::Tensor& out,
+    int input_fence_mode) {
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
   auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -73,20 +101,20 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
       // Always use 1-stage kernel for determinism
       switch (fa->world_size_) {
         case 2:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 2>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 4:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 4>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 6:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 6>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 8:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 8>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         default:
           throw std::runtime_error("world_size must be in (2,4,6,8)");
@@ -104,20 +132,20 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
       int blocks = std::min(16, (size + threads - 1) / threads);
       switch (fa->world_size_) {
         case 2:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 2>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 4:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 4>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 6:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 6>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 8:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 8>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         default:
           throw std::runtime_error("world_size must be in (2,4,6,8)");
@@ -136,20 +164,20 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
       int blocks = std::min(16, (size + threads - 1) / threads);
       switch (fa->world_size_) {
         case 2:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 2>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 4:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 4>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 6:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 6>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         case 8:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
+          launch_deterministic_1stage<T, 8>(
+              fa, ptrs, reinterpret_cast<T*>(out.data_ptr()), size, input_fence_mode, blocks, threads, stream);
           break;
         default:
           throw std::runtime_error("world_size must be in (2,4,6,8)");
@@ -160,6 +188,12 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
     default:
       throw std::runtime_error("deterministic allreduce only supports float32, float16 and bfloat16");
   }
+}
+
+// Deterministic all-reduce for registered buffers (ROCm)
+// Uses the 1-stage kernel which is deterministic (fixed ordering)
+void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out) {
+  deterministic_all_reduce_impl(_fa, inp, out, sglang::kInputFenceNone);
 }
 
 // Deterministic all-reduce for unregistered buffers (ROCm)
@@ -174,5 +208,9 @@ void deterministic_all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tenso
               "registered buffer is too small to contain the input");
   AT_CUDA_CHECK(hipMemcpyAsync(reg_buffer.data_ptr(), inp.data_ptr(),
                                 input_size, hipMemcpyDeviceToDevice, stream));
-  deterministic_all_reduce_reg(_fa, reg_buffer, out);
+  deterministic_all_reduce_impl(
+      _fa,
+      reg_buffer,
+      out,
+      sglang::get_input_fence_mode_from_env());
 }

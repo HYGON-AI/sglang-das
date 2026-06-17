@@ -375,6 +375,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 torch.cuda.empty_cache()
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_deepgemm_moe and _is_dcu:
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
+
         elif (_use_fp8_w8a8_moe and _is_dcu
             and not self.use_deepep
             and not getattr(layer, "_w8a8_fp8_packed", False)):

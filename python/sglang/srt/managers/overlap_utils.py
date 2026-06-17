@@ -134,7 +134,7 @@ class FutureMap:
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            if draft_input is None : #nhb
+            if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
@@ -178,6 +178,14 @@ class FutureMap:
 
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
+
+        elif spec_need_hidden_states() and draft_input.hidden_states is not None:
+            # When PD disaggregation warmup initializes the buffer via process_prebuilt
+            # with metadata-buffer hidden states (shaped by model_config.hidden_size),
+            # the actual forward may produce hidden states with a different shape.
+            # Re-initialize if shapes differ.
+            if self.hidden_states_buf.shape[1:] != draft_input.hidden_states.shape[1:]:
+                self._lazy_init_buf(draft_input)
 
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index

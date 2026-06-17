@@ -89,3 +89,11 @@ Long-term active SGLang contributors are eligible for coding agent sponsorship, 
 
 ## Acknowledgment
 We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+
+## License
+
+This repository is based on [SGLang](https://github.com/sgl-project/sglang), version `v0.5.12`, licensed under the Apache License, Version 2.0.
+
+DCU adaptations, modifications, and original contributions by Hygon Information Technology Co., Ltd. are licensed under the Apache License, Version 2.0.
+
+Original copyright notices and license terms from the upstream SGLang project are retained. See `LICENSE` and `THIRD_PARTY_NOTICES.md` for details.

@@ -17,7 +17,10 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+
+register_dcu_ci(est_time=200, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+
 from sglang.test.lora_utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
 from sglang.test.test_utils import CustomTestCase
 

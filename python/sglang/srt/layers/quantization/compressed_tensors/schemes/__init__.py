@@ -14,7 +14,10 @@ from .compressed_tensors_w8a8_int8 import (
     CompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8,
 )
-from .compressed_tensors_w8a8_int8_moe import NPUCompressedTensorsW8A8Int8DynamicMoE
+from .compressed_tensors_w8a8_int8_moe import (
+    CompressedTensorsW8A8Int8MoE,
+    NPUCompressedTensorsW8A8Int8DynamicMoE,
+)
 from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
 from .compressed_tensors_wNa16 import WNA16_SUPPORTED_BITS, CompressedTensorsWNA16
 from .compressed_tensors_wNa16_moe import (
@@ -30,6 +33,7 @@ __all__ = [
     "CompressedTensorsW8A8Fp8MoE",
     "CompressedTensorsW8A16Fp8",
     "CompressedTensorsW8A8Int8",
+    "CompressedTensorsW8A8Int8MoE",
     "NPUCompressedTensorsW8A8Int8",
     "NPUCompressedTensorsW8A8Int8DynamicMoE",
     "CompressedTensorsWNA16",

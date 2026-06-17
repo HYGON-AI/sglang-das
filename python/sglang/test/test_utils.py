@@ -48,17 +48,32 @@ from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
 # General test models
-DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "Qwen/Qwen3-Reranker-0.6B"
+DEFAULT_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_MODEL_NAME",
+    "Qwen/Qwen2.5-7B-Instruct",
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME", "meta-llama/Llama-3.2-1B-Instruct"
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_BASE", "meta-llama/Llama-3.2-1B"
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE", "Qwen/Qwen3-Reranker-0.6B"
+)
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME",
+    "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+)
+DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME",
+    "cross-encoder/ms-marco-MiniLM-L6-v2",
+)
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
@@ -130,14 +145,23 @@ DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME",
+    "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+)
+DEFAULT_REASONING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_REASONING_MODEL_NAME",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+)
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
-DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_DEFAULT_ENABLE_THINKING_MODEL_NAME",
+    "Qwen/Qwen3-30B-A3B",
+)
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
@@ -821,6 +845,59 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def _has_cli_option(args: list[object], names: set[str]) -> bool:
+    return any(
+        isinstance(arg, str)
+        and (arg in names or any(arg.startswith(f"{name}=") for name in names))
+        for arg in args
+    )
+
+
+def _with_dcu_ci_server_defaults(args: list[str], env: dict) -> list[str]:
+    if env.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return args
+
+    defaults = shlex.split(
+        env.get(
+            "SGLANG_TEST_DCU_DEFAULT_SERVER_ARGS",
+            "--attention-backend fa3 --page-size 64 --trust-remote-code",
+        )
+    )
+    result = list(args)
+
+    if not _has_cli_option(
+        result,
+        {
+            "--attention-backend",
+            "--prefill-attention-backend",
+            "--decode-attention-backend",
+        },
+    ):
+        index = 0
+        while index < len(defaults):
+            option = defaults[index]
+            if option == "--attention-backend":
+                result.extend(defaults[index : index + 2])
+                index += 2
+            else:
+                index += 1
+
+    if not _has_cli_option(result, {"--page-size"}):
+        index = 0
+        while index < len(defaults):
+            option = defaults[index]
+            if option == "--page-size":
+                result.extend(defaults[index : index + 2])
+                index += 2
+            else:
+                index += 1
+
+    if "--trust-remote-code" in defaults and "--trust-remote-code" not in result:
+        result.append("--trust-remote-code")
+
+    return result
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -881,6 +958,7 @@ def popen_launch_server(
     # Build server command
     _, host, port = base_url.split(":")
     host = host[2:]
+    other_args = _with_dcu_ci_server_defaults(other_args, env)
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:

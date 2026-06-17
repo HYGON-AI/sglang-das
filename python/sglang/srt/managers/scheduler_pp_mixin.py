@@ -30,6 +30,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.model_executor.input_buffers import get_pp_proxy_hidden_states_shape
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -138,7 +139,7 @@ class SchedulerPPMixin:
                             "send_proxy_dict_to_next_stage"
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
+                                self._pp_prepare_proxy_tensor_dict_for_send(result),
                                 async_send=True,
                                 msg_type="proxy",
                             )
@@ -312,7 +313,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            self._pp_prepare_proxy_tensor_dict_for_send(result),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -495,7 +496,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            self._pp_prepare_proxy_tensor_dict_for_send(result),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -619,7 +620,11 @@ class SchedulerPPMixin:
                 )
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (current_seq_len, hs),
+                        get_pp_proxy_hidden_states_shape(
+                            num_tokens=current_seq_len,
+                            hidden_size=model_config.hidden_size,
+                            model_config=model_config,
+                        ),
                         dtype=model_config.dtype,
                         device=self.device,
                     ),
@@ -954,6 +959,14 @@ class SchedulerPPMixin:
                 **logprob_dict,
             }
         return tensor_dict
+
+    def _pp_prepare_proxy_tensor_dict_for_send(
+        self: Scheduler, result: GenerationBatchResult
+    ) -> Dict[str, torch.Tensor]:
+        tensor_dict = result.pp_hidden_states_proxy_tensors.tensors
+        if not result.can_run_cuda_graph:
+            return tensor_dict
+        return {name: tensor.clone() for name, tensor in tensor_dict.items()}
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,

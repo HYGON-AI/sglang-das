@@ -19,7 +19,14 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, is_hip, is_dcu, get_bool_env_var
+# from sglang.srt.layers.attention.compressed.metadata import (
+#     PagedCoreMetadata,
+#     PagedIndexerMetadata,
+# )
+# from sglang.srt.layers.attention.indexer_topk_capturer import (
+#     get_global_indexer_capturer,
+# )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -30,7 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-
+_is_dcu = is_dcu()
 if is_hip():
     FP8_DTYPE = torch.float8_e4m3fnuz
     FP8_MAX = torch.finfo(FP8_DTYPE).max
@@ -99,90 +106,51 @@ def topk_transform_512_pytorch_vectorized(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-
     TOPK = 512
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
     device = scores.device
-
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
-
-    positions = (
-        torch.arange(max_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    sequential_indices = torch.arange(TOPK, device=device, dtype=torch.int32).unsqueeze(
+        0
     )
-    valid_mask = positions < seq_lens.unsqueeze(1)
-
-    masked_scores = scores.clone()
-    masked_scores[~valid_mask] = float("-inf")
-
-    actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
-    )
-    raw_indices = raw_indices.to(torch.int32)
-
-    if actual_k < TOPK:
-        padding = torch.zeros(
-            (batch_size, TOPK - actual_k), dtype=torch.int32, device=device
-        )
-        raw_indices = torch.cat([raw_indices, padding], dim=1)
-
-    batch_indices = (
-        torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, TOPK)
-    )
-    gathered_scores = scores[
-        batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-    ].view(batch_size, TOPK)
-
-    valid_topk = gathered_scores != float("-inf")
-    if actual_k < TOPK:
-        pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
-        valid_topk = valid_topk & ~pad_mask
-
-    needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
-
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    negative_indices = torch.full_like(sequential_indices, -1)
+    if max_seq_len <= TOPK:
         raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
+            sequential_valid, sequential_indices, negative_indices
+        )
+        valid_topk = sequential_valid
+    else:
+        positions = torch.arange(max_seq_len, device=device).unsqueeze(0)
+        valid_mask = positions < seq_lens.unsqueeze(1)
+        masked_scores = scores.masked_fill(~valid_mask, float("-inf"))
+        _, raw_indices = torch.topk(
+            masked_scores, k=TOPK, dim=1, largest=True, sorted=False
+        )
+        raw_indices = raw_indices.to(torch.int32)
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+        gathered_scores = scores[batch_indices, raw_indices]
+        valid_topk = gathered_scores != float("-inf")
+        needs_sequential = (seq_lens <= TOPK).unsqueeze(1)
+        raw_indices = torch.where(
+            needs_sequential,
+            torch.where(sequential_valid, sequential_indices, negative_indices),
             raw_indices,
         )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
-
+        valid_topk = torch.where(needs_sequential, sequential_valid, valid_topk)
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
-
     page_idx_clamped = torch.clamp(page_idx, min=0)
     physical_pages = torch.gather(page_tables, dim=1, index=page_idx_clamped.long())
-
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
-
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
-
+    page_indices = torch.where(valid_topk, page_indices, negative_indices)
     out_page_indices.copy_(page_indices)
-
     if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
+        raw_indices = torch.where(valid_topk, raw_indices, negative_indices)
         out_raw_indices.copy_(raw_indices)
-
 
 @triton.jit
 def _fused_scale_kernel(
@@ -294,6 +262,42 @@ class C4IndexerBackendMixin:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
+        # q = c4_indexer.compute_q(q_lora, positions=positions)
+
+        # if _is_dcu and _use_lightop_group_fp8_quant:
+        #     from lightop import op as ops
+        #     def act_quant_group_lightop(
+        #         x: torch.Tensor,
+        #         block_size: int = 128,
+        #         scale_fmt=None,
+        #         quant_dtype: torch.dtype = fp8_dtype,
+        #     ):
+        #         assert x.is_cuda
+        #         assert x.is_contiguous()
+        #         assert x.size(-1) % block_size == 0
+
+        #         N = x.size(-1)
+        #         groups = N // block_size
+
+        #         y = torch.empty_like(x, dtype=quant_dtype)
+        #         s = torch.empty(*x.shape[:-1], groups, dtype=torch.float32, device=x.device)
+
+        #         ops.per_token_group_quant_fp8(
+        #             y.view(-1, N),
+        #             x.view(-1, N),
+        #             s.view(-1, groups),
+        #             block_size,
+        #             1e-4,
+        #             scale_fmt is not None,
+        #         )
+
+        #         return y, s
+
+        #     q_fp8, q_scale = act_quant_group_lightop(q)
+    
+        # else:
+        #     q_fp8, q_scale = act_quant(q) # init
+        
         weights = c4_indexer.compute_weights(x, skip_scale=True)
         q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
         self.forward_indexer_compressor(
@@ -427,6 +431,14 @@ class C4IndexerBackendMixin:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
+        elif getattr(core_metadata, "c4_sparse_raw_indices", None) is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+
+        if raw_indices is not None:
+            assert raw_indices.shape[0] == logits.shape[0], (
+                "C4 topk raw_indices must use the same local batch as logits, "
+                f"got raw_indices.shape={raw_indices.shape}, logits.shape={logits.shape}"
+            )
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
