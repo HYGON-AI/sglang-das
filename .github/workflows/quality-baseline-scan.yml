@@ -140,6 +140,7 @@ jobs:
             -v "$PWD:/repo" \
             aquasec/trivy:0.63.0 \
             fs \
+            --db-repository docker.xuanyuan.run/aquasec/trivy-db:2 \
             --scanners vuln \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
