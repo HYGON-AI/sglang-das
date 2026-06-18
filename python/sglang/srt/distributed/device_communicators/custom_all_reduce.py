@@ -389,7 +389,8 @@ def dispatch_custom_allreduce():
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                # Workaround to use uncached input buffer, try again to revert it after umd fix(>=26.04.02)
+                enable_register_for_capturing=tms_cudagraph,
             )
         except ImportError as e:
             logger.warning(
