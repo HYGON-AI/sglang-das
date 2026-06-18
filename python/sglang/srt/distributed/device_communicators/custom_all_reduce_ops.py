@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, get_bool_env_var
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +27,6 @@ except ImportError as e:
     IS_CUSTOM_AR_AVAILABLE = False
     IS_QUICK_AR_AVAILABLE = False
     IS_MSCCLPP_AR_AVAILABLE = False
-
-# import vllm custom allreduce for sglang
-use_dcu_custom_allreduce = get_bool_env_var(
-    "USE_DCU_CUSTOM_ALLREDUCE", default="true"
-)
-if use_dcu_custom_allreduce:
-    try:
-        import vllm._C
-    except ImportError as e:
-        logger.warning("Failed to import from vllm._C with %r", e)
-
 
 # region IS_CUSTOM_AR_AVAILABLE
 
@@ -81,77 +70,6 @@ elif _is_cuda or _is_musa:
     ) -> None:
         _custom_ar.register_graph_buffers(fa, handles, offsets)
 
-elif _is_hip and use_dcu_custom_allreduce:
-    # custom ar
-    def init_custom_ar(ipc_tensors: list[torch.Tensor], rank_data: torch.Tensor,
-                    rank: int, fully_connected: bool) -> int:
-        return torch.ops._C_custom_ar.init_custom_ar(ipc_tensors, rank_data, rank,
-                                                    fully_connected)
-
-
-    def all_reduce(fa: int, inp: torch.Tensor, out: torch.Tensor, reg_buffer: int,
-                reg_buffer_sz_bytes: int) -> None:
-        torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer,
-                                        reg_buffer_sz_bytes)
-
-
-    def dispose(fa: int) -> None:
-        torch.ops._C_custom_ar.dispose(fa)
-
-
-    def meta_size() -> int:
-        return torch.ops._C_custom_ar.meta_size()
-
-
-    def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
-        return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
-
-
-    def get_graph_buffer_ipc_meta(fa: int) -> tuple[list[int], list[int]]:
-        return torch.ops._C_custom_ar.get_graph_buffer_ipc_meta(fa)
-
-
-    def register_graph_buffers(fa: int, handles: list[list[int]],
-                            offsets: list[list[int]]) -> None:
-        torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
-
-
-    def allocate_shared_buffer_and_handle(size: int) -> tuple[int, torch.Tensor]:
-        return torch.ops._C_custom_ar.allocate_shared_buffer_and_handle(size)
-
-
-    def open_mem_handle(mem_handle: torch.Tensor):
-        return torch.ops._C_custom_ar.open_mem_handle(mem_handle)
-
-
-    def free_shared_buffer(ptr: int) -> None:
-        torch.ops._C_custom_ar.free_shared_buffer(ptr)
-
-
-    def read_cache(
-            keys: torch.Tensor,
-            values: torch.Tensor,
-            key_caches: list[torch.Tensor],
-            value_caches: list[torch.Tensor],
-            slot_mapping: torch.Tensor,
-            kv_cache_dtype: str
-    ) -> None:
-        torch.ops._C_cache_ops.read_cache(keys, values, key_caches,
-                                        value_caches, slot_mapping,
-                                        kv_cache_dtype)
-
-    def write_cache_multi_layers(
-            keys: torch.Tensor,
-            values: torch.Tensor,
-            key_caches: list[torch.Tensor],
-            value_caches: list[torch.Tensor],
-            slot_mapping: torch.Tensor,
-            kv_cache_dtype: str
-    ) -> None:
-        torch.ops._C_cache_ops.write_cache_multi_layers(keys, values, key_caches,
-                                                        value_caches, slot_mapping,
-                                                        kv_cache_dtype)
-        
 elif _is_hip:
     # ROCM custom allreduce
 
