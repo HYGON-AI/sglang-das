@@ -138,9 +138,10 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/repo" \
+            -v /home/github/.cache/trivy:/root/.cache/trivy \
             aquasec/trivy:0.63.0 \
             fs \
-            --db-repository docker.xuanyuan.run/aquasec/trivy-db:2 \
+            --skip-db-update \
             --scanners vuln \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
