@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   update-pr-body:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
     steps:
       - name: Update CI states block in PR body
         uses: actions/github-script@v7
