@@ -72,7 +72,6 @@ pip list | grep mooncake-transfer-engine
 **加载环境变量：**
 
 ```bash
-export USE_DCU_CUSTOM_ALLREDUCE=1
 export MC_TOPO_FILE_FORCE=./mc_topo.config
 export MC_ALLOWED_IBV_DEVICES=mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
 #export MC_IB_GID_INDEX=0 #Roce网络需要设置

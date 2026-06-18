@@ -41,7 +41,6 @@ from unittest.mock import patch
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
@@ -346,7 +345,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            dispatch_custom_allreduce, DCUCustomAllreduce
+            dispatch_custom_allreduce
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -393,17 +392,11 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                if is_hip() and ops.use_dcu_custom_allreduce:
-                    self.ca_comm = DCUCustomAllreduce(
-                        group=self.cpu_group,
-                        device=self.device,
-                    )
-                else:
-                    CAClass = dispatch_custom_allreduce()
-                    self.ca_comm = CAClass(
-                        group=self.cpu_group,
-                        device=self.device,
-                    )
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
