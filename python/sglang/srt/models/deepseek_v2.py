@@ -903,7 +903,7 @@ class DeepseekV2MoE(nn.Module):
                     residual = residual,
                 )
         else:
-            return self.forward_deepep(hidden_states, forward_batch, rms_weight=rms_weight, residual=residual,)
+            return self.forward_deepep(hidden_states, forward_batch, input_ids_global=input_ids_global, rms_weight=rms_weight, residual=residual,)
 
     def forward_normal_dual_stream(
         self,
