@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.lightop_concat import concat_decode_opt
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -28,6 +29,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
+    _is_dcu,
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
@@ -38,7 +40,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -122,6 +124,27 @@ if _use_aiter_gfx95:
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
+_use_opt_cat_decode = get_bool_env_var("SGLANG_USE_OPT_CAT")
+_use_fused_mla_cat = get_bool_env_var("SGLANG_USE_FUSED_MLA_CAT")
+_use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+
+_dtype_mapping = {
+    torch.float8_e4m3fn: "fp8_e4m3",
+    torch.float8_e4m3fnuz: "fp8_e4m3",
+    torch.float8_e5m2: "fp8_e5m2",
+    torch.float8_e5m2fnuz: "fp8_e5m2",
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+}
+
+if _use_fused_rmsnorm_rope:
+    from lightop import fused_rms_norm_rope_contiguous
+
+    fused_rms_norm_rope_contiguous = torch._dynamo.disable(
+        fused_rms_norm_rope_contiguous
+    )
+
 
 class DeepseekMLAForwardMixin:
 
@@ -155,7 +178,12 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not _use_fused_rmsnorm_rope
+                and not _use_fused_rms_quant
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -206,7 +234,11 @@ class DeepseekMLAForwardMixin:
                                 output_unquantized_inp1=False,
                             )
 
-                    elif _use_aiter:
+                    elif (
+                        _use_aiter
+                        and not _use_fused_rmsnorm_rope
+                        and not _use_fused_rms_quant
+                    ):
                         q, k_nope = fused_qk_rmsnorm_bf16(
                             q,
                             self.q_a_layernorm.weight,
@@ -216,8 +248,10 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.variance_epsilon,
                         )
                     else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                        if not _use_fused_rms_quant:
+                            q = self.q_a_layernorm(q)
+                        if not _use_fused_rmsnorm_rope:
+                            k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_nsa:
@@ -262,8 +296,19 @@ class DeepseekMLAForwardMixin:
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if not _use_fused_rmsnorm_rope:
+                    k_nope = k_nope.unsqueeze(1)
+                if _use_fused_rms_quant:
+                    q = self.q_b_proj(
+                        q,
+                        rms_weight=self.q_a_layernorm.weight.data,
+                        residual=None,
+                        update_hd=False,
+                    )[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                else:
+                    q = self.q_b_proj(q)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 if q_lora is not None:
                     # See the skip_topk note above: shared layers have no
                     # indexer weights, so this gate must not fall back to
@@ -288,10 +333,31 @@ class DeepseekMLAForwardMixin:
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            if not _use_fused_rmsnorm_rope:
+                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+
+        if _use_fused_rmsnorm_rope:
+            k_nope_normed = torch.empty_like(k_nope)
+            kv_pool = forward_batch.token_to_kv_pool
+            fused_rms_norm_rope_contiguous(
+                positions,
+                q_pe,
+                k_pe.squeeze(1),
+                k_nope,
+                k_nope_normed,
+                self.kv_a_layernorm.weight,
+                self.rotary_emb.cos_sin_cache,
+                forward_batch.out_cache_loc,
+                kv_pool.kv_buffer[self.layer_id - kv_pool.start_layer],
+                _dtype_mapping.get(kv_pool.dtype),
+                1.0,
+                False,
+                self.kv_a_layernorm.variance_epsilon,
+            )
+            k_nope = k_nope.unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -383,6 +449,7 @@ class DeepseekMLAForwardMixin:
             and (not skip_rope_for_nsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+            and not _use_fused_rmsnorm_rope
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -539,22 +606,75 @@ class DeepseekMLAForwardMixin:
                 )
 
                 save_kv_cache = False
+                if llama_4_scaling is not None:
+                    q *= llama_4_scaling
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            elif _use_fused_mla_cat:
+                q_nope_for_attn = (
+                    q_nope_out * llama_4_scaling
+                    if llama_4_scaling is not None
+                    else q_nope_out
+                )
+                attn_output = self.attn_mqa(
+                    q_nope_for_attn,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            elif _use_opt_cat_decode and q_nope_out.shape[0] < 1024:
+                q = concat_decode_opt(q_nope_out, q_pe, dim=2)
+                if llama_4_scaling is not None:
+                    q *= llama_4_scaling
+                attn_output = self.attn_mqa(
+                    q,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    k_rope=k_pe,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 
-            # Apply llama 4 scaling if provided
-            if llama_4_scaling is not None:
-                q *= llama_4_scaling
+                # Apply llama 4 scaling if provided
+                if llama_4_scaling is not None:
+                    q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -576,7 +696,7 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif _is_hip:
+        elif _is_hip and not _is_dcu:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
@@ -617,11 +737,23 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_fp8_group_quant(
-                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
-                )
+                if _use_aiter_gfx95:
+                    attn_bmm_output = fused_flatten_fp8_group_quant(
+                        attn_bmm_output,
+                        group_size=128,
+                        dtype_quant=torch.float8_e4m3fn,
+                    )
+                else:
+                    attn_bmm_output = attn_bmm_output.flatten(1, 2)
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+
+        elif _is_dcu:
+            attn_bmm_output = torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1),
+                self.w_vc.to(torch.bfloat16) * self.w_scale,
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
