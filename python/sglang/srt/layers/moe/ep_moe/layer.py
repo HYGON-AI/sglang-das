@@ -636,13 +636,7 @@ class DeepEPMoE(FusedMoE):
             output = self.forward_npu(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             # assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            if (
-                self.use_fp8_w8a8
-                and hasattr(self, "w13_weight_deepgemm")
-                and hasattr(self, "w2_weight_deepgemm")
-            ):
-                output = self.forward_groupgemm_w8a8_fp8_contiguous(dispatch_output)
-            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
                 output = self.forward_deepgemm_contiguous(dispatch_output)
             elif self.use_w4a8_marlin:
                 output = self.forward_deepgemm_w4a8_marlin_contiguous(dispatch_output)
@@ -927,7 +921,7 @@ class DeepEPMoE(FusedMoE):
             return hidden_states.bfloat16()
 
         M, K = hidden_states.size()
-        N = self.w13_weight_scale.size(1)
+        N = self.w13_weight.size(1)
         # from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
         # w13_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w13_weight)
         # w2_repacked = pack_int8_weight_enk_to_w6_low_latency(self.w2_weight)
