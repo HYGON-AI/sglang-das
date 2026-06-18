@@ -3,6 +3,14 @@ name: quality-baseline-scan
 on:
   workflow_dispatch:
     inputs:
+      scan_encoding:
+        description: "Run encoding baseline scan"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
       scan_secrets:
         description: "Run secret baseline scan"
         required: true
@@ -11,8 +19,16 @@ on:
         options:
           - "true"
           - "false"
-      scan_encoding:
-        description: "Run encoding baseline scan"
+      scan_dependencies:
+        description: "Run dependency baseline scan"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      scan_sast:
+        description: "Run SAST baseline scan"
         required: true
         default: "true"
         type: choice
@@ -23,7 +39,7 @@ on:
 jobs:
   encoding-baseline-scan:
     name: encoding-baseline-scan
-    if: inputs.scan_encoding == 'true'
+    if: ${{ github.event.inputs.scan_encoding == 'true' }}
     runs-on: [self-hosted, linux, x64, quality]
 
     steps:
@@ -90,7 +106,7 @@ jobs:
 
   secret-baseline-scan:
     name: secret-baseline-scan
-    if: inputs.scan_secrets == 'true'
+    if: ${{ github.event.inputs.scan_secrets == 'true' }}
     runs-on: [self-hosted, linux, x64, quality]
 
     steps:
@@ -106,3 +122,43 @@ jobs:
             -v "$PWD:/repo" \
             zricethezav/gitleaks:v8.24.2 \
             detect --source /repo --no-git --verbose
+
+  dependency-baseline-scan:
+    name: dependency-baseline-scan
+    if: ${{ github.event.inputs.scan_dependencies == 'true' }}
+    runs-on: [self-hosted, linux, x64, quality]
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy dependency baseline scan
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            aquasec/trivy:0.63.0 \
+            fs \
+            --scanners vuln \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            /repo
+
+  sast-baseline-scan:
+    name: sast-baseline-scan
+    if: ${{ github.event.inputs.scan_sast == 'true' }}
+    runs-on: [self-hosted, linux, x64, quality]
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST baseline scan
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            semgrep/semgrep:1.125.0 \
+            semgrep scan --config auto --error /src
