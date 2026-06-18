@@ -163,8 +163,8 @@ def _build_m_indices_with_optional_lightop(
         block_size,
         counts_are_aligned,
     ):
-        m_indices = torch.empty(
-            (total_elements,), device=device, dtype=torch.int32
+        m_indices = torch.full(
+            (total_elements,), -1, device=device, dtype=torch.int32
         )
         lightop_op.ep_build_m_indices(
             topk_ids, m_indices, num_experts, block_size
@@ -246,10 +246,12 @@ def _ep_scatter_with_optional_lightop(
         counts_are_aligned=counts_are_aligned,
         scale_ue8m0=scale_ue8m0,
     ):
-        output_index = torch.empty(
-            recv_topk.shape, device=recv_topk.device, dtype=torch.int32
+        output_index = torch.full(
+            recv_topk.shape, -1, device=recv_topk.device, dtype=torch.int32
         )
-        m_indices = torch.empty((all_tokens,), device=recv_x.device, dtype=torch.int32)
+        m_indices = torch.full(
+            (all_tokens,), -1, device=recv_x.device, dtype=torch.int32
+        )
         lightop_op.ep_scatter(
             recv_x,
             recv_x_scale,

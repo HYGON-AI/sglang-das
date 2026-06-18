@@ -1455,6 +1455,7 @@ def build_m_indices_triton(topk_ids, device, num_experts):
 @triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
+    input_token_num,
     input_tensor,
     input_tensor_stride0,
     input_tensor_stride1,
@@ -1496,18 +1497,23 @@ def _fwd_kernel_ep_gather(
                 source_token_index_int32 = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
-                source_token_index = source_token_index_int32.to(tl.int64)
+                if (source_token_index_int32 >= 0) & (
+                    source_token_index_int32 < input_token_num
+                ):
+                    source_token_index = source_token_index_int32.to(tl.int64)
 
-                acc_weight = tl.load(
-                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
-                )
-                tmp = tl.load(
-                    input_tensor
-                    + source_token_index * input_tensor_stride0
-                    + cur_block * BLOCK_D
-                    + off_d
-                )
-                accumulator += tmp.to(tl.float32) * acc_weight
+                    acc_weight = tl.load(
+                        recv_topk_weight
+                        + cur_token * recv_topk_weight_stride0
+                        + topk_index
+                    )
+                    tmp = tl.load(
+                        input_tensor
+                        + source_token_index * input_tensor_stride0
+                        + cur_block * BLOCK_D
+                        + off_d
+                    )
+                    accumulator += tmp.to(tl.float32) * acc_weight
 
         tl.store(
             output_tensor
@@ -1537,6 +1543,7 @@ def ep_gather(
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](
         num_tokens,
+        input_tensor.shape[0],
         input_tensor,
         input_tensor.stride(0),
         input_tensor.stride(1),
