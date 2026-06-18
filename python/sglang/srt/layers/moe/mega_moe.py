@@ -27,6 +27,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.utils import is_dcu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_IS_DCU = is_dcu()
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -71,6 +73,7 @@ def _get_mega_moe_symm_buffer(
     _apply_mega_moe_dg_env()
 
     key = (
+        "dcu" if _IS_DCU else "cuda",
         id(group),
         num_max_tokens_per_rank,
         num_experts,
@@ -99,8 +102,10 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+    if _IS_DCU and not getattr(moe.experts, "_mega_moe_dcu_w8a8_weights", False):
+        return False
     if get_is_capture_mode():
-        return True
+        return not _IS_DCU
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens:
@@ -190,8 +195,10 @@ def _run_mega_routed(
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
-    assert num_tokens <= num_max_tokens_per_rank, (
-        f"mega MoE: num_tokens={num_tokens} exceeds cap "
+    global_num_tokens = get_dp_global_num_tokens()
+    dispatch_num_tokens = max(global_num_tokens) if global_num_tokens else num_tokens
+    assert dispatch_num_tokens <= num_max_tokens_per_rank, (
+        f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
         f"{num_max_tokens_per_rank}; raise the env var or shrink "
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
@@ -205,6 +212,37 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
     )
+
+    if _IS_DCU:
+        if num_tokens > 0:
+            topk_ids_in = topk_ids.to(torch.int64)
+            topk_weights_in = topk_weights.to(torch.float32)
+            x_fp8, x_scale = deep_gemm.cast_to_fp8_channelwise(hidden_states)
+            buf.x[:num_tokens].copy_(x_fp8)
+            buf.x_sf[:num_tokens].copy_(x_scale)
+            buf.topk_idx[:num_tokens].copy_(topk_ids_in)
+            buf.topk_weights[:num_tokens].copy_(topk_weights_in)
+
+        y = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        swiglu_limit = getattr(moe.config, "swiglu_limit", None)
+        deep_gemm.fp8_w8a8_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+            dispatch_num_tokens=dispatch_num_tokens,
+        )
+        if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+            y.mul_(moe.routed_scaling_factor)
+        return y
 
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
@@ -329,4 +367,68 @@ def build_mega_moe_experts_weights(experts) -> None:
         experts.mega_l1_weights = l1_pair
         experts.mega_l2_weights = l2_pair
 
+    experts._mega_moe_weights_built = True
+
+
+def _dcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tensor:
+    num_experts = int(experts.w13_weight.shape[0])
+    for name in names:
+        scale_param = getattr(experts, name, None)
+        if scale_param is None:
+            continue
+        scale = scale_param.data if hasattr(scale_param, "data") else scale_param
+        if scale.dim() == 3 and scale.shape == (num_experts, rows, 1):
+            return scale.squeeze(-1).to(torch.float32).contiguous()
+        if scale.dim() == 2 and scale.shape == (num_experts, rows):
+            return scale.to(torch.float32).contiguous()
+    raise ValueError(
+        "DCU W8A8 MegaMoE requires channelwise FP32 scales shaped "
+        f"[expert,row] for {label}; checked {', '.join(names)}"
+    )
+
+
+def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
+    import deep_gemm
+
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    w13 = experts.w13_weight.data
+    w2 = experts.w2_weight.data
+    if w13.dim() != 3 or w2.dim() != 3 or w13.shape[0] != w2.shape[0]:
+        raise ValueError("DCU W8A8 MegaMoE expects grouped 3D expert weights")
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        raise ValueError("DCU W8A8 MegaMoE expects torch.float8_e4m3fn expert weights")
+
+    num_experts, l1_rows, hidden = w13.shape
+    _, l2_rows, intermediate = w2.shape
+    if l1_rows != 2 * intermediate or l2_rows != hidden:
+        raise ValueError(
+            "DCU W8A8 MegaMoE expects w13=[E,2I,H] and w2=[E,H,I]"
+        )
+    if l1_rows % 16 != 0 or hidden % 16 != 0 or intermediate % 16 != 0:
+        raise ValueError("DCU W8A8 MegaMoE requires rows and K divisible by 16")
+
+    w13_scale = _dcu_channelwise_scale(
+        experts,
+        ("w13_weight_scale", "w13_weight_scale1"),
+        l1_rows,
+        "w13",
+    )
+    w2_scale = _dcu_channelwise_scale(
+        experts,
+        ("w2_weight_scale", "w2_weight_scale1"),
+        l2_rows,
+        "w2",
+    )
+
+    experts.mega_l1_weights = (
+        deep_gemm.weight8bit_nt_kpack2_marlin(w13.contiguous()),
+        w13_scale,
+    )
+    experts.mega_l2_weights = (
+        deep_gemm.weight8bit_nt_kpack2_marlin(w2.contiguous()),
+        w2_scale,
+    )
+    experts._mega_moe_dcu_w8a8_weights = True
     experts._mega_moe_weights_built = True

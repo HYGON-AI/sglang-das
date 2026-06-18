@@ -3252,6 +3252,13 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
+            if is_dcu():
+                if not self.disable_cuda_graph:
+                    logger.warning(
+                        "Cuda graph is disabled for DCU W8A8 MegaMoE v1."
+                    )
+                self.disable_cuda_graph = True
+                self.disable_piecewise_cuda_graph = True
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(

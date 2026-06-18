@@ -1431,7 +1431,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if _is_hip and _use_hip_int4:
+        if (
+            _is_dcu
+            and get_moe_a2a_backend().is_megamoe()
+            and not self.block_quant
+            and not self.is_fp4_expert
+        ):
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "DCU W8A8 MegaMoE requires an FP8-serialized checkpoint "
+                    "with channelwise expert weight scales"
+                )
+            from sglang.srt.layers.moe.mega_moe import (
+                build_dcu_w8a8_mega_moe_experts_weights,
+            )
+
+            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            return
+
+        elif _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
         elif self.block_quant:

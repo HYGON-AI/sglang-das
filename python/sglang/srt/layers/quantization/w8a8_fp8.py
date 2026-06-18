@@ -283,6 +283,14 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_dcu_w8a8_mega_moe_experts_weights,
+            )
+
+            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            return
+
         if _is_dcu and _use_fp8_w8a8_moe:
             w1 = layer.w13_weight
             w2 = layer.w2_weight
