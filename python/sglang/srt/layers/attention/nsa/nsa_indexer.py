@@ -565,7 +565,7 @@ class Indexer(MultiPlatformOp):
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
-        if _is_hip and not _use_aiter_preshuffle:
+        if _is_hip and not _use_aiter_preshuffle and not _is_dcu:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
