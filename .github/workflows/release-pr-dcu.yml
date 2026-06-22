@@ -42,6 +42,7 @@ jobs:
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
+        -v ${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}:${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}
         --shm-size=80G
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
@@ -61,6 +62,7 @@ jobs:
       DCU_RUNNER_HOST_UID: ${{ vars.DCU_RUNNER_HOST_UID || '1000' }}
       DCU_RUNNER_HOST_GID: ${{ vars.DCU_RUNNER_HOST_GID || '1000' }}
       WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      DCU_CI_WHEEL_STAGING_HOST: ${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}
 
     steps:
       # =======================================================================
@@ -170,16 +172,20 @@ jobs:
           ls -lh target/wheels/*.whl
 
       # =======================================================================
-      # 修复 (auditwheel) & 上传产物
+      # 修复 (auditwheel) & 本地暂存产物
       # =======================================================================
 
-      - name: Apply DAS local version to wheels
+      - name: Apply DAS local version and stage wheels
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.run_id }}
         run: |
+          set -euo pipefail
           source /opt/dtk/env.sh
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
+          SHORT_SHA="$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g${SHORT_SHA}"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
@@ -188,12 +194,62 @@ jobs:
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+
+          if ! compgen -G "output/*.whl" >/dev/null; then
+            echo "::error::No repaired DCU wheels were produced."
+            exit 1
+          fi
+
+          REPO_KEY="$(printf '%s' "${GITHUB_REPOSITORY}" | tr '/:' '__')"
+          STAGING_BASE="${DCU_CI_WHEEL_STAGING_HOST}/${REPO_KEY}/pr-${PR_NUMBER}"
+          STAGING_DIR="${STAGING_BASE}/${WHEEL_COMMIT_SHA}"
+          TMP_DIR="${STAGING_DIR}.tmp.${GITHUB_RUN_ID}"
+
+          rm -rf "${TMP_DIR}"
+          mkdir -p "${TMP_DIR}/wheels"
+          cp -f output/*.whl "${TMP_DIR}/wheels/"
+
+          export STAGING_DIR="${TMP_DIR}"
+          export MANIFEST_REPO="${GITHUB_REPOSITORY}"
+          export MANIFEST_PR_NUMBER="${PR_NUMBER}"
+          export MANIFEST_HEAD_SHA="${WHEEL_COMMIT_SHA}"
+          export MANIFEST_SHORT_SHA="${SHORT_SHA}"
+          export MANIFEST_RUN_ID="${GITHUB_RUN_ID}"
+          export MANIFEST_REF_NAME="${GITHUB_REF_NAME:-}"
+          export MANIFEST_GATEWAY_REQUIRED="${{ steps.changes.outputs.gateway }}"
+          python3 - <<'PY_MANIFEST'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          staging = Path(os.environ["STAGING_DIR"])
+          wheels = sorted(str(p.relative_to(staging)) for p in (staging / "wheels").glob("*.whl"))
+          manifest = {
+              "repo": os.environ["MANIFEST_REPO"],
+              "pr_number": os.environ["MANIFEST_PR_NUMBER"],
+              "head_sha": os.environ["MANIFEST_HEAD_SHA"],
+              "short_sha": os.environ["MANIFEST_SHORT_SHA"],
+              "build_run_id": os.environ["MANIFEST_RUN_ID"],
+              "source_ref": os.environ.get("MANIFEST_REF_NAME", ""),
+              "created_at": datetime.now(timezone.utc).isoformat(),
+              "gateway_required": os.environ.get("MANIFEST_GATEWAY_REQUIRED", "false") == "true",
+              "wheels": wheels,
+          }
+          (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          PY_MANIFEST
+
+          rm -rf "${STAGING_DIR}"
+          mkdir -p "${STAGING_BASE}"
+          mv "${TMP_DIR}" "${STAGING_DIR}"
+          touch "${STAGING_DIR}/READY"
+          echo "DCU PR wheels staged locally at ${STAGING_DIR}"
+          find "${STAGING_DIR}" -maxdepth 2 -type f -print | sort
 
       - name: Skip GitHub artifact upload
         run: |
-          echo "DCU PR wheels are uploaded to internal devpi in the previous step."
-          echo "Skipping GitHub artifact upload to avoid blocking PR CI on repository artifact quota."
+          echo "DCU PR wheels are staged locally under ${DCU_CI_WHEEL_STAGING_HOST}."
+          echo "They will be uploaded to internal devpi only after PR Test (DCU) succeeds."
 
       - name: Normalize workspace ownership
         if: always()

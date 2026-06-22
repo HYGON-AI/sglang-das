@@ -17,6 +17,8 @@ SKIP_DEPENDENCY_INSTALL="${DCU_CI_SKIP_DEPENDENCY_INSTALL:-0}"
 SKIP_REQUIREMENTS_INSTALL="${DCU_CI_SKIP_REQUIREMENTS_INSTALL:-0}"
 SKIP_SGLANG_BUILD="${DCU_CI_SKIP_SGLANG_BUILD:-0}"
 SKIP_COMPAT_INSTALL="${DCU_CI_SKIP_COMPAT_INSTALL:-0}"
+USE_INSTALLED_WHEELS="${DCU_CI_USE_INSTALLED_WHEELS:-0}"
+INSTALL_WHEEL_PATHS="${DCU_CI_INSTALL_WHEEL_PATHS:-}"
 INSTALL_WHEEL_URLS="${DCU_CI_INSTALL_WHEEL_URLS:-}"
 
 run_in_container() {
@@ -65,15 +67,28 @@ else
     pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.9" tabulate
 fi
 
-if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
-  echo "[dcu-ci] Installing DCU wheels from explicit URLs"
-  echo "[dcu-ci] DCU_CI_INSTALL_WHEEL_URLS=${INSTALL_WHEEL_URLS}"
+install_explicit_wheels() {
+  local source_label="$1"
+  local wheel_args="$2"
+
+  echo "[dcu-ci] Installing DCU wheels from explicit ${source_label}"
+  echo "[dcu-ci] wheel args=${wheel_args}"
   run_in_container "python3 -m pip uninstall -y sglang sgl-kernel sglang-kernel sgl-model-gateway || true"
   install_with_retry docker exec "${CONTAINER}" \
-    python3 -m pip install --no-cache-dir --no-deps ${INSTALL_WHEEL_URLS}
+    python3 -m pip install --no-cache-dir --no-deps ${wheel_args}
   echo "[dcu-ci] Installed wheel import paths:"
   run_in_container "python3 -c 'import sglang; print(\"sglang:\", sglang.__file__)'"
   run_in_container "python3 -c 'import sgl_kernel; print(\"sgl_kernel:\", sgl_kernel.__file__)'"
+
+  if [[ "${USE_INSTALLED_WHEELS}" == "1" || "${USE_INSTALLED_WHEELS}" == "true" ]]; then
+    SKIP_SGLANG_BUILD=1
+  fi
+}
+
+if [[ -n "${INSTALL_WHEEL_PATHS}" ]]; then
+  install_explicit_wheels "local paths" "${INSTALL_WHEEL_PATHS}"
+elif [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
+  install_explicit_wheels "URLs" "${INSTALL_WHEEL_URLS}"
 fi
 
 if [[ "${SKIP_DEPENDENCY_INSTALL}" == "1" || "${SKIP_DEPENDENCY_INSTALL}" == "true" ]]; then

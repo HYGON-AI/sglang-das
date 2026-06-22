@@ -460,11 +460,14 @@ jobs:
     if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.wheel_required == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     outputs:
-      wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
+      wheel_paths: ${{ steps.wait.outputs.wheel_paths }}
+      staging_dir: ${{ steps.wait.outputs.staging_dir }}
     env:
-      DCU_WHEEL_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number || '' }}
       GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
+      DCU_CI_WHEEL_STAGING_HOST: ${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}
+      DCU_CI_WHEEL_STAGING_CONTAINER: ${{ vars.DCU_CI_WHEEL_STAGING_CONTAINER || '/dcu-wheel-staging' }}
     steps:
       - name: Checkout code
         env:
@@ -491,99 +494,115 @@ jobs:
         id: sha
         run: |
           set -euo pipefail
+          full_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
           short_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
+          echo "full_sha=${full_sha}" >> "${GITHUB_OUTPUT}"
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
-          echo "Using wheel short SHA: ${short_sha}"
+          echo "Using wheel SHA: ${full_sha} (${short_sha})"
 
-      - name: Wait for current commit DCU wheels
+      - name: Wait for current commit local DCU wheels
         id: wait
+        env:
+          CHECKOUT_FULL_SHA: ${{ steps.sha.outputs.full_sha }}
+          CHECKOUT_SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
         run: |
           set -euo pipefail
-          short_sha="${{ steps.sha.outputs.short_sha }}"
-          export CHECKOUT_REF="${short_sha}"
-          echo "Waiting for DCU wheels with g${short_sha}"
+          echo "Waiting for local DCU wheels with g${CHECKOUT_SHORT_SHA} under ${DCU_CI_WHEEL_STAGING_HOST}"
 
-          python3 - <<'PY_WAIT' | tee /tmp/dcu_wheel_urls.out
-          import html.parser
+          python3 - <<'PY_WAIT'
+          import json
           import os
           import sys
           import time
-          import urllib.parse
-          import urllib.request
+          from pathlib import Path, PurePosixPath
 
-          base = os.environ["DCU_WHEEL_INDEX_URL"].rstrip("/") + "/"
-          short_sha = os.environ["CHECKOUT_REF"][:12]
+          staging_root = Path(os.environ["DCU_CI_WHEEL_STAGING_HOST"])
+          container_root = PurePosixPath(os.environ.get("DCU_CI_WHEEL_STAGING_CONTAINER", "/dcu-wheel-staging"))
+          repo_key = os.environ["GITHUB_REPOSITORY"].replace("/", "_").replace(":", "_")
+          full_sha = os.environ["CHECKOUT_FULL_SHA"]
+          short_sha = os.environ["CHECKOUT_SHORT_SHA"][:12]
+          pr_number = os.environ.get("PR_NUMBER", "")
           gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
           timeout_s = int(os.environ.get("DCU_WHEEL_WAIT_TIMEOUT", "3600"))
           interval_s = int(os.environ.get("DCU_WHEEL_WAIT_INTERVAL", "60"))
+          repo_dir = staging_root / repo_key
 
-          class LinkParser(html.parser.HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.links = []
+          def candidate_dirs():
+              seen = set()
+              if pr_number:
+                  path = repo_dir / f"pr-{pr_number}" / full_sha
+                  seen.add(path)
+                  yield path
+              if repo_dir.exists():
+                  for path in sorted(repo_dir.glob(f"*/{full_sha}")):
+                      if path not in seen:
+                          yield path
 
-              def handle_starttag(self, tag, attrs):
-                  if tag != "a":
-                      return
-                  for key, value in attrs:
-                      if key == "href":
-                          self.links.append(value)
-
-          def fetch_links(project):
-              url = urllib.parse.urljoin(base, project.strip("/") + "/")
-              with urllib.request.urlopen(url, timeout=30) as resp:
-                  parser = LinkParser()
-                  parser.feed(resp.read().decode("utf-8", errors="replace"))
-              return [urllib.parse.urljoin(url, link) for link in parser.links]
-
-          def find_wheel(projects, prefixes):
+          def match_wheel(wheels, kind):
               marker = f"g{short_sha}"
-              for project in projects:
-                  try:
-                      links = fetch_links(project)
-                  except Exception as exc:
-                      print(f"[wait-dcu-wheels] {project}: {type(exc).__name__}: {exc}", file=sys.stderr)
+              for wheel in wheels:
+                  filename = wheel.name
+                  normalized = filename.replace("-", "_")
+                  if not filename.endswith(".whl") or marker not in filename:
                       continue
-                  for link in links:
-                      filename = urllib.parse.unquote(link.rsplit("/", 1)[-1].split("#", 1)[0])
-                      normalized = filename.replace("-", "_")
-                      if not filename.endswith(".whl") or marker not in filename:
-                          continue
-                      if any(normalized.startswith(prefix.replace("-", "_")) for prefix in prefixes):
-                          return link
+                  if kind == "sglang" and normalized.startswith("sglang_") and not normalized.startswith(("sglang_kernel_", "sgl_kernel_")):
+                      return wheel
+                  if kind == "sgl-kernel" and normalized.startswith(("sgl_kernel_", "sglang_kernel_")):
+                      return wheel
+                  if kind == "sgl-model-gateway" and normalized.startswith("sgl_model_gateway_"):
+                      return wheel
               return None
 
-          requirements = [
-              ("sglang", ["sglang"], ["sglang_"]),
-              ("sgl-kernel", ["sgl-kernel", "sglang-kernel", "sgl_kernel", "sglang_kernel"], ["sgl_kernel_", "sglang_kernel_"]),
-          ]
+          requirements = ["sglang", "sgl-kernel"]
           if gateway_required:
-              requirements.append(("sgl-model-gateway", ["sgl-model-gateway", "sgl_model_gateway"], ["sgl_model_gateway_"]))
+              requirements.append("sgl-model-gateway")
 
           deadline = time.time() + timeout_s
-          found = {}
+          last_status = ""
           while time.time() < deadline:
-              missing = []
-              for name, projects, prefixes in requirements:
-                  if name in found:
+              for staging_dir in candidate_dirs():
+                  ready = staging_dir / "READY"
+                  manifest_path = staging_dir / "manifest.json"
+                  wheels_dir = staging_dir / "wheels"
+                  if not ready.exists() or not manifest_path.exists() or not wheels_dir.is_dir():
+                      last_status = f"{staging_dir} is not ready"
                       continue
-                  wheel = find_wheel(projects, prefixes)
-                  if wheel:
-                      found[name] = wheel
-                      print(f"[wait-dcu-wheels] found {name}: {wheel}", file=sys.stderr)
-                  else:
-                      missing.append(name)
-              if len(found) == len(requirements):
-                  print(" ".join(found[name] for name, _, _ in requirements))
+                  try:
+                      manifest = json.loads(manifest_path.read_text())
+                  except Exception as exc:
+                      last_status = f"failed to read {manifest_path}: {exc}"
+                      continue
+                  if manifest.get("head_sha") != full_sha:
+                      last_status = f"{manifest_path} head_sha mismatch: {manifest.get('head_sha')}"
+                      continue
+
+                  wheels = sorted(wheels_dir.glob("*.whl"))
+                  found = {name: match_wheel(wheels, name) for name in requirements}
+                  missing = [name for name, wheel in found.items() if wheel is None]
+                  if missing:
+                      last_status = f"{staging_dir} missing wheels: {missing}"
+                      continue
+
+                  ordered = [found[name] for name in requirements]
+                  container_paths = []
+                  for wheel in ordered:
+                      rel = wheel.relative_to(staging_root)
+                      container_paths.append(str(container_root / PurePosixPath(rel.as_posix())))
+
+                  output_path = Path(os.environ["GITHUB_OUTPUT"])
+                  with output_path.open("a") as out:
+                      out.write(f"wheel_paths={' '.join(container_paths)}\n")
+                      out.write(f"staging_dir={staging_dir}\n")
+                  print(f"[wait-dcu-wheels] found local wheels: {' '.join(container_paths)}")
+                  print(f"[wait-dcu-wheels] staging dir: {staging_dir}")
                   sys.exit(0)
-              print(f"[wait-dcu-wheels] missing {missing}; sleep {interval_s}s", file=sys.stderr)
+
+              print(f"[wait-dcu-wheels] {last_status or 'staged wheels not found'}; sleep {interval_s}s", file=sys.stderr)
               time.sleep(interval_s)
 
-          print(f"Timed out waiting for current commit wheels g{short_sha}; found={found}", file=sys.stderr)
+          print(f"Timed out waiting for local DCU wheels for {full_sha}; last_status={last_status}", file=sys.stderr)
           sys.exit(1)
           PY_WAIT
-          wheel_urls="$(tail -n 1 /tmp/dcu_wheel_urls.out)"
-          echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
   stage-a-test-1-gpu-small-dcu:
     name: Stage A DCU smoke
@@ -602,7 +621,9 @@ jobs:
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
-      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
+      DCU_CI_WHEEL_STAGING_HOST: ${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}
+      DCU_CI_WHEEL_STAGING_CONTAINER: ${{ vars.DCU_CI_WHEEL_STAGING_CONTAINER || '/dcu-wheel-staging' }}
+      DCU_CI_INSTALL_WHEEL_PATHS: ${{ needs.wait-dcu-wheels.outputs.wheel_paths || '' }}
       DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
@@ -696,7 +717,9 @@ jobs:
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
-      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
+      DCU_CI_WHEEL_STAGING_HOST: ${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}
+      DCU_CI_WHEEL_STAGING_CONTAINER: ${{ vars.DCU_CI_WHEEL_STAGING_CONTAINER || '/dcu-wheel-staging' }}
+      DCU_CI_INSTALL_WHEEL_PATHS: ${{ needs.wait-dcu-wheels.outputs.wheel_paths || '' }}
       DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
@@ -785,6 +808,85 @@ jobs:
         if: always()
         run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
+  finalize-dcu-wheels:
+    name: Finalize DCU wheels
+    needs:
+      - check-changes
+      - call-gate
+      - validate-config
+      - wait-dcu-wheels
+      - stage-a-test-1-gpu-small-dcu
+      - stage-b-test-1-gpu-small-dcu
+    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.wheel_required == 'true' && needs.wait-dcu-wheels.result == 'success'
+    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    container:
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      options: >
+        --network=host
+        -v ${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}:${{ vars.DCU_CI_WHEEL_STAGING_HOST || '/home/github/sgl_whl_temp' }}
+    env:
+      DCU_WHEEL_STAGING_DIR: ${{ needs.wait-dcu-wheels.outputs.staging_dir }}
+      STAGE_A_RESULT: ${{ needs.stage-a-test-1-gpu-small-dcu.result }}
+      STAGE_B_RESULT: ${{ needs.stage-b-test-1-gpu-small-dcu.result }}
+      PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
+      PIP_TRUSTED_HOST: 10.16.1.201
+      RESOURCE_SERVER: http://10.16.1.201:8000/
+      DCU_CI_PROMOTE_DEVPI_URL: ${{ vars.DCU_CI_PROMOTE_DEVPI_URL || 'http://10.16.1.201:9929' }}
+      DCU_CI_PROMOTE_DEVPI_USER: ${{ vars.DCU_CI_PROMOTE_DEVPI_USER || 'nightly' }}
+      DCU_CI_PROMOTE_DEVPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+    steps:
+      - name: Record test result or promote wheels
+        run: |
+          set -euo pipefail
+          if [[ -z "${DCU_WHEEL_STAGING_DIR}" || ! -d "${DCU_WHEEL_STAGING_DIR}" ]]; then
+            echo "::error::DCU wheel staging dir is missing: ${DCU_WHEEL_STAGING_DIR}"
+            exit 1
+          fi
+
+          export RESULT_STATUS="failed"
+          if [[ "${STAGE_A_RESULT}" =~ ^(success|skipped)$ && "${STAGE_B_RESULT}" =~ ^(success|skipped)$ ]]; then
+            RESULT_STATUS="passed"
+          fi
+
+          python3 - <<'PY_RESULT'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          staging_dir = Path(os.environ["DCU_WHEEL_STAGING_DIR"])
+          result = {
+              "status": os.environ["RESULT_STATUS"],
+              "stage_a_result": os.environ["STAGE_A_RESULT"],
+              "stage_b_result": os.environ["STAGE_B_RESULT"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "updated_at": datetime.now(timezone.utc).isoformat(),
+          }
+          (staging_dir / "test-result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          PY_RESULT
+
+          if [[ "${RESULT_STATUS}" != "passed" ]]; then
+            touch "${DCU_WHEEL_STAGING_DIR}/TEST_FAILED"
+            echo "DCU tests did not pass; keeping staged wheels local and skipping devpi upload."
+            exit 0
+          fi
+
+          if [[ -z "${DCU_CI_PROMOTE_DEVPI_PASSWORD}" ]]; then
+            echo "::error::PYPI_PASSWORD secret is required to promote DCU wheels."
+            exit 1
+          fi
+
+          python3 -m pip install ciupload
+          DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+          CIUpload \
+            --devpi_url "${DCU_CI_PROMOTE_DEVPI_URL}" \
+            --devpi_user "${DCU_CI_PROMOTE_DEVPI_USER}" \
+            --devpi_password "${DCU_CI_PROMOTE_DEVPI_PASSWORD}" \
+            --dtk_pkg_name "$(basename "${DTK_PKG_URL}")" \
+            -f "${DCU_WHEEL_STAGING_DIR}"/wheels/*.whl
+          touch "${DCU_WHEEL_STAGING_DIR}/PROMOTED"
+          echo "DCU PR wheels promoted from ${DCU_WHEEL_STAGING_DIR}."
+
   pr-test-dcu-finish:
     name: PR Test (DCU) finish
     needs:
@@ -794,6 +896,7 @@ jobs:
       - wait-dcu-wheels
       - stage-a-test-1-gpu-small-dcu
       - stage-b-test-1-gpu-small-dcu
+      - finalize-dcu-wheels
     if: always()
     runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
