@@ -209,7 +209,7 @@ jobs:
           mkdir -p "${TMP_DIR}/wheels"
           cp -f output/*.whl "${TMP_DIR}/wheels/"
 
-          export STAGING_DIR="${TMP_DIR}"
+          export STAGING_TMP_DIR="${TMP_DIR}"
           export MANIFEST_REPO="${GITHUB_REPOSITORY}"
           export MANIFEST_PR_NUMBER="${PR_NUMBER}"
           export MANIFEST_HEAD_SHA="${WHEEL_COMMIT_SHA}"
@@ -223,7 +223,7 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          staging = Path(os.environ["STAGING_DIR"])
+          staging = Path(os.environ["STAGING_TMP_DIR"])
           wheels = sorted(str(p.relative_to(staging)) for p in (staging / "wheels").glob("*.whl"))
           manifest = {
               "repo": os.environ["MANIFEST_REPO"],
