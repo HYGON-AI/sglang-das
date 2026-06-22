@@ -614,18 +614,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         has_swa = swa_indices > 0
-        swa_indices_valid = swa_indices[has_swa]
-        if swa_indices_valid.numel() > 0:
-            unique_swa = torch.unique(swa_indices_valid)
-            if len(self.swa_attn_allocator.release_pages) > 0:
-                self.swa_attn_allocator.merge_and_sort_free()
-            swa_pages = unique_swa // self.swa_attn_allocator.page_size
-            already_free = torch.isin(swa_pages, self.swa_attn_allocator.free_pages)
-            if already_free.any():
-                unique_swa = unique_swa[~already_free]
-            if unique_swa.numel() > 0:
-                self.swa_attn_allocator.free(unique_swa)
-        self.full_to_swa_index_mapping[free_index] = 0
+        free_index = free_index[has_swa]
+        swa_indices = swa_indices[has_swa]
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices)
+            freed_swa_pages = torch.unique(
+                swa_indices // self.swa_attn_allocator.page_size
+            )
+            all_swa = self.full_to_swa_index_mapping
+            all_swa_pages = all_swa // self.swa_attn_allocator.page_size
+            stale = torch.isin(all_swa_pages, freed_swa_pages) & (all_swa > 0)
+            if stale.any():
+                self.full_to_swa_index_mapping[stale] = 0
+        else:
+            self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
         return [
