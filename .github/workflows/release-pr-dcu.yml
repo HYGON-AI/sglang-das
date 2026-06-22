@@ -179,7 +179,7 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || github.run_id }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           source /opt/dtk/env.sh
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
