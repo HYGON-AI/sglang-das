@@ -1143,6 +1143,8 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
 
     num_tokens = gating_output.shape[0]
@@ -1338,6 +1340,8 @@ def biased_grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
@@ -1543,6 +1547,8 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                num_token_non_padded=num_token_non_padded,
             )
 
     elif torch_native and custom_routing_function is None:
