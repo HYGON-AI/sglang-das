@@ -3,6 +3,9 @@ name: Nightly Test (DCU)
 on:
   schedule:
     - cron: "30 18 * * *" # 02:30 Beijing Time daily
+  pull_request:
+    paths:
+      - ".github/workflows/nightly-test-dcu.yml"
   workflow_dispatch:
     inputs:
       ref:
