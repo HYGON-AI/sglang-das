@@ -29,8 +29,11 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         logger.warning(
             f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
         )
+    if server_args.kv_cache_dtype == "bf16":
+        server_args.kv_cache_dtype = "bfloat16"
     assert server_args.kv_cache_dtype in [
-        "fp8_e4m3"
+        "bfloat16",
+        "fp8_e4m3",
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:

@@ -937,7 +937,13 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         raw_loc = forward_batch.out_cache_loc
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if self.token_to_kv_pool.is_bf16_attention_kv_cache:
+            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+                layer_id=layer_id,
+                raw_loc=raw_loc,
+                cache_k=swa_k,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
@@ -1011,7 +1017,7 @@ class DeepseekV4AttnBackend(
             cache_seqlens=None,
             tile_scheduler_metadata=flashmla_metadata,
             softmax_scale=self.softmax_scale,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=swa_k_cache.dtype != torch.bfloat16,
             indices=swa_page_indices,
             topk_length=swa_topk_lengths,
             attn_sink=attn_sink,

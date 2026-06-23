@@ -10,6 +10,10 @@ from sglang.jit_kernel.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.jit_kernel.deepseek_v4 import (
+    compress_fused_norm_rope_inplace,
+    fused_norm_rope_inplace,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -28,6 +32,24 @@ FusedCompressMetadata: TypeAlias = CompressMetadata
 def _use_online_compress(compress_ratio: int) -> bool:
     """Online state-pool path is c128-only."""
     return compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def _select_bf16_prefill_compress_writes(
+    plan: CompressorPrefillPlan,
+    out_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (write_loc, positions) for compact rows produced by plan_c."""
+    plan_c = plan.plan_c
+    assert plan_c.shape[-1] == 16, (
+        "BF16 compressed cache prefill expects CompressPlan layout, "
+        f"got {tuple(plan_c.shape)}"
+    )
+    plan_c_i32 = plan_c.contiguous().view(dtype=torch.int32).view(-1, 4)
+    seq_lens = plan_c_i32[:, 0].to(torch.int64)
+    ragged_ids = torch.bitwise_and(plan_c_i32[:, 1], 0xFFFF).to(torch.long)
+    positions = seq_lens - int(plan.compress_ratio)
+    write_loc = out_loc.index_select(0, ragged_ids)
+    return write_loc, positions
 
 
 class CompressorBackendMixin:
@@ -109,6 +131,62 @@ class CompressorBackendMixin:
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
         state_pool = compressor.get_state_pool(forward_batch)
+        if (
+            token_to_kv_pool.is_bf16_attention_kv_cache
+            and not compressor.is_in_indexer
+        ):
+            plan = self._get_paged_compress_metadata(compressor.ratio)
+            is_online = _use_online_compress(compressor.ratio)
+            kv_score_buffer = state_pool.kv_score_buffer.kv_score
+            if is_online:
+                kv_score_buffer = kv_score_buffer.view(-1, 1, compressor.head_dim * 3)
+            else:
+                coff = 2 if is_overlap_compress(compressor.ratio) else 1
+                last_dim = 2 * compressor.head_dim * coff
+                assert kv_score_buffer.shape[-1] == last_dim
+                kv_score_buffer = kv_score_buffer.view(
+                    -1, compressor.ratio, last_dim
+                )
+            kv_compressed = compress_forward(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=compressor.ape.view(-1, compressor.head_dim),
+                plan=plan,
+                compress_ratio=compressor.ratio,
+                head_dim=compressor.head_dim,
+                is_online=is_online,
+            )
+            if plan.is_decode:
+                decode_seq_lens = forward_batch.seq_lens.to(torch.int32).contiguous()
+                compress_fused_norm_rope_inplace(
+                    kv_compressed,
+                    compressor.norm.weight,
+                    compressor.norm.variance_epsilon,
+                    compressor.freqs_cis,
+                    plan,
+                    decode_seq_lens,
+                )
+                write_loc = self._get_out_loc(compressor.ratio)
+                kv_to_write = kv_compressed
+            else:
+                write_loc, positions = _select_bf16_prefill_compress_writes(
+                    plan, self._get_out_loc(compressor.ratio)
+                )
+                fused_norm_rope_inplace(
+                    kv_compressed,
+                    compressor.norm.weight,
+                    compressor.norm.variance_epsilon,
+                    compressor.freqs_cis,
+                    positions,
+                )
+                kv_to_write = kv_compressed
+            token_to_kv_pool.set_extra_key_buffer_fused(
+                layer_id=layer_id,
+                loc=write_loc,
+                cache_k=kv_to_write,
+            )
+            return
+
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()

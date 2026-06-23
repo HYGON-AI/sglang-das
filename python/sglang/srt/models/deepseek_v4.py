@@ -529,6 +529,7 @@ class MQALayer(nn.Module):
         q = q.view(-1, self.n_local_heads, self.head_dim)
 
         _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _bf16_kv_cache = forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
         _use_lightop_qnorm_rope = (
             _use_fused_qnorm_rope_kv_rope_quant and _is_dcu
         )
@@ -538,7 +539,7 @@ class MQALayer(nn.Module):
         else:
             cos_sin_cache_fused = None
 
-        if _use_lightop_qnorm_rope and not _cp_enabled:
+        if _use_lightop_qnorm_rope and not _cp_enabled and not _bf16_kv_cache:
             # Fused kernel: Q no-weight RMSNorm + Q RoPE + KV RMSNorm +
             # K RoPE + K FP8 quant + cache insert.
             pool = forward_batch.token_to_kv_pool
@@ -669,6 +670,7 @@ class MQALayer(nn.Module):
             and not _cp_enabled
             and _is_dcu
             and not enable_multi_stream
+            and not forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
         )
         _cache_already_written = (
             enable_multi_stream
