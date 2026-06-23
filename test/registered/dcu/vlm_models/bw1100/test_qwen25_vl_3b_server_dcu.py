@@ -21,6 +21,10 @@ register_dcu_ci(est_time=1800, suite="stage-b-test-1-gpu-small-dcu")
 DEFAULT_QWEN25_VL_3B_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 
+def _default_vlm_args() -> list[str]:
+    return DCU_VLM_SERVER_ARGS + ["--disable-cuda-graph"]
+
+
 class TestBW1100Qwen25VLThreeBServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -35,7 +39,7 @@ class TestBW1100Qwen25VLThreeBServerDCU(unittest.TestCase):
             timeout=get_int_env("SGLANG_DCU_QWEN25_VL_3B_TIMEOUT", 1800),
             api_key=cls.api_key,
             other_args=get_server_args(
-                "SGLANG_DCU_VLM_SERVER_ARGS", DCU_VLM_SERVER_ARGS
+                "SGLANG_DCU_VLM_SERVER_ARGS", _default_vlm_args()
             ),
         )
 
