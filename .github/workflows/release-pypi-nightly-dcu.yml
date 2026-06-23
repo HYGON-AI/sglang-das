@@ -30,7 +30,7 @@ on:
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
         required: false
-        default: true
+        default: false
         type: boolean
 
   # ---- 手动触发，可传参 ----
@@ -44,7 +44,7 @@ on:
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
         required: false
-        default: true
+        default: false
         type: boolean
 
 jobs:
