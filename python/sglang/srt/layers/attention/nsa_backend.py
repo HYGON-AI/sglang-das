@@ -1765,7 +1765,10 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
+        if not _is_dcu:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd 
+        else:
+            from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
@@ -1816,7 +1819,10 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from flash_mla.flash_mla_interface import flash_mla_with_kvcache
+        if not _is_dcu:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        else:
+            from flash_mla.flash_mla_interface import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
@@ -2314,7 +2320,10 @@ class NativeSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from flash_mla.flash_mla_interface import get_mla_metadata
+        if not _is_dcu:
+            from sgl_kernel.flash_mla import get_mla_metadata
+        else:
+            from flash_mla.flash_mla_interface import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
