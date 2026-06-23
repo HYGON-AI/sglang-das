@@ -463,7 +463,8 @@ class C4IndexerBackendMixin:
                 indexer_metadata.topk_metadata,
             )
         else:
-            topk_transform_512(
+            from lightop import topk_transform_512 as lightop_topk_transform_512
+            lightop_topk_transform_512(
                 logits,
                 indexer_metadata.c4_seq_lens,
                 core_metadata.page_table,
