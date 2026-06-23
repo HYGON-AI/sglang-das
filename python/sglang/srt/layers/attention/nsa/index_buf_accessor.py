@@ -440,7 +440,12 @@ def _set_k_and_s_triton(
     assert index_head_dim == 128
     assert scale_dim == 1
     if _is_hip and not _is_dcu:
-        assert page_size == 1
+        if _use_aiter_preshuffle:
+            assert (
+                page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+        else:
+            assert page_size == 1
     else:
         assert page_size == 64
 

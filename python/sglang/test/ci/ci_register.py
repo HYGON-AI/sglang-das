@@ -32,6 +32,7 @@ class HWBackend(Enum):
     AMD = auto()
     NPU = auto()
     DCU = auto()
+    XPU = auto()
 
 
 @dataclass
@@ -116,6 +117,15 @@ def register_dcu_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for DCU CI registration (parsed via AST; runtime no-op)."""
+
+
+def register_xpu_ci(
+    est_time: float,
+    suite: str,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+):
+    """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
 
@@ -125,6 +135,7 @@ REGISTER_MAPPING = {
     "register_amd_ci": HWBackend.AMD,
     "register_npu_ci": HWBackend.NPU,
     "register_dcu_ci": HWBackend.DCU,
+    "register_xpu_ci": HWBackend.XPU,
 }
 
 
