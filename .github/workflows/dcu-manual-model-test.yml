@@ -1,0 +1,335 @@
+name: Manual DCU Unattended Model Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_branch:
+        description: "Git ref, branch, tag, or SHA to test. Empty uses the ref selected when starting the workflow."
+        required: false
+        type: string
+        default: ""
+      suite:
+        description: "DCU model suite. Empty defaults to nightly-dcu-accuracy."
+        required: false
+        type: string
+        default: ""
+      include_file:
+        description: "Optional single registered test file to run, relative to repo root or test/."
+        required: false
+        type: string
+        default: ""
+      model_name:
+        description: "Optional model/path for tests that honor SGLANG_TEST_DEFAULT_MODEL_NAME. TODO: add per-suite model filtering when run_suite.py supports it."
+        required: false
+        type: string
+        default: ""
+      timeout_per_file:
+        description: "Timeout per test file in seconds."
+        required: false
+        type: string
+        default: "4200"
+      auto_partition_id:
+        description: "Optional 0-based partition id. Must be set together with auto_partition_size."
+        required: false
+        type: string
+        default: ""
+      auto_partition_size:
+        description: "Optional partition count. Must be set together with auto_partition_id."
+        required: false
+        type: string
+        default: ""
+      continue_on_error:
+        description: "Ask run_suite.py to keep running files after a failure. The workflow still fails if tests fail."
+        required: false
+        type: boolean
+        default: true
+      runner_label:
+        description: "DCU runner label. Empty uses vars.DCU_CI_RUNNER_LABEL, then dcu-ci-pr-2."
+        required: false
+        type: string
+        default: ""
+      container_name:
+        description: "CI container name. Empty uses a per-run ci_sglang_dcu_manual_* name."
+        required: false
+        type: string
+        default: ""
+      image:
+        description: "DCU CI Docker image."
+        required: false
+        type: string
+        default: "10.16.1.152:5000/jenkins/model_test_env/sglang:latest"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dcu-manual-model-test-${{ github.ref_name }}-${{ inputs.test_branch || 'selected-ref' }}-${{ inputs.suite || 'nightly-dcu-accuracy' }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_DCU_MODEL_SUITE: nightly-dcu-accuracy
+  DEFAULT_DCU_CI_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:latest
+
+jobs:
+  manual-dcu-model-test:
+    name: Manual DCU model validation
+    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
+    timeout-minutes: 720
+    env:
+      SELECTED_RUNNER_LABEL: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
+      INPUT_TEST_BRANCH: ${{ inputs.test_branch || '' }}
+      INPUT_SUITE: ${{ inputs.suite || '' }}
+      INPUT_INCLUDE_FILE: ${{ inputs.include_file || '' }}
+      INPUT_MODEL_NAME: ${{ inputs.model_name || '' }}
+      INPUT_TIMEOUT_PER_FILE: ${{ inputs.timeout_per_file || '4200' }}
+      INPUT_AUTO_PARTITION_ID: ${{ inputs.auto_partition_id || '' }}
+      INPUT_AUTO_PARTITION_SIZE: ${{ inputs.auto_partition_size || '' }}
+      INPUT_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+      INPUT_CONTAINER_NAME: ${{ inputs.container_name || '' }}
+      INPUT_IMAGE: ${{ inputs.image || '' }}
+      VAR_DCU_CI_IMAGE: ${{ vars.DCU_CI_IMAGE || '' }}
+      DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
+      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
+    steps:
+      - name: Resolve manual DCU configuration
+        id: config
+        run: |
+          set -euo pipefail
+
+          checkout_ref="${INPUT_TEST_BRANCH:-${GITHUB_REF}}"
+          suite="${INPUT_SUITE:-${DEFAULT_DCU_MODEL_SUITE}}"
+          image="${INPUT_IMAGE:-${VAR_DCU_CI_IMAGE:-${DEFAULT_DCU_CI_IMAGE}}}"
+          container_name="${INPUT_CONTAINER_NAME:-ci_sglang_dcu_manual_${GITHUB_RUN_ID}}"
+          timeout_per_file="${INPUT_TIMEOUT_PER_FILE:-4200}"
+          log_dir="${RUNNER_TEMP}/dcu-manual-model-test-${GITHUB_RUN_ID}-logs"
+
+          if [[ ! "${timeout_per_file}" =~ ^[0-9]+$ ]]; then
+            echo "::error::timeout_per_file must be a positive integer, got '${timeout_per_file}'."
+            exit 1
+          fi
+          if [[ "${timeout_per_file}" -le 0 ]]; then
+            echo "::error::timeout_per_file must be a positive integer, got '${timeout_per_file}'."
+            exit 1
+          fi
+
+          if [[ -n "${INPUT_AUTO_PARTITION_ID}" || -n "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
+            if [[ -z "${INPUT_AUTO_PARTITION_ID}" || -z "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
+              echo "::error::auto_partition_id and auto_partition_size must be specified together."
+              exit 1
+            fi
+            if [[ ! "${INPUT_AUTO_PARTITION_ID}" =~ ^[0-9]+$ || ! "${INPUT_AUTO_PARTITION_SIZE}" =~ ^[0-9]+$ ]]; then
+              echo "::error::auto_partition_id and auto_partition_size must be non-negative integers."
+              exit 1
+            fi
+            if [[ "${INPUT_AUTO_PARTITION_SIZE}" -le 0 || "${INPUT_AUTO_PARTITION_ID}" -ge "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
+              echo "::error::auto_partition_id must be in [0, auto_partition_size)."
+              exit 1
+            fi
+          fi
+
+          nightly_flag=""
+          if [[ "${suite}" == nightly-dcu* ]]; then
+            nightly_flag="--nightly"
+          fi
+
+          mkdir -p "${log_dir}"
+
+          {
+            echo "checkout_ref=${checkout_ref}"
+            echo "suite=${suite}"
+            echo "image=${image}"
+            echo "container_name=${container_name}"
+            echo "timeout_per_file=${timeout_per_file}"
+            echo "nightly_flag=${nightly_flag}"
+            echo "log_dir=${log_dir}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "DCU_CI_IMAGE=${image}"
+            echo "DCU_CI_CONTAINER_NAME=${container_name}"
+            echo "DCU_MANUAL_LOG_DIR=${log_dir}"
+            echo "DCU_MANUAL_SUITE=${suite}"
+            echo "DCU_MANUAL_NIGHTLY_FLAG=${nightly_flag}"
+            echo "DCU_MANUAL_TIMEOUT_PER_FILE=${timeout_per_file}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Checkout selected ref
+        env:
+          CHECKOUT_REF: ${{ steps.config.outputs.checkout_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-manual-model-test"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
+
+          checked_sha="$(git rev-parse HEAD)"
+          echo "DCU_MANUAL_CHECKED_SHA=${checked_sha}" >> "${GITHUB_ENV}"
+          echo "Checked out ${CHECKOUT_REF} -> ${checked_sha}"
+
+      - name: Write manual test summary
+        run: |
+          set -euo pipefail
+          summary="${DCU_MANUAL_LOG_DIR}/summary.md"
+          partition="full"
+          if [[ -n "${INPUT_AUTO_PARTITION_ID}" && -n "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
+            partition="${INPUT_AUTO_PARTITION_ID}/${INPUT_AUTO_PARTITION_SIZE}"
+          fi
+          model_note="${INPUT_MODEL_NAME:-not set}"
+          if [[ -n "${INPUT_MODEL_NAME}" ]]; then
+            model_note="${INPUT_MODEL_NAME} (passed as SGLANG_TEST_DEFAULT_MODEL_NAME; TODO: add run_suite.py model filter when supported)"
+          fi
+
+          {
+            echo "## Manual DCU Unattended Model Test"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Ref | \`${{ steps.config.outputs.checkout_ref }}\` |"
+            echo "| Commit | \`${DCU_MANUAL_CHECKED_SHA}\` |"
+            echo "| Runner label | \`${SELECTED_RUNNER_LABEL}\` |"
+            echo "| Container | \`${DCU_CI_CONTAINER_NAME}\` |"
+            echo "| Image | \`${DCU_CI_IMAGE}\` |"
+            echo "| Suite | \`${DCU_MANUAL_SUITE}\` |"
+            echo "| Nightly mode | \`${DCU_MANUAL_NIGHTLY_FLAG:-false}\` |"
+            echo "| Include file | \`${INPUT_INCLUDE_FILE:-not set}\` |"
+            echo "| Model name | \`${model_note}\` |"
+            echo "| Timeout per file | \`${DCU_MANUAL_TIMEOUT_PER_FILE}\` |"
+            echo "| Partition | \`${partition}\` |"
+            echo "| Continue on error | \`${INPUT_CONTINUE_ON_ERROR}\` |"
+            echo ""
+            echo "Artifacts from this run are uploaded as \`dcu-manual-model-test-${GITHUB_RUN_ID}\`."
+          } | tee "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Setup DCU container
+        run: |
+          set -euo pipefail
+          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
+              --image "${DCU_CI_IMAGE}" \
+              --container-name "${DCU_CI_CONTAINER_NAME}"
+
+      - name: Install dependencies
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
+
+      - name: Run manual DCU model suite
+        id: test
+        run: |
+          set -euo pipefail
+
+          run_suite_cmd=(
+            python3 run_suite.py
+            --hw dcu
+            --suite "${DCU_MANUAL_SUITE}"
+            --timeout-per-file "${DCU_MANUAL_TIMEOUT_PER_FILE}"
+          )
+
+          if [[ -n "${DCU_MANUAL_NIGHTLY_FLAG}" ]]; then
+            run_suite_cmd+=("${DCU_MANUAL_NIGHTLY_FLAG}")
+          fi
+
+          if [[ "${INPUT_CONTINUE_ON_ERROR}" == "true" ]]; then
+            run_suite_cmd+=(--continue-on-error)
+          fi
+
+          if [[ -n "${INPUT_INCLUDE_FILE}" ]]; then
+            run_suite_cmd+=(--include-file "${INPUT_INCLUDE_FILE}")
+          fi
+
+          if [[ -n "${INPUT_AUTO_PARTITION_ID}" && -n "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
+            run_suite_cmd+=(--auto-partition-id "${INPUT_AUTO_PARTITION_ID}")
+            run_suite_cmd+=(--auto-partition-size "${INPUT_AUTO_PARTITION_SIZE}")
+          fi
+
+          exec_cmd=(
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh"
+            --container-name "${DCU_CI_CONTAINER_NAME}"
+            -w /sglang-checkout/test
+          )
+
+          if [[ -n "${INPUT_MODEL_NAME}" ]]; then
+            exec_cmd+=(-e "SGLANG_TEST_DEFAULT_MODEL_NAME=${INPUT_MODEL_NAME}")
+          fi
+
+          exec_cmd+=(-- "${run_suite_cmd[@]}")
+
+          {
+            printf '%q ' "${exec_cmd[@]}"
+            echo
+          } | tee "${DCU_MANUAL_LOG_DIR}/command.txt"
+
+          {
+            echo ""
+            echo "### Final Command"
+            echo ""
+            echo '```bash'
+            cat "${DCU_MANUAL_LOG_DIR}/command.txt"
+            echo '```'
+            echo ""
+          } | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "===== Manual DCU unattended model test configuration ====="
+          echo "ref=${{ steps.config.outputs.checkout_ref }}"
+          echo "commit=${DCU_MANUAL_CHECKED_SHA}"
+          echo "runner_label=${SELECTED_RUNNER_LABEL}"
+          echo "container_name=${DCU_CI_CONTAINER_NAME}"
+          echo "image=${DCU_CI_IMAGE}"
+          echo "suite=${DCU_MANUAL_SUITE}"
+          echo "include_file=${INPUT_INCLUDE_FILE:-}"
+          echo "model_name=${INPUT_MODEL_NAME:-}"
+          echo "timeout_per_file=${DCU_MANUAL_TIMEOUT_PER_FILE}"
+          echo "auto_partition_id=${INPUT_AUTO_PARTITION_ID:-}"
+          echo "auto_partition_size=${INPUT_AUTO_PARTITION_SIZE:-}"
+          echo "continue_on_error=${INPUT_CONTINUE_ON_ERROR}"
+          echo "========================================================="
+
+          set +e
+          "${exec_cmd[@]}" 2>&1 | tee "${DCU_MANUAL_LOG_DIR}/run.log"
+          test_exit=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${test_exit}" >> "${GITHUB_OUTPUT}"
+          if [[ "${test_exit}" -eq 0 ]]; then
+            echo "result=success" >> "${GITHUB_OUTPUT}"
+            echo "**Result:** success" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "result=failure" >> "${GITHUB_OUTPUT}"
+            echo "**Result:** failure, exit code ${test_exit}" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          exit "${test_exit}"
+
+      - name: Cleanup DCU container
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${DCU_CI_CHECKOUT_DIR:-}" && -f "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh" ]]; then
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+          else
+            echo "DCU checkout directory is unavailable; skipping container cleanup."
+          fi
+
+      - name: Upload manual DCU model test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcu-manual-model-test-${{ github.run_id }}
+          path: ${{ env.DCU_MANUAL_LOG_DIR }}
+          if-no-files-found: warn

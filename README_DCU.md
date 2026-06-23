@@ -57,6 +57,16 @@ pip install -e "python[all_hip]" --no-deps --no-build-isolation --no-index
 ## 验证
 - python -c "import sglang; print(sglang.\_\_version__)",
 
+## 手动无人值守大模型测试
+
+仓库提供独立 workflow `Manual DCU Unattended Model Test`（文件：`.github/workflows/dcu-manual-model-test.yml`），用于在 DCU runner 上手动启动长时间模型验证任务。它只支持 `workflow_dispatch`，不会在 `pull_request`、`push` 或 `schedule` 时自动触发，因此不属于 PR gate。
+
+使用方式：进入 GitHub Actions，选择 `Manual DCU Unattended Model Test`，点击 `Run workflow`。GitHub 页面上的分支下拉框决定默认测试 ref；也可以通过 `test_branch` 输入分支、tag、ref 或 SHA 覆盖。默认 suite 为 `nightly-dcu-accuracy`，可通过 `suite` 改成 `nightly-dcu`、`nightly-dcu-vlm`、`nightly-dcu-4-gpu` 等已注册 DCU suite。若只跑单个文件，填写 `include_file`，例如 `test/registered/dcu/accuracy/bw1100/test_gsm8k_eval_dcu.py`。
+
+常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 DCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 当前会传给支持全局默认模型变量的测试（`SGLANG_TEST_DEFAULT_MODEL_NAME`）；`run_suite.py` 尚无 `--model-name` 过滤参数，后续如需要按模型精确筛选，应在 runner 或测试注册层补充正式能力。
+
+运行结束后，可在 workflow 日志中查看测试 ref、runner label、容器名、suite、include_file、model_name、timeout、分片配置和最终执行命令。job summary 会展示本次配置和结果；artifact `dcu-manual-model-test-<run_id>` 会上传 `summary.md`、最终命令和 `run.log`。
+
 ## PD 分离
 
 ### Requirements
