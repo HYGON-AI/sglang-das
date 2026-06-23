@@ -1,5 +1,8 @@
 name: Release DCU Nightly Wheels
 
+permissions:
+  contents: read
+
 on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
   push:
@@ -10,7 +13,25 @@ on:
       - 'sgl-kernel/**'
       - 'sgl-model-gateway/**'
       - 'requirements_dcu.txt'
-      - '.github/workflows/release-pypi-nightky-dcu.yml'
+      - '.github/workflows/release-pypi-nightly-dcu.yml'
+
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref, branch, tag, or SHA to build'
+        required: false
+        default: ''
+        type: string
+      torch_version:
+        description: 'PyTorch version to install'
+        required: false
+        default: '2.10.0'
+        type: string
+      skip_gateway:
+        description: 'Skip sgl-model-gateway build'
+        required: false
+        default: true
+        type: boolean
 
   # ---- 手动触发，可传参 ----
   workflow_dispatch:
@@ -23,7 +44,7 @@ on:
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
         required: false
-        default: false
+        default: true
         type: boolean
 
 jobs:
@@ -53,10 +74,11 @@ jobs:
 
     env:
       TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
-      SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
+      SKIP_GATEWAY: ${{ inputs.skip_gateway != false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
+      WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
 
     steps:
       # =======================================================================
@@ -65,7 +87,14 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
+
+      - name: Resolve wheel commit SHA
+        run: |
+          WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
+          echo "WHEEL_COMMIT_SHA=${WHEEL_COMMIT_SHA}" >> "${GITHUB_ENV}"
+          echo "Building DCU wheels for ${WHEEL_COMMIT_SHA}"
 
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
@@ -129,7 +158,6 @@ jobs:
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
-        if: steps.changes.outputs.sgl-kernel == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           source /opt/dtk/env.sh
           cd sgl-kernel && python setup_hip.py bdist_wheel
@@ -150,7 +178,7 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Build sgl-model-gateway
-        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch') }}
+        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') }}
         run: |
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
@@ -171,7 +199,7 @@ jobs:
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=6 HEAD)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
