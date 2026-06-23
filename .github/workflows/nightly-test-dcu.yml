@@ -3,10 +3,6 @@ name: Nightly Test (DCU)
 on:
   schedule:
     - cron: "30 18 * * *" # 02:30 Beijing Time daily
-  pull_request:
-    paths:
-      - ".github/workflows/nightly-test-dcu.yml"
-      - ".github/workflows/release-pypi-nightly-dcu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -110,7 +106,7 @@ jobs:
           fi
 
           wheel_mode="false"
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" || "${GITHUB_EVENT_NAME}" == "pull_request" || "${force_wheel_mode}" == "true" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" || "${force_wheel_mode}" == "true" ]]; then
             wheel_mode="true"
           fi
 
