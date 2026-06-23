@@ -25,7 +25,7 @@ register_dcu_ci(
 
 register_cuda_ci(
     est_time=9,
-    stage="stage-b",
+    stage="base-b",
     runner_config="1-gpu-small",
     disabled="Test uses pytest-style function without TestCase class - see #17145",
 )

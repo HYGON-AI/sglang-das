@@ -23,7 +23,7 @@ register_dcu_ci(est_time=5, suite="stage-b-test-1-gpu-small-dcu")
 
 
 # CPU-based unit test, runs quickly on any GPU runner
-register_cuda_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 import random

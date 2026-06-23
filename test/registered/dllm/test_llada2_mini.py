@@ -6,7 +6,7 @@ register_dcu_ci(
 )
 
 
-register_cuda_ci(est_time=139, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=139, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest

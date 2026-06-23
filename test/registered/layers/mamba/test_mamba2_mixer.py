@@ -26,7 +26,7 @@ register_dcu_ci(
 )
 
 
-register_cuda_ci(est_time=32, stage="stage-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=32, stage="base-b", runner_config="2-gpu-large")
 
 NUM_GPUS = 2
 

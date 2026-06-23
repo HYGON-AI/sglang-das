@@ -252,7 +252,7 @@ def compute_dp_attention_world_info(
         # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
         attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
 
-    return attn_tp_rank, attn_tp_size, attn_dp_rank
+    return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
 def compute_dp_attention_local_info(
@@ -288,7 +288,7 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(

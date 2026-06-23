@@ -21,7 +21,7 @@ register_dcu_ci(
 
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=32, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=32, stage="base-b", runner_config="1-gpu-large")
 
 
 class AsyncEngine(Engine):

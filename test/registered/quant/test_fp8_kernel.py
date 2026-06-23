@@ -18,7 +18,7 @@ register_dcu_ci(
 
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
 

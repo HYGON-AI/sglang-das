@@ -15,7 +15,7 @@ register_dcu_ci(
 )
 
 
-register_cuda_ci(est_time=15, stage="stage-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
