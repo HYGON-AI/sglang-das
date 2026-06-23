@@ -875,7 +875,7 @@ jobs:
             exit 1
           fi
 
-          python3 -m pip install ciupload
+          python3 -m pip install wheel ciupload
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           CIUpload \
             --devpi_url "${DCU_CI_PROMOTE_DEVPI_URL}" \
