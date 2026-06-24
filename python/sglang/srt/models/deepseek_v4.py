@@ -15,7 +15,6 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_rope,
-    rmsnorm_self,
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
@@ -329,7 +328,6 @@ class MQALayer(nn.Module):
                 prefix=add_prefix("wkv", prefix),
             )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
-        self.use_jit_norm = False
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -594,13 +592,10 @@ class MQALayer(nn.Module):
                 )
             else:
                 kv = self.kv_norm(kv)
-                if self.use_jit_norm:
-                    q = rmsnorm_self(q, self.eps)
+                if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+                    op.rms_norm_no_weight(None, q, None, self.eps)
                 else:
-                    if _is_dcu and _use_dpskv4_lightop_rmsnorm:
-                        op.rms_norm_no_weight(None, q, None, self.eps)
-                    else:
-                        q = rms_normalize_triton(q, self.eps)
+                    q = rms_normalize_triton(q, self.eps)
 
                 fused_rope(
                     q[..., -self.qk_rope_head_dim :],

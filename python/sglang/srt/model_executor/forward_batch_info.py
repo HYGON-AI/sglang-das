@@ -635,13 +635,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            assert isinstance(batch.extend_seq_lens, list)
-            assert isinstance(batch.extend_prefix_lens, list)
+            assert isinstance(batch.extend_lens, list)
+            assert isinstance(batch.prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
+                batch.extend_lens, dtype=torch.int32
             ).pin_memory().to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
+                batch.prefix_lens, dtype=torch.int32
             ).pin_memory().to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
