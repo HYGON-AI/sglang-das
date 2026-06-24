@@ -615,19 +615,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         has_swa = swa_indices > 0
         free_index = free_index[has_swa]
-        swa_indices = swa_indices[has_swa]
-        if swa_indices.numel() > 0:
-            self.swa_attn_allocator.free(swa_indices)
+        swa_indices_valid = swa_indices[has_swa]
+        if swa_indices_valid.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices_valid)
             freed_swa_pages = torch.unique(
-                swa_indices // self.swa_attn_allocator.page_size
+                swa_indices_valid // self.swa_attn_allocator.page_size
             )
             all_swa = self.full_to_swa_index_mapping
             all_swa_pages = all_swa // self.swa_attn_allocator.page_size
             stale = torch.isin(all_swa_pages, freed_swa_pages) & (all_swa > 0)
             if stale.any():
                 self.full_to_swa_index_mapping[stale] = 0
-        else:
-            self.full_to_swa_index_mapping[free_index] = 0
+        self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
         return [
