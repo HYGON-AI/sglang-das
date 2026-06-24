@@ -6,18 +6,9 @@ permissions:
 
 on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
-  # push:
-  #   branches:
-  #     - v0.5.12_dev
-  #   paths:
-  #     - 'python/**'
-  #     - 'sgl-kernel/**'
-  #     - 'sgl-model-gateway/**'
-  #     - 'requirements_dcu.txt'
-  #     - '.github/workflows/release-pypi-nightly-dcu.yml'
-
-  # TODO: remove after testing
-  pull_request:
+  push:
+    branches:
+      - v0.5.12_dev
     paths:
       - 'python/**'
       - 'sgl-kernel/**'
@@ -219,5 +210,5 @@ jobs:
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
-          # CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
           rm -rf /home/github/sgl_whl_temp/HYGON-AI_dcu-sglang/* || true
