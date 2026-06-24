@@ -411,8 +411,8 @@ class Compressor(nn.Module):
             is_paged=True,
         )
 
-
-if _is_hip:
+# TODO: compatibility impl for dsv4 backend on HIP
+if _is_hip and not _is_dcu:
     from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
         CompressorHip as Compressor,
     )

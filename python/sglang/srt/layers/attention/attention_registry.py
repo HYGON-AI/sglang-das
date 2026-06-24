@@ -105,9 +105,10 @@ def create_nsa_backend(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    from sglang.srt.utils import is_hip
+    # TODO: compatibility impl for dsv4 backend on HIP
+    from sglang.srt.utils import is_hip, is_dcu
 
-    if is_hip():
+    if is_hip() and not is_dcu():
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DeepseekV4HipRadixBackend,
         )
