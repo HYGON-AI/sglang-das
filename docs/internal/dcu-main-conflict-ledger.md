@@ -5,60 +5,99 @@ up with official SGLang `main`.
 
 ## Status Legend
 
-| Status | Meaning |
-|---|---|
-| `open` | Conflict exists or owner decision is pending |
-| `merged` | Conflict resolution has been committed to the checkpoint branch |
-| `validated` | Required validation passed |
-| `waived` | Validation or issue is explicitly waived with reason |
+
+| Status      | Meaning                                                         |
+| ----------- | --------------------------------------------------------------- |
+| `open`      | Conflict exists or owner decision is pending                    |
+| `merged`    | Conflict resolution has been committed to the checkpoint branch |
+| `validated` | Required validation passed                                      |
+| `waived`    | Validation or issue is explicitly waived with reason            |
 
 ## Strategy Legend
 
-| Strategy | Meaning |
-|---|---|
-| `ours` | Keep DCU-side implementation |
-| `theirs` | Take official implementation |
-| `manual merge` | Combine both sides manually |
-| `drop DCU patch` | Remove DCU patch because official code supersedes it |
+
+| Strategy          | Meaning                                                |
+| ----------------- | ------------------------------------------------------ |
+| `ours`            | Keep DCU-side implementation                           |
+| `theirs`          | Take official implementation                           |
+| `manual merge`    | Combine both sides manually                            |
+| `drop DCU patch`  | Remove DCU patch because official code supersedes it   |
 | `port to new API` | Re-implement DCU behavior on top of official interface |
+
+## Validation Recording Rule
+
+The `Validation` column records completed mechanical or CI checks. Developer
+owners should choose the concrete runtime commands for their area and fill the
+manual result in the checkpoint notes.
+
+Recommended format for manual validation results:
+
+```text
+Manual validation result:
+- <area>: <passed / failed / waived>, command or CI job: <...>, evidence: <log / run id / issue>
+```
+
+## Recommended Validation Matrix
+
+These are validation recommendations, not fixed commands. Use the closest
+available internal CI, local model path, or targeted reproducer, then record the
+actual result in the checkpoint note.
+
+
+| Area                                 | Recommended validation content                                                                                                            |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `ci` / `test`                        | CI registration scan, workflow dry-run if available, PR label/rerun flow, suite partition generation, DCU runner/image selection          |
+| `dependency`                         | DCU install flow, wheel build/import check, CUDA-only dependency leakage check,`pip` resolver sanity in the target container              |
+| `env` / `server_args`                | CLI parse smoke, env var default/value override check, affected model auto-backend selection                                              |
+| `mem_cache`                          | Radix/cache unit or smoke, CPU offload if touched, DCU FA KV layout path, SWA/hybrid cache path if touched                                |
+| `scheduler` / `model_executor`       | Stage-a/stage-b scheduler smoke, split prefill, pipeline-parallel smoke, forward-batch init, request abort/retract if touched             |
+| `attention`                          | Qwen dense smoke, FlashMLA smoke, DSV4 attention smoke, NSA/topk/index-cache smoke, sparse prefill/chunking if touched                    |
+| `jit-kernel` / `sgl-kernel`          | targeted kernel compile/import, kernel unit or smoke whitelist, DSV4 JIT smoke, deleted-file reference scan                               |
+| `quantization`                       | FP8/W8A8/W4A8/MXFP4 targeted smoke, AITER shuffle path if touched, quantized MoE smoke, accuracy spot check if weights change             |
+| `moe`                                | Qwen3 MoE smoke, EP/TP combination smoke, DeepEP normal and low-latency paths, AITER path, groupgemm/marlin path if touched               |
+| `deepep`                             | DeepEP small and large smoke, normal dispatch and low-latency dispatch, topk/dispatch/combine compatibility, BF16/FP8 dispatch mode check |
+| `aiter`                              | AITER import/init, W8A8/W16A16 MoE path, custom allreduce if related, eager and cuda-graph path if graph behavior is touched              |
+| `model` / `deepseek` / `deepseek-v4` | DeepSeek V2/V3/V4 startup, short request, MTP/NextN if touched, FP8/FP4 checkpoint path, DSV4 JIT and attention path                      |
+| `speculative`                        | EAGLE/EAGLE3/MTP/frozen-KV smoke, draft/target worker path, idle batch path, cuda graph draft path if touched                             |
 
 ## Active Conflict Board
 
-| Checkpoint | Merge branch | Conflict file | Area | Owner | Strategy | Reason | Risk | Validation | Follow-up | Status |
-|---|---|---|---|---|---|---|---|---|---|---|
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `.github/workflows/_pr-test-stage.yml` | ci | Codex | theirs | Official renamed `check-stage-health` to `check-pr-test-health`; this is a pure workflow action rename | low | precise marker scan passed; DCU registration passed | None | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `.github/workflows/pr-states.yml` | ci | Codex | manual merge | Keep official `workflow_run` PR lookup and preserve DCU `/rerun-failed-ci` stale-run wording | low | precise marker scan passed; DCU registration passed | Verify real GitHub workflow behavior in CI dry-run | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/environ.py` | env | Codex | manual merge | Keep both DCU `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` and official `SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN` env switches | low | syntax compile passed; DCU registration passed | None | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/mem_cache/memory_pool.py` | mem_cache | Codex | manual merge | Preserve DCU FA KV layout copy/load while taking official `current_platform.synchronize()` | medium | syntax compile passed; DCU registration passed | Add CPU-offload smoke on DCU FA layout when CI command is available | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/managers/scheduler_pp_mixin.py` | scheduler | Codex | manual merge | Combine official `hc_hidden_size` fallback with DCU proxy hidden-state shape helper | medium | syntax compile passed; DCU registration passed | Pipeline-parallel smoke if available | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `test/registered/tokenizer/test_multi_detokenizer.py` | test | Codex | theirs | Official C01 renames CUDA suite from `stage-b-*` to `base-b-*`; AMD registration remains from DCU tree | low | syntax compile passed; DCU registration passed | None | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/moe/ep_moe/layer.py` | moe | Codex | ours | High-risk official MoE runner restructuring overlaps DCU DeepEP/AITER paths; preserve known DCU runtime for C01 | high | syntax compile passed; DCU registration passed | Owner should port official runner-core changes onto DCU path in later checkpoint | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/moe/moe_runner/aiter.py` | aiter | Codex | ours | Official AITER runner refactor conflicts with DCU W8A8/W16A16 handling; avoid semantic rewrite in first checkpoint | high | syntax compile passed; DCU registration passed | Create dedicated AITER merge task before enabling official runner-core behavior | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/quantization/unquant.py` | quantization | Codex | ours | Conflict is inside MoE execution fallback; keep DCU behavior until AITER/MoE owner ports official path | high | syntax compile passed; DCU registration passed | Revisit together with `moe_runner/aiter.py` | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/models/deepseek_v2.py` | model | Codex | ours | DeepSeek forward path overlaps DCU fused RMS/quant behavior; preserve current DCU model path in C01 | high | syntax compile passed; DCU registration passed | Run DeepSeek V2/V3 smoke after C01; port official output-buffer context if needed | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/models/deepseek_v4.py` | model | Codex | ours | DeepSeek V4 has many DCU-specific imports/kernels and official changes are not safe to fold blindly | high | syntax compile passed; DCU registration passed | DSV4 owner should review skipped official C01 hunks before C02/C03 | validated |
-| C01 / `c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/server_args.py` | server_args | Codex | ours | Preserve DCU speculative-algorithm alias helper; official side did not supersede it in C01 | medium | syntax compile passed; DCU registration passed | Confirm Gemma4 assistant draft CLI path still works if used internally | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `.github/workflows/pr-states.yml` | ci | Codex | manual merge | Keep official run status icon/link behavior and preserve DCU `/rerun-failed-ci` stale-run wording | low | marker scan passed; targeted compile passed; DCU registration passed | Verify real GitHub workflow behavior in CI dry-run | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/pyproject.toml` | dependency | Codex | ours | Avoid adding unconditional CUDA `flashinfer_python[cu13]` and `flashinfer_cubin` dependencies to DCU install path | medium | marker scan passed; targeted compile passed; DCU registration passed | Revisit with CUDA/Docker owner if internal main must match official CUDA dependency set exactly | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/csrc/deepseek_v4/rmsnorm.cuh` | jit-kernel | Codex | theirs | File was deleted upstream and no current tree references remained | medium | marker scan passed; targeted compile passed; DCU registration passed | None | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/csrc/deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh` | jit-kernel | Codex | theirs | File was deleted upstream and no current tree references remained | medium | marker scan passed; targeted compile passed; DCU registration passed | None | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/deepseek_v4.py` | jit-kernel | Codex | manual merge | Keep DCU BLASLt env path while adding official HIP/AITER imports and guard | medium | marker scan passed; targeted compile passed; DCU registration passed | DSV4 JIT smoke on DCU | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/dsv4/indexer.py` | attention | Codex | manual merge | Use official dynamic TOPK from output shape instead of fixed 512 | low | marker scan passed; targeted compile passed; DCU registration passed | DSV4 sparse prefill/topk smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/flashmla_backend.py` | attention | Codex | theirs | Official tuple-style forward mode check is equivalent and cleaner | low | marker scan passed; targeted compile passed; DCU registration passed | FlashMLA/DSV4 smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/nsa/index_buf_accessor.py` | attention | Codex | manual merge | Preserve DCU page-size 64 assertion while accepting official HIP preshuffle page-size check for non-DCU HIP | medium | marker scan passed; targeted compile passed; DCU registration passed | NSA/DCU index cache smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/nsa/nsa_indexer.py` | attention | Codex | manual merge | Preserve DCU BF16 index-cache path and adopt official `device_index` budget API | high | marker scan passed; targeted compile passed; DCU registration passed | NSA topk/chunking smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/ep_moe/layer.py` | moe | Codex | ours | Official low-latency MoE runner updates overlap DCU AITER/DeepEP/groupgemm paths; keep known DCU implementation for C02 | high | marker scan passed; targeted compile passed; DCU registration passed | Dedicated MoE owner should port official C02 hunks separately | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` | deepep | Codex | ours | Official DeepEP dispatcher API changes conflict with DCU quantized dispatch and low-latency dispatch parameters | high | marker scan passed; targeted compile passed; DCU registration passed | Confirm topk, BF16 dispatch, and low-latency dispatch compatibility before later checkpoints | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/quantization/fp8.py` | quantization | Codex | ours | Preserve DCU AITER/ASM FP8 MoE shuffle behavior; official shuffle path is CUDA/HIP-generic and needs DCU review | high | marker scan passed; targeted compile passed; DCU registration passed | Review with AITER/MoE owner | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/managers/tp_worker.py` | scheduler | Codex | theirs | Official fix avoids undefined `model_worker_batch` in split prefill sampling | low | marker scan passed; targeted compile passed; DCU registration passed | Split-prefill smoke if available | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/model_executor/forward_batch_info.py` | model_executor | Codex | ours | Preserve current DCU pinned-memory construction for extend lengths | medium | marker scan passed; targeted compile passed; DCU registration passed | Forward batch init smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/models/deepseek_v4.py` | model | Codex | manual merge | Keep DCU FP8 WO-A GEMM shape compatibility and add official `ceil_to_ue8m0` scale conversion / rotary import | high | marker scan passed; targeted compile passed; DCU registration passed | DeepSeek V4 startup and short request smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/server_args.py` | server_args | Codex | theirs | Official Gemma4 backend selection supports causal and conditional arch plus split backend validation | low | marker scan passed; targeted compile passed; DCU registration passed | Server args unit smoke | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/speculative/eagle_worker_v2.py` | speculative | Codex | theirs | Official side fixes stale `model_worker_batch` references to use `batch` | medium | marker scan passed; targeted compile passed; DCU registration passed | EAGLE/MTP smoke if available | validated |
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/test/ci/ci_register.py` | ci | Codex | manual merge | Keep DCU backend/marker and add official XPU backend/marker | low | marker scan passed; targeted compile passed; DCU registration passed | DCU registration script | validated |
-| C07 / `a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py` | attention | TBD | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available | high | Qwen dense plus DSV4 smoke | Assign attention owner | open |
-| C10 / `47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml` | ci | TBD | manual merge | Keep official workflow structure and DCU runner/wheel overlays | medium | CI dry-run and DCU registration check | Fill exact runner/image validation command | open |
-| C13 / `125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**` | sgl-kernel | TBD | manual merge | sgl-kernel interfaces and DCU/HIP glue both changed | high | sgl-kernel DCU smoke whitelist | Assign kernel owner | open |
+
+| Checkpoint          | Merge branch                      | Conflict file                                                                      | Area           | Owner | Strategy        | Reason                                                                                                                  | Risk   | Validation                                                           | Follow-up                                                                                       | Status    |
+| ------------------- | --------------------------------- | ---------------------------------------------------------------------------------- | -------------- | ----- | --------------- | ----------------------------------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | --------- |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `.github/workflows/_pr-test-stage.yml`                                             | ci             | Codex | theirs          | Official renamed`check-stage-health` to `check-pr-test-health`; this is a pure workflow action rename                   | low    | precise marker scan passed; DCU registration passed                  | None                                                                                            | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `.github/workflows/pr-states.yml`                                                  | ci             | Codex | manual merge    | Keep official`workflow_run` PR lookup and preserve DCU `/rerun-failed-ci` stale-run wording                             | low    | precise marker scan passed; DCU registration passed                  | Verify real GitHub workflow behavior in CI dry-run                                              | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/environ.py`                                                     | env            | Codex | manual merge    | Keep both DCU`SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` and official `SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN` env switches     | low    | syntax compile passed; DCU registration passed                       | None                                                                                            | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/mem_cache/memory_pool.py`                                       | mem_cache      | Codex | manual merge    | Preserve DCU FA KV layout copy/load while taking official`current_platform.synchronize()`                               | medium | syntax compile passed; DCU registration passed                       | Add CPU-offload smoke on DCU FA layout when CI command is available                             | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/managers/scheduler_pp_mixin.py`                                 | scheduler      | Codex | manual merge    | Combine official`hc_hidden_size` fallback with DCU proxy hidden-state shape helper                                      | medium | syntax compile passed; DCU registration passed                       | Pipeline-parallel smoke if available                                                            | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `test/registered/tokenizer/test_multi_detokenizer.py`                              | test           | Codex | theirs          | Official C01 renames CUDA suite from`stage-b-*` to `base-b-*`; AMD registration remains from DCU tree                   | low    | syntax compile passed; DCU registration passed                       | None                                                                                            | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/moe/ep_moe/layer.py`                                     | moe            | Codex | ours            | High-risk official MoE runner restructuring overlaps DCU DeepEP/AITER paths; preserve known DCU runtime for C01         | high   | syntax compile passed; DCU registration passed                       | Owner should port official runner-core changes onto DCU path in later checkpoint                | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/moe/moe_runner/aiter.py`                                 | aiter          | Codex | ours            | Official AITER runner refactor conflicts with DCU W8A8/W16A16 handling; avoid semantic rewrite in first checkpoint      | high   | syntax compile passed; DCU registration passed                       | Create dedicated AITER merge task before enabling official runner-core behavior                 | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/quantization/unquant.py`                                 | quantization   | Codex | ours            | Conflict is inside MoE execution fallback; keep DCU behavior until AITER/MoE owner ports official path                  | high   | syntax compile passed; DCU registration passed                       | Revisit together with`moe_runner/aiter.py`                                                      | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/models/deepseek_v2.py`                                          | model          | Codex | ours            | DeepSeek forward path overlaps DCU fused RMS/quant behavior; preserve current DCU model path in C01                     | high   | syntax compile passed; DCU registration passed                       | Run DeepSeek V2/V3 smoke after C01; port official output-buffer context if needed               | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/models/deepseek_v4.py`                                          | model          | Codex | ours            | DeepSeek V4 has many DCU-specific imports/kernels and official changes are not safe to fold blindly                     | high   | syntax compile passed; DCU registration passed                       | DSV4 owner should review skipped official C01 hunks before C02/C03                              | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | ours            | Preserve DCU speculative-algorithm alias helper; official side did not supersede it in C01                              | medium | syntax compile passed; DCU registration passed                       | Confirm Gemma4 assistant draft CLI path still works if used internally                          | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `.github/workflows/pr-states.yml`                                                  | ci             | Codex | manual merge    | Keep official run status icon/link behavior and preserve DCU`/rerun-failed-ci` stale-run wording                        | low    | marker scan passed; targeted compile passed; DCU registration passed | Verify real GitHub workflow behavior in CI dry-run                                              | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/pyproject.toml`                                                            | dependency     | Codex | ours            | Avoid adding unconditional CUDA`flashinfer_python[cu13]` and `flashinfer_cubin` dependencies to DCU install path        | medium | marker scan passed; targeted compile passed; DCU registration passed | Revisit with CUDA/Docker owner if internal main must match official CUDA dependency set exactly | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/csrc/deepseek_v4/rmsnorm.cuh`                            | jit-kernel     | Codex | theirs          | File was deleted upstream and no current tree references remained                                                       | medium | marker scan passed; targeted compile passed; DCU registration passed | None                                                                                            | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/csrc/deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh` | jit-kernel     | Codex | theirs          | File was deleted upstream and no current tree references remained                                                       | medium | marker scan passed; targeted compile passed; DCU registration passed | None                                                                                            | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/deepseek_v4.py`                                          | jit-kernel     | Codex | manual merge    | Keep DCU BLASLt env path while adding official HIP/AITER imports and guard                                              | medium | marker scan passed; targeted compile passed; DCU registration passed | DSV4 JIT smoke on DCU                                                                           | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | attention      | Codex | manual merge    | Use official dynamic TOPK from output shape instead of fixed 512                                                        | low    | marker scan passed; targeted compile passed; DCU registration passed | DSV4 sparse prefill/topk smoke                                                                  | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | Codex | theirs          | Official tuple-style forward mode check is equivalent and cleaner                                                       | low    | marker scan passed; targeted compile passed; DCU registration passed | FlashMLA/DSV4 smoke                                                                             | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/nsa/index_buf_accessor.py`                     | attention      | Codex | manual merge    | Preserve DCU page-size 64 assertion while accepting official HIP preshuffle page-size check for non-DCU HIP             | medium | marker scan passed; targeted compile passed; DCU registration passed | NSA/DCU index cache smoke                                                                       | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/nsa/nsa_indexer.py`                            | attention      | Codex | manual merge    | Preserve DCU BF16 index-cache path and adopt official`device_index` budget API                                          | high   | marker scan passed; targeted compile passed; DCU registration passed | NSA topk/chunking smoke                                                                         | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/ep_moe/layer.py`                                     | moe            | Codex | ours            | Official low-latency MoE runner updates overlap DCU AITER/DeepEP/groupgemm paths; keep known DCU implementation for C02 | high   | marker scan passed; targeted compile passed; DCU registration passed | Dedicated MoE owner should port official C02 hunks separately                                   | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py`                          | deepep         | Codex | ours            | Official DeepEP dispatcher API changes conflict with DCU quantized dispatch and low-latency dispatch parameters         | high   | marker scan passed; targeted compile passed; DCU registration passed | Confirm topk, BF16 dispatch, and low-latency dispatch compatibility before later checkpoints    | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/quantization/fp8.py`                                     | quantization   | Codex | ours            | Preserve DCU AITER/ASM FP8 MoE shuffle behavior; official shuffle path is CUDA/HIP-generic and needs DCU review         | high   | marker scan passed; targeted compile passed; DCU registration passed | Review with AITER/MoE owner                                                                     | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/managers/tp_worker.py`                                          | scheduler      | Codex | theirs          | Official fix avoids undefined`model_worker_batch` in split prefill sampling                                             | low    | marker scan passed; targeted compile passed; DCU registration passed | Split-prefill smoke if available                                                                | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/model_executor/forward_batch_info.py`                           | model_executor | Codex | ours            | Preserve current DCU pinned-memory construction for extend lengths                                                      | medium | marker scan passed; targeted compile passed; DCU registration passed | Forward batch init smoke                                                                        | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/models/deepseek_v4.py`                                          | model          | Codex | manual merge    | Keep DCU FP8 WO-A GEMM shape compatibility and add official`ceil_to_ue8m0` scale conversion / rotary import             | high   | marker scan passed; targeted compile passed; DCU registration passed | DeepSeek V4 startup and short request smoke                                                     | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | theirs          | Official Gemma4 backend selection supports causal and conditional arch plus split backend validation                    | low    | marker scan passed; targeted compile passed; DCU registration passed | Server args unit smoke                                                                          | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/speculative/eagle_worker_v2.py`                                 | speculative    | Codex | theirs          | Official side fixes stale`model_worker_batch` references to use `batch`                                                 | medium | marker scan passed; targeted compile passed; DCU registration passed | EAGLE/MTP smoke if available                                                                    | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/test/ci/ci_register.py`                                             | ci             | Codex | manual merge    | Keep DCU backend/marker and add official XPU backend/marker                                                             | low    | marker scan passed; targeted compile passed; DCU registration passed | DCU registration script                                                                         | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | TBD   | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available                                    | high   | Qwen dense plus DSV4 smoke                                           | Assign attention owner                                                                          | open      |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml`                                                | ci             | TBD   | manual merge    | Keep official workflow structure and DCU runner/wheel overlays                                                          | medium | CI dry-run and DCU registration check                                | Fill exact runner/image validation command                                                      | open      |
+| C13 /`125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**`                                                                    | sgl-kernel     | TBD   | manual merge    | sgl-kernel interfaces and DCU/HIP glue both changed                                                                     | high   | sgl-kernel DCU smoke whitelist                                       | Assign kernel owner                                                                             | open      |
 
 ## Per-Checkpoint Notes
 
@@ -87,6 +126,16 @@ up with official SGLang `main`.
     - syntax compile for all conflicted Python files: passed.
     - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
       212 DCU registered test files.
+  - Recommended manual validation:
+    - `ci` / `test`: PR workflow dry-run and `/rerun-failed-ci` flow.
+    - `mem_cache`: CPU offload smoke covering DCU FA KV layout.
+    - `scheduler`: pipeline-parallel proxy tensor smoke.
+    - `moe` / `deepep` / `aiter`: Qwen3 MoE or DeepEP smoke covering current
+      DCU AITER path.
+    - `model` / `deepseek-v4`: DeepSeek V2/V4 startup and short request smoke.
+    - `server_args`: speculative algorithm alias CLI parse smoke if used.
+  - Manual validation result:
+    - TBD
 
 ### C02 / `425dffbde339`
 
@@ -108,6 +157,25 @@ up with official SGLang `main`.
     - syntax compile for all conflicted Python files: passed.
     - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
       212 DCU registered test files.
+  - Recommended manual validation:
+    - `dependency`: DCU install flow to confirm CUDA-only flashinfer cu13 deps
+      are not required by internal workflow.
+    - `jit-kernel`: DSV4 JIT smoke and deleted-header reference check in the
+      target build container.
+    - `attention`: DSV4 sparse prefill/topk, FlashMLA, NSA BF16 index-cache, and
+      NSA chunking smoke.
+    - `moe` / `deepep`: DeepEP normal dispatch and low-latency dispatch smoke,
+      including topk/dispatch/combine compatibility.
+    - `quantization` / `aiter`: FP8 MoE path, AITER/ASM shuffle path, and
+      quantized MoE smoke.
+    - `scheduler` / `model_executor`: split prefill and forward-batch init smoke.
+    - `model` / `deepseek-v4`: DeepSeek V4 startup, short request, and FP8 WO-A
+      GEMM path if the checkpoint is available.
+    - `speculative`: EAGLE/MTP smoke covering idle and prefill paths.
+    - `ci`: DCU registration, XPU marker coexistence, and PR workflow dry-run.
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
 
 ### C03 / `7cf193fe1faf`
 
@@ -116,6 +184,12 @@ up with official SGLang `main`.
 - Required validation:
   - Dense smoke.
   - Cache-related unit or smoke test, exact command to be filled.
+- Recommended manual validation:
+  - `attention`: Qwen dense smoke and attention backend selection smoke.
+  - `mem_cache`: radix cache, SWA/hybrid cache, and retract/decode cache smoke.
+  - `model`: affected model startup and short request smoke.
+- Manual validation result:
+  - TBD
 - Notes:
   - TBD
 
@@ -125,6 +199,12 @@ up with official SGLang `main`.
 - Owner: TBD
 - Required validation:
   - jit-kernel or sgl-kernel DCU smoke.
+- Recommended manual validation:
+  - `jit-kernel`: DSV4 JIT build/import and targeted kernel smoke.
+  - `attention` / `deepseek-v4`: DSV4 attention runtime smoke.
+  - `dependency`: DCU container install/build sanity.
+- Manual validation result:
+  - TBD
 - Notes:
   - TBD
 
@@ -136,6 +216,14 @@ up with official SGLang `main`.
   - Stage-b small model smoke.
   - Qwen2.5 dense server smoke.
   - Qwen2.5-VL smoke.
+- Recommended manual validation:
+  - `scheduler`: stage-b small model smoke, split prefill, abort/retract if touched.
+  - `attention`: dense + VLM attention backend smoke.
+  - `mem_cache`: cache hit/retract/SWA smoke if cache files conflict.
+  - `embedding` / `reranker`: embedding and reranker API smoke when touched.
+  - `ci`: DCU suite partition generation and runner/image dry-run.
+- Manual validation result:
+  - TBD
 - Notes:
   - TBD
 
@@ -149,6 +237,16 @@ up with official SGLang `main`.
   - DeepEP small and large.
   - DeepSeek V4 startup and short request.
   - Nightly-dcu.
+- Recommended manual validation:
+  - `moe`: Qwen3 MoE, EP/TP, groupgemm/marlin, and AITER MoE paths.
+  - `deepep`: normal + low-latency dispatch/combine, BF16/FP8 dispatch modes.
+  - `deepseek-v4`: startup, short request, MTP/NextN, FP8/FP4 checkpoint path.
+  - `aiter`: AITER import/init plus eager and cuda-graph paths if graph code changes.
+  - `quantization`: FP8/W8A8/W4A8/MXFP4 smoke and accuracy spot check.
+  - `speculative`: EAGLE/MTP/frozen-KV smoke where touched.
+  - `nightly`: full nightly-dcu or equivalent internal gate before closing phase.
+- Manual validation result:
+  - TBD
 - Notes:
   - TBD
 
@@ -158,5 +256,12 @@ up with official SGLang `main`.
 - Owner: TBD
 - Required validation:
   - Daily sync smoke gate.
+- Recommended manual validation:
+  - `daily-sync`: DCU smoke gate, conflict marker scan, DCU registration, and
+    official-lag dashboard update.
+  - `speculative`: MTP rejection sampling smoke if touched.
+  - `platform`: XPU/import guard sanity should not regress DCU imports.
+- Manual validation result:
+  - TBD
 - Notes:
   - TBD
