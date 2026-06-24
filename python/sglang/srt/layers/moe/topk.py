@@ -1270,12 +1270,12 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts, 
             routed_scaling_factor,
         )
-        if (expert_location_dispatch_info is not None) or (
-            num_token_non_padded is not None
-        ):
-            topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded
-            )
+        # if (expert_location_dispatch_info is not None) or (
+        #     num_token_non_padded is not None
+        # ):
+        #     topk_ids = _biased_grouped_topk_postprocess(
+        #         topk_ids, expert_location_dispatch_info, num_token_non_padded
+        #     )
         return topk_weights, topk_ids
     else:
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
