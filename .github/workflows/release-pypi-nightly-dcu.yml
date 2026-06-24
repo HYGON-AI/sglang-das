@@ -2,12 +2,22 @@ name: Release DCU Nightly Wheels
 
 permissions:
   contents: read
+  pull-requests: read
 
 on:
   # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
-  push:
-    branches:
-      - v0.5.12_dev
+  # push:
+  #   branches:
+  #     - v0.5.12_dev
+  #   paths:
+  #     - 'python/**'
+  #     - 'sgl-kernel/**'
+  #     - 'sgl-model-gateway/**'
+  #     - 'requirements_dcu.txt'
+  #     - '.github/workflows/release-pypi-nightly-dcu.yml'
+
+  # TODO: remove after testing
+  pull_request:
     paths:
       - 'python/**'
       - 'sgl-kernel/**'
@@ -62,6 +72,7 @@ jobs:
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
+        -v /home/github/sgl_whl_temp/HYGON-AI_dcu-sglang:/home/github/sgl_whl_temp/HYGON-AI_dcu-sglang
         --shm-size=80G
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
@@ -199,7 +210,7 @@ jobs:
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-6)"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
@@ -208,11 +219,5 @@ jobs:
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: dcu-wheels-py${{ matrix.python-version }}
-          path: output/*.whl
-          if-no-files-found: warn
+          # CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+          rm -rf /home/github/sgl_whl_temp/HYGON-AI_dcu-sglang/* || true
