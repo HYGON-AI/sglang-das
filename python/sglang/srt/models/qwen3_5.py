@@ -71,6 +71,7 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -116,6 +117,11 @@ if _is_dcu and _use_fused_qwen_bailing_rotary:
     from lightop import gammarms_rotary_embedding_fuse_with_kv_store
 
 cached_get_processor = lru_cache(get_processor)
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+        split_qkvgate_gemma_rmsnorm_rope,
+    )
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -856,15 +862,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def self_attention(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Full attention forward pass."""
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -876,19 +875,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            
+            gate = None
+
         if _is_dcu and _use_fused_qwen_bailing_rotary:
             # Fused RMSNorm + RoPE + kv_store path through custom op.
             cos_sin_cache = self.rotary_emb.cos_sin_cache
-            if (cos_sin_cache.device != q.device
-                    or cos_sin_cache.dtype != q.dtype):
-                cos_sin_cache = cos_sin_cache.to(q.device,
-                                                dtype=q.dtype,
-                                                non_blocking=True)
+            if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
+                cos_sin_cache = cos_sin_cache.to(
+                    q.device,
+                    dtype=q.dtype,
+                    non_blocking=True,
+                )
                 # Persist the converted cache so we don't re-copy/re-allocate
                 # on every forward when the original buffer starts on CPU.
                 self.rotary_emb.cos_sin_cache = cos_sin_cache
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+            k_buffer, v_buffer = get_token_to_kv_pool().get_kv_buffer(self.layer_id)
 
             q, k, v = gammarms_rotary_embedding_fuse_with_kv_store(
                 positions,
@@ -914,6 +915,51 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Calculate first full attention layer ID based on config
+        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+            self.rotary_emb.get_cos_sin_with_position(positions)
+
+        q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            int(self.head_dim * self.partial_rotary_factor),
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+        )
+        return q, k, v, gate
+
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            q, k, v, gate = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            q, k, v, gate = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:

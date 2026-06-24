@@ -80,6 +80,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     apply_qk_norm,
@@ -836,7 +837,7 @@ class BailingMoEAttention(nn.Module):
                 # Persist the converted cache so we don't re-copy/re-allocate
                 # on every forward when the original buffer starts on CPU.
                 self.rotary_emb.cos_sin_cache = cos_sin_cache
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+            k_buffer, v_buffer = get_token_to_kv_pool().get_kv_buffer(self.layer_id)
 
             q, k, v = rms_rotary_embedding_fuse_with_kv_store(
                 positions,

@@ -112,7 +112,7 @@ class PagedIndexerMetadata:
         else: # lightop support get_paged_mqa_logits_metadata but has other potential issues, skip it in dcu
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
-                from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
+                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
                 from lightop.gemmopt import get_paged_mqa_logits_metadata
 
@@ -127,9 +127,9 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get() and torch.version.hip is None:
-            from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+        from sglang.jit_kernel.dsv4 import plan_topk_v2
 
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and torch.version.hip is None:
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
