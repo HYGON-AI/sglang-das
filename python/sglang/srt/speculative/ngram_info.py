@@ -34,7 +34,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_dcu, is_hip, is_musa, next_power_of_2
+
+_is_dcu = is_dcu()
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -440,9 +442,11 @@ class NgramVerifyInput(SpecInput):
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            build_label = "DCU/HIP" if _is_dcu else "ROCm/HIP"
             logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
+                "Tree speculative sampling kernel unavailable (likely %s build). "
+                "Falling back to greedy verification.",
+                build_label,
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
