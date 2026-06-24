@@ -66,7 +66,7 @@ else
 fi
 
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
-  echo "[dcu-ci] Installing DCU wheels from explicit URLs"
+  echo "[dcu-ci] Installing DCU wheels from explicit URLs or local paths"
   echo "[dcu-ci] DCU_CI_INSTALL_WHEEL_URLS=${INSTALL_WHEEL_URLS}"
   run_in_container "python3 -m pip uninstall -y sglang sgl-kernel sglang-kernel sgl-model-gateway || true"
   install_with_retry docker exec "${CONTAINER}" \
