@@ -190,6 +190,7 @@ NIGHTLY_SUITES = {
     HWBackend.DCU: [
         "nightly-dcu",
         "nightly-dcu-1-gpu",
+        "nightly-dcu-2-gpu",
         "nightly-dcu-4-gpu",
         "nightly-dcu-8-gpu",
         "nightly-dcu-accuracy",
