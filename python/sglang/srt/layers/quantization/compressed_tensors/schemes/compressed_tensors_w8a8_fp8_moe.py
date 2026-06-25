@@ -370,6 +370,19 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
+        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+            if self.weight_quant.strategy != QuantizationStrategy.CHANNEL:
+                raise RuntimeError(
+                    "DCU W8A8 MegaMoE requires channelwise FP8 expert weights "
+                    "with dynamic per-token activation scales"
+                )
+            from sglang.srt.layers.moe.mega_moe import (
+                build_dcu_w8a8_mega_moe_experts_weights,
+            )
+
+            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            return
+
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights

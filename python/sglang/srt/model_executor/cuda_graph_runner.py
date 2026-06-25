@@ -1306,6 +1306,13 @@ class CudaGraphRunner:
         )
         attn_backend._replay_forward_batch = None
 
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                set_mega_moe_cuda_graph_num_tokens,
+            )
+
+            set_mega_moe_cuda_graph_num_tokens(raw_num_token)
+
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token

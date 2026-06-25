@@ -3253,12 +3253,27 @@ class ServerArgs:
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
             if is_dcu():
-                if not self.disable_cuda_graph:
-                    logger.warning(
-                        "Cuda graph is disabled for DCU W8A8 MegaMoE v1."
+                dcu_runtime = (
+                    envs.SGLANG_DCU_MEGA_MOE_RUNTIME.get().strip().lower()
+                )
+                if dcu_runtime not in {"deep_gemm", "megamoe"}:
+                    raise ValueError(
+                        "SGLANG_DCU_MEGA_MOE_RUNTIME must be 'deep_gemm' or "
+                        f"'megamoe', got {dcu_runtime!r}"
                     )
-                self.disable_cuda_graph = True
-                self.disable_piecewise_cuda_graph = True
+                if dcu_runtime == "deep_gemm":
+                    if not self.disable_cuda_graph:
+                        logger.warning(
+                            "Cuda graph is disabled for the DCU deep_gemm "
+                            "W8A8 MegaMoE runtime."
+                        )
+                    self.disable_cuda_graph = True
+                    self.disable_piecewise_cuda_graph = True
+                else:
+                    logger.info(
+                        "DCU MegaMoE uses the standalone megamoe runtime; "
+                        "CUDA graph remains enabled."
+                    )
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(

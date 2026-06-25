@@ -286,8 +286,17 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         if _is_dcu and get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
                 build_dcu_w8a8_mega_moe_experts_weights,
+                get_dcu_mega_moe_runtime,
             )
 
+            if (
+                get_dcu_mega_moe_runtime() == "megamoe"
+                and not self.quant_config.is_checkpoint_fp8_serialized
+            ):
+                raise ValueError(
+                    "standalone megamoe requires an FP8-serialized "
+                    "channelwise W8A8 checkpoint"
+                )
             build_dcu_w8a8_mega_moe_experts_weights(layer)
             return
 
