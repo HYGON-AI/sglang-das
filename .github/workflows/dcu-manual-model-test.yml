@@ -19,7 +19,37 @@ on:
         type: string
         default: ""
       model_name:
-        description: "Optional model/path for tests that honor SGLANG_TEST_DEFAULT_MODEL_NAME. TODO: add per-suite model filtering when run_suite.py supports it."
+        description: "Optional model/path for DCU accuracy tests. Passed to SGLANG_DCU_GSM8K_MODEL and SGLANG_DCU_MMLU_MODEL."
+        required: false
+        type: string
+        default: ""
+      eval_num_examples:
+        description: "Optional shared sample count for DCU accuracy evals. Use a small value such as 10 for quick validation. Empty uses test defaults."
+        required: false
+        type: string
+        default: ""
+      gsm8k_num_examples:
+        description: "Optional GSM8K sample count override. Empty uses eval_num_examples or the test default."
+        required: false
+        type: string
+        default: ""
+      mmlu_num_examples:
+        description: "Optional MMLU sample count override. Empty uses eval_num_examples or the test default."
+        required: false
+        type: string
+        default: ""
+      mmlu_num_threads:
+        description: "MMLU client thread count. 128 is the validated quick/unattended default on the DCU runner."
+        required: false
+        type: string
+        default: "128"
+      gsm8k_threshold:
+        description: "Optional GSM8K score threshold override for non-default models. Empty uses the test default."
+        required: false
+        type: string
+        default: ""
+      mmlu_threshold:
+        description: "Optional MMLU score threshold override for non-default models. Empty uses the test default."
         required: false
         type: string
         default: ""
@@ -58,6 +88,11 @@ on:
         required: false
         type: string
         default: "10.16.1.152:5000/jenkins/model_test_env/sglang:latest"
+      rebuild_sgl_kernel:
+        description: "Rebuild and reinstall sgl-kernel from the selected ref before running tests to avoid source/package mismatch."
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -81,17 +116,24 @@ jobs:
       INPUT_SUITE: ${{ inputs.suite || '' }}
       INPUT_INCLUDE_FILE: ${{ inputs.include_file || '' }}
       INPUT_MODEL_NAME: ${{ inputs.model_name || '' }}
+      INPUT_EVAL_NUM_EXAMPLES: ${{ inputs.eval_num_examples || '' }}
+      INPUT_GSM8K_NUM_EXAMPLES: ${{ inputs.gsm8k_num_examples || '' }}
+      INPUT_MMLU_NUM_EXAMPLES: ${{ inputs.mmlu_num_examples || '' }}
+      INPUT_MMLU_NUM_THREADS: ${{ inputs.mmlu_num_threads || '128' }}
+      INPUT_GSM8K_THRESHOLD: ${{ inputs.gsm8k_threshold || '' }}
+      INPUT_MMLU_THRESHOLD: ${{ inputs.mmlu_threshold || '' }}
       INPUT_TIMEOUT_PER_FILE: ${{ inputs.timeout_per_file || '4200' }}
       INPUT_AUTO_PARTITION_ID: ${{ inputs.auto_partition_id || '' }}
       INPUT_AUTO_PARTITION_SIZE: ${{ inputs.auto_partition_size || '' }}
       INPUT_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
       INPUT_CONTAINER_NAME: ${{ inputs.container_name || '' }}
       INPUT_IMAGE: ${{ inputs.image || '' }}
+      INPUT_REBUILD_SGL_KERNEL: ${{ inputs.rebuild_sgl_kernel }}
       VAR_DCU_CI_IMAGE: ${{ vars.DCU_CI_IMAGE || '' }}
       DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
+      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '1' }}
       DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
       HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
     steps:
@@ -115,6 +157,33 @@ jobs:
             echo "::error::timeout_per_file must be a positive integer, got '${timeout_per_file}'."
             exit 1
           fi
+
+          validate_optional_positive_int() {
+            local name="$1"
+            local value="$2"
+            if [[ -n "${value}" ]]; then
+              if [[ ! "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -le 0 ]]; then
+                echo "::error::${name} must be a positive integer when set, got '${value}'."
+                exit 1
+              fi
+            fi
+          }
+
+          validate_optional_decimal() {
+            local name="$1"
+            local value="$2"
+            if [[ -n "${value}" && ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+              echo "::error::${name} must be a non-negative decimal when set, got '${value}'."
+              exit 1
+            fi
+          }
+
+          validate_optional_positive_int eval_num_examples "${INPUT_EVAL_NUM_EXAMPLES}"
+          validate_optional_positive_int gsm8k_num_examples "${INPUT_GSM8K_NUM_EXAMPLES}"
+          validate_optional_positive_int mmlu_num_examples "${INPUT_MMLU_NUM_EXAMPLES}"
+          validate_optional_positive_int mmlu_num_threads "${INPUT_MMLU_NUM_THREADS}"
+          validate_optional_decimal gsm8k_threshold "${INPUT_GSM8K_THRESHOLD}"
+          validate_optional_decimal mmlu_threshold "${INPUT_MMLU_THRESHOLD}"
 
           if [[ -n "${INPUT_AUTO_PARTITION_ID}" || -n "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
             if [[ -z "${INPUT_AUTO_PARTITION_ID}" || -z "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
@@ -194,7 +263,7 @@ jobs:
           fi
           model_note="${INPUT_MODEL_NAME:-not set}"
           if [[ -n "${INPUT_MODEL_NAME}" ]]; then
-            model_note="${INPUT_MODEL_NAME} (passed as SGLANG_TEST_DEFAULT_MODEL_NAME; TODO: add run_suite.py model filter when supported)"
+            model_note="${INPUT_MODEL_NAME} (passed as SGLANG_DCU_GSM8K_MODEL, SGLANG_DCU_MMLU_MODEL, and SGLANG_TEST_DEFAULT_MODEL_NAME)"
           fi
 
           {
@@ -211,6 +280,13 @@ jobs:
             echo "| Nightly mode | \`${DCU_MANUAL_NIGHTLY_FLAG:-false}\` |"
             echo "| Include file | \`${INPUT_INCLUDE_FILE:-not set}\` |"
             echo "| Model name | \`${model_note}\` |"
+            echo "| Eval examples | \`${INPUT_EVAL_NUM_EXAMPLES:-test default}\` |"
+            echo "| GSM8K examples | \`${INPUT_GSM8K_NUM_EXAMPLES:-test/default shared}\` |"
+            echo "| MMLU examples | \`${INPUT_MMLU_NUM_EXAMPLES:-test/default shared}\` |"
+            echo "| MMLU threads | \`${INPUT_MMLU_NUM_THREADS:-test default}\` |"
+            echo "| GSM8K threshold | \`${INPUT_GSM8K_THRESHOLD:-test default}\` |"
+            echo "| MMLU threshold | \`${INPUT_MMLU_THRESHOLD:-test default}\` |"
+            echo "| Rebuild sgl-kernel | \`${INPUT_REBUILD_SGL_KERNEL}\` |"
             echo "| Timeout per file | \`${DCU_MANUAL_TIMEOUT_PER_FILE}\` |"
             echo "| Partition | \`${partition}\` |"
             echo "| Continue on error | \`${INPUT_CONTINUE_ON_ERROR}\` |"
@@ -228,6 +304,20 @@ jobs:
 
       - name: Install dependencies
         run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
+
+      - name: Rebuild selected-ref sgl-kernel
+        if: ${{ inputs.rebuild_sgl_kernel }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Rebuilding sgl-kernel from selected ref to match /sglang-checkout/python source."
+            docker exec -w /sglang-checkout/sgl-kernel "${DCU_CI_CONTAINER_NAME}" \
+              bash -lc "source /opt/dtk/env.sh && python setup_hip.py bdist_wheel && ls -lh dist/*.whl"
+            docker exec "${DCU_CI_CONTAINER_NAME}" \
+              bash -lc "pip install --force-reinstall /sglang-checkout/sgl-kernel/dist/sglang_kernel-*.whl"
+            docker exec "${DCU_CI_CONTAINER_NAME}" \
+              bash -lc 'python3 -c "import sgl_kernel; print(sgl_kernel.__file__); ok = hasattr(sgl_kernel, \"normal_decode_metadata_general\"); print(\"normal_decode_metadata_general=\", ok); raise SystemExit(0 if ok else \"rebuilt sgl-kernel does not expose normal_decode_metadata_general\")"'
+          } 2>&1 | tee "${DCU_MANUAL_LOG_DIR}/rebuild-sgl-kernel.log"
 
       - name: Run manual DCU model suite
         id: test
@@ -258,17 +348,37 @@ jobs:
             run_suite_cmd+=(--auto-partition-size "${INPUT_AUTO_PARTITION_SIZE}")
           fi
 
+          test_env_cmd=(env)
+          if [[ -n "${INPUT_MODEL_NAME}" ]]; then
+            test_env_cmd+=("SGLANG_TEST_DEFAULT_MODEL_NAME=${INPUT_MODEL_NAME}")
+            test_env_cmd+=("SGLANG_DCU_GSM8K_MODEL=${INPUT_MODEL_NAME}")
+            test_env_cmd+=("SGLANG_DCU_MMLU_MODEL=${INPUT_MODEL_NAME}")
+          fi
+          if [[ -n "${INPUT_EVAL_NUM_EXAMPLES}" ]]; then
+            test_env_cmd+=("SGLANG_DCU_EVAL_NUM_EXAMPLES=${INPUT_EVAL_NUM_EXAMPLES}")
+          fi
+          if [[ -n "${INPUT_GSM8K_NUM_EXAMPLES}" ]]; then
+            test_env_cmd+=("SGLANG_DCU_GSM8K_NUM_EXAMPLES=${INPUT_GSM8K_NUM_EXAMPLES}")
+          fi
+          if [[ -n "${INPUT_MMLU_NUM_EXAMPLES}" ]]; then
+            test_env_cmd+=("SGLANG_DCU_MMLU_NUM_EXAMPLES=${INPUT_MMLU_NUM_EXAMPLES}")
+          fi
+          if [[ -n "${INPUT_MMLU_NUM_THREADS}" ]]; then
+            test_env_cmd+=("SGLANG_DCU_MMLU_NUM_THREADS=${INPUT_MMLU_NUM_THREADS}")
+          fi
+          if [[ -n "${INPUT_GSM8K_THRESHOLD}" ]]; then
+            test_env_cmd+=("SGLANG_DCU_GSM8K_THRESHOLD=${INPUT_GSM8K_THRESHOLD}")
+          fi
+          if [[ -n "${INPUT_MMLU_THRESHOLD}" ]]; then
+            test_env_cmd+=("SGLANG_DCU_MMLU_THRESHOLD=${INPUT_MMLU_THRESHOLD}")
+          fi
+
           exec_cmd=(
             bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh"
             --container-name "${DCU_CI_CONTAINER_NAME}"
             -w /sglang-checkout/test
+            -- "${test_env_cmd[@]}" "${run_suite_cmd[@]}"
           )
-
-          if [[ -n "${INPUT_MODEL_NAME}" ]]; then
-            exec_cmd+=(-e "SGLANG_TEST_DEFAULT_MODEL_NAME=${INPUT_MODEL_NAME}")
-          fi
-
-          exec_cmd+=(-- "${run_suite_cmd[@]}")
 
           {
             printf '%q ' "${exec_cmd[@]}"
@@ -294,6 +404,13 @@ jobs:
           echo "suite=${DCU_MANUAL_SUITE}"
           echo "include_file=${INPUT_INCLUDE_FILE:-}"
           echo "model_name=${INPUT_MODEL_NAME:-}"
+          echo "eval_num_examples=${INPUT_EVAL_NUM_EXAMPLES:-}"
+          echo "gsm8k_num_examples=${INPUT_GSM8K_NUM_EXAMPLES:-}"
+          echo "mmlu_num_examples=${INPUT_MMLU_NUM_EXAMPLES:-}"
+          echo "mmlu_num_threads=${INPUT_MMLU_NUM_THREADS:-}"
+          echo "gsm8k_threshold=${INPUT_GSM8K_THRESHOLD:-}"
+          echo "mmlu_threshold=${INPUT_MMLU_THRESHOLD:-}"
+          echo "rebuild_sgl_kernel=${INPUT_REBUILD_SGL_KERNEL}"
           echo "timeout_per_file=${DCU_MANUAL_TIMEOUT_PER_FILE}"
           echo "auto_partition_id=${INPUT_AUTO_PARTITION_ID:-}"
           echo "auto_partition_size=${INPUT_AUTO_PARTITION_SIZE:-}"
