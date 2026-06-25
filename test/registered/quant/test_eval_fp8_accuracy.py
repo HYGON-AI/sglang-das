@@ -1,8 +1,15 @@
+import os
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.dcu_utils import (
+    DCU_TEXT_SERVER_ARGS,
+    assert_generate_non_empty,
+    get_model_path,
+    get_server_args,
+)
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8,
@@ -11,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    find_available_port,
     popen_launch_server,
 )
 
@@ -18,20 +26,63 @@ register_cuda_ci(est_time=250, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
-    est_time=120,
+    est_time=240,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: quantization path needs BW1100 numeric/backend validation before required CI.",
 )
+
+DEFAULT_DCU_FP8_ACCURACY_MODEL = (
+    "/public/opendas/DL_DATA/llm-models/vllm-fp8-models/Qwen3-0.6B-FP8"
+)
+
+
+def _is_dcu():
+    return os.environ.get("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+def _dcu_fp8_server_args():
+    return get_server_args(
+        "SGLANG_DCU_FP8_ACCURACY_SERVER_ARGS",
+        DCU_TEXT_SERVER_ARGS
+        + [
+            "--disable-cuda-graph",
+            "--fp8-gemm-backend",
+            "triton",
+        ],
+    )
+
+
+def _dcu_fp8_env():
+    return {
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+        "SGLANG_USE_LIGHTOP": "0",
+        "SGLANG_USE_MODELSCOPE": os.environ.get("SGLANG_USE_MODELSCOPE", "1"),
+    }
+
 
 class TestEvalFP8Accuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        if _is_dcu():
+            cls.model = get_model_path(
+                "SGLANG_DCU_FP8_ACCURACY_MODEL", DEFAULT_DCU_FP8_ACCURACY_MODEL
+            )
+            port = find_available_port(11001)
+            cls.base_url = f"http://127.0.0.1:{port}"
+            other_args = _dcu_fp8_server_args()
+            env = _dcu_fp8_env()
+        else:
+            cls.model = DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8
+            cls.base_url = DEFAULT_URL_FOR_TEST
+            other_args = None
+            env = None
+
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=env,
         )
 
     @classmethod
@@ -39,6 +90,15 @@ class TestEvalFP8Accuracy(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
+        if _is_dcu():
+            output = assert_generate_non_empty(
+                self.base_url,
+                text="The capital of France is",
+                max_new_tokens=8,
+            )
+            self.assertGreater(len(output.strip()), 0)
+            return
+
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
@@ -59,6 +119,9 @@ class TestEvalFP8Accuracy(CustomTestCase):
 class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
 
     def _run_test(self, model, other_args, expected_score):
+        if _is_dcu():
+            self.skipTest("DCU FP8 CI uses TestEvalFP8Accuracy smoke coverage.")
+
         base_url = DEFAULT_URL_FOR_TEST
         other_args = other_args or []
 

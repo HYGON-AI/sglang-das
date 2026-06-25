@@ -24,6 +24,7 @@ from sglang.test.lora_utils import (
     CI_LORA_MODELS,
     DEFAULT_PROMPTS,
     TORCH_DTYPES,
+    LoRAAdaptor,
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
@@ -38,13 +39,43 @@ register_amd_ci(
 register_dcu_ci(
     est_time=200,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: LoRA CI matrix uses remote base/adapters; needs local base and adapter mapping before enabling.",
 )
+
+DCU_QWEN3_LORA_MODEL = LoRAModelCase(
+    base="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-4B",
+    adaptors=[
+        LoRAAdaptor(
+            name="/public/opendas/DL_DATA/llm-models/lora/nissenj/Qwen3-4B-lora-v2",
+            prefill_tolerance=3e-1,
+            decode_tolerance=3e-1,
+        ),
+    ],
+    max_loras_per_batch=1,
+)
+DCU_PROMPTS = ["SGL is a"]
+DCU_BACKENDS = ["csgmv", "triton"]
+DCU_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
+def _is_dcu() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI_DCU", "0") == "1"
 
 
 class TestLoRABackend(CustomTestCase):
 
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
+        if _is_dcu():
+            self._run_dcu_backend_on_model_cases(model_cases)
+            return
+
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
             prompts = (
@@ -62,7 +93,34 @@ class TestLoRABackend(CustomTestCase):
                         backend=backend,
                     )
 
+    def _run_dcu_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
+        for model_case in model_cases:
+            for path in [model_case.base, *[adaptor.name for adaptor in model_case.adaptors]]:
+                if not os.path.exists(path):
+                    self.skipTest(f"DCU LoRA backend path does not exist: {path}")
+
+            for torch_dtype in TORCH_DTYPES:
+                for backend in DCU_BACKENDS:
+                    run_lora_test_one_by_one(
+                        DCU_PROMPTS,
+                        model_case,
+                        torch_dtype,
+                        max_new_tokens=8,
+                        backend=backend,
+                        disable_cuda_graph=True,
+                        disable_radix_cache=True,
+                        mem_fraction_static=0.65,
+                        attention_backend="fa3",
+                        page_size=64,
+                        max_lora_rank=32,
+                        lora_target_modules=DCU_LORA_TARGET_MODULES,
+                    )
+
     def test_ci_lora_models(self):
+        if _is_dcu():
+            self._run_backend_on_model_cases([DCU_QWEN3_LORA_MODEL])
+            return
+
         self._run_backend_on_model_cases(CI_LORA_MODELS)
 
     def test_all_lora_models(self):

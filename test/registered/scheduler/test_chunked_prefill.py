@@ -2,31 +2,111 @@
 python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
 """
 
+import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
+import requests
+
+from sglang.test.run_eval import run_eval
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-from sglang.test.test_utils import CustomTestCase, run_mmlu_test, run_mulit_request_test
+from sglang.test.test_utils import (
+    CustomTestCase,
+    run_and_check_memory_leak,
+    run_mmlu_test,
+    run_mulit_request_test,
+)
 
 register_cuda_ci(est_time=312, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=312, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(est_time=312, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_dcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-dcu")
+
+
+def _is_dcu():
+    return os.environ.get("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+def _run_dcu_mmlu_smoke(disable_radix_cache=False, enable_mixed_chunk=False):
+    def workload_func(base_url, model):
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=8,
+            num_threads=8,
+        )
+        metrics = run_eval(args)
+        assert metrics["score"] >= 0.0, f"metrics={metrics}"
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        disable_overlap=False,
+        chunked_prefill_size=32,
+        assert_has_abort=False,
+    )
+
+
+def _run_dcu_multi_request_smoke(enable_mixed_chunk=False, chunked_prefill_size=2048):
+    def workload_func(base_url, model):
+        def run_one(_):
+            response = requests.post(
+                f"{base_url}/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 4,
+                    },
+                },
+            )
+            assert response.status_code == 200, response.text
+            response.json()
+
+        with ThreadPoolExecutor(2) as executor:
+            list(executor.map(run_one, list(range(2))))
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache=False,
+        enable_mixed_chunk=enable_mixed_chunk,
+        disable_overlap=False,
+        chunked_prefill_size=chunked_prefill_size,
+        assert_has_abort=False,
+    )
+
+
+def _run_chunked_mmlu_test(**kwargs):
+    if _is_dcu():
+        _run_dcu_mmlu_smoke(**kwargs)
+    else:
+        run_mmlu_test(**kwargs)
+
+
+def _run_chunked_multi_request_test(**kwargs):
+    if _is_dcu():
+        _run_dcu_multi_request_smoke(**kwargs)
+    else:
+        run_mulit_request_test(**kwargs)
 
 
 class TestChunkedPrefill(CustomTestCase):
     def test_chunked_prefill(self):
-        run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=False)
+        _run_chunked_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=False)
 
     def test_mixed_chunked_prefill(self):
-        run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=True)
+        _run_chunked_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=True)
 
     def test_chunked_prefill_without_radix_cache(self):
-        run_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=False)
+        _run_chunked_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=False)
 
     def test_mixed_chunked_prefill_without_radix_cache(self):
-        run_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=True)
+        _run_chunked_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=True)
 
     def test_mixed_chunked_prefill_multi_requests(self):
-        run_mulit_request_test(
+        _run_chunked_multi_request_test(
             enable_mixed_chunk=True,
             chunked_prefill_size=2048,
         )

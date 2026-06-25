@@ -430,7 +430,7 @@ def _get_sum_extend_prefix_lens(forward_batch):
 
 
 def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
-    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
+    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla", "dcu_mla"]
     sum_seq_lens = (
         sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
     )
@@ -544,6 +544,19 @@ def handle_attention_triton(attn, forward_batch):
         return AttnForwardMethod.MHA
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
+
+
+AttentionBackendRegistry.register("ascend", handle_attention_ascend)
+AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
+AttentionBackendRegistry.register("fa3", handle_attention_fa3)
+AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
+AttentionBackendRegistry.register("dcu_mla", handle_attention_dcu_mla)
+AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
+AttentionBackendRegistry.register("fa4", handle_attention_fa4)
+AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
+AttentionBackendRegistry.register("aiter", handle_attention_aiter)
+AttentionBackendRegistry.register("nsa", handle_attention_nsa)
+AttentionBackendRegistry.register("triton", handle_attention_triton)
 
 
 class DeepseekV2MLP(nn.Module):

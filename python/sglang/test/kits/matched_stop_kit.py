@@ -134,7 +134,7 @@ class MatchedStopMixin:
 You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
 What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
         """
-        eos_token_ids = [128000, 128009, 2]
+        eos_token_ids = getattr(self, "eos_token_ids", [128000, 128009, 2])
         self._run_completions_generation(
             prompt=llama_format_prompt,
             max_tokens=1000,

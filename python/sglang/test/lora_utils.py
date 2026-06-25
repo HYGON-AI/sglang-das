@@ -385,6 +385,9 @@ def run_lora_test_one_by_one(
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
     attention_backend: Optional[str] = None,
+    page_size: Optional[int] = None,
+    max_lora_rank: Optional[int] = None,
+    lora_target_modules: Optional[List[str]] = None,
 ):
     """
     Input a batch of prompts, and run lora tests one by one with several generate requests
@@ -435,6 +438,9 @@ def run_lora_test_one_by_one(
         disable_radix_cache=disable_radix_cache,
         mem_fraction_static=mem_fraction_static,
         attention_backend=attention_backend,
+        page_size=page_size,
+        max_lora_rank=max_lora_rank,
+        lora_target_modules=lora_target_modules,
     ) as srt_runner:
         srt_outputs = srt_runner.forward(
             prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
@@ -447,6 +453,9 @@ def run_lora_test_one_by_one(
         tp_size=model_case.tp_size,
         mem_fraction_static=mem_fraction_static,
         attention_backend=attention_backend,
+        page_size=page_size,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_radix_cache=disable_radix_cache,
     ) as srt_runner:
         srt_no_lora_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 

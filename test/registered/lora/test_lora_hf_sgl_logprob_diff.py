@@ -38,10 +38,8 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
 register_dcu_ci(
-    est_time=120,
-    suite="nightly-dcu",
-    nightly=True,
-    disabled="BW1100 quick validation failed: Llama-2 local path is a broken /models symlink in sgl-test, and available TinyLlama LoRA lacks a compatible local base model.",
+    est_time=180,
+    suite="stage-b-test-1-gpu-small-dcu",
 )
 
 from sglang.test.runners import HFRunner, SRTRunner
@@ -64,6 +62,18 @@ DISABLE_CUDA_GRAPH = False
 LORA_TARGET_MODULES = None
 LOGPROB_THRESHOLD = 1e-01
 MAX_NEW_TOKENS = 32
+DCU_BASE_MODEL = os.environ.get(
+    "SGLANG_DCU_LORA_LOGPROB_BASE_MODEL",
+    "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-4B",
+)
+DCU_LORA_PATHS = [
+    os.environ.get(
+        "SGLANG_DCU_LORA_LOGPROB_ADAPTER",
+        "/public/opendas/DL_DATA/llm-models/lora/nissenj/Qwen3-4B-lora-v2",
+    )
+]
+DCU_TEST_PROMPTS = ["SGL is a"]
+DCU_MAX_NEW_TOKENS = 8
 
 # Default test prompts
 DEFAULT_TEST_PROMPTS = [
@@ -78,6 +88,10 @@ DEFAULT_TEST_PROMPTS = [
 DIVIDER_WIDTH = 80
 SECTION_CHAR = "="
 SUBSECTION_CHAR = "-"
+
+
+def _is_dcu() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI_DCU", "0") == "1"
 
 
 def print_section_header(title: str):
@@ -216,6 +230,9 @@ def run_sglang_with_lora(
     disable_cuda_graph: bool,
     lora_target_modules: Optional[List[str]],
     tp_size: int,
+    attention_backend: Optional[str] = None,
+    page_size: Optional[int] = None,
+    mem_fraction_static: float = 0.88,
 ) -> Dict[str, Any]:
     """Run SGLang with LoRA and return log probabilities."""
     config = {
@@ -226,6 +243,8 @@ def run_sglang_with_lora(
         "Port": port,
         "Number of prompts": len(prompts),
         "Tensor parallel size": tp_size,
+        "Attention backend": attention_backend,
+        "Page size": page_size,
     }
     print_config_info("Running SGLang with LoRA", config)
 
@@ -242,8 +261,10 @@ def run_sglang_with_lora(
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=True,
         port=port,
-        mem_fraction_static=0.88,
+        mem_fraction_static=mem_fraction_static,
         lora_target_modules=lora_target_modules,
+        attention_backend=attention_backend,
+        page_size=page_size,
     ) as srt_runner:
         srt_outputs = srt_runner.forward(
             prompts,
@@ -462,6 +483,9 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         disable_cuda_graph: bool = DISABLE_CUDA_GRAPH,
         lora_target_modules: Optional[List[str]] = LORA_TARGET_MODULES,
         tp_size: int = 1,
+        attention_backend: Optional[str] = None,
+        page_size: Optional[int] = None,
+        mem_fraction_static: float = 0.88,
     ):
         """
         Run comparison test between SGLang and HuggingFace with LoRA.
@@ -480,6 +504,9 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             disable_cuda_graph=disable_cuda_graph,
             lora_target_modules=lora_target_modules,
             tp_size=tp_size,
+            attention_backend=attention_backend,
+            page_size=page_size,
+            mem_fraction_static=mem_fraction_static,
         )
 
         # Clear GPU memory
@@ -515,10 +542,27 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
         return results, overall_stats
 
+    def _run_dcu_logprob_smoke(self):
+        self._run_comparison_test(
+            model_path=DCU_BASE_MODEL,
+            lora_paths=DCU_LORA_PATHS,
+            prompts=DCU_TEST_PROMPTS,
+            max_new_tokens=DCU_MAX_NEW_TOKENS,
+            torch_dtype=torch.float16,
+            disable_cuda_graph=True,
+            attention_backend="fa3",
+            page_size=64,
+            mem_fraction_static=0.65,
+        )
+
     def test_lora_logprob_comparison_basic(self):
         """
         Basic test comparing HF and SGLang LoRA logprobs with small model.
         """
+        if _is_dcu():
+            self._run_dcu_logprob_smoke()
+            return
+
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
 
         self._run_comparison_test(
@@ -531,6 +575,9 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Full test comparing HF and SGLang LoRA logprobs with all prompts.
         """
+        if _is_dcu():
+            self.skipTest("DCU uses the local basic LoRA logprob smoke.")
+
         self._run_comparison_test(
             model_path=BASE_MODEL,
             lora_paths=LORA_PATHS,
@@ -542,6 +589,9 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         Test with logprobs chunking enabled and a small chunk size so that
         even short prompts trigger the multi-pass lm_head LoRA path.
         """
+        if _is_dcu():
+            self.skipTest("DCU uses the local basic LoRA logprob smoke.")
+
         saved = {}
         env_overrides = {
             "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "true",

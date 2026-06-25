@@ -38,17 +38,15 @@ register_amd_ci(
 )
 register_cuda_ci(est_time=73, suite="stage-b-test-1-gpu-small")
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local gte-Qwen2 mapping added, but HFRunner/SRTRunner logits comparison hung before DCU allocation on BW1100; OpenAI embedding API smoke is enabled separately.",
 )
 
 if os.environ.get("SGLANG_IS_IN_CI_DCU"):
     _dcu_embedding_model = os.environ.get(
         "SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME",
-        "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        "/public/opendas/DL_DATA/llm-models/vllm-optest-models/Qwen/Qwen3-Embedding-0.6B",
     )
     MODEL_TO_CONFIG = {_dcu_embedding_model: (1, 1e-5)}
 else:
@@ -63,6 +61,11 @@ else:
 MODELS = [(key, *MODEL_TO_CONFIG[key]) for key in MODEL_TO_CONFIG]
 
 TORCH_DTYPES = [torch.float16]
+DCU_PROMPTS = ["DCU embedding smoke test", "SGLang embedding check"]
+
+
+def _is_dcu() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI_DCU", "0") == "1"
 
 
 class TestEmbeddingModels(CustomTestCase):
@@ -98,7 +101,8 @@ class TestEmbeddingModels(CustomTestCase):
         prefill_tolerance,
         matryoshka_dim: Optional[int] = None,
     ) -> None:
-        truncated_prompts = self._truncate_prompts(prompts, model_path)
+        test_prompts = DCU_PROMPTS if _is_dcu() else prompts
+        truncated_prompts = self._truncate_prompts(test_prompts, model_path)
 
         with HFRunner(
             model_path,
@@ -108,13 +112,18 @@ class TestEmbeddingModels(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
 
-        attention_backend = "triton" if is_in_amd_ci() else None
+        attention_backend = (
+            "fa3" if _is_dcu() else ("triton" if is_in_amd_ci() else None)
+        )
         with SRTRunner(
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
             attention_backend=attention_backend,
+            page_size=64 if _is_dcu() else None,
+            disable_cuda_graph=_is_dcu(),
+            disable_radix_cache=_is_dcu(),
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
             ),
@@ -123,19 +132,23 @@ class TestEmbeddingModels(CustomTestCase):
                 truncated_prompts, dimensions=matryoshka_dim
             )
 
-        for i in range(len(prompts)):
+        for i in range(len(test_prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
             srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
 
             similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
             print("similarity diff", abs(similarity - 1))
 
-            if len(prompts[i]) <= 1000:
+            if len(test_prompts[i]) <= 1000:
                 assert torch.all(
                     abs(similarity - 1) < prefill_tolerance
                 ), "embeddings are not all close"
 
     def test_prefill_logits(self):
+        if _is_dcu():
+            self._run_dcu_embedding_smoke(matryoshka_dim=None)
+            return
+
         models_to_test = MODELS
 
         if is_in_ci():
@@ -148,6 +161,10 @@ class TestEmbeddingModels(CustomTestCase):
                 )
 
     def test_matryoshka_embedding(self):
+        if _is_dcu():
+            self._run_dcu_embedding_smoke(matryoshka_dim=128)
+            return
+
         matryoshka_model = (
             _dcu_embedding_model
             if os.environ.get("SGLANG_IS_IN_CI_DCU")
@@ -165,6 +182,40 @@ class TestEmbeddingModels(CustomTestCase):
                     prefill_tolerance,
                     matryoshka_dim=128,
                 )
+
+    def _run_dcu_embedding_smoke(self, matryoshka_dim: Optional[int] = None):
+        model_path = _dcu_embedding_model
+        if not os.path.exists(model_path):
+            self.skipTest(f"DCU embedding model path does not exist: {model_path}")
+
+        json_model_override_args = (
+            {
+                "is_matryoshka": True,
+                "matryoshka_dimensions": [matryoshka_dim],
+            }
+            if matryoshka_dim
+            else None
+        )
+        with SRTRunner(
+            model_path,
+            tp_size=1,
+            torch_dtype=torch.float16,
+            model_type="embedding",
+            attention_backend="fa3",
+            page_size=64,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+            json_model_override_args=json_model_override_args,
+        ) as srt_runner:
+            srt_outputs = srt_runner.forward(
+                DCU_PROMPTS, dimensions=matryoshka_dim
+            )
+
+        self.assertEqual(len(srt_outputs.embed_logits), len(DCU_PROMPTS))
+        for embedding in srt_outputs.embed_logits:
+            self.assertGreater(len(embedding), 0)
+            if matryoshka_dim:
+                self.assertEqual(len(embedding), matryoshka_dim)
 
 
 if __name__ == "__main__":

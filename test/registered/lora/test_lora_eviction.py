@@ -14,6 +14,7 @@
 
 import contextlib
 import multiprocessing as mp
+import os
 import unittest
 from typing import Dict, List, Tuple
 
@@ -21,11 +22,9 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
-    est_time=224,
+    est_time=180,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: LoRA path needs local base/adapter mapping and dedicated BW1100 validation.",
 )
 
 from sglang.test.runners import SRTRunner
@@ -50,6 +49,28 @@ ADAPTERS = [
 ]
 
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+DCU_BASE_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-4B"
+DCU_ADAPTERS = [
+    "/public/opendas/DL_DATA/llm-models/lora/nissenj/Qwen3-4B-lora-v2",
+    "/public/opendas/DL_DATA/llm-models/lora/TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0",
+]
+DCU_PROMPTS = [
+    "Write one sentence about Paris.",
+    "写一句关于人工智能的话。",
+]
+DCU_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
+def _is_dcu() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI_DCU", "0") == "1"
 
 
 @contextlib.contextmanager
@@ -71,8 +92,9 @@ class TestLoRAEviction(CustomTestCase):
         that the outputs of the same (adapter, prompt) pair are consistent across runs.
         """
         output_history = {}
-        self._run_test(ADAPTERS, output_history, reverse=False)
-        self._run_test(ADAPTERS, output_history, reverse=True)
+        lora_paths = DCU_ADAPTERS if _is_dcu() else ADAPTERS
+        self._run_test(lora_paths, output_history, reverse=False)
+        self._run_test(lora_paths, output_history, reverse=True)
 
     def test_lora_eviction_with_reused_lora_name(self):
         """
@@ -82,8 +104,9 @@ class TestLoRAEviction(CustomTestCase):
         works correctly when reusing LoRA names.
         """
         output_history = {}
-        self._run_test(ADAPTERS, output_history, reuse_lora_name=True, repeat=1)
-        self._run_test(ADAPTERS, output_history, reuse_lora_name=False, repeat=1)
+        lora_paths = DCU_ADAPTERS if _is_dcu() else ADAPTERS
+        self._run_test(lora_paths, output_history, reuse_lora_name=True, repeat=1)
+        self._run_test(lora_paths, output_history, reuse_lora_name=False, repeat=1)
 
     def _run_test(
         self,
@@ -94,22 +117,33 @@ class TestLoRAEviction(CustomTestCase):
         reuse_lora_name: bool = False,
     ):
         REUSED_LORA_NAME = "lora"
-        max_new_tokens = 256
+        max_new_tokens = 16 if _is_dcu() else 256
         torch_dtype = torch.float16
-        base_path = BASE_MODEL
+        base_path = DCU_BASE_MODEL if _is_dcu() else BASE_MODEL
+        prompts = DCU_PROMPTS if _is_dcu() else PROMPTS
         assert len(lora_paths) >= 2
+        if _is_dcu():
+            for path in [base_path, *lora_paths]:
+                if not os.path.exists(path):
+                    self.skipTest(f"DCU LoRA eviction path does not exist: {path}")
 
         initial_lora_paths = lora_paths if not reuse_lora_name else None
+        max_loras_per_batch = 1 if not reuse_lora_name else 2
         # Initialize runners
         with SRTRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
             lora_paths=initial_lora_paths,
-            max_loras_per_batch=1,
+            max_loras_per_batch=max_loras_per_batch,
             enable_lora=True,
-            max_lora_rank=256,
-            lora_target_modules=["all"],
+            max_lora_rank=32 if _is_dcu() else 256,
+            lora_target_modules=DCU_LORA_TARGET_MODULES if _is_dcu() else ["all"],
+            disable_cuda_graph=_is_dcu(),
+            disable_radix_cache=_is_dcu(),
+            attention_backend="fa3" if _is_dcu() else None,
+            page_size=64 if _is_dcu() else None,
+            mem_fraction_static=0.65,
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 
@@ -126,7 +160,7 @@ class TestLoRAEviction(CustomTestCase):
                         else contextlib.nullcontext()
                     )
                     with context:
-                        for prompt in PROMPTS:
+                        for prompt in prompts:
                             print("\nprompt:\n", prompt)
                             srt_outputs = srt_runner.forward(
                                 [prompt],

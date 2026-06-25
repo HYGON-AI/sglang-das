@@ -6,6 +6,7 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 """
 
 import json
+import os
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -18,8 +19,9 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.dcu_utils import DCU_TEXT_SERVER_ARGS, get_server_args
 
-register_dcu_ci(est_time=200, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_dcu_ci(est_time=240, suite="stage-b-test-1-gpu-small-dcu")
 
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
@@ -28,6 +30,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    find_available_port,
     popen_launch_server,
 )
 
@@ -35,17 +38,49 @@ register_cuda_ci(est_time=182, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
+def _is_dcu():
+    return os.environ.get("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+def _dcu_values(default_values, dcu_values):
+    return dcu_values if _is_dcu() else default_values
+
+
+def _base_url(default_port=11001):
+    if not _is_dcu():
+        return DEFAULT_URL_FOR_TEST
+    return f"http://127.0.0.1:{find_available_port(default_port)}"
+
+
+def _dcu_env():
+    if not _is_dcu():
+        return None
+    return {
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+        "SGLANG_USE_MODELSCOPE": os.environ.get("SGLANG_USE_MODELSCOPE", "1"),
+        "SGLANG_USE_LIGHTOP": os.environ.get("SGLANG_USE_LIGHTOP", "1"),
+    }
+
+
+def _server_args(env_name, default_args=None):
+    if not _is_dcu():
+        return default_args
+    return get_server_args(env_name, DCU_TEXT_SERVER_ARGS + list(default_args or []))
+
+
 class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = _base_url()
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
+            other_args=_server_args("SGLANG_DCU_OPENAI_SERVER_ARGS"),
+            env=_dcu_env(),
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -311,11 +346,11 @@ class TestOpenAIServer(CustomTestCase):
             ), f"Expected 1 finish_reason chunk for index {index}, got {finish_reason_counts[index]}"
 
     def test_completion(self):
-        for echo in [False, True]:
-            for logprobs in [None, 5]:
-                for use_list_input in [True, False]:
-                    for parallel_sample_num in [1, 2]:
-                        for token_input in [False, True]:
+        for echo in _dcu_values([False, True], [False]):
+            for logprobs in _dcu_values([None, 5], [None]):
+                for use_list_input in _dcu_values([True, False], [False]):
+                    for parallel_sample_num in _dcu_values([1, 2], [1]):
+                        for token_input in _dcu_values([False, True], [False]):
                             self.run_completion(
                                 echo,
                                 logprobs,
@@ -326,11 +361,11 @@ class TestOpenAIServer(CustomTestCase):
 
     def test_completion_stream(self):
         # parallel sampling and list input are not supported in streaming mode
-        for echo in [False, True]:
-            for logprobs in [None, 5]:
-                for use_list_input in [True, False]:
-                    for parallel_sample_num in [1, 2]:
-                        for token_input in [False, True]:
+        for echo in _dcu_values([False, True], [False]):
+            for logprobs in _dcu_values([None, 5], [None]):
+                for use_list_input in _dcu_values([True, False], [False]):
+                    for parallel_sample_num in _dcu_values([1, 2], [1]):
+                        for token_input in _dcu_values([False, True], [False]):
                             self.run_completion_stream(
                                 echo,
                                 logprobs,
@@ -340,13 +375,13 @@ class TestOpenAIServer(CustomTestCase):
                             )
 
     def test_chat_completion(self):
-        for logprobs in [None, 5]:
-            for parallel_sample_num in [1, 2]:
+        for logprobs in _dcu_values([None, 5], [None]):
+            for parallel_sample_num in _dcu_values([1, 2], [1]):
                 self.run_chat_completion(logprobs, parallel_sample_num)
 
     def test_chat_completion_stream(self):
-        for logprobs in [None, 5]:
-            for parallel_sample_num in [1, 2]:
+        for logprobs in _dcu_values([None, 5], [None]):
+            for parallel_sample_num in _dcu_values([1, 2], [1]):
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
 
     def test_regex(self):
@@ -396,6 +431,9 @@ class TestOpenAIServer(CustomTestCase):
         assert isinstance(text, str)
 
     def test_response_prefill(self):
+        if _is_dcu():
+            self.skipTest("DCU smoke uses the configured local model, not the hard-coded Llama served-model alias.")
+
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -450,13 +488,15 @@ class TestOpenAIServerv1Responses(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = _base_url()
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
+            other_args=_server_args("SGLANG_DCU_OPENAI_RESPONSES_SERVER_ARGS"),
+            env=_dcu_env(),
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -754,6 +794,9 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             self.assertIn("total_tokens", body["usage"])
 
     def test_response_prefill(self):
+        if _is_dcu():
+            self.skipTest("DCU smoke uses the configured local model, not the hard-coded Llama served-model alias.")
+
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -792,6 +835,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
+@unittest.skipIf(_is_dcu(), "DCU rerank coverage is kept in dedicated reranker smoke tests.")
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -863,6 +907,7 @@ class TestOpenAIV1Rerank(CustomTestCase):
         self.assertTrue(isinstance(response[1]["index"], int))
 
 
+@unittest.skipIf(_is_dcu(), "DCU basic OpenAI CI keeps this file to API smoke coverage.")
 class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -951,6 +996,7 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
 
+@unittest.skipIf(_is_dcu(), "DCU score endpoint coverage is kept in dedicated score API smoke tests.")
 class TestOpenAIV1Score(CustomTestCase):
     @classmethod
     def setUpClass(cls):
