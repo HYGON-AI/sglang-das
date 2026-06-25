@@ -379,7 +379,7 @@ def dispatch_custom_allreduce():
     if _use_amd_deterministic_impl():
         return CustomAllreduce
 
-    if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+    if get_bool_env_var("SGLANG_USE_AITER_AR", default="false"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
