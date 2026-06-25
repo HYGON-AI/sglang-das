@@ -33,7 +33,7 @@ cd sgl-kernel
 python setup_hip.py install
 
 1. 编译whl包并安装
-python setup.py bdist_wheel 
+python setup.py bdist_wheel
 cd dist
 pip install sglang*
 
@@ -104,7 +104,7 @@ mc_topo.config
 ```
 **DeepSeek-R1-Channel-INT8 模型示例**
 
-##### prefill 
+##### prefill
 ```bash
 python -m sglang.launch_server \
   --model-path DeepSeek-R1-Channel-INT8 \
@@ -119,10 +119,10 @@ python -m sglang.launch_server \
   --tp-size 2 \
   --pp-size 4 \
   --mem-fraction-static 0.9 \
-  --attention-backend dcu_mla 
+  --attention-backend dcu_mla
 ```
 
-##### decode  
+##### decode
 ```bash
 python -m sglang.launch_server \
   --model-path DeepSeek-R1-Channel-INT8  \
@@ -159,7 +159,7 @@ curl -X POST http://localhost:30002/v1/completions \
 #### low_latency （使用deepep）
 prefill部分同上面normal部分的prefill
 
-##### decode  
+##### decode
 ```bash
 # deep_ep
 #export ROCSHMEM_DISABLE_HDP_FLUSH=1 #xdp使用
