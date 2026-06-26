@@ -3,7 +3,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu",
     nightly=True,
-    disabled="DCU LoRA/HiCache path needs local model/storage mapping and dedicated validation.",
+    disabled="DCU LoRA/HiCache path still triggers BW1100 HiCache runtime/kernel VMFault even with local Qwen3 smoke.",
 )
 
 

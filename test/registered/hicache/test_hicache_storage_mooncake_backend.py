@@ -10,7 +10,7 @@ import time
 import unittest
 
 import requests
-from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
+from registered.hicache.test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 

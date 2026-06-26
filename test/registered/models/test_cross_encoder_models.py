@@ -19,7 +19,7 @@ register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local bge-reranker-base mapping added, but HFRunner/SRTRunner cross-encoder comparison hung before DCU allocation on BW1100.",
+    disabled="DCU Stage-B deferred: local bge-reranker-base SRT smoke reaches cross-encoder forward but triggers BW1100 VMFault/torch_native attention shape mismatch.",
 )
 
 if os.environ.get("SGLANG_IS_IN_CI_DCU"):
@@ -27,7 +27,7 @@ if os.environ.get("SGLANG_IS_IN_CI_DCU"):
         (
             os.environ.get(
                 "SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME",
-                "BAAI/bge-reranker-base",
+                "/public/opendas/DL_DATA/llm-models/vllm-optest-models/BAAI/bge-reranker-base",
             ),
             1,
             1e-2,

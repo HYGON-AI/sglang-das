@@ -1,3 +1,4 @@
+import os
 import unittest
 from typing import Dict, List
 
@@ -17,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
+    find_available_port,
     popen_launch_server,
 )
 
@@ -25,10 +27,14 @@ register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=32,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: metrics endpoint starts with local Qwen3-0.6B on BW1100, but metrics output is missing sglang:cached_tokens_total; needs metrics/runtime validation before required CI.",
 )
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
+_DCU_MODEL_NAME = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B"
+
+
+def _is_dcu():
+    return os.getenv("SGLANG_IS_IN_CI_DCU") == "1"
 
 
 class TestEnableMetrics(CustomTestCase):
@@ -41,7 +47,7 @@ class TestEnableMetrics(CustomTestCase):
 
     def test_metrics_2gpu(self):
         # TODO enable when we have 2-gpu runner in nightly CI
-        if is_in_ci():
+        if is_in_ci() or _is_dcu():
             print("Skip test_metrics_2gpu since in 1-gpu CI")
             return
 
@@ -79,30 +85,57 @@ class TestEnableMetrics(CustomTestCase):
         )
 
     def _execute_core(self, other_args, verify_metrics_extra):
+        model_name = _DCU_MODEL_NAME if _is_dcu() else _MODEL_NAME
+        base_url = (
+            f"http://127.0.0.1:{find_available_port(11001)}"
+            if _is_dcu()
+            else DEFAULT_URL_FOR_TEST
+        )
+        dcu_args = []
+        if _is_dcu():
+            dcu_args = [
+                "--attention-backend",
+                "fa3",
+                "--page-size",
+                "64",
+                "--trust-remote-code",
+                "--max-total-tokens",
+                "1024",
+                "--disable-cuda-graph",
+            ]
+
         with (
             envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
             envs.SGLANG_TEST_RETRACT.override(True),
         ):
             process = popen_launch_server(
-                _MODEL_NAME,
-                DEFAULT_URL_FOR_TEST,
+                model_name,
+                base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args],
+                other_args=[
+                    "--enable-metrics",
+                    "--cuda-graph-max-bs",
+                    "2",
+                    *dcu_args,
+                    *other_args,
+                ],
             )
 
         try:
             # Make some requests to generate some metrics
-            response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
+            response = requests.get(f"{base_url}/health_generate")
             self.assertEqual(response.status_code, 200)
 
+            batch_size = 4 if _is_dcu() else 20
+            max_new_tokens = 8 if _is_dcu() else 50
             response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
+                f"{base_url}/generate",
                 json={
-                    "text": ["The capital of France is"] * 20,
+                    "text": ["The capital of France is"] * batch_size,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 50,
+                        "max_new_tokens": max_new_tokens,
                     },
                     "stream": True,
                     "ignore_eos": True,
@@ -112,8 +145,19 @@ class TestEnableMetrics(CustomTestCase):
             for _ in response.iter_lines(decode_unicode=False):
                 pass
 
+            cached_prompt = "The capital of France is known for " * 80
+            for _ in range(2):
+                response = requests.post(
+                    f"{base_url}/generate",
+                    json={
+                        "text": cached_prompt,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+
             response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
+                f"{base_url}/generate",
                 json={
                     "text": "Hello",
                     "sampling_params": {"temperature": 0, "max_new_tokens": 5},
@@ -123,20 +167,20 @@ class TestEnableMetrics(CustomTestCase):
             self.assertEqual(response.status_code, 200)
 
             # Get metrics
-            metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
+            metrics_response = requests.get(f"{base_url}/metrics")
             self.assertEqual(metrics_response.status_code, 200)
             metrics_text = metrics_response.text
 
             print(f"metrics_text=\n{metrics_text}")
 
             metrics = _parse_prometheus_metrics(metrics_text)
-            self._verify_metrics_common(metrics_text, metrics)
+            self._verify_metrics_common(metrics_text, metrics, model_name)
             if verify_metrics_extra is not None:
                 verify_metrics_extra(metrics)
         finally:
             kill_process_tree(process.pid)
 
-    def _verify_metrics_common(self, metrics_text, metrics):
+    def _verify_metrics_common(self, metrics_text, metrics, model_name):
         essential_metrics = [
             "sglang:num_running_reqs",
             "sglang:num_used_tokens",
@@ -177,7 +221,7 @@ class TestEnableMetrics(CustomTestCase):
                 f"{metric_name}: Expected {expected_buckets} buckets, got {len(gt_le_pairs)}",
             )
 
-        self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_text)
+        self.assertIn(f'model_name="{model_name}"', metrics_text)
         self.assertIn("_sum{", metrics_text)
         self.assertIn("_count{", metrics_text)
         self.assertIn("_bucket{", metrics_text)
@@ -185,10 +229,18 @@ class TestEnableMetrics(CustomTestCase):
         metrics_to_check = [
             ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
+        if not _is_dcu():
+            metrics_to_check.extend(
+                [
+                    (
+                        "sglang:gpu_execution_seconds_total",
+                        {"category": "forward_extend"},
+                    ),
+                    ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+                ]
+            )
         _check_metrics_positive(self, metrics, metrics_to_check)
 
 

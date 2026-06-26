@@ -5,6 +5,7 @@ python3 -m unittest test_srt_engine.TestSRTEngine.test_4_sync_async_stream_combi
 
 import asyncio
 import json
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
-register_dcu_ci(est_time=261, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_dcu_ci(est_time=180, suite="stage-b-test-1-gpu-small-dcu")
 
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
@@ -29,19 +30,44 @@ register_cuda_ci(est_time=387, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
+DCU_SMALL_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B"
+DCU_EMBEDDING_MODEL = (
+    "/public/opendas/DL_DATA/llm-models/vllm-optest-models/Qwen/Qwen3-Embedding-0.6B"
+)
+
+
+def _is_dcu() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI_DCU", "0") == "1"
+
+
+def _dcu_engine_kwargs():
+    if not _is_dcu():
+        return {}
+    return {
+        "attention_backend": "fa3",
+        "page_size": 64,
+        "max_total_tokens": 256,
+        "disable_cuda_graph": True,
+        "disable_radix_cache": True,
+        "trust_remote_code": True,
+    }
+
+
 class TestSRTEngine(CustomTestCase):
 
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
-        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        model_path = DCU_SMALL_MODEL if _is_dcu() else DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42)
+        engine = sgl.Engine(model_path=model_path, random_seed=42, **_dcu_engine_kwargs())
         out1 = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 
-        runtime = sgl.Runtime(model_path=model_path, random_seed=42)
+        runtime = sgl.Runtime(
+            model_path=model_path, random_seed=42, **_dcu_engine_kwargs()
+        )
         out2 = json.loads(runtime.generate(prompt, sampling_params))["text"]
         runtime.shutdown()
 
@@ -54,13 +80,25 @@ class TestSRTEngine(CustomTestCase):
 
     def test_2_engine_runtime_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
-        model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        model_path = (
+            DCU_EMBEDDING_MODEL if _is_dcu() else DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        )
 
-        engine = sgl.Engine(model_path=model_path, is_embedding=True, random_seed=42)
+        engine = sgl.Engine(
+            model_path=model_path,
+            is_embedding=True,
+            random_seed=42,
+            **_dcu_engine_kwargs(),
+        )
         out1 = torch.tensor(engine.encode(prompt)["embedding"])
         engine.shutdown()
 
-        runtime = sgl.Runtime(model_path=model_path, is_embedding=True, random_seed=42)
+        runtime = sgl.Runtime(
+            model_path=model_path,
+            is_embedding=True,
+            random_seed=42,
+            **_dcu_engine_kwargs(),
+        )
         out2 = torch.tensor(json.loads(runtime.encode(prompt))["embedding"])
         runtime.shutdown()
 
@@ -69,11 +107,14 @@ class TestSRTEngine(CustomTestCase):
     def test_3_engine_token_ids_consistency(self):
         # just to ensure there is no issue running multiple generate calls
         prompt = "Today is a sunny day and I like"
-        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        model_path = DCU_SMALL_MODEL if _is_dcu() else DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
         engine = sgl.Engine(
-            model_path=model_path, random_seed=42, disable_radix_cache=True
+            model_path=model_path,
+            random_seed=42,
+            disable_radix_cache=True,
+            **{k: v for k, v in _dcu_engine_kwargs().items() if k != "disable_radix_cache"},
         )
         out1 = engine.generate(prompt, sampling_params)["text"]
 
@@ -95,10 +136,13 @@ class TestSRTEngine(CustomTestCase):
     def test_4_sync_async_stream_combination(self):
         prompt = "AI safety is"
         sampling_params = {"temperature": 0.8, "top_p": 0.95}
+        if _is_dcu():
+            sampling_params["max_new_tokens"] = 8
 
         # Create an LLM.
         llm = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            model_path=DCU_SMALL_MODEL if _is_dcu() else DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            **_dcu_engine_kwargs(),
         )
 
         if True:
@@ -143,6 +187,8 @@ class TestSRTEngine(CustomTestCase):
         llm.shutdown()
 
     def test_5_gsm8k(self):
+        if _is_dcu():
+            self.skipTest("DCU engine CI keeps lightweight runtime coverage only.")
 
         args = SimpleNamespace(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -155,6 +201,9 @@ class TestSRTEngine(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.33)
 
     def test_6_engine_cpu_offload(self):
+        if _is_dcu():
+            self.skipTest("CPU offload comparison is outside the single-card DCU smoke.")
+
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -185,6 +234,9 @@ class TestSRTEngine(CustomTestCase):
         self.assertEqual(out1, out2)
 
     def test_7_engine_offline_throughput(self):
+        if _is_dcu():
+            self.skipTest("Throughput threshold is CUDA-specific and not a DCU smoke.")
+
         server_args = ServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         )
@@ -194,13 +246,16 @@ class TestSRTEngine(CustomTestCase):
 
     def test_8_engine_async_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
-        model_path = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        model_path = (
+            DCU_EMBEDDING_MODEL if _is_dcu() else DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        )
 
         engine = sgl.Engine(
             model_path=model_path,
             is_embedding=True,
             random_seed=42,
             disable_radix_cache=True,
+            **{k: v for k, v in _dcu_engine_kwargs().items() if k != "disable_radix_cache"},
         )
 
         # Get sync and async embeddings

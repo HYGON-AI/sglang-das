@@ -570,18 +570,22 @@ class Gemma3TextModel(PreTrainedModel):
         rope_params = config.rope_parameters
         if isinstance(rope_params, dict) and "full_attention" in rope_params:
             global_theta = rope_params["full_attention"].get("rope_theta", 1000000.0)
+            global_factor = rope_params["full_attention"].get("factor", 1.0)
             local_theta = rope_params["sliding_attention"].get("rope_theta", 10000.0)
         else:
             # v4 flat format fallback
             global_theta = (
                 rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
             )
+            global_factor = (
+                rope_params.get("factor", 1.0) if isinstance(rope_params, dict) else 1.0
+            )
             local_theta = getattr(config, "rope_local_base_freq", 10000.0)
 
         global_config = copy.deepcopy(config)
         global_config.rope_parameters = {
             "rope_theta": global_theta,
-            "factor": config.rope_parameters["full_attention"]["factor"],
+            "factor": global_factor,
             "rope_type": "linear",
         }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)

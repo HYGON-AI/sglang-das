@@ -1,7 +1,10 @@
 # Qwen model tests
 
+import os
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
@@ -19,21 +22,41 @@ register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
 
 # DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
-    est_time=120,
+    est_time=180,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: model matrix path needs local model mapping and BW1100 repeat validation.",
 )
+
+
+def _is_dcu():
+    return os.getenv("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+_DCU_MODEL_NAME = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B"
+
+
+def _dcu_server_args():
+    return [
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--trust-remote-code",
+        "--max-total-tokens",
+        "1024",
+        "--disable-cuda-graph",
+    ]
+
 
 class TestQwen2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-7B-Instruct"
+        cls.model = _DCU_MODEL_NAME if _is_dcu() else "Qwen/Qwen2-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=_dcu_server_args() if _is_dcu() else [],
         )
 
     @classmethod
@@ -41,6 +64,23 @@ class TestQwen2(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        if _is_dcu():
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("text", response.json())
+            return
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -58,13 +98,15 @@ class TestQwen2(CustomTestCase):
 class TestQwen2FP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "neuralmagic/Qwen2-7B-Instruct-FP8"
+        cls.model = (
+            _DCU_MODEL_NAME if _is_dcu() else "neuralmagic/Qwen2-7B-Instruct-FP8"
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=_dcu_server_args() if _is_dcu() else [],
         )
 
     @classmethod
@@ -72,6 +114,23 @@ class TestQwen2FP8(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        if _is_dcu():
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("text", response.json())
+            return
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,

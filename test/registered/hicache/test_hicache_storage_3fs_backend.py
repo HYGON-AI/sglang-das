@@ -8,7 +8,7 @@ import json
 import os
 import unittest
 
-from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
+from registered.hicache.test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
@@ -92,7 +92,9 @@ class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase
 
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
-        from test_hicache_storage_file_backend import run_eval_accuracy_test
+        from registered.hicache.test_hicache_storage_file_backend import (
+            run_eval_accuracy_test,
+        )
 
         run_eval_accuracy_test(self)
 
