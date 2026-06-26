@@ -7,7 +7,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_dcu_ci
 from sglang.test.dcu_utils import repo_root_from_test_file
 
-register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=2400, suite="nightly-dcu-core-functional", nightly=True)
 
 SMOKE_KERNEL_TESTS = [
     "tests/speculative/test_eagle_utils.py",

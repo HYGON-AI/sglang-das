@@ -196,6 +196,14 @@ NIGHTLY_SUITES = {
         "nightly-dcu-accuracy",
         "nightly-dcu-perf",
         "nightly-dcu-vlm",
+        "nightly-dcu-core-functional",
+        "nightly-dcu-accuracy-text",
+        "nightly-dcu-perf-text",
+        "nightly-dcu-large-model-4gpu",
+        "nightly-dcu-large-model-8gpu",
+        "nightly-dcu-quant-opt",
+        "nightly-dcu-functional-long",
+        "nightly-dcu-api-models",
     ],
 }
 

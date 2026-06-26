@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_dcu_ci(est_time=3600, suite="nightly-dcu-accuracy", nightly=True)
+register_dcu_ci(est_time=3600, suite="nightly-dcu-accuracy-text", nightly=True)
 
 DEFAULT_DCU_SERVER_ARGS = [
     "--attention-backend",
