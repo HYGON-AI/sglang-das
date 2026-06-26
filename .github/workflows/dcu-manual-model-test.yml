@@ -34,17 +34,17 @@ on:
         type: string
         default: ""
       eval_num_examples:
-        description: "Optional shared sample count for DCU accuracy evals. Use a small value such as 10 for quick validation. Empty uses test defaults."
+        description: "Accuracy-only. Shared sample count for GSM8K/MMLU tests in nightly-dcu-accuracy. Empty uses test defaults."
         required: false
         type: string
         default: ""
       gsm8k_num_examples:
-        description: "Optional GSM8K sample count override. Empty uses eval_num_examples or the test default."
+        description: "Accuracy-only. GSM8K sample count override for nightly-dcu-accuracy. Empty uses eval_num_examples or the test default."
         required: false
         type: string
         default: ""
       mmlu_num_examples:
-        description: "Optional MMLU sample count override. Empty uses eval_num_examples or the test default."
+        description: "Accuracy-only. MMLU sample count override for nightly-dcu-accuracy. Empty uses eval_num_examples or the test default."
         required: false
         type: string
         default: ""
