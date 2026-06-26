@@ -24,7 +24,7 @@ on:
         type: string
         default: ""
       extra_test_env:
-        description: "Optional extra env vars for the test process. Accepts export KEY=VALUE; separate multiple vars with semicolons. Example: export SGLANG_DCU_GSM8K_NUM_SHOTS=5"
+        description: "Optional extra env vars for the test process. Accepts KEY=VALUE or export KEY=VALUE; separate multiple vars with semicolons. Example: export SGLANG_DCU_GSM8K_NUM_SHOTS=5"
         required: false
         type: string
         default: ""
@@ -360,24 +360,6 @@ jobs:
             test_env_cmd+=("SGLANG_DCU_GSM8K_MODEL=${INPUT_MODEL_NAME}")
             test_env_cmd+=("SGLANG_DCU_MMLU_MODEL=${INPUT_MODEL_NAME}")
           fi
-          f [[ -n "${INPUT_EXTRA_TEST_ENV}" ]]; then
-            while IFS= read -r extra_env_line; do
-              extra_env_line="${extra_env_line#"${extra_env_line%%[![:space:]]*}"}"
-              extra_env_line="${extra_env_line%"${extra_env_line##*[![:space:]]}"}"
-              [[ -z "${extra_env_line}" || "${extra_env_line}" == \#* ]] && continue
-
-              extra_env_line="${extra_env_line#export }"
-              extra_env_line="${extra_env_line%;}"
-
-              if [[ ! "${extra_env_line}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-                echo "::error::Invalid extra_test_env entry: ${extra_env_line}"
-                echo "::error::Use KEY=VALUE or export KEY=VALUE; separate multiple entries with semicolons."
-                exit 1
-              fi
-
-              test_env_cmd+=("${extra_env_line}")
-            done < <(printf '%s\n' "${INPUT_EXTRA_TEST_ENV}" | tr ';' '\n')
-          fi
           if [[ -n "${INPUT_EVAL_NUM_EXAMPLES}" ]]; then
             test_env_cmd+=("SGLANG_DCU_EVAL_NUM_EXAMPLES=${INPUT_EVAL_NUM_EXAMPLES}")
           fi
@@ -395,6 +377,24 @@ jobs:
           fi
           if [[ -n "${INPUT_MMLU_THRESHOLD}" ]]; then
             test_env_cmd+=("SGLANG_DCU_MMLU_THRESHOLD=${INPUT_MMLU_THRESHOLD}")
+          fi
+          if [[ -n "${INPUT_EXTRA_TEST_ENV}" ]]; then
+            while IFS= read -r extra_env_line; do
+              extra_env_line="${extra_env_line#"${extra_env_line%%[![:space:]]*}"}"
+              extra_env_line="${extra_env_line%"${extra_env_line##*[![:space:]]}"}"
+              [[ -z "${extra_env_line}" || "${extra_env_line}" == \#* ]] && continue
+
+              extra_env_line="${extra_env_line#export }"
+              extra_env_line="${extra_env_line%;}"
+
+              if [[ ! "${extra_env_line}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+                echo "::error::Invalid extra_test_env entry: ${extra_env_line}"
+                echo "::error::Use KEY=VALUE or export KEY=VALUE; separate multiple entries with semicolons."
+                exit 1
+              fi
+
+              test_env_cmd+=("${extra_env_line}")
+            done < <(printf '%s\n' "${INPUT_EXTRA_TEST_ENV}" | tr ';' '\n')
           fi
 
           exec_cmd=(
