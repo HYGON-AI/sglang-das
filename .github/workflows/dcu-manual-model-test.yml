@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: ""
+      model_names:
+        description: "Optional model paths to test sequentially; separate multiple models with semicolons. If set, this overrides model_name."
+        required: false
+        type: string
+        default: ""
       extra_test_env:
         description: "Optional extra env vars for the test process. Accepts KEY=VALUE or export KEY=VALUE; separate multiple vars with semicolons. Example: export SGLANG_DCU_GSM8K_NUM_SHOTS=5"
         required: false
@@ -121,6 +126,7 @@ jobs:
       INPUT_SUITE: ${{ inputs.suite || '' }}
       INPUT_INCLUDE_FILE: ${{ inputs.include_file || '' }}
       INPUT_MODEL_NAME: ${{ inputs.model_name || '' }}
+      INPUT_MODEL_NAMES: ${{ inputs.model_names || '' }}
       INPUT_EXTRA_TEST_ENV: ${{ inputs.extra_test_env || '' }}
       INPUT_EVAL_NUM_EXAMPLES: ${{ inputs.eval_num_examples || '' }}
       INPUT_GSM8K_NUM_EXAMPLES: ${{ inputs.gsm8k_num_examples || '' }}
@@ -267,8 +273,10 @@ jobs:
           if [[ -n "${INPUT_AUTO_PARTITION_ID}" && -n "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
             partition="${INPUT_AUTO_PARTITION_ID}/${INPUT_AUTO_PARTITION_SIZE}"
           fi
-          model_note="${INPUT_MODEL_NAME:-not set}"
-          if [[ -n "${INPUT_MODEL_NAME}" ]]; then
+          model_note="test default"
+          if [[ -n "${INPUT_MODEL_NAMES}" ]]; then
+            model_note="${INPUT_MODEL_NAMES} (sequential; semicolon separated; overrides model_name)"
+          elif [[ -n "${INPUT_MODEL_NAME}" ]]; then
             model_note="${INPUT_MODEL_NAME} (passed as SGLANG_DCU_GSM8K_MODEL, SGLANG_DCU_MMLU_MODEL, and SGLANG_TEST_DEFAULT_MODEL_NAME)"
           fi
 
@@ -354,29 +362,24 @@ jobs:
             run_suite_cmd+=(--auto-partition-size "${INPUT_AUTO_PARTITION_SIZE}")
           fi
 
-          test_env_cmd=(env)
-          if [[ -n "${INPUT_MODEL_NAME}" ]]; then
-            test_env_cmd+=("SGLANG_TEST_DEFAULT_MODEL_NAME=${INPUT_MODEL_NAME}")
-            test_env_cmd+=("SGLANG_DCU_GSM8K_MODEL=${INPUT_MODEL_NAME}")
-            test_env_cmd+=("SGLANG_DCU_MMLU_MODEL=${INPUT_MODEL_NAME}")
-          fi
+          base_test_env_cmd=(env)
           if [[ -n "${INPUT_EVAL_NUM_EXAMPLES}" ]]; then
-            test_env_cmd+=("SGLANG_DCU_EVAL_NUM_EXAMPLES=${INPUT_EVAL_NUM_EXAMPLES}")
+            base_test_env_cmd+=("SGLANG_DCU_EVAL_NUM_EXAMPLES=${INPUT_EVAL_NUM_EXAMPLES}")
           fi
           if [[ -n "${INPUT_GSM8K_NUM_EXAMPLES}" ]]; then
-            test_env_cmd+=("SGLANG_DCU_GSM8K_NUM_EXAMPLES=${INPUT_GSM8K_NUM_EXAMPLES}")
+            base_test_env_cmd+=("SGLANG_DCU_GSM8K_NUM_EXAMPLES=${INPUT_GSM8K_NUM_EXAMPLES}")
           fi
           if [[ -n "${INPUT_MMLU_NUM_EXAMPLES}" ]]; then
-            test_env_cmd+=("SGLANG_DCU_MMLU_NUM_EXAMPLES=${INPUT_MMLU_NUM_EXAMPLES}")
+            base_test_env_cmd+=("SGLANG_DCU_MMLU_NUM_EXAMPLES=${INPUT_MMLU_NUM_EXAMPLES}")
           fi
           if [[ -n "${INPUT_MMLU_NUM_THREADS}" ]]; then
-            test_env_cmd+=("SGLANG_DCU_MMLU_NUM_THREADS=${INPUT_MMLU_NUM_THREADS}")
+            base_test_env_cmd+=("SGLANG_DCU_MMLU_NUM_THREADS=${INPUT_MMLU_NUM_THREADS}")
           fi
           if [[ -n "${INPUT_GSM8K_THRESHOLD}" ]]; then
-            test_env_cmd+=("SGLANG_DCU_GSM8K_THRESHOLD=${INPUT_GSM8K_THRESHOLD}")
+            base_test_env_cmd+=("SGLANG_DCU_GSM8K_THRESHOLD=${INPUT_GSM8K_THRESHOLD}")
           fi
           if [[ -n "${INPUT_MMLU_THRESHOLD}" ]]; then
-            test_env_cmd+=("SGLANG_DCU_MMLU_THRESHOLD=${INPUT_MMLU_THRESHOLD}")
+            base_test_env_cmd+=("SGLANG_DCU_MMLU_THRESHOLD=${INPUT_MMLU_THRESHOLD}")
           fi
           if [[ -n "${INPUT_EXTRA_TEST_ENV}" ]]; then
             while IFS= read -r extra_env_line; do
@@ -393,30 +396,36 @@ jobs:
                 exit 1
               fi
 
-              test_env_cmd+=("${extra_env_line}")
+              base_test_env_cmd+=("${extra_env_line}")
             done < <(printf '%s\n' "${INPUT_EXTRA_TEST_ENV}" | tr ';' '\n')
           fi
 
-          exec_cmd=(
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh"
-            --container-name "${DCU_CI_CONTAINER_NAME}"
-            -w /sglang-checkout/test
-            -- "${test_env_cmd[@]}" "${run_suite_cmd[@]}"
-          )
+          models_to_test=()
+          if [[ -n "${INPUT_MODEL_NAMES}" ]]; then
+            while IFS= read -r model_item; do
+              model_item="${model_item#"${model_item%%[![:space:]]*}"}"
+              model_item="${model_item%"${model_item##*[![:space:]]}"}"
+              [[ -z "${model_item}" ]] && continue
+              models_to_test+=("${model_item}")
+            done < <(printf '%s\n' "${INPUT_MODEL_NAMES}" | tr ';' '\n')
+          elif [[ -n "${INPUT_MODEL_NAME}" ]]; then
+            models_to_test+=("${INPUT_MODEL_NAME}")
+          else
+            models_to_test+=("")
+          fi
 
-          {
-            printf '%q ' "${exec_cmd[@]}"
-            echo
-          } | tee "${DCU_MANUAL_LOG_DIR}/command.txt"
+          if [[ "${#models_to_test[@]}" -eq 0 ]]; then
+            echo "::error::model_names was set, but no non-empty model path was found."
+            exit 1
+          fi
+
+          : > "${DCU_MANUAL_LOG_DIR}/command.txt"
 
           {
             echo ""
-            echo "### Final Command"
+            echo "### Final Commands"
             echo ""
             echo '```bash'
-            cat "${DCU_MANUAL_LOG_DIR}/command.txt"
-            echo '```'
-            echo ""
           } | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
 
           echo "===== Manual DCU unattended model test configuration ====="
@@ -428,6 +437,7 @@ jobs:
           echo "suite=${DCU_MANUAL_SUITE}"
           echo "include_file=${INPUT_INCLUDE_FILE:-}"
           echo "model_name=${INPUT_MODEL_NAME:-}"
+          echo "model_names=${INPUT_MODEL_NAMES:-}"
           echo "eval_num_examples=${INPUT_EVAL_NUM_EXAMPLES:-}"
           echo "gsm8k_num_examples=${INPUT_GSM8K_NUM_EXAMPLES:-}"
           echo "mmlu_num_examples=${INPUT_MMLU_NUM_EXAMPLES:-}"
@@ -439,23 +449,73 @@ jobs:
           echo "auto_partition_id=${INPUT_AUTO_PARTITION_ID:-}"
           echo "auto_partition_size=${INPUT_AUTO_PARTITION_SIZE:-}"
           echo "continue_on_error=${INPUT_CONTINUE_ON_ERROR}"
+          echo "model_count=${#models_to_test[@]}"
           echo "========================================================="
 
-          set +e
-          "${exec_cmd[@]}" 2>&1 | tee "${DCU_MANUAL_LOG_DIR}/run.log"
-          test_exit=${PIPESTATUS[0]}
-          set -e
+          overall_exit=0
+          for model_index in "${!models_to_test[@]}"; do
+            model="${models_to_test[${model_index}]}"
+            model_display="${model:-test default}"
+            model_number=$((model_index + 1))
+            model_total="${#models_to_test[@]}"
+            run_log="${DCU_MANUAL_LOG_DIR}/run-model-${model_number}.log"
 
-          echo "exit_code=${test_exit}" >> "${GITHUB_OUTPUT}"
-          if [[ "${test_exit}" -eq 0 ]]; then
+            test_env_cmd=("${base_test_env_cmd[@]}")
+            if [[ -n "${model}" ]]; then
+              test_env_cmd+=("SGLANG_TEST_DEFAULT_MODEL_NAME=${model}")
+              test_env_cmd+=("SGLANG_DCU_GSM8K_MODEL=${model}")
+              test_env_cmd+=("SGLANG_DCU_MMLU_MODEL=${model}")
+            fi
+
+            exec_cmd=(
+              bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh"
+              --container-name "${DCU_CI_CONTAINER_NAME}"
+              -w /sglang-checkout/test
+              -- "${test_env_cmd[@]}" "${run_suite_cmd[@]}"
+            )
+
+            {
+              echo "# model ${model_number}/${model_total}: ${model_display}"
+              printf '%q ' "${exec_cmd[@]}"
+              echo
+              echo
+            } | tee -a "${DCU_MANUAL_LOG_DIR}/command.txt" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+
+            echo "===== Manual DCU model ${model_number}/${model_total} ====="
+            echo "model=${model_display}"
+            echo "log=${run_log}"
+            echo "=========================================================="
+
+            set +e
+            "${exec_cmd[@]}" 2>&1 | tee "${run_log}"
+            test_exit=${PIPESTATUS[0]}
+            set -e
+
+            if [[ "${test_exit}" -eq 0 ]]; then
+              echo "**Model ${model_number}/${model_total}:** success - \`${model_display}\`" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              echo "**Model ${model_number}/${model_total}:** failure, exit code ${test_exit} - \`${model_display}\`" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+              if [[ "${overall_exit}" -eq 0 ]]; then
+                overall_exit="${test_exit}"
+              fi
+            fi
+          done
+
+          cat "${DCU_MANUAL_LOG_DIR}"/run-model-*.log > "${DCU_MANUAL_LOG_DIR}/run.log"
+
+          echo '```' | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "exit_code=${overall_exit}" >> "${GITHUB_OUTPUT}"
+          if [[ "${overall_exit}" -eq 0 ]]; then
             echo "result=success" >> "${GITHUB_OUTPUT}"
             echo "**Result:** success" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           else
             echo "result=failure" >> "${GITHUB_OUTPUT}"
-            echo "**Result:** failure, exit code ${test_exit}" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+            echo "**Result:** failure, exit code ${overall_exit}" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
-          exit "${test_exit}"
+          exit "${overall_exit}"
 
       - name: Cleanup DCU container
         if: always()
