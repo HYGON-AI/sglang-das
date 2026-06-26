@@ -14,7 +14,7 @@ on:
         type: string
         default: ""
       include_file:
-        description: "Optional single registered test file to run, relative to repo root or test/."
+        description: "Optional. Leave empty to run all tests in the selected suite. To run one file only, set a registered test path, e.g. test/registered/dcu/accuracy/bw1100/test_gsm8k_eval_dcu.py"
         required: false
         type: string
         default: ""
