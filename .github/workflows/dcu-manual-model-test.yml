@@ -12,7 +12,7 @@ on:
         description: "DCU model suite. Empty defaults to nightly-dcu-accuracy."
         required: false
         type: string
-        default: ""
+        default: "nightly-dcu-accuracy"
       include_file:
         description: "Optional. Leave empty to run all tests in the selected suite. To run one file only, set a registered test path, e.g. test/registered/dcu/accuracy/bw1100/test_gsm8k_eval_dcu.py"
         required: false
