@@ -909,6 +909,24 @@ def run_cookbook_accuracy_eval(
     if eval_name not in {"gsm8k", "mmlu", "mmmu"}:
         raise AssertionError(f"unsupported cookbook eval_name={eval_name!r}")
 
+    dataset_path = None
+    gsm8k_data_path = None
+    if eval_name == "mmlu":
+        dataset_path = (
+            os.environ.get("SGLANG_DCU_COOKBOOK_MMLU_DATASET_PATH")
+            or os.environ.get("SGLANG_DCU_MMLU_DATASET_PATH")
+        )
+    elif eval_name == "mmmu":
+        dataset_path = (
+            os.environ.get("SGLANG_DCU_COOKBOOK_MMMU_DATASET_PATH")
+            or os.environ.get("SGLANG_DCU_MMMU_DATASET_PATH")
+        )
+    elif eval_name == "gsm8k":
+        gsm8k_data_path = (
+            os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_DATA_PATH")
+            or os.environ.get("SGLANG_DCU_GSM8K_DATA_PATH")
+        )
+
     os.environ["OPENAI_API_KEY"] = DCU_COOKBOOK_API_KEY
     with CookbookServer(config, base_url) as server:
         args = SimpleNamespace(
@@ -923,8 +941,8 @@ def run_cookbook_accuracy_eval(
             temperature=0.0,
             top_p=1.0,
             repeat=1,
-            gsm8k_data_path=None,
-            dataset_path=None,
+            gsm8k_data_path=gsm8k_data_path,
+            dataset_path=dataset_path,
             response_answer_regex=None,
             return_latency=False,
         )
