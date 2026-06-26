@@ -425,6 +425,133 @@ jobs:
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
+          - name: nightly-dcu-2gpu
+            suite: nightly-dcu-2-gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
+          - name: core-functional
+            suite: nightly-dcu-core-functional
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 3000
+            timeout_minutes: 90
+          - name: accuracy-text-0
+            suite: nightly-dcu-accuracy-text
+            nightly: "true"
+            part: 0
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: accuracy-text-1
+            suite: nightly-dcu-accuracy-text
+            nightly: "true"
+            part: 1
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: perf-text-0
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 0
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-1
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 1
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-2
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 2
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-3
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 3
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-4
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 4
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-4gpu
+            suite: nightly-dcu-large-model-4gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 7800
+            timeout_minutes: 180
+            visible_devices: "4,5,6,7"
+          - name: large-model-8gpu-0
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 0
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-1
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 1
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-2
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 2
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-3
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 3
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-0
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 0
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-1
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 1
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-2
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 2
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-3
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 3
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
@@ -432,7 +559,7 @@ jobs:
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.DCU_CI_VISIBLE_DEVICES || '' }}
       DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
       DCU_CI_USE_INSTALLED_WHEELS: ${{ inputs.force_wheel_mode == true && '1' || '' }}
     steps:
