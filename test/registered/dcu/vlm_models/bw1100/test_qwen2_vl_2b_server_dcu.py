@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 register_dcu_ci(est_time=900, suite="nightly-dcu-vlm", nightly=True)
 
-DEFAULT_QWEN2_VL_2B_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
+DEFAULT_QWEN2_VL_2B_MODEL = "/public/opendas/DL_DATA/llm-models/qwen2/Qwen2-VL-2B-Instruct"
 DEFAULT_QWEN2_VL_2B_ARGS = [
     "--attention-backend",
     "fa3",
