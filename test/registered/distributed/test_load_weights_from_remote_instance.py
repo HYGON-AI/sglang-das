@@ -30,6 +30,7 @@ register_dcu_ci(
     est_time=240,
     suite="nightly-dcu-2-gpu",
     nightly=True,
+    disabled="DCU nightly disabled: remote weight loading OOMs or times out on BW1100; pending fix.",
 )
 
 from sglang.test.test_utils import (
