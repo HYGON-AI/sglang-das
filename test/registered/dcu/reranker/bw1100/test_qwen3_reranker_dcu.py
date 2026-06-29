@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
 )
 
 register_dcu_ci(est_time=1200, suite="stage-b-test-1-gpu-small-dcu")
+register_dcu_ci(est_time=1200, suite="nightly-dcu-api-models", nightly=True)
 
 DEFAULT_DCU_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 

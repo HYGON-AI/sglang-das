@@ -18,6 +18,7 @@ register_dcu_ci(
     est_time=600,
     suite="stage-b-test-1-gpu-small-dcu",
 )
+register_dcu_ci(est_time=600, suite="nightly-dcu-api-models", nightly=True)
 
 DEFAULT_DCU_REWARD_MODEL = (
     "/public/opendas/DL_DATA/llm-models/internlm2/internlm2-1.8b-reward"

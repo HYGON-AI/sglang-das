@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=900, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=900, suite="nightly-dcu-api-models", nightly=True)
 
 DEFAULT_QWEN3_4B_MODEL = "Qwen/Qwen3-4B"
 DEFAULT_QWEN3_LORA_1 = "nissenj/Qwen3-4B-lora-v2"

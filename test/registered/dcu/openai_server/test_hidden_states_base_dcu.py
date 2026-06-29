@@ -8,6 +8,7 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_dcu_ci
 
 register_dcu_ci(est_time=600, suite="stage-b-test-1-gpu-small-dcu")
+register_dcu_ci(est_time=600, suite="nightly-dcu-core-functional", nightly=True)
 
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=1800, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=1800, suite="nightly-dcu-quant-opt", nightly=True)
 
 DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
 DEFAULT_QWEN3_MOE_EAGLE_DRAFT = "Tengyunw/qwen3_30b_moe_eagle3"
