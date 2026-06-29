@@ -15,6 +15,7 @@ register_dcu_ci(
     est_time=210,
     suite="nightly-dcu-1-gpu",
     nightly=True,
+    disabled="DCU nightly disabled: cache flush fails on BW1100; pending fix.",
 )
 
 from sglang.test.test_utils import (
