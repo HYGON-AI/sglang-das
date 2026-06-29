@@ -96,7 +96,7 @@ jobs:
             nightly-dcu-accuracy)
               job_filter="nightly-dcu-accuracy-text"
               ;;
-            nightly-dcu-long-scheduler|nightly-dcu-long-decoding|nightly-dcu-2gpu)
+            nightly-dcu-long-scheduler|nightly-dcu-long-decoding)
               job_filter="nightly-dcu-functional-long"
               ;;
           esac
@@ -567,33 +567,6 @@ jobs:
             timeout_per_file: 3000
             timeout_minutes: 180
             include_files: ""
-          - name: legacy-core-0
-            group: nightly-dcu-core-functional
-            suite: nightly-dcu
-            nightly: "true"
-            part: 0
-            parts: 3
-            timeout_per_file: 3000
-            timeout_minutes: 180
-            include_files: ""
-          - name: legacy-core-1
-            group: nightly-dcu-core-functional
-            suite: nightly-dcu
-            nightly: "true"
-            part: 1
-            parts: 3
-            timeout_per_file: 3000
-            timeout_minutes: 180
-            include_files: ""
-          - name: legacy-core-2
-            group: nightly-dcu-core-functional
-            suite: nightly-dcu
-            nightly: "true"
-            part: 2
-            parts: 3
-            timeout_per_file: 3000
-            timeout_minutes: 180
-            include_files: ""
           - name: one-gpu
             group: nightly-dcu-1gpu
             suite: nightly-dcu-1-gpu
@@ -788,8 +761,8 @@ jobs:
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models"
           - name: long-scheduler
             group: nightly-dcu-functional-long
-            suite: stage-b-test-1-gpu-small-dcu
-            nightly: "false"
+            suite: nightly-dcu-functional-long
+            nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 1800
@@ -801,8 +774,8 @@ jobs:
               registered/tokenizer/test_skip_tokenizer_init.py
           - name: long-decoding
             group: nightly-dcu-functional-long
-            suite: stage-b-test-1-gpu-small-dcu
-            nightly: "false"
+            suite: nightly-dcu-functional-long
+            nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 1800
@@ -811,28 +784,24 @@ jobs:
               registered/constrained_decoding/test_constrained_decoding.py
               registered/openai_server/features/test_json_mode.py
           - name: two-gpu
-            group: nightly-dcu-functional-long
-            suite: stage-b-test-2-gpu-large-dcu
-            nightly: "false"
+            group: nightly-dcu-2gpu
+            suite: nightly-dcu-2-gpu
+            nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 1800
-            timeout_minutes: 90
-            include_files: registered/distributed/test_data_parallelism.py
+            timeout_minutes: 120
+            include_files: ""
+            visible_devices: "0,1"
           - name: api-models
             group: nightly-dcu-api-models
-            suite: stage-b-test-1-gpu-small-dcu
-            nightly: "false"
+            suite: nightly-dcu-api-models
+            nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 1800
             timeout_minutes: 180
-            include_files: >-
-              registered/dcu/embedding/bw1100/test_gte_qwen2_embedding_dcu.py
-              registered/dcu/reranker/bw1100/test_qwen3_reranker_dcu.py
-              registered/dcu/models/test_reward_models_dcu.py
-              registered/dcu/openai_server/test_function_calling_dcu.py
-              registered/dcu/openai_server/test_tool_choice_dcu.py
+            include_files: ""
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_nightly_${{ github.run_id }}_${{ matrix.name }}
