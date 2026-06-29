@@ -1166,21 +1166,16 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
-        hidden_states_dtype = hidden_states.dtype
-        input_tensor = [
-            torch.empty(
-                (all_tokens, K),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            ),
-            (
-                torch.empty(
-                    (all_tokens, hidden_states_scale.shape[-1]),
-                    device=hidden_states.device,
-                    dtype=torch.float32,
-                )
-            ),
-        ]
+        a_int8 = torch.empty(
+            (all_tokens, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        a_scale = torch.empty(
+            (all_tokens, hidden_states_scale.shape[-1]),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -1197,8 +1192,8 @@ class DeepEPMoE(FusedMoE):
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
-            input_tensor[0],
-            input_tensor[1],
+            a_int8,
+            a_scale,
             all_tokens,
             counts_are_aligned=all(
                 count % 256 == 0 for count in num_recv_tokens_per_expert
@@ -1234,7 +1229,7 @@ class DeepEPMoE(FusedMoE):
             m_indices,
         )
 
-        gather_out = torch.empty(
+        gather_out = torch.zeros(
             hidden_states_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
