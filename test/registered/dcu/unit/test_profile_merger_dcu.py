@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileRe
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.test.ci.ci_register import register_dcu_ci
 register_dcu_ci(est_time=8, suite="stage-b-test-1-gpu-small-dcu")
+register_dcu_ci(est_time=8, suite="nightly-dcu-core-functional", nightly=True)
 
 
 class TestProfileMerger(unittest.TestCase):

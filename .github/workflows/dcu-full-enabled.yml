@@ -174,7 +174,8 @@ jobs:
     outputs:
       wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
     env:
-      DCU_WHEEL_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
+      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.ref || github.sha }}
     steps:
       - name: Checkout code
@@ -202,95 +203,102 @@ jobs:
         id: sha
         run: |
           set -euo pipefail
+          full_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
           short_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
+          echo "full_sha=${full_sha}" >> "${GITHUB_OUTPUT}"
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
-          echo "Using wheel short SHA: ${short_sha}"
+          echo "Using wheel SHA: ${full_sha} (${short_sha})"
 
       - name: Wait for current commit DCU wheels
         id: wait
         run: |
           set -euo pipefail
+          full_sha="${{ steps.sha.outputs.full_sha }}"
           short_sha="${{ steps.sha.outputs.short_sha }}"
-          export CHECKOUT_REF="${short_sha}"
-          echo "Waiting for DCU wheels with g${short_sha}"
+          export DCU_WHEEL_TARGET_SHA="${full_sha}"
+          export DCU_WHEEL_TARGET_SHORT_SHA="${short_sha}"
+          echo "Waiting for locally staged DCU wheels for ${full_sha}"
+          echo "Host staging root: ${DCU_WHEEL_STAGING_ROOT}"
 
-          python3 - <<'PY_WAIT' | tee /tmp/dcu_full_wheel_urls.out
-          import html.parser
+          python3 - <<'PY_WAIT' | tee /tmp/dcu_wheel_paths.out
           import os
+          import pathlib
           import sys
           import time
-          import urllib.parse
-          import urllib.request
 
-          base = os.environ["DCU_WHEEL_INDEX_URL"].rstrip("/") + "/"
-          short_sha = os.environ["CHECKOUT_REF"][:12]
+          root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
+          container_root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_CONTAINER_ROOT", "/dcu-wheel-staging"))
+          target_sha = os.environ["DCU_WHEEL_TARGET_SHA"]
+          short_sha = os.environ.get("DCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
+          repo = os.environ["GITHUB_REPOSITORY"]
+          owner, repo_name = repo.split("/", 1)
+          repo_key = f"{owner}_{repo_name}"
+          gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
           timeout_s = int(os.environ.get("DCU_WHEEL_WAIT_TIMEOUT", "3600"))
           interval_s = int(os.environ.get("DCU_WHEEL_WAIT_INTERVAL", "60"))
 
-          class LinkParser(html.parser.HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.links = []
+          requirements = ["sglang", "sgl-kernel"]
+          if gateway_required:
+              requirements.append("sgl-model-gateway")
 
-              def handle_starttag(self, tag, attrs):
-                  if tag != "a":
-                      return
-                  for key, value in attrs:
-                      if key == "href":
-                          self.links.append(value)
-
-          def fetch_links(project):
-              url = urllib.parse.urljoin(base, project.strip("/") + "/")
-              with urllib.request.urlopen(url, timeout=30) as resp:
-                  parser = LinkParser()
-                  parser.feed(resp.read().decode("utf-8", errors="replace"))
-              return [urllib.parse.urljoin(url, link) for link in parser.links]
-
-          def find_wheel(projects, prefixes):
-              marker = f"g{short_sha}"
-              for project in projects:
-                  try:
-                      links = fetch_links(project)
-                  except Exception as exc:
-                      print(f"[wait-dcu-wheels] {project}: {type(exc).__name__}: {exc}", file=sys.stderr)
-                      continue
-                  for link in links:
-                      filename = urllib.parse.unquote(link.rsplit("/", 1)[-1].split("#", 1)[0])
-                      normalized = filename.replace("-", "_")
-                      if not filename.endswith(".whl") or marker not in filename:
-                          continue
-                      if any(normalized.startswith(prefix.replace("-", "_")) for prefix in prefixes):
-                          return link
+          def wheel_kind(path: pathlib.Path):
+              name = path.name.replace("-", "_")
+              if name.startswith(("sgl_kernel_", "sglang_kernel_")):
+                  return "sgl-kernel"
+              if name.startswith("sgl_model_gateway_"):
+                  return "sgl-model-gateway"
+              if name.startswith("sglang_"):
+                  return "sglang"
               return None
 
-          requirements = [
-              ("sglang", ["sglang"], ["sglang_"]),
-              ("sgl-kernel", ["sgl-kernel", "sglang-kernel", "sgl_kernel", "sglang_kernel"], ["sgl_kernel_", "sglang_kernel_"]),
-          ]
+          def to_container_path(path: pathlib.Path) -> str:
+              return str(container_root / path.relative_to(root))
+
+          def candidate_dirs():
+              base = root / repo_key
+              return sorted(
+                  [path for path in base.glob(f"pr-*/{target_sha}") if path.is_dir()],
+                  key=lambda path: path.stat().st_mtime,
+                  reverse=True,
+              )
 
           deadline = time.time() + timeout_s
-          found = {}
           while time.time() < deadline:
-              missing = []
-              for name, projects, prefixes in requirements:
-                  if name in found:
+              candidates = candidate_dirs()
+              if not candidates:
+                  print(f"[wait-dcu-wheels] no staged dirs under {root / repo_key}/pr-*/{target_sha}", file=sys.stderr)
+              for staging_dir in candidates:
+                  ready = staging_dir / "READY"
+                  wheel_dir = staging_dir / "wheels"
+                  if not ready.exists():
+                      print(f"[wait-dcu-wheels] {staging_dir} has no READY", file=sys.stderr)
                       continue
-                  wheel = find_wheel(projects, prefixes)
-                  if wheel:
-                      found[name] = wheel
-                      print(f"[wait-dcu-wheels] found {name}: {wheel}", file=sys.stderr)
-                  else:
-                      missing.append(name)
-              if len(found) == len(requirements):
-                  print(" ".join(found[name] for name, _, _ in requirements))
-                  sys.exit(0)
-              print(f"[wait-dcu-wheels] missing {missing}; sleep {interval_s}s", file=sys.stderr)
+                  if not wheel_dir.is_dir():
+                      print(f"[wait-dcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
+                      continue
+                  found = {}
+                  for wheel in sorted(wheel_dir.glob("*.whl")):
+                      kind = wheel_kind(wheel)
+                      if kind and kind not in found:
+                          found[kind] = wheel
+                  missing = [name for name in requirements if name not in found]
+                  if not missing:
+                      paths = [to_container_path(found[name]) for name in requirements]
+                      print(f"[wait-dcu-wheels] found staged wheels in {staging_dir}: {' '.join(paths)}", file=sys.stderr)
+                      print(" ".join(paths))
+                      sys.exit(0)
+                  print(f"[wait-dcu-wheels] {staging_dir} missing {missing}; found={list(found)}", file=sys.stderr)
+              print(f"[wait-dcu-wheels] waiting for local staged wheels for {short_sha}; sleep {interval_s}s", file=sys.stderr)
               time.sleep(interval_s)
 
-          print(f"Timed out waiting for current commit wheels g{short_sha}; found={found}", file=sys.stderr)
+          print(f"Timed out waiting for locally staged DCU wheels for {target_sha}", file=sys.stderr)
           sys.exit(1)
           PY_WAIT
-          wheel_urls="$(tail -n 1 /tmp/dcu_full_wheel_urls.out)"
+          wheel_urls="$(tail -n 1 /tmp/dcu_wheel_paths.out)"
+          if [[ -z "${wheel_urls}" ]]; then
+            echo "No local staged wheel paths were produced." >&2
+            exit 1
+          fi
           echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
   full-enabled-dcu:
@@ -425,6 +433,133 @@ jobs:
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
+          - name: nightly-dcu-2gpu
+            suite: nightly-dcu-2-gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
+          - name: core-functional
+            suite: nightly-dcu-core-functional
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 3000
+            timeout_minutes: 90
+          - name: accuracy-text-0
+            suite: nightly-dcu-accuracy-text
+            nightly: "true"
+            part: 0
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: accuracy-text-1
+            suite: nightly-dcu-accuracy-text
+            nightly: "true"
+            part: 1
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: perf-text-0
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 0
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-1
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 1
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-2
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 2
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-3
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 3
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-4
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 4
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-4gpu
+            suite: nightly-dcu-large-model-4gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 7800
+            timeout_minutes: 180
+            visible_devices: "4,5,6,7"
+          - name: large-model-8gpu-0
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 0
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-1
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 1
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-2
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 2
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-3
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 3
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-0
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 0
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-1
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 1
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-2
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 2
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-3
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 3
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
@@ -432,8 +567,10 @@ jobs:
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.DCU_CI_VISIBLE_DEVICES || '' }}
       DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
+      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
       DCU_CI_USE_INSTALLED_WHEELS: ${{ inputs.force_wheel_mode == true && '1' || '' }}
     steps:
       - name: Checkout code
