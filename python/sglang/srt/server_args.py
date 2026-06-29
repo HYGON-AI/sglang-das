@@ -70,7 +70,6 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
-    is_dcu,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -4433,10 +4432,12 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                    platform = "DCU/DTK" if is_dcu() else "ROCm/HIP"
+                    # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
-                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        "%s: Using 1-stage all-reduce kernel (deterministic)",
+                        platform,
                     )
                 else:
                     # CUDA: use NCCL tree algorithm
@@ -4449,16 +4450,19 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+        # On HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
+            platform = "DCU/DTK" if is_dcu() else "ROCm/HIP GPUs"
             if not self.disable_cuda_graph:
                 logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                    "Cuda graph is disabled for diffusion LLM inference on %s",
+                    platform,
                 )
                 self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                    "Attention backend is set to triton for diffusion LLM inference on %s",
+                    platform,
                 )
                 self.attention_backend = "triton"
         elif is_npu():
@@ -6569,7 +6573,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for HIP/RCCL, disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
