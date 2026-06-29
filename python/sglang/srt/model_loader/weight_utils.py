@@ -257,6 +257,9 @@ def get_quant_config(
     if hf_quant_config is None:
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+    # kimi_k26 等多模态模型可能把 compression_config 放在 text_config 里
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = getattr(hf_text_config, "compression_config", None)
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
