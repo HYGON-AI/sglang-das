@@ -13,16 +13,16 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: FP8 kernel path needs BW1100 numeric validation before enabling.",
 )
 
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-large")
 
-from sglang.srt.utils import get_device, is_cuda, is_xpu
+from sglang.srt.utils import get_device, is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_xpu = is_xpu()
 
 device = get_device()
@@ -37,25 +37,25 @@ class TestFP8Base(CustomTestCase):
         cls.K = 512
         cls.group_size = 128
         cls.quant_type = torch.float8_e4m3fn
+        cls.quant_max = 224.0 if _is_hip else torch.finfo(cls.quant_type).max
         cls.output_type = torch.bfloat16
 
     @staticmethod
-    def _make_A(M, K, group_size, out_dtype):
+    def _make_A(M, K, group_size, out_dtype, quant_max=None):
+        quant_max = torch.finfo(out_dtype).max if quant_max is None else quant_max
         quant_A = torch.rand(
             M, K // group_size, group_size, dtype=torch.float32, device=device
         )
         # -1 ~ 1
         quant_A = quant_A * 2 - 1
         # scaling abs max to fmax
-        finfo = torch.finfo(out_dtype)
-        fmax = finfo.max
-        scaling = fmax / quant_A.abs().amax(-1, keepdim=True)
+        scaling = quant_max / quant_A.abs().amax(-1, keepdim=True)
         quant_A *= scaling
         quant_A = quant_A.to(out_dtype).to(torch.float32)
 
         # create scale and A
         scale = torch.rand(M, K // group_size, dtype=torch.float32, device=device)
-        scale /= fmax
+        scale /= quant_max
         A = quant_A * scale[..., None]
 
         A = A.reshape(M, K)
@@ -63,7 +63,9 @@ class TestFP8Base(CustomTestCase):
         return A, quant_A, scale
 
     @staticmethod
-    def _make_B(K, N, group_size, out_dtype):
+    def _make_B(K, N, group_size, out_dtype, quant_max=None):
+        quant_max = torch.finfo(out_dtype).max if quant_max is None else quant_max
+
         def _aligned_size(a, b):
             return (a + b - 1) // b * b
 
@@ -81,9 +83,7 @@ class TestFP8Base(CustomTestCase):
         quant_B = quant_B * 2 - 1
 
         # scaling abs max to fmax
-        finfo = torch.finfo(out_dtype)
-        fmax = finfo.max
-        scaling = fmax / quant_B.abs().amax((1, 3), keepdim=True)
+        scaling = quant_max / quant_B.abs().amax((1, 3), keepdim=True)
         quant_B *= scaling
         quant_B = quant_B.to(out_dtype).to(torch.float32)
 
@@ -95,7 +95,7 @@ class TestFP8Base(CustomTestCase):
             dtype=torch.float32,
             device=device,
         )
-        scale /= fmax
+        scale /= quant_max
 
         B = quant_B * scale
 
@@ -111,7 +111,11 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
             return
 
         A, A_quant_gt, scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+            M=self.M,
+            K=self.K,
+            group_size=self.group_size,
+            out_dtype=self.quant_type,
+            quant_max=self.quant_max,
         )
         A_quant, scale = per_token_group_quant_fp8(
             x=A.to(torch.bfloat16), group_size=self.group_size
@@ -133,10 +137,18 @@ class TestW8A8BlockFP8Matmul(TestFP8Base):
             return
 
         A, A_quant_gt, A_scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+            M=self.M,
+            K=self.K,
+            group_size=self.group_size,
+            out_dtype=self.quant_type,
+            quant_max=self.quant_max,
         )
         B, B_quant_gt, B_scale_gt = self._make_B(
-            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+            K=self.K,
+            N=self.N,
+            group_size=self.group_size,
+            out_dtype=self.quant_type,
+            quant_max=self.quant_max,
         )
         C_gt = A.to(self.output_type) @ B.to(self.output_type)
         C = w8a8_block_fp8_matmul(

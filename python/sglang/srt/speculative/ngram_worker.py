@@ -3,7 +3,11 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+try:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+except (ImportError, AttributeError):
+    reconstruct_indices_from_tree_mask = None
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -22,6 +26,109 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+
+
+def reconstruct_indices_from_tree_mask_torch(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    tree_mask_cpu = tree_mask.view(
+        batch_size, draft_token_num, draft_token_num
+    ).cpu()
+    verified_seq_len_cpu = verified_seq_len.cpu()
+
+    positions_cpu = torch.empty(
+        (batch_size, draft_token_num), dtype=positions.dtype, device="cpu"
+    )
+    retrive_index_cpu = torch.empty(
+        (batch_size, draft_token_num), dtype=retrive_index.dtype, device="cpu"
+    )
+    retrive_next_token_cpu = torch.empty(
+        (batch_size, draft_token_num), dtype=retrive_next_token.dtype, device="cpu"
+    )
+    retrive_next_sibling_cpu = torch.empty(
+        (batch_size, draft_token_num), dtype=retrive_next_sibling.dtype, device="cpu"
+    )
+
+    for bid in range(batch_size):
+        mask = tree_mask_cpu[bid]
+        token_offset = bid * draft_token_num
+        for tid in range(draft_token_num):
+            depth = 0
+            parent_idx = -1
+            for i in range(tid - 1, -1, -1):
+                if bool(mask[tid, i]):
+                    depth += 1
+                    if parent_idx == -1:
+                        parent_idx = i
+
+            retrive_index_cpu[bid, tid] = token_offset + tid
+            positions_cpu[bid, tid] = depth + verified_seq_len_cpu[bid]
+
+            next_token_idx = -1
+            for i in range(tid + 1, draft_token_num):
+                if bool(mask[i, tid]):
+                    next_token_idx = i
+                    break
+            retrive_next_token_cpu[bid, tid] = next_token_idx
+
+            next_sibling_idx = -1
+            if parent_idx != -1:
+                for i in range(tid + 1, draft_token_num):
+                    if bool(mask[i, parent_idx]) and not bool(mask[i, parent_idx + 1 : i].any()):
+                        next_sibling_idx = i
+                        break
+            retrive_next_sibling_cpu[bid, tid] = next_sibling_idx
+
+    positions.copy_(positions_cpu.reshape(-1), non_blocking=True)
+    retrive_index.copy_(retrive_index_cpu, non_blocking=True)
+    retrive_next_token.copy_(retrive_next_token_cpu, non_blocking=True)
+    retrive_next_sibling.copy_(retrive_next_sibling_cpu, non_blocking=True)
+
+
+def reconstruct_indices_from_tree_mask_compat(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    if reconstruct_indices_from_tree_mask is not None:
+        try:
+            reconstruct_indices_from_tree_mask(
+                tree_mask,
+                verified_seq_len,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                batch_size,
+                draft_token_num,
+            )
+            return
+        except (AttributeError, RuntimeError) as exc:
+            if "reconstruct_indices_from_tree_mask" not in str(exc):
+                raise
+
+    reconstruct_indices_from_tree_mask_torch(
+        tree_mask,
+        verified_seq_len,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        batch_size,
+        draft_token_num,
+    )
 
 
 class NGRAMWorker:
@@ -206,7 +313,7 @@ class NGRAMWorker:
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        reconstruct_indices_from_tree_mask(
+        reconstruct_indices_from_tree_mask_compat(
             tree_mask,
             batch.seq_lens,
             positions,  # mutable

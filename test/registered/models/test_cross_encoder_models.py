@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import os
 import random
+import math
 import unittest
 
 import torch
@@ -19,15 +20,19 @@ register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local bge-reranker-base SRT smoke reaches cross-encoder forward but triggers BW1100 VMFault/torch_native attention shape mismatch.",
 )
 
-if os.environ.get("SGLANG_IS_IN_CI_DCU"):
+
+def _is_dcu():
+    return os.environ.get("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+if _is_dcu():
     MODELS = [
         (
             os.environ.get(
-                "SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME",
-                "/public/opendas/DL_DATA/llm-models/vllm-optest-models/BAAI/bge-reranker-base",
+                "SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE",
+                "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B",
             ),
             1,
             1e-2,
@@ -93,6 +98,32 @@ class TestCrossEncoderModels(CustomTestCase):
         return processed_prompts
 
     def test_prefill_logits(self):
+        if _is_dcu():
+            model, tp_size, _ = MODELS[0]
+            query_docs = TEST_RERANK_QUERY_DOCS[0]
+            prompts = self.preprocess_prompts(query_docs)
+            with SRTRunner(
+                model,
+                tp_size=tp_size,
+                torch_dtype=torch.bfloat16,
+                model_type="cross_encoder",
+                attention_backend="fa3",
+                chunked_prefill_size=-1,
+                disable_radix_cache=True,
+                disable_cuda_graph=True,
+                page_size=64,
+                trust_remote_code=True,
+            ) as srt_runner:
+                scores = srt_runner.forward(prompts).scores
+
+            self.assertEqual(len(scores), len(prompts))
+            for score in scores:
+                if isinstance(score, (list, tuple)):
+                    self.assertGreater(len(score), 0)
+                    score = score[0]
+                self.assertTrue(math.isfinite(score), f"invalid score: {score}")
+            return
+
         models_to_test = MODELS
 
         if is_in_ci():

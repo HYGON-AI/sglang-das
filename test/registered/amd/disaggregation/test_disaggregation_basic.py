@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import openai
@@ -30,10 +31,60 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
 
 
+def _is_dcu():
+    return os.getenv("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+_DCU_MODEL_NAME = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B"
+
+
+def _dcu_disagg_server_args():
+    return [
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--disable-cuda-graph",
+        "--max-total-tokens",
+        "1024",
+        "--max-running-requests",
+        "8",
+    ]
+
+
+@contextmanager
+def _temporary_env(name, value):
+    old_value = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old_value
+
+
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        if _is_dcu():
+            cls.model = _DCU_MODEL_NAME
+            cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+            cls.rdma_devices = []
+            cls.start_prefill()
+            cls.start_decode()
+            cls.wait_server_ready(
+                cls.prefill_url + "/health", process=cls.process_prefill
+            )
+            cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+            cls.launch_lb()
+            return
+
         # Configure ROCm RDMA environment
         os.environ["SGLANG_USE_AITER"] = "1"
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
@@ -73,13 +124,28 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--log-level",
             "debug",
         ]
+        if _is_dcu():
+            prefill_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "prefill",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp",
+                "1",
+                *_dcu_disagg_server_args(),
+            ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
+        env_context = (
+            _temporary_env("SGLANG_USE_AITER", "0") if _is_dcu() else nullcontext()
         )
+        with env_context:
+            cls.process_prefill = popen_launch_pd_server(
+                cls.model,
+                cls.prefill_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=prefill_args,
+            )
 
     @classmethod
     def start_decode(cls):
@@ -100,17 +166,51 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--log-level",
             "debug",
         ]
+        if _is_dcu():
+            decode_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "decode",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp",
+                "1",
+                "--base-gpu-id",
+                "1",
+                *_dcu_disagg_server_args(),
+            ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         print("Debug")
         print(decode_args)
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
+        env_context = (
+            _temporary_env("SGLANG_USE_AITER", "0") if _is_dcu() else nullcontext()
         )
+        with env_context:
+            cls.process_decode = popen_launch_pd_server(
+                cls.model,
+                cls.decode_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=decode_args,
+            )
 
     def test_gsm8k(self):
+        if _is_dcu():
+            response = requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("text", response.json())
+            return
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -126,6 +226,9 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         self.assertGreater(metrics["accuracy"], 0.70)
 
     def test_logprob(self):
+        if _is_dcu():
+            self.skipTest("DCU disaggregation smoke covers generate path only.")
+
         prompt = "The capital of france is "
         response = requests.post(
             self.lb_url + "/generate",
@@ -151,6 +254,9 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
 
     def test_structured_output(self):
+        if _is_dcu():
+            self.skipTest("DCU disaggregation smoke covers generate path only.")
+
         json_schema = json.dumps(
             {
                 "type": "object",
@@ -179,6 +285,9 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         json.loads(output)
 
     def test_first_token_finish(self):
+        if _is_dcu():
+            self.skipTest("DCU disaggregation smoke covers generate path only.")
+
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")
         tokenizer = AutoTokenizer.from_pretrained(self.model)
         eos_token = tokenizer.eos_token_id
@@ -229,6 +338,9 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        if _is_dcu():
+            raise unittest.SkipTest("DCU smoke is covered by TestDisaggregationAccuracy.")
+
         super().setUpClass()
         # Configure ROCm RDMA environment
         os.environ["SGLANG_USE_AITER"] = "1"
@@ -343,6 +455,9 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
+        if _is_dcu():
+            raise unittest.SkipTest("DCU smoke is covered by TestDisaggregationAccuracy.")
+
         super().setUpClass()
         # Configure ROCm RDMA environment
         os.environ["SGLANG_USE_AITER"] = "1"

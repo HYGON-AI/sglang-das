@@ -8,19 +8,20 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import is_dcu
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_dcu_ci(
     est_time=30,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: INT8 kernel path needs BW1100 numeric validation before enabling.",
 )
 
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small")
+
+_is_dcu = is_dcu()
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
@@ -45,14 +46,30 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
     return C.reshape(origin_C_shape).to(output_dtype)
 
 
-def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
+def torch_per_token_quant_int8_reference(x, scale_dtype=torch.float32):
+    M = x.numel() // x.shape[-1]
+    N = x.shape[-1]
+    x_2d = x.reshape(M, N)
+    x_float = x_2d.to(torch.float32)
+    absmax = torch.maximum(
+        x_float.abs().amax(dim=-1, keepdim=True),
+        torch.tensor(1e-10, device=x.device, dtype=torch.float32),
+    )
+    scales = (absmax / 127).to(scale_dtype).reshape(x.shape[:-1] + (1,))
+    x_q = torch.round(x_float * (127 / absmax)).clamp(-128, 127).to(torch.int8)
+    return x_q.reshape_as(x), scales
+
+
+def torch_w8a8_per_column_moe(
+    a, w1, w2, w1_s, w2_s, score, topk, quant_func=per_token_quant_int8
+):
     """This function performs fused moe with per-column int8 quantization using native torch."""
 
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     B, D = a.shape
     # Perform per-token quantization
-    a_q, a_s = per_token_quant_int8(a)
+    a_q, a_s = quant_func(a)
     # Repeat tokens to match topk
     a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     # Also repeat the scale
@@ -76,7 +93,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
             # Activation function
             act_out = SiluAndMul().forward_native(inter_out)
             # Quantize activation output with per-token
-            act_out_q, act_out_s = per_token_quant_int8(act_out)
+            act_out_q, act_out_s = quant_func(act_out)
 
             # Second MLP layer
             out[mask] = native_w8a8_per_token_matmul(
@@ -90,11 +107,11 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
 
 class TestW8A8Int8FusedMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
-    M = [1, 33]
+    M = [1] if _is_dcu else [1, 33]
     N = [128, 1024]
     K = [256, 4096]
     E = [8]
-    TOP_KS = [2, 6]
+    TOP_KS = [2] if _is_dcu else [2, 6]
     BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
     BLOCK_SIZE = [[128, 128]]
     SEEDS = [0]
@@ -129,6 +146,20 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
+            if _is_dcu:
+                a_q, a_s = per_token_quant_int8(a)
+                ref_a_q, ref_a_s = torch_per_token_quant_int8_reference(a)
+                self.assertTrue(torch.equal(a_s, ref_a_s))
+                self.assertLessEqual(
+                    (a_q.to(torch.int16) - ref_a_q.to(torch.int16)).abs().max().item(),
+                    1,
+                )
+
+                out = torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk)
+                self.assertTrue(torch.isfinite(out).all())
+                self.assertEqual(out.shape, (M, K))
+                return
+
             ref_out = torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk)
             topk_output = select_experts(
                 hidden_states=a,

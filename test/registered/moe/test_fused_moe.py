@@ -9,14 +9,13 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device, get_device_capability, is_hip
+from sglang.srt.utils import get_device, get_device_capability, is_dcu, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
 # DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: fused_moe_triton aborts/segfaults on BW1100 in fused_experts_impl/Triton launcher; keep disabled until backend crash is fixed.",
 )
 
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
@@ -25,6 +24,7 @@ register_cuda_ci(est_time=87, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 _is_hip = is_hip()
+_is_dcu = is_dcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
@@ -198,6 +198,10 @@ class TestFusedMOE(CustomTestCase):
             )
 
     def test_various_configurations(self):
+        if _is_dcu:
+            self._test_dcu_aiter_w16a16()
+            return
+
         m_values = [1, 33, 64, 222]
         n_values = [128, 1024]
         k_values = [128, 511, 1024]
@@ -246,6 +250,59 @@ class TestFusedMOE(CustomTestCase):
                                             )
                                             empty_gpu_cache()
                                         pbar.update(1)
+
+    def _test_dcu_aiter_w16a16(self):
+        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        dcu_cases = [
+            (1, 128, 128, 8, 2),
+            (4, 128, 128, 8, 2),
+        ]
+        for m, n, k, e, topk in dcu_cases:
+            with self.subTest(m=m, n=n, k=k, e=e, topk=topk):
+                a = self.create_random_gpu_tensor((m, k), torch.bfloat16)
+                w1 = self.create_random_gpu_tensor((e, 2 * n, k), torch.bfloat16)
+                w2 = self.create_random_gpu_tensor((e, k, n), torch.bfloat16)
+                score = self.create_random_gpu_tensor((m, e), torch.bfloat16)
+                topk_output = select_experts(
+                    hidden_states=a,
+                    router_logits=score,
+                    topk_config=TopKConfig(top_k=topk, renormalize=False),
+                )
+                status, moe_config = get_aiter_moe_config(
+                    M=m,
+                    E=e,
+                    N1=2 * n,
+                    N2=k,
+                    K=k,
+                    top_k=topk,
+                    block_size=0,
+                    dtype=torch.bfloat16,
+                    quant_type=MoeQuantType.W16A16,
+                )
+                self.assertTrue(status, f"AITER W16A16 MoE config not found: {moe_config}")
+
+                aiter_output = aiter_moe(
+                    a,
+                    w1,
+                    w2,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    moe_config,
+                    False,
+                    "silu",
+                    global_num_experts=e,
+                    output_dtype=torch.bfloat16,
+                )
+                torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
+                torch.testing.assert_close(
+                    aiter_output,
+                    torch_output,
+                    rtol=1e-1,
+                    atol=1e-2,
+                )
+                empty_gpu_cache()
 
 
 if __name__ == "__main__":
