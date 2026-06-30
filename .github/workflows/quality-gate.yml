@@ -7,13 +7,19 @@ on:
       - main
       - master
       - v0.5.12_dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   changed-files:
     name: changed-files
-    runs-on: [self-hosted, linux, x64, quality]
+    runs-on: [self-hosted, Linux, X64, internal, quality]
     outputs:
       files: ${{ steps.collect.outputs.files }}
+      entries: ${{ steps.collect.outputs.entries }}
       has_files: ${{ steps.collect.outputs.has_files }}
 
     steps:
@@ -34,18 +40,30 @@ jobs:
             HEAD_SHA="${{ github.sha }}"
           fi
 
-          git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+          if echo "$BASE_SHA" | grep -Eq '^0+$'; then
+            git diff --name-only --diff-filter=ACMRT "$HEAD_SHA^" "$HEAD_SHA" > changed-files.txt || git ls-files > changed-files.txt
+            git diff --name-status --diff-filter=ACMRT "$HEAD_SHA^" "$HEAD_SHA" > changed-entries.txt || git ls-files | sed 's/^/A\t/' > changed-entries.txt
+          else
+            git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+            git diff --name-status --diff-filter=ACMRT "$BASE_SHA" "$HEAD_SHA" > changed-entries.txt
+          fi
 
           if [ -s changed-files.txt ]; then
             {
               echo "files<<EOF"
               cat changed-files.txt
               echo "EOF"
+              echo "entries<<EOF"
+              cat changed-entries.txt
+              echo "EOF"
               echo "has_files=true"
             } >> "$GITHUB_OUTPUT"
           else
             {
               echo "files<<EOF"
+              echo ""
+              echo "EOF"
+              echo "entries<<EOF"
               echo ""
               echo "EOF"
               echo "has_files=false"
@@ -59,13 +77,13 @@ jobs:
     name: encoding-check
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
-    runs-on: [self-hosted, linux, x64, quality]
+    runs-on: [self-hosted, Linux, X64, internal, quality]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check UTF-8 and garbled characters in changed files
+      - name: Check UTF-8 and line endings
         shell: bash
         env:
           CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
@@ -75,9 +93,9 @@ jobs:
           from pathlib import Path
 
           skip_dirs = {
-              ".git", ".github", "node_modules", "venv", ".venv",
-              "__pycache__", "dist", "build", "target", ".tox", ".mypy_cache",
-              ".pytest_cache", ".ruff_cache"
+              ".git", "node_modules", "venv", ".venv",
+              "__pycache__", "dist", "build", "target", ".tox",
+              ".mypy_cache", ".pytest_cache", ".ruff_cache"
           }
 
           binary_exts = {
@@ -94,10 +112,8 @@ jobs:
 
               if not path.exists() or not path.is_file():
                   continue
-
               if set(path.parts) & skip_dirs:
                   continue
-
               if path.suffix.lower() in binary_exts:
                   continue
 
@@ -113,8 +129,7 @@ jobs:
                   continue
 
               if "\ufffd" in text:
-                  bad.append(f"{path}: contains replacement character �")
-
+                  bad.append(f"{path}: contains replacement character U+FFFD")
               if "\r\n" in text:
                   bad.append(f"{path}: contains CRLF line endings")
 
@@ -129,7 +144,7 @@ jobs:
 
   secret-check:
     name: secret-check
-    runs-on: [self-hosted, linux, x64, quality]
+    runs-on: [self-hosted, Linux, X64, internal, quality]
 
     steps:
       - name: Checkout
@@ -137,31 +152,197 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks on pull request commits
-        if: github.event_name == 'pull_request'
+      - name: Run Gitleaks
         shell: bash
         run: |
-          docker run --rm \
-            -v "$PWD:/repo" \
-            zricethezav/gitleaks:v8.24.2 \
-            detect --source /repo \
-            --log-opts "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" \
-            --verbose
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            LOG_OPTS="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            BEFORE="${{ github.event.before }}"
+            if echo "$BEFORE" | grep -Eq '^0+$'; then
+              LOG_OPTS=""
+            else
+              LOG_OPTS="${{ github.event.before }}..${{ github.sha }}"
+            fi
+          fi
 
-      - name: Run Gitleaks on push commits
-        if: github.event_name != 'pull_request'
+          if [ -n "$LOG_OPTS" ]; then
+            docker run --rm \
+              -v "$PWD:/repo" \
+              zricethezav/gitleaks:v8.24.2 \
+              detect --source /repo --log-opts "$LOG_OPTS" --verbose
+          else
+            docker run --rm \
+              -v "$PWD:/repo" \
+              zricethezav/gitleaks:v8.24.2 \
+              detect --source /repo --verbose
+          fi
+
+  large-file-check:
+    name: large-file-check
+    needs: changed-files
+    if: needs.changed-files.outputs.has_files == 'true'
+    runs-on: [self-hosted, Linux, X64, internal, quality]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check forbidden large/model/cache files
         shell: bash
+        env:
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          blocked_exts = {
+              ".safetensors", ".bin", ".pt", ".pth", ".ckpt",
+              ".arrow", ".onnx"
+          }
+
+          blocked_dirs = {
+              "datasets", "checkpoints", "outputs", ".cache"
+          }
+
+          max_size = 50 * 1024 * 1024
+          files = [line.strip() for line in os.environ.get("CHANGED_FILES", "").splitlines() if line.strip()]
+          bad = []
+
+          for name in files:
+              path = Path(name)
+
+              if not path.exists() or not path.is_file():
+                  continue
+
+              parts = set(path.parts)
+              suffix = path.suffix.lower()
+              size = path.stat().st_size
+
+              if parts & blocked_dirs:
+                  bad.append(f"{path}: file under blocked directory")
+              elif suffix in blocked_exts:
+                  bad.append(f"{path}: blocked file type {suffix}")
+              elif size > max_size:
+                  bad.append(f"{path}: file too large ({size} bytes > {max_size} bytes)")
+
+          if bad:
+              print("Large file check failed:")
+              for item in bad:
+                  print(" -", item)
+              raise SystemExit(1)
+
+          print("Large file check passed.")
+          PY
+
+  license-copyright-check:
+    name: license-copyright-check
+    needs: changed-files
+    runs-on: [self-hosted, Linux, X64, internal, quality]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check license and copyright headers
+        shell: bash
+        env:
+          CHANGED_ENTRIES: ${{ needs.changed-files.outputs.entries }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          license_files = list(Path(".").glob("LICENSE*"))
+          if not license_files:
+              print("Repository must contain LICENSE or LICENSE-* file.")
+              raise SystemExit(1)
+
+          if not Path("NOTICE").exists():
+              print("Warning: NOTICE file not found. Add NOTICE if upstream attribution requires it.")
+
+          source_exts = {
+              ".py", ".sh", ".bash", ".c", ".cc", ".cpp",
+              ".h", ".hpp", ".cu", ".hip"
+          }
+
+          bad = []
+          warn = []
+
+          entries = [line.strip() for line in os.environ.get("CHANGED_ENTRIES", "").splitlines() if line.strip()]
+
+          for entry in entries:
+              parts = entry.split("\t")
+              if not parts:
+                  continue
+
+              status = parts[0]
+              file_path = parts[-1]
+              path = Path(file_path)
+
+              if not path.exists() or not path.is_file():
+                  continue
+              if path.suffix.lower() not in source_exts:
+                  continue
+
+              head = "\n".join(path.read_text(encoding="utf-8", errors="ignore").splitlines()[:80])
+              has_copyright = "Copyright" in head
+              has_license = "Licensed under" in head or "SPDX-License-Identifier" in head
+
+              if status.startswith("A") and not (has_copyright and has_license):
+                  bad.append(f"{path}: new source file missing Copyright or License header")
+              elif status.startswith("M") and not (has_copyright and has_license):
+                  warn.append(f"{path}: modified source file has no visible Copyright/License header")
+
+          if warn:
+              print("License/Copyright warnings:")
+              for item in warn:
+                  print(" -", item)
+
+          if bad:
+              print("License/Copyright check failed:")
+              for item in bad:
+                  print(" -", item)
+              raise SystemExit(1)
+
+          print("License/Copyright check passed.")
+          PY
+
+  lint-check:
+    name: lint-check
+    needs: changed-files
+    if: needs.changed-files.outputs.has_files == 'true'
+    runs-on: [self-hosted, Linux, X64, internal, quality]
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Ruff on changed Python files
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
+        run: |
+          PY_FILES=$(echo "$CHANGED_FILES" | grep -E '\.py$' || true)
+
+          if [ -z "$PY_FILES" ]; then
+            echo "No changed Python files. Skip ruff."
+            exit 0
+          fi
+
+          echo "$PY_FILES" > ruff-files.txt
+
           docker run --rm \
             -v "$PWD:/repo" \
-            zricethezav/gitleaks:v8.24.2 \
-            detect --source /repo \
-            --log-opts "${{ github.event.before }}..${{ github.sha }}" \
-            --verbose
+            -w /repo \
+            ghcr.io/astral-sh/ruff:0.12.1 \
+            check $(cat ruff-files.txt)
 
   sast-check:
     name: sast-check
-    runs-on: [self-hosted, linux, x64, quality]
+    runs-on: [self-hosted, Linux, X64, internal, quality]
     continue-on-error: true
 
     steps:
@@ -175,3 +356,112 @@ jobs:
             -v "$PWD:/src" \
             semgrep/semgrep:1.125.0 \
             semgrep scan --config auto /src
+
+  sensitive-word-check:
+    name: sensitive-word-check
+    needs: changed-files
+    if: needs.changed-files.outputs.has_files == 'true'
+    runs-on: [self-hosted, Linux, X64, internal, quality]
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check sensitive words in changed files
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          skip_dirs = {
+              ".git", "node_modules", "venv", ".venv",
+              "__pycache__", "dist", "build", "target"
+          }
+
+          binary_exts = {
+              ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf",
+              ".zip", ".gz", ".tar", ".tgz", ".jar", ".so", ".dll", ".exe",
+              ".bin", ".onnx", ".pt", ".pth", ".safetensors", ".whl"
+          }
+
+          patterns = [
+              ("confidential marker", re.compile(r"\b(confidential|internal only|do not distribute|restricted|classified)\b", re.I)),
+              ("Chinese confidential marker", re.compile(r"(仅内部使用|禁止外传|保密|内部资料)")),
+              ("private key marker", re.compile(r"BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY")),
+              ("credential keyword", re.compile(r"\b(password|passwd|api[_-]?key|access[_-]?key|secret[_-]?key|credential|bearer token)\b", re.I)),
+              ("internal path hint", re.compile(r"(/home/[^/\s]+|/mnt/[^/\s]+|/data/[^/\s]+|/public/[^/\s]+)")),
+              ("private IPv4 address", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b")),
+          ]
+
+          files = [line.strip() for line in os.environ.get("CHANGED_FILES", "").splitlines() if line.strip()]
+          findings = []
+
+          for name in files:
+              path = Path(name)
+
+              if not path.exists() or not path.is_file():
+                  continue
+              if set(path.parts) & skip_dirs:
+                  continue
+              if path.suffix.lower() in binary_exts:
+                  continue
+
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              for i, line in enumerate(text.splitlines(), 1):
+                  for label, pattern in patterns:
+                      if pattern.search(line):
+                          findings.append(f"{path}:{i}: {label}: {line[:160]}")
+
+          if findings:
+              print("Sensitive word findings, observe mode only:")
+              for item in findings:
+                  print(" -", item)
+          else:
+              print("Sensitive word check passed.")
+          PY
+
+  quality-gate-result:
+    name: quality-gate-result
+    needs:
+      - changed-files
+      - encoding-check
+      - secret-check
+      - large-file-check
+      - license-copyright-check
+    if: always()
+    runs-on: [self-hosted, Linux, X64, internal, quality]
+
+    steps:
+      - name: Check required quality gate jobs
+        shell: bash
+        run: |
+          failed=0
+
+          check_result() {
+            name="$1"
+            result="$2"
+
+            echo "$name: $result"
+
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              failed=1
+            fi
+          }
+
+          check_result "changed-files" "${{ needs.changed-files.result }}"
+          check_result "encoding-check" "${{ needs.encoding-check.result }}"
+          check_result "secret-check" "${{ needs.secret-check.result }}"
+          check_result "large-file-check" "${{ needs.large-file-check.result }}"
+          check_result "license-copyright-check" "${{ needs.license-copyright-check.result }}"
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Quality gate failed."
+            exit 1
+          fi
+
+          echo "Quality gate passed."
