@@ -350,10 +350,11 @@ jobs:
           echo "$PY_FILES" > ruff-files.txt
 
           docker run --rm \
-            -v "$PWD:/repo" \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo:ro" \
             -w /repo \
             ${{ env.RUFF_IMAGE }} \
-            check $(cat ruff-files.txt)
+            check --no-cache $(cat ruff-files.txt)
 
   sast-check:
     name: sast-check
