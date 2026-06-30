@@ -13,10 +13,20 @@ permissions:
   contents: read
   pull-requests: read
 
+env:
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.24.2
+  RUFF_IMAGE: ghcr.io/astral-sh/ruff:0.12.1
+  SEMGREP_IMAGE: semgrep/semgrep:1.125.0
+
+concurrency:
+  group: quality-gate-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   changed-files:
     name: changed-files
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
     outputs:
       files: ${{ steps.collect.outputs.files }}
       entries: ${{ steps.collect.outputs.entries }}
@@ -78,6 +88,7 @@ jobs:
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -145,6 +156,7 @@ jobs:
   secret-check:
     name: secret-check
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -169,12 +181,12 @@ jobs:
           if [ -n "$LOG_OPTS" ]; then
             docker run --rm \
               -v "$PWD:/repo" \
-              zricethezav/gitleaks:v8.24.2 \
+              ${{ env.GITLEAKS_IMAGE }} \
               detect --source /repo --log-opts "$LOG_OPTS" --verbose
           else
             docker run --rm \
               -v "$PWD:/repo" \
-              zricethezav/gitleaks:v8.24.2 \
+              ${{ env.GITLEAKS_IMAGE }} \
               detect --source /repo --verbose
           fi
 
@@ -183,6 +195,7 @@ jobs:
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -240,6 +253,7 @@ jobs:
     name: license-copyright-check
     needs: changed-files
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -314,6 +328,7 @@ jobs:
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 10
     continue-on-error: true
 
     steps:
@@ -337,12 +352,15 @@ jobs:
           docker run --rm \
             -v "$PWD:/repo" \
             -w /repo \
-            ghcr.io/astral-sh/ruff:0.12.1 \
+            ${{ env.RUFF_IMAGE }} \
             check $(cat ruff-files.txt)
 
   sast-check:
     name: sast-check
+    needs: changed-files
+    if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 20
     continue-on-error: true
 
     steps:
@@ -354,7 +372,7 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/src" \
-            semgrep/semgrep:1.125.0 \
+            ${{ env.SEMGREP_IMAGE }} \
             semgrep scan --config auto /src
 
   sensitive-word-check:
@@ -362,6 +380,7 @@ jobs:
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
     continue-on-error: true
 
     steps:
@@ -435,6 +454,7 @@ jobs:
       - license-copyright-check
     if: always()
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
 
     steps:
       - name: Check required quality gate jobs
