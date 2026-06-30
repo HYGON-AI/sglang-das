@@ -1835,6 +1835,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
+        self.loc_tensor = torch.tensor([-1], device=self.device)
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, _ = alloc_for_extend(self)
