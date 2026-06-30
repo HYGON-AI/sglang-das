@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -148,10 +151,10 @@ class HashTopK(nn.Module):
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
 
-        # topk_ids = _maybe_override_topk_ids_random(topk_ids, self.num_experts)
         topk_ids = _topk_ids_postprocess(
             topk_ids, expert_location_dispatch_info, num_token_non_padded
         )
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )

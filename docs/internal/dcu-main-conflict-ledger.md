@@ -135,6 +135,11 @@ actual result in the checkpoint note.
 | C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/models/deepseek_v2.py`                                          | model          | Codex | manual merge    | Keep DCU fused RMS/quant returns while adding official DSA/MLA CP parameters and MoE output-buffer context                 | high   | static/registration passed; DCU runtime pending                      | DeepSeek V2/V3 fused RMS/quant, CP, MoE, and short-request smoke                                   | validated |
 | C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep DCU fused cos/sin and LightOp/JIT paths; restrict official fused QK/sgl-kernel behavior to non-DCU HIP                | high   | static/registration passed; DCU runtime pending                      | DSV4 TP, CP+EP, DP+EP, MTP, graph capture, and FP8 WO-A smoke                                      | validated |
 | C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `sgl-kernel/csrc/common_extension_rocm.cc`                                         | sgl-kernel     | Codex | manual merge    | Register both DCU decode metadata operators and official DSV4 top-k/norm/RoPE operators                                    | high   | static/registration passed; DCU runtime pending                      | `gfx938` metadata check plus DCU sgl-kernel smoke whitelist                                        | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/multimodal_gen/envs.py`                                             | diffusion      | Codex | manual merge    | Keep the DCU ring-attention setting while adopting official CFG gating and model-aware VAE channels-last policy            | low    | compile and isolated env-default check passed                         | Diffusion runtime smoke on its target platform                                                       | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/layers/attention/dsa_backend.py`                                | attention      | Codex | port to new API | Adopt official `DSATopKBackend`; move the DCU LightOp fused transform into the new backend module                          | high   | compile, CLI/env, and DCU LightOp route mock passed                 | DSA fused/unfused top-k, paged/ragged transform, graph, and sparse prefill smoke                    | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/layers/moe/hash_topk.py`                                        | moe            | Codex | manual merge    | Preserve DCU fused hash-top-k and LightOp postprocess, then invoke the official EPLB expert-distribution recorder           | high   | compile and DCU semantic audit passed; runtime pending               | DSV4 hash top-k with EPLB off/on, padding, and logical-to-physical dispatch                         | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep DCU tuning-path imports and kernel branches while adding official EPLB per-layer recording context                    | high   | compile and DCU path audit passed; runtime pending                   | DSV4 pure TP, EPLB, MTP, CUDA graph, and short-request inference                                    | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `test/registered/distributed/test_dp_attention_large.py`                           | test           | Codex | theirs          | Follow the official registered-test directory split and retain the existing DCU nightly registration at the new path       | low    | DCU registration passed with 211 files; move scan passed             | Execute the moved nightly test on its configured DCU runner                                         | validated |
 | C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | TBD   | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available                                       | high   | Qwen dense plus DSV4 smoke                                           | Assign attention owner                                                                             | open      |
 | C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml`                                                | ci             | TBD   | manual merge    | Keep official workflow structure and DCU runner/wheel overlays                                                             | medium | CI dry-run and DCU registration check                                | Fill exact runner/image validation command                                                         | open      |
 | C13 /`125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**`                                                                    | sgl-kernel     | TBD   | manual merge    | sgl-kernel interfaces and DCU/HIP glue both changed                                                                        | high   | sgl-kernel DCU smoke whitelist                                       | Assign kernel owner                                                                                | open      |
@@ -360,20 +365,58 @@ actual result in the checkpoint note.
       empty-prefix paged allocation.
     - DeepSeek-V4 pure-TP service startup and real inference passed.
 
-### C05-C10
+### C05 / `8805f4cf1666`
 
-- Expected focus: PD, scheduler, attention, mem_cache, embedding, workflows.
+- Expected focus: PD/scheduler fail-fast, DSA top-k backend, DSV4 EPLB,
+  hybrid-cache dispatch, and registered-test directory split.
+- Owner: Codex for merge and static validation; DCU DSA/DSV4 owners for runtime.
+- Required validation:
+  - conflict marker scan, compile, and DCU registration.
+  - scheduler fail-fast and PD subprocess-exit behavior.
+  - DSA top-k backend CLI/env plus DCU LightOp route.
+- Recommended manual validation:
+  - `scheduler` / `PD`: scheduler exception, subprocess exit, overlap idle batch,
+    and disaggregation prefill/decode failure propagation.
+  - `attention`: DSA `sgl-kernel` backend with fused/unfused paged and ragged
+    top-k; confirm DCU uses LightOp only for fused transforms.
+  - `deepseek-v4` / `moe`: pure TP, MTP, graph capture, hash top-k, and EPLB
+    recording with EPLB both disabled and enabled.
+  - `mem_cache`: hybrid SWA/HiCache strategy selection, cache hit/retract, and
+    DeepSeek-V4 FULL+SWA pool construction.
+  - `test`: DCU registry after the official directory split.
+- Manual validation result:
+  - TBD
+- Notes:
+  - Five conflicts were resolved as one checkpoint; no split was required.
+  - The new official `DSATopKBackend.SGL_KERNEL` keeps `fast_topk_v2` from
+    sgl-kernel, while DCU fused paged/ragged transforms route to LightOp.
+  - `ScheduleBatch.loc_tensor` and all existing DeepSeek-V4 `_is_dcu` kernel
+    paths remain present after the automatic merge.
+  - The official hybrid-cache strategy refactor was accepted unchanged; it
+    already contains dedicated DeepSeek-V4 FULL+SWA dispatch.
+  - Automated validation completed:
+    - no unmerged entries, marker scan, and `git diff --check`: passed.
+    - full `python/sglang` and registered-test compile: passed.
+    - DCU registration: passed with 211 registered files.
+    - existing DSA alias/CLI/env suite: 24 tests passed.
+    - C05 DSA top-k CLI/env defaults and DCU LightOp fused-route mock: passed.
+    - official metrics collector dependency-injection suite: 14 tests passed.
+    - diffusion merged env defaults: passed with isolated module loading.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls; C04 DSV4 sources remain in the build manifest.
+  - Runtime validation pending:
+    - hybrid-cache dispatch/radix unit collection is blocked locally by LightOp
+      and lmslim device initialization because no HIP device is available.
+    - scheduler/PD fail-fast, DSA kernels, DSV4 EPLB/hash top-k, pure-TP server,
+      and CUDA graph validation require a DCU runner.
+
+### C06-C10
+
+- Expected focus: model, mem_cache, attention, embedding, and workflows.
 - Owner: TBD
 - Required validation:
   - Stage-b small model smoke.
-  - Qwen2.5 dense server smoke.
-  - Qwen2.5-VL smoke.
-- Recommended manual validation:
-  - `scheduler`: stage-b small model smoke, split prefill, abort/retract if touched.
-  - `attention`: dense + VLM attention backend smoke.
-  - `mem_cache`: cache hit/retract/SWA smoke if cache files conflict.
-  - `embedding` / `reranker`: embedding and reranker API smoke when touched.
-  - `ci`: DCU suite partition generation and runner/image dry-run.
+  - Qwen2.5 dense, VLM, embedding, and reranker smoke.
 - Manual validation result:
   - TBD
 - Notes:
