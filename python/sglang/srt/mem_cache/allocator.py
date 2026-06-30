@@ -32,6 +32,26 @@ from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kerne
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
+_LIGHTOP_ALLOC_EXTEND_KERNEL = None
+_LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED = False
+
+
+def _get_lightop_alloc_extend_kernel():
+    global _LIGHTOP_ALLOC_EXTEND_KERNEL, _LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED
+    if _LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED:
+        return _LIGHTOP_ALLOC_EXTEND_KERNEL
+
+    _LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED = True
+    try:
+        from lightop import op as lightop_op
+
+        _LIGHTOP_ALLOC_EXTEND_KERNEL = getattr(
+            lightop_op, "dcu_alloc_extend_kernel", None
+        )
+    except Exception:
+        _LIGHTOP_ALLOC_EXTEND_KERNEL = None
+    return _LIGHTOP_ALLOC_EXTEND_KERNEL
+
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
@@ -383,6 +403,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.sglang_kvalloc_kernel = get_bool_env_var("SGLANG_KVALLOC_KERNEL", default="true")
+        self.lightop_kvalloc_kernel = get_bool_env_var(
+            "SGLANG_LIGHTOP_KVALLOC_KERNEL", default="true"
+        )
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
@@ -433,15 +456,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        if self.sglang_kvalloc_kernel:
+        lightop_alloc_extend_kernel = (
+            _get_lightop_alloc_extend_kernel() if self.lightop_kvalloc_kernel else None
+        )
+        if lightop_alloc_extend_kernel is not None:
+            lightop_alloc_extend_kernel(
+                pre_lens_ptr=prefix_lens.to(torch.int64),
+                seq_lens_ptr=seq_lens.to(torch.int64),
+                last_loc_ptr=last_loc.to(torch.int64),
+                free_page_ptr=self.free_pages.to(torch.int64),
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
+            )
+        elif self.sglang_kvalloc_kernel:
             dcu_alloc_extend_kernel(
-                pre_lens_ptr = prefix_lens.to(torch.int64),
-                seq_lens_ptr = seq_lens.to(torch.int64),
-                last_loc_ptr = last_loc.to(torch.int64),
-                free_page_ptr = self.free_pages.to(torch.int64),
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                pre_lens_ptr=prefix_lens.to(torch.int64),
+                seq_lens_ptr=seq_lens.to(torch.int64),
+                last_loc_ptr=last_loc.to(torch.int64),
+                free_page_ptr=self.free_pages.to(torch.int64),
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
         else:
             alloc_extend_kernel[(bs,)](
