@@ -88,7 +88,7 @@ template <>
 struct _dtype_trait<fp8_e4m3_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
-#elif defined(__HIPCC__)
+#elif defined(__HIPCC__) && !defined(USE_ROCM)
 template <>
 struct _dtype_trait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
@@ -100,6 +100,8 @@ struct _dtype_trait<bf16_t> {
 #endif
 
 #ifdef USE_ROCM
+// fp16_t and bf16_t alias the HIP native types on DCU, so define their
+// traits only once through the native types below.
 template <>
 struct _dtype_trait<__half> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
