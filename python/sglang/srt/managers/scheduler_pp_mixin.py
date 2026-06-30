@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import ExpertDistributionReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -82,8 +83,26 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
+                    # Expert-distribution dump performs a world-group collective.
+                    # Forward its control request before handling it locally so
+                    # downstream PP stages can enter the same collective.
+                    preforward_expert_distribution_req = (
+                        not self.pp_group.is_last_rank
+                        and any(
+                            isinstance(req, ExpertDistributionReq) for req in recv_reqs
+                        )
+                    )
+                    if preforward_expert_distribution_req:
+                        self._pp_commit_comm_work(self.send_req_work)
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                if (
+                    not self.pp_group.is_last_rank
+                    and not preforward_expert_distribution_req
+                ):
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(

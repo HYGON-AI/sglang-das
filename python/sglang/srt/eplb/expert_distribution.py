@@ -868,20 +868,37 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
+        buffered_global_physical_count = (
+            self._global_physical_count_of_buffered_step.get_all()
+        )
+        logger.info(
+            "[EPLB dump][rank=%s] start, buffered_steps=%s",
+            self._rank,
+            buffered_global_physical_count.shape[0],
+        )
+
+        # EPLB ultimately sums the recorded steps before rebalancing. Sum locally
+        # first so the distributed collective has a small, fixed shape even when
+        # different ranks recorded a different number of forward passes.
+        global_physical_count = buffered_global_physical_count.sum(
+            dim=0, keepdim=True, dtype=torch.int64
+        )
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            global_physical_count,
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
-        )
+        ).squeeze(0)
 
         if self._first_dump:
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
+        logger.info("[EPLB dump][rank=%s] before all_reduce", self._rank)
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
         )
+        logger.info("[EPLB dump][rank=%s] after all_reduce", self._rank)
 
         output = dict(
             rank=self._rank,
@@ -930,6 +947,7 @@ def _dump_to_file(name, data):
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))
+    logger.info(f"Finished writing expert distribution to {path_output}")
 
 
 class _Buffer:
