@@ -8,11 +8,12 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_dcu, is_hip
 
 from .utils import make_name
 
 _is_hip = is_hip()
+_is_dcu = is_dcu()
 
 
 @cache_once
@@ -132,10 +133,47 @@ def fused_q_indexer_rope_hadamard_quant(
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
-    module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
-    )
+    if _is_dcu:
+        from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+
+        # TVM-FFI matches this output as uint8 storage. Passing a torch FP8 tensor
+        # directly makes DLPack report float8_e4m3fn and fails the C++ matcher.
+        q_fp8_storage = torch.empty(
+            q_input.shape, dtype=torch.uint8, device=q_input.device
+        )
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module.forward(
+            q_input,
+            q_fp8_storage,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+        q_fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+        q_fp8 = q_fp8_storage.view(q_fp8_dtype)
+    elif _is_hip:
+        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    else:
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module.forward(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
     return q_fp8, weights_out
 
 
