@@ -1,4 +1,5 @@
 import unittest
+from array import array
 
 import torch
 
@@ -118,7 +119,7 @@ class TestMamba(unittest.TestCase):
         req = Req(
             rid=0,
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=sampling_params,
         )
 
@@ -160,7 +161,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        key = RadixKey(req1_token_ids)
+        key = RadixKey(array("q", req1_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -178,7 +179,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        key = RadixKey(req2_token_ids)
+        key = RadixKey(array("q", req2_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -197,7 +198,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        key = RadixKey(req3_token_ids)
+        key = RadixKey(array("q", req3_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -215,7 +216,7 @@ class TestMamba(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        key = RadixKey(req4_token_ids)
+        key = RadixKey(array("q", req4_token_ids))
         result = tree.insert(
             InsertParams(
                 key=key,
@@ -246,7 +247,9 @@ class TestMamba(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req5_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -254,7 +257,9 @@ class TestMamba(unittest.TestCase):
         assert len(kv_indices) == 0
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req6_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -263,7 +268,9 @@ class TestMamba(unittest.TestCase):
         assert len(last_node.key) == 2
 
         req7_token_ids = [1, 2, 3, 4, 5, 6, 7]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req7_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req7_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req7: token_ids: {req7_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -280,7 +287,9 @@ class TestMamba(unittest.TestCase):
         tree.pretty_print()
 
         req8_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req8_token_ids)))
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", req8_token_ids)))
+        )
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req8: token_ids: {req8_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -291,7 +300,9 @@ class TestMamba(unittest.TestCase):
         req9_token_ids = [1, 2, 3, 4, 5, 6, 7]
         req9 = make_dummy_req()
         result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(req9_token_ids), req=req9, cow_mamba=True)
+            MatchPrefixParams(
+                key=RadixKey(array("q", req9_token_ids)), req=req9, cow_mamba=True
+            )
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
         assert req9.mamba_pool_idx is not None
@@ -317,7 +328,7 @@ class TestMamba(unittest.TestCase):
         stored_hashes = []
 
         req1 = make_dummy_req()
-        key1 = RadixKey([1, 2, 3])
+        key1 = RadixKey(array("q", [1, 2, 3]))
         tree.insert(
             InsertParams(
                 key=key1,
@@ -332,7 +343,7 @@ class TestMamba(unittest.TestCase):
         stored_hashes.extend(e.block_hashes[0] for e in stored_events)
 
         req2 = make_dummy_req()
-        key2 = RadixKey([1, 2, 3, 4, 5])
+        key2 = RadixKey(array("q", [1, 2, 3, 4, 5]))
         tree.insert(
             InsertParams(
                 key=key2,
@@ -369,7 +380,7 @@ class TestMamba(unittest.TestCase):
         tree.take_events()  # Clear the reset event.
 
         req1 = make_dummy_req()
-        key1 = RadixKey([1, 2, 3, 4])
+        key1 = RadixKey(array("q", [1, 2, 3, 4]))
         tree.insert(
             InsertParams(
                 key=key1,
@@ -384,7 +395,7 @@ class TestMamba(unittest.TestCase):
         split_parent_hash = first_insert_events[1].block_hashes[0]
 
         req2 = make_dummy_req()
-        key2 = RadixKey([1, 2, 5, 6])
+        key2 = RadixKey(array("q", [1, 2, 5, 6]))
         tree.insert(
             InsertParams(
                 key=key2,
@@ -396,7 +407,7 @@ class TestMamba(unittest.TestCase):
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
         self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(second_insert_events[0].token_ids, [5])
+        self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
@@ -480,7 +491,7 @@ class TestMamba(unittest.TestCase):
             req = Req(
                 rid=0,
                 origin_input_text="",
-                origin_input_ids=[],
+                origin_input_ids=array("q"),
                 sampling_params=sampling_params,
             )
             req_to_token_pool.alloc([req])
@@ -494,9 +505,9 @@ class TestMamba(unittest.TestCase):
         parent = TreeNode()
         deleted = TreeNode()
 
-        root.key = RadixKey([])
-        parent.key = RadixKey([1])
-        deleted.key = RadixKey([2])
+        root.key = RadixKey(array("q", []))
+        parent.key = RadixKey(array("q", [1]))
+        deleted.key = RadixKey(array("q", [2]))
         parent.parent = root
         deleted.parent = parent
         parent.value = torch.tensor([1], dtype=torch.int64)
@@ -670,7 +681,7 @@ class TestMamba(unittest.TestCase):
 
         # Step 1: Insert [1,2,3] to create first node
         req1 = make_dummy_req()
-        key1 = RadixKey([1, 2, 3])
+        key1 = RadixKey(array("q", [1, 2, 3]))
         tree.insert(
             InsertParams(
                 key=key1,
@@ -683,7 +694,7 @@ class TestMamba(unittest.TestCase):
         # Step 2: Insert [1,2,3,4,5,6,7] with prev_prefix_len=0 (free all matched)
         # Creates tree: [1,2,3] -> [4,5,6,7]
         req2 = make_dummy_req()
-        key2 = RadixKey([1, 2, 3, 4, 5, 6, 7])
+        key2 = RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7]))
         result = tree.insert(
             InsertParams(
                 key=key2,
@@ -701,7 +712,7 @@ class TestMamba(unittest.TestCase):
         # Matched prefix = 7 (across two nodes: [1,2,3] len=3, [4,5,6,7] len=4)
         # Protected [0..1], freed [2..6] = 5 slots, new [7] = 1 slot stored
         req3 = make_dummy_req()
-        key3 = RadixKey([1, 2, 3, 4, 5, 6, 7, 8])
+        key3 = RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8]))
         result = tree.insert(
             InsertParams(
                 key=key3,
@@ -718,7 +729,7 @@ class TestMamba(unittest.TestCase):
         # Step 4: Insert [1,2,3,4,5,6,7,8,9] with prev_prefix_len=8 (covers all matched)
         # Matched prefix = 8, prev_prefix_len=8 => nothing freed
         req4 = make_dummy_req()
-        key4 = RadixKey([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        key4 = RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9]))
         result = tree.insert(
             InsertParams(
                 key=key4,

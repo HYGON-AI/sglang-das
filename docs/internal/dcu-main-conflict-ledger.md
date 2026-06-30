@@ -119,6 +119,22 @@ actual result in the checkpoint note.
 | C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | manual merge    | Preserve DCU page-size 64 behavior, adopt DSA naming and deprecated aliases, and restore official alias action import      | high   | 24 DSA CLI/registry/env tests passed                                 | DCU DSA backend auto-selection and page-size startup smoke                                         | validated |
 | C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `test/registered/core/test_srt_engine.py`                                          | test           | Codex | manual merge    | Preserve DCU stage-b registration while taking official consolidated core test structure                                   | low    | DCU registration passed                                              | Execute the registered test on the normal DCU stage-b runner when enabled                          | validated |
 | C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `test/registered/language/test_srt_backend.py`                                     | test           | Codex | theirs          | Official replaced the legacy backend suite with consolidated basic sanity kits                                             | low    | deleted-file reference scan passed; DCU registration passed          | Decide whether`test_basic_sanity.py` should receive a DCU stage-a registration                     | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh`                             | jit-kernel     | Codex | manual merge    | Adopt official `kDLGPU` device checks while retaining the C03 planner extensions                                           | high   | static/registration passed; DCU runtime pending              | DSV4 JIT planner compile and runtime smoke                                                          | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/dsv4/elementwise.py`                                     | jit-kernel     | Codex | manual merge    | Keep DCU uint8 JIT storage, use official sgl-kernel on non-DCU HIP, and retain official CUDA JIT                           | high   | static/registration passed; DCU runtime pending              | DSV4 FP8 elementwise numeric smoke on DCU                                                         | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/deepseek_v4/fp8_utils.cuh`             | jit-kernel     | Codex | ours            | Preserve the validated DCU HIP FP8 pack; official AMD sgl-kernel keeps its separate software conversion path              | high   | static/registration passed; DCU runtime pending            | DCU FP8 pack compile and numeric smoke                                                            | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh`                           | jit-kernel     | Codex | theirs          | Adopt official `kDLGPU` aliases and HIP runtime fallback required by the new JIT interface                                 | medium | static/registration passed; DCU runtime pending            | Compile a DSV4 JIT module in the target DCU container                                             | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh`                             | jit-kernel     | Codex | manual merge    | Combine official device/memcpy additions with DCU launch, shuffle, sync, and shared-memory helpers                        | high   | static/registration passed; DCU runtime pending            | Compile and launch a representative DCU JIT kernel                                                | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh`                              | jit-kernel     | Codex | manual merge    | Adopt official wave64 mask behavior while retaining DCU shuffle and synchronization helpers                               | high   | static/registration passed; DCU runtime pending            | Wave64 shuffle/sync kernel smoke                                                                   | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/disaggregation/mooncake/conn.py`                                | disaggregation | Codex | manual merge    | Use official common `TransferKVChunk` while preserving the DCU FA KV-layout environment and transfer layout               | medium | static/registration passed; DCU runtime pending              | Mooncake transfer smoke with `SGLANG_KV_LAYOUT_DCU_FA`                                            | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/attention/dsa/dsa_indexer.py`                            | attention      | Codex | port to new API | Port official piecewise CUDA-graph structure around the existing DCU BF16/FP8 cache, LightOp, and page-size-64 paths      | high   | static/registration passed; DCU runtime pending              | DSA BF16/FP8 cache, sparse prefill, ragged decode, and graph smoke                                | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | port to new API | Add official MLA context parallelism while retaining DCU fused cache-write ownership guards                               | high   | static/registration passed; DCU runtime pending              | Dense, MLA CP, DSV4, and fused cache-write smoke                                                  | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/attention/triton_backend.py`                             | attention      | Codex | manual merge    | Adopt official pool API and cache invalidation while retaining CPU last-index handling for graph capture                  | high   | static/registration passed; DCU runtime pending              | Decode/extend and CUDA graph cache-invalidation smoke                                             | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/deepseek_v4_rope.py`                                     | dependency     | Codex | theirs          | Adopt the official ImportError-guarded TileLang initialization                                                             | medium | static/registration passed; DCU runtime pending              | Import with and without TileLang, then DSV4 RoPE smoke                                            | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/managers/overlap_utils.py`                                      | scheduler      | Codex | manual merge    | Adopt official FutureIndices/spec-extras APIs while keeping the native token resolver on DCU                              | medium | static/registration passed; DCU runtime pending              | Overlap scheduler plus speculative decode smoke                                                   | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/managers/schedule_batch.py`                                     | scheduler      | Codex | theirs          | Adopt official tensor flatten and speculative batch interface updates                                                      | medium | static/registration passed; DCU runtime pending              | Batch flatten, overlap scheduling, and speculative decode smoke                                   | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/models/deepseek_v2.py`                                          | model          | Codex | manual merge    | Keep DCU fused RMS/quant returns while adding official DSA/MLA CP parameters and MoE output-buffer context                 | high   | static/registration passed; DCU runtime pending              | DeepSeek V2/V3 fused RMS/quant, CP, MoE, and short-request smoke                                  | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep DCU fused cos/sin and LightOp/JIT paths; restrict official fused QK/sgl-kernel behavior to non-DCU HIP               | high   | static/registration passed; DCU runtime pending              | DSV4 TP, CP+EP, DP+EP, MTP, graph capture, and FP8 WO-A smoke                                    | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `sgl-kernel/csrc/common_extension_rocm.cc`                                         | sgl-kernel     | Codex | manual merge    | Register both DCU decode metadata operators and official DSV4 top-k/norm/RoPE operators                                    | high   | static/registration passed; DCU runtime pending                   | `gfx938` metadata check plus DCU sgl-kernel smoke whitelist                                       | validated |
 | C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | TBD   | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available                                       | high   | Qwen dense plus DSV4 smoke                                           | Assign attention owner                                                                             | open      |
 | C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml`                                                | ci             | TBD   | manual merge    | Keep official workflow structure and DCU runner/wheel overlays                                                             | medium | CI dry-run and DCU registration check                                | Fill exact runner/image validation command                                                         | open      |
 | C13 /`125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**`                                                                    | sgl-kernel     | TBD   | manual merge    | sgl-kernel interfaces and DCU/HIP glue both changed                                                                        | high   | sgl-kernel DCU smoke whitelist                                       | Assign kernel owner                                                                                | open      |
@@ -266,17 +282,68 @@ actual result in the checkpoint note.
 ### C04 / `af8f66940e9b`
 
 - Expected focus: AMD DSV4 runtime and jit-kernel.
-- Owner: TBD
+- Owner: Codex for the mechanical merge; DCU DSV4, attention, model, and kernel
+  owners are required for runtime validation.
 - Required validation:
   - jit-kernel or sgl-kernel DCU smoke.
 - Recommended manual validation:
-  - `jit-kernel`: DSV4 JIT build/import and targeted kernel smoke.
-  - `attention` / `deepseek-v4`: DSV4 attention runtime smoke.
-  - `dependency`: DCU container install/build sanity.
+  - `jit-kernel` / `sgl-kernel`: DSV4 JIT build/import, FP8 elementwise,
+    wave64 helpers, LightOp top-k, compressor, and kernel smoke whitelist.
+  - `attention`: DSA BF16/FP8 index cache, sparse prefill, FlashMLA, MLA CP,
+    fused cache write, and graph cache invalidation.
+  - `model` / `deepseek-v4`: DeepSeek V2/V3 fused RMS/quant and DeepSeek V4
+    pure TP, CP+EP, DP+EP, MTP, FP8 WO-A, and CUDA graph capture.
+  - `disaggregation`: Mooncake transfer with the DCU FA KV layout.
+  - `scheduler` / `speculative`: overlap scheduler and speculative decode.
+  - `dependency`: DCU container install/build sanity and guarded TileLang import.
 - Manual validation result:
   - TBD
 - Notes:
-  - TBD
+  - Branch: `sync/official-main-C04-20260523`.
+  - Resolved 16 Git conflicts as one checkpoint; no checkpoint split was
+    required.
+  - Adopted official `kDLGPU`, HIP runtime fallback, context-parallel APIs,
+    common disaggregation types, scheduler flattening, and DSV4 sgl-kernel
+    registrations.
+  - Preserved DCU-first behavior for uint8-backed FP8 JIT output, HIP FP8 pack,
+    fused cache writes, DSA page-size-64/BF16/FP8 cache, LightOp top-k, fused
+    RMS/quant, and fused cos/sin caches.
+  - Non-conflict HIP semantic audit:
+    - `dsv4/attn.py` keeps the JIT fused-store path on DCU; Triton store is
+      limited to non-DCU HIP.
+    - `dsv4/moe.py` keeps the JIT hash top-k path on DCU; Triton hash top-k is
+      limited to non-DCU HIP.
+    - `dsv4/gemm.py` preserves DCU deep-gemm priority and FP32 AITER output;
+      official non-DCU HIP behavior remains unchanged.
+    - `dsa_indexer.py` preserves the DCU page-table-64 path for ragged prefill.
+    - `deepseek_v2.py` limits the official fused-clamp AITER path to non-DCU
+      HIP so DCU keeps the existing JIT elementwise path.
+    - `deepseek_v4.py` limits official fused QK norm/RoPE and gfx95 FP8 input
+      quantization to non-DCU HIP, while retaining DCU alt streams.
+    - `overlap_utils.py` adopts the official speculative data model but keeps
+      the native future-token resolver on DCU.
+    - `attention/dsv4/indexer.py` still routes DCU top-k to
+      `lightop_topk_transform_512`; the removed JIT shared-memory workaround was
+      not restored.
+  - Automated validation completed:
+    - no unmerged Git entries: passed.
+    - precise conflict marker scan: passed.
+    - staged `git diff --check`: passed.
+    - compile for every changed Python file: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      211 DCU registered test files.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - `AMDGPU_TARGET=gfx938 python3 setup_rocm.py --name`, run from
+      `sgl-kernel/`: passed; the new DSV4 top-k and norm/RoPE sources hipified
+      successfully.
+    - removed JIT cast-file reference scan: passed.
+    - official C04 commit object was repacked locally and remains readable
+      without an alternate object directory.
+  - Runtime validation pending:
+    - `run_upgrade.sh` and the DCU sgl-kernel smoke whitelist were not run
+      because this container has no `/dev/kfd` or `/dev/dri`, and
+      `torch.cuda.is_available()` is false.
 
 ### C05-C10
 

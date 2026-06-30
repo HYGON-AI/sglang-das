@@ -52,6 +52,7 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define __syncwarp(...) __syncthreads()
 #define __shfl_sync(mask, var, src_lane, ...) __shfl(var, src_lane, ##__VA_ARGS__)
 #define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta, ##__VA_ARGS__)
@@ -97,6 +98,13 @@ using fp32x4_t = float4;
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
+// DLPack device type for the current platform
+#ifndef USE_ROCM
+inline constexpr auto kDLGPU = kDLCUDA;
+#else
+inline constexpr auto kDLGPU = kDLROCM;
+#endif
+
 namespace device {
 
 /// \brief Macro: forced-inline device function qualifier.
@@ -128,7 +136,11 @@ inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 :
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
+#ifndef USE_ROCM
 inline constexpr auto kFullMask = 0xffffffffu;
+#else
+inline constexpr auto kFullMask = 0xffffffffffffffffULL;
+#endif
 
 /**
  * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
