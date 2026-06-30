@@ -620,6 +620,9 @@ class Envs:
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+    
+    # lightop kernels
+    SGLANG_LIGHTOP_TOPK = EnvBool(True)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
