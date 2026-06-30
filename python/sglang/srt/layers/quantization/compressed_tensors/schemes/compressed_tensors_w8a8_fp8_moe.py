@@ -44,6 +44,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_aiter_fp8_w8a8_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
+_use_shufle = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE")
+if _use_shufle:
+    from aiter.ops.shuffle import asm_shuffle_weight_b8
 if _use_aiter_fp8_w8a8_moe:
     import aiter
     from aiter.moe import (
@@ -385,6 +388,13 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 torch.cuda.empty_cache()
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_deepgemm_moe and _is_dcu:
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
+        elif _is_dcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe and _use_shufle:
+            w13_weight = asm_shuffle_weight_b8(layer.w13_weight, 1)
+            layer.w13_weight.copy_(w13_weight)
+            del w13_weight
+            w2_weight = asm_shuffle_weight_b8(layer.w2_weight, 2)
+            layer.w2_weight.copy_(w2_weight)
+            del w2_weight
 
         elif (_use_fp8_w8a8_moe and _is_dcu
             and not getattr(layer, "_w8a8_fp8_packed", False)):
@@ -664,6 +674,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 block_size=0,
                 dtype=x.dtype,
                 quant_type=MoeQuantType.FP8_W8A8,
+                use_shuffle=_use_shufle
             )
             if not status:
                 raise RuntimeError(
@@ -711,6 +722,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 block_shape=None,
                 global_num_experts=E,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                use_weight_shuffle=_use_shufle
             )
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
