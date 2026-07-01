@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       scan_encoding:
-        description: "Run encoding baseline scan"
+        description: "Run full-repository encoding scan"
         required: true
         default: "true"
         type: choice
@@ -12,7 +12,31 @@ on:
           - "true"
           - "false"
       scan_secrets:
-        description: "Run secret baseline scan"
+        description: "Run full-repository secret scan, including git history"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      scan_large_files:
+        description: "Run large file and binary artifact scan"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      scan_license:
+        description: "Run license and copyright baseline scan"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      scan_sensitive_words:
+        description: "Run sensitive word and internal information scan"
         required: true
         default: "true"
         type: choice
@@ -20,7 +44,7 @@ on:
           - "true"
           - "false"
       scan_dependencies:
-        description: "Run dependency baseline scan"
+        description: "Run dependency vulnerability scan with local Trivy DB"
         required: true
         default: "true"
         type: choice
@@ -36,20 +60,38 @@ on:
           - "true"
           - "false"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-baseline-scan-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REPORT_DIR: baseline-reports
+  MAX_FILE_MB: "20"
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.24.2
+  TRIVY_IMAGE: aquasec/trivy:0.63.0
+  SEMGREP_IMAGE: semgrep/semgrep:1.125.0
+  TRIVY_CACHE_DIR: /home/github/.cache/trivy
+
 jobs:
   encoding-baseline-scan:
     name: encoding-baseline-scan
     if: ${{ github.event.inputs.scan_encoding == 'true' }}
     runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check UTF-8 and garbled characters
+      - name: Run encoding baseline scan
         shell: bash
         run: |
-          python3 - <<'PY'
+          mkdir -p "$REPORT_DIR"
+
+          python3 - <<'PY' | tee "$REPORT_DIR/encoding-report.txt"
           from pathlib import Path
 
           skip_dirs = {
@@ -66,15 +108,14 @@ jobs:
               ".whl", ".mp4", ".avi", ".mov", ".sqlite", ".db"
           }
 
-          bad = []
+          errors = []
+          warnings = []
 
           for path in Path(".").rglob("*"):
               if not path.is_file():
                   continue
-
               if set(path.parts) & skip_dirs:
                   continue
-
               if path.suffix.lower() in binary_exts:
                   continue
 
@@ -86,31 +127,48 @@ jobs:
               try:
                   text = data.decode("utf-8")
               except UnicodeDecodeError as e:
-                  bad.append(f"{path}: not valid UTF-8: {e}")
+                  errors.append(f"{path}: not valid UTF-8: {e}")
                   continue
 
               if "\ufffd" in text:
-                  bad.append(f"{path}: contains replacement character")
+                  errors.append(f"{path}: contains replacement character")
 
               if "\r\n" in text:
-                  bad.append(f"{path}: contains CRLF line endings")
+                  warnings.append(f"{path}: contains CRLF line endings")
 
-          if bad:
-              print("Encoding baseline scan failed:")
-              for item in bad:
+          print("# Encoding baseline scan")
+          print(f"errors: {len(errors)}")
+          print(f"warnings: {len(warnings)}")
+
+          if errors:
+              print("\n## Errors")
+              for item in errors:
                   print(" -", item)
-              raise SystemExit(1)
 
-          print("Encoding baseline scan passed.")
+          if warnings:
+              print("\n## Warnings")
+              for item in warnings:
+                  print(" -", item)
+
+          if errors:
+              raise SystemExit(1)
           PY
+
+      - name: Upload encoding report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: encoding-baseline-report
+          path: baseline-reports/encoding-report.txt
 
   secret-baseline-scan:
     name: secret-baseline-scan
     if: ${{ github.event.inputs.scan_secrets == 'true' }}
     runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout full history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -118,15 +176,288 @@ jobs:
       - name: Run Gitleaks baseline scan
         shell: bash
         run: |
+          mkdir -p "$REPORT_DIR"
+
           docker run --rm \
-            -v "$PWD:/repo" \
-            zricethezav/gitleaks:v8.24.2 \
-            detect --source /repo --no-git --verbose
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo:ro" \
+            -v "$PWD/$REPORT_DIR:/reports" \
+            "$GITLEAKS_IMAGE" \
+            detect \
+            --source /repo \
+            --redact \
+            --verbose \
+            --report-format json \
+            --report-path /reports/gitleaks-report.json
+
+      - name: Upload secret report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secret-baseline-report
+          path: baseline-reports/gitleaks-report.json
+
+  large-file-baseline-scan:
+    name: large-file-baseline-scan
+    if: ${{ github.event.inputs.scan_large_files == 'true' }}
+    runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run large file baseline scan
+        shell: bash
+        run: |
+          mkdir -p "$REPORT_DIR"
+
+          python3 - <<'PY' | tee "$REPORT_DIR/large-file-report.txt"
+          import os
+          from pathlib import Path
+
+          max_mb = int(os.environ.get("MAX_FILE_MB", "20"))
+          max_bytes = max_mb * 1024 * 1024
+
+          skip_dirs = {
+              ".git", ".github", ".cache", ".ruff_cache",
+              "__pycache__", "node_modules", "venv", ".venv"
+          }
+
+          blocked_exts = {
+              ".pt", ".pth", ".bin", ".onnx", ".safetensors", ".ckpt",
+              ".arrow", ".parquet", ".zip", ".tar", ".gz", ".tgz",
+              ".whl", ".mp4", ".avi", ".mov"
+          }
+
+          findings = []
+
+          for path in Path(".").rglob("*"):
+              if not path.is_file():
+                  continue
+              if set(path.parts) & skip_dirs:
+                  continue
+
+              size = path.stat().st_size
+              suffix = path.suffix.lower()
+
+              if size > max_bytes:
+                  findings.append(f"{path}: size={size / 1024 / 1024:.2f}MB exceeds {max_mb}MB")
+
+              if suffix in blocked_exts:
+                  findings.append(f"{path}: blocked artifact extension {suffix}")
+
+          print("# Large file baseline scan")
+          print(f"findings: {len(findings)}")
+
+          for item in findings:
+              print(" -", item)
+
+          if findings:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload large file report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: large-file-baseline-report
+          path: baseline-reports/large-file-report.txt
+
+  license-copyright-baseline-scan:
+    name: license-copyright-baseline-scan
+    if: ${{ github.event.inputs.scan_license == 'true' }}
+    runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run license and copyright baseline scan
+        shell: bash
+        run: |
+          mkdir -p "$REPORT_DIR"
+
+          python3 - <<'PY' | tee "$REPORT_DIR/license-copyright-report.txt"
+          from pathlib import Path
+
+          root = Path(".")
+          errors = []
+          warnings = []
+
+          license_files = [
+              p for p in root.iterdir()
+              if p.is_file() and p.name.upper().startswith("LICENSE")
+          ]
+          notice_files = [
+              p for p in root.iterdir()
+              if p.is_file() and p.name.upper() == "NOTICE"
+          ]
+          readme_files = [
+              p for p in root.iterdir()
+              if p.is_file() and p.name.upper().startswith("README")
+          ]
+
+          if not license_files:
+              errors.append("Root LICENSE file is missing")
+
+          if not readme_files:
+              warnings.append("Root README file is missing")
+
+          if not notice_files:
+              warnings.append("Root NOTICE file is missing or not found; verify whether upstream requires NOTICE retention")
+
+          source_exts = {
+              ".py", ".sh", ".c", ".cc", ".cpp", ".cu", ".h", ".hpp",
+              ".go", ".rs", ".java"
+          }
+
+          skip_dirs = {
+              ".git", ".github", "third_party", "3rdparty", "vendor",
+              "node_modules", "build", "dist", "__pycache__", ".cache"
+          }
+
+          missing_headers = []
+
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              if set(path.parts) & skip_dirs:
+                  continue
+              if path.suffix.lower() not in source_exts:
+                  continue
+
+              try:
+                  head = path.read_text(encoding="utf-8", errors="ignore")[:1200].lower()
+              except Exception:
+                  continue
+
+              has_hint = (
+                  "copyright" in head
+                  or "licensed under" in head
+                  or "apache license" in head
+                  or "mit license" in head
+                  or "bsd license" in head
+              )
+
+              if not has_hint:
+                  missing_headers.append(str(path))
+
+          print("# License and copyright baseline scan")
+          print(f"errors: {len(errors)}")
+          print(f"warnings: {len(warnings)}")
+          print(f"files_missing_header_hint: {len(missing_headers)}")
+
+          if errors:
+              print("\n## Errors")
+              for item in errors:
+                  print(" -", item)
+
+          if warnings:
+              print("\n## Warnings")
+              for item in warnings:
+                  print(" -", item)
+
+          if missing_headers:
+              print("\n## Files missing license/copyright header hint")
+              for item in missing_headers:
+                  print(" -", item)
+
+          if errors:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload license copyright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: license-copyright-baseline-report
+          path: baseline-reports/license-copyright-report.txt
+
+  sensitive-word-baseline-scan:
+    name: sensitive-word-baseline-scan
+    if: ${{ github.event.inputs.scan_sensitive_words == 'true' }}
+    runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run sensitive word baseline scan
+        shell: bash
+        run: |
+          mkdir -p "$REPORT_DIR"
+
+          python3 - <<'PY' | tee "$REPORT_DIR/sensitive-word-report.txt"
+          import re
+          from pathlib import Path
+
+          skip_dirs = {
+              ".git", ".github", "node_modules", "venv", ".venv",
+              "__pycache__", "dist", "build", "target", ".ruff_cache", ".cache"
+          }
+
+          binary_exts = {
+              ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf",
+              ".zip", ".gz", ".tar", ".tgz", ".jar", ".so", ".dll",
+              ".exe", ".bin", ".onnx", ".pt", ".pth", ".safetensors",
+              ".whl", ".mp4", ".avi", ".mov", ".sqlite", ".db"
+          }
+
+          patterns = [
+              ("confidential marker", re.compile(r"\b(confidential|internal only|do not distribute|restricted|classified)\b", re.I)),
+              ("Chinese confidential marker", re.compile(r"(仅内部使用|禁止外传|保密|内部资料)")),
+              ("private key marker", re.compile(r"BEGIN (RSA|DSA|EC|OPENSSH)? ?PRIVATE KEY")),
+              ("credential keyword", re.compile(r"\b(password|passwd|api[_-]?key|access[_-]?key|secret[_-]?key|credential|token)\b", re.I)),
+              ("internal path hint", re.compile(r"(/home/[^/\s]+|/mnt/[^/\s]+|/data/[^/\s]+|/public/[^/\s]+)")),
+              ("private IPv4 address", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b")),
+          ]
+
+          findings = []
+
+          for path in Path(".").rglob("*"):
+              if not path.is_file():
+                  continue
+              if set(path.parts) & skip_dirs:
+                  continue
+              if path.suffix.lower() in binary_exts:
+                  continue
+
+              try:
+                  text = path.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  for name, pattern in patterns:
+                      if pattern.search(line):
+                          findings.append(f"{path}:{lineno}: {name}")
+                          break
+
+          print("# Sensitive word baseline scan")
+          print(f"findings: {len(findings)}")
+
+          for item in findings:
+              print(" -", item)
+
+          if findings:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload sensitive word report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sensitive-word-baseline-report
+          path: baseline-reports/sensitive-word-report.txt
 
   dependency-baseline-scan:
     name: dependency-baseline-scan
     if: ${{ github.event.inputs.scan_dependencies == 'true' }}
     runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 45
     continue-on-error: true
 
     steps:
@@ -136,21 +467,36 @@ jobs:
       - name: Run Trivy dependency baseline scan
         shell: bash
         run: |
+          mkdir -p "$REPORT_DIR"
+
           docker run --rm \
-            -v "$PWD:/repo" \
-            -v /home/github/.cache/trivy:/root/.cache/trivy \
-            aquasec/trivy:0.63.0 \
+            --user "$(id -u):$(id -g)" \
+            -e TRIVY_CACHE_DIR=/trivy-cache \
+            -v "$PWD:/repo:ro" \
+            -v "$PWD/$REPORT_DIR:/reports" \
+            -v "$TRIVY_CACHE_DIR:/trivy-cache:ro" \
+            "$TRIVY_IMAGE" \
             fs \
             --skip-db-update \
             --scanners vuln \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
+            --format json \
+            --output /reports/trivy-report.json \
             /repo
+
+      - name: Upload dependency report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-baseline-report
+          path: baseline-reports/trivy-report.json
 
   sast-baseline-scan:
     name: sast-baseline-scan
     if: ${{ github.event.inputs.scan_sast == 'true' }}
     runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 45
     continue-on-error: true
 
     steps:
@@ -160,7 +506,77 @@ jobs:
       - name: Run Semgrep SAST baseline scan
         shell: bash
         run: |
+          mkdir -p "$REPORT_DIR"
+
           docker run --rm \
-            -v "$PWD:/src" \
-            semgrep/semgrep:1.125.0 \
-            semgrep scan --config auto --error /src
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e SEMGREP_SEND_METRICS=off \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/$REPORT_DIR:/reports" \
+            "$SEMGREP_IMAGE" \
+            semgrep scan \
+            --config auto \
+            --json \
+            --output /reports/semgrep-report.json \
+            /src
+
+      - name: Upload SAST report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-baseline-report
+          path: baseline-reports/semgrep-report.json
+
+  baseline-summary:
+    name: baseline-summary
+    runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 10
+    if: always()
+    needs:
+      - encoding-baseline-scan
+      - secret-baseline-scan
+      - large-file-baseline-scan
+      - license-copyright-baseline-scan
+      - sensitive-word-baseline-scan
+      - dependency-baseline-scan
+      - sast-baseline-scan
+
+    steps:
+      - name: Generate baseline summary
+        shell: bash
+        run: |
+          mkdir -p "$REPORT_DIR"
+
+          cat > "$REPORT_DIR/scan-summary.md" <<EOF
+          # Quality Baseline Scan Summary
+
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ## Results
+
+          | Check | Result |
+          |---|---|
+          | encoding-baseline-scan | ${{ needs.encoding-baseline-scan.result }} |
+          | secret-baseline-scan | ${{ needs.secret-baseline-scan.result }} |
+          | large-file-baseline-scan | ${{ needs.large-file-baseline-scan.result }} |
+          | license-copyright-baseline-scan | ${{ needs.license-copyright-baseline-scan.result }} |
+          | sensitive-word-baseline-scan | ${{ needs.sensitive-word-baseline-scan.result }} |
+          | dependency-baseline-scan | ${{ needs.dependency-baseline-scan.result }} |
+          | sast-baseline-scan | ${{ needs.sast-baseline-scan.result }} |
+
+          ## Purpose
+
+          This workflow is used as evidence for open-source stage 5:
+          full-repository security and quality baseline scan.
+          EOF
+
+      - name: Upload baseline summary
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-baseline-scan-summary
+          path: baseline-reports/scan-summary.md
