@@ -473,7 +473,7 @@ jobs:
             -e TRIVY_CACHE_DIR=/trivy-cache \
             -v "$PWD:/repo:ro" \
             -v "$PWD/$REPORT_DIR:/reports" \
-            -v "$TRIVY_CACHE_DIR:/trivy-cache:ro" \
+            -v "$TRIVY_CACHE_DIR:/trivy-cache" \
             "$TRIVY_IMAGE" \
             fs \
             --skip-db-update \
