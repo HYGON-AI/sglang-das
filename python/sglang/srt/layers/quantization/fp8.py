@@ -84,10 +84,10 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_hip,
     is_musa,
     is_npu,
-    is_dcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -96,10 +96,10 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+
 SGLANG_USE_AITER_FP8_ASM_MOE = False
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
@@ -543,7 +543,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.format_ue8m0 = True
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
-        from sglang.srt.layers.quantization.fp8_utils import hipblaslt_w8a8_block_fp8_linear
+        from sglang.srt.layers.quantization.fp8_utils import (
+            hipblaslt_w8a8_block_fp8_linear,
+        )
 
         if self.w8a8_block_fp8_linear is hipblaslt_w8a8_block_fp8_linear:
             weight = weight.T.contiguous()
@@ -1166,10 +1168,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # t = shuffle_weight(layer.w2_weight, (16, 16))
             # layer.w2_weight.copy_(t)
             # del t
-            w13_weight = asm_shuffle_weight_b8(layer.w13_weight, 1)
+            w13_weight = asm_shuffle_weight_b8(layer.w13_weight, 1)  # noqa: F821
             layer.w13_weight.copy_(w13_weight)
             del w13_weight
-            w2_weight = asm_shuffle_weight_b8(layer.w2_weight, 2)
+            w2_weight = asm_shuffle_weight_b8(layer.w2_weight, 2)  # noqa: F821
             layer.w2_weight.copy_(w2_weight)
             del w2_weight
         elif _is_cpu:
@@ -1958,38 +1960,39 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
-        topk_weights, topk_ids, _ = topk_output
+        topk_weights, topk_ids, _ = topk_output  # noqa: F821
         if self.block_quant and SGLANG_USE_AITER_FP8_ASM_MOE:
-            return fused_experts_asm_impl(x,
-                            layer.w13_weight,
-                            layer.w2_weight,
-                            topk_weights,
-                            topk_ids,
-                            x.dtype,
-                            False,
-                            activation,
-                            True,
-                            False,
-                            False,
-                            False,
-                            False,
-                            False,
-                            -1,
-                            None,
-                            layer.w13_weight_scale_inv,
-                            layer.w2_weight_scale_inv,
-                            None,
-                            None,
-                            layer.w13_input_scale,
-                            layer.w2_input_scale,
-                            (128,128),
-                            use_shuffle=True
-                )
+            return fused_experts_asm_impl(  # noqa: F821
+                x,  # noqa: F821
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                x.dtype,  # noqa: F821
+                False,
+                activation,  # noqa: F821
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                -1,
+                None,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                None,
+                None,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+                (128, 128),
+                use_shuffle=True,
+            )
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
             return fused_moe(
-                x,
+                x,  # noqa: F821
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
@@ -1998,7 +2001,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w1_scale=layer.w13_weight_scale1,
                 w2_scale=layer.w2_weight_scale1,
                 activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                    ActivationType.Silu
+                    if activation == "silu"  # noqa: F821
+                    else ActivationType.Gelu
                 ),
             )
 

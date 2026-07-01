@@ -54,9 +54,7 @@ _MEGA_MOE_DCU_BACKEND_ENV = "MEGAMOE_DCU_BACKEND"
 _MEGA_MOE_DCU_BACKEND_AUTO = "auto"
 _MEGA_MOE_DCU_BACKEND_LL = "ll"
 _MEGA_MOE_DCU_BACKEND_NORMAL = "normal"
-_MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = (
-    "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
-)
+_MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
 _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD = 496
 
 logger = logging.getLogger(__name__)
@@ -267,9 +265,7 @@ def _get_mega_moe_symm_buffer(
     if buf is None:
         kwargs = {}
         if cuda_graph_max_tokens_per_rank is not None:
-            kwargs["cuda_graph_max_tokens_per_rank"] = (
-                cuda_graph_max_tokens_per_rank
-            )
+            kwargs["cuda_graph_max_tokens_per_rank"] = cuda_graph_max_tokens_per_rank
         buf = factory(
             group,
             num_experts,
@@ -397,11 +393,7 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
-    runtime = (
-        get_dcu_mega_moe_runtime()
-        if _IS_DCU
-        else _DCU_MEGA_MOE_RUNTIME_DEEP_GEMM
-    )
+    runtime = get_dcu_mega_moe_runtime() if _IS_DCU else _DCU_MEGA_MOE_RUNTIME_DEEP_GEMM
     cuda_graph_max_tokens_per_rank = (
         _get_dcu_cuda_graph_max_tokens_per_rank(
             num_max_tokens_per_rank,
@@ -531,9 +523,7 @@ def _run_deep_gemm_dcu_w8a8_mega_moe(
         buf.x[:num_tokens].copy_(x_fp8)
         buf.x_sf[:num_tokens].copy_(x_scale)
         buf.topk_idx[:num_tokens].copy_(topk_ids.to(buf.topk_idx.dtype))
-        buf.topk_weights[:num_tokens].copy_(
-            topk_weights.to(buf.topk_weights.dtype)
-        )
+        buf.topk_weights[:num_tokens].copy_(topk_weights.to(buf.topk_weights.dtype))
 
     y = torch.empty(
         (num_tokens, hidden_size),
@@ -585,18 +575,14 @@ def _run_standalone_dcu_w8a8_mega_moe(
         )
 
     output_rows = (
-        int(buf.cuda_graph_max_tokens_per_rank)
-        if is_graph_capture
-        else num_tokens
+        int(buf.cuda_graph_max_tokens_per_rank) if is_graph_capture else num_tokens
     )
     y = torch.empty(
         (output_rows, hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    api_kwargs = {
-        "megamoe_backend": _select_dcu_megamoe_backend(dispatch_num_tokens)
-    }
+    api_kwargs = {"megamoe_backend": _select_dcu_megamoe_backend(dispatch_num_tokens)}
     if is_graph_capture:
         api_kwargs["graph"] = True
     else:
@@ -723,9 +709,7 @@ def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
     num_experts, l1_rows, hidden = w13.shape
     _, l2_rows, intermediate = w2.shape
     if l1_rows != 2 * intermediate or l2_rows != hidden:
-        raise ValueError(
-            "DCU W8A8 MegaMoE expects w13=[E,2I,H] and w2=[E,H,I]"
-        )
+        raise ValueError("DCU W8A8 MegaMoE expects w13=[E,2I,H] and w2=[E,H,I]")
 
     w13_scale = _dcu_channelwise_scale(
         experts,
