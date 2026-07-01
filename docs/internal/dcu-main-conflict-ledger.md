@@ -355,15 +355,6 @@ actual result in the checkpoint note.
 
     - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
     - CI test - ✅
-  - Post-checkpoint fixes and validation (2026-06-30):
-    - Added the missing DSV4 top-k and norm/RoPE sources to the DCU
-      `setup_hip.py` manifest; a clean AOT build and operator registration
-      check passed.
-    - Removed duplicate DCU HIP dtype traits in the DSV4 JIT headers; a
-      fresh-cache compressor-plan JIT build passed.
-    - Restored the DCU `ScheduleBatch.loc_tensor` initialization required by
-      empty-prefix paged allocation.
-    - DeepSeek-V4 pure-TP service startup and real inference passed.
 
 ### C05 / `8805f4cf1666`
 
@@ -374,18 +365,7 @@ actual result in the checkpoint note.
   - conflict marker scan, compile, and DCU registration.
   - scheduler fail-fast and PD subprocess-exit behavior.
   - DSA top-k backend CLI/env plus DCU LightOp route.
-- Recommended manual validation:
-  - `scheduler` / `PD`: scheduler exception, subprocess exit, overlap idle batch,
-    and disaggregation prefill/decode failure propagation.
-  - `attention`: DSA `sgl-kernel` backend with fused/unfused paged and ragged
-    top-k; confirm DCU uses LightOp only for fused transforms.
-  - `deepseek-v4` / `moe`: pure TP, MTP, graph capture, hash top-k, and EPLB
-    recording with EPLB both disabled and enabled.
-  - `mem_cache`: hybrid SWA/HiCache strategy selection, cache hit/retract, and
-    DeepSeek-V4 FULL+SWA pool construction.
-  - `test`: DCU registry after the official directory split.
-- Manual validation result:
-  - TBD
+
 - Notes:
   - Five conflicts were resolved as one checkpoint; no split was required.
   - The new official `DSATopKBackend.SGL_KERNEL` keeps `fast_topk_v2` from
@@ -409,6 +389,23 @@ actual result in the checkpoint note.
       and lmslim device initialization because no HIP device is available.
     - scheduler/PD fail-fast, DSA kernels, DSV4 EPLB/hash top-k, pure-TP server,
       and CUDA graph validation require a DCU runner.
+
+  - Recommended manual validation:
+    - `scheduler` / `PD`: scheduler exception, subprocess exit, overlap idle batch,
+      and disaggregation prefill/decode failure propagation.
+    - `attention`: DSA `sgl-kernel` backend with fused/unfused paged and ragged
+      top-k; confirm DCU uses LightOp only for fused transforms.
+    - `deepseek-v4` / `moe`: pure TP, MTP, graph capture, hash top-k, and EPLB
+      recording with EPLB both disabled and enabled.
+    - `mem_cache`: hybrid SWA/HiCache strategy selection, cache hit/retract, and
+      DeepSeek-V4 FULL+SWA pool construction.
+    - `test`: DCU registry after the official directory split.
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+    - DCU EPLB recording enabled validation - ✅
+    - HiCache - ❓
+    - PD disaggregation validation - ✅
 
 ### C06-C10
 
