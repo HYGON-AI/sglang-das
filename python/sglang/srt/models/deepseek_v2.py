@@ -3714,16 +3714,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
             and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
         ):
+            hip_platform = "DCU/DTK-platform" if _is_dcu else "ROCm/HIP-platform"
             disable_reason = (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
-                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+                f"or {hip_platform} with capability >= gfx942(MI30x) can use shared experts fusion optimization."
                 "or MT-platform with capability >= 31 can use shared experts fusion optimization."
             )
         elif get_moe_expert_parallel_world_size() > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
+            hip_platform = "DCU/DTK-platform" if _is_dcu else "ROCm/HIP-platform"
             disable_reason = (
-                "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) "
+                f"Only Deepseek V3/R1 on {hip_platform} with capability >= gfx942(MI30x) "
                 "can use shared experts fusion optimization under expert parallelism."
             )
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":

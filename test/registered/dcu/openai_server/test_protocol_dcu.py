@@ -31,6 +31,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.test.ci.ci_register import register_dcu_ci
 
 register_dcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-dcu")
+register_dcu_ci(est_time=10, suite="nightly-dcu-core-functional", nightly=True)
 
 
 class TestModelCard(unittest.TestCase):

@@ -3,6 +3,9 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+import math
+from scipy.linalg import hadamard
+import torch.nn.functional as F
 
 
 # Triton implementation
@@ -224,31 +227,68 @@ def _hadamard_transform_kernel(
     tl.store(out_ptr + row_offset + cols, acc * scale, mask=mask)
 
 
-def hadamard_transform_optimized(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+# def hadamard_transform_optimized(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+#     """
+#     x: (..., dim) - dim must be a power of 2
+#     """
+#     x_shape = x.shape
+#     dim = x.shape[-1]
+#     assert (
+#         dim & (dim - 1)
+#     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+
+#     x_2d = x.contiguous().view(-1, dim)
+#     out = torch.empty_like(x_2d)
+#     block_d = triton.next_power_of_2(dim)
+#     bits = block_d.bit_length()
+#     num_warps = min(max(block_d // 32, 1), 8)
+#     _hadamard_transform_kernel[(x_2d.shape[0],)](
+#         x_2d,
+#         out,
+#         float(scale),
+#         dim,
+#         BLOCK_D=block_d,
+#         BITS=bits,
+#         num_warps=num_warps,
+#     )
+#     return out.view(*x_shape)
+
+# 全局缓存
+_HADAMARD_CACHE = {}
+
+def get_hadamard_matrix(dim, device=None, dtype=torch.float32):
+    """获取缓存的 Hadamard 矩阵"""
+    global _HADAMARD_CACHE
+    key = (dim, str(device), str(dtype))
+
+    if key not in _HADAMARD_CACHE:
+        log_dim = math.ceil(math.log2(dim))
+        dim_padded = 2 ** log_dim
+        h = hadamard(dim_padded, dtype=float)
+        _HADAMARD_CACHE[key] = torch.tensor(h, dtype=dtype, device=device)
+    return _HADAMARD_CACHE[key]
+
+def hadamard_transform_optimized(x, scale=1.0):
     """
-    x: (..., dim) - dim must be a power of 2
+    x: (..., dim) - dim 固定为 128
     """
     x_shape = x.shape
     dim = x.shape[-1]
-    assert (
-        dim & (dim - 1)
-    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
 
-    x_2d = x.contiguous().view(-1, dim)
-    out = torch.empty_like(x_2d)
-    block_d = triton.next_power_of_2(dim)
-    bits = block_d.bit_length()
-    num_warps = min(max(block_d // 32, 1), 8)
-    _hadamard_transform_kernel[(x_2d.shape[0],)](
-        x_2d,
-        out,
-        float(scale),
-        dim,
-        BLOCK_D=block_d,
-        BITS=bits,
-        num_warps=num_warps,
-    )
-    return out.view(*x_shape)
+    h_matrix = get_hadamard_matrix(dim, x.device, x.dtype)
+
+    x = x.reshape(-1, dim)
+    log_dim = math.ceil(math.log2(dim))
+    dim_padded = 2 ** log_dim
+
+    if dim != dim_padded:
+        x = F.pad(x, (0, dim_padded - dim))
+
+    out = F.linear(x, h_matrix)
+    if scale != 1.0:
+        out = out * scale
+    return out[..., :dim].reshape(*x_shape)
+
 
 
 @triton.jit

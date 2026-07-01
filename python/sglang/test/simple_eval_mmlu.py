@@ -6,6 +6,8 @@ Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song,
 https://arxiv.org/abs/2009.03300
 """
 
+import glob
+import os
 import random
 import re
 from typing import Optional
@@ -86,15 +88,63 @@ subject2category = {
 
 class MMLUEval(Eval):
     def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
-        if "://" in filename:
+        if os.path.isdir(filename):
+            examples = self._load_local_hf_mmlu(filename)
+        elif "://" in filename:
             df = pandas.read_csv(filename, storage_options={"timeout": 30})
+            examples = [row.to_dict() for _, row in df.iterrows()]
         else:
             df = pandas.read_csv(filename)
-        examples = [row.to_dict() for _, row in df.iterrows()]
+            examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
             examples = random.Random(0).sample(examples, num_examples)
         self.examples = examples
         self.num_threads = num_threads
+
+    @staticmethod
+    def _load_local_hf_mmlu(dataset_path: str) -> list[dict]:
+        from datasets import concatenate_datasets, load_dataset
+
+        answer_letters = ["A", "B", "C", "D"]
+        datasets = []
+        for subject in sorted(subject2category):
+            files = sorted(
+                glob.glob(os.path.join(dataset_path, subject, "test-*.parquet"))
+            )
+            if not files:
+                files = sorted(
+                    glob.glob(
+                        os.path.join(dataset_path, subject, "validation-*.parquet")
+                    )
+                )
+            if not files:
+                continue
+            d = load_dataset("parquet", data_files=files, split="train")
+            datasets.append(d)
+        if not datasets:
+            raise RuntimeError(f"Failed to load local MMLU dataset from {dataset_path}")
+
+        merged = concatenate_datasets(datasets)
+        examples = []
+        for row in merged:
+            choices = row.get("choices") or []
+            if len(choices) < 4:
+                continue
+            answer = row.get("answer")
+            if isinstance(answer, int):
+                answer = answer_letters[answer]
+            examples.append(
+                {
+                    "Question": row.get("question", ""),
+                    "A": choices[0],
+                    "B": choices[1],
+                    "C": choices[2],
+                    "D": choices[3],
+                    "Answer": answer,
+                    "Subject": row.get("subject", "unknown"),
+                }
+            )
+        return examples
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):

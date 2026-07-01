@@ -12,10 +12,11 @@ if str(PARENT_DIR) not in sys.path:
 from auto_benchmark import AutoBenchmarkTestCase
 
 from sglang.auto_benchmark_lib import SearchDeadlineExceeded, run_candidate
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
 register_cuda_ci(est_time=6, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
+register_dcu_ci(est_time=6, suite="nightly-dcu-1-gpu", nightly=True)
 
 
 class TestAutoBenchmarkRunCandidate(AutoBenchmarkTestCase):

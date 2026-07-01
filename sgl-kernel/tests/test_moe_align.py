@@ -12,7 +12,20 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+def is_dcu() -> bool:
+    if not is_hip():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
+        return any(gfx in gcn_arch for gfx in ("gfx936", "gfx938", "gfx928"))
+    except Exception:
+        return False
+
+
 _is_hip = is_hip()
+_is_dcu = is_dcu()
+_hip_skip_reason = "Skip for DCU/DTK GPU" if _is_dcu else "Skip for ROCm/HIP GPU"
 
 
 def ceil_div(a, b):
@@ -260,7 +273,7 @@ def test_moe_align_block_size_compare_implementations(
 @pytest.mark.parametrize("topk", [2, 6])
 @pytest.mark.parametrize("k", [128, 511, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
+@pytest.mark.skipif(_is_hip, reason=_hip_skip_reason)
 def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
     input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
     actual = torch.empty((m, k), device="cuda", dtype=dtype)

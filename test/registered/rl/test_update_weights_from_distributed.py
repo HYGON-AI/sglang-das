@@ -1,9 +1,8 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
+    est_time=400,
+    suite="nightly-dcu-2-gpu",
+    nightly=True,
 )
 
 
@@ -54,6 +53,28 @@ register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 mp.set_start_method("spawn", force=True)
+
+
+def _dcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return {}
+    return {
+        "attention_backend": "fa3",
+        "page_size": 64,
+        "trust_remote_code": True,
+    }
+
+
+def _dcu_server_args():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return ()
+    return (
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--trust-remote-code",
+    )
 
 
 def verify_params_close(params1, params2, error_msg):
@@ -323,6 +344,7 @@ def init_process_sgl(
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
             cuda_graph_max_bs=2,
+            **_dcu_engine_kwargs(),
         )
     else:
         if rank == 1:
@@ -343,7 +365,8 @@ def init_process_sgl(
                 str(tp_size),
                 "--cuda-graph-max-bs",
                 2,
-            ),
+            )
+            + _dcu_server_args(),
         )
     torch.cuda.synchronize()
 
