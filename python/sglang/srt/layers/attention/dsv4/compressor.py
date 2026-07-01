@@ -62,6 +62,9 @@ class CompressorBackendMixin:
         assert isinstance(metadata, FusedCompressMetadata)
         return metadata
 
+    def _maybe_upgrade_forward_metadata(self) -> None:
+        pass
+
     def forward_compress(
         self,
         *,
@@ -95,6 +98,37 @@ class CompressorBackendMixin:
             plan = make_compressor_plan(compress_ratio, forward_batch)
             metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
         indices, extra_data, plan = metadata
+
+        if _is_hip:
+            if not is_paged:
+                raise NotImplementedError("HIP fused compressor expects paged metadata")
+
+            from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+                hip_compress_forward,
+                hip_compress_fused_norm_rope_inplace,
+            )
+
+            kv_compressed = hip_compress_forward(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=ape,
+                indices=indices,
+                plan=plan,
+                compress_ratio=compress_ratio,
+                head_dim=head_dim,
+                extra_data=extra_data,
+            )
+            norm_eps = (
+                norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
+            )
+            hip_compress_fused_norm_rope_inplace(
+                kv_compressed,
+                norm.weight,
+                norm_eps,
+                freqs_cis_cache,
+                plan,
+            )
+            return rotate_activation(kv_compressed) if rotate else kv_compressed
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -298,6 +332,8 @@ def create_paged_compressor_data(
         if is_overlap:
             write_overlap_loc = get_raw_loc(write_positions - compress_ratio)
             extra_data = write_overlap_loc.view(-1, 1)
+        elif _is_hip:
+            extra_data = get_raw_loc(write_positions - compress_ratio)
         else:
             extra_data = None
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
@@ -411,7 +447,11 @@ class Compressor(nn.Module):
         )
 
 # TODO: compatibility impl for dsv4 backend on HIP
-if _is_hip and not _is_dcu:
+if (
+    _is_hip
+    and not _is_dcu
+    and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
+):
     from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
         CompressorHip as Compressor,
     )

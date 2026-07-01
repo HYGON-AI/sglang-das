@@ -77,7 +77,7 @@ _is_dcu = is_dcu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -108,7 +108,10 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    import flash_mla
+    if _is_dcu:
+        import flash_mla
+    else:
+        import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 

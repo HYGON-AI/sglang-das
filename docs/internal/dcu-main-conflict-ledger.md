@@ -140,6 +140,20 @@ actual result in the checkpoint note.
 | C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/layers/moe/hash_topk.py`                                        | moe            | Codex | manual merge    | Preserve DCU fused hash-top-k and LightOp postprocess, then invoke the official EPLB expert-distribution recorder           | high   | compile and DCU semantic audit passed; runtime pending               | DSV4 hash top-k with EPLB off/on, padding, and logical-to-physical dispatch                         | validated |
 | C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep DCU tuning-path imports and kernel branches while adding official EPLB per-layer recording context                    | high   | compile and DCU path audit passed; runtime pending                   | DSV4 pure TP, EPLB, MTP, CUDA graph, and short-request inference                                    | validated |
 | C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `test/registered/distributed/test_dp_attention_large.py`                           | test           | Codex | theirs          | Follow the official registered-test directory split and retain the existing DCU nightly registration at the new path       | low    | DCU registration passed with 211 files; move scan passed             | Execute the moved nightly test on its configured DCU runner                                         | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/activation.py`                                           | aiter          | Codex | manual merge    | Accept the official AITER activation gate on generic HIP while keeping the existing DCU activation implementation          | medium | compile and DCU path audit passed; runtime pending                   | AITER import plus activation eager and graph smoke on DCU                                           | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py`                        | attention      | Codex | manual merge    | Adopt official FlashMLA metadata API but keep the external `flash_mla` package on DCU and sgl-kernel on other platforms     | high   | compile and DCU path audit passed; runtime pending                   | DSV4 pure TP, context parallel, FlashMLA metadata, and graph capture                                 | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/dsv4/compressor.py`                            | attention      | Codex | manual merge    | Restrict official HIP compressor fallback to non-DCU HIP so the validated DCU JIT/compressor-v2 selection remains intact   | high   | compile and DCU path audit passed; runtime pending                   | DSV4 compressor with JIT norm and compressor-v2 toggles                                             | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | attention      | Codex | manual merge    | Accept the official cached vectorized fallback while preserving LightOp top-k as the sole DCU-priority transform path       | high   | compile and DCU path audit passed; runtime pending                   | LightOp top-k, index cache, sparse prefill, and graph replay                                         | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/dsv4/metadata.py`                              | attention      | Codex | manual merge    | Use official compact HIP metadata copy only outside DCU and keep full DCU metadata plus DeepGEMM disable guards             | high   | compile and DCU path audit passed; runtime pending                   | DSV4 extend/decode metadata under pure TP, CP, MTP, and CUDA graph                                  | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | theirs          | Adopt official per-request varlen encoder metadata and retain the previously merged DCU cache-write guards                 | medium | compile and DCU path audit passed; runtime pending                   | Dense/VLM encoder attention plus DCU fused cache-write smoke                                        | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/moe/hash_topk.py`                                        | moe            | Codex | manual merge    | Preserve DCU hash top-k and EPLB recording, then apply the official optional DeepEP waterfill transformation               | high   | compile and DCU path audit passed; runtime pending                   | Hash top-k with EPLB and DeepEP waterfill independently enabled and combined                        | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/moe/moe_runner/aiter.py`                                 | aiter          | Codex | manual merge    | Add official activation/quant runner inputs for generic HIP while preserving DCU W8A8 and native AITER runner paths         | high   | compile and DCU path audit passed; runtime pending                   | DCU AITER W8A8/W16A16 MoE, DeepEP, eager, and CUDA graph                                            | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/quantization/fp8.py`                                     | quantization   | Codex | manual merge    | Accept official gfx95 MXFP4/AITER transforms only outside DCU and retain DCU FP8 shuffle and loading behavior              | high   | compile and DCU path audit passed; runtime pending                   | DSV4 FP8 channel scale plus W8A8/MXFP4 load and accuracy spot check                                 | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/managers/overlap_utils.py`                                      | scheduler      | Codex | manual merge    | Adopt official overlap helpers while disabling their torch-compile path on both NPU and DCU                                | medium | compile and DCU path audit passed; runtime pending                   | Overlap scheduling, idle batch, request retract, and speculative decode                             | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep five DCU alternate streams and DCU preparation while accepting the official two-stream generic HIP implementation     | high   | compile and DCU path audit passed; runtime pending                   | DSV4 pure TP, CP+EP, DP+EP, MTP, DeepEP, and CUDA graph                                             | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/speculative/eagle_info.py`                                      | speculative    | Codex | manual merge    | Combine official async NaN/OOB probes with the existing DCU sgl-kernel KV-cache I/O functions                              | high   | compile and DCU path audit passed; runtime pending                   | EAGLE/MTP draft-target KV transfer, async probes, and graph smoke                                   | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/test/ci/ci_register.py`                                             | ci             | Codex | manual merge    | Export both the internal DCU registration decorator and the newly added official XPU decorator                             | low    | DCU registration passed with 211 files                               | DCU and XPU suite import/registration scan                                                          | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `test/run_suite.py`                                                                | test           | Codex | manual merge    | Keep DCU suite mappings and schedules while adding the official XPU suite mappings and schedules                           | low    | compile and DCU registration passed                                  | Generate/list DCU and XPU per-commit and nightly suites                                             | validated |
 | C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | TBD   | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available                                       | high   | Qwen dense plus DSV4 smoke                                           | Assign attention owner                                                                             | open      |
 | C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml`                                                | ci             | TBD   | manual merge    | Keep official workflow structure and DCU runner/wheel overlays                                                             | medium | CI dry-run and DCU registration check                                | Fill exact runner/image validation command                                                         | open      |
 | C13 /`125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**`                                                                    | sgl-kernel     | TBD   | manual merge    | sgl-kernel interfaces and DCU/HIP glue both changed                                                                        | high   | sgl-kernel DCU smoke whitelist                                       | Assign kernel owner                                                                                | open      |
@@ -407,7 +421,59 @@ actual result in the checkpoint note.
     - HiCache - ❓
     - PD disaggregation validation - ✅
 
-### C06-C10
+### C06 / `0abe6a85a51f`
+
+- Expected focus: DSV4 compressor/FlashMLA/MTP, AITER and FP8 MoE,
+  DeepEP waterfill, overlap scheduling, unified radix cache, and HiCache.
+- Owner: Codex for merge and static validation; DCU attention, MoE, cache,
+  and speculative owners for runtime validation.
+- Required validation:
+  - conflict marker scan, Python compile, DCU registration, and HIP build metadata.
+  - DSV4 DCU-priority path audit for compressor, LightOp top-k, FlashMLA,
+    metadata copy, AITER/FP8, alternate streams, and draft attention backend.
+  - unified radix cache and HiCache targeted tests where the local environment
+    can import the DCU runtime.
+- Notes:
+  - Fourteen conflicts were resolved as one checkpoint; no split was required.
+  - Official C06 was merged at exact SHA `0abe6a85a51f`; later official commits
+    are not included.
+  - Official generic HIP behavior is preserved for AMD ROCm, while `_is_dcu`
+    retains the existing external FlashMLA package, LightOp top-k, full DSV4
+    metadata copy, five alternate streams, and DCU AITER/FP8 paths.
+  - The automatically merged speculative draft backend was corrected so the
+    new HIP radix backend is selected only on non-DCU HIP.
+  - `ScheduleBatch.loc_tensor` remains device-resident and the C04 DSV4
+    sgl-kernel AOT sources remain in `setup_hip.py`.
+  - Automated validation completed:
+    - no unmerged entries, precise marker scan, and `git diff --check`: passed.
+    - full `python/sglang` and registered-test syntax compile: passed.
+    - DCU registration: passed with 211 registered files.
+    - existing DSA alias/CLI/env suite: 24 tests passed.
+    - field-validator suite: 18 tests and 13 subtests passed.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls; DSV4 top-k and norm/RoPE sources remain present.
+    - targeted undefined-name audit found and fixed the merged `is_hip` import
+      in DSV4 metadata. Full-file ruff still reports inherited C05 lint debt.
+  - Runtime validation pending:
+    - unified-radix registry collection is blocked locally because LightOp
+      cannot initialize without a visible HIP device.
+    - model, kernel, HiCache, DeepEP, MTP, and graph tests require a DCU runner
+      and model weights.
+- Recommended manual validation:
+  - `deepseek-v4` / `attention`: pure TP, CP batch greater than one, CP+EP,
+    DP+EP+MTP, FlashMLA, compressor, sparse prefill, and CUDA graph capture.
+  - `moe` / `deepep` / `aiter`: DeepEP normal mode, waterfill disabled/enabled,
+    EPLB disabled/enabled, hash top-k, W8A8/W16A16, and graph replay.
+  - `quantization`: FP8 channel scale plus FP8/MXFP4 load and accuracy spot check.
+  - `mem_cache`: unified radix cache, HiCache, cache hit/retract, and Mooncake
+    or CPU-offload path when available.
+  - `scheduler` / `speculative`: overlap idle batch and MTP/EAGLE draft-target
+    KV-cache transfer with async NaN/OOB probes.
+  - `ci` / `test`: DCU and XPU registration plus suite partition generation.
+- Manual validation result:
+  - TBD
+
+### C07-C10
 
 - Expected focus: model, mem_cache, attention, embedding, and workflows.
 - Owner: TBD

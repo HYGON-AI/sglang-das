@@ -76,6 +76,7 @@ HW_MAPPING = {
     "amd": HWBackend.AMD,
     "npu": HWBackend.NPU,
     "dcu": HWBackend.DCU,
+    "xpu": HWBackend.XPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -140,6 +141,10 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-gpu-large-dcu",
         "stage-c-test-large-8-gpu-dcu",
     ],
+    HWBackend.XPU: [
+        "stage-a-test-1-gpu-xpu",
+        "stage-b-test-1-gpu-xpu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -199,6 +204,7 @@ NIGHTLY_SUITES = {
         "nightly-dcu-perf",
         "nightly-dcu-vlm",
     ],
+    HWBackend.XPU: [],
 }
 
 
@@ -213,7 +219,7 @@ OTHER_SUITES = {
 }
 
 
-_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU, HWBackend.XPU}
 
 
 def _valid_suites_by_backend() -> dict:

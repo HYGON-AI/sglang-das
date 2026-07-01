@@ -52,6 +52,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     doweight_stage1: bool = False
     hidden_pad: int = 0
     intermediate_pad: int = 0
+    swiglu_limit: float = 0.0
     use_int8_w8a8: bool = False
     use_fp8_w8a8: bool = False
     global_num_experts: Optional[int] = None
@@ -66,11 +67,27 @@ class AiterMoeQuantInfo(MoeQuantInfo):
 _AITER_ACTIVATIONS = {"silu": "Silu", "swiglu": "Swiglu"}
 
 
+def _aiter_activation(activation: str):
+    from aiter import ActivationType
+
+    return getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+
+
+def _aiter_quant_type(quant_type: AiterQuantType):
+    from aiter import QuantType
+
+    return getattr(QuantType, quant_type.value)
+
+
 @dataclass
 class AiterRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
+    quant_type: AiterQuantType = AiterQuantType.NONE
+    a1_scale: Optional[torch.Tensor] = None
+    num_local_tokens: Optional[torch.Tensor] = None
+    output_dtype: Optional[torch.dtype] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -513,7 +530,48 @@ class AiterRunnerCore(MoeRunnerCore):
                 "Use the native AITER path for other quantization modes."
             )
 
-        return _run_aiter_native(runner_input, quant_info, self.config)
+        if _is_dcu:
+            return _run_aiter_native(runner_input, quant_info, self.config)
+
+        from aiter.fused_moe import fused_moe
+        from aiter.ops.flydsl.moe_common import GateMode
+
+        a1_scale = (
+            runner_input.a1_scale
+            if runner_input.a1_scale is not None
+            else quant_info.a13_scale
+        )
+
+        extra: dict = {}
+        if runner_input.num_local_tokens is not None:
+            extra["num_local_tokens"] = runner_input.num_local_tokens
+        if runner_input.output_dtype is not None:
+            extra["dtype"] = runner_input.output_dtype
+        if quant_info.swiglu_limit > 0:
+            extra["gate_mode"] = GateMode.INTERLEAVE.value
+            extra["swiglu_limit"] = quant_info.swiglu_limit
+
+        output = fused_moe(
+            hidden_states=runner_input.hidden_states,
+            w1=quant_info.w13_weight,
+            w2=quant_info.w2_weight,
+            topk_weight=runner_input.topk_weights,
+            topk_ids=runner_input.topk_ids,
+            quant_type=_aiter_quant_type(runner_input.quant_type),
+            activation=_aiter_activation(self.config.activation),
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=quant_info.a2_scale,
+            bias1=quant_info.b13,
+            bias2=quant_info.b2,
+            expert_mask=quant_info.expert_mask,
+            doweight_stage1=quant_info.doweight_stage1,
+            hidden_pad=quant_info.hidden_pad,
+            intermediate_pad=quant_info.intermediate_pad,
+            **extra,
+        )
+        return AiterRunnerOutput(hidden_states=output)
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:

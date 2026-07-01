@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_dcu, is_hip
 
 _is_dcu = is_dcu()
 
@@ -107,7 +107,11 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_dcu:
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or _is_dcu
+        ):
             self.deep_gemm_metadata = None
         else: # lightop support get_paged_mqa_logits_metadata but has other potential issues, skip it in dcu
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -149,17 +153,19 @@ class PagedIndexerMetadata:
         return self.page_table.shape[1] * self.c4_page_size
 
     def copy_(self, other: "PagedIndexerMetadata"):
-        copy_fields = [
-            "page_table",
-            "c4_seq_lens",
-            "deep_gemm_metadata",
-            "topk_metadata",
-        ]
+        if is_hip() and not _is_dcu:
+            copy_fields = ["page_table", "c4_seq_lens"]
+            assign_fields = ["deep_gemm_metadata"]
+        else:
+            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            assign_fields = []
+        copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
+            assign_fields=assign_fields,
         )
 
 

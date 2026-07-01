@@ -1,7 +1,7 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import is_blackwell, is_musa
+from sglang.srt.utils.common import is_blackwell, is_dcu, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -237,9 +237,14 @@ class DraftBackendFactory:
         )
 
     def _create_dsv4_decode_backend(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4MultiStepBackend,
-        )
+        if is_hip() and not is_dcu():
+            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+                DeepseekV4MultiStepBackend,
+            )
+        else:
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4MultiStepBackend,
+            )
 
         return DeepseekV4MultiStepBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
@@ -337,6 +342,14 @@ class DraftBackendFactory:
         return None
 
     def _create_dsv4_prefill_backend(self):
+        if is_hip() and not is_dcu():
+            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+                DeepseekV4HipRadixBackend,
+            )
+
+            return DeepseekV4HipRadixBackend(
+                self.draft_model_runner, skip_prefill=False
+            )
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
