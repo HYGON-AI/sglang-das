@@ -134,12 +134,15 @@ class MultimodalSpecialTokens:
         return None
 
     def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
-        return {
+        modality_to_token_id = {
             Modality.IMAGE: self.image_token_id,
-            Modality.MULTI_IMAGES: self.image_token_id,
             Modality.VIDEO: self.video_token_id,
             Modality.AUDIO: self.audio_token_id,
-        }.get(modality)
+        }
+        multi_images_modality = getattr(Modality, "MULTI_IMAGES", None)
+        if multi_images_modality is not None:
+            modality_to_token_id[multi_images_modality] = self.image_token_id
+        return modality_to_token_id.get(modality)
 
     def parse_regex(self):
         if self.image_token_regex is None and self.image_token is not None:
