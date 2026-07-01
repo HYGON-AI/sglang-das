@@ -422,39 +422,6 @@ class CudaIpcTensorTransportProxy:
 
         return state
 
-    def _reconstruct_from_ipc_extra(
-        self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
-    ):
-        shape = ipc_extra["shape"]
-        dtype = ipc_extra["dtype"]
-        stride = ipc_extra["stride"]
-        # Redirect handle[0] to the consumer's device so _new_shared_cuda's
-        # CUDAGuard stays there; peer access handles the cross-GPU open.
-        pool_handle = ipc_extra["pool_handle"]
-        redirected_handle = (rebuild_device_idx,) + tuple(pool_handle)[1:]
-        target_device = torch.device(f"cuda:{rebuild_device_idx}")
-        cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
-
-        with torch.cuda.device(target_device):
-            if use_cache:
-                storage = _pool_handle_cache_get_or_open(cache_key, redirected_handle)
-                storage_to_cache = None
-            else:
-                storage = _open_pooled_storage_uncached(redirected_handle)
-                storage_to_cache = storage
-            slice_storage = storage[
-                ipc_extra["pool_byte_offset"] : ipc_extra["pool_byte_offset"]
-                + ipc_extra["nbytes"]
-            ]
-            slice_tensor = torch.empty(0, dtype=dtype, device=target_device).set_(
-                slice_storage,
-                storage_offset=ipc_extra["storage_offset"],
-                size=shape,
-                stride=stride,
-            )
-
-        return slice_tensor, target_device, cache_key, storage_to_cache
-
     def _copy_slice_tensor_to_target(
         self,
         slice_tensor: torch.Tensor,
