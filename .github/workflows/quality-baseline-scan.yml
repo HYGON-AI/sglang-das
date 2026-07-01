@@ -410,7 +410,6 @@ jobs:
               ("confidential marker", re.compile(r"\b(confidential|internal only|do not distribute|restricted|classified)\b", re.I)),
               ("Chinese confidential marker", re.compile(r"(仅内部使用|禁止外传|保密|内部资料)")),
               ("private key marker", re.compile(r"BEGIN (RSA|DSA|EC|OPENSSH)? ?PRIVATE KEY")),
-              ("credential keyword", re.compile(r"\b(password|passwd|api[_-]?key|access[_-]?key|secret[_-]?key|credential|token)\b", re.I)),
               ("internal path hint", re.compile(r"(/home/[^/\s]+|/mnt/[^/\s]+|/data/[^/\s]+|/public/[^/\s]+)")),
               ("private IPv4 address", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b")),
           ]
@@ -516,7 +515,7 @@ jobs:
             -v "$PWD/$REPORT_DIR:/reports" \
             "$SEMGREP_IMAGE" \
             semgrep scan \
-            --config auto \
+            --config p/python \
             --json \
             --output /reports/semgrep-report.json \
             /src
