@@ -629,7 +629,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     # Router-weighted input no longer matches precomputed rms-quant activations.
                     use_prequant_input = False
                 # from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_fp8_w8a8
-                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe_fp8_w8a8
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    fused_moe_fp8_w8a8,
+                )
 
                 origin_w1_shape = getattr(layer.w13_weight, "w1_shape", None)
                 origin_w2_shape = getattr(layer.w2_weight, "w2_shape", None)
