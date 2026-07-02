@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.utils import get_bool_env_var, is_dcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -298,7 +297,7 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         topk_weights, topk_ids, router_logits = dispatch_output.topk_output
 
         if _use_aiter_moe:
-            from aiter.moe import get_aiter_moe_config, aiter_moe, MoeQuantType
+            from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
 
             E = layer.w13_weight.size(0)
             K = x.size(-1)

@@ -2,8 +2,8 @@ import unittest
 
 from sglang.test.ci.ci_register import register_dcu_ci
 from sglang.test.dcu_cookbook_utils import (
-    CookbookServer,
     MINIMAX_M25_8GPU_MODELS,
+    CookbookServer,
     selected_configs,
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST

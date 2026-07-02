@@ -19,10 +19,10 @@ from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
     device_context,
+    get_bool_env_var,
     is_cpu,
     is_npu,
     next_power_of_2,
-    get_bool_env_var,
 )
 
 _is_npu = is_npu()
@@ -269,6 +269,7 @@ def _layer_norm_fwd(
             )
         else:
             from lightop import op
+
             op.layer_norm_fwd_1pass_opt(
                 x,
                 out,

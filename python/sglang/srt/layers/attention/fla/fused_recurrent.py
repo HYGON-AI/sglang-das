@@ -404,7 +404,10 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             num_stages=num_stages,
         )
     else:
-        from aiter.ops.triton.fla.fused_recurrent import fused_recurrent_gated_delta_rule_packed_decode as aiter_fused_recurrent_gated_delta_rule_packed_decode
+        from aiter.ops.triton.fla.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode as aiter_fused_recurrent_gated_delta_rule_packed_decode,
+        )
+
         aiter_fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,

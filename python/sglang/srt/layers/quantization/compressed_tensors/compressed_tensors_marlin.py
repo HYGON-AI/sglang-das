@@ -1,25 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+
+import logging
+from typing import Any, Literal, Optional
+
 import torch
 from compressed_tensors.config import SparsityCompressionConfig
 from compressed_tensors.quantization import QuantizationArgs
-import logging
 
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.quantization.base_config import (
-    LinearMethodBase,
-    QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig, CompressedTensorsLinearMethod, CompressedTensorsKVCacheMethod
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import CompressedTensorsMarlinMoEMethod
-from sglang.srt.layers.quantization.compressed_tensors.utils import (
-    should_ignore_layer)
-from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-import os
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+    CompressedTensorsKVCacheMethod,
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+    CompressedTensorsMarlinMoEMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 
 # if TYPE_CHECKING:
 #     from vllm.model_executor.models.utils import WeightsMapper
@@ -57,36 +60,40 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
             linear_fp8_config,
         )
 
-
     @classmethod
-    def override_quantization_method(
-            cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
-                and user_quant == "slimquant_marlin":
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if (
+            hf_quant_cfg.get("quant_method") == "compressed-tensors"
+            and user_quant == "slimquant_marlin"
+        ):
             return cls.get_name()
         return None
+
     @classmethod
     def get_name(cls) -> str:
         return "slimquant_marlin"
 
     def get_quant_method(
-            self,
-            layer: torch.nn.Module,
-            prefix: str,
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE  # Avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            FusedMoE,  # Avoid circular import
+        )
         from sglang.srt.layers.radix_attention import RadixAttention
+
         # Check if the layer is skipped for quantization.
         if isinstance(layer, RadixAttention):
             return CompressedTensorsKVCacheMethod(self)
-        if should_ignore_layer(prefix,
-                               ignore=self.ignore,
-                               fused_mapping=self.packed_modules_mapping):
-            return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return UnquantizedEmbeddingMethod()  # UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
-                return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
+                return UnquantizedEmbeddingMethod()  # UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
         if isinstance(layer, FusedMoE):

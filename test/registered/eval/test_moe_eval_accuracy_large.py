@@ -7,7 +7,11 @@ import os
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 from sglang.test.kits.eval_accuracy_kit import HumanEvalMixin, MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -28,6 +32,7 @@ register_dcu_ci(
     nightly=True,
     disabled="DCU accuracy registration placeholder; needs BW1100 accuracy baseline, thresholds, and local dataset/model paths.",
 )
+
 
 class TestMoEEvalAccuracyLarge(CustomTestCase, MMLUMixin, HumanEvalMixin, MGSMEnMixin):
     mmlu_score_threshold = 0.62

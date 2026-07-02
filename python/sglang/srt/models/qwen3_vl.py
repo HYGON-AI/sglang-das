@@ -439,7 +439,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             base = self.rot_pos_ids(h, w, self.spatial_merge_size)
             pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
-        pos_ids = torch.cat(pos_ids, dim=0).pin_memory().to(self.device, non_blocking=True)
+        pos_ids = (
+            torch.cat(pos_ids, dim=0).pin_memory().to(self.device, non_blocking=True)
+        )
         max_grid_size = max(max(h, w) for _, h, w in grid_thw)
 
         # Use pre-computed cos_sin_cache from RotaryEmbedding
@@ -808,16 +810,21 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
             sequence_lengths = (
                 torch.from_numpy(seq_lens_padded)
-                .pin_memory().to(device=self.device, dtype=torch.int32, non_blocking=True)
+                .pin_memory()
+                .to(device=self.device, dtype=torch.int32, non_blocking=True)
                 .view(-1, 1, 1, 1)
             )  # match cuDNN test style
 
-            cu_seqlens = torch.from_numpy(offsets_packed).pin_memory().to(
-                device=self.device, dtype=torch.int32, non_blocking=True
+            cu_seqlens = (
+                torch.from_numpy(offsets_packed)
+                .pin_memory()
+                .to(device=self.device, dtype=torch.int32, non_blocking=True)
             )
 
             max_seqlen = int(flashinfer_max_seqlen)
-            sequence_lengths = sequence_lengths.pin_memory().to(self.device, non_blocking=True)
+            sequence_lengths = sequence_lengths.pin_memory().to(
+                self.device, non_blocking=True
+            )
         else:
             sequence_lengths = None
             cu_seqlens = torch.from_numpy(token_cu_seqlens)

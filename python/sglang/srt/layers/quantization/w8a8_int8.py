@@ -5,6 +5,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
 import torch
+
+# from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -14,6 +17,7 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -21,10 +25,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-# from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -39,6 +40,7 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+
 from lmslim import quant_ops
 
 _is_cuda = is_cuda()
@@ -48,7 +50,6 @@ _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
 
     @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
     def _int8_scaled_mm_abstract(

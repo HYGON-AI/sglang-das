@@ -664,7 +664,9 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
-    @unittest.skip("Current OpenAIServingChat no longer exposes use_dpsk_v32_encoding; skip DeepSeek V3.2-specific unit path in DCU smoke")
+    @unittest.skip(
+        "Current OpenAIServingChat no longer exposes use_dpsk_v32_encoding; skip DeepSeek V3.2-specific unit path in DCU smoke"
+    )
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
         from sglang.srt.managers.template_manager import TemplateManager

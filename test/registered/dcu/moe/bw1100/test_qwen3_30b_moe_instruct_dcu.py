@@ -10,12 +10,16 @@ from sglang.test.dcu_utils import (
     get_server_args,
 )
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_dcu_ci(
+    est_time=2400,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
+)
 
 DEFAULT_QWEN3_MOE_INSTRUCT_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 

@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Module
 
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
@@ -20,7 +21,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn 
     SparseLinearAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,

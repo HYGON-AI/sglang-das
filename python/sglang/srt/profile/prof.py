@@ -1,11 +1,12 @@
-from ctypes import *
 import os
-import time
 import threading
+import time
+from ctypes import *
+
 
 class Prof:
     def __init__(self):
-        self.use_roctx = os.getenv('SGLANG_HIP_PROF') is not None
+        self.use_roctx = os.getenv("SGLANG_HIP_PROF") is not None
         if self.use_roctx:
             self.lib = cdll.LoadLibrary("libroctracer64.so")
             self.lib.roctxRangePushA.argtypes = [c_char_p]
@@ -40,8 +41,8 @@ class Prof:
 
     def ProfRangePush(self, message):
         if profile.use_roctx and self.roc_tracer_flag:
-            profile.lib.roctxRangePushA(message.encode('utf-8'))
-            profile.lib.roctxRangePushA(message.encode('utf-8'))
+            profile.lib.roctxRangePushA(message.encode("utf-8"))
+            profile.lib.roctxRangePushA(message.encode("utf-8"))
             self.thread_depth_add(1)
 
     def ProfRangePop(self):

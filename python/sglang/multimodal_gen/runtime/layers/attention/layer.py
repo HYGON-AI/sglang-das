@@ -44,10 +44,12 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 ]
 
 import sglang.multimodal_gen.envs as envs
+
 if envs.SGLANG_DIFFUSION_RING_ATTN_OVERLAP:
     from sglang.multimodal_gen.runtime.layers.usp import ring_attn_overlap as ring_attn
 else:
     from sglang.multimodal_gen.runtime.layers.usp import ring_attn
+
 
 class UlyssesAttention(nn.Module):
     """Ulysses-style SequenceParallelism attention layer."""

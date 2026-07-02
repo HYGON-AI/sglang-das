@@ -5,9 +5,11 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from lmslim.layers.gemm.fp8_utils import per_token_quant_fp8
+from lmslim.layers.gemm.int8_utils import per_token_quant_int8
+
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -27,6 +29,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     is_blackwell,
@@ -34,9 +37,7 @@ from sglang.srt.utils import (
     is_npu,
     load_json_config,
 )
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-from lmslim.layers.gemm.fp8_utils import per_token_quant_fp8
-from sglang.srt.server_args import get_global_server_args
+
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -67,9 +68,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 
-use_groupgemm = get_bool_env_var(
-    "SGLANG_GROUPGEMM", default="true"
-)
+use_groupgemm = get_bool_env_var("SGLANG_GROUPGEMM", default="true")
 
 logger = logging.getLogger(__name__)
 
@@ -499,8 +498,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 num_tokens_per_expert=num_tokens_per_expert,
                 previous_event=previous_event,
                 async_finish=self.async_finish,
-                allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-                expert_alignment=256 if (get_global_server_args().quantization == "slimquant_marlin" or _use_fp8_w8a8_moe or _use_marlin_w16a16_moe) else 1,
+                allocate_on_comm_stream=(previous_event is not None)
+                and self.async_finish,
+                expert_alignment=(
+                    256
+                    if (
+                        get_global_server_args().quantization == "slimquant_marlin"
+                        or _use_fp8_w8a8_moe
+                        or _use_marlin_w16a16_moe
+                    )
+                    else 1
+                ),
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
         else:
@@ -521,7 +529,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 num_tokens_per_expert=num_tokens_per_expert,
                 previous_event=previous_event,
                 async_finish=self.async_finish,
-                allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+                allocate_on_comm_stream=(previous_event is not None)
+                and self.async_finish,
                 expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
@@ -546,7 +555,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        #if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        # if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
         output = hidden_states
         # else:
         #     if hidden_states.shape[0] > 0:
@@ -730,7 +739,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
-                        quant_type = 2,
+                        quant_type=2,
                         fp8_round_scale=False,
                         async_finish=not self.return_recv_hook,
                         return_recv_hook=self.return_recv_hook,
@@ -744,7 +753,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
-                        quant_type = 0,
+                        quant_type=0,
                         fp8_round_scale=False,
                         async_finish=not self.return_recv_hook,
                         return_recv_hook=self.return_recv_hook,
@@ -772,7 +781,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
-                    quant_type = 0,
+                    quant_type=0,
                     **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                     **(
                         dict(x_global_scale=input_global_scale)

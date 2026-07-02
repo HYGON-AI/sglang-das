@@ -116,9 +116,9 @@ def _default_device_cflags() -> List[str]:
     )
     if not amdgpu_targets and torch.cuda.is_available():
         try:
-            amdgpu_targets = torch.cuda.get_device_properties(0).gcnArchName.split(
-                ":"
-            )[0]
+            amdgpu_targets = torch.cuda.get_device_properties(0).gcnArchName.split(":")[
+                0
+            ]
         except Exception:
             amdgpu_targets = None
 
@@ -240,9 +240,7 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     backend = "hip" if _is_rocm_build() else "cuda"
-    module_name = (
-        "sgl_kernel_jit_" + backend + "_" + "_".join(str(arg) for arg in args)
-    )
+    module_name = "sgl_kernel_jit_" + backend + "_" + "_".join(str(arg) for arg in args)
     default_device_cflags = _default_device_cflags()
     if header_only:
         from tvm_ffi.cpp import load_inline
@@ -281,7 +279,6 @@ def load_jit(
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
             )
-
 
 
 @dataclass
@@ -391,9 +388,7 @@ def _patch_tvm_ffi_load_inline_for_hip() -> None:
         ]
 
         cflags = default_cflags + [flag.strip() for flag in extra_cflags]
-        cuda_cflags = default_cuda_cflags + [
-            flag.strip() for flag in extra_cuda_cflags
-        ]
+        cuda_cflags = default_cuda_cflags + [flag.strip() for flag in extra_cuda_cflags]
         ldflags = default_ldflags + [flag.strip() for flag in extra_ldflags]
         include_paths = default_include_paths + [
             str(pathlib.Path(path).resolve()) for path in extra_include_paths

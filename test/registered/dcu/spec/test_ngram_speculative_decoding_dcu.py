@@ -27,7 +27,9 @@ register_dcu_ci(
     ),
 )
 
-DEFAULT_DCU_NGRAM_MODEL = "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+DEFAULT_DCU_NGRAM_MODEL = (
+    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+)
 
 
 class TestNgramSpeculativeDecodingDCU(unittest.TestCase):

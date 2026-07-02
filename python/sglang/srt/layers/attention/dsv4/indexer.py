@@ -19,7 +19,8 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip, is_dcu, get_bool_env_var
+from sglang.srt.utils import add_prefix, is_dcu, is_hip
+
 # from sglang.srt.layers.attention.compressed.metadata import (
 #     PagedCoreMetadata,
 #     PagedIndexerMetadata,
@@ -151,6 +152,7 @@ def topk_transform_512_pytorch_vectorized(
     if out_raw_indices is not None:
         raw_indices = torch.where(valid_topk, raw_indices, negative_indices)
         out_raw_indices.copy_(raw_indices)
+
 
 @triton.jit
 def _fused_scale_kernel(
@@ -294,10 +296,10 @@ class C4IndexerBackendMixin:
         #         return y, s
 
         #     q_fp8, q_scale = act_quant_group_lightop(q)
-    
+
         # else:
         #     q_fp8, q_scale = act_quant(q) # init
-        
+
         weights = c4_indexer.compute_weights(x, skip_scale=True)
         q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
         self.forward_indexer_compressor(
@@ -462,8 +464,9 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
-        elif (envs.SGLANG_LIGHTOP_TOPK.get()):
+        elif envs.SGLANG_LIGHTOP_TOPK.get():
             from lightop import topk_transform_512 as lightop_topk_transform_512
+
             lightop_topk_transform_512(
                 logits,
                 indexer_metadata.c4_seq_lens,

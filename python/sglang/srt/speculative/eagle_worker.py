@@ -883,9 +883,7 @@ class EAGLEWorker(TpModelWorker):
         # Only safe with topk == 1: select_top_k_tokens reorders candidate rows
         # each step, which would desync the cached indices from their rows.
         index_share_for_mtp_iteration = (
-            getattr(
-                self.model_config.hf_config, "index_share_for_mtp_iteration", False
-            )
+            getattr(self.model_config.hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
         )
         if index_share_for_mtp_iteration:

@@ -1,8 +1,9 @@
 from typing import Optional
+
 import numpy as np
-from lightop import moe_gemm_marlin_w16a16, get_moe_cuda_marlin_config_w16a16
 import torch
 import torch.nn.functional as F
+from lightop import get_moe_cuda_marlin_config_w16a16, moe_gemm_marlin_w16a16
 
 from sglang.srt.utils import direct_register_custom_op, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -18,8 +19,12 @@ if _is_cuda:
 from lightop import fuse_silu_and_mul
 from lightop import op as op
 from vllm.platforms import current_platform
+
 device_name = current_platform.get_device_name().replace(" ", "_")
-num_cus= torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+num_cus = torch.cuda.get_device_properties(
+    torch.cuda.current_device()
+).multi_processor_count
+
 
 def get_scalar_type(num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] = None):
     from sgl_kernel.scalar_type import scalar_types
@@ -340,11 +345,7 @@ def get_weight_perms(interleave: bool = False):
 
 
 # npack重排 //512大小
-def marlin_weights_npack2(
-    q_w,
-    weight_perm,
-    k_tile=16,
-    n_tile=32):
+def marlin_weights_npack2(q_w, weight_perm, k_tile=16, n_tile=32):
     # 2048, 768
     size_k, size_n = q_w.shape
 
@@ -368,8 +369,7 @@ def marlin_weights_npack2(
     return q_w
 
 
-def w16a16_marlin_weight(full_w16a16_w  # [size_n, size_k]
-                         ):
+def w16a16_marlin_weight(full_w16a16_w):  # [size_n, size_k]
     # import pdb
     # pdb.set_trace()
     # [size_n, size_k] == > [size_k, size_n] 此时已经是默认NN的 k * n 基于这个进行重排
@@ -409,12 +409,7 @@ def get_weight_perms_fp8(interleave: bool = False):
     return perm
 
 
-def marlin_weights(
-    q_w,
-    weight_perm,
-    k_tile=64,
-    n_tile=32,
-    pack_factor=8):
+def marlin_weights(q_w, weight_perm, k_tile=64, n_tile=32, pack_factor=8):
     # 7168, 512
     size_k, size_n = q_w.shape
 
@@ -441,8 +436,7 @@ def marlin_weights(
     return q_w
 
 
-def w8a8_2_marlin_weight(w4a8_w  # [size_n, size_k// 2 ]
-                         ):
+def w8a8_2_marlin_weight(w4a8_w):  # [size_n, size_k// 2 ]
     # 将 w4a8 的现有权重 拆开 # [size_n, size_k// 2 ] --> [size_n, size_k]
     full_w4a8_w = w4a8_w
     # [size_n, size_k] == > [size_k, size_n]
@@ -450,48 +444,79 @@ def w8a8_2_marlin_weight(w4a8_w  # [size_n, size_k// 2 ]
     # 获取 [32, 64]的权重数据块中，需要重排的 顺序
     weight_perm = get_weight_perms_fp8()
     # 按照索引进行重排
-    marlin_q_w = marlin_weights(full_w4a8_w, weight_perm, k_tile=64, n_tile=32, pack_factor=8)
+    marlin_q_w = marlin_weights(
+        full_w4a8_w, weight_perm, k_tile=64, n_tile=32, pack_factor=8
+    )
     return marlin_q_w
 
-def weight8bit_nt_kpack2_marlin1(weight, # [size_n, size_k// 2 ]
-                                k_tile=16,
-                                k_tile1=4,
-                                n_tile=16, 
-                                n_tile1=16):
+
+def weight8bit_nt_kpack2_marlin1(
+    weight, k_tile=16, k_tile1=4, n_tile=16, n_tile1=16  # [size_n, size_k// 2 ]
+):
     assert weight.element_size() == 1, "weight 必须是 8 bit 类型"
     if weight.dim() == 2:
         size_n, size_k = weight.shape
-        assert size_n % k_tile == 0 and size_k % n_tile == 0, "k_tile / n_tile 必须能整除对应维度"
+        assert (
+            size_n % k_tile == 0 and size_k % n_tile == 0
+        ), "k_tile / n_tile 必须能整除对应维度"
 
-        q = weight.reshape((size_n // (n_tile*n_tile1), n_tile1, n_tile, size_k // (k_tile*k_tile1), k_tile1, k_tile))
+        q = weight.reshape(
+            (
+                size_n // (n_tile * n_tile1),
+                n_tile1,
+                n_tile,
+                size_k // (k_tile * k_tile1),
+                k_tile1,
+                k_tile,
+            )
+        )
         # q = q.permute((0, 2, 1, 3)).contiguous()
         q = q.permute((0, 3, 1, 4, 2, 5)).contiguous()
         q = q.reshape((size_n // k_tile, size_k * k_tile))
     elif weight.dim() == 3:
         E, size_n, size_k = weight.shape
-        assert size_n % n_tile == 0 and size_k % k_tile == 0, "k_tile / n_tile 必须能整除对应维度"
+        assert (
+            size_n % n_tile == 0 and size_k % k_tile == 0
+        ), "k_tile / n_tile 必须能整除对应维度"
 
-        q = weight.reshape((E, size_n // (n_tile*n_tile1), n_tile1, n_tile, size_k // (k_tile*k_tile1), k_tile1, k_tile))
+        q = weight.reshape(
+            (
+                E,
+                size_n // (n_tile * n_tile1),
+                n_tile1,
+                n_tile,
+                size_k // (k_tile * k_tile1),
+                k_tile1,
+                k_tile,
+            )
+        )
         q = q.permute((0, 1, 4, 2, 5, 3, 6)).contiguous()
         q = q.reshape((E, size_n // k_tile, size_k * k_tile))
     return q
 
-def weight8bit_nt_kpack2_marlin(weight, # [size_n, size_k// 2 ]
-                                k_tile=16,
-                                n_tile=16, ):
+
+def weight8bit_nt_kpack2_marlin(
+    weight,  # [size_n, size_k// 2 ]
+    k_tile=16,
+    n_tile=16,
+):
     assert weight.element_size() == 1, "weight 必须是 8 bit 类型"
     if weight.dim() == 2:
         size_n, size_k = weight.shape
-        assert size_n % k_tile == 0 and size_k % n_tile == 0, "k_tile / n_tile 必须能整除对应维度"
+        assert (
+            size_n % k_tile == 0 and size_k % n_tile == 0
+        ), "k_tile / n_tile 必须能整除对应维度"
 
-        q = weight.reshape((size_n // n_tile,  n_tile, size_k // k_tile, k_tile))
+        q = weight.reshape((size_n // n_tile, n_tile, size_k // k_tile, k_tile))
         q = q.permute((0, 2, 1, 3)).contiguous()
         q = q.reshape((size_n // k_tile, size_k * k_tile))
     elif weight.dim() == 3:
         E, size_n, size_k = weight.shape
-        assert size_n % n_tile == 0 and size_k % k_tile == 0, "k_tile / n_tile 必须能整除对应维度"
+        assert (
+            size_n % n_tile == 0 and size_k % k_tile == 0
+        ), "k_tile / n_tile 必须能整除对应维度"
 
-        q = weight.reshape((E, size_n // n_tile,  n_tile, size_k // k_tile, k_tile))
+        q = weight.reshape((E, size_n // n_tile, n_tile, size_k // k_tile, k_tile))
         q = q.permute((0, 1, 3, 2, 4)).contiguous()
         q = q.reshape((E, size_n // k_tile, size_k * k_tile))
     return q
@@ -542,7 +567,9 @@ def fused_marlin_moe_w16a16(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+        dcu_moe_align_block_size,
+    )
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -556,22 +583,16 @@ def fused_marlin_moe_w16a16(
     topk = topk_ids.shape[1]
 
     config_marlin_0, config_marlin_1, status = get_moe_cuda_marlin_config_w16a16(
-        E,
-        M,
-        2 * N,
-        K,
-        K,
-        N,
-        topk,
-        device_name,
-        num_cus,
-        hidden_states.dtype)      
+        E, M, 2 * N, K, K, N, topk, device_name, num_cus, hidden_states.dtype
+    )
     block_size_m = config_marlin_0["BLOCK_SIZE_M"]
 
     if global_num_experts == -1:
         global_num_experts = E
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(topk_ids, block_size_m, global_num_experts)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(
+        topk_ids, block_size_m, global_num_experts
+    )
 
     # TODO: tune this further for specific models
     intermediate_cache2 = torch.empty(
@@ -584,9 +605,11 @@ def fused_marlin_moe_w16a16(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = intermediate_cache13[:M * topk_ids.shape[1] * 2 * N]
-    intermediate_cache1 = intermediate_cache1.view(-1, 2 * N)  # [M * topk, 2 * N]  [32*8, 512]
-    intermediate_cache3 = intermediate_cache13[:M * topk_ids.shape[1] * K]
+    intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * 2 * N]
+    intermediate_cache1 = intermediate_cache1.view(
+        -1, 2 * N
+    )  # [M * topk, 2 * N]  [32*8, 512]
+    intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     intermediate_cache1 = moe_gemm_marlin_w16a16(
@@ -598,7 +621,7 @@ def fused_marlin_moe_w16a16(
         expert_ids,
         num_tokens_post_padded,
         topk,
-        config_marlin_0
+        config_marlin_0,
     )
     fuse_silu_and_mul(intermediate_cache1, intermediate_cache2)
     intermediate_cache3 = moe_gemm_marlin_w16a16(
@@ -623,6 +646,6 @@ def fused_marlin_moe_w16a16(
         bias=None,
         expert_mask=None,
         num_local_tokens=None,
-        factor=routed_scaling_factor
+        factor=routed_scaling_factor,
     )
     return output

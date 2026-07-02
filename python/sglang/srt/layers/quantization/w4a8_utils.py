@@ -1,11 +1,14 @@
-import torch
 import numpy as np
+import torch
 
 try:
     from lightop import awq_marlin_repack_w4a8
+
     use_lightop = False
 except Exception:
     use_lightop = False
+
+
 def unpack_int8_to_int4(tensor_int8: torch.Tensor) -> torch.Tensor:
     """
     将[N, K//2]大小的torch.int8 Tensor，转换为[N, K]大小的torch.int32 Tensor。
@@ -24,13 +27,16 @@ def unpack_int8_to_int4(tensor_int8: torch.Tensor) -> torch.Tensor:
     tensor_uint8 = tensor_int8.to(torch.uint8)
     high4 = tensor_uint8 & 0x0F
     low4 = (tensor_uint8 >> 4) & 0x0F
-    unpacked = torch.empty((N, K_half * 2), dtype=torch.int32, device=tensor_int8.device)
+    unpacked = torch.empty(
+        (N, K_half * 2), dtype=torch.int32, device=tensor_int8.device
+    )
     unpacked[:, 0::2] = low4.to(torch.int32)
     unpacked[:, 1::2] = high4.to(torch.int32)
 
     return unpacked
 
-def get_weight_perms(interleave: bool=True):
+
+def get_weight_perms(interleave: bool = True):
     perm = []
     for i in range(64):
 
@@ -38,7 +44,7 @@ def get_weight_perms(interleave: bool=True):
             cur_col = (i % 16) * 4 + col
             for row in range(8):
                 cur_row = (i // 16) * 8 + row
-                cur_idx =  cur_row * 64 + cur_col
+                cur_idx = cur_row * 64 + cur_col
                 perm.append(cur_idx)
 
     perm = np.array(perm)
@@ -50,7 +56,8 @@ def get_weight_perms(interleave: bool=True):
 
     return perm
 
-def marlin_weights(q_w,weight_perm,k_tile=32,n_tile=64,pack_factor=8):
+
+def marlin_weights(q_w, weight_perm, k_tile=32, n_tile=64, pack_factor=8):
     size_k, size_n = q_w.shape
     q_w = q_w.reshape((size_k // k_tile, k_tile, size_n // n_tile, n_tile))
     q_w = q_w.permute((0, 2, 1, 3))
@@ -60,18 +67,23 @@ def marlin_weights(q_w,weight_perm,k_tile=32,n_tile=64,pack_factor=8):
     orig_device = q_w.device
     q_w = q_w.contiguous().to(torch.int32)
     M, N = q_w.shape
-    assert N % pack_factor == 0, f"size_n ({N}) must be divisible by pack_factor ({pack_factor})"
+    assert (
+        N % pack_factor == 0
+    ), f"size_n ({N}) must be divisible by pack_factor ({pack_factor})"
     q_packed = torch.zeros((M, N // pack_factor), dtype=torch.int32, device=orig_device)
     for i in range(pack_factor):
         q_packed += q_w[:, i::pack_factor] << (4 * i)
 
     return q_packed
 
+
 def w4a8_2_marlin_weight(w4a8_w):
     full_w4a8_w = unpack_int8_to_int4(w4a8_w)
     full_w4a8_w = full_w4a8_w.T
     weight_perm = get_weight_perms()
-    marlin_q_w = marlin_weights(full_w4a8_w, weight_perm, k_tile=32, n_tile=64, pack_factor=8)
+    marlin_q_w = marlin_weights(
+        full_w4a8_w, weight_perm, k_tile=32, n_tile=64, pack_factor=8
+    )
     return marlin_q_w
 
 
@@ -162,6 +174,7 @@ def weight4bit_nt_kpack2_marlin2_qqq_from_packed(
     )
     return _pack_uint4_qqq_to_int32(q, pack_order=pack_order)
 
+
 def w4a8_weight_repack_impl(input, use_deepep: bool = False):
     if use_deepep:
         output = weight4bit_nt_kpack2_marlin2_qqq_from_packed_mem_efficient(input)
@@ -169,7 +182,11 @@ def w4a8_weight_repack_impl(input, use_deepep: bool = False):
         size_batch = input.shape[0]
         size_n = input.shape[1]
         size_k = input.shape[2] * 2
-        output = torch.zeros((size_batch, size_k // 32, size_n * 4), device=input.device, dtype=torch.int32)
+        output = torch.zeros(
+            (size_batch, size_k // 32, size_n * 4),
+            device=input.device,
+            dtype=torch.int32,
+        )
         awq_marlin_repack_w4a8(input, output, size_batch, size_k, size_n)
     else:
         w_marlin_list = []
@@ -179,7 +196,6 @@ def w4a8_weight_repack_impl(input, use_deepep: bool = False):
         output = torch.stack(w_marlin_list, dim=0)
 
     return output
-
 
 
 def weight4bit_nt_kpack2_marlin2_qqq_from_packed_mem_efficient(
@@ -214,7 +230,9 @@ def weight4bit_nt_kpack2_marlin2_qqq_from_packed_mem_efficient(
     if k_tile % 8 != 0:
         raise ValueError("k_tile 必须能被 8 整除，因为最后每 8 个 int4 pack 成 int32")
     if (k_tile * k_tile1) % 2 != 0:
-        raise ValueError("k_tile * k_tile1 必须能被 2 整除，因为输入是每 2 个 int4 pack 成 1 个 int8")
+        raise ValueError(
+            "k_tile * k_tile1 必须能被 2 整除，因为输入是每 2 个 int4 pack 成 1 个 int8"
+        )
     pack_order_t = torch.tensor(pack_order, dtype=torch.long, device=weight.device)
     if pack_order_t.numel() != 8:
         raise ValueError("pack_order 必须包含 8 个元素")
@@ -286,7 +304,8 @@ def weight4bit_nt_kpack2_marlin2_qqq_from_packed_mem_efficient(
         return out
     else:
         raise ValueError("weight 只支持 2D 或 3D")
-    
+
+
 def _unpack_int8_to_uint4_int8_small(tensor_int8: torch.Tensor) -> torch.Tensor:
     """
     小块解包版本。
@@ -301,6 +320,7 @@ def _unpack_int8_to_uint4_int8_small(tensor_int8: torch.Tensor) -> torch.Tensor:
     out[..., 0::2] = high4.to(torch.int8)
     out[..., 1::2] = low4.to(torch.int8)
     return out
+
 
 def _pack_uint4_qqq_to_int32_lastdim_small(
     q: torch.Tensor,

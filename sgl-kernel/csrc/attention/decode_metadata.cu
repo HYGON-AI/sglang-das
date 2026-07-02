@@ -55,8 +55,7 @@ __global__ void normal_decode_metadata_gather_kernel(
   const int64_t col = linear_idx - batch_idx * max_seq_pages;
   const auto row_idx = static_cast<int64_t>(req_pool_indices[batch_idx * req_pool_indices_stride_0]);
   const int64_t col_idx = col << shift;
-  const int64_t rt_offset =
-      static_cast<int64_t>(row_idx) * req_to_token_stride_0 + col_idx * req_to_token_stride_1;
+  const int64_t rt_offset = static_cast<int64_t>(row_idx) * req_to_token_stride_0 + col_idx * req_to_token_stride_1;
   const int32_t page_index = req_to_token[rt_offset];
   const int32_t page_table_val = page_index >> shift;
 
@@ -164,8 +163,7 @@ void normal_decode_metadata_general(
   TORCH_CHECK(page_table.is_cuda(), "page_table must be a CUDA tensor");
   TORCH_CHECK(req_to_token.scalar_type() == at::ScalarType::Int, "req_to_token must be int32");
   TORCH_CHECK(
-      req_pool_indices.scalar_type() == at::ScalarType::Int ||
-          req_pool_indices.scalar_type() == at::ScalarType::Long,
+      req_pool_indices.scalar_type() == at::ScalarType::Int || req_pool_indices.scalar_type() == at::ScalarType::Long,
       "req_pool_indices must be int32 or int64");
   TORCH_CHECK(cache_seqlens_int32.scalar_type() == at::ScalarType::Int, "cache_seqlens_int32 must be int32");
   TORCH_CHECK(cu_seqlens_k.scalar_type() == at::ScalarType::Int, "cu_seqlens_k must be int32");
@@ -175,8 +173,9 @@ void normal_decode_metadata_general(
   TORCH_CHECK(cu_seqlens_k.numel() >= cache_seqlens_int32.numel() + 1, "cu_seqlens_k is too small");
   TORCH_CHECK(page_table.dim() == 2, "page_table must be 2D");
   TORCH_CHECK(page_table.size(0) >= cache_seqlens_int32.size(0), "page_table batch dimension is too small");
-  TORCH_CHECK(!use_swa || (swa_page_table.has_value() && full_to_swa_mapping.has_value()),
-              "SWA metadata tensors are required when use_swa is true");
+  TORCH_CHECK(
+      !use_swa || (swa_page_table.has_value() && full_to_swa_mapping.has_value()),
+      "SWA metadata tensors are required when use_swa is true");
   if (use_swa) {
     TORCH_CHECK(swa_page_table->is_cuda(), "swa_page_table must be a CUDA tensor");
     TORCH_CHECK(full_to_swa_mapping->is_cuda(), "full_to_swa_mapping must be a CUDA tensor");

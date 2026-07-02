@@ -3,9 +3,9 @@ import unittest
 
 from sglang.test.ci.ci_register import register_dcu_ci
 from sglang.test.dcu_cookbook_utils import (
-    assert_cookbook_min_output_throughput,
-    CookbookServer,
     MINIMAX_M25_8GPU_PERF_MODELS,
+    CookbookServer,
+    assert_cookbook_min_output_throughput,
     run_random_serving_perf,
     selected_configs,
 )

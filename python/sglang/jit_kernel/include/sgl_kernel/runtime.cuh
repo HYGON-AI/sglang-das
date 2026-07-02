@@ -23,11 +23,7 @@ namespace host::runtime {
 template <typename T>
 inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
   int num_blocks_per_sm = 0;
-  RuntimeDeviceCheck(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-      &num_blocks_per_sm,
-      kernel,
-      block_dim,
-      dynamic_smem));
+  RuntimeDeviceCheck(hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
   return static_cast<uint32_t>(num_blocks_per_sm);
 }
 
@@ -56,11 +52,7 @@ inline auto get_runtime_version() -> int {
 template <typename T>
 inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int block_size) -> std::size_t {
   std::size_t smem_size;
-  RuntimeDeviceCheck(hipOccupancyAvailableDynamicSMemPerBlock(
-      &smem_size,
-      kernel,
-      num_blocks,
-      block_size));
+  RuntimeDeviceCheck(hipOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel, num_blocks, block_size));
   return smem_size;
 }
 #else
@@ -69,8 +61,7 @@ template <typename T>
 inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
   int num_blocks_per_sm = 0;
 #ifdef USE_ROCM
-  RuntimeDeviceCheck(
-      hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
+  RuntimeDeviceCheck(hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
 #else
   RuntimeDeviceCheck(
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));

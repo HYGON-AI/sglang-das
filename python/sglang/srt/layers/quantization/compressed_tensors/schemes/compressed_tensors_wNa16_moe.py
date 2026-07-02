@@ -234,9 +234,24 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
 
         if self.w13_zp is None:
-            self.w13_zp = torch.ones((num_experts, 2 * intermediate_size_per_partition, num_groups_w13 // 2 ), dtype=torch.uint8) * 136
+            self.w13_zp = (
+                torch.ones(
+                    (
+                        num_experts,
+                        2 * intermediate_size_per_partition,
+                        num_groups_w13 // 2,
+                    ),
+                    dtype=torch.uint8,
+                )
+                * 136
+            )
         if self.w2_zp is None:
-            self.w2_zp = torch.ones((num_experts, hidden_size, num_groups_w13 // 2), dtype=torch.uint8) * 136
+            self.w2_zp = (
+                torch.ones(
+                    (num_experts, hidden_size, num_groups_w13 // 2), dtype=torch.uint8
+                )
+                * 136
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 

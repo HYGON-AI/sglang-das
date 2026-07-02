@@ -86,7 +86,6 @@ def test_rocm_sparse_linear_attention_calls_flash_attn_sla(monkeypatch):
     torch.testing.assert_close(output, query + key + value)
 
 
-
 def test_rocm_sparse_linear_attention_calls_sla_without_compute_flags(monkeypatch):
     calls = {}
 
@@ -266,7 +265,9 @@ def test_minimal_a2a_binds_ulysses_group_when_sequence_sharded(monkeypatch):
     )
     monkeypatch.setattr(turbo_layer.dist, "is_available", lambda: True)
     monkeypatch.setattr(turbo_layer.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(turbo_layer, "get_sp_group", lambda: fake_sp_group, raising=False)
+    monkeypatch.setattr(
+        turbo_layer, "get_sp_group", lambda: fake_sp_group, raising=False
+    )
 
     attn_op = turbo_layer.MinimalA2AAttnOp(
         num_heads=4,
@@ -352,10 +353,7 @@ def test_wan_sla_backend_switches_default_attention_type():
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
     assert wanvideo.resolve_wan_attention_type("original", "sla_attn") == "sla"
-    assert (
-        wanvideo.resolve_wan_attention_type("original", "sage_sla_attn")
-        == "sagesla"
-    )
+    assert wanvideo.resolve_wan_attention_type("original", "sage_sla_attn") == "sagesla"
     assert wanvideo.resolve_wan_attention_type("original", "fa") == "original"
     assert wanvideo.resolve_wan_attention_type("sla", "fa") == "sla"
 
@@ -366,15 +364,11 @@ def test_fsdp_loader_treats_rocm_sla_projection_as_zero_init():
     )
 
     assert (
-        _resolve_missing_param_init(
-            "blocks.10.attn1.local_attn.proj_l.weight", None
-        )
+        _resolve_missing_param_init("blocks.10.attn1.local_attn.proj_l.weight", None)
         == "zeros"
     )
     assert (
-        _resolve_missing_param_init(
-            "blocks.10.attn1.local_attn.proj_l.bias", None
-        )
+        _resolve_missing_param_init("blocks.10.attn1.local_attn.proj_l.bias", None)
         == "zeros"
     )
 
@@ -382,24 +376,9 @@ def test_fsdp_loader_treats_rocm_sla_projection_as_zero_init():
 def test_wan_sla_topk_uses_attention_backend_config():
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
-    assert (
-        wanvideo.resolve_wan_sla_topk(
-            0.1, "sla", {"sla_topk": 0.3}
-        )
-        == 0.3
-    )
-    assert (
-        wanvideo.resolve_wan_sla_topk(
-            0.1, "sla", {"topk": "0.5"}
-        )
-        == 0.5
-    )
-    assert (
-        wanvideo.resolve_wan_sla_topk(
-            0.1, "original", {"sla_topk": 0.3}
-        )
-        == 0.1
-    )
+    assert wanvideo.resolve_wan_sla_topk(0.1, "sla", {"sla_topk": 0.3}) == 0.3
+    assert wanvideo.resolve_wan_sla_topk(0.1, "sla", {"topk": "0.5"}) == 0.5
+    assert wanvideo.resolve_wan_sla_topk(0.1, "original", {"sla_topk": 0.3}) == 0.1
 
     with pytest.raises(ValueError, match="sla_topk"):
         wanvideo.resolve_wan_sla_topk(0.1, "sla", {"sla_topk": 0})
@@ -408,14 +387,8 @@ def test_wan_sla_topk_uses_attention_backend_config():
 def test_wan_sla_local_blocks_uses_attention_backend_config():
     from sglang.multimodal_gen.runtime.models.dits import wanvideo
 
-    assert (
-        wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"sla_local_blocks": 3})
-        == 3
-    )
-    assert (
-        wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"local_blocks": "2"})
-        == 2
-    )
+    assert wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"sla_local_blocks": 3}) == 3
+    assert wanvideo.resolve_wan_sla_local_blocks(0, "sla", {"local_blocks": "2"}) == 2
     assert (
         wanvideo.resolve_wan_sla_local_blocks(0, "original", {"sla_local_blocks": 3})
         == 0
@@ -441,7 +414,9 @@ def test_wan_sla_skip_linear_uses_attention_backend_config():
         is True
     )
     assert (
-        wanvideo.resolve_wan_sla_skip_linear(True, "original", {"sla_skip_linear": False})
+        wanvideo.resolve_wan_sla_skip_linear(
+            True, "original", {"sla_skip_linear": False}
+        )
         is True
     )
 

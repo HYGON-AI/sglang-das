@@ -62,7 +62,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! cache_seqlens_int32, Tensor! cu_seqlens_k, Tensor! page_table, Tensor? swa_page_table, "
       "Tensor? full_to_swa_mapping, int max_seq_pages, int page_size, int seq_len_delta, bool use_swa) -> ()");
   m.impl("normal_decode_metadata_general", torch::kCUDA, &normal_decode_metadata_general);
-  
+
   /*
    * From csrc/elementwise
    */

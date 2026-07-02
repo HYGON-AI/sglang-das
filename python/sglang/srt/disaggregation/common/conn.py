@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
-from sglang.srt.configs.model_config import ModelConfig
+
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -16,6 +16,7 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,

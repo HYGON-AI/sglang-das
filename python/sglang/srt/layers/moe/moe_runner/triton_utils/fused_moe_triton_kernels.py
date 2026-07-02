@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.moe.utils import get_moe_padding_size
@@ -15,12 +16,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.quantization.int8_kernel import (
+from sglang.srt.layers.quantization.int8_kernel import (  # per_token_quant_int8,
     per_token_group_quant_int8,
-    # per_token_quant_int8,
     sglang_per_token_group_quant_int8,
 )
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -930,6 +929,7 @@ def invoke_fused_moe_kernel(
             **config,
         )
 
+
 @triton.jit
 def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
@@ -1035,8 +1035,6 @@ def act_and_mul_triton(
     expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
     has_swiglu_limit = swiglu_limit is not None
-    if has_swiglu_limit:
-        deepseek_v4_moe_code_path_checker.observed += 1
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,

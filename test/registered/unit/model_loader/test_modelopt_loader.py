@@ -23,7 +23,11 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because modelopt_fp8 is unsupported on ROCm/HIP.
-register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled="DCU Stage-B deferred: modelopt_fp8 quantization is not supported in ROCm/HIP; BW1100 run failed 6 tests in test_modelopt_loader.py.")
+register_dcu_ci(
+    est_time=30,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Stage-B deferred: modelopt_fp8 quantization is not supported in ROCm/HIP; BW1100 run failed 6 tests in test_modelopt_loader.py.",
+)
 
 from sglang.test.test_utils import CustomTestCase
 

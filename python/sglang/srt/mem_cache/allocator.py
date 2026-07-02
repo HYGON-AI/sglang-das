@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kernel
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
-from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kernel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -382,7 +382,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.sglang_kvalloc_kernel = get_bool_env_var("SGLANG_KVALLOC_KERNEL", default="true")
+        self.sglang_kvalloc_kernel = get_bool_env_var(
+            "SGLANG_KVALLOC_KERNEL", default="true"
+        )
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
@@ -435,13 +437,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if self.sglang_kvalloc_kernel:
             dcu_alloc_extend_kernel(
-                pre_lens_ptr = prefix_lens.to(torch.int64),
-                seq_lens_ptr = seq_lens.to(torch.int64),
-                last_loc_ptr = last_loc.to(torch.int64),
-                free_page_ptr = self.free_pages.to(torch.int64),
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                pre_lens_ptr=prefix_lens.to(torch.int64),
+                seq_lens_ptr=seq_lens.to(torch.int64),
+                last_loc_ptr=last_loc.to(torch.int64),
+                free_page_ptr=self.free_pages.to(torch.int64),
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
         else:
             alloc_extend_kernel[(bs,)](
@@ -488,12 +490,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.sglang_kvalloc_kernel:
             dcu_alloc_decode_kernel(
-                seq_lens_ptr = seq_lens,
-                last_loc_ptr = last_loc,
-                free_page_ptr = self.free_pages,
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                seq_lens_ptr=seq_lens,
+                last_loc_ptr=last_loc,
+                free_page_ptr=self.free_pages,
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
         else:
             alloc_decode_kernel[(bs,)](

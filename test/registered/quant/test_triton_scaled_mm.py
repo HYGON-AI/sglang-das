@@ -6,7 +6,11 @@ import torch.testing
 
 from sglang.srt.layers.quantization.fp8_kernel import triton_scaled_mm
 from sglang.srt.utils.common import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: triton_scaled_mm passed three runs.
 register_dcu_ci(

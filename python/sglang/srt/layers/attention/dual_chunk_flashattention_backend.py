@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from sgl_kernel.sparse_flash_attn import (
     convert_vertical_slash_indexes,
     convert_vertical_slash_indexes_mergehead,
@@ -24,6 +22,12 @@ from sglang.jit_kernel.flash_attention import (
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+
+# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sglang.srt.layers.attention.flashattention_interface import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:

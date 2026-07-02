@@ -9,6 +9,7 @@ def is_hip() -> bool:
 
 _is_hip = is_hip()
 
+
 def dcu_create_extend_after_decode_spec_info(
     verified_id: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -25,6 +26,7 @@ def dcu_create_extend_after_decode_spec_info(
         new_verified_id,
         bs,
     )
+
 
 def dcu_alloc_extend_kernel(
     pre_lens_ptr: torch.Tensor,
@@ -45,13 +47,14 @@ def dcu_alloc_extend_kernel(
         page_size,
     )
 
+
 def dcu_alloc_decode_kernel(
-    seq_lens_ptr: torch.Tensor,   
-    last_loc_ptr: torch.Tensor,    
-    free_page_ptr: torch.Tensor ,   
-    out_indices: torch.Tensor , 
-    bs: int,          
-    page_size: int,              
+    seq_lens_ptr: torch.Tensor,
+    last_loc_ptr: torch.Tensor,
+    free_page_ptr: torch.Tensor,
+    out_indices: torch.Tensor,
+    bs: int,
+    page_size: int,
 ):
     torch.ops.sgl_kernel.dcu_alloc_decode_kernel(
         seq_lens_ptr,
@@ -61,6 +64,7 @@ def dcu_alloc_decode_kernel(
         bs,
         page_size,
     )
+
 
 def transfer_kv_per_layer(
     src_k: torch.Tensor,
@@ -358,14 +362,15 @@ def transfer_kv_all_layer_mla_lf_pf(
         num_warps_per_block,
     )
 
+
 def dcu_assign_req_to_token_pool(
-    req_pool_indices:torch.Tensor,
-    req_to_token:torch.Tensor,
-    allocate_lens:torch.Tensor,
-    new_allocate_lens:torch.Tensor,
-    out_cache_loc:torch.Tensor,
-    shape:int,
-    bs:int,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    allocate_lens: torch.Tensor,
+    new_allocate_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    shape: int,
+    bs: int,
 ):
     torch.ops.sgl_kernel.dcu_assign_req_to_token_pool(
         req_pool_indices,
@@ -376,6 +381,7 @@ def dcu_assign_req_to_token_pool(
         shape,
         bs,
     )
+
 
 def dcu_get_last_loc(
     req_to_token: torch.Tensor,
@@ -401,13 +407,14 @@ def dcu_assign_extend_cache_locs(
 ):
     torch.ops.sgl_kernel.dcu_assign_extend_cache_locs(
         req_pool_indices,
-        req_to_token, 
-        start_offset, 
+        req_to_token,
+        start_offset,
         end_offset,
-        out_cache_loc, 
-        pool_len, 
+        out_cache_loc,
+        pool_len,
         bs,
     )
+
 
 def dcu_create_chunked_prefix_cache_kv_indices(
     req_to_token: torch.Tensor,
@@ -421,26 +428,27 @@ def dcu_create_chunked_prefix_cache_kv_indices(
 ):
     torch.ops.sgl_kernel.dcu_create_chunked_prefix_cache_kv_indices(
         req_to_token,
-        req_pool_indices, 
-        chunk_starts, 
+        req_pool_indices,
+        chunk_starts,
         chunk_seq_lens,
-        chunk_cu_seq_lens, 
-        chunk_kv_indices, 
-        col_num, 
+        chunk_cu_seq_lens,
+        chunk_kv_indices,
+        col_num,
         bs,
     )
+
 
 def dcu_align_evict_mask_to_page_size(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
     page_size: int,
     num_draft_tokens: int,
-    bs:int,
+    bs: int,
 ):
     torch.ops.sgl_kernel.dcu_align_evict_mask_to_page_size(
         seq_lens,
-        evict_mask, 
-        page_size, 
+        evict_mask,
+        page_size,
         num_draft_tokens,
         bs,
     )

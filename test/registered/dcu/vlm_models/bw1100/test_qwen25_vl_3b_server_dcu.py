@@ -11,7 +11,6 @@ from sglang.test.dcu_utils import (
     get_server_args,
 )
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )

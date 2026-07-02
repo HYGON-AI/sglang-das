@@ -43,9 +43,7 @@ def _load_ci_register():
     if module_name in sys.modules:
         return sys.modules[module_name]
 
-    path = os.path.join(
-        REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-    )
+    path = os.path.join(REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py")
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load ci_register from {path}")
@@ -330,8 +328,14 @@ def filter_include_files(
     }
     missing = sorted(set(include_files) - matched)
     if missing:
-        return selected_tests, selected_skipped_tests, (
-            "\n".join(f"{path} was not found in the selected suite." for path in missing)
+        return (
+            selected_tests,
+            selected_skipped_tests,
+            (
+                "\n".join(
+                    f"{path} was not found in the selected suite." for path in missing
+                )
+            ),
         )
 
     return selected_tests, selected_skipped_tests, None

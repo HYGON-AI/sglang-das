@@ -65,8 +65,6 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.environ import envs
-from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -145,49 +143,52 @@ class FusedMoeWeightScaleSupported(Enum):
     GROUP = "group"
     BLOCK = "block"
 
+
 def determine_expert_map(
-        ep_size: int, ep_rank: int,
-        global_num_experts: int) -> tuple[int, Optional[torch.Tensor]]:
-        """
-            Calculates how many experts should be assigned to each rank for EP and
-            creates a mapping from global to local expert index. Experts are
-            distributed evenly across ranks. Any remaining are assigned to the
-            last rank.
+    ep_size: int, ep_rank: int, global_num_experts: int
+) -> tuple[int, Optional[torch.Tensor]]:
+    """
+    Calculates how many experts should be assigned to each rank for EP and
+    creates a mapping from global to local expert index. Experts are
+    distributed evenly across ranks. Any remaining are assigned to the
+    last rank.
 
-            Args:
-                ep_size (int): The size of the expert parallel group
-                global_num_experts (int): The total number of experts in the model.
+    Args:
+        ep_size (int): The size of the expert parallel group
+        global_num_experts (int): The total number of experts in the model.
 
-            Returns:
-                tuple[int, Optional[torch.Tensor]]: A tuple containing:
-                    - local_num_experts (int): The number of experts assigned
-                        to the current rank.
-                    - expert_map (Optional[torch.Tensor]): A tensor of shape
-                        (global_num_experts,) mapping from global to local index.
-                        Contains -1 for experts not assigned to the current rank.
-                        Returns None if ep_size is 1.
-         """
-        assert ep_size > 0
-        if ep_size == 1:
-            return (global_num_experts, None)
+    Returns:
+        tuple[int, Optional[torch.Tensor]]: A tuple containing:
+            - local_num_experts (int): The number of experts assigned
+                to the current rank.
+            - expert_map (Optional[torch.Tensor]): A tensor of shape
+                (global_num_experts,) mapping from global to local index.
+                Contains -1 for experts not assigned to the current rank.
+                Returns None if ep_size is 1.
+    """
+    assert ep_size > 0
+    if ep_size == 1:
+        return (global_num_experts, None)
 
-        local_num_experts = global_num_experts // ep_size
+    local_num_experts = global_num_experts // ep_size
 
-        # Create a tensor of size num_experts filled with -1
-        expert_map = torch.full((global_num_experts, ), -1, dtype=torch.int32)
-        # Create a expert map for the local experts
-        if ep_rank < (ep_size - 1):
-            # Each non-last rank gets local_num_experts experts.
-            expert_map[ep_rank * local_num_experts:
-                            (ep_rank + 1) * local_num_experts] = \
-                torch.arange(0, local_num_experts, dtype=torch.int32)
-        else:
-            # All remaining experts are assigned to the last rank.
-            local_num_experts = (global_num_experts - ep_rank * local_num_experts)
+    # Create a tensor of size num_experts filled with -1
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
+    # Create a expert map for the local experts
+    if ep_rank < (ep_size - 1):
+        # Each non-last rank gets local_num_experts experts.
+        expert_map[ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts] = (
+            torch.arange(0, local_num_experts, dtype=torch.int32)
+        )
+    else:
+        # All remaining experts are assigned to the last rank.
+        local_num_experts = global_num_experts - ep_rank * local_num_experts
 
-            expert_map[-local_num_experts:] = \
-                torch.arange(0, local_num_experts, dtype=torch.int32)
-        return (local_num_experts, expert_map)
+        expert_map[-local_num_experts:] = torch.arange(
+            0, local_num_experts, dtype=torch.int32
+        )
+    return (local_num_experts, expert_map)
+
 
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
@@ -274,11 +275,11 @@ class FusedMoE(torch.nn.Module):
             self.num_local_experts, self.expert_map = determine_expert_map(
                 ep_size=self.moe_ep_size,
                 ep_rank=self.moe_ep_rank,
-                global_num_experts=num_experts)
+                global_num_experts=num_experts,
+            )
         else:
-            self.local_num_experts, self.expert_map = (self.global_num_experts,
-                                                       None)
-                                                       
+            self.local_num_experts, self.expert_map = (self.global_num_experts, None)
+
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
@@ -1097,7 +1098,15 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, shared_output: torch.Tensor = None, i_q: Optional[torch.Tensor] = None, i_s: Optional[torch.Tensor] = None, **kwargs):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        shared_output: torch.Tensor = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1122,23 +1131,37 @@ class FusedMoE(torch.nn.Module):
                 # Make sure there is torch lib op registration for the whole moe layer
                 return self.forward_impl(hidden_states, topk_output)
         else:
-            return self.forward_impl(hidden_states, topk_output, shared_output, i_q, i_s, **kwargs)
+            return self.forward_impl(
+                hidden_states, topk_output, shared_output, i_q, i_s, **kwargs
+            )
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput, shared_output: torch.Tensor = None, i_q: Optional[torch.Tensor] = None, i_s: Optional[torch.Tensor] = None, **kwargs):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        shared_output: torch.Tensor = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
         if _use_lightop_moe_sum_mul_add:
             final_hidden_states = self.quant_method.apply_with_shared_output(
                 layer=self,
                 x=hidden_states,
-                activation=getattr(self, 'moe_runner_config', None) and self.moe_runner_config.activation or "silu",
+                activation=getattr(self, "moe_runner_config", None)
+                and self.moe_runner_config.activation
+                or "silu",
                 shared_output=shared_output,
-                topk_output=topk_output, 
+                topk_output=topk_output,
                 i_q=i_q,
                 i_s=i_s,
             )
             if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
             return final_hidden_states
 

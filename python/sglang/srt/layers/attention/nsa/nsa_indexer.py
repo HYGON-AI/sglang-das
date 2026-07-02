@@ -54,8 +54,8 @@ if _use_aiter and not _use_aiter_preshuffle:
 _is_dcu = is_dcu()
 if _is_dcu:
     import lightop
-    from lightop import gemmopt
-    from lightop import op
+    from lightop import gemmopt, op
+
     from sglang.srt.layers.attention.nsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
         hadamard_transform_optimized,
@@ -68,7 +68,7 @@ else:
 
 _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
 if _is_dcu and _use_fast_hadamard_transform:
-    from fast_hadamard_transform import hadamard_transform
+    pass
 
 if _is_cuda:
     try:
@@ -104,6 +104,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+
 
 class BaseIndexerMetadata(ABC):
     @abstractmethod
@@ -199,6 +200,7 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
     else:
         return hadamard_transform(x, scale=scale)
 
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -242,7 +244,11 @@ class Indexer(MultiPlatformOp):
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         elif _is_dcu:
             device_props = torch.cuda.get_device_properties(0)
-            device_name = device_props.gcnArchName.split(':')[0] if hasattr(device_props, 'gcnArchName') else device_props.name
+            device_name = (
+                device_props.gcnArchName.split(":")[0]
+                if hasattr(device_props, "gcnArchName")
+                else device_props.name
+            )
             self.sm_count = device_props.multi_processor_count
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -380,7 +386,7 @@ class Indexer(MultiPlatformOp):
                 weights=weights,
                 q_scale=q_scale,
                 n_heads=self.n_heads,
-                softmax_scale=self.softmax_scale
+                softmax_scale=self.softmax_scale,
             )
         else:
             weights = weights * self.n_heads**-0.5
@@ -421,7 +427,7 @@ class Indexer(MultiPlatformOp):
                 None,
                 None,
                 self.k_norm.weight,
-                getattr(self.k_norm, 'bias', None),
+                getattr(self.k_norm, "bias", None),
                 None,
                 None,
                 1e-6,
@@ -606,7 +612,9 @@ class Indexer(MultiPlatformOp):
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if self._use_dcu_bf16_index_cache(forward_batch):
-            kv_cache = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id=layer_id)
+            kv_cache = forward_batch.token_to_kv_pool.get_index_k_buffer(
+                layer_id=layer_id
+            )
             # BF16 decode follows the vLLM ROCm pattern:
             # keep the indexer K cache in paged BF16 layout and pass it directly
             # to the paged kernel, instead of packing an fp8+scale buffer first.
@@ -666,15 +674,15 @@ class Indexer(MultiPlatformOp):
             elif _is_dcu:
 
                 logits = gemmopt.paged_mqa_logits(
-                            q_fp8[:q_offset],
-                            kv_cache_fp8,
-                            weights[:q_offset],
-                            seqlens_32,
-                            block_tables,
-                            schedule_metadata,
-                            max_seq_len,
-                            clean_logits=True
-                        )
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=True,
+                )
             else:
                 logits = deep_gemm.fp8_paged_mqa_logits(
                     q_fp8[:q_offset],
@@ -850,7 +858,7 @@ class Indexer(MultiPlatformOp):
                         q.shape[1],
                         q.shape[2],
                         scale.view(torch.float32).flatten(),
-                        True
+                        True,
                     )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
@@ -927,7 +935,7 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        scale
+                        scale,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
@@ -939,10 +947,9 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
 
-
-            assert logits_chunk.shape[0] == (end - start), (
-                f"logits_chunk rows mismatch: {logits_chunk.shape[0]} != {end - start}"
-            )
+            assert logits_chunk.shape[0] == (
+                end - start
+            ), f"logits_chunk rows mismatch: {logits_chunk.shape[0]} != {end - start}"
 
             lengths_chunk = seq_lens_expanded[start:end]
 
@@ -992,7 +999,7 @@ class Indexer(MultiPlatformOp):
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
 
-        #k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        # k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
@@ -1068,10 +1075,12 @@ class Indexer(MultiPlatformOp):
                     block_tables[batch_idx],
                 )
                 if not use_bf16_index_cache:
-                    k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-                        layer_id,
-                        end_seq_position,
-                        block_tables[batch_idx],
+                    k_scale = (
+                        forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                            layer_id,
+                            end_seq_position,
+                            block_tables[batch_idx],
+                        )
                     )
 
                 extend_seq_len = end_seq_position - start_seq_position
@@ -1121,7 +1130,9 @@ class Indexer(MultiPlatformOp):
                     )
                 else:
                     k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-                    k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+                    k_scale = (
+                        torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+                    )
                     kv_fp8 = (k_fp8, k_scale)
                     logits = deep_gemm.fp8_mqa_logits(
                         q,
@@ -1177,10 +1188,12 @@ class Indexer(MultiPlatformOp):
                         True,
                     )
                 elif _is_dcu:
-                    k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-                        layer_id,
-                        kv_len,
-                        block_tables[0],
+                    k_scale = (
+                        forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                            layer_id,
+                            kv_len,
+                            block_tables[0],
+                        )
                     )
                     k_fp8 = k_fp8.view(torch.float8_e4m3fn)
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
@@ -1193,10 +1206,12 @@ class Indexer(MultiPlatformOp):
                         k_scale,
                     )
                 else:
-                    k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-                        layer_id,
-                        kv_len,
-                        block_tables[0],
+                    k_scale = (
+                        forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                            layer_id,
+                            kv_len,
+                            block_tables[0],
+                        )
                     )
                     k_fp8 = k_fp8.view(torch.float8_e4m3fn)
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
@@ -1379,13 +1394,13 @@ class Indexer(MultiPlatformOp):
             )
             is_e4m3 = not _is_fp8_fnuz
             op.fuse_act_quant_and_store_index_k_cache(
-                key,                                      # input
-                buf,                                      # buf
-                forward_batch.out_cache_loc,              # loc
-                forward_batch.token_to_kv_pool.page_size, # page_size
-                1e-5,                                     # eps
-                False,                                    # use_ue8m0
-                is_e4m3                                   # is_e4m3
+                key,  # input
+                buf,  # buf
+                forward_batch.out_cache_loc,  # loc
+                forward_batch.token_to_kv_pool.page_size,  # page_size
+                1e-5,  # eps
+                False,  # use_ue8m0
+                is_e4m3,  # is_e4m3
             )
             return
         # Fallback: original path
@@ -1491,36 +1506,52 @@ class Indexer(MultiPlatformOp):
                 else:
                     weights = self._project_and_scale_head_gates(x)
                     query, key = self._get_q_k_bf16(
-                        q_lora, x, positions, False, forward_batch=forward_batch,
-                        apply_hadamard_scale=False
+                        q_lora,
+                        x,
+                        positions,
+                        False,
+                        forward_batch=forward_batch,
+                        apply_hadamard_scale=False,
                     )
-                    k_buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+                    k_buf = (
+                        forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                            layer_id=layer_id
+                        )
+                    )
                     k_loc = forward_batch.out_cache_loc
                     page_size = forward_batch.token_to_kv_pool.page_size
                     is_e4m3 = not _is_fp8_fnuz
 
-                    hadamard_scale = self.hidden_size ** -0.5
+                    hadamard_scale = self.hidden_size**-0.5
                     fused_q_scale = hadamard_scale * self.softmax_scale
                     fused_k_scale = hadamard_scale
 
                     q_fp8, q_scale, weights = op.fuse_qk_quant_and_store_index_k_cache(
-                            query,
-                            key,
-                            k_buf,
-                            k_loc,
-                            page_size,
-                            weights,           # weights_in_opt
-                            fused_q_scale,     # q_scale_factor
-                            fused_k_scale,     # k_scale_factor
-                            1e-5,              # eps
-                            False,             # use_ue8m0
-                            is_e4m3            # is_e4m3
-                        )
-                    q_index = q_fp8.view(torch.float8_e4m3fnuz) if _is_fp8_fnuz else q_fp8.view(torch.float8_e4m3fn)
+                        query,
+                        key,
+                        k_buf,
+                        k_loc,
+                        page_size,
+                        weights,  # weights_in_opt
+                        fused_q_scale,  # q_scale_factor
+                        fused_k_scale,  # k_scale_factor
+                        1e-5,  # eps
+                        False,  # use_ue8m0
+                        is_e4m3,  # is_e4m3
+                    )
+                    q_index = (
+                        q_fp8.view(torch.float8_e4m3fnuz)
+                        if _is_fp8_fnuz
+                        else q_fp8.view(torch.float8_e4m3fn)
+                    )
             else:
                 weights = self._project_and_scale_head_gates(x)
                 query, key = self._get_q_k_bf16(
-                    q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+                    q_lora,
+                    x,
+                    positions,
+                    enable_dual_stream,
+                    forward_batch=forward_batch,
                 )
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 with torch.cuda.stream(self.alt_stream):
@@ -1566,7 +1597,7 @@ class Indexer(MultiPlatformOp):
                     page_size = forward_batch.token_to_kv_pool.page_size
                     is_e4m3 = not _is_fp8_fnuz
 
-                    hadamard_scale = self.hidden_size ** -0.5
+                    hadamard_scale = self.hidden_size**-0.5
                     fused_q_scale = hadamard_scale * self.softmax_scale
                     fused_k_scale = hadamard_scale
 
@@ -1576,12 +1607,12 @@ class Indexer(MultiPlatformOp):
                         k_buf,
                         k_loc,
                         page_size,
-                        None,              # weights_in_opt=None
-                        fused_q_scale,     # q_scale_factor
-                        fused_k_scale,     # k_scale_factor
-                        1e-5,              # eps
-                        False,             # use_ue8m0
-                        is_e4m3            # is_e4m3
+                        None,  # weights_in_opt=None
+                        fused_q_scale,  # q_scale_factor
+                        fused_k_scale,  # k_scale_factor
+                        1e-5,  # eps
+                        False,  # use_ue8m0
+                        is_e4m3,  # is_e4m3
                     )
                     q_index = (
                         q_fp8.view(torch.float8_e4m3fnuz)
@@ -1620,7 +1651,10 @@ class Indexer(MultiPlatformOp):
 
             x_for_gate = self._get_gate_input_tensor(x)
             if self._use_dcu_bf16_index_cache(forward_batch):
-                weights = self._project_and_scale_head_gates(x_for_gate).unsqueeze(-1) * self.softmax_scale
+                weights = (
+                    self._project_and_scale_head_gates(x_for_gate).unsqueeze(-1)
+                    * self.softmax_scale
+                )
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
         # if not forward_batch.out_cache_loc.is_contiguous():

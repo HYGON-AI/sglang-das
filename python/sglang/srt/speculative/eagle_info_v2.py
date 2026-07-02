@@ -35,17 +35,26 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    fast_topk,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
-from sglang.srt.utils import get_bool_env_var
+import logging
+
 from sgl_kernel.kvcacheio import dcu_assign_extend_cache_locs
 
-import logging
+from sglang.srt.utils import get_bool_env_var
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -264,7 +273,9 @@ class EagleDraftInputV2Mixin:
 @dataclass
 class EagleVerifyInputV2Mixin:
 
-    use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
+    use_sglang_assign_extend_cache_locs = get_bool_env_var(
+        "SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"
+    )
 
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
@@ -512,7 +523,7 @@ class EagleVerifyInputV2Mixin:
         return predict, num_correct_drafts + 1, accept_index
 
 
-#@torch.compile(dynamic=True, disable=_is_npu)  #disable on dcu, is cause large bubble
+# @torch.compile(dynamic=True, disable=_is_npu)  #disable on dcu, is cause large bubble
 def select_top_k_tokens_tmp(
     i: int,
     topk_p: torch.Tensor,
@@ -571,16 +582,18 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if is_cuda() or is_hip() :
+    if is_cuda() or is_hip():
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,
             device=device,
         )
-        use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
+        use_sglang_assign_extend_cache_locs = get_bool_env_var(
+            "SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"
+        )
         if use_sglang_assign_extend_cache_locs:
             dcu_assign_extend_cache_locs(
-                req_pool_indices,         
+                req_pool_indices,
                 req_to_token,
                 start_offset,
                 start_offset + draft_token_num,
@@ -590,7 +603,7 @@ def assign_extend_cache_locs_func(
             )
         else:
             assign_extend_cache_locs[(batch_size,)](
-                req_pool_indices,         
+                req_pool_indices,
                 req_to_token,
                 start_offset,
                 start_offset + draft_token_num,
@@ -600,6 +613,7 @@ def assign_extend_cache_locs_func(
             )
 
         return out_cache_loc
+
 
 @triton.jit
 def fill_bonus_tokens(

@@ -12,7 +12,6 @@ from sglang.test.dcu_utils import (
 )
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
@@ -23,7 +22,9 @@ register_dcu_ci(est_time=1200, suite="stage-b-test-1-gpu-small-dcu")
 class TestBW1100Qwen25SevenBServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = get_model_path("SGLANG_DCU_QWEN25_7B_MODEL", DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = get_model_path(
+            "SGLANG_DCU_QWEN25_7B_MODEL", DEFAULT_MODEL_NAME_FOR_TEST
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(

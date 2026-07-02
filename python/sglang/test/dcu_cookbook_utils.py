@@ -20,7 +20,6 @@ from sglang.test.dcu_utils import (
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import popen_launch_server
 
-
 DCU_COOKBOOK_API_KEY = "sk-123456"
 
 QWEN3_COOKBOOK_ENV = {
@@ -245,6 +244,7 @@ def _glm51_args(quantization: str) -> list[str]:
         "--log-level-http",
         "warning",
     ]
+
 
 def _deepseek_v32_args(quantization: str) -> list[str]:
     return [
@@ -818,7 +818,9 @@ class CookbookServer:
         message = payload.get("choices", [{}])[0].get("message", {})
         content = message.get("content") or message.get("reasoning_content") or ""
         if not content.strip():
-            raise AssertionError(f"VLM chat completion returned empty content: {payload}")
+            raise AssertionError(
+                f"VLM chat completion returned empty content: {payload}"
+            )
         return content
 
 
@@ -912,20 +914,17 @@ def run_cookbook_accuracy_eval(
     dataset_path = None
     gsm8k_data_path = None
     if eval_name == "mmlu":
-        dataset_path = (
-            os.environ.get("SGLANG_DCU_COOKBOOK_MMLU_DATASET_PATH")
-            or os.environ.get("SGLANG_DCU_MMLU_DATASET_PATH")
-        )
+        dataset_path = os.environ.get(
+            "SGLANG_DCU_COOKBOOK_MMLU_DATASET_PATH"
+        ) or os.environ.get("SGLANG_DCU_MMLU_DATASET_PATH")
     elif eval_name == "mmmu":
-        dataset_path = (
-            os.environ.get("SGLANG_DCU_COOKBOOK_MMMU_DATASET_PATH")
-            or os.environ.get("SGLANG_DCU_MMMU_DATASET_PATH")
-        )
+        dataset_path = os.environ.get(
+            "SGLANG_DCU_COOKBOOK_MMMU_DATASET_PATH"
+        ) or os.environ.get("SGLANG_DCU_MMMU_DATASET_PATH")
     elif eval_name == "gsm8k":
-        gsm8k_data_path = (
-            os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_DATA_PATH")
-            or os.environ.get("SGLANG_DCU_GSM8K_DATA_PATH")
-        )
+        gsm8k_data_path = os.environ.get(
+            "SGLANG_DCU_COOKBOOK_GSM8K_DATA_PATH"
+        ) or os.environ.get("SGLANG_DCU_GSM8K_DATA_PATH")
 
     os.environ["OPENAI_API_KEY"] = DCU_COOKBOOK_API_KEY
     with CookbookServer(config, base_url) as server:

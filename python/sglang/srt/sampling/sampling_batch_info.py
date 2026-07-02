@@ -140,7 +140,8 @@ class SamplingBatchInfo:
                     # The mask tensor for the requests that use this custom logit processor
                     torch.zeros(len(reqs), dtype=torch.bool)
                     .scatter_(0, torch.tensor(true_indices), True)
-                    .pin_memory().to(device, non_blocking=True),
+                    .pin_memory()
+                    .to(device, non_blocking=True),
                 )
                 for processor_str, true_indices in processor_dict.items()
             }

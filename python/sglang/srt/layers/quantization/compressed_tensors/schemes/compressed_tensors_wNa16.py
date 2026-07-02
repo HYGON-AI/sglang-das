@@ -3,8 +3,8 @@
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
-from typing import Callable, Optional
 import os
+from typing import Callable, Optional
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering

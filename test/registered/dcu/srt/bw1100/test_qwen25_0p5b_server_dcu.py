@@ -31,7 +31,9 @@ def _get_model_path() -> str:
             "SGLANG_DCU_QWEN25_0P5B_MODEL" in os.environ
             or "SGLANG_DCU_SERVER_SMOKE_MODEL" in os.environ
         ):
-            raise FileNotFoundError(f"DCU Qwen2.5-0.5B model path missing: {model_path}")
+            raise FileNotFoundError(
+                f"DCU Qwen2.5-0.5B model path missing: {model_path}"
+            )
         raise unittest.SkipTest(f"Default DCU model path does not exist: {model_path}")
     return model_path
 
@@ -48,7 +50,10 @@ class TestBW1100Qwen25HalfBServerDCU(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=get_server_args("SGLANG_DCU_SERVER_ARGS", DCU_TEXT_SERVER_ARGS + ["--disable-cuda-graph"]),
+            other_args=get_server_args(
+                "SGLANG_DCU_SERVER_ARGS",
+                DCU_TEXT_SERVER_ARGS + ["--disable-cuda-graph"],
+            ),
             env={
                 "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
                 "SGLANG_USE_MODELSCOPE": os.environ.get("SGLANG_USE_MODELSCOPE", "1"),

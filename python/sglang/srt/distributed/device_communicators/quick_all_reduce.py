@@ -240,7 +240,8 @@ class QuickAllReduce:
         if self.use_fp16_kernels:
             dtype = torch.float16
         return (
-            inp_size <= self.qr_max_size
+            inp_size
+            <= self.qr_max_size
             # and inp_size
             # >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
         )

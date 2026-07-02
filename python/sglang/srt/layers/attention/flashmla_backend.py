@@ -9,18 +9,18 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
-#from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+# from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-#from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
+
+# from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-
-from sglang.srt.utils  import get_bool_env_var
-from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
-
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 
 
 PAGE_SIZE = 64
+
+use_sglang_create_flashmla_kv_indices_triton = get_bool_env_var(
+    "SGLANG_CREATE_FLASHMLA_KV_INDICES_TRITON", default="true"
+)
 
 
 @dataclass
@@ -103,13 +107,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             if use_sglang_create_flashmla_kv_indices_triton:
                 dcu_create_flashmla_kv_indices(
-                    req_to_token_ptr = self.req_to_token,
-                    req_pool_indices_ptr = forward_batch.req_pool_indices,
-                    page_kernel_lens_ptr = forward_batch.seq_lens,
-                    kv_start_idx = None,
-                    kv_indices_ptr = block_kv_indices,
-                    req_to_token_ptr_stride = self.req_to_token.stride(0),
-                    kv_indices_ptr_stride = max_seqlen_pad,
+                    req_to_token_ptr=self.req_to_token,
+                    req_pool_indices_ptr=forward_batch.req_pool_indices,
+                    page_kernel_lens_ptr=forward_batch.seq_lens,
+                    kv_start_idx=None,
+                    kv_indices_ptr=block_kv_indices,
+                    req_to_token_ptr_stride=self.req_to_token.stride(0),
+                    kv_indices_ptr_stride=max_seqlen_pad,
                 )
 
             else:
@@ -146,13 +150,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             if use_sglang_create_flashmla_kv_indices_triton:
                 dcu_create_flashmla_kv_indices(
-                    req_to_token_ptr = self.req_to_token,
-                    req_pool_indices_ptr = forward_batch.req_pool_indices,
-                    page_kernel_lens_ptr = forward_batch.seq_lens,
-                    kv_start_idx = None,
-                    kv_indices_ptr = block_kv_indices,
-                    req_to_token_ptr_stride = self.req_to_token.stride(0),
-                    kv_indices_ptr_stride = max_seqlen_pad,
+                    req_to_token_ptr=self.req_to_token,
+                    req_pool_indices_ptr=forward_batch.req_pool_indices,
+                    page_kernel_lens_ptr=forward_batch.seq_lens,
+                    kv_start_idx=None,
+                    kv_indices_ptr=block_kv_indices,
+                    req_to_token_ptr_stride=self.req_to_token.stride(0),
+                    kv_indices_ptr_stride=max_seqlen_pad,
                 )
 
             else:
@@ -178,7 +182,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             super().init_forward_metadata(forward_batch)
-            
+
     def init_cuda_graph_state(
         self,
         max_bs: int,

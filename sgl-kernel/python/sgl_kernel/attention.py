@@ -112,6 +112,7 @@ def cutlass_mla_get_workspace_size(
         max_seq_len, num_batches, sm_count, num_kv_splits
     )
 
+
 def normal_decode_metadata_general(
     seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,

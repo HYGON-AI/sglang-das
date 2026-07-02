@@ -19,7 +19,11 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: triton attention kernels passed three runs.

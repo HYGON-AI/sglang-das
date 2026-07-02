@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestOpenAIServerFunctionCalling(CustomTestCase):
     # NOTE: this system_message is for Llama3.2 system prompt. Without this,
     # sometimes Llama3.2 gives a different tool call format such as:
@@ -779,7 +780,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             )
 
 
-@unittest.skip("DCU smoke keeps the Llama3 parser path; pythonic parser starts a separate server and currently exits -9 on BW1100")
+@unittest.skip(
+    "DCU smoke keeps the Llama3 parser path; pythonic parser starts a separate server and currently exits -9 on BW1100"
+)
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     PYTHONIC_TOOLS = [
         {

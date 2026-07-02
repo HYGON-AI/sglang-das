@@ -17,7 +17,11 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,

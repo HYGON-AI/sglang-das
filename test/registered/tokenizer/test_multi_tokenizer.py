@@ -1,7 +1,11 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because TTFT/latency gate failed on local Qwen2.5-7B.
 register_dcu_ci(

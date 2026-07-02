@@ -264,7 +264,6 @@ class EAGLEDraftExtendCudaGraphRunner:
     def _replay(self, forward_batch: ForwardBatch):
         self.graphs[self.bs].replay()
 
-
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
 

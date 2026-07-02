@@ -10,12 +10,16 @@ from sglang.test.dcu_utils import (
     get_server_args,
 )
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=2400, suite="nightly-dcu", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_dcu_ci(
+    est_time=2400,
+    suite="nightly-dcu",
+    nightly=True,
+    disabled="DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
+)
 
 DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
 
@@ -23,7 +27,9 @@ DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
 class TestBW1100Qwen3ThirtyBMoEServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = get_model_path("SGLANG_DCU_QWEN3_MOE_MODEL", DEFAULT_QWEN3_MOE_MODEL)
+        cls.model = get_model_path(
+            "SGLANG_DCU_QWEN3_MOE_MODEL", DEFAULT_QWEN3_MOE_MODEL
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,

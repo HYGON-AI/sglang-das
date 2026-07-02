@@ -117,7 +117,9 @@ def resolve_wan_sla_topk(
     try:
         sla_topk = float(raw_topk)
     except (TypeError, ValueError) as err:
-        raise ValueError(f"sla_topk must be a float in (0, 1], got {raw_topk!r}") from err
+        raise ValueError(
+            f"sla_topk must be a float in (0, 1], got {raw_topk!r}"
+        ) from err
 
     if not 0 < sla_topk <= 1:
         raise ValueError(f"sla_topk must be in (0, 1], got {sla_topk}")
@@ -179,9 +181,7 @@ def resolve_wan_sla_skip_linear(
         if normalized in ("0", "false", "no", "off"):
             return False
 
-    raise ValueError(
-        f"sla_skip_linear must be a boolean, got {raw_skip_linear!r}"
-    )
+    raise ValueError(f"sla_skip_linear must be a boolean, got {raw_skip_linear!r}")
 
 
 class WanImageEmbedding(torch.nn.Module):

@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import is_sbo_enabled
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.cp_utils import (
@@ -58,7 +59,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForC
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
-from sglang.srt.layers.moe.utils import is_sbo_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.alt_stream = (
             torch.cuda.Stream()
-            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get() or is_sbo_enabled() 
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get() or is_sbo_enabled()
             else None
         )
 

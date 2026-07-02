@@ -3,7 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: EVS unit/doctest path passed three runs.
 register_dcu_ci(

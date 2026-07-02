@@ -8,7 +8,7 @@ Supports arbitrary seq_dim to work with any tensor layout (e.g. BSHD or BHSD).
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import auto, Enum
+from enum import Enum, auto
 from typing import Any, Optional, Protocol
 
 import torch
@@ -16,10 +16,10 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 import torch.nn.functional as F
 
-
 # ---------------------------------------------------------------------------
 # Enums and options
 # ---------------------------------------------------------------------------
+
 
 class _CausalBehavior(Enum):
     SKIP = None
@@ -41,6 +41,7 @@ class _ContextParallelOptions:
 
 _cp_options = _ContextParallelOptions()
 _cp_options.enable_load_balance = False
+
 
 def _is_causal_behavior(
     rank: int, world_size: int, i: int, is_causal: bool
@@ -88,6 +89,7 @@ def _partial_update(
 # ---------------------------------------------------------------------------
 # _SDPAMerger
 # ---------------------------------------------------------------------------
+
 
 class _SDPAMerger:
     """A class to help to merge the local SDPA result."""
@@ -166,6 +168,7 @@ class _SDPAMerger:
 # _AttentionOp protocol
 # ---------------------------------------------------------------------------
 
+
 class _AttentionOp(Protocol):
     def __call__(
         self,
@@ -179,6 +182,7 @@ class _AttentionOp(Protocol):
 # ---------------------------------------------------------------------------
 # Ring rotater classes
 # ---------------------------------------------------------------------------
+
 
 class _RingRotater(ABC):
     @abstractmethod
@@ -256,6 +260,7 @@ def _create_rotater(
 # _templated_ring_attention — main entry point
 # ---------------------------------------------------------------------------
 
+
 def _templated_ring_attention(
     group: dist.ProcessGroup,
     seq_dim: int,
@@ -273,9 +278,9 @@ def _templated_ring_attention(
     if not is_causal and _cp_options.enable_load_balance:
         raise RuntimeError("Load balancing requires `is_causal=True`.")
 
-    assert isinstance(group, dist.ProcessGroup), (
-        "process group must be single dimension"
-    )
+    assert isinstance(
+        group, dist.ProcessGroup
+    ), "process group must be single dimension"
     rank = dist.get_rank(group)
     size = dist.get_world_size(group)
 
@@ -338,6 +343,7 @@ def _templated_ring_attention(
 # Overlap-optimized ring attention with timing instrumentation
 # ---------------------------------------------------------------------------
 
+
 class _AllToAllRotaterOverlap:
     """Ring-shift rotater with true GPU-level compute-communication overlap.
 
@@ -399,9 +405,9 @@ def _templated_ring_attention_overlap(
     if not is_causal and _cp_options.enable_load_balance:
         raise RuntimeError("Load balancing requires `is_causal=True`.")
 
-    assert isinstance(group, dist.ProcessGroup), (
-        "process group must be single dimension"
-    )
+    assert isinstance(
+        group, dist.ProcessGroup
+    ), "process group must be single dimension"
     rank = dist.get_rank(group)
     size = dist.get_world_size(group)
 

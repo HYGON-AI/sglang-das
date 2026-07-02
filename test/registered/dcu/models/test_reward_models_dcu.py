@@ -24,7 +24,9 @@ DEFAULT_DCU_REWARD_MODEL = (
     "/public/opendas/DL_DATA/llm-models/internlm2/internlm2-1.8b-reward"
 )
 
-PROMPT = "What is the range of the numeric output of a sigmoid node in a neural network?"
+PROMPT = (
+    "What is the range of the numeric output of a sigmoid node in a neural network?"
+)
 RESPONSE1 = "The output of a sigmoid node is bounded between -1 and 1."
 RESPONSE2 = "The output of a sigmoid node is bounded between 0 and 1."
 

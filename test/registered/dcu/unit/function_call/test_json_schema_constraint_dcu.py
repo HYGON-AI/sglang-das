@@ -17,6 +17,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
 )
 from sglang.test.ci.ci_register import register_dcu_ci
+
 register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
 register_dcu_ci(est_time=30, suite="nightly-dcu-api-models", nightly=True)
 

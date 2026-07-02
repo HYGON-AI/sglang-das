@@ -119,6 +119,7 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
         scale_k_nope_ue8m0=scale_k_nope_ue8m0,
     )
 
+
 def quant_to_nope_fp8_rope_bf16_pack(k_bf16: torch.Tensor) -> NopeFp8RopeBf16Pack:
     assert k_bf16.dtype == torch.bfloat16
     _num_tokens, hidden_dim = k_bf16.shape
@@ -145,11 +146,13 @@ def quant_to_nope_fp8_rope_bf16_pack(k_bf16: torch.Tensor) -> NopeFp8RopeBf16Pac
         scale_k_nope_ue8m0=scale_k_nope_ue8m0,
     )
 
+
 def quant_to_nope_fp8_rope_bf16_pack_lightop(
     k_bf16: torch.Tensor, eps: float = 1e-8
 ) -> NopeFp8RopeBf16Pack:
     """Call the C++ implementation and wrap result in NopeFp8RopeBf16Pack."""
     from lightop import op
+
     result = op.quantize_nope_fp8_rope_bf16_pack(k_bf16, eps)
     k_nope_fp8_u8, k_rope_bf16, scale_k_nope = result
     # C++ returns k_nope_fp8 as uint8; view as fp8 for the dataclass
@@ -159,6 +162,7 @@ def quant_to_nope_fp8_rope_bf16_pack_lightop(
         k_rope_bf16=k_rope_bf16,
         scale_k_nope_ue8m0=scale_k_nope,
     )
+
 
 def _cast_scale_inv_to_ue8m0(
     scales_inv: torch.Tensor, out_dtype=torch.float32

@@ -1,23 +1,29 @@
 import logging
 import os
 from typing import Dict, List, Optional
-# from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 import torch
-from sglang.srt.utils import set_weight_attrs
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from torch.nn.parameter import Parameter
+
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
-from sglang.srt.layers.quantization.base_config import (FusedMoEMethodBase, QuantizeMethodBase)
-from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
     get_moe_a2a_backend,
 )
+from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
+from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
+from sglang.srt.utils import set_weight_attrs
+
+# from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
+
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +31,9 @@ W4A8_TPMOE_BACKEND_ENV = "SGLANG_W4A8_TPMOE_BACKEND"
 W4A8_TPMOE_BACKEND_AUTO = "auto"
 W4A8_TPMOE_BACKEND_LMSLIM = "lmslim"
 W4A8_TPMOE_BACKEND_AITER = "aiter"
-_requested_backend = os.getenv(
-    W4A8_TPMOE_BACKEND_ENV, W4A8_TPMOE_BACKEND_AUTO
-).strip().lower()
+_requested_backend = (
+    os.getenv(W4A8_TPMOE_BACKEND_ENV, W4A8_TPMOE_BACKEND_AUTO).strip().lower()
+)
 
 
 _lmslim_w4a8_marlin_available = False
@@ -71,14 +77,20 @@ if _requested_backend == W4A8_TPMOE_BACKEND_AUTO:
     elif _aiter_w4a8_marlin_available:
         _resolved_backend = W4A8_TPMOE_BACKEND_AITER
     else:
-        raise RuntimeError("Neither lmslim nor aiter backend is available for w4a8 tpmoe.")
+        raise RuntimeError(
+            "Neither lmslim nor aiter backend is available for w4a8 tpmoe."
+        )
 elif _requested_backend == W4A8_TPMOE_BACKEND_LMSLIM:
     if not _lmslim_w4a8_marlin_available:
-        raise RuntimeError("lmslim backend is selected for w4a8 tpmoe, but lmslim is not available.")
+        raise RuntimeError(
+            "lmslim backend is selected for w4a8 tpmoe, but lmslim is not available."
+        )
     _resolved_backend = W4A8_TPMOE_BACKEND_LMSLIM
 else:
     if not _aiter_w4a8_marlin_available:
-        raise RuntimeError("aiter backend is selected for w4a8 tpmoe, but aiter is not available.")
+        raise RuntimeError(
+            "aiter backend is selected for w4a8 tpmoe, but aiter is not available."
+        )
     _resolved_backend = W4A8_TPMOE_BACKEND_AITER
 
 logger.info(
@@ -91,9 +103,11 @@ logger.info(
 class MarlinMoeWorkspace:
     """
     Singleton manager for device-specific workspace buffers used by w4a8 Marlin-MoE.
-    global_reduce_buffer will take 1.5MB * cus (about 120MB for BW200) memoery in each device
+    global_reduce_buffer will take 1.5MB * cus (about 120MB for BW200) memory in each device
     """
+
     _instances = {}
+
     def __new__(cls, device):
         if device not in cls._instances:
             instance = super().__new__(cls)
@@ -118,52 +132,50 @@ class MarlinMoeWorkspace:
 
 
 def repack_and_shuffle_w4a8(weight_data, E):
-        """
-        逐 expert 处理 [n, k_half]
-        处理完直接写回 weight_data[i]
-        """
-        # 原始 shape: [E, n, k_half]
-        for i in range(E):
-            # 1. 取当前 expert [n, k_half]
-            expert = weight_data[i]
-            n, k_half = expert.shape
+    """
+    逐 expert 处理 [n, k_half]
+    处理完直接写回 weight_data[i]
+    """
+    # 原始 shape: [E, n, k_half]
+    for i in range(E):
+        # 1. 取当前 expert [n, k_half]
+        expert = weight_data[i]
+        n, k_half = expert.shape
 
-            # 2. repack 逻辑（连续 → blocked）
-            w_u8 = expert.to(torch.uint8)
-            
-            # 解包 1byte → 2个4bit
-            w_unpacked = torch.stack([
-                (w_u8 >> 4) & 0x0F,
-                w_u8 & 0x0F
-            ], dim=-1).view(n, -1)
+        # 2. repack 逻辑（连续 → blocked）
+        w_u8 = expert.to(torch.uint8)
 
-            # 8个4bit分块重排
-            blocks = w_unpacked.view(n, -1, 8)
-            w_low = blocks[..., :4]
-            w_high = blocks[..., 4:]
-            packed = (w_low << 4) | w_high
-            packed = packed.view(n, k_half)
+        # 解包 1byte → 2个4bit
+        w_unpacked = torch.stack([(w_u8 >> 4) & 0x0F, w_u8 & 0x0F], dim=-1).view(n, -1)
 
-            # 3. shuffle
-            w_marlin_in = w4a8_moe_layout_shuffle_gemm2(packed)
-            w_marlin_in = w_marlin_in.reshape(n, k_half)
-            # 4. 直接写回
-            weight_data[i] = w_marlin_in
+        # 8个4bit分块重排
+        blocks = w_unpacked.view(n, -1, 8)
+        w_low = blocks[..., :4]
+        w_high = blocks[..., 4:]
+        packed = (w_low << 4) | w_high
+        packed = packed.view(n, k_half)
 
-        return weight_data
+        # 3. shuffle
+        w_marlin_in = w4a8_moe_layout_shuffle_gemm2(packed)
+        w_marlin_in = w_marlin_in.reshape(n, k_half)
+        # 4. 直接写回
+        weight_data[i] = w_marlin_in
+
+    return weight_data
 
 
-def baseline_scaled_mm(a: torch.Tensor,
-                      b: torch.Tensor,
-                      scale_a: torch.Tensor,
-                      scale_b: torch.Tensor,
-                      out_dtype: torch.dtype,
-                      bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+def baseline_scaled_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
 
-    scales= scale_a* scale_b.T
-    gemmout= torch.mm(
-        a.to(dtype=torch.float32), b.to(dtype=torch.float32))
-    output = (scales *gemmout).to(out_dtype)
+    scales = scale_a * scale_b.T
+    gemmout = torch.mm(a.to(dtype=torch.float32), b.to(dtype=torch.float32))
+    output = (scales * gemmout).to(out_dtype)
     if bias is not None:
         output = output + bias
     return output.to(out_dtype)
@@ -197,19 +209,22 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, any]) -> "SlimQuantW4A8Int8MarlinConfig":
         return cls()
+
     @classmethod
-    def override_quantization_method(
-            cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" \
-                and user_quant in ("slimquant_w4a8_marlin", "slimquant_marlin"):
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" and user_quant in (
+            "slimquant_w4a8_marlin",
+            "slimquant_marlin",
+        ):
             return cls.get_name()
         return None
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.moe.fused_moe_triton import (FusedMoE, FusedMoeWeightScaleSupported)
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
             return SlimQuantW4A8Int8LinearMethod(self)
@@ -232,7 +247,6 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
     """
 
     def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import (FusedMoE, FusedMoeWeightScaleSupported)
 
         if not hasattr(cls, "_initialized"):
             original_init = cls.__init__
@@ -262,13 +276,14 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import (FusedMoE, FusedMoeWeightScaleSupported)
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         tp_size = get_tensor_model_parallel_world_size()
         intermediate_size = intermediate_size_per_partition
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size//2, dtype=torch.int8
+                num_experts, 2 * intermediate_size, hidden_size // 2, dtype=torch.int8
             ),
             requires_grad=False,
         )
@@ -276,7 +291,9 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size//2, dtype=torch.int8),
+            torch.empty(
+                num_experts, hidden_size, intermediate_size // 2, dtype=torch.int8
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -308,15 +325,11 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight = Parameter(
-            w4a8_weight_repack_impl(
-                layer.w13_weight, use_deepep=self.use_deepep
-            ),
+            w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
             requires_grad=False,
         )
         layer.w2_weight = Parameter(
-            w4a8_weight_repack_impl(
-                layer.w2_weight, use_deepep=self.use_deepep
-            ),
+            w4a8_weight_repack_impl(layer.w2_weight, use_deepep=self.use_deepep),
             requires_grad=False,
         )
         layer.w13_weight_scale = Parameter(
@@ -339,9 +352,10 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         dispatch_output,
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
-       # local_expert_mapping,
-    ) :
+        # local_expert_mapping,
+    ):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -495,7 +509,8 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
     #         use_nn_moe=use_nn_moe,
     #     )
 
-    def apply_ep(self,
+    def apply_ep(
+        self,
         x: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
@@ -511,47 +526,48 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         a2_scale: Optional[torch.Tensor] = None,
         use_nn_moe: Optional[bool] = False,
         num_local_tokens: Optional[torch.Tensor] = None,
-        #config_select_bs: Optional[int] = None,
+        # config_select_bs: Optional[int] = None,
         routed_scaling_factor: Optional[float] = 1.0,
         shared_output: Optional[torch.Tensor] = None,
-        #scales: Optional[torch.Tensor] = None,
+        # scales: Optional[torch.Tensor] = None,
         num_recv_tokens_per_expert: List = None,
-        **_  ):
-            workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
-            routed_scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
-            return fused_experts_impl_w4a8_marlin(
-                x,
-                w1,
-                w2,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                workspace=workspace,
-                global_reduce_buffer=global_reduce_buffer,
-                inplace=True,
-                use_int4_w4a8=True,
-                per_channel_quant=True,
-                activation=activation,
-                expert_map=expert_map,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                use_nn_moe=use_nn_moe,
-                shared_output=shared_output,
-                routed_scaling_factor=float(routed_scaling_factor),
-                # num_local_tokens=num_local_tokens,
-                #config_select_bs=config_select_bs,
-                #q_scales=scales
-
-            )
+        **_,
+    ):
+        workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
+        routed_scaling_factor = (
+            1.0 if routed_scaling_factor is None else routed_scaling_factor
+        )
+        return fused_experts_impl_w4a8_marlin(
+            x,
+            w1,
+            w2,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            workspace=workspace,
+            global_reduce_buffer=global_reduce_buffer,
+            inplace=True,
+            use_int4_w4a8=True,
+            per_channel_quant=True,
+            activation=activation,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            use_nn_moe=use_nn_moe,
+            shared_output=shared_output,
+            routed_scaling_factor=float(routed_scaling_factor),
+            # num_local_tokens=num_local_tokens,
+            # config_select_bs=config_select_bs,
+            # q_scales=scales
+        )
 
 
 class SlimQuantW4A8Int8AiterMoEMethod:
     """MoE method for W4A8INT8 AITER."""
 
     def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import (FusedMoE, FusedMoeWeightScaleSupported)
 
         if not hasattr(cls, "_initialized"):
             original_init = cls.__init__
@@ -580,7 +596,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import (FusedMoE, FusedMoeWeightScaleSupported)
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         tp_size = get_tensor_model_parallel_world_size()
         intermediate_size = intermediate_size_per_partition
         w13_weight = torch.nn.Parameter(
@@ -593,7 +610,9 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size // 2, dtype=torch.int8),
+            torch.empty(
+                num_experts, hidden_size, intermediate_size // 2, dtype=torch.int8
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -623,9 +642,13 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        E = layer.w13_weight.shape[0]  
-        layer.w13_weight = Parameter(repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False)
-        layer.w2_weight = Parameter(repack_and_shuffle_w4a8(layer.w2_weight.data, E), requires_grad=False)
+        E = layer.w13_weight.shape[0]
+        layer.w13_weight = Parameter(
+            repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False
+        )
+        layer.w2_weight = Parameter(
+            repack_and_shuffle_w4a8(layer.w2_weight.data, E), requires_grad=False
+        )
 
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data, requires_grad=False
@@ -647,7 +670,6 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         dispatch_output,
     ):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-        from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output

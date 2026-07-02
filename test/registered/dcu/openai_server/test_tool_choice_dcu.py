@@ -27,6 +27,7 @@ from sglang.test.test_utils import (
 register_dcu_ci(est_time=180, suite="stage-b-test-1-gpu-small-dcu")
 register_dcu_ci(est_time=180, suite="nightly-dcu-api-models", nightly=True)
 
+
 class TestToolChoiceLlama32(CustomTestCase):
 
     @classmethod
@@ -349,7 +350,9 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         self.assertEqual(found_name, "get_weather")
 
-    @unittest.skip("Llama3.2 DCU smoke skips streaming JSON chunk assembly; model may emit list chunks for this prompt")
+    @unittest.skip(
+        "Llama3.2 DCU smoke skips streaming JSON chunk assembly; model may emit list chunks for this prompt"
+    )
     def test_required_streaming_arguments_chunks_json(self):
         """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined"""
         tools = self.get_test_tools()
@@ -408,7 +411,9 @@ class TestToolChoiceLlama32(CustomTestCase):
                     f"Invalid JSON in complete tool call arguments: {tool_call['function']['arguments']}"
                 )
 
-    @unittest.skip("Llama3.2 DCU smoke keeps stable tool_choice paths; complex nested parameter generation is model-behavior flaky")
+    @unittest.skip(
+        "Llama3.2 DCU smoke keeps stable tool_choice paths; complex nested parameter generation is model-behavior flaky"
+    )
     def test_complex_parameters_required_non_streaming(self):
         """Validate complex nested parameter schemas in non-streaming required mode"""
         complex_tools = [
@@ -766,7 +771,9 @@ class TestToolChoiceLlama32(CustomTestCase):
         self.assertIn("not supported", error_msg)
 
 
-@unittest.skip("DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix")
+@unittest.skip(
+    "DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix"
+)
 class TestToolChoiceQwen25(TestToolChoiceLlama32):
     """Test tool_choice functionality with Qwen2.5 model"""
 
@@ -792,7 +799,9 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
         cls.tokenizer = get_tokenizer(cls.model)
 
 
-@unittest.skip("DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix")
+@unittest.skip(
+    "DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix"
+)
 class TestToolChoiceMistral(TestToolChoiceLlama32):
     """Test tool_choice functionality with Mistral model"""
 
@@ -866,7 +875,9 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
 #         cls.tokenizer = get_tokenizer(cls.model)
 
 
-@unittest.skip("DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix")
+@unittest.skip(
+    "DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix"
+)
 class TestToolChoiceLfm2(TestToolChoiceLlama32):
     """Test tool_choice functionality with LiquidAI LFM2 model"""
 
@@ -895,7 +906,9 @@ class TestToolChoiceLfm2(TestToolChoiceLlama32):
         cls.tokenizer = get_tokenizer(cls.model)
 
 
-@unittest.skip("DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix")
+@unittest.skip(
+    "DCU smoke keeps the local Llama3.2 parser path; skip broader model matrix"
+)
 class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
     """Test tool_choice functionality with LiquidAI LFM2-MoE model"""
 

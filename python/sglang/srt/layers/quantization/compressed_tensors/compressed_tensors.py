@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
+
 import inspect
 import logging
 from contextlib import suppress
@@ -74,6 +75,7 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -968,7 +970,7 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
         input_quant_args: Optional[list[torch.Tensor]] = None,
-        silu_quant_args: Optional[list[torch.Tensor]] = None
+        silu_quant_args: Optional[list[torch.Tensor]] = None,
     ):
         """
         Use the output of create_weights and the CompressedTensorsScheme
@@ -1072,11 +1074,15 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
         supported_kwargs = getattr(scheme, "_apply_weights_supported_kwargs", None)
         if supported_kwargs is None:
-            supported_kwargs = frozenset(inspect.signature(scheme.apply_weights).parameters)
+            supported_kwargs = frozenset(
+                inspect.signature(scheme.apply_weights).parameters
+            )
             scheme._apply_weights_supported_kwargs = supported_kwargs
 
         supports_bias = "bias" in supported_kwargs
-        supports_prequant_input = "i_q" in supported_kwargs and "i_s" in supported_kwargs
+        supports_prequant_input = (
+            "i_q" in supported_kwargs and "i_s" in supported_kwargs
+        )
 
         if bias is not None and supports_bias:
             apply_kwargs["bias"] = bias
@@ -1086,7 +1092,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
         return scheme.apply_weights(**apply_kwargs)
 
-        #return scheme.apply_weights(layer, dispatch_output, bias, i_q, i_s)
+        # return scheme.apply_weights(layer, dispatch_output, bias, i_q, i_s)
 
     def apply_weights_with_router_logits(
         self,
@@ -1115,7 +1121,8 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
-    
+
+
 class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
     """
     Supports loading kv-cache scaling factors from compressed-tensors
@@ -1143,18 +1150,21 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
             raise NotImplementedError(
                 "Currently supported kv cache quantization is "
                 "num_bits=8, type=float, however "
-                f"received num_bits={num_bits}, type={type_}")
+                f"received num_bits={num_bits}, type={type_}"
+            )
 
         strategy = kv_cache_scheme.get("strategy")
         if strategy != "tensor":
             raise NotImplementedError(
                 "Only support per-tensor scaling factor "
                 "for compressed-tensors KV cache. "
-                f"Expected strategy: tensor, found strategy: {strategy}")
+                f"Expected strategy: tensor, found strategy: {strategy}"
+            )
 
         is_symmetric = kv_cache_scheme.get("symmetric")
         if not is_symmetric:
             raise NotImplementedError(
                 "Only support symmetric scaling factor "
                 "for compressed-tensors KV cache. "
-                f"However found symmetric: {is_symmetric}")
+                f"However found symmetric: {is_symmetric}"
+            )

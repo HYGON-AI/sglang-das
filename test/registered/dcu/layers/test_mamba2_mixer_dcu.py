@@ -46,9 +46,9 @@ class TestMamba2MixerDCU(unittest.TestCase):
 
         gated = hidden_states * torch.nn.functional.silu(gate_states.to(torch.float32))
         variance = gated.pow(2).mean(dim=-1, keepdim=True)
-        reference = weight * (gated * torch.rsqrt(variance + mixer.variance_epsilon)).to(
-            dtype
-        )
+        reference = weight * (
+            gated * torch.rsqrt(variance + mixer.variance_epsilon)
+        ).to(dtype)
 
         torch.testing.assert_close(output, reference, atol=5e-3, rtol=1e-3)
 

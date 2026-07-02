@@ -5,6 +5,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from sgl_kernel.kvcacheio import (
+    dcu_align_evict_mask_to_page_size,
+    dcu_create_extend_after_decode_spec_info,
+)
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
@@ -51,7 +55,7 @@ from sglang.srt.utils import (
     is_musa,
     next_power_of_2,
 )
-from sgl_kernel.kvcacheio import dcu_create_extend_after_decode_spec_info,dcu_assign_req_to_token_pool,dcu_align_evict_mask_to_page_size
+
 # _is_npu = is_npu()
 _is_dcu = is_dcu()
 if is_cuda() or is_musa():
@@ -92,8 +96,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
-    use_sglang_assign_req_to_token_pool = get_bool_env_var("SGLANG_ASSIGN_REQ_TO_TOKEN_POOL")
-    use_sglang_align_evict_mask_to_page_size = get_bool_env_var("SGLANG_ALIGN_EVICT_MASK_TO_PAGE_SIZE")
+    use_sglang_assign_req_to_token_pool = get_bool_env_var(
+        "SGLANG_ASSIGN_REQ_TO_TOKEN_POOL"
+    )
+    use_sglang_align_evict_mask_to_page_size = get_bool_env_var(
+        "SGLANG_ALIGN_EVICT_MASK_TO_PAGE_SIZE"
+    )
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -525,11 +533,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 # Only evict full empty page. Do not evict partial empty page
                 if self.use_sglang_align_evict_mask_to_page_size:
                     dcu_align_evict_mask_to_page_size(
-                        seq_lens = batch.seq_lens,
-                        evict_mask = evict_mask,
-                        page_size = page_size,
-                        num_draft_tokens = self.draft_token_num,
-                        bs = len(batch.seq_lens),
+                        seq_lens=batch.seq_lens,
+                        evict_mask=evict_mask,
+                        page_size=page_size,
+                        num_draft_tokens=self.draft_token_num,
+                        bs=len(batch.seq_lens),
                     )
                 else:
                     align_evict_mask_to_page_size[len(batch.seq_lens),](
@@ -783,7 +791,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     num_correct_drafts: Optional[torch.Tensor] = None
     num_accept_tokens: Optional[torch.Tensor] = None
 
-    use_sglang_create_extend_after_decode_spec_info = get_bool_env_var("SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO", default="true")
+    use_sglang_create_extend_after_decode_spec_info = get_bool_env_var(
+        "SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO", default="true"
+    )
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -1040,16 +1050,18 @@ class EagleDraftExtendInput(SpecInput):
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
         if self.use_sglang_create_extend_after_decode_spec_info:
             dcu_create_extend_after_decode_spec_info(
-                verified_id = batch.input_ids,
-                seq_lens = batch.seq_lens,
-                accept_lens = self.accept_length,
-                positions = self.positions,
-                new_verified_id = self.verified_id,
+                verified_id=batch.input_ids,
+                seq_lens=batch.seq_lens,
+                accept_lens=self.accept_length,
+                positions=self.positions,
+                new_verified_id=self.verified_id,
                 # bs = max(speculative_num_steps + 1, len(batch.seq_lens)),
-                bs =len(batch.seq_lens),
+                bs=len(batch.seq_lens),
             )
         else:
-            self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
+            self.bonus_tokens = torch.empty_like(
+                self.num_accept_tokens, dtype=torch.int32
+            )
             create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
                 batch.input_ids,
                 batch.seq_lens,

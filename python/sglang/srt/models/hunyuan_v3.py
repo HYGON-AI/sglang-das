@@ -40,34 +40,32 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
-    create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -176,9 +174,9 @@ class HYV3MoEFused(nn.Module):
         #     quant_config=quant_config,
         #     prefix=f"{prefix}.experts",
         # )
-        
+
         experts_cls = get_moe_impl_class(quant_config)
-        self.experts = experts_cls(        
+        self.experts = experts_cls(
             num_experts=self.n_routed_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
@@ -188,7 +186,7 @@ class HYV3MoEFused(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
-        
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             use_grouped_topk=True,
@@ -218,7 +216,6 @@ class HYV3MoEFused(nn.Module):
             )
         else:
             self.shared_mlp = None
-
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:

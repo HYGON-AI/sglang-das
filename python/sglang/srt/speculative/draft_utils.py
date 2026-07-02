@@ -178,7 +178,7 @@ class DraftBackendFactory:
         return FlashMLAMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
-    
+
     def _create_dcumla_decode_backend(self):
         from sglang.srt.layers.attention.dcu_mla_backend import (
             DCUMLAMultiStepDraftBackend,
@@ -327,7 +327,6 @@ class DraftBackendFactory:
 
         return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False)
 
-    
     def _create_dcumla_prefill_backend(self):
         logger.warning(
             "flashmla prefill backend is not yet supported for draft extend."

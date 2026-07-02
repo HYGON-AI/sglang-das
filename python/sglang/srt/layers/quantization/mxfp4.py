@@ -46,10 +46,10 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    is_dcu,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
-    is_dcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,

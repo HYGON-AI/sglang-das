@@ -75,7 +75,9 @@ def _get_server_args_env(name: str) -> list[str]:
 class TestBW1100GSM8KEvalDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = _get_model_env("SGLANG_DCU_GSM8K_MODEL", DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = _get_model_env(
+            "SGLANG_DCU_GSM8K_MODEL", DEFAULT_MODEL_NAME_FOR_TEST
+        )
         cls.threshold = _get_float_env("SGLANG_DCU_GSM8K_THRESHOLD", 0.65)
         cls.num_examples = _get_int_env_with_fallback(
             "SGLANG_DCU_GSM8K_NUM_EXAMPLES", "SGLANG_DCU_EVAL_NUM_EXAMPLES", 10

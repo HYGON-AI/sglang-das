@@ -203,14 +203,9 @@ DINLINE void start_sync(
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __atomic_store_n(
-        &sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-        flag,
-        __ATOMIC_RELAXED);
+    __atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED);
     // wait until we got true from all ranks
-    while (__atomic_load_n(
-               &self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED) <
-           flag)
+    while (__atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED) < flag)
       ;
   }
   __syncthreads();
@@ -253,13 +248,10 @@ DINLINE void end_sync(
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
     __atomic_store_n(
-        &sg.signals[threadIdx.x]->end[blockIdx.x][rank],
-        flag,
-        final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE);
+        &sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag, final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE);
     // wait until we got true from all ranks
-    while (__atomic_load_n(
-               &self_sg->end[blockIdx.x][threadIdx.x],
-               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE) < flag)
+    while (__atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x], final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE) <
+           flag)
       ;
   }
   __syncthreads();
@@ -595,38 +587,28 @@ class CustomAllreduce {
     }
   }
 
-#define KL(ngpus, name)                                                       \
-  {                                                                           \
-    void* kernelArgs[] = {                                                    \
-        &ptrs, &sg_, &self_sg_, &output, &rank_, &size, &input_fence_mode};   \
-    hipExtLaunchKernel(                                                       \
-        (void*)name<T, ngpus>,                                                \
-        blocks,                                                               \
-        threads,                                                              \
-        kernelArgs,                                                           \
-        0,                                                                    \
-        stream,                                                               \
-        nullptr,                                                              \
-        stopEvent,                                                            \
-        0);                                                                   \
+#define KL(ngpus, name)                                                                                       \
+  {                                                                                                           \
+    void* kernelArgs[] = {&ptrs, &sg_, &self_sg_, &output, &rank_, &size, &input_fence_mode};                 \
+    hipExtLaunchKernel((void*)name<T, ngpus>, blocks, threads, kernelArgs, 0, stream, nullptr, stopEvent, 0); \
   }
-#define REDUCE_CASE(ngpus)                                                             \
-  case ngpus: {                                                                        \
-    if (force_1stage) {                                                                \
-      KL(ngpus, cross_device_reduce_1stage);                                           \
-    } else if (force_2stage) {                                                         \
-      KL(ngpus, cross_device_reduce_2stage);                                           \
-    } else if (world_size_ == 2) {                                                     \
-      KL(ngpus, cross_device_reduce_1stage);                                           \
-    } else if (full_nvlink_) {                                                         \
-      if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) ||   \
-          (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) {   \
-        KL(ngpus, cross_device_reduce_1stage);                                         \
-      } else {                                                                         \
-        KL(ngpus, cross_device_reduce_2stage);                                         \
-      }                                                                                \
-    }                                                                                  \
-    break;                                                                             \
+#define REDUCE_CASE(ngpus)                                                           \
+  case ngpus: {                                                                      \
+    if (force_1stage) {                                                              \
+      KL(ngpus, cross_device_reduce_1stage);                                         \
+    } else if (force_2stage) {                                                       \
+      KL(ngpus, cross_device_reduce_2stage);                                         \
+    } else if (world_size_ == 2) {                                                   \
+      KL(ngpus, cross_device_reduce_1stage);                                         \
+    } else if (full_nvlink_) {                                                       \
+      if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) || \
+          (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) { \
+        KL(ngpus, cross_device_reduce_1stage);                                       \
+      } else {                                                                       \
+        KL(ngpus, cross_device_reduce_2stage);                                       \
+      }                                                                              \
+    }                                                                                \
+    break;                                                                           \
   }
 
   switch (world_size_) {

@@ -28,7 +28,6 @@ from sglang.srt.utils import (
     is_musa,
     log_info_on_rank0,
 )
-from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
 _is_cuda = is_cuda()
 _is_dcu = is_dcu()
@@ -339,6 +338,7 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
 
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).

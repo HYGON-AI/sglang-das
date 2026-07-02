@@ -27,13 +27,13 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
     is_xpu,
-    is_dcu,
 )
 
 _is_hip = is_hip()

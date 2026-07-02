@@ -2,7 +2,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #ifdef __HIP_PLATFORM_AMD__
-  #include <hip/hip_bf16.h>
+#include <hip/hip_bf16.h>
 #endif
 
 #include <algorithm>

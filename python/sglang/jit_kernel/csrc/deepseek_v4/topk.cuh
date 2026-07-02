@@ -13,9 +13,9 @@ namespace {
 
 // Support both CUDA and HIP compilation
 #if defined(USE_ROCM)
-  #define GRID_CONSTANT_ATTR
+#define GRID_CONSTANT_ATTR
 #else
-  #define GRID_CONSTANT_ATTR __grid_constant__
+#define GRID_CONSTANT_ATTR __grid_constant__
 #endif
 
 constexpr uint32_t kTopK = 512;
@@ -242,8 +242,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 }
 
 template <bool kUsePDL>
-__global__ __launch_bounds__(kTopKBlockSize, 1) void topk_512_transform(
-    const SGL_GRID_CONSTANT TopK512Params params) {
+__global__ __launch_bounds__(kTopKBlockSize, 1) void topk_512_transform(const SGL_GRID_CONSTANT TopK512Params params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits // sizes

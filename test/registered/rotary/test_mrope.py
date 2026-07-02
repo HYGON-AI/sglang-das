@@ -20,7 +20,11 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 
 register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")

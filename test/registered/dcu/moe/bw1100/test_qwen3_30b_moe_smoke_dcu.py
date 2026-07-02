@@ -40,7 +40,9 @@ DEFAULT_QWEN3_MOE_SMOKE_ARGS = [
 class TestBW1100Qwen3ThirtyBMoESmokeDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = get_model_path("SGLANG_DCU_QWEN3_MOE_MODEL", DEFAULT_QWEN3_MOE_MODEL)
+        cls.model = get_model_path(
+            "SGLANG_DCU_QWEN3_MOE_MODEL", DEFAULT_QWEN3_MOE_MODEL
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(

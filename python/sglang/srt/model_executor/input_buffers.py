@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 
@@ -17,7 +17,9 @@ def get_pp_proxy_hidden_states_shape(
     hidden_size: int,
     model_config,
 ) -> Tuple[int, ...]:
-    architectures = getattr(getattr(model_config, "hf_config", None), "architectures", [])
+    architectures = getattr(
+        getattr(model_config, "hf_config", None), "architectures", []
+    )
     if any(
         arch in ("DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN")
         for arch in architectures

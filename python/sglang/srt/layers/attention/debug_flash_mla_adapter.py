@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
-
 _DIM_NOPE = 448
 _DIM_ROPE = 64
 _DIM_K = _DIM_NOPE + _DIM_ROPE
@@ -36,9 +35,8 @@ def _unpack_nope_fp8_rope_bf16_parts(
     page_idx = safe_loc // page_size
     token_offset = safe_loc % page_size
 
-    nope_offsets = (
-        token_offset.unsqueeze(-1) * _BYTES_PER_K_TOKEN
-        + torch.arange(_DIM_NOPE, device=loc.device)
+    nope_offsets = token_offset.unsqueeze(-1) * _BYTES_PER_K_TOKEN + torch.arange(
+        _DIM_NOPE, device=loc.device
     )
     k_nope_fp8 = page_bytes[page_idx.unsqueeze(-1), nope_offsets].view(_FP8_DTYPE)
 

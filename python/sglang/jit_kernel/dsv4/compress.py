@@ -118,7 +118,7 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
-        ) -> CompressorDecodePlan:
+    ) -> CompressorDecodePlan:
         module = _jit_compress_plan_module()
         plan_d = torch.empty(
             (req_pool_indices.shape[0], 16),

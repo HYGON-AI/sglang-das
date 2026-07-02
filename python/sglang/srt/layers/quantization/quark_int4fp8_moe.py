@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.utils import BAR_FORMAT, is_hip, is_dcu, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, is_dcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput

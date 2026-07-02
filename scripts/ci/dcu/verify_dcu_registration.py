@@ -31,9 +31,7 @@ def _load_ci_register():
     This avoids pulling in the full sglang runtime (tqdm, torch, ...) just
     to run a static AST-based check.
     """
-    path = os.path.join(
-        REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-    )
+    path = os.path.join(REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py")
     spec = importlib.util.spec_from_file_location("dcu_ci_register", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load ci_register from {path}")
@@ -109,9 +107,7 @@ def main() -> int:
     registered_dir = os.path.join(test_dir, "registered")
     files = [
         f
-        for f in glob.glob(
-            os.path.join(registered_dir, "**", "*.py"), recursive=True
-        )
+        for f in glob.glob(os.path.join(registered_dir, "**", "*.py"), recursive=True)
         if not f.endswith(("conftest.py", "__init__.py"))
     ]
 

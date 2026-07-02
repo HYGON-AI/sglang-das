@@ -99,7 +99,9 @@ class AttentionBackend(ABC):
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim,dtype=torch.bfloat16)
+            return q.new_empty(
+                q.shape[0], layer.tp_q_head_num * layer.v_head_dim, dtype=torch.bfloat16
+            )
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,

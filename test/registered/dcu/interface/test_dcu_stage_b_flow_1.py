@@ -20,7 +20,9 @@ class TestDCUStageBFlowOne(CustomTestCase):
 
     def test_dcu_runner_visible_environment_is_stable(self):
         if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
-            self.skipTest("Not running inside DCU CI container; skipping environment check.")
+            self.skipTest(
+                "Not running inside DCU CI container; skipping environment check."
+            )
 
         self.assertEqual(os.environ.get("SGLANG_USE_AITER"), "0")
         self.assertEqual(os.environ.get("SGLANG_ROCM_USE_AITER_MOE"), "0")

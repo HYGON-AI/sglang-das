@@ -13,7 +13,6 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
-    cp_attn_forward_extend,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -25,7 +24,23 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from flash_attn import varlen_fwd_unified
 from sgl_kernel import merge_state_v2
+
+# from sglang.jit_kernel.flash_attention_v4 import (
+#     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+# )
+# from sglang.jit_kernel.flash_attention_v4 import (
+#     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+# )
+# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sglang.srt.layers.attention.flashattention_interface import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+    vllm_flash_attn_varlen_func,
+    vllm_flash_attn_with_kvcache,
+)
+from sglang.srt.utils import get_bool_env_var
 
 # from sglang.jit_kernel.flash_attention import (
 #     flash_attn_varlen_func,
@@ -37,29 +52,23 @@ from sgl_kernel import merge_state_v2
 # flash_attn_varlen_func = flash_attn_varlen_func_fa3
 # flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
-# from sglang.jit_kernel.flash_attention_v4 import (
-#     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-# )
-# from sglang.jit_kernel.flash_attention_v4 import (
-#     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
-# )
-# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func, flash_attn_with_kvcache, vllm_flash_attn_varlen_func, vllm_flash_attn_with_kvcache
-from flash_attn import varlen_fwd_unified
-from sglang.srt.utils import get_bool_env_var
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
 
 _is_dcu = is_dcu()
 
+
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_dcu():
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
-        if "gfx938" in gcn_arch and (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2):
+        if "gfx938" in gcn_arch and (
+            dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2
+        ):
             return True
     return False
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -563,9 +572,11 @@ class FlashAttentionBackend(AttentionBackend):
             # # Setup local attention if enabled
             # if forward_batch.forward_mode == ForwardMode.EXTEND:
             #     self._init_local_attn_metadata(forward_batch, metadata, device)
-            if forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.DRAFT_EXTEND_V2):
+            if forward_batch.forward_mode in (
+                ForwardMode.EXTEND,
+                ForwardMode.DRAFT_EXTEND_V2,
+            ):
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
-
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -682,9 +693,14 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if k_rope is None:
-                    if (not self.use_mla or not _use_fused_rmsnorm_rope) and not _use_fused_bailing_rms_rotary:
+                    if (
+                        not self.use_mla or not _use_fused_rmsnorm_rope
+                    ) and not _use_fused_bailing_rms_rotary:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, #layer.k_scale, layer.v_scale
+                            layer,
+                            cache_loc,
+                            k,
+                            v,  # layer.k_scale, layer.v_scale
                         )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -905,14 +921,18 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    s_aux=kwargs.get('sinks', None)
+                    s_aux=kwargs.get("sinks", None),
                 )
             else:
                 descale_shape = (metadata.cu_seqlens_q.shape[0] - 1, k.shape[2])
                 output = vllm_flash_attn_varlen_func(
                     q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k=key_cache.view(-1, layer.tp_k_head_num, self.page_size, layer.head_dim),
-                    v=value_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim, self.page_size),
+                    k=key_cache.view(
+                        -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                    ),
+                    v=value_cache.view(
+                        -1, layer.tp_k_head_num, layer.v_head_dim, self.page_size
+                    ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     max_seqlen_q=metadata.max_seq_len_q,
                     seqused_k=metadata.cache_seqlens_int32,
@@ -949,8 +969,16 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
-                    v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
+                    k = (
+                        k.to(self.kv_cache_dtype)
+                        if is_nmz_fp8(self.kv_cache_dtype)
+                        else k
+                    )
+                    v = (
+                        v.to(self.kv_cache_dtype)
+                        if is_nmz_fp8(self.kv_cache_dtype)
+                        else v
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -980,8 +1008,16 @@ class FlashAttentionBackend(AttentionBackend):
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
-                    k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
-                    v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
+                    k = (
+                        k.to(self.kv_cache_dtype)
+                        if is_nmz_fp8(self.kv_cache_dtype)
+                        else k
+                    )
+                    v = (
+                        v.to(self.kv_cache_dtype)
+                        if is_nmz_fp8(self.kv_cache_dtype)
+                        else v
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -1052,8 +1088,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 # if layer.layer_id == 0:
                 #     print('### mla output, q, k, v', result.shape, q_rope.shape, k_rope_cache.shape, c_kv_cache.shape)
-                    #torch.Size([8, 16, 512]) torch.Size([8, 16, 64]) torch.Size([3318, 64, 1, 64]) torch.Size([3318, 64, 1, 512])
-                    #torch.Size([286, 16, 512]) torch.Size([286, 16, 64]) torch.Size([3322, 64, 1, 64]) torch.Size([3322, 64, 1, 512])
+                # torch.Size([8, 16, 512]) torch.Size([8, 16, 64]) torch.Size([3318, 64, 1, 64]) torch.Size([3318, 64, 1, 512])
+                # torch.Size([286, 16, 512]) torch.Size([286, 16, 64]) torch.Size([3322, 64, 1, 64]) torch.Size([3322, 64, 1, 512])
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
@@ -1112,9 +1148,14 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 # if not self.use_mla:
                 if k_rope is None:
-                    if (not self.use_mla or not _use_fused_rmsnorm_rope) and not _use_fused_bailing_rms_rotary:
+                    if (
+                        not self.use_mla or not _use_fused_rmsnorm_rope
+                    ) and not _use_fused_bailing_rms_rotary:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, # layer.k_scale, # layer.v_scale
+                            layer,
+                            cache_loc,
+                            k,
+                            v,  # layer.k_scale, # layer.v_scale
                         )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -1293,7 +1334,7 @@ class FlashAttentionBackend(AttentionBackend):
                         k_descale=k_descale,
                         v_descale=v_descale,
                         return_softmax_lse=use_cascade_attn,
-                        s_aux=kwargs.get('sinks', None)
+                        s_aux=kwargs.get("sinks", None),
                     )
                 elif max_seqlen_q > 1:
                     result = flash_attn_varlen_func(
@@ -2033,23 +2074,23 @@ class FlashAttentionBackend(AttentionBackend):
                     ) // self.page_size
                     if _is_dcu:
                         normal_decode_set_metadata_lightop(
-                        metadata.cache_seqlens_int32,
-                        metadata.cu_seqlens_k,
-                        metadata.page_table,
-                        self.req_to_token,
-                        req_pool_indices,
-                        #self.decode_cuda_graph_metadata["strided_indices"],
-                        max_seq_pages,
-                        seq_lens,
-                        self.speculative_step_id + 1,
-                        self.page_size,
-                        metadata.swa_page_table,
-                        (
-                            self.token_to_kv_pool
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
-                    )
+                            metadata.cache_seqlens_int32,
+                            metadata.cu_seqlens_k,
+                            metadata.page_table,
+                            self.req_to_token,
+                            req_pool_indices,
+                            # self.decode_cuda_graph_metadata["strided_indices"],
+                            max_seq_pages,
+                            seq_lens,
+                            self.speculative_step_id + 1,
+                            self.page_size,
+                            metadata.swa_page_table,
+                            (
+                                self.token_to_kv_pool
+                                if self.use_sliding_window_kv_pool
+                                else None
+                            ),
+                        )
                     else:
                         normal_decode_set_metadata(
                             metadata.cache_seqlens_int32,
@@ -2126,19 +2167,23 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = max_len
                 if _is_dcu:
                     normal_decode_set_metadata_lightop(
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table,
-                    self.req_to_token,
-                    req_pool_indices,
-                    #self.decode_cuda_graph_metadata["strided_indices"],
-                    max_seq_pages,
-                    seq_lens,
-                    0,
-                    self.page_size,
-                    metadata.swa_page_table,
-                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
-                )
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        # self.decode_cuda_graph_metadata["strided_indices"],
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        (
+                            self.token_to_kv_pool
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
+                    )
                 else:
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
@@ -2152,7 +2197,11 @@ class FlashAttentionBackend(AttentionBackend):
                         0,
                         self.page_size,
                         metadata.swa_page_table,
-                        self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+                        (
+                            self.token_to_kv_pool
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
                     )
 
                 self._maybe_update_local_attn_metadata_for_replay(
@@ -2992,12 +3041,14 @@ def _fused_metadata_kernel_ps1_no_swa(
     # page_table = page_index // 1 = page_index
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
+
+
 def normal_decode_set_metadata_lightop(
     cache_seqlens_int32: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,       
+    req_pool_indices: torch.Tensor,
     max_seq_pages: int,
     seq_lens: torch.Tensor,
     seq_len_delta: int,
@@ -3009,7 +3060,8 @@ def normal_decode_set_metadata_lightop(
         page_size > 0 and (page_size & (page_size - 1)) == 0
     ), f"page_size must be a power of two, got {page_size}"
     use_swa = swa_page_table is not None and token_to_kv_pool is not None
-    from lightop import fused_metadata_kernel_general    
+    from lightop import fused_metadata_kernel_general
+
     fused_metadata_kernel_general(
         seq_lens=seq_lens,
         req_to_token=req_to_token,
@@ -3019,8 +3071,7 @@ def normal_decode_set_metadata_lightop(
         page_table=page_table,
         swa_page_table=swa_page_table if use_swa else None,
         full_to_swa_mapping=(
-            token_to_kv_pool.full_to_swa_index_mapping
-            if use_swa else None
+            token_to_kv_pool.full_to_swa_index_mapping if use_swa else None
         ),
         B=cache_seqlens_int32.shape[0],
         max_seq_pages=max_seq_pages,
@@ -3028,6 +3079,8 @@ def normal_decode_set_metadata_lightop(
         seq_len_delta=seq_len_delta,
         use_swa=use_swa,
     )
+
+
 # Fused Triton kernel implementation
 def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
@@ -3111,16 +3164,19 @@ def normal_decode_set_metadata(
         )
     else:
         if _is_dcu:
-            from sgl_kernel import normal_decode_metadata_general as normal_decode_metadata_general_sgl
+            from sgl_kernel import (
+                normal_decode_metadata_general as normal_decode_metadata_general_sgl,
+            )
+
             # General kernel for page_size > 1 or SWA cases
             # SWA parameters
             if use_swa:
                 assert isinstance(token_to_kv_pool, SWAKVPool)
                 swa_page_table = swa_page_table.contiguous()
                 # Extract the full_to_swa_index_mapping from token_to_kv_pool
-                full_to_swa_mapping = (
-                    token_to_kv_pool.full_to_swa_index_mapping.to(torch.int32).contiguous()
-                )
+                full_to_swa_mapping = token_to_kv_pool.full_to_swa_index_mapping.to(
+                    torch.int32
+                ).contiguous()
             else:
                 # Dummy tensors (not used)
                 swa_page_table = torch.empty(0, dtype=torch.int32, device=device)

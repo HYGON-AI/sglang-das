@@ -1,11 +1,11 @@
+import math
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
-import math
 from scipy.linalg import hadamard
-import torch.nn.functional as F
 
 
 # Triton implementation
@@ -256,6 +256,7 @@ def _hadamard_transform_kernel(
 # 全局缓存
 _HADAMARD_CACHE = {}
 
+
 def get_hadamard_matrix(dim, device=None, dtype=torch.float32):
     """获取缓存的 Hadamard 矩阵"""
     global _HADAMARD_CACHE
@@ -263,10 +264,11 @@ def get_hadamard_matrix(dim, device=None, dtype=torch.float32):
 
     if key not in _HADAMARD_CACHE:
         log_dim = math.ceil(math.log2(dim))
-        dim_padded = 2 ** log_dim
+        dim_padded = 2**log_dim
         h = hadamard(dim_padded, dtype=float)
         _HADAMARD_CACHE[key] = torch.tensor(h, dtype=dtype, device=device)
     return _HADAMARD_CACHE[key]
+
 
 def hadamard_transform_optimized(x, scale=1.0):
     """
@@ -279,7 +281,7 @@ def hadamard_transform_optimized(x, scale=1.0):
 
     x = x.reshape(-1, dim)
     log_dim = math.ceil(math.log2(dim))
-    dim_padded = 2 ** log_dim
+    dim_padded = 2**log_dim
 
     if dim != dim_padded:
         x = F.pad(x, (0, dim_padded - dim))
@@ -288,7 +290,6 @@ def hadamard_transform_optimized(x, scale=1.0):
     if scale != 1.0:
         out = out * scale
     return out[..., :dim].reshape(*x_shape)
-
 
 
 @triton.jit

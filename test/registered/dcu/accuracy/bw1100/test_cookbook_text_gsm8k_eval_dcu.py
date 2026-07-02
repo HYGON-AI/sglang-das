@@ -3,8 +3,8 @@ import unittest
 
 from sglang.test.ci.ci_register import register_dcu_ci
 from sglang.test.dcu_cookbook_utils import (
-    assert_cookbook_min_score,
     COOKBOOK_GSM8K_EVAL_MODELS,
+    assert_cookbook_min_score,
     run_cookbook_accuracy_eval,
     selected_configs,
 )
@@ -25,8 +25,12 @@ class TestCookbookTextGSM8KEvalDCU(unittest.TestCase):
         configs = selected_configs(
             COOKBOOK_GSM8K_EVAL_MODELS, "SGLANG_DCU_COOKBOOK_GSM8K_MODEL_FILTER"
         )
-        num_examples = int(os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_NUM_EXAMPLES", "100"))
-        num_threads = int(os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_NUM_THREADS", "128"))
+        num_examples = int(
+            os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_NUM_EXAMPLES", "100")
+        )
+        num_threads = int(
+            os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_NUM_THREADS", "128")
+        )
         num_shots = int(os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_NUM_SHOTS", "5"))
         max_tokens = int(os.environ.get("SGLANG_DCU_COOKBOOK_GSM8K_MAX_TOKENS", "2048"))
 

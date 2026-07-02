@@ -1,6 +1,5 @@
 # Rotary Embedding - MRoPE tests (1-GPU)
 
-import os
 import sys
 from typing import NamedTuple
 
@@ -67,7 +66,9 @@ class MRoPETestInfo(NamedTuple):
 TRANSFORMERS_BASE_VERSION = Version(TRANSFORMERS_VERSION).base_version
 
 MODELS_TO_TEST = [
-    MRoPETestInfo(model_name="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-VL-2B-Instruct")
+    MRoPETestInfo(
+        model_name="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-VL-2B-Instruct"
+    )
 ]
 
 num_tokens_list = [11]

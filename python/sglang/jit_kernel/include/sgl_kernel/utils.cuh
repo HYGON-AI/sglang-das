@@ -276,13 +276,15 @@ struct LaunchKernel {
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
     void* kernel_args[] = {const_cast<void*>(static_cast<const void*>(std::addressof(args)))...};
-    RuntimeDeviceCheck(::hipLaunchKernel(
-        reinterpret_cast<const void*>(kernel),
-        m_grid_dim,
-        m_block_dim,
-        kernel_args,
-        m_dynamic_shared_mem_bytes,
-        m_stream), m_location);
+    RuntimeDeviceCheck(
+        ::hipLaunchKernel(
+            reinterpret_cast<const void*>(kernel),
+            m_grid_dim,
+            m_block_dim,
+            kernel_args,
+            m_dynamic_shared_mem_bytes,
+            m_stream),
+        m_location);
   }
 
  private:

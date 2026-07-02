@@ -4,9 +4,9 @@
 #include <cuda_fp16.h>
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  #include <hip/hip_bf16.h>
-  using nv_bfloat16  = __hip_bfloat16;
-  using nv_bfloat162 = __hip_bfloat162;
+#include <hip/hip_bf16.h>
+using nv_bfloat16 = __hip_bfloat16;
+using nv_bfloat162 = __hip_bfloat162;
 #endif
 
 #include "marlin.cuh"

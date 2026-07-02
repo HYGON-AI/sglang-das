@@ -7,7 +7,11 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 
 register_dcu_ci(
     est_time=120,

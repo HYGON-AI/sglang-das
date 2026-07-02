@@ -19,7 +19,6 @@ from sglang.test.test_utils import (
 )
 
 
-
 class BaseTestOpenAIServerWithHiddenStates(ABC):
 
     @classmethod
@@ -206,7 +205,9 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
             ), "hidden_states were returned and should not have been"
 
 
-@unittest.skip("DCU smoke keeps the cuda-graph-disabled hidden-states server path only.")
+@unittest.skip(
+    "DCU smoke keeps the cuda-graph-disabled hidden-states server path only."
+)
 class TestOpenAIServerWithHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):

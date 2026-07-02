@@ -89,7 +89,9 @@ class TestBW1100MMLUEvalDCU(unittest.TestCase):
             "SGLANG_DCU_MMLU_NUM_EXAMPLES", "SGLANG_DCU_EVAL_NUM_EXAMPLES", 50
         )
         cls.num_threads = _get_int_env("SGLANG_DCU_MMLU_NUM_THREADS", 256)
-        cls.dataset_path = _get_optional_dataset_path_env("SGLANG_DCU_MMLU_DATASET_PATH")
+        cls.dataset_path = _get_optional_dataset_path_env(
+            "SGLANG_DCU_MMLU_DATASET_PATH"
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_mmlu(self):

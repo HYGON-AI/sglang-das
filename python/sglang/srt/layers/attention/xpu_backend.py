@@ -20,7 +20,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_state_v2
-from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+
+from sglang.srt.layers.attention.flashattention_interface import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
 
 
 class XPUAttentionBackend(AttentionBackend):

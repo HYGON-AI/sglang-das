@@ -17,7 +17,6 @@ register_dcu_ci(est_time=55, suite="nightly-dcu-core-functional", nightly=True)
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-
 class TestHiddenState(CustomTestCase):
     def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]

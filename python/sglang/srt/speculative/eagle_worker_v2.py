@@ -757,7 +757,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
-            
+
             # Draft prefill
             draft_capture_mode = (
                 CaptureHiddenMode.NULL
