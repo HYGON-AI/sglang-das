@@ -130,10 +130,12 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
 
         modality_to_token_id = {
             Modality.IMAGE: self.mm_tokens.image_token_id,
-            Modality.MULTI_IMAGES: self.mm_tokens.image_token_id,
             Modality.VIDEO: self.mm_tokens.video_token_id,
             Modality.AUDIO: self.mm_tokens.audio_token_id,
         }
+        multi_images_modality = getattr(Modality, "MULTI_IMAGES", None)
+        if multi_images_modality is not None:
+            modality_to_token_id[multi_images_modality] = self.mm_tokens.image_token_id
 
         for item in items:
             token_id = modality_to_token_id.get(item.modality)

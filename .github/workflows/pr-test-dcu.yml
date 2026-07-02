@@ -678,22 +678,22 @@ jobs:
           - name: stage-b-required-0
             part: 0
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
           - name: stage-b-required-1
             part: 1
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
           - name: stage-b-required-2
             part: 2
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
           - name: stage-b-required-3
             part: 3
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}

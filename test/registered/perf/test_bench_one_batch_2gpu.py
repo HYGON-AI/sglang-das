@@ -6,7 +6,7 @@ register_dcu_ci(
     est_time=120,
     suite="nightly-dcu-perf",
     nightly=True,
-    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+    disabled="DCU BW1100 2GPU perf validation with current wheel stayed silent for more than 8 minutes during MoE bench_one_batch cold start; keep disabled until perf cold-start behavior and pass thresholds are baselined.",
 )
 
 from sglang.test.test_utils import (

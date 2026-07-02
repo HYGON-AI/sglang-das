@@ -50,9 +50,9 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_flashinfer_available,
     is_hip,
-    is_dcu,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -70,7 +70,6 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
-    is_dcu,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -158,7 +157,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # ransplant from vllm
-    "dcu_mla", 
+    "dcu_mla",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1881,7 +1880,11 @@ class ServerArgs:
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 
-                    if is_hip() and not is_dcu() and not aiter_can_use_preshuffle_paged_mqa():
+                    if (
+                        is_hip()
+                        and not is_dcu()
+                        and not aiter_can_use_preshuffle_paged_mqa()
+                    ):
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                         # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
@@ -3252,6 +3255,26 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
+            if is_dcu():
+                dcu_runtime = envs.SGLANG_DCU_MEGA_MOE_RUNTIME.get().strip().lower()
+                if dcu_runtime not in {"deep_gemm", "megamoe"}:
+                    raise ValueError(
+                        "SGLANG_DCU_MEGA_MOE_RUNTIME must be 'deep_gemm' or "
+                        f"'megamoe', got {dcu_runtime!r}"
+                    )
+                if dcu_runtime == "deep_gemm":
+                    if not self.disable_cuda_graph:
+                        logger.warning(
+                            "Cuda graph is disabled for the DCU deep_gemm "
+                            "W8A8 MegaMoE runtime."
+                        )
+                    self.disable_cuda_graph = True
+                    self.disable_piecewise_cuda_graph = True
+                else:
+                    logger.info(
+                        "DCU MegaMoE uses the standalone megamoe runtime; "
+                        "CUDA graph remains enabled."
+                    )
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(
@@ -4433,10 +4456,12 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                    platform = "DCU/DTK" if is_dcu() else "ROCm/HIP"
+                    # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
-                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        "%s: Using 1-stage all-reduce kernel (deterministic)",
+                        platform,
                     )
                 else:
                     # CUDA: use NCCL tree algorithm
@@ -4449,16 +4474,19 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+        # On HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
+            platform = "DCU/DTK" if is_dcu() else "ROCm/HIP GPUs"
             if not self.disable_cuda_graph:
                 logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                    "Cuda graph is disabled for diffusion LLM inference on %s",
+                    platform,
                 )
                 self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                    "Attention backend is set to triton for diffusion LLM inference on %s",
+                    platform,
                 )
                 self.attention_backend = "triton"
         elif is_npu():
@@ -6569,7 +6597,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for HIP/RCCL, disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

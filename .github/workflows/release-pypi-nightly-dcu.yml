@@ -5,7 +5,6 @@ permissions:
   pull-requests: read
 
 on:
-  # ---- 推送到 main 分支时触发（限定路径，减少无效运行） ----
   push:
     branches:
       - v0.5.12_dev
@@ -101,7 +100,8 @@ jobs:
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
+          yum install -y perl-IPC-Cmd perl-Time-Piece
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" ciupload
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -187,7 +187,7 @@ jobs:
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
           cd sgl-model-gateway && cargo build --release
-          cd bindings/python && maturin build --release --skip-auditwheel
+          cd bindings/python && maturin build --release --skip-auditwheel --features vendored-openssl
           echo "=== sgl-model-gateway wheel ==="
           ls -lh target/wheels/*.whl
 

@@ -11,6 +11,22 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.fla.utils import input_guard
 
+try:
+    from sgl_kernel import l2norm as _l2norm_cuda
+
+    _has_l2norm_cuda = True
+except (ImportError, AttributeError):
+    try:
+        import torch
+
+        if hasattr(torch.ops.sgl_kernel, "l2norm"):
+            _l2norm_cuda = torch.ops.sgl_kernel.l2norm
+            _has_l2norm_cuda = True
+        else:
+            _has_l2norm_cuda = False
+    except Exception:
+        _has_l2norm_cuda = False
+
 BT_LIST = [8, 16, 32, 64, 128]
 
 
@@ -76,8 +92,21 @@ def l2norm_fwd(
 ):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
-    # allocate output
     if output_dtype is None:
+        output_dtype = x.dtype
+
+    if _has_l2norm_cuda and x.is_cuda and x.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        y = _l2norm_cuda(x.contiguous(), eps)
+        if y.dtype != output_dtype:
+            y = y.to(output_dtype)
+        return y.view(x_shape_og)
+
+    # allocate output
+    if output_dtype == x.dtype:
         y = torch.empty_like(x)
     else:
         y = torch.empty_like(x, dtype=output_dtype)

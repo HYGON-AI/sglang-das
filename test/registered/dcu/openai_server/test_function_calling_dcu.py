@@ -9,6 +9,7 @@ from sglang.test.ci.ci_register import register_dcu_ci
 from sglang.test.dcu_utils import DCU_TEXT_SERVER_ARGS, get_server_args
 
 register_dcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-dcu")
+register_dcu_ci(est_time=120, suite="nightly-dcu-api-models", nightly=True)
 
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

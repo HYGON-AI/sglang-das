@@ -1625,7 +1625,8 @@ def fused_moe_fp8_w8a8(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
+    # from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import dcu_moe_align_block_size
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1698,6 +1699,7 @@ def fused_moe_fp8_w8a8(
             topk,
             cuda_config1,
         )
+        from lightop import fuse_silu_mul_fp8_quant
 
         fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(intermediate_cache1, fp8type=0)
 
@@ -1718,6 +1720,7 @@ def fused_moe_fp8_w8a8(
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
+        from lightop import op as ops # 报错缺少ops
 
         ops.moe_sum(
             intermediate_cache3,
