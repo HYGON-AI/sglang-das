@@ -10,6 +10,7 @@ register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
 
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class TestMetricsUtils(unittest.TestCase):

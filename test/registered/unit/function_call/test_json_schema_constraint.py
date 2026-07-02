@@ -22,6 +22,7 @@ register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU
 
 
 register_cpu_ci(5, "base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):

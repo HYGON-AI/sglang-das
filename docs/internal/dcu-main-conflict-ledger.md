@@ -154,7 +154,24 @@ actual result in the checkpoint note.
 | C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/speculative/eagle_info.py`                                      | speculative    | Codex | manual merge    | Combine official async NaN/OOB probes with the existing DCU sgl-kernel KV-cache I/O functions                              | high   | compile and DCU path audit passed; runtime pending                   | EAGLE/MTP draft-target KV transfer, async probes, and graph smoke                                   | validated |
 | C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/test/ci/ci_register.py`                                             | ci             | Codex | manual merge    | Export both the internal DCU registration decorator and the newly added official XPU decorator                             | low    | DCU registration passed with 211 files                               | DCU and XPU suite import/registration scan                                                          | validated |
 | C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `test/run_suite.py`                                                                | test           | Codex | manual merge    | Keep DCU suite mappings and schedules while adding the official XPU suite mappings and schedules                           | low    | compile and DCU registration passed                                  | Generate/list DCU and XPU per-commit and nightly suites                                             | validated |
-| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | TBD   | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available                                       | high   | Qwen dense plus DSV4 smoke                                           | Assign attention owner                                                                             | open      |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `.gitignore`                                                                       | build          | Codex | manual merge    | Keep both DCU HIP generated-file ignores and official `.humanize/`                                                         | low    | static passed; DCU runtime not required                              | None                                                                                                | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/jit_kernel/utils.py`                                                | jit-kernel     | Codex | manual merge    | Accept official MUSA/PDL detection while preserving DCU hipcc, FP8 target flags, and the DCU JIT cache key                 | medium | static/registration passed; DCU runtime pending                                   | Compile representative DSV4 JIT kernels on gfx938                                                    | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/multimodal_gen/runtime/layers/attention/layer.py`                   | attention      | Codex | manual merge    | Keep DCU ring-attention overlap selection and add official varlen FlashAttention fast path                                 | medium | static/registration passed; DCU runtime pending                                   | Diffusion ring-attention and varlen attention smoke                                                  | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/distributed/device_communicators/custom_all_reduce.py`          | aiter          | Codex | port to new API | Adopt `(group, device)` dispatch and CUDA V2 checks while preserving DCU AITER selection, deterministic AR, and graph registration | high | static/registration passed; DCU runtime pending                            | AITER custom-allreduce eager plus CUDA graph replay                                                   | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/triton_backend.py`                             | attention      | Codex | port to new API | Use official unified graph metadata helpers; retain DCU CPU seq-lens, SWA location translation/cache invalidation, and draft offsets | high | static/registration passed; DCU runtime pending                         | Triton SWA/hybrid cache, target verify, EAGLE/MTP draft graph, and replay smoke                       | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/model_executor/forward_batch_info.py`                           | model_executor | Codex | manual merge    | Adopt official grouped fields and GPU-only extend lengths while retaining DCU quant fields and pinned H2D for list inputs | high   | static/registration passed; DCU runtime pending                                   | ForwardBatch list/GPU-only init, overlap scheduling, and speculative decode                          | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Non-DCU uses official DeepGEMM wrapper; DCU keeps `deepgemm`, representative MHC prewarm, LightOp paths, and safe HIP multistream | high | static/registration passed; DCU runtime pending                           | DSV4 TP, CP+EP, DP+EP+MTP, MHC prewarm, graph capture, and GSM8K accuracy                            | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/debug_utils/test_crash_dump.py`                                  | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Run on the registered DCU suite when available                                                       | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/debug_utils/test_soft_watchdog.py`                               | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Run on the registered DCU suite when available                                                       | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/lora/test_lora_eviction_policy.py`                               | test           | Codex | manual merge    | Preserve DCU registration and disabled reason while accepting official CPU registration                                  | low    | static/registration passed; DCU runtime pending                                   | LoRA eviction policy smoke on DCU                                                                   | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/lora/test_lora_openai_api.py`                                    | test           | Codex | manual merge    | Preserve DCU registration and disabled reason while accepting official CPU registration                                  | low    | static/registration passed; DCU runtime pending                                   | LoRA OpenAI API smoke on DCU                                                                         | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/model_loading/test_external_models.py`                           | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | External-model loading smoke on DCU                                                                 | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/scheduler/test_routing_key_scheduling.py`                        | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Routing-key scheduler smoke and registered CPU unit test                                              | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/managers/test_io_struct.py`                                 | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Run focused CPU unit test and registered DCU suite                                                    | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/managers/test_prefill_adder.py`                             | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Run focused CPU unit test and prefill scheduler smoke                                                 | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/managers/test_profile_merger_http_api.py`                   | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Run focused CPU unit test and registered DCU suite                                                    | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/utils/test_profile_merger.py`                               | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                       | low    | static/registration passed; DCU runtime pending                                   | Run focused CPU unit test and registered DCU suite                                                    | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/vlm/test_evs.py`                                                 | test           | Codex | manual merge    | Preserve DCU VLM registration and disabled reason while accepting official CPU registration                              | low    | static/registration passed; DCU runtime pending                                   | EVS/VLM startup and short-request smoke on DCU                                                        | validated |
 | C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml`                                                | ci             | TBD   | manual merge    | Keep official workflow structure and DCU runner/wheel overlays                                                             | medium | CI dry-run and DCU registration check                                | Fill exact runner/image validation command                                                         | open      |
 | C13 /`125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**`                                                                    | sgl-kernel     | TBD   | manual merge    | sgl-kernel interfaces and DCU/HIP glue both changed                                                                        | high   | sgl-kernel DCU smoke whitelist                                       | Assign kernel owner                                                                                | open      |
 
@@ -506,7 +523,84 @@ actual result in the checkpoint note.
     - CI test - ✅
     - HiCache - ❓
 
-### C07-C10
+### C07 / `a5e6a8887a94`
+
+- Expected focus: attention graph unification, ForwardBatch grouping, custom
+  allreduce V2 dispatch, DeepSeek-V4 MHC/DeepGEMM, and test registration moves.
+- Owner: Codex for merge and static validation; DCU attention, DSV4, AITER,
+  speculative, and CI owners for runtime validation.
+- Required validation:
+  - conflict marker scan, Python compile, DCU registration, and HIP build metadata.
+  - custom-allreduce signature/call-site audit and DSV4 DCU-priority path audit.
+  - CUDA graph replay through `bs=128`, single-request accuracy, and GSM8K 10.
+- Notes:
+  - Branch: `sync/official-main-C07-20260529`.
+  - Git reported 18 textual conflicts. The planned modify/delete conflict for
+    GPT-OSS was automatically recognized as a rename to
+    `test_gpt_oss_4gpu_mxfp4.py`; it is recorded as a semantic audit rather
+    than an artificial nineteenth conflict.
+  - Official C07 unified Triton capture/replay helpers are the canonical
+    structure. DCU retains CPU seq-lens publication for the Triton backend,
+    SWA full-to-window location translation, cache invalidation, variable MTP
+    draft lengths, and sliding-window offsets.
+  - The DSV4 backend continues to inherit `needs_cpu_seq_lens=True`; it does
+    not enter Triton's non-DCU GPU-only seq-lens path.
+  - DeepSeek-V4 keeps the C06 conservative HIP multistream topology: only core
+    and indexer compressor work uses auxiliary streams. DCU also retains the
+    `deepgemm` package path and representative-shape MHC prewarm; non-DCU uses
+    the official DeepGEMM wrapper.
+  - `model_runner.py` restores model-specific kernel warmup only for DCU. The
+    generic non-DCU path remains on the official C07 warmup behavior.
+  - GPT-OSS DCU nightly placeholder registration now follows both official
+    split files: BF16 and MXFP4. Both remain disabled pending BW1100 validation.
+  - Non-conflict semantic audit:
+    - official DSV4 graph metadata copy/replay structure and page-size 64 are
+      retained; DSV4 remains CPU-seq-lens aware.
+    - official HIP `Event.synchronize()` TPOT workaround is accepted while the
+      DCU native future-token resolver remains present.
+    - MXFP4 AITER shuffle imports stay restricted to non-DCU HIP; gfx938 DCU
+      does not enter the gfx95 shuffle path.
+    - all DCU per-commit and nightly suite mappings remain in `test/run_suite.py`.
+  - Automated validation completed:
+    - no unmerged entries and precise conflict marker scan: passed.
+    - staged `git diff --check`: passed after normalizing the official
+      `pr-test-npu.yml` CRLF line endings; workflow content is unchanged.
+    - syntax compile for every C07 changed Python file: passed.
+    - targeted undefined-name/unused-import ruff gate for conflict and semantic
+      audit files: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      212 DCU registered test files. Both GPT-OSS BF16 and MXFP4 registrations
+      appear in `nightly-dcu-4-gpu`.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - custom-allreduce AST signature check: passed with exactly
+      `(group, device)`; the sole framework call site passes both arguments.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`, run from
+      `sgl-kernel/`: passed with zero unsupported CUDA calls.
+    - source audit confirmed the DCU safe HIP multistream dispatch, `deepgemm`,
+      LightOp top-k, DCU-only model warmup, and Triton CPU seq-lens contract.
+    - conflict-related CPU unit collections were attempted but blocked before
+      assertions: this host has no HIP device, so installed `lightop` obtains
+      no CU count from `rocminfo` and raises while assigning
+      `LIGHTOP_GPU_CUS=None`.
+    - DCU model, graph, custom-allreduce, and kernel runtime validation remains
+      pending on the target runner.
+  - Recommended manual validation:
+    - `deepseek-v4` / `attention`: graph capture through `bs=128`, three
+      repeated short requests, GSM8K 10, pure TP, CP+EP, DP+EP+MTP, FlashMLA,
+      compressor, and representative MHC prewarm log.
+    - `speculative` / `mem_cache`: Triton target verify, EAGLE/MTP draft graph,
+      SWA/hybrid-cache location translation, and cache invalidation.
+    - `aiter`: custom-allreduce eager and graph replay, deterministic mode,
+      and the graph registration workaround.
+    - `jit-kernel`: representative gfx938 DSV4 JIT compile and FP8 target flags.
+    - `model`: Qwen2.5 dense, VLM, embedding, and reranker smoke.
+    - `ci` / `test`: stage-a plus available stage-b DCU CI and split GPT-OSS
+      registration generation.
+- Manual validation result:
+  - TBD
+
+### C08-C10
 
 - Expected focus: model, mem_cache, attention, embedding, and workflows.
 - Owner: TBD

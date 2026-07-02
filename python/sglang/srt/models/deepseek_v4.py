@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 import time
 from contextlib import nullcontext
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Any,
     Iterable,
     List,
     Literal,
@@ -27,7 +24,6 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
-    fused_q_norm_rope,
     fused_rope_inplace,
 )
 
@@ -69,10 +65,8 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_quant_fp8,
-    sglang_per_token_group_quant_fp8,
-)
+from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+from sglang.srt.layers.quantization.fp8_kernel import per_token_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -81,8 +75,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
 )
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -1202,8 +1194,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post.squeeze(-1), comb, False
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            # import deep_gemm
-            import deepgemm as deep_gemm
+            if _is_dcu:
+                import deepgemm as deep_gemm
+            else:
+                from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+                    tf32_hc_prenorm_gemm,
+                )
 
             x_flat = x.flatten(1).bfloat16()
 
@@ -1211,9 +1207,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             mix_hc = hc_fn.size(0)
             d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
             s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            deep_gemm.tf32_hc_prenorm_gemm(
-                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
-            )
+            if _is_dcu:
+                deep_gemm.tf32_hc_prenorm_gemm(
+                    x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
+                )
+            else:
+                tf32_hc_prenorm_gemm(
+                    x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
+                )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
@@ -1398,11 +1399,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-
-        dsv4_2604_submode = getattr(envs, "SGLANG_DSV4_2604_SUBMODE", None)
-        if dsv4_2604_submode is not None and dsv4_2604_submode.get() == "2604B":
-            # assert deepseek_v4_moe_code_path_checker.observed == 1
-            deepseek_v4_moe_code_path_checker.observed = 0
 
         return hidden_states
 
@@ -1662,6 +1658,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
 
     def kernel_warmup(self, model_runner) -> None:
+        if not _is_dcu:
+            return
         if not model_runner.is_hybrid_swa:
             return
         if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
@@ -1677,7 +1675,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             max_num_tokens, model_runner.device
         )
         model_runner.tp_group.barrier()
-
         logger.info(
             "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
             token_counts,
