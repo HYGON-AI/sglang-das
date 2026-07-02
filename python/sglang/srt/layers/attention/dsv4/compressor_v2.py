@@ -12,7 +12,7 @@ from sglang.jit_kernel.dsv4 import (
 )
 from sglang.jit_kernel.deepseek_v4 import (
     compress_fused_norm_rope_inplace,
-    fused_norm_rope_inplace,
+    fused_rope,
 )
 from sglang.srt.environ import envs
 
@@ -37,8 +37,8 @@ def _use_online_compress(compress_ratio: int) -> bool:
 def _select_bf16_prefill_compress_writes(
     plan: CompressorPrefillPlan,
     out_loc: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (write_loc, positions) for compact rows produced by plan_c."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return static-shape (valid_mask, write_loc, positions) from plan_c."""
     plan_c = plan.plan_c
     assert plan_c.shape[-1] == 16, (
         "BF16 compressed cache prefill expects CompressPlan layout, "
@@ -47,9 +47,11 @@ def _select_bf16_prefill_compress_writes(
     plan_c_i32 = plan_c.contiguous().view(dtype=torch.int32).view(-1, 4)
     seq_lens = plan_c_i32[:, 0].to(torch.int64)
     ragged_ids = torch.bitwise_and(plan_c_i32[:, 1], 0xFFFF).to(torch.long)
-    positions = seq_lens - int(plan.compress_ratio)
+    compress_ratio = int(plan.compress_ratio)
+    valid = (seq_lens >= compress_ratio) & (seq_lens % compress_ratio == 0)
+    positions = torch.clamp(seq_lens - compress_ratio, min=0)
     write_loc = out_loc.index_select(0, ragged_ids)
-    return write_loc, positions
+    return valid, write_loc, positions
 
 
 class CompressorBackendMixin:
@@ -156,6 +158,7 @@ class CompressorBackendMixin:
                 head_dim=compressor.head_dim,
                 is_online=is_online,
             )
+            valid_mask = None
             if plan.is_decode:
                 decode_seq_lens = forward_batch.seq_lens.to(torch.int32).contiguous()
                 compress_fused_norm_rope_inplace(
@@ -169,21 +172,25 @@ class CompressorBackendMixin:
                 write_loc = self._get_out_loc(compressor.ratio)
                 kv_to_write = kv_compressed
             else:
-                write_loc, positions = _select_bf16_prefill_compress_writes(
+                valid_mask, write_loc, positions = _select_bf16_prefill_compress_writes(
                     plan, self._get_out_loc(compressor.ratio)
                 )
-                fused_norm_rope_inplace(
-                    kv_compressed,
-                    compressor.norm.weight,
-                    compressor.norm.variance_epsilon,
+                kv_compressed = compressor.norm(kv_compressed).to(torch.bfloat16)
+                q_dummy = kv_compressed.new_empty(
+                    kv_compressed.shape[0], 1, compressor.rope_head_dim
+                )
+                fused_rope(
+                    q_dummy,
+                    kv_compressed[..., -compressor.rope_head_dim :].unsqueeze(1),
                     compressor.freqs_cis,
-                    positions,
+                    positions=positions,
                 )
                 kv_to_write = kv_compressed
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
                 loc=write_loc,
                 cache_k=kv_to_write,
+                valid_mask=valid_mask,
             )
             return
 

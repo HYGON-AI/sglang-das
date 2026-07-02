@@ -21,7 +21,10 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton
+from sglang.srt.mem_cache.utils import (
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_masked,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
 
@@ -161,9 +164,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if self.is_bf16_attention_kv_cache:
-            return self.set_key_buffer_bf16(layer_id, loc, cache_k)
+            return self.set_key_buffer_bf16(layer_id, loc, cache_k, valid_mask)
 
         return fused_store_cache(
             input=cache_k,
@@ -195,6 +199,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         assert self.is_bf16_attention_kv_cache
         assert cache_k.shape[-1] == self.logical_kv_dim, (
@@ -207,12 +212,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         if n_values == 0:
             return
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id].view(-1, self.logical_kv_dim),
-            loc.long(),
-            values[..., : self.qk_nope_head_dim],
-            values[..., self.qk_nope_head_dim :],
-        )
+        kv_buffer = self.kv_buffer[layer_id].view(-1, self.logical_kv_dim)
+        loc = loc.long()
+        cache_k_nope = values[..., : self.qk_nope_head_dim]
+        cache_k_rope = values[..., self.qk_nope_head_dim :]
+        if valid_mask is None:
+            set_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_triton_masked(
+                kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                valid_mask.contiguous(),
+            )
 
     def get_key_buffer(self, layer_id: int):
         return self.kv_buffer[layer_id]
@@ -299,9 +312,10 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().set_key_buffer_fused(layer_id, loc, cache_k)
+        return super().set_key_buffer_fused(layer_id, loc, cache_k, valid_mask)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -886,10 +900,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
-        return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
+        return compress_kv_pool.set_key_buffer_fused(
+            compress_layer_id, loc, cache_k, valid_mask
+        )
 
     def set_extra_key_buffer_lightop_fused(
         self,

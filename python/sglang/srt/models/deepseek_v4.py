@@ -16,7 +16,6 @@ import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_rope,
     rmsnorm_self,
-    fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
 )
@@ -440,12 +439,13 @@ class MQALayer(nn.Module):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        fused_norm_rope_inplace(
-            kv,
-            self.kv_norm.weight.data,
-            self.eps,
+        kv = self.kv_norm(kv).to(torch.bfloat16)
+        q_dummy = kv.new_empty(kv.shape[0], 1, self.qk_rope_head_dim)
+        fused_rope(
+            q_dummy,
+            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
             self.freqs_cis,
-            positions,
+            positions=positions,
         )
         return kv
 
@@ -641,6 +641,7 @@ class MQALayer(nn.Module):
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
+            and not forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
