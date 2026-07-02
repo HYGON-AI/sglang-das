@@ -332,7 +332,7 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    
+
     # DCU Lightop
     SGLANG_USE_LIGHTOP = EnvBool(False)
 
@@ -378,7 +378,7 @@ class Envs:
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
-    
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
@@ -620,7 +620,7 @@ class Envs:
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
-    
+
     # lightop kernels
     SGLANG_LIGHTOP_TOPK = EnvBool(True)
 
@@ -635,6 +635,7 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_DCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
