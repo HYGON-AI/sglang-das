@@ -889,7 +889,7 @@ class MQALayer(nn.Module):
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
-            if _is_hip and not _is_dcu:
+            if _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
                     x,
                     positions,

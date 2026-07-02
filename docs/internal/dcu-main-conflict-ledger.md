@@ -444,6 +444,32 @@ actual result in the checkpoint note.
     new HIP radix backend is selected only on non-DCU HIP.
   - `ScheduleBatch.loc_tensor` remains device-resident and the C04 DSV4
     sgl-kernel AOT sources remain in `setup_hip.py`.
+  - CUDA Graph runtime follow-up (2026-07-02):
+    - with graph disabled, startup and inference accuracy pass; with graph
+      enabled, a single request repeats an incorrect short phrase and a
+      multi-request GSM8K run faults after prefill enters graph decode.
+    - the VMFault queue identifies `per_token_quant_fp8_kernel`, downstream of
+      DSV4 attention output; the kernel implementation itself predates C06.
+    - root cause: official `3f5e2c7688` added an HIP-specific conservative
+      multi-stream path that overlaps only the core/indexer compressors. The C06
+      merge resolution changed its dispatch from `_is_hip` to
+      `_is_hip and not _is_dcu`, so DCU combined newly enabled fused WQA/WKV
+      with the old three-stream Q/KV/indexer path during graph capture.
+    - resolution: DCU now follows `_forward_prepare_multi_stream_hip()`.
+      Fused WQA/WKV, Q projection, KV cache write, and complete indexer work
+      remain on the main stream; only core and indexer compressor work runs on
+      auxiliary streams. Existing DCU LightOp, FP8, RoPE, and fused cache-write
+      branches remain unchanged.
+    - the temporary DCU guard in generic `can_cp_split()` was removed. The
+      reported DeepSeek-V4 launch uses DSA round-robin CP through
+      `can_dsa_cp_split()`, so that guard was not on the failing call path and
+      only disabled multi-request CP for other generic CP users.
+    - the old DCU three-stream topology is not restored. Revisit it only with
+      dedicated cross-stream lifetime and graph-replay validation.
+    - follow-up static validation passed: targeted Python compile,
+      `git diff --check`, DCU registration with 211 registered files, HIP helper
+      dispatch audit, and DCU LightOp/compressor priority-path audit.
+    - follow-up runtime validation remains pending on the target DCU node.
   - Automated validation completed:
     - no unmerged entries, precise marker scan, and `git diff --check`: passed.
     - full `python/sglang` and registered-test syntax compile: passed.
@@ -459,19 +485,26 @@ actual result in the checkpoint note.
       cannot initialize without a visible HIP device.
     - model, kernel, HiCache, DeepEP, MTP, and graph tests require a DCU runner
       and model weights.
-- Recommended manual validation:
-  - `deepseek-v4` / `attention`: pure TP, CP batch greater than one, CP+EP,
-    DP+EP+MTP, FlashMLA, compressor, sparse prefill, and CUDA graph capture.
-  - `moe` / `deepep` / `aiter`: DeepEP normal mode, waterfill disabled/enabled,
-    EPLB disabled/enabled, hash top-k, W8A8/W16A16, and graph replay.
-  - `quantization`: FP8 channel scale plus FP8/MXFP4 load and accuracy spot check.
-  - `mem_cache`: unified radix cache, HiCache, cache hit/retract, and Mooncake
-    or CPU-offload path when available.
-  - `scheduler` / `speculative`: overlap idle batch and MTP/EAGLE draft-target
-    KV-cache transfer with async NaN/OOB probes.
-  - `ci` / `test`: DCU and XPU registration plus suite partition generation.
-- Manual validation result:
-  - TBD
+    - rerun the reported completion request with CUDA Graph enabled and verify
+      a coherent 128-token answer rather than a repeated phrase.
+    - run `bench_sglang.py --num-questions 10` and verify no VMFault; the log
+      should show multi-request prefill with `cuda graph: False` followed by
+      stable graph decode.
+  - Recommended manual validation:
+    - `deepseek-v4` / `attention`: pure TP, CP batch greater than one, CP+EP,
+      DP+EP+MTP, FlashMLA, compressor, sparse prefill, and CUDA graph capture.
+    - `moe` / `deepep` / `aiter`: DeepEP normal mode, waterfill disabled/enabled,
+      EPLB disabled/enabled, hash top-k, W8A8/W16A16, and graph replay.
+    - `quantization`: FP8 channel scale plus FP8/MXFP4 load and accuracy spot check.
+    - `mem_cache`: unified radix cache, HiCache, cache hit/retract, and Mooncake
+      or CPU-offload path when available.
+    - `scheduler` / `speculative`: overlap idle batch and MTP/EAGLE draft-target
+      KV-cache transfer with async NaN/OOB probes.
+    - `ci` / `test`: DCU and XPU registration plus suite partition generation.
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+    - HiCache - ❓
 
 ### C07-C10
 
