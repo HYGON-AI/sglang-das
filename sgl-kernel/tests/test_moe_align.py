@@ -25,7 +25,7 @@ def is_dcu() -> bool:
 
 _is_hip = is_hip()
 _is_dcu = is_dcu()
-_hip_skip_reason = "Skip for DCU/DTK GPU" if _is_dcu else "Skip for ROCm/HIP GPU"
+_hip_skip_reason = "Skip for HCU device" if _is_dcu else "Skip for AMD GPU"
 
 
 def ceil_div(a, b):

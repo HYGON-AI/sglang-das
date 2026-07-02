@@ -442,7 +442,7 @@ class NgramVerifyInput(SpecInput):
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            build_label = "DCU/HIP" if _is_dcu else "ROCm/HIP"
+            build_label = "HCU/HIP" if _is_dcu else "AMD/HIP"
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely %s build). "
                 "Falling back to greedy verification.",

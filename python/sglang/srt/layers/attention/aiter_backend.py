@@ -52,13 +52,11 @@ try:
 except ImportError:
     if _is_dcu:
         print(
-            "aiter is DCU/DTK compatible kernel library. "
-            "Please make sure aiter is installed on your DCU device."
+            "Please make sure aiter is installed on your HCU device."
         )
     else:
         print(
-            "aiter is ROCm/HIP specific kernel library. "
-            "Please make sure aiter is installed on your ROCm/HIP device."
+            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 
 from sglang.srt.configs.model_config import AttentionArch

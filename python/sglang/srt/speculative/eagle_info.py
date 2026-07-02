@@ -351,7 +351,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            build_label = "DCU/HIP" if _is_dcu else "ROCm/HIP"
+            build_label = "HCU/HIP" if _is_dcu else "AMD/HIP"
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely %s build). "
                 "Falling back to greedy verification.",

@@ -427,7 +427,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_aiter():
         if not _use_aiter:
-            aiter_platform = "DCU/DTK devices" if _is_dcu else "ROCm/HIP devices"
+            aiter_platform = "HCU devices" if _is_dcu else "AMD GPUs"
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
                 f"but AITER is not available. AITER requires {aiter_platform} with "

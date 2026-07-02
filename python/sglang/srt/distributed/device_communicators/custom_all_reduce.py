@@ -388,9 +388,9 @@ def dispatch_custom_allreduce():
             )
 
             if _is_dcu:
-                logger.info("[AR] Using AiterCustomAllreduce (DCU/DTK default)")
+                logger.info("[AR] Using AiterCustomAllreduce (HCU default)")
             else:
-                logger.info("[AR] Using AiterCustomAllreduce (ROCm/HIP default)")
+                logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             return partial(
                 AiterCustomAllreduce,

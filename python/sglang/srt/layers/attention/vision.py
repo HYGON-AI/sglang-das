@@ -393,7 +393,7 @@ class VisionFlash3Attention(nn.Module):
         **kwargs,
     ):
         if not (_is_cuda or _is_musa or _is_dcu):
-            raise Exception("VisionFlash3Attention is only available for cuda or musa or dcu")
+            raise Exception("VisionFlash3Attention is only available for cuda or musa or hcu")
         super().__init__()
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
@@ -638,19 +638,17 @@ class VisionAiterAttention(nn.Module):
     ):
         if not _is_hip:
             if _is_dcu:
-                raise Exception("aiter_attn is only available for DCU/DTK")
-            raise Exception("aiter_attn is only available for ROCm/HIP")
+                raise Exception("aiter_attn is available for HCU")
+            raise Exception("aiter_attn is available for AMD")
         try:
             from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
         except ImportError as e:
             if _is_dcu:
                 raise ImportError(
-                    "aiter is DCU/DTK compatible kernel library. "
-                    "Please make sure aiter is installed on your DCU device."
+                    "Please make sure aiter is installed on your HCU device."
                 ) from e
             raise ImportError(
-                "aiter is ROCm/HIP specific kernel library. "
-                "Please make sure aiter is installed on your ROCm/HIP device."
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
             ) from e
 
         self.flash_attn_varlen_func = aiter_flash_attn_varlen_func

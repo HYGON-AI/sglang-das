@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_dcu, is_hip, is_mps, is_musa, is_npu
 
 
 def is_cuda_v2():
@@ -225,10 +225,16 @@ class GPUEnv(BaseEnv):
 class HIPEnv(BaseEnv):
     """Environment checker for ROCm/HIP"""
 
-    def get_info(self):
-        cuda_info = {"ROCM available": torch.cuda.is_available()}
+    def __init__(self):
+        super().__init__()
+        self.is_hcu = is_dcu()
 
-        if cuda_info["ROCM available"]:
+    def get_info(self):
+        runtime_name = "DTK" if self.is_hcu else "ROCM"
+        runtime_available = torch.cuda.is_available()
+        cuda_info = {f"{runtime_name} available": runtime_available}
+
+        if runtime_available:
             cuda_info.update(self.get_device_info())
             cuda_info.update(self._get_cuda_version_info())
 
@@ -237,7 +243,8 @@ class HIPEnv(BaseEnv):
     def _get_cuda_version_info(self):
         from torch.utils.cpp_extension import ROCM_HOME as ROCM_HOME
 
-        cuda_info = {"ROCM_HOME": ROCM_HOME}
+        runtime_name = "DTK" if self.is_hcu else "ROCM"
+        cuda_info = {f"{runtime_name}_HOME": ROCM_HOME}
 
         if ROCM_HOME and os.path.isdir(ROCM_HOME):
             cuda_info.update(self._get_hipcc_info())
@@ -277,9 +284,11 @@ class HIPEnv(BaseEnv):
             ver = versions.pop()
             ver = ver.replace('"Driver version", ', "").replace('"', "")
 
-            return {"ROCM Driver Version": ver}
+            driver_name = "DTK Driver Version" if self.is_hcu else "ROCM Driver Version"
+            return {driver_name: ver}
         except subprocess.SubprocessError:
-            return {"ROCM Driver Version": "Not Available"}
+            driver_name = "DTK Driver Version" if self.is_hcu else "ROCM Driver Version"
+            return {driver_name: "Not Available"}
 
     def get_topology(self):
         try:
@@ -290,9 +299,8 @@ class HIPEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "AMD Topology": "\n" + result.stdout if result.returncode == 0 else None
-            }
+            topology_name = "HCU Topology" if self.is_hcu else "AMD Topology"
+            return {topology_name: "\n" + result.stdout if result.returncode == 0 else None}
         except subprocess.SubprocessError:
             return {}
 
