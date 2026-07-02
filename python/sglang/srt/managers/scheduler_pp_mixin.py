@@ -30,8 +30,8 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.model_executor.input_buffers import get_pp_proxy_hidden_states_shape
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -633,10 +633,6 @@ class SchedulerPPMixin:
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
 
-                hs = (
-                    getattr(model_config, "hc_hidden_size", None)
-                    or model_config.hidden_size
-                )
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
                         get_pp_proxy_hidden_states_shape(
@@ -781,7 +777,6 @@ class SchedulerPPMixin:
                     + bad_consensus_bootstrapped_rids,
                 )
             )
-
 
             # if ready_reqs:
             #     self._try_send_prefill_kv_ready_batch(ready_reqs)
@@ -1439,11 +1434,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
+        def f(length: float) -> float:
             """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

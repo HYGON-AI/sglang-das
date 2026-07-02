@@ -879,7 +879,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         # EPLB ultimately sums the recorded steps before rebalancing. Sum locally
         # first so the distributed collective has a small, fixed shape even when
-        # different ranks recorded a different number of forward passes.
+        # different ranks recorded a different number of forward passes. The
+        # per-step buffer is int32, but a 1,000-step window with 65K-token prefills
+        # and cross-rank reduction can exceed int32, so accumulate in int64.
         global_physical_count = buffered_global_physical_count.sum(
             dim=0, keepdim=True, dtype=torch.int64
         )
@@ -888,7 +890,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
-        ).squeeze(0)
+        ).squeeze(
+            0
+        )
 
         if self._first_dump:
             self._first_dump = False
@@ -943,11 +947,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 def _dump_to_file(name, data):
     save_dir = Path(envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
     path_output = save_dir / name
-    logger.info(f"Write expert distribution to {path_output}")
+    logger.info("Writing expert distribution to %s", path_output)
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))
-    logger.info(f"Finished writing expert distribution to {path_output}")
+    logger.info("Finished writing expert distribution to %s", path_output)
 
 
 class _Buffer:
