@@ -73,6 +73,11 @@ def _gemma_fused_add_rmsnorm_internal(
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
 # Kudos to @yzh119
+def l2norm(input: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    r"""L2-normalize the last dimension: ``x / sqrt(sum(x^2) + eps)``."""
+    return torch.ops.sgl_kernel.l2norm(input, eps)
+
+
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
