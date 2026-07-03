@@ -597,8 +597,10 @@ actual result in the checkpoint note.
     - `model`: Qwen2.5 dense, VLM, embedding, and reranker smoke.
     - `ci` / `test`: stage-a plus available stage-b DCU CI and split GPT-OSS
       registration generation.
-- Manual validation result:
-  - TBD
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+    - HiCache - ❓
 
 ### C08-C10
 
