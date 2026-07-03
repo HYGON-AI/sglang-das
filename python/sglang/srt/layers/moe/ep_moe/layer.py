@@ -73,7 +73,7 @@ from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_f
     fuse_silu_mul_fp8_quant
 from lightop import op as lightop_op
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_triton_like_entry
+from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1786,7 +1786,7 @@ class DeepEPMoE(FusedMoE):
         gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
 
         # ---- first GEMM ----
-        grouped_gemm_w4a16_nt_masked_triton_like_entry(
+        grouped_gemm_w4a16_nt_masked_entry(
             hidden_states,
             w13_weight, w13_scales,
             gateup_output,
@@ -1804,7 +1804,7 @@ class DeepEPMoE(FusedMoE):
         n2 = w2_scales.size(1)
         down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
 
-        grouped_gemm_w4a16_nt_masked_triton_like_entry(
+        grouped_gemm_w4a16_nt_masked_entry(
             q_a2_all, 
             w2_weight, w2_scales,
             down_output,
