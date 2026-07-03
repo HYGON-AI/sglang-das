@@ -15,6 +15,7 @@ __all__ = [
     "register_npu_ci",
     "register_dcu_ci",
     "register_xpu_ci",
+    "register_musa_ci",
     "ut_parse_one_file",
 ]
 
@@ -34,6 +35,7 @@ class HWBackend(Enum):
     NPU = auto()
     DCU = auto()
     XPU = auto()
+    MUSA = auto()
 
 
 @dataclass
@@ -133,6 +135,19 @@ def register_xpu_ci(
     return None
 
 
+def register_musa_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 REGISTER_MAPPING = {
     "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
@@ -140,6 +155,7 @@ REGISTER_MAPPING = {
     "register_npu_ci": HWBackend.NPU,
     "register_dcu_ci": HWBackend.DCU,
     "register_xpu_ci": HWBackend.XPU,
+    "register_musa_ci": HWBackend.MUSA,
 }
 
 

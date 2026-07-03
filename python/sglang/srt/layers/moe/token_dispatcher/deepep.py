@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -23,7 +22,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    DeepEPOutputDtype,
     get_deepep_config,
+    get_deepep_output_dtype,
     get_moe_runner_backend,
     is_tbo_enabled,
 )
@@ -379,6 +380,71 @@ class _DeepEPDispatcherImplBase:
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
+        self.set_deepep_dispatcher_dtype()
+
+    def set_deepep_dispatcher_dtype(self) -> None:
+        self.deepep_output_dtype = get_deepep_output_dtype(self)
+
+        # Configuration mapping for each dtype
+        config_map = {
+            DeepEPOutputDtype.BF16: {
+                "use_fp8": False,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.FP8: {
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            # Needed for Ascend A2/A3 NPU case,
+            # despite the use_fp8 flag,
+            # quantization will be performed in int8
+            DeepEPOutputDtype.INT8: {
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.NVFP4: {
+                "use_fp8": False,
+                "use_nvfp4": True,
+            },
+        }
+
+        # Validate and apply hardware-specific adjustments
+        self._validate_and_adjust_dtype()
+
+        # Apply configuration
+        config = config_map[self.deepep_output_dtype]
+        self.use_fp8 = config["use_fp8"]
+        self.use_nvfp4 = config["use_nvfp4"]
+
+        # Handle environment variables
+        if _is_npu:
+            self._update_int8_quant_env()
+
+    def _validate_and_adjust_dtype(self) -> None:
+        """Validate dtype against hardware and adjust if necessary."""
+        if _is_npu:
+            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
+                logger.warning_once(
+                    "Ascend A2/A3 NPU does not support fp8 "
+                    "deepep_dispatcher_output_dtype, switching to int8..."
+                )
+                self.deepep_output_dtype = DeepEPOutputDtype.INT8
+            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
+                raise RuntimeError(
+                    "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
+                )
+        else:
+            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+                logger.warning_once(
+                    "GPU does not support int8 "
+                    "deepep_dispatcher_output_dtype, switching to fp8..."
+                )
+                self.deepep_output_dtype = DeepEPOutputDtype.FP8
+            # NVFP4 is supported on GPU, no adjustment needed
+
+    def _update_int8_quant_env(self) -> None:
+        """TODO adapt different quantization schemes for base model and draft model on NPU"""
+        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
