@@ -200,7 +200,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
-    is_dcu,
     is_hip,
     is_host_cpu_arm64,
     is_npu,
@@ -232,7 +231,6 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
-_is_dcu = is_dcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -2346,11 +2344,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         if self.device != "cuda":
             return
-
-        if _is_dcu:
-            model_kernel_warmup = getattr(self.model, "kernel_warmup", None)
-            if model_kernel_warmup is not None:
-                model_kernel_warmup(self)
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
