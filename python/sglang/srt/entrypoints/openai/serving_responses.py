@@ -535,6 +535,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -555,6 +556,69 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
+
+        chat_tools = self._response_tools_to_chat_tools(request)
+        is_required = request.tool_choice == "required"
+        tool_call_items: list[ResponseFunctionToolCall] = []
+        parsed_via_native = False
+        if (
+            content
+            and chat_tools
+            and self.tool_call_parser
+            and request.tool_choice != "none"
+        ):
+            parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
+            should_try_native = (
+                not is_required or parser.detector.supports_structural_tag()
+            )
+            if should_try_native and parser.has_tool_call(content):
+                try:
+                    content, call_info_list = parser.parse_non_stream(content)
+                    for call_info in call_info_list:
+                        tool_call_items.append(
+                            ResponseFunctionToolCall(
+                                arguments=call_info.parameters or "",
+                                call_id=f"call_{random_uuid()[:24]}",
+                                type="function_call",
+                                name=call_info.name,
+                                id=f"fc_{random_uuid()[:8]}",
+                                status="completed",
+                            )
+                        )
+                    parsed_via_native = bool(call_info_list)
+                except Exception as e:
+                    logger.error("Tool call parsing error: %s", e)
+
+        if content and chat_tools and is_required and not parsed_via_native:
+            try:
+                tool_call_data = orjson.loads(content)
+                if isinstance(tool_call_data, dict):
+                    tool_call_data = [tool_call_data]
+                if isinstance(tool_call_data, list):
+                    for tool in tool_call_data:
+                        if not isinstance(tool, dict) or "name" not in tool:
+                            continue
+                        arguments = json.dumps(
+                            tool.get("parameters", {}), ensure_ascii=False
+                        )
+                        tool_call_items.append(
+                            ResponseFunctionToolCall(
+                                arguments=arguments,
+                                call_id=f"call_{random_uuid()[:24]}",
+                                type="function_call",
+                                name=tool["name"],
+                                id=f"fc_{random_uuid()[:8]}",
+                                status="completed",
+                            )
+                        )
+                    content = ""
+            except Exception as e:
+                logger.error("Required tool JSON parse error: %s", e)
+
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -1243,6 +1307,605 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "output_tokens": usage_info.get("completion_tokens", 0),
                 "output_tokens_details": {
                     "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+                },
+                "total_tokens": usage_info.get("total_tokens", 0),
+            }
+
+        yield _send_event(
+            openai_responses_types.ResponseCompletedEvent(
+                type="response.completed",
+                sequence_number=-1,
+                response=response_dict,
+            )
+        )
+
+    async def responses_stream_generator_non_harmony(
+        self,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        result_generator: AsyncIterator[Any],
+        model_name: str,
+        tokenizer: Any,
+        request_metadata: RequestResponseMetadata,
+        created_time: Optional[int] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream a /v1/responses response as typed OpenAI SSE events for
+        non-harmony models. Each engine chunk is run through the reasoning
+        and function-call parsers; leftover text becomes
+        ``response.output_text.delta``.
+        """
+
+        created_time = created_time or int(time.time())
+        sequence_number = 0
+
+        def _send_event(event):
+            nonlocal sequence_number
+            if hasattr(event, "sequence_number"):
+                event.sequence_number = sequence_number
+            sequence_number += 1
+            event_type = getattr(event, "type", "unknown")
+            return (
+                f"event: {event_type}\n"
+                f"data: {event.model_dump_json(indent=None)}\n\n"
+            )
+
+        # The streaming Response* event models echo ``tools`` through a
+        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
+        # validation failures on extended tool types.
+        def _sanitize_response_dict(d: dict) -> dict:
+            d["tools"] = []
+            return d
+
+        initial_response = _sanitize_response_dict(
+            ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name=model_name,
+                created_time=created_time,
+                output=[],
+                status="in_progress",
+                usage=None,
+            ).model_dump()
+        )
+        yield _send_event(
+            openai_responses_types.ResponseCreatedEvent(
+                type="response.created",
+                sequence_number=-1,
+                response=initial_response,
+            )
+        )
+        yield _send_event(
+            openai_responses_types.ResponseInProgressEvent(
+                type="response.in_progress",
+                sequence_number=-1,
+                response=initial_response,
+            )
+        )
+
+        chat_tools = self._response_tools_to_chat_tools(request)
+        is_required = request.tool_choice == "required"
+        tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
+        if chat_tools and request.tool_choice != "none":
+            native_supports_structural_tag = False
+            if self.tool_call_parser:
+                probe = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+                native_supports_structural_tag = (
+                    probe.detector.supports_structural_tag()
+                )
+            if is_required and not native_supports_structural_tag:
+                tool_parser = JsonArrayParser()
+            elif self.tool_call_parser:
+                tool_parser = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+        reasoning_parser_obj: Optional[ReasoningParser] = None
+        if self.reasoning_parser:
+            reasoning_parser_obj = ReasoningParser(
+                model_type=self.reasoning_parser,
+                stream_reasoning=True,
+                force_reasoning=self._is_thinking_enabled_for_request(request),
+                request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
+
+        current_output_index = -1
+        reasoning_state = {
+            "open": False,
+            "item_id": "",
+            "output_index": -1,
+            "text": "",
+        }
+        message_state = {
+            "open": False,
+            "item_id": "",
+            "output_index": -1,
+            "text": "",
+        }
+        tool_call_states: dict[int, dict[str, Any]] = {}
+        # Items closed during the stream, in wire order. Feeds the final
+        # ``response.completed`` snapshot and the stored response.
+        emitted_items: list = []
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        cached_tokens = 0
+        total_tokens_meta = 0
+        reasoning_tokens_meta = 0
+        finish_reason: Optional[dict[str, Any]] = None
+        stream_offset = 0
+        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+
+        def _open_reasoning_item() -> str:
+            nonlocal current_output_index
+            current_output_index += 1
+            item_id = f"rs_{random_uuid()}"
+            reasoning_state.update(
+                open=True, item_id=item_id, output_index=current_output_index, text=""
+            )
+            return item_id
+
+        wants_summary = self._wants_reasoning_summary(request)
+
+        def _close_reasoning_item():
+            if not reasoning_state["open"]:
+                return []
+            text = reasoning_state["text"]
+            completed_item = ResponseReasoningItem(
+                id=reasoning_state["item_id"],
+                type="reasoning",
+                summary=(
+                    [ResponseReasoningSummary(type="summary_text", text=text)]
+                    if wants_summary
+                    else []
+                ),
+                content=[
+                    ResponseReasoningTextContent(type="reasoning_text", text=text),
+                ],
+                status="completed",
+            )
+            events: list = []
+            if wants_summary:
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
+                            type="response.reasoning_summary_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            text=text,
+                        )
+                    )
+                )
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
+                            type="response.reasoning_summary_part.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            part=ResponseReasoningSummaryDonePart(
+                                type="summary_text", text=text
+                            ),
+                        )
+                    )
+                )
+            else:
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningTextDoneEvent(
+                            type="response.reasoning_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            text=text,
+                        )
+                    )
+                )
+            events += [
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        item=completed_item,
+                    )
+                ),
+            ]
+            emitted_items.append(completed_item)
+            reasoning_state["open"] = False
+            return events
+
+        def _open_message_item() -> str:
+            nonlocal current_output_index
+            current_output_index += 1
+            item_id = f"msg_{random_uuid()}"
+            message_state.update(
+                open=True, item_id=item_id, output_index=current_output_index, text=""
+            )
+            return item_id
+
+        def _close_message_item():
+            if not message_state["open"]:
+                return []
+            text = message_state["text"]
+            text_content = openai_responses_types.ResponseOutputText(
+                type="output_text", text=text, annotations=[], logprobs=None
+            )
+            completed_item = ResponseOutputMessage(
+                id=message_state["item_id"],
+                type="message",
+                role="assistant",
+                content=[text_content],
+                status="completed",
+            )
+            events = [
+                _send_event(
+                    openai_responses_types.ResponseTextDoneEvent(
+                        type="response.output_text.done",
+                        sequence_number=-1,
+                        output_index=message_state["output_index"],
+                        content_index=0,
+                        text=text,
+                        logprobs=[],
+                        item_id=message_state["item_id"],
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        sequence_number=-1,
+                        item_id=message_state["item_id"],
+                        output_index=message_state["output_index"],
+                        content_index=0,
+                        part=text_content,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=message_state["output_index"],
+                        item=completed_item,
+                    )
+                ),
+            ]
+            emitted_items.append(completed_item)
+            message_state["open"] = False
+            return events
+
+        def _close_tool_call_state(tool_index: int):
+            state = tool_call_states.get(tool_index)
+            if state is None or state.get("done"):
+                return []
+            arguments = state["arguments"]
+            completed_item = ResponseFunctionToolCall(
+                arguments=arguments,
+                call_id=state["call_id"],
+                name=state["name"] or "",
+                type="function_call",
+                id=state["item_id"],
+                status="completed",
+            )
+            events = [
+                _send_event(
+                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                        type="response.function_call_arguments.done",
+                        sequence_number=-1,
+                        item_id=state["item_id"],
+                        output_index=state["output_index"],
+                        arguments=arguments,
+                        name=state["name"] or "",
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=state["output_index"],
+                        item=completed_item,
+                    )
+                ),
+            ]
+            emitted_items.append(completed_item)
+            state["done"] = True
+            return events
+
+        try:
+            async for ctx in result_generator:
+                if isinstance(ctx, dict):
+                    chunk = ctx
+                else:
+                    chunk = getattr(ctx, "last_output", None)
+                if not isinstance(chunk, dict):
+                    continue
+                meta = chunk.get("meta_info") or {}
+                prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
+                completion_tokens = meta.get("completion_tokens", completion_tokens)
+                cached_tokens = meta.get("cached_tokens", cached_tokens)
+                total_tokens_meta = meta.get("total_tokens", total_tokens_meta)
+                reasoning_tokens_meta = meta.get(
+                    "reasoning_tokens", reasoning_tokens_meta
+                )
+                finish_reason = meta.get("finish_reason") or finish_reason
+
+                text = chunk.get("text", "") or ""
+                if incremental:
+                    delta = text
+                else:
+                    delta = text[stream_offset:]
+                    stream_offset = len(text)
+                if not delta and finish_reason is None:
+                    continue
+
+                if reasoning_parser_obj is not None:
+                    reasoning_chunk, delta = reasoning_parser_obj.parse_stream_chunk(
+                        delta
+                    )
+                else:
+                    reasoning_chunk = None
+
+                if reasoning_chunk:
+                    if message_state["open"]:
+                        for ev in _close_message_item():
+                            yield ev
+                    if not reasoning_state["open"]:
+                        item_id = _open_reasoning_item()
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=reasoning_state["output_index"],
+                                item=ResponseReasoningItem(
+                                    id=item_id,
+                                    type="reasoning",
+                                    summary=[],
+                                    content=[],
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        # Clients that opt into ``reasoning.summary`` render
+                        # off the ``reasoning_summary_text.*`` event stream,
+                        # so mirror the trace into a summary part.
+                        if wants_summary:
+                            yield _send_event(
+                                openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                                    type="response.reasoning_summary_part.added",
+                                    item_id=item_id,
+                                    output_index=reasoning_state["output_index"],
+                                    summary_index=0,
+                                    part=ResponseReasoningSummaryAddedPart(
+                                        type="summary_text", text=""
+                                    ),
+                                    sequence_number=-1,
+                                )
+                            )
+                    reasoning_state["text"] += reasoning_chunk
+                    if wants_summary:
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                                type="response.reasoning_summary_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                summary_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
+                        )
+                    else:
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningTextDeltaEvent(
+                                type="response.reasoning_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                content_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
+                        )
+
+                if not delta:
+                    continue
+
+                if isinstance(tool_parser, JsonArrayParser):
+                    sp = tool_parser.parse_streaming_increment(delta, chat_tools)
+                    normal_text, tool_calls = sp.normal_text or "", sp.calls
+                elif tool_parser is not None:
+                    normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
+                else:
+                    normal_text, tool_calls = delta, []
+
+                # Close any open tool-call item before opening a message so
+                # ``output_item.done`` lands before the next ``added``.
+                if normal_text:
+                    if reasoning_state["open"]:
+                        for ev in _close_reasoning_item():
+                            yield ev
+                    for tool_index in list(tool_call_states):
+                        for ev in _close_tool_call_state(tool_index):
+                            yield ev
+                    if not message_state["open"]:
+                        item_id = _open_message_item()
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=message_state["output_index"],
+                                item=ResponseOutputMessage(
+                                    id=item_id,
+                                    type="message",
+                                    role="assistant",
+                                    content=[],
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=message_state["output_index"],
+                                item_id=message_state["item_id"],
+                                content_index=0,
+                                part=openai_responses_types.ResponseOutputText(
+                                    type="output_text",
+                                    text="",
+                                    annotations=[],
+                                    logprobs=None,
+                                ),
+                            )
+                        )
+                    message_state["text"] += normal_text
+                    yield _send_event(
+                        openai_responses_types.ResponseTextDeltaEvent(
+                            type="response.output_text.delta",
+                            sequence_number=-1,
+                            content_index=0,
+                            output_index=message_state["output_index"],
+                            item_id=message_state["item_id"],
+                            delta=normal_text,
+                            logprobs=[],
+                        )
+                    )
+
+                if not tool_calls:
+                    continue
+
+                if reasoning_state["open"]:
+                    for ev in _close_reasoning_item():
+                        yield ev
+                if message_state["open"]:
+                    for ev in _close_message_item():
+                        yield ev
+
+                for call in tool_calls:
+                    tool_index = call.tool_index
+                    state = tool_call_states.get(tool_index)
+                    if state is None or state.get("done"):
+                        current_output_index += 1
+                        item_id = f"fc_{random_uuid()[:8]}"
+                        call_id = f"call_{random_uuid()[:24]}"
+                        state = {
+                            "item_id": item_id,
+                            "call_id": call_id,
+                            "output_index": current_output_index,
+                            "name": call.name or "",
+                            "arguments": "",
+                            "added": False,
+                            "done": False,
+                        }
+                        tool_call_states[tool_index] = state
+                    if not state["added"]:
+                        state["added"] = True
+                        # Capture ``call.name`` before the ``added`` event so
+                        # the name is set on the first emitted item.
+                        if call.name and not state["name"]:
+                            state["name"] = call.name
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=state["output_index"],
+                                item=ResponseFunctionToolCall(
+                                    arguments="",
+                                    call_id=state["call_id"],
+                                    name=state["name"],
+                                    type="function_call",
+                                    id=state["item_id"],
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                    if call.parameters:
+                        state["arguments"] += call.parameters
+                        yield _send_event(
+                            openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                type="response.function_call_arguments.delta",
+                                sequence_number=-1,
+                                item_id=state["item_id"],
+                                output_index=state["output_index"],
+                                delta=call.parameters,
+                            )
+                        )
+        except Exception:
+            logger.exception("Error while streaming /v1/responses")
+            failed = _sanitize_response_dict(
+                ResponsesResponse.from_request(
+                    request,
+                    sampling_params,
+                    model_name=model_name,
+                    created_time=created_time,
+                    output=[],
+                    status="failed",
+                    usage=None,
+                ).model_dump()
+            )
+            yield _send_event(
+                openai_responses_types.ResponseFailedEvent(
+                    type="response.failed",
+                    sequence_number=-1,
+                    response=failed,
+                )
+            )
+            return
+
+        for ev in _close_reasoning_item():
+            yield ev
+        for ev in _close_message_item():
+            yield ev
+        for tool_index in list(tool_call_states):
+            for ev in _close_tool_call_state(tool_index):
+                yield ev
+
+        final_output_items = list(emitted_items)
+
+        usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
+            reasoning_tokens=reasoning_tokens_meta,
+        )
+        if self.enable_prompt_tokens_details and cached_tokens:
+            usage.prompt_tokens_details = PromptTokenUsageInfo(
+                cached_tokens=cached_tokens
+            )
+        request_metadata.final_usage_info = usage
+
+        final_response = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time,
+            output=final_output_items,
+            status="completed",
+            usage=usage,
+        )
+        if request.store:
+            async with self.response_store_lock:
+                stored = self.response_store.get(final_response.id)
+                if stored is None or stored.status != "cancelled":
+                    self.response_store[final_response.id] = final_response
+
+        response_dict = _sanitize_response_dict(final_response.model_dump())
+        if response_dict.get("usage"):
+            usage_info = response_dict["usage"]
+            response_dict["usage"] = {
+                "input_tokens": usage_info.get("prompt_tokens", 0),
+                "input_tokens_details": {
+                    "cached_tokens": cached_tokens,
+                },
+                "output_tokens": usage_info.get("completion_tokens", 0),
+                "output_tokens_details": {
+                    "reasoning_tokens": reasoning_tokens_meta,
                 },
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
