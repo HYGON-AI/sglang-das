@@ -176,7 +176,7 @@ spec:
           - --eplb-algorithm
           - deepseek
           #          - --deepep-config
-          #          -  /home/aiges/tuned/tuned_8sms.json
+          #          -  <TUNED_CONFIG_PATH>/tuned_8sms.json
           # can be tuned using deepep test scripts
           - --enable-dp-lm-head
           - --enable-dp-attention
