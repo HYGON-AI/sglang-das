@@ -302,7 +302,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
-                if new_text and not new_text.endswith("�"):
+                if new_text and not new_text.endswith("\ufffd"):
                     s.decoded_text += new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
