@@ -230,9 +230,8 @@ class HIPEnv(BaseEnv):
         self.is_hcu = is_dcu()
 
     def get_info(self):
-        runtime_name = "DTK" if self.is_hcu else "ROCM"
         runtime_available = torch.cuda.is_available()
-        cuda_info = {f"{runtime_name} available": runtime_available}
+        cuda_info = {"ROCM available": runtime_available}
 
         if runtime_available:
             cuda_info.update(self.get_device_info())
@@ -243,8 +242,7 @@ class HIPEnv(BaseEnv):
     def _get_cuda_version_info(self):
         from torch.utils.cpp_extension import ROCM_HOME as ROCM_HOME
 
-        runtime_name = "DTK" if self.is_hcu else "ROCM"
-        cuda_info = {f"{runtime_name}_HOME": ROCM_HOME}
+        cuda_info = {"ROCM_HOME": ROCM_HOME}
 
         if ROCM_HOME and os.path.isdir(ROCM_HOME):
             cuda_info.update(self._get_hipcc_info())
@@ -284,11 +282,9 @@ class HIPEnv(BaseEnv):
             ver = versions.pop()
             ver = ver.replace('"Driver version", ', "").replace('"', "")
 
-            driver_name = "DTK Driver Version" if self.is_hcu else "ROCM Driver Version"
-            return {driver_name: ver}
+            return {"ROCM Driver Version": ver}
         except subprocess.SubprocessError:
-            driver_name = "DTK Driver Version" if self.is_hcu else "ROCM Driver Version"
-            return {driver_name: "Not Available"}
+            return {"ROCM Driver Version": "Not Available"}
 
     def get_topology(self):
         try:

@@ -540,7 +540,7 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
                 (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
             const bool is_hcu_device = is_dcu_runtime_device();
             const char* platform_label = is_hcu_device ? "HCU device" : "AMD GPU";
-            const char* stack_label = is_hcu_device ? "DTK versions" : "ROCm versions";
+            const char* stack_label = "ROCm versions";
             std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on "
                       << platform_label
                       << " which is currently a non-op (in " << stack_label

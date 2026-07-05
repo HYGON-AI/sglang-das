@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
+    is_dcu,
     is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -93,6 +94,7 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
+_is_dcu = is_dcu()
 
 if not _is_hip:
     from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
@@ -967,7 +969,10 @@ class CudaGraphRunner:
     def _create_device_graph(self):
         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
             if _is_hip:
-                raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
+                platform = "HCU/HIP" if _is_dcu else "ROCm/HIP"
+                raise RuntimeError(
+                    f"Breakable CUDA graph is not supported on {platform}"
+                )
             return BreakableCUDAGraph()
         return torch.cuda.CUDAGraph()
 

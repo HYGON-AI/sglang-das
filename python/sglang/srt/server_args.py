@@ -2086,7 +2086,7 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             hip_aiter_enabled = is_hip() and envs.SGLANG_USE_AITER.get()
-            hip_aiter_platform = "HCU/DTK" if is_dcu() else "ROCm"
+            hip_aiter_platform = "ROCm"
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
@@ -4433,7 +4433,7 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    platform = "HCU/DTK" if is_dcu() else "AMD/ROCm"
+                    platform = "HCU/ROCm" if is_dcu() else "AMD/ROCm"
                     # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
@@ -5807,7 +5807,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (AMD/ROCm or HCU/DTK only). ",
+            "'aiter' (AMD/ROCm or HCU/ROCm only). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",

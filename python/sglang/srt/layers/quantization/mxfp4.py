@@ -269,6 +269,10 @@ def dequant_mxfp4(
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
+        if _is_dcu:
+            raise ImportError(
+                "The Quark package is required to use MX-FP4 models. Please install the Quark package."
+            ) from err
         raise ImportError(
             "The package `amd-quark` is required to use "
             "MX-FP4 models. Please install it with `pip install "
@@ -285,6 +289,10 @@ def quant_dequant_mxfp4(
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
+        if _is_dcu:
+            raise ImportError(
+                "The Quark package is required to use MX-FP4 models. Please install the Quark package."
+            ) from err
         raise ImportError(
             "The package `amd-quark` is required to use "
             "MX-FP4 models. Please install it with `pip install "

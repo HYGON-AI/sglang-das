@@ -637,9 +637,7 @@ class VisionAiterAttention(nn.Module):
         **kwargs,
     ):
         if not _is_hip:
-            if _is_dcu:
-                raise Exception("aiter_attn is available for HCU")
-            raise Exception("aiter_attn is available for AMD")
+            raise Exception("aiter_attn is only available for AMD or HCU")
         try:
             from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
         except ImportError as e:
