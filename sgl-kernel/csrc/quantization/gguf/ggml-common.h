@@ -1,3 +1,19 @@
+/*
+ * Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+ *
+ * Hygon modifications to this file are licensed under the Apache License,
+ * Version 2.0 (the "License"); you may not use these modifications except
+ * in compliance with the License. You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // adapted from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/ggml-common.h
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-common.h
