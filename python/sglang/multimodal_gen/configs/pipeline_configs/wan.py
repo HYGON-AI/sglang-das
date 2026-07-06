@@ -231,6 +231,10 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
     boundary_ratio: float | None = 0.875
 
     def __post_init__(self) -> None:
+        super().__post_init__()
+        # Match the official full-frame Wan VAE decode path for SP/Ulysses runs.
+        self.vae_config.use_parallel_encode = False
+        self.vae_config.use_parallel_decode = False
         self.dit_config.boundary_ratio = self.boundary_ratio
 
 
