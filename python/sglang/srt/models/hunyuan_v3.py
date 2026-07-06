@@ -63,10 +63,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.utils import (
-    create_fused_set_kv_buffer_arg,
-    enable_fused_set_kv_buffer,
-)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu
 from sglang.srt.utils.common import LazyValue
@@ -492,15 +488,12 @@ class HYV3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        can_fuse_set_kv = (
-            self.head_dim == self.rotary_emb.rotary_dim
-            and enable_fused_set_kv_buffer(forward_batch)
-        )
+        used_fused_hunyuan_rotary_kv_store = False
         if (
             _is_dcu
             and _use_fused_hunyuan_rotary
             and self.use_qk_norm
-            and can_fuse_set_kv
+            and self.head_dim == self.rotary_emb.rotary_dim
         ):
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
@@ -534,13 +527,20 @@ class HYV3Attention(nn.Module):
                 v_scale=None,
                 epsilon=self.q_norm.variance_epsilon,
             )
+            used_fused_hunyuan_rotary_kv_store = True
         elif self.use_qk_norm:
             q = self.q_norm(q.reshape(-1, self.head_dim))
             q = q.view(-1, self.q_size)
             k = self.k_norm(k.reshape(-1, self.head_dim))
             k = k.view(-1, self.kv_size)
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not used_fused_hunyuan_rotary_kv_store,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
