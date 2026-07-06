@@ -442,6 +442,54 @@ class CommonKVManager(BaseKVManager):
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
+        total_draft_layers = getattr(self.kv_args, "total_draft_kv_layers", None) or 0
+        total_main_layers = getattr(self.kv_args, "total_main_kv_layers", None) or 0
+        if total_draft_layers > 0 and total_main_layers > 0:
+            src_num_layers = len(src_kv_ptrs) // 2
+            dst_num_layers = len(dst_kv_ptrs) // 2
+            src_k_ptrs = list(src_kv_ptrs[:src_num_layers])
+            src_v_ptrs = list(src_kv_ptrs[src_num_layers:])
+            dst_k_all = list(dst_kv_ptrs[:dst_num_layers])
+            dst_v_all = list(dst_kv_ptrs[dst_num_layers:])
+
+            main_start = getattr(self.kv_args, "prefill_main_start_layer", None)
+            main_end = getattr(self.kv_args, "prefill_main_end_layer", None)
+            draft_start = getattr(self.kv_args, "prefill_draft_start_layer", None)
+            draft_end = getattr(self.kv_args, "prefill_draft_end_layer", None)
+            if None in (main_start, main_end, draft_start, draft_end):
+                raise ValueError(
+                    "MHA+MTP PP transfer requires prefill main/draft layer ranges "
+                    "on KVArgs."
+                )
+
+            expected_dst_layers = total_main_layers + total_draft_layers
+            if dst_num_layers != expected_dst_layers:
+                raise ValueError(
+                    f"Unexpected decode MHA+MTP KV pointer layout: "
+                    f"dst_num_layers={dst_num_layers}, expected={expected_dst_layers} "
+                    f"(main={total_main_layers}, draft={total_draft_layers})."
+                )
+
+            dst_k_ptrs = (
+                dst_k_all[main_start:main_end]
+                + dst_k_all[
+                    total_main_layers + draft_start : total_main_layers + draft_end
+                ]
+            )
+            dst_v_ptrs = (
+                dst_v_all[main_start:main_end]
+                + dst_v_all[
+                    total_main_layers + draft_start : total_main_layers + draft_end
+                ]
+            )
+            if len(dst_k_ptrs) != src_num_layers:
+                raise ValueError(
+                    f"MHA+MTP PP pointer mismatch: src_layers={src_num_layers}, "
+                    f"dst_layers={len(dst_k_ptrs)}, main=[{main_start},{main_end}), "
+                    f"draft=[{draft_start},{draft_end})."
+                )
+            return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, src_num_layers
+
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
