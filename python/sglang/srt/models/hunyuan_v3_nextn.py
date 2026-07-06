@@ -1,3 +1,4 @@
+ 
 # coding=utf-8
 # Copyright 2026 The HunYuan team.
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -251,6 +252,14 @@ class HYV3ForCausalLMNextN(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 EntryClass = [HYV3ForCausalLMNextN]
