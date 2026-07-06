@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -65,6 +66,75 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _slice_mha_kv_infos_for_pp(
+    kv_data_ptrs: List[int],
+    kv_data_lens: List[int],
+    kv_item_lens: List[int],
+    *,
+    pp_rank: int,
+    pp_size: int,
+    total_layers: int,
+    pool_start_layer: int,
+) -> tuple[List[int], List[int], List[int], int, int]:
+    """Slice full-model MHA KV buffer infos to this prefill PP stage.
+
+    Some DCU/PP configurations keep a full-model KV pool on each PP rank while
+    only the local PP stage writes a subset of layers. Sending the whole pool
+    makes every PP rank overwrite the same decode-side layers.
+    """
+    if pp_size <= 1:
+        return kv_data_ptrs, kv_data_lens, kv_item_lens, pool_start_layer, (
+            pool_start_layer + len(kv_data_ptrs) // 2
+        )
+
+    num_layers = len(kv_data_ptrs) // 2
+    local_start, local_end = get_pp_indices(total_layers, pp_rank, pp_size)
+    local_layers = local_end - local_start
+
+    if num_layers == local_layers and pool_start_layer == local_start:
+        return kv_data_ptrs, kv_data_lens, kv_item_lens, local_start, local_end
+
+    if num_layers != total_layers:
+        logger.warning(
+            "Cannot PP-slice KV infos: pp_rank=%s pp_size=%s total_layers=%s "
+            "pool_start_layer=%s num_layers=%s expected either local_layers=%s "
+            "or total_layers=%s. Keeping original KV infos.",
+            pp_rank,
+            pp_size,
+            total_layers,
+            pool_start_layer,
+            num_layers,
+            local_layers,
+            total_layers,
+        )
+        return kv_data_ptrs, kv_data_lens, kv_item_lens, pool_start_layer, (
+            pool_start_layer + num_layers
+        )
+
+    def _slice_pair(values):
+        return (
+            list(values[local_start:local_end])
+            + list(values[num_layers + local_start : num_layers + local_end])
+        )
+
+    logger.info(
+        "PP-slice full MHA KV infos for disaggregation: pp_rank=%s "
+        "layers=[%s,%s) ptr_count %s -> %s",
+        pp_rank,
+        local_start,
+        local_end,
+        len(kv_data_ptrs),
+        2 * local_layers,
+    )
+    return (
+        _slice_pair(kv_data_ptrs),
+        _slice_pair(kv_data_lens),
+        _slice_pair(kv_item_lens),
+        local_start,
+        local_end,
+    )
 
 
 def release_req_to_metadata_buffer(
@@ -162,6 +232,27 @@ class PrefillBootstrapQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+
+        if (
+            not self.is_mla_backend
+            and self.draft_token_to_kv_pool is None
+            and self.pp_size > 1
+        ):
+            (
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                kv_args.prefill_start_layer,
+                kv_args.prefill_end_layer,
+            ) = _slice_mha_kv_infos_for_pp(
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                total_layers=self.scheduler.model_config.num_hidden_layers,
+                pool_start_layer=self.token_to_kv_pool.start_layer,
+            )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
