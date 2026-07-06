@@ -520,7 +520,9 @@ class ProjectedDSV4Attention(nn.Module):
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_flat)
             attn_backend.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=self.attn.layer_id,
-                raw_loc=forward_batch.out_cache_loc.to(torch.int64),
+                swa_loc=attn_backend.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc.to(torch.int64)
+                ),
                 cache_nope_fp8_rope_bf16_pack=pack,
             )
         out = attn_backend.forward(
@@ -546,7 +548,9 @@ def _write_swa_cache(
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16.to(torch.bfloat16))
     runner.token_to_kv_pool.set_swa_key_buffer_radix(
         layer_id=layer_id,
-        raw_loc=loc.to(torch.int64),
+        swa_loc=runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+            loc.to(torch.int64)
+        ),
         cache_nope_fp8_rope_bf16_pack=pack,
     )
 

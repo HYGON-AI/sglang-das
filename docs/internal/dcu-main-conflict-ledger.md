@@ -187,6 +187,7 @@ actual result in the checkpoint note.
 | C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/model_executor/model_runner.py`                                 | model_executor | Codex | port to new API | Use official `hc_hidden_size` graph-buffer contract, which replaces the removed DSV4 PP proxy-shape argument                         | high   | compile/ruff/registration passed; DCU runtime pending                             | DeepSeek-V4 PP/PD startup, graph capture, flattened MHC hidden-state transfer                      | merged    |
 | C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/speculative/eagle_info_v2.py`                                   | speculative    | Codex | port to new API | Consume official centralized cache-location/EAGLE helpers; DCU operator dispatch moved with the helper rather than duplicated        | high   | compile/ruff/registration passed; DCU runtime pending                             | EAGLE/MTP draft and target verify, page-size 1/64, eager/graph, operator-disabled Triton fallback  | merged    |
 | C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/speculative/spec_utils.py`                                      | speculative    | Codex | port to new API | Remove duplicated Triton cache kernels and import the official centralized helpers, including the migrated DCU req-pool operator     | high   | compile/ruff/registration passed; DCU runtime pending                             | Spec V1/V2 cache assignment, retract/abort, graph replay, and `SGLANG_ASSIGN_REQ_TO_TOKEN_POOL=0`  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-bootstrap`   | `python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py`                           | mem_cache      | Codex | backport upstream fix | Backport official `c9ca56da8c`: compute full-to-SWA write locations once in per-forward graph metadata instead of retaining pool-level locations across replay; preserve DCU LightOp stores | high | compile/ruff/registration passed; DCU runtime pending | Graph on/off parity; standalone CP+EP; PD prefill/decode; EAGLE/MTP; GSM8K 10; HiCache mapping reload | merged |
 | C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_a.py`                                 | test           | Codex | port to new API | Accept official test deletion and migrate the DCU placeholder registration to the new core/top-k EAGLE suites                        | medium | registration passed; DCU runtime pending                                            | Enable after BW1100 draft/target model mapping is available                                       | merged    |
 | C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_b.py`                                 | test           | Codex | port to new API | Accept official test deletion and migrate page-size/tree coverage plus the DCU disabled reason to the split test files                | medium | registration passed; DCU runtime pending                                            | Run new core/page/top-k suites on a DCU runner                                                     | merged    |
 | C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_beta.py`                              | test           | Codex | port to new API | Accept official beta-test deletion and preserve its DCU placeholder intent in the new EAGLE core/page suites                         | medium | registration passed; DCU runtime pending                                            | Validate EAGLE3 overlap, logprob parity, page-size 64, and graph replay on BW1100                  | merged    |
@@ -708,6 +709,10 @@ actual result in the checkpoint note.
     `layers/attention/triton_ops/metadata.py`. The DCU FA layout and SWA
     location translation remain in the backend; `cu_seqlens_q` is retained
     because the DCU varlen/decode paths still consume it.
+  - Runtime audit restored the DCU LightOp implementation of
+    `normal_decode_set_metadata` in the centralized metadata module. This was a
+    real C09 migration omission, but the failing DeepSeek-V4 runs use the DSV4
+    backend, so it does not explain their decode corruption.
   - DeepSeek-V4 uses official `init_forward_metadata_out_graph()` plus
     `init_forward_metadata_in_graph()`. Raw metadata is upgraded in-graph;
     the removed `_maybe_upgrade_forward_metadata()` hook is not restored.
@@ -723,6 +728,18 @@ actual result in the checkpoint note.
     registrations are preserved in the new core, page-size, and top-k suites.
   - `flash-attn-4` is accepted. The internal `sgl-deep-gemm==0.1.0` pin is
     retained pending a DCU package upgrade/compatibility decision for 0.1.2.
+  - Runtime accuracy follow-up: standalone CP+EP and PD decode both produce a
+    correct first token followed by corrupted CUDA Graph decode output. This
+    excludes PD transfer and EAGLE as necessary causes and points to DSV4 KV
+    write locations during graph replay.
+  - Official C10 commit `c9ca56da8c` fixes this exact lifetime problem by
+    recording full-to-SWA translation in `init_forward_metadata_in_graph()` and
+    removing the pool-level cross-forward cache. Its DSV4 changes were
+    backported while retaining DCU external FlashMLA, LightOp quant/store,
+    fused norm/RoPE/cache-write, and conservative HIP multi-stream paths.
+  - Direct C10 merge was rejected for this runtime fix: C10 contains 115
+    commits and 364 changed files, while merge-tree reports roughly 60
+    dual-modified conflicts. C09 accuracy must pass before C10 integration.
   - Automated validation completed:
     - no unmerged entries, precise marker scan, and `git diff --check`: passed.
     - full `python/sglang` and registered-test syntax compile: passed.
@@ -740,6 +757,9 @@ actual result in the checkpoint note.
       receives `LIGHTOP_GPU_CUS=None`. No test assertion was reached.
     - DCU model, graph, PD, HiCache, EAGLE, and kernel runtime validation remains
       pending on the target runner.
+    - SWA-loc backport validation: changed-file `py_compile`, targeted ruff,
+      `git diff --check`, and DCU registration with 212 files passed. Runtime
+      graph replay remains pending on a DCU node.
 - Recommended manual validation:
   - `deepseek-v4` / `attention`: pure TP, CP+EP, DP+EP+MTP112, PD prefill and
     decode, split FlashMLA prefill/decode, sparse prefill, CUDA graph to

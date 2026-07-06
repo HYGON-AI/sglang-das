@@ -106,6 +106,8 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     c4_sparse_topk: int
+    # SWA KV-store write target, refreshed once per forward/graph replay.
+    swa_out_cache_loc: Optional[torch.Tensor] = None
     c4_out_loc: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
@@ -160,6 +162,7 @@ class DSV4AttnMetadata:
                 "c4_sparse_page_indices",
             ],
             assign_fields=[
+                "swa_out_cache_loc",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
@@ -206,6 +209,7 @@ class DSV4AttnMetadata:
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
+        "swa_out_cache_loc",
         "c4_out_loc",
         "c128_out_loc",
     ]
@@ -672,6 +676,29 @@ class DeepseekV4HipRadixBackend(
                 raw_metadata=self.forward_metadata,
             )
 
+        metadata = self.forward_metadata
+        if (
+            isinstance(metadata, DSV4Metadata)
+            and forward_batch.out_cache_loc is not None
+        ):
+            out_cache_loc = forward_batch.out_cache_loc
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.topk > 0
+                and self.speculative_num_steps > 1
+            ):
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
+            metadata.core_attn_metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                    torch.int32
+                )
+            )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -693,14 +720,12 @@ class DeepseekV4HipRadixBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_sum = int(seq_lens.sum().item())
             seq_lens_cpu = seq_lens.cpu()
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
-            seq_lens_sum = forward_batch.seq_lens_sum
             seq_lens_cpu = forward_batch.seq_lens_cpu
 
         if actual_forward_mode == ForwardMode.IDLE:
@@ -712,7 +737,6 @@ class DeepseekV4HipRadixBackend(
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
             seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )
@@ -760,12 +784,20 @@ class DeepseekV4HipRadixBackend(
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
+            if out_cache_loc is not None:
+                out_cache_loc = torch.nn.functional.pad(
+                    out_cache_loc,
+                    pad=(0, num_tokens_per_bs * bs - len(out_cache_loc)),
+                    mode="constant",
+                    value=0,
+                )
             temp_metadata = self.init_forward_metadata_draft_extend(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 num_tokens_per_bs=num_tokens_per_bs,
+                out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=True,
             )
         else:
@@ -905,21 +937,36 @@ class DeepseekV4HipRadixBackend(
         if current_raw is not None:
             self.forward_metadata = current_raw
 
+    def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Resolve a current SWA write target without cross-forward caching."""
+        out_cache_loc = forward_batch.out_cache_loc
+        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        cached = core.swa_out_cache_loc if core is not None else None
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == out_cache_loc.shape[0]
+        ):
+            return cached
+        return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+            torch.int32
+        )
+
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        raw_loc = forward_batch.out_cache_loc
+        swa_loc = self.get_swa_out_cache_loc(forward_batch)
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
-                raw_loc=raw_loc,
+                swa_loc=swa_loc,
                 cache_k=swa_k,
             )
         else:
             swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
-                raw_loc=raw_loc,
+                swa_loc=swa_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
 

@@ -530,15 +530,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self._init_paged_compress_states(enable_memory_saver)
 
-        self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
-        self.cached_loc = None
-
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.cached_loc = None  # mapping replaced; discard any cached translation
 
     def invalidate_loc_cache(self) -> None:
-        self.cached_loc = None
+        # Compatibility with C09 graph runners. DSV4 locations now live in
+        # per-forward metadata, so there is no pool-level cache to invalidate.
+        pass
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
@@ -551,10 +549,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
     def get_cached_swa_loc(self, raw_loc: torch.Tensor, layer_id: int) -> torch.Tensor:
-        if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
-                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            return self.cached_loc
+        # Compatibility for out-of-tree DCU callers. Never retain graph input
+        # translations across forwards.
         return self.translate_loc_from_full_to_swa(raw_loc)
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
@@ -785,10 +781,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def set_swa_key_buffer_radix(
         self,
         layer_id: int,
-        raw_loc: torch.Tensor,
+        swa_loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ) -> None:
-        swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
         )
@@ -800,10 +795,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def set_swa_key_buffer_radix_fused(
         self,
         layer_id: int,
-        raw_loc: torch.Tensor,
+        swa_loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        swa_loc = self.get_cached_swa_loc(raw_loc, layer_id)
         return self.swa_kv_pool.set_key_buffer_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
@@ -811,14 +805,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
         layer_id: int,
-        raw_loc: torch.Tensor,
+        swa_loc: torch.Tensor,
         kv: torch.Tensor,
         kv_weight: torch.Tensor,
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        swa_loc = self.get_cached_swa_loc(raw_loc, layer_id)
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -833,16 +826,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def set_swa_key_buffer_radix_lightop_fused(
         self,
         layer_id: int,
-        raw_loc: torch.Tensor,
+        swa_loc: torch.Tensor,
         cache_k: torch.Tensor,
         eps: float = 1e-8,
     ) -> None:
-        if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
-                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
-        else:
-            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         return self.swa_kv_pool.set_key_buffer_lightop_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k, eps
         )
