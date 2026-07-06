@@ -180,6 +180,16 @@ actual result in the checkpoint note.
 | C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | port to new API | Import moved argparse actions, remove duplicate local definitions, and accept official KV-canary/parallel CLI                        | medium | compile/ruff; 48 unit tests passed and 8 blocked by no-device LightOp | CLI parse for DCU launch arguments, KV-canary default-off, and moe-dense-tp validation             | validated |
 | C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/speculative/eagle_info_v2.py`                                   | speculative    | Codex | manual merge    | Use official cache-location helper API with a single`_is_dcu` branch that preserves the DCU kvcache operator                         | high   | compile/ruff/registration passed; DCU runtime pending                 | EAGLE/MTP target verify, page-size-64 cache locations, graph replay, and fallback Triton path      | validated |
 | C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/speculative/eagle_worker_v2.py`                                 | speculative    | Codex | theirs          | Accept official KV-canary contexts around draft eager/graph execution while retaining existing DCU HIP top-k behavior                | high   | compile/ruff/registration passed; DCU runtime pending                 | EAGLE draft/decode graph, multi-step draft, MTP112, and KV-canary disabled/enabled smoke           | validated |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/pyproject.toml`                                                            | dependency     | Codex | manual merge    | Accept official FlashAttention 4 dependency while retaining the internally validated `sgl-deep-gemm==0.1.0` pin                      | medium | static install-flow audit passed; runtime pending                                       | DCU install/resolver smoke; assess upgrading the internal DeepGEMM package to 0.1.2                 | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py`                        | attention      | Codex | port to new API | Adopt the three-method metadata lifecycle and SM120 path; retain DCU external FlashMLA, LightOp quant cache, and sparse prefill       | high   | compile/ruff/registration passed; DCU runtime pending                             | DSV4 TP/CP/PD, split prefill/decode, graph to bs=128, sparse prefill, and FlashMLA                  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | attention      | Codex | manual merge    | Accept official FP4/SM120 indexer support while preserving DCU LightOp top-k as the sole DCU-priority transform                       | high   | compile/ruff/registration passed; DCU runtime pending                             | DCU FP8 index cache, LightOp top-k, graph replay; verify FP4 flag remains rejected off SM100        | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | port to new API | Move metadata kernels to official `triton_ops/metadata.py`, keep DCU FA layout/SWA translation, and restore required `cu_seqlens_q` | high   | compile/ruff/registration passed; DCU runtime pending                             | Dense/VLM, DSV4, SWA, cross-attention, speculative graph, and DCU FA-layout smoke                  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/model_executor/model_runner.py`                                 | model_executor | Codex | port to new API | Use official `hc_hidden_size` graph-buffer contract, which replaces the removed DSV4 PP proxy-shape argument                         | high   | compile/ruff/registration passed; DCU runtime pending                             | DeepSeek-V4 PP/PD startup, graph capture, flattened MHC hidden-state transfer                      | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/speculative/eagle_info_v2.py`                                   | speculative    | Codex | port to new API | Consume official centralized cache-location/EAGLE helpers; DCU operator dispatch moved with the helper rather than duplicated        | high   | compile/ruff/registration passed; DCU runtime pending                             | EAGLE/MTP draft and target verify, page-size 1/64, eager/graph, operator-disabled Triton fallback  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/speculative/spec_utils.py`                                      | speculative    | Codex | port to new API | Remove duplicated Triton cache kernels and import the official centralized helpers, including the migrated DCU req-pool operator     | high   | compile/ruff/registration passed; DCU runtime pending                             | Spec V1/V2 cache assignment, retract/abort, graph replay, and `SGLANG_ASSIGN_REQ_TO_TOKEN_POOL=0`  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_a.py`                                 | test           | Codex | port to new API | Accept official test deletion and migrate the DCU placeholder registration to the new core/top-k EAGLE suites                        | medium | registration passed; DCU runtime pending                                            | Enable after BW1100 draft/target model mapping is available                                       | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_b.py`                                 | test           | Codex | port to new API | Accept official test deletion and migrate page-size/tree coverage plus the DCU disabled reason to the split test files                | medium | registration passed; DCU runtime pending                                            | Run new core/page/top-k suites on a DCU runner                                                     | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_beta.py`                              | test           | Codex | port to new API | Accept official beta-test deletion and preserve its DCU placeholder intent in the new EAGLE core/page suites                         | medium | registration passed; DCU runtime pending                                            | Validate EAGLE3 overlap, logprob parity, page-size 64, and graph replay on BW1100                  | merged    |
 | C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml`                                                | ci             | TBD   | manual merge    | Keep official workflow structure and DCU runner/wheel overlays                                                                       | medium | CI dry-run and DCU registration check                                 | Fill exact runner/image validation command                                                         | open      |
 | C13 /`125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**`                                                                    | sgl-kernel     | TBD   | manual merge    | sgl-kernel interfaces and DCU/HIP glue both changed                                                                                  | high   | sgl-kernel DCU smoke whitelist                                        | Assign kernel owner                                                                                | open      |
 
@@ -673,9 +683,81 @@ actual result in the checkpoint note.
   - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112/PD disaggregation of intranode validation - ✅
   - CI test - ✅
 
-### C09-C10
+### C09 / `c55548ba115c`
 
-- Expected focus: embedding, mem_cache, attention, models, and workflows.
+- Expected focus: three-method attention metadata lifecycle, DSV4 FP4/SM120,
+  FlashAttention metadata kernel centralization, EAGLE test/helper refactor,
+  PD HiCache transfer, embedding replication, and mem-cache changes.
+- Owner: Codex for merge and static validation; DCU DSV4, speculative, PD,
+  HiCache, PP, and dependency owners for runtime validation.
+- Required validation:
+  - precise conflict-marker scan, changed-Python compile, targeted ruff, DCU
+    registration, DSA alias/CLI/env tests, and `gfx938` HIP build metadata.
+  - DSV4 pure TP, CP+EP, DP+EP+MTP, PD prefill/decode, sparse prefill, LightOp
+    top-k, FlashMLA, and CUDA graph capture/replay through `bs=128`.
+  - EAGLE/MTP cache-location operators and their Triton fallbacks with page
+    sizes 1 and 64, overlap on/off, retract/abort, and graph replay.
+  - HiCache optimistic prefetch/incremental transfer, dense/VLM attention,
+    embedding/reranker, and PP hidden-state transfer.
+- Notes:
+  - Branch: `sync/official-main-C09-20260602`.
+  - C09 contains 103 official commits and reported seven textual conflicts
+    plus three modify/delete test conflicts; checkpoint splitting was not
+    required.
+  - Official attention metadata kernels now live in
+    `layers/attention/triton_ops/metadata.py`. The DCU FA layout and SWA
+    location translation remain in the backend; `cu_seqlens_q` is retained
+    because the DCU varlen/decode paths still consume it.
+  - DeepSeek-V4 uses official `init_forward_metadata_out_graph()` plus
+    `init_forward_metadata_in_graph()`. Raw metadata is upgraded in-graph;
+    the removed `_maybe_upgrade_forward_metadata()` hook is not restored.
+  - DCU keeps the external FlashMLA adapter, split prefill/decode behavior,
+    sparse-prefill workspace, LightOp KV quantization, and LightOp top-k.
+    SM120 and other non-DCU platforms use the official C09 implementations.
+  - Official FP4 indexer support is accepted but remains guarded by the
+    existing SM100 server-argument check, so gfx938 DCU stays on FP8.
+  - EAGLE cache-location kernels are centralized in
+    `speculative/triton_ops/cache_locs.py`; both DCU kvcache operators and
+    their `SGLANG_ASSIGN_*` fallback switches moved into that module.
+  - The old EAGLE A/B/Beta files are removed upstream. Their DCU disabled
+    registrations are preserved in the new core, page-size, and top-k suites.
+  - `flash-attn-4` is accepted. The internal `sgl-deep-gemm==0.1.0` pin is
+    retained pending a DCU package upgrade/compatibility decision for 0.1.2.
+  - Automated validation completed:
+    - no unmerged entries, precise marker scan, and `git diff --check`: passed.
+    - full `python/sglang` and registered-test syntax compile: passed.
+    - targeted `E9/F401/F811/F821/F841` ruff gate: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+      registered files; the new EAGLE core/page/top-k placeholders are present.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls and 50 converted kernel launches.
+    - AST dispatch check confirmed both centralized DCU cache-location calls
+      and their Triton fallback branches.
+    - the EAGLE top-k=1 fast-path unit test was attempted but blocked during
+      collection because this host has no HIP device; installed `lightop`
+      receives `LIGHTOP_GPU_CUS=None`. No test assertion was reached.
+    - DCU model, graph, PD, HiCache, EAGLE, and kernel runtime validation remains
+      pending on the target runner.
+- Recommended manual validation:
+  - `deepseek-v4` / `attention`: pure TP, CP+EP, DP+EP+MTP112, PD prefill and
+    decode, split FlashMLA prefill/decode, sparse prefill, CUDA graph to
+    `bs=128`, three repeated requests, and GSM8K 10.
+  - `speculative`: EAGLE3/MTP eager and graph, page-size 1/64, cache-location
+    operator enabled/disabled, overlap on/off, abort/retract, and logprob parity.
+  - `mem_cache` / `disaggregation`: HiCache optimistic prefetch, incremental
+    transfer, radix reuse/eviction, and Mooncake/NIXL paths used internally.
+  - `model_executor`: DeepSeek-V4 PP hidden-state shape and PD startup.
+  - `model`: Qwen2.5 dense/VLM, embedding, reranker, and replicated embedding.
+  - `dependency`: DCU install/resolver and import checks with FlashAttention 4
+    present or intentionally omitted by the internal image.
+- Manual validation result:
+  - TBD
+
+### C10 / `47377525cb32`
+
+- Expected focus: CI, mem_cache, and attention.
 - Owner: TBD
 - Required validation:
   - Stage-b small model smoke.
