@@ -127,6 +127,23 @@ jobs:
           print("Encoding check passed.")
           PY
 
+  hcu-runtime-text-check:
+    name: hcu-runtime-text-check
+    needs: changed-files
+    if: needs.changed-files.outputs.has_files == 'true'
+    runs-on: [self-hosted, linux, x64, quality]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check HCU user-visible runtime text
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
+        run: |
+          python3 scripts/ci/dcu/check_no_amd_runtime_text.py ${CHANGED_FILES}
+
   secret-check:
     name: secret-check
     runs-on: [self-hosted, linux, x64, quality]

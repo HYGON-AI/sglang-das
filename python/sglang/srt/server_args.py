@@ -2086,7 +2086,6 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             hip_aiter_enabled = is_hip() and envs.SGLANG_USE_AITER.get()
-            hip_aiter_platform = "ROCm"
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
@@ -2102,14 +2101,14 @@ class ServerArgs:
                 elif hip_aiter_enabled and is_mxfp4_quant_format:
                     self.moe_runner_backend = "auto"
                     logger.warning(
-                        f"Detected {hip_aiter_platform} and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
+                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
                 elif hip_aiter_enabled:
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
                     self.moe_runner_backend = "triton"
                     logger.warning(
-                        f"Detected {hip_aiter_platform} with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
+                        "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
                     )
                 elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
                     self.moe_runner_backend = "deep_gemm"
