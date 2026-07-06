@@ -158,7 +158,7 @@ def is_npu() -> bool:
     return True
 
 @lru_cache(maxsize=1)
-def is_dcu() -> bool:
+def is_hcu() -> bool:
     if not is_hip():
         return False
     try:
@@ -167,19 +167,23 @@ def is_dcu() -> bool:
         supported_archs = ["gfx936", "gfx938", "gfx928"]
         return any(gfx in gcn_arch for gfx in supported_archs)
     except Exception as e:
-        logger.warning("DCU detection failed (not a DCU or HIP misconfigured): %s", e)
+        logger.warning("HCU detection failed (not an HCU or HIP misconfigured): %s", e)
         return False
+
+
+def is_dcu() -> bool:
+    return is_hcu()
 
 
 @lru_cache(maxsize=1)
 def is_dcu_native_fp8_supported() -> bool:
-    if not is_dcu():
+    if not is_hcu():
         return False
     try:
         gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
         return "gfx938" in gcn_arch
     except Exception as e:
-        logger.warning("DCU native FP8 detection failed: %s", e)
+        logger.warning("HCU native FP8 detection failed: %s", e)
         return False
 
 @lru_cache(maxsize=1)
@@ -1623,7 +1627,7 @@ def get_amdgpu_memory_capacity():
         return min(memory_values)
 
     except FileNotFoundError:
-        if is_dcu():
+        if is_hcu():
             raise RuntimeError(
                 "rocminfo not found. Ensure HCU ROCm-compatible drivers are installed and accessible."
             )

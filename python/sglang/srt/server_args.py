@@ -52,7 +52,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
-    is_dcu,
+    is_hcu,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -1880,7 +1880,7 @@ class ServerArgs:
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 
-                    if is_hip() and not is_dcu() and not aiter_can_use_preshuffle_paged_mqa():
+                    if is_hip() and not is_hcu() and not aiter_can_use_preshuffle_paged_mqa():
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                         # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
@@ -2536,7 +2536,7 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa() or is_npu() or is_dcu()
+                is_cuda() or is_musa() or is_npu() or is_hcu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
@@ -2576,7 +2576,7 @@ class ServerArgs:
             else:
                 if not self.disable_radix_cache:
                     if is_hip():
-                        platform = "HCU devices" if is_dcu() else "ROCm devices"
+                        platform = "HCU devices" if is_hcu() else "ROCm devices"
                         # On ROCm, extra_buffer is unsupported.
                         # Automatically disable radix cache instead.
                         logger.warning(
@@ -3179,7 +3179,7 @@ class ServerArgs:
             logger.warning(
                 "LightOp MoE runner is a transitional backend and may be deprecated in future releases. Please use AITER MoE runner."
             )
-            assert is_dcu(), "lightop MoE runner backend is only supported on HCU."
+            assert is_hcu(), "lightop MoE runner backend is only supported on HCU."
             assert (
                 self.quantization == "w8a8_int8"
             ), "lightop MoE runner backend currently supports only w8a8_int8 quantization."
@@ -3189,7 +3189,7 @@ class ServerArgs:
             )
 
         if self.moe_runner_backend == "aiter" and self.quantization == "w8a8_int8":
-            assert is_dcu(), (
+            assert is_hcu(), (
                 "aiter MoE runner backend with w8a8_int8 quantization is only "
                 "supported on HCU."
             )
@@ -4432,7 +4432,7 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    platform = "HCU/ROCm" if is_dcu() else "AMD/ROCm"
+                    platform = "HCU/ROCm" if is_hcu() else "AMD/ROCm"
                     # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
@@ -4451,7 +4451,7 @@ class ServerArgs:
             return
         # On HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
-            platform = "HCU devices" if is_dcu() else "AMD GPUs"
+            platform = "HCU devices" if is_hcu() else "AMD GPUs"
             if not self.disable_cuda_graph:
                 logger.warning(
                     f"Cuda graph is disabled for diffusion LLM inference on {platform}"

@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_dcu, is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_hcu, is_hip, is_mps, is_musa, is_npu
 
 
 def is_cuda_v2():
@@ -227,7 +227,7 @@ class HIPEnv(BaseEnv):
 
     def __init__(self):
         super().__init__()
-        self.is_hcu = is_dcu()
+        self.is_hcu = is_hcu()
 
     def get_info(self):
         runtime_available = torch.cuda.is_available()

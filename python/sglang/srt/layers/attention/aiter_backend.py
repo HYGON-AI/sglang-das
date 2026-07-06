@@ -26,9 +26,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_dcu, is_gfx95_supported
+from sglang.srt.utils import is_hcu, is_gfx95_supported
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -50,7 +50,7 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
-    if _is_dcu:
+    if _is_hcu:
         print(
             "Please make sure aiter is installed on your HCU device."
         )

@@ -18,16 +18,16 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.utils import BAR_FORMAT, is_hip, is_dcu, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, is_hip, is_hcu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
     from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
@@ -142,7 +142,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         if not _is_hip:
-            quark_platform = "HCU devices" if _is_dcu else "AMD GPUs"
+            quark_platform = "HCU devices" if _is_hcu else "AMD GPUs"
             raise NotImplementedError(
                 f"The quark_int4fp8_moe online quantization scheme is only supported on {quark_platform}."
             )
