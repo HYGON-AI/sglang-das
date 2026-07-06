@@ -773,7 +773,9 @@ actual result in the checkpoint note.
   - `dependency`: DCU install/resolver and import checks with FlashAttention 4
     present or intentionally omitted by the internal image.
 - Manual validation result:
-  - TBD
+  - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - SGLANG_USE_AITER_AG=0 to ensure accuracy ✅ （temporarily disable it）
+  - CI test - ✅
 
 ### C10 / `47377525cb32`
 
