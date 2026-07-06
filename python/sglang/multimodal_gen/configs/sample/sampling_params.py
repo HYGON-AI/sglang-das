@@ -176,6 +176,7 @@ class SamplingParams:
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
     num_profiled_timesteps: int = field(default=5, metadata={"batch_sig_exclude": True})
+    profile_start_step: int = field(default=0, metadata={"batch_sig_exclude": True})
     profile_all_stages: bool = field(
         default=False, metadata={"batch_sig_exclude": True}
     )

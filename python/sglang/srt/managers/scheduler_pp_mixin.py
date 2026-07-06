@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import ExpertDistributionReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -82,8 +83,26 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
+                    # Expert-distribution dump performs a world-group collective.
+                    # Forward its control request before handling it locally so
+                    # downstream PP stages can enter the same collective.
+                    preforward_expert_distribution_req = (
+                        not self.pp_group.is_last_rank
+                        and any(
+                            isinstance(req, ExpertDistributionReq) for req in recv_reqs
+                        )
+                    )
+                    if preforward_expert_distribution_req:
+                        self._pp_commit_comm_work(self.send_req_work)
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                if (
+                    not self.pp_group.is_last_rank
+                    and not preforward_expert_distribution_req
+                ):
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -614,10 +633,6 @@ class SchedulerPPMixin:
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
 
-                hs = (
-                    getattr(model_config, "hc_hidden_size", None)
-                    or model_config.hidden_size
-                )
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
                         get_pp_proxy_hidden_states_shape(
@@ -1419,11 +1434,11 @@ class ChunkSizePredictor:
     def set_target_latency(self, base_chunk_size: int):
         """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
 
-        def f(l: float) -> float:
+        def f(length: float) -> float:
             """Total latency function: f(l) = al^2 + bl + c (or bl + c for linear)"""
             return (
-                self.quadratic_coeff_a * l * l
-                + self.linear_coeff_b * l
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
                 + self.constant_coeff_c
             )
 

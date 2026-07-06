@@ -474,6 +474,10 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            # Keep this list aligned with get_contiguous_buf_infos(): speculative
+            # intermediate buffers are not registered for PD state transfer.
+            if field in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
                 state_tensors.extend(value)

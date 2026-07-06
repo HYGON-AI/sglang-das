@@ -841,6 +841,29 @@ class MooncakeKVManager(CommonKVManager):
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
             self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
         )
+        ptr_lengths = {
+            "src_k": len(src_k_ptrs),
+            "src_v": len(src_v_ptrs),
+            "dst_k": len(dst_k_ptrs),
+            "dst_v": len(dst_v_ptrs),
+        }
+        min_ptr_layers = min(ptr_lengths.values()) if ptr_lengths else 0
+        if min_ptr_layers < layers_current_pp_stage:
+            logger.error(
+                "[%s] MHA slice pointer length mismatch: layers_current_pp_stage=%s, "
+                "ptr_lengths=%s, prefill_start_layer=%s, src_kv_ptrs=%s, "
+                "dst_kv_ptrs=%s, attn_tp_size=%s, dst_tp_rank=%s, dst_attn_tp_size=%s",
+                mooncake_session_id,
+                layers_current_pp_stage,
+                ptr_lengths,
+                self.kv_args.prefill_start_layer,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+                self.attn_tp_size,
+                dst_tp_rank,
+                dst_attn_tp_size,
+            )
+            return -1
 
         # Calculate offsets / transfer sizes
         if _kv_layout_dcu_fa:
@@ -1153,14 +1176,81 @@ class MooncakeKVManager(CommonKVManager):
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
+        dst_tensor_indices = self._get_mamba_state_tensor_indices(
+            len(src_state_data_ptrs), len(dst_state_data_ptrs)
+        )
+        dst_state_data_ptrs = [dst_state_data_ptrs[i] for i in dst_tensor_indices]
+
         transfer_blocks = []
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        state_tensor_count = min(
+            len(src_state_data_ptrs),
+            len(src_state_item_lens),
+            len(dst_state_data_ptrs),
+        )
+        if state_tensor_count < len(dst_state_data_ptrs):
+            logger.warning_once(
+                "Skip decode-only Mamba state tensors during PD transfer: "
+                f"src_state_data_ptrs={len(src_state_data_ptrs)}, "
+                f"src_state_item_lens={len(src_state_item_lens)}, "
+                f"dst_state_data_ptrs={len(dst_state_data_ptrs)}."
+            )
+        for i, dst_state_ptr in enumerate(dst_state_data_ptrs[:state_tensor_count]):
             length = src_state_item_lens[i]
             src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _get_mamba_state_tensor_indices(
+        self, src_state_tensor_count: int, dst_state_tensor_count: int
+    ) -> list[int]:
+        fallback_count = min(src_state_tensor_count, dst_state_tensor_count)
+        fallback_indices = list(range(fallback_count))
+
+        hf_text_config = getattr(self.model_config, "hf_text_config", None)
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        if layer_types is None:
+            layer_types = getattr(hf_text_config, "layers_block_type", None)
+        if not layer_types:
+            return fallback_indices
+
+        linear_layer_ids = [
+            layer_id
+            for layer_id, layer_type in enumerate(layer_types)
+            if str(layer_type).endswith("linear_attention")
+            or str(layer_type) == "linear_attention"
+        ]
+        if not linear_layer_ids or dst_state_tensor_count % len(linear_layer_ids) != 0:
+            return fallback_indices
+
+        tensors_per_layer = dst_state_tensor_count // len(linear_layer_ids)
+        if tensors_per_layer <= 0 or src_state_tensor_count % tensors_per_layer != 0:
+            return fallback_indices
+
+        # MambaPool stores state tensors grouped by tensor type, e.g.
+        # [conv for all linear layers, temporal for all linear layers].
+        # Decode has all layers, while a PP prefill rank only has its local layers.
+        start_layer = self.kv_args.prefill_start_layer
+        compact_start_layer = sum(
+            1 for layer_id in linear_layer_ids if layer_id < start_layer
+        )
+        stage_layer_count = src_state_tensor_count // tensors_per_layer
+
+        dst_indices = []
+        for tensor_group_id in range(tensors_per_layer):
+            group_base = tensor_group_id * len(linear_layer_ids)
+            group_start = group_base + compact_start_layer
+            group_end = group_start + stage_layer_count
+            if group_end > group_base + len(linear_layer_ids):
+                return fallback_indices
+            dst_indices.extend(range(group_start, group_end))
+
+        if len(dst_indices) != src_state_tensor_count or any(
+            index >= dst_state_tensor_count for index in dst_indices
+        ):
+            return fallback_indices
+        return dst_indices
 
     def _send_mamba_state_slice(
         self,
@@ -1206,8 +1296,35 @@ class MooncakeKVManager(CommonKVManager):
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
+        dst_tensor_indices = self._get_mamba_state_tensor_indices(
+            len(src_state_data_ptrs), len(dst_state_data_ptrs)
+        )
+        dst_state_data_ptrs = [dst_state_data_ptrs[i] for i in dst_tensor_indices]
+        dst_state_item_lens = [dst_state_item_lens[i] for i in dst_tensor_indices]
+        dst_state_dim_per_tensor = [
+            dst_state_dim_per_tensor[i] for i in dst_tensor_indices
+        ]
+
         transfer_blocks = []
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        state_tensor_count = min(
+            len(src_state_data_ptrs),
+            len(src_state_item_lens),
+            len(src_state_dim_per_tensor),
+            len(dst_state_data_ptrs),
+            len(dst_state_item_lens),
+            len(dst_state_dim_per_tensor),
+        )
+        if state_tensor_count < len(dst_state_data_ptrs):
+            logger.warning_once(
+                "Skip decode-only Mamba state tensors during sliced PD transfer: "
+                f"src_state_data_ptrs={len(src_state_data_ptrs)}, "
+                f"src_state_item_lens={len(src_state_item_lens)}, "
+                f"src_state_dim_per_tensor={len(src_state_dim_per_tensor)}, "
+                f"dst_state_data_ptrs={len(dst_state_data_ptrs)}, "
+                f"dst_state_item_lens={len(dst_state_item_lens)}, "
+                f"dst_state_dim_per_tensor={len(dst_state_dim_per_tensor)}."
+            )
+        for i, dst_state_ptr in enumerate(dst_state_data_ptrs[:state_tensor_count]):
             src_item_len = src_state_item_lens[i]
             dst_item_len = dst_state_item_lens[i]
             src_dim = src_state_dim_per_tensor[i]
@@ -1242,7 +1359,6 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr = (
                 dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_dim_offset
             )
-
             transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)

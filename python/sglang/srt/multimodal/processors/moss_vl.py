@@ -555,40 +555,35 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                 for item in mm_items:
                     if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
                         sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                            self.cudaipc_mmfeature_pool.return_slices_with_flags(
                                 item.feature
                             )
                         )
-                        if isinstance(available_slice, torch.Tensor):
-                            available_slice.copy_(
-                                item.feature.reshape(-1).view(torch.int8),
-                                non_blocking=True,
-                            )
+                        if isinstance(available_slice, dict):
                             item.feature = CudaIpcTensorTransportProxy(
                                 data=available_slice,
                                 info_data=item.feature,
                                 sync_buffer_meta=sync_flag,
                             )
+                        elif not self.server_args.keep_mm_feature_on_device:
+                            item.feature = item.feature.cpu()
                     elif (
                         isinstance(item.precomputed_embeddings, torch.Tensor)
                         and item.precomputed_embeddings.is_cuda
                     ):
                         sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                            self.cudaipc_mmfeature_pool.return_slices_with_flags(
                                 item.precomputed_embeddings
                             )
                         )
-                        if isinstance(available_slice, torch.Tensor):
-                            flattened = item.precomputed_embeddings.reshape(-1)
-                            available_slice.copy_(
-                                flattened.view(torch.int8),
-                                non_blocking=True,
-                            )
+                        if isinstance(available_slice, dict):
                             item.precomputed_embeddings = CudaIpcTensorTransportProxy(
                                 data=available_slice,
                                 info_data=item.precomputed_embeddings,
                                 sync_buffer_meta=sync_flag,
                             )
+                        elif not self.server_args.keep_mm_feature_on_device:
+                            item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),

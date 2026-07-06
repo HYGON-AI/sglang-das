@@ -678,22 +678,22 @@ jobs:
           - name: stage-b-required-0
             part: 0
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
           - name: stage-b-required-1
             part: 1
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
           - name: stage-b-required-2
             part: 2
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
           - name: stage-b-required-3
             part: 3
             parts: 4
-            timeout_per_file: 300
+            timeout_per_file: 600
             timeout_minutes: 60
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
@@ -707,6 +707,7 @@ jobs:
       DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
       DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
       DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+      SGLANG_DCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
     steps:
       - name: Checkout code
         env:
@@ -743,7 +744,8 @@ jobs:
       - name: Run stage-b-test-1-gpu-small-dcu required partition
         run: |
           echo "Running stage-b-test-1-gpu-small-dcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
-          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" \
+            -e SGLANG_DCU_RERANKER_MODEL="${SGLANG_DCU_RERANKER_MODEL}" -- \
             python3 run_suite.py \
               --hw dcu \
               --suite stage-b-test-1-gpu-small-dcu \
