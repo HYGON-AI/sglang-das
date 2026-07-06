@@ -10,6 +10,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.metadata import (
     normal_decode_set_metadata,
+    normal_decode_set_metadata_lightop,
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -2148,24 +2149,43 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
 
-                    normal_decode_set_metadata(
-                        metadata.cache_seqlens_int32,
-                        metadata.cu_seqlens_k,
-                        metadata.page_table,
-                        self.req_to_token,
-                        req_pool_indices,
-                        self.decode_cuda_graph_metadata["strided_indices"],
-                        max_seq_pages,
-                        seq_lens,
-                        self.speculative_step_id + 1,
-                        self.page_size,
-                        metadata.swa_page_table,
-                        (
-                            self.token_to_kv_pool
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
-                    )
+                    if _is_dcu:
+                        normal_decode_set_metadata_lightop(
+                            metadata.cache_seqlens_int32,
+                            metadata.cu_seqlens_k,
+                            metadata.page_table,
+                            self.req_to_token,
+                            req_pool_indices,
+                            max_seq_pages,
+                            seq_lens,
+                            self.speculative_step_id + 1,
+                            self.page_size,
+                            metadata.swa_page_table,
+                            (
+                                self.token_to_kv_pool
+                                if self.use_sliding_window_kv_pool
+                                else None
+                            ),
+                        )
+                    else:
+                        normal_decode_set_metadata(
+                            metadata.cache_seqlens_int32,
+                            metadata.cu_seqlens_k,
+                            metadata.page_table,
+                            self.req_to_token,
+                            req_pool_indices,
+                            self.decode_cuda_graph_metadata["strided_indices"],
+                            max_seq_pages,
+                            seq_lens,
+                            self.speculative_step_id + 1,
+                            self.page_size,
+                            metadata.swa_page_table,
+                            (
+                                self.token_to_kv_pool
+                                if self.use_sliding_window_kv_pool
+                                else None
+                            ),
+                        )
 
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -2222,20 +2242,43 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
-                normal_decode_set_metadata(
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table,
-                    self.req_to_token,
-                    req_pool_indices,
-                    self.decode_cuda_graph_metadata["strided_indices"],
-                    max_seq_pages,
-                    seq_lens,
-                    0,
-                    self.page_size,
-                    metadata.swa_page_table,
-                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
-                )
+                if _is_dcu:
+                    normal_decode_set_metadata_lightop(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        (
+                            self.token_to_kv_pool
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
+                    )
+                else:
+                    normal_decode_set_metadata(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        self.decode_cuda_graph_metadata["strided_indices"],
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        (
+                            self.token_to_kv_pool
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
+                    )
 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,

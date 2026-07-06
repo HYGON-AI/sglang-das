@@ -322,6 +322,45 @@ def _fused_metadata_kernel_ps1_no_swa(
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
 
+def normal_decode_set_metadata_lightop(
+    cache_seqlens_int32: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    max_seq_pages: int,
+    seq_lens: torch.Tensor,
+    seq_len_delta: int,
+    page_size: int,
+    swa_page_table: Optional[torch.Tensor] = None,
+    token_to_kv_pool: Optional["SWAKVPool"] = None,
+):
+    assert (
+        page_size > 0 and (page_size & (page_size - 1)) == 0
+    ), f"page_size must be a power of two, got {page_size}"
+    use_swa = swa_page_table is not None and token_to_kv_pool is not None
+
+    from lightop import fused_metadata_kernel_general
+
+    fused_metadata_kernel_general(
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        cache_seqlens_int32=cache_seqlens_int32,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=page_table,
+        swa_page_table=swa_page_table if use_swa else None,
+        full_to_swa_mapping=(
+            token_to_kv_pool.full_to_swa_index_mapping if use_swa else None
+        ),
+        B=cache_seqlens_int32.shape[0],
+        max_seq_pages=max_seq_pages,
+        page_size=page_size,
+        seq_len_delta=seq_len_delta,
+        use_swa=use_swa,
+    )
+
+
 def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
