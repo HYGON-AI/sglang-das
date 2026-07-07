@@ -2215,9 +2215,15 @@ class ServerArgs:
                 effective_attn_tp_size = (
                     self.tp_size // attn_dp_size // self.attn_cp_size
                 )
+                # When effective_attn_tp_size == 1, attention does not apply TP
+                # splitting, so the expected_attn_tp_size check is skipped. In
+                # this case, the fused qkv_proj weights (which are stored with
+                # TP-interleaved layout) will be reordered and loaded in full
+                # by the weight loader.
                 if (
                     expected_attn_tp_size is not None
                     and effective_attn_tp_size != expected_attn_tp_size
+                    and effective_attn_tp_size != 1
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
