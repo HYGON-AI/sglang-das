@@ -150,6 +150,10 @@ jobs:
             -c https.proxy= \
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
+          git config --local http.https://github.com.proxy ""
+          git config --local http.proxy ""
+          git config --local https.proxy ""
 
       - name: Determine run mode
         id: run-mode
