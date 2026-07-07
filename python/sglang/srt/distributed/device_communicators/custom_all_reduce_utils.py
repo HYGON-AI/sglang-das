@@ -42,7 +42,7 @@ if _is_musa:
     except ImportError as e:
         logger.warning("Failed to import pymtml with %r", e)
 
-if _is_hip:
+if _is_hip and not _is_hcu:
     try:
         from amdsmi import (
             AmdSmiException,
@@ -333,6 +333,9 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     @wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if _is_hcu:
+            return fn(*args, **kwargs)
+
         if _is_hip:
             try:
                 amdsmi_init()
@@ -351,6 +354,9 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 @with_nvml_context
 def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
+    if _is_hcu:
+        return False
+
     if _is_hip:
         """
         query if the set of gpus are fully connected by xgmi (1 hop)
@@ -366,10 +372,7 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                             return False
                     except AmdSmiException as error:
                         if _is_hcu:
-                            logger.error(
-                                "HCU 1 hop HSL detection failed.",
-                                exc_info=error,
-                            )
+                            logger.error("HCU 1 hop HSL detection failed.")
                         else:
                             logger.error(
                                 "AMD 1 hop XGMI detection failed.",
