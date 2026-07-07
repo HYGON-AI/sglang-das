@@ -14,11 +14,11 @@ from sglang.jit_kernel.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    is_dcu,
+    is_hcu,
     get_bool_env_var
 )
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_linear_bf16_fp32_use_blaslt = get_bool_env_var("SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT")
 
 if TYPE_CHECKING:
@@ -978,7 +978,7 @@ def rmsnorm_self(
 def _jit_torch_cublas_bf16_fp32() -> Any:
     import torch.utils.cpp_extension
 
-    if _is_dcu and _use_linear_bf16_fp32_use_blaslt:
+    if _is_hcu and _use_linear_bf16_fp32_use_blaslt:
         source = """
         #include <torch/extension.h>
         #include <ATen/cuda/CUDAContext.h> 

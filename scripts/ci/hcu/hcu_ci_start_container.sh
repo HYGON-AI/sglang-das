@@ -115,7 +115,8 @@ docker run -dt --user root --privileged \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name "${CONTAINER}" \
-  "${IMAGE}"
+  "${IMAGE}" \
+  tail -f /dev/null
 
 # Git >= 2.35.2 refuses cross-user repos; mark the mount as safe.
 docker exec "${CONTAINER}" git config --global --add safe.directory /sglang-checkout

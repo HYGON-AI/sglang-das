@@ -112,7 +112,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_dcu,
+    is_hcu,
     is_npu,
     is_xpu,
 )
@@ -129,7 +129,7 @@ from sglang.srt.layers.dp_attention import get_attention_dp_rank,get_attention_d
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -211,7 +211,7 @@ if _use_lightop:
     from lightop import op as op
 
 
-def moe_fused_gate_dcu(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
+def moe_fused_gate_hcu(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
                                    topk_group: int, topk: int,
                                    num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
     topk_weights, topk_ids = op.moe_fused_gate(
@@ -235,8 +235,8 @@ def moe_fused_gate_fake(gating_output: torch.Tensor, correction_bias: torch.Tens
                            dtype=gating_output.dtype,
                            device=gating_output.device)
 direct_register_custom_op(
-        op_name="moe_fused_gate_dcu",
-        op_func=moe_fused_gate_dcu,
+        op_name="moe_fused_gate_hcu",
+        op_func=moe_fused_gate_hcu,
         mutates_args=[],
         fake_impl=moe_fused_gate_fake,
     )
@@ -691,7 +691,7 @@ def fused_topk(
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
             )
-        elif _is_dcu and _use_fused_topk_softmax:
+        elif _is_hcu and _use_fused_topk_softmax:
             from lightop import op
             op.topk_softmax(
                 topk_weights,
@@ -1261,7 +1261,7 @@ def biased_grouped_topk_gpu(
         )
     elif _use_lightop:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_dcu(
+        topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_hcu(
             gating_output,
             correction_bias,
             num_expert_group,

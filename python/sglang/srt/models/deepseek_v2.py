@@ -178,7 +178,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_npu,
     is_gfx95_supported,
     is_hip,
@@ -203,7 +203,7 @@ from sglang.srt.distributed import (
 import tqdm
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -1066,7 +1066,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _is_musa
-            and not _is_dcu
+            and not _is_hcu
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
@@ -2215,7 +2215,7 @@ class DeepseekV2AttentionMLA(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
-        elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_dcu:
+        elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_hcu:
             # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),

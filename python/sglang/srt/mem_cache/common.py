@@ -15,7 +15,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils import support_triton,get_bool_env_var
-from sgl_kernel.kvcacheio import dcu_get_last_loc
+from sgl_kernel.kvcacheio import hcu_get_last_loc
 
 _is_hip = is_hip()
 
@@ -186,7 +186,7 @@ def get_last_loc(
             impl = get_last_loc_torch
     use_sglang_get_last_loc = get_bool_env_var("SGLANG_GET_LAST_LOC", default="true")
     if use_sglang_get_last_loc:
-        impl = dcu_get_last_loc
+        impl = hcu_get_last_loc
     return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
 
 

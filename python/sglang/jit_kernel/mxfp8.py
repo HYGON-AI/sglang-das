@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 def _mxfp8_cuda_flags() -> list[str]:
     return [
         "-DNDEBUG",
-        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-        "-DCUTLASS_VERSIONS_GENERATED",
-        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+        "-HCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+        "-HCUTLASS_VERSIONS_GENERATED",
+        "-HCUTLASS_DEBUG_TRACE_LEVEL=0",
         "--expt-extended-lambda",
     ]
 

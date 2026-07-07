@@ -55,7 +55,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, get_int_env_var, is_hip, is_npu, is_dcu, \
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, get_int_env_var, is_hip, is_npu, is_hcu, \
     direct_register_custom_op
 from sglang.srt.utils.offloader import get_offloader
 
@@ -76,7 +76,7 @@ from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
@@ -85,7 +85,7 @@ _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", 
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
 
-if _use_aiter and not _is_dcu:
+if _use_aiter and not _is_hcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 elif _is_npu:
@@ -504,7 +504,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = True
             self.use_bf16_marlin = False
-        elif _use_fp8_w8a8_moe and _is_dcu:
+        elif _use_fp8_w8a8_moe and _is_hcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = True
             self.use_block_quant = False
@@ -512,7 +512,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
-        elif _use_marlin_w16a16_moe and _is_dcu:
+        elif _use_marlin_w16a16_moe and _is_hcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False

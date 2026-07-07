@@ -845,8 +845,8 @@ def relaxed_source_stats_lookup(
                 continue
             score = prefix_len
             if lowered_compact.startswith(
-                "voidcutlassdevicekernelflash"
-            ) and candidate_compact.startswith("voidcutlassdevicekernelflash"):
+                "voihcutlassdevicekernelflash"
+            ) and candidate_compact.startswith("voihcutlassdevicekernelflash"):
                 score += 32
             if score > best_score:
                 best_key = candidate_key

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DCU PR CI 流程可视化交接</title>
+  <title>HCU PR CI 流程可视化交接</title>
   <style>
     :root {
       --bg: #f6f7f3;
@@ -428,16 +428,16 @@
 <body>
   <main class="page">
     <header>
-      <div class="eyebrow"><span class="dot"></span>DCU PR CI Visual Handoff</div>
-      <h1>DCU 官方 PR CI 对齐流程</h1>
+      <div class="eyebrow"><span class="dot"></span>HCU PR CI Visual Handoff</div>
+      <h1>HCU 官方 PR CI 对齐流程</h1>
       <p class="subtitle">
-        这页用于解释我们新增的 DCU PR CI 代码、runner/container 执行关系、测试注册收集逻辑，以及后续合入官方仓库时的推进路线。
+        这页用于解释我们新增的 HCU PR CI 代码、runner/container 执行关系、测试注册收集逻辑，以及后续合入官方仓库时的推进路线。
       </p>
       <div class="meta">
-        <span class="pill">当前分支：dcu-pr-ci-testcase-integration</span>
+        <span class="pill">当前分支：hcu-pr-ci-testcase-integration</span>
         <span class="pill">最新本地提交：b13fad059</span>
         <span class="pill">GitHub E2E：26491648762 success</span>
-        <span class="pill">DCU registered：205 files</span>
+        <span class="pill">HCU registered：205 files</span>
       </div>
     </header>
 
@@ -456,7 +456,7 @@
           <div class="node">
             <span class="k">check</span>
             <h3>check-changes</h3>
-            <p>判断是否改到 DCU 相关路径，并决定跑 Stage A/B。</p>
+            <p>判断是否改到 HCU 相关路径，并决定跑 Stage A/B。</p>
           </div>
           <div class="node amber">
             <span class="k">gate</span>
@@ -466,21 +466,21 @@
           <div class="node">
             <span class="k">config</span>
             <h3>validate-config</h3>
-            <p>检查 <code>DCU_CI_RUNNER_LABEL</code> 和 <code>DCU_CI_IMAGE</code>。</p>
+            <p>检查 <code>HCU_CI_RUNNER_LABEL</code> 和 <code>HCU_CI_IMAGE</code>。</p>
           </div>
           <div class="node blue">
             <span class="k">runner</span>
-            <h3>self-hosted DCU</h3>
-            <p>GitHub 按 runner label 把 job 调度到 DCU 节点。</p>
+            <h3>self-hosted HCU</h3>
+            <p>GitHub 按 runner label 把 job 调度到 HCU 节点。</p>
           </div>
           <div class="node blue">
             <span class="k">test</span>
             <h3>Stage A/B matrix</h3>
-            <p>容器内执行 <code>run_suite.py --hw dcu</code>，Stage B 两分片。</p>
+            <p>容器内执行 <code>run_suite.py --hw hcu</code>，Stage B 两分片。</p>
           </div>
           <div class="node green">
             <span class="k">finish</span>
-            <h3>PR Test (DCU) finish</h3>
+            <h3>PR Test (HCU) finish</h3>
             <p>聚合所有依赖 job，作为最终 required check 候选。</p>
           </div>
         </div>
@@ -496,7 +496,7 @@
         <div class="panel swimlane">
           <div class="lane">
             <strong>机器侧</strong>
-            <span>在 DCU 节点安装 GitHub Actions self-hosted runner，并给它打 label，例如 <code>nmz26-dcu-sglang</code>。</span>
+            <span>在 HCU 节点安装 GitHub Actions self-hosted runner，并给它打 label，例如 <code>nmz26-hcu-sglang</code>。</span>
           </div>
           <div class="lane">
             <strong>GitHub 侧</strong>
@@ -504,7 +504,7 @@
           </div>
           <div class="lane">
             <strong>仓库代码</strong>
-            <span>没有“注册 runner”的逻辑，只在 workflow 中读取 <code>DCU_CI_RUNNER_LABEL</code>。</span>
+            <span>没有“注册 runner”的逻辑，只在 workflow 中读取 <code>HCU_CI_RUNNER_LABEL</code>。</span>
           </div>
           <div class="lane">
             <strong>失败表现</strong>
@@ -514,11 +514,11 @@
         <div class="grid">
           <div class="card">
             <h3>必须配置</h3>
-            <p><code>DCU_CI_RUNNER_LABEL</code> 选择 DCU runner；<code>DCU_CI_IMAGE</code> 选择 DTK/DCU 容器镜像。</p>
+            <p><code>HCU_CI_RUNNER_LABEL</code> 选择 HCU runner；<code>HCU_CI_IMAGE</code> 选择 DTK/HCU 容器镜像。</p>
           </div>
           <div class="card">
             <h3>调试可选</h3>
-            <p><code>DCU_CI_SKIP_PULL=1</code> 避免重复拉镜像；<code>DCU_CI_SKIP_SGLANG_BUILD=1</code> 复用镜像内依赖。</p>
+            <p><code>HCU_CI_SKIP_PULL=1</code> 避免重复拉镜像；<code>HCU_CI_SKIP_SGLANG_BUILD=1</code> 复用镜像内依赖。</p>
           </div>
           <div class="callout">
             <strong>合官方时注意</strong>
@@ -531,19 +531,19 @@
     <section>
       <div class="section-title">
         <h2>3. 容器执行逻辑</h2>
-        <span class="hint">workflow 到 DCU 容器内测试的三段式脚本</span>
+        <span class="hint">workflow 到 HCU 容器内测试的三段式脚本</span>
       </div>
       <div class="grid three">
         <div class="card">
-          <h3><code>dcu_ci_start_container.sh</code></h3>
-          <p>启动 DCU 容器，挂载 checkout 到 <code>/sglang-checkout</code>，挂载 <code>/dev/kfd</code>、<code>/dev/dri</code>、模型目录和 cache。</p>
+          <h3><code>hcu_ci_start_container.sh</code></h3>
+          <p>启动 HCU 容器，挂载 checkout 到 <code>/sglang-checkout</code>，挂载 <code>/dev/kfd</code>、<code>/dev/dri</code>、模型目录和 cache。</p>
         </div>
         <div class="card">
-          <h3><code>dcu_ci_install_dependency.sh</code></h3>
-          <p>安装 DCU 依赖和 editable SGLang。测试仓库可通过 <code>DCU_CI_SKIP_SGLANG_BUILD</code> 跳过 build。</p>
+          <h3><code>hcu_ci_install_dependency.sh</code></h3>
+          <p>安装 HCU 依赖和 editable SGLang。测试仓库可通过 <code>HCU_CI_SKIP_SGLANG_BUILD</code> 跳过 build。</p>
         </div>
         <div class="card">
-          <h3><code>dcu_ci_exec.sh</code></h3>
+          <h3><code>hcu_ci_exec.sh</code></h3>
           <p>在容器里执行 <code>run_suite.py</code>，注入 CI marker、本地模型路径、<code>PYTHONPATH=/sglang-checkout/python</code>。</p>
         </div>
       </div>
@@ -552,28 +552,28 @@
     <section>
       <div class="section-title">
         <h2>4. 测试注册和分片</h2>
-        <span class="hint">register_dcu_ci 是标记，run_suite.py 才是执行入口</span>
+        <span class="hint">register_hcu_ci 是标记，run_suite.py 才是执行入口</span>
       </div>
       <div class="panel sequence">
         <div class="seq-item">
           <div class="num">1</div>
           <div>
             <h3>测试文件声明注册</h3>
-            <p>在测试文件顶层写 <code>register_dcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-dcu")</code>。</p>
+            <p>在测试文件顶层写 <code>register_hcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-hcu")</code>。</p>
           </div>
         </div>
         <div class="seq-item">
           <div class="num">2</div>
           <div>
             <h3><code>ci_register.py</code> 静态解析</h3>
-            <p>通过 AST 收集 <code>register_dcu_ci</code>，拿到 backend、suite、est_time、nightly、disabled。</p>
+            <p>通过 AST 收集 <code>register_hcu_ci</code>，拿到 backend、suite、est_time、nightly、disabled。</p>
           </div>
         </div>
         <div class="seq-item">
           <div class="num">3</div>
           <div>
             <h3><code>run_suite.py</code> 过滤 suite</h3>
-            <p>根据 <code>--hw dcu</code>、<code>--suite</code>、<code>--include-file</code> 选出要跑的文件。</p>
+            <p>根据 <code>--hw hcu</code>、<code>--suite</code>、<code>--include-file</code> 选出要跑的文件。</p>
           </div>
         </div>
         <div class="seq-item">
@@ -605,7 +605,7 @@
         </div>
         <div class="status ok">
           <b>205</b>
-          <span>当前 DCU registered test files，注册健康检查通过。</span>
+          <span>当前 HCU registered test files，注册健康检查通过。</span>
         </div>
         <div class="status todo">
           <b>保守</b>
@@ -619,7 +619,7 @@
       <div class="grid two">
         <div class="card">
           <h3>当前 required baseline</h3>
-          <p>Stage A: <code>test_dcu_smoke.py</code>。Stage B: <code>test_dcu_stage_b_flow_0.py</code> 和 <code>test_dcu_stage_b_flow_1.py</code>。</p>
+          <p>Stage A: <code>test_hcu_smoke.py</code>。Stage B: <code>test_hcu_stage_b_flow_0.py</code> 和 <code>test_hcu_stage_b_flow_1.py</code>。</p>
         </div>
         <div class="card">
           <h3>真实模型用例状态</h3>
@@ -638,14 +638,14 @@
           <div class="num">1</div>
           <div>
             <h3>从官方最新 main 起分支</h3>
-            <p>只带 DCU PR CI 框架和最小 flow smoke，不夹带大规模用例扩容。</p>
+            <p>只带 HCU PR CI 框架和最小 flow smoke，不夹带大规模用例扩容。</p>
           </div>
         </div>
         <div class="seq-item">
           <div class="num">2</div>
           <div>
             <h3>官方仓库配置变量和 runner</h3>
-            <p>配置 <code>DCU_CI_RUNNER_LABEL</code>、<code>DCU_CI_IMAGE</code>，确认 self-hosted runner online。</p>
+            <p>配置 <code>HCU_CI_RUNNER_LABEL</code>、<code>HCU_CI_IMAGE</code>，确认 self-hosted runner online。</p>
           </div>
         </div>
         <div class="seq-item">
@@ -658,7 +658,7 @@
         <div class="seq-item">
           <div class="num">4</div>
           <div>
-            <h3>把 <code>PR Test (DCU) finish</code> 设为 required 候选</h3>
+            <h3>把 <code>PR Test (HCU) finish</code> 设为 required 候选</h3>
             <p>确保 required check 名称固定，后续扩测试不改变对外信号。</p>
           </div>
         </div>
@@ -679,39 +679,39 @@
       </div>
       <div class="panel file-map">
         <div class="file">
-          <code>.github/workflows/pr-test-dcu.yml</code>
-          <span>DCU PR CI 主 workflow：触发、gate、config、Stage A/B、finish 全在这里。</span>
+          <code>.github/workflows/pr-test-hcu.yml</code>
+          <span>HCU PR CI 主 workflow：触发、gate、config、Stage A/B、finish 全在这里。</span>
         </div>
         <div class="file">
           <code>.github/workflows/pr-gate.yml</code>
-          <span>官方风格 PR gate，被 DCU workflow 通过 <code>workflow_call</code> 调用。</span>
+          <span>官方风格 PR gate，被 HCU workflow 通过 <code>workflow_call</code> 调用。</span>
         </div>
         <div class="file">
-          <code>scripts/ci/dcu/dcu_ci_start_container.sh</code>
-          <span>启动 DCU 容器，挂载设备、模型和 checkout。</span>
+          <code>scripts/ci/hcu/hcu_ci_start_container.sh</code>
+          <span>启动 HCU 容器，挂载设备、模型和 checkout。</span>
         </div>
         <div class="file">
-          <code>scripts/ci/dcu/dcu_ci_install_dependency.sh</code>
+          <code>scripts/ci/hcu/hcu_ci_install_dependency.sh</code>
           <span>容器内依赖安装逻辑，支持测试仓库 skip build。</span>
         </div>
         <div class="file">
-          <code>scripts/ci/dcu/dcu_ci_exec.sh</code>
+          <code>scripts/ci/hcu/hcu_ci_exec.sh</code>
           <span>容器内命令执行入口，注入 CI marker、本地模型路径和 PYTHONPATH。</span>
         </div>
         <div class="file">
           <code>python/sglang/test/ci/ci_register.py</code>
-          <span>新增 <code>HWBackend.DCU</code> 和 <code>register_dcu_ci</code>，通过 AST 收集注册信息。</span>
+          <span>新增 <code>HWBackend.HCU</code> 和 <code>register_hcu_ci</code>，通过 AST 收集注册信息。</span>
         </div>
         <div class="file">
           <code>test/run_suite.py</code>
           <span>suite 过滤、disabled 跳过、include-file 收缩、自动分片、执行测试。</span>
         </div>
         <div class="file">
-          <code>test/registered/dcu/**</code>
-          <span>DCU 专属测试和当前 flow smoke；后续真实用例扩容主要在这里推进。</span>
+          <code>test/registered/hcu/**</code>
+          <span>HCU 专属测试和当前 flow smoke；后续真实用例扩容主要在这里推进。</span>
         </div>
         <div class="file">
-          <code>docs/dcu-pr-ci-integration-handoff.md</code>
+          <code>docs/hcu-pr-ci-integration-handoff.md</code>
           <span>当前状态、验证命令、GitHub 成功 run、交接说明。</span>
         </div>
       </div>

@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2, get_bool_env_var
-from sgl_kernel.kvcacheio import dcu_create_extend_after_decode_spec_info,dcu_assign_req_to_token_pool,dcu_align_evict_mask_to_page_size
+from sgl_kernel.kvcacheio import hcu_create_extend_after_decode_spec_info,hcu_assign_req_to_token_pool,hcu_align_evict_mask_to_page_size
 # _is_npu = is_npu()
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -166,7 +166,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             bs,
         )
         # if self.use_sglang_assign_req_to_token_pool:
-        #     dcu_assign_req_to_token_pool(
+        #     hcu_assign_req_to_token_pool(
         #         req_pool_indices = batch.req_pool_indices,
         #         req_to_token = batch.req_to_token_pool.req_to_token,
         #         allocate_lens = batch.seq_lens,
@@ -515,7 +515,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
                 if self.use_sglang_align_evict_mask_to_page_size:
-                    dcu_align_evict_mask_to_page_size(
+                    hcu_align_evict_mask_to_page_size(
                         seq_lens = batch.seq_lens,
                         evict_mask = evict_mask,
                         page_size = page_size,
@@ -581,7 +581,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
                 # if self.use_sglang_assign_req_to_token_pool:
-                #     dcu_assign_req_to_token_pool(
+                #     hcu_assign_req_to_token_pool(
                 #         req_pool_indices = batch.req_pool_indices,
                 #         req_to_token = batch.req_to_token_pool.req_to_token,
                 #         allocate_lens = batch.seq_lens,
@@ -638,7 +638,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             if page_size == 1 or self.topk == 1:
                 # if self.use_sglang_assign_req_to_token_pool:
-                #     dcu_assign_req_to_token_pool(
+                #     hcu_assign_req_to_token_pool(
                 #         req_pool_indices = batch.req_pool_indices,
                 #         req_to_token = batch.req_to_token_pool.req_to_token,
                 #         allocate_lens = batch.seq_lens,
@@ -1030,7 +1030,7 @@ class EagleDraftExtendInput(SpecInput):
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
         if self.use_sglang_create_extend_after_decode_spec_info:
-            dcu_create_extend_after_decode_spec_info(
+            hcu_create_extend_after_decode_spec_info(
                 verified_id = batch.input_ids,
                 seq_lens = batch.seq_lens,
                 accept_lens = self.accept_length,

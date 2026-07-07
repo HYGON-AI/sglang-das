@@ -14,8 +14,6 @@ Exit code 0 means the HCU registration is structurally healthy:
     - Every HCU test belongs to a known HCU per-commit or nightly suite.
 """
 
-from __future__ import annotations
-
 import glob
 import importlib.util
 import os
@@ -42,7 +40,7 @@ def _load_ci_register():
     return module
 
 
-def main() -> int:
+def main():
     ci_register = _load_ci_register()
     HWBackend = ci_register.HWBackend
     collect_tests = ci_register.collect_tests
@@ -61,11 +59,11 @@ def main() -> int:
     with open(os.path.join(test_dir, "run_suite.py"), "r", encoding="utf-8") as f:
         tree = ast.parse(f.read())
 
-    per_commit: dict[str, list[str]] = {}
-    nightly: dict[str, list[str]] = {}
+    per_commit = {}
+    nightly = {}
 
-    def _extract_dict(node: ast.Dict) -> dict[str, list[str]]:
-        out: dict[str, list[str]] = {}
+    def _extract_dict(node):
+        out = {}
         for k, v in zip(node.keys, node.values):
             # key is HWBackend.NAME
             if not isinstance(k, ast.Attribute) or not isinstance(k.value, ast.Name):
@@ -119,7 +117,7 @@ def main() -> int:
     hcu_tests = [t for t in tests if t.backend == HWBackend.HCU]
 
     print(f"Collected {len(hcu_tests)} HCU registered test file(s):")
-    by_suite: dict[str, list[str]] = defaultdict(list)
+    by_suite = defaultdict(list)
     for t in hcu_tests:
         by_suite[t.suite].append(
             f"{os.path.relpath(t.filename, REPO_ROOT)} "

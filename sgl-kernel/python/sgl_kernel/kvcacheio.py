@@ -9,7 +9,7 @@ def is_hip() -> bool:
 
 _is_hip = is_hip()
 
-def dcu_create_extend_after_decode_spec_info(
+def hcu_create_extend_after_decode_spec_info(
     verified_id: torch.Tensor,
     seq_lens: torch.Tensor,
     accept_lens: torch.Tensor,
@@ -17,7 +17,7 @@ def dcu_create_extend_after_decode_spec_info(
     new_verified_id: torch.Tensor,
     bs: int,
 ):
-    torch.ops.sgl_kernel.dcu_create_extend_after_decode_spec_info(
+    torch.ops.sgl_kernel.hcu_create_extend_after_decode_spec_info(
         verified_id,
         seq_lens,
         accept_lens,
@@ -26,7 +26,7 @@ def dcu_create_extend_after_decode_spec_info(
         bs,
     )
 
-def dcu_alloc_extend_kernel(
+def hcu_alloc_extend_kernel(
     pre_lens_ptr: torch.Tensor,
     seq_lens_ptr: torch.Tensor,
     last_loc_ptr: torch.Tensor,
@@ -35,7 +35,7 @@ def dcu_alloc_extend_kernel(
     bs: int,
     page_size: int,
 ):
-    torch.ops.sgl_kernel.dcu_alloc_extend_kernel(
+    torch.ops.sgl_kernel.hcu_alloc_extend_kernel(
         pre_lens_ptr,
         seq_lens_ptr,
         last_loc_ptr,
@@ -45,7 +45,7 @@ def dcu_alloc_extend_kernel(
         page_size,
     )
 
-def dcu_alloc_decode_kernel(
+def hcu_alloc_decode_kernel(
     seq_lens_ptr: torch.Tensor,   
     last_loc_ptr: torch.Tensor,    
     free_page_ptr: torch.Tensor ,   
@@ -53,7 +53,7 @@ def dcu_alloc_decode_kernel(
     bs: int,          
     page_size: int,              
 ):
-    torch.ops.sgl_kernel.dcu_alloc_decode_kernel(
+    torch.ops.sgl_kernel.hcu_alloc_decode_kernel(
         seq_lens_ptr,
         last_loc_ptr,
         free_page_ptr,
@@ -358,7 +358,7 @@ def transfer_kv_all_layer_mla_lf_pf(
         num_warps_per_block,
     )
 
-def dcu_assign_req_to_token_pool(
+def hcu_assign_req_to_token_pool(
     req_pool_indices:torch.Tensor,
     req_to_token:torch.Tensor,
     allocate_lens:torch.Tensor,
@@ -367,7 +367,7 @@ def dcu_assign_req_to_token_pool(
     shape:int,
     bs:int,
 ):
-    torch.ops.sgl_kernel.dcu_assign_req_to_token_pool(
+    torch.ops.sgl_kernel.hcu_assign_req_to_token_pool(
         req_pool_indices,
         req_to_token,
         allocate_lens,
@@ -377,12 +377,12 @@ def dcu_assign_req_to_token_pool(
         bs,
     )
 
-def dcu_get_last_loc(
+def hcu_get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
 ):
-    result = torch.ops.sgl_kernel.dcu_get_last_loc(
+    result = torch.ops.sgl_kernel.hcu_get_last_loc(
         req_to_token,
         req_pool_indices,
         prefix_lens,
@@ -390,7 +390,7 @@ def dcu_get_last_loc(
     return result
 
 
-def dcu_assign_extend_cache_locs(
+def hcu_assign_extend_cache_locs(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
     start_offset: torch.Tensor,
@@ -399,7 +399,7 @@ def dcu_assign_extend_cache_locs(
     pool_len: int,
     bs: int,
 ):
-    torch.ops.sgl_kernel.dcu_assign_extend_cache_locs(
+    torch.ops.sgl_kernel.hcu_assign_extend_cache_locs(
         req_pool_indices,
         req_to_token, 
         start_offset, 
@@ -409,7 +409,7 @@ def dcu_assign_extend_cache_locs(
         bs,
     )
 
-def dcu_create_chunked_prefix_cache_kv_indices(
+def hcu_create_chunked_prefix_cache_kv_indices(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     chunk_starts: torch.Tensor,
@@ -419,7 +419,7 @@ def dcu_create_chunked_prefix_cache_kv_indices(
     col_num: int,
     bs: int,
 ):
-    torch.ops.sgl_kernel.dcu_create_chunked_prefix_cache_kv_indices(
+    torch.ops.sgl_kernel.hcu_create_chunked_prefix_cache_kv_indices(
         req_to_token,
         req_pool_indices, 
         chunk_starts, 
@@ -430,14 +430,14 @@ def dcu_create_chunked_prefix_cache_kv_indices(
         bs,
     )
 
-def dcu_align_evict_mask_to_page_size(
+def hcu_align_evict_mask_to_page_size(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
     page_size: int,
     num_draft_tokens: int,
     bs:int,
 ):
-    torch.ops.sgl_kernel.dcu_align_evict_mask_to_page_size(
+    torch.ops.sgl_kernel.hcu_align_evict_mask_to_page_size(
         seq_lens,
         evict_mask, 
         page_size, 

@@ -1202,7 +1202,7 @@ __global__ void launch_create_extend_after_decode_spec_info_int64_kernel(
     new_verified_id_ptr[pid] = verified_id_ptr[verified_idx];
 }
 
-void dcu_alloc_decode_kernel(
+void hcu_alloc_decode_kernel(
   const at::Tensor seq_lens_ptr,   
   const at::Tensor last_loc_ptr,    
   const at::Tensor free_page_ptr,   
@@ -1222,7 +1222,7 @@ void dcu_alloc_decode_kernel(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void dcu_create_extend_after_decode_spec_info(
+void hcu_create_extend_after_decode_spec_info(
     const at::Tensor verified_id,
     const at::Tensor seq_lens,
     const at::Tensor accept_lens,
@@ -1265,7 +1265,7 @@ void dcu_create_extend_after_decode_spec_info(
     }
 };
 
-void dcu_alloc_extend_kernel(
+void hcu_alloc_extend_kernel(
     const at::Tensor pre_lens_ptr,
     const at::Tensor seq_lens_ptr,
     const at::Tensor last_loc_ptr,
@@ -1322,7 +1322,7 @@ __global__ void launch_assign_req_to_token_pool(
 }
 
 
-void dcu_assign_req_to_token_pool(
+void hcu_assign_req_to_token_pool(
     const at::Tensor req_pool_indices_ptr,
     at::Tensor req_to_token_ptr,
     const at::Tensor allocate_lens_ptr,
@@ -1366,7 +1366,7 @@ __global__ void get_last_loc_kernel(
     }
 }
 
-at::Tensor dcu_get_last_loc(
+at::Tensor hcu_get_last_loc(
     const at::Tensor req_to_token,     
     const at::Tensor req_pool_indices,  
     const at::Tensor prefix_lens) {
@@ -1447,7 +1447,7 @@ __global__ void launch_assign_extend_cache_locs_kernel(
     }
 }
 
-void dcu_assign_extend_cache_locs(
+void hcu_assign_extend_cache_locs(
     const at::Tensor req_pool_indices,
     const at::Tensor req_to_token,
     const at::Tensor start_offset,
@@ -1479,7 +1479,7 @@ void dcu_assign_extend_cache_locs(
 
 
 template<int PAGED_SIZE>
-__global__ void dcu_create_flashmla_kv_indices_kernel(
+__global__ void hcu_create_flashmla_kv_indices_kernel(
     const int32_t* __restrict__ req_to_token,
     const int32_t* __restrict__ req_pool_indices,
     const int32_t* __restrict__ page_kernel_lens,
@@ -1517,7 +1517,7 @@ __global__ void dcu_create_flashmla_kv_indices_kernel(
     }
 }
 
-void dcu_create_flashmla_kv_indices(
+void hcu_create_flashmla_kv_indices(
     const at::Tensor& req_to_token,
     const at::Tensor& req_pool_indices,
     const at::Tensor& page_kernel_lens,
@@ -1543,7 +1543,7 @@ void dcu_create_flashmla_kv_indices(
         kv_start_idx_ptr = kv_start_idx.value().data_ptr<int32_t>();
     }
     if (PAGED_SIZE == 64) {
-        dcu_create_flashmla_kv_indices_kernel<64><<<grid, block, 0, stream>>>(
+        hcu_create_flashmla_kv_indices_kernel<64><<<grid, block, 0, stream>>>(
             req_to_token.data_ptr<int32_t>(),
             req_pool_indices.data_ptr<int32_t>(),
             page_kernel_lens.data_ptr<int32_t>(),
@@ -1586,7 +1586,7 @@ __global__ void launch_create_chunked_prefix_cache_kv_indices(
 }
 
 
-void dcu_create_chunked_prefix_cache_kv_indices(
+void hcu_create_chunked_prefix_cache_kv_indices(
     at::Tensor req_to_token_ptr,
     const at::Tensor req_pool_indices_ptr,
     const at::Tensor chunk_starts_ptr,
@@ -1636,7 +1636,7 @@ __global__ void launch_align_evict_mask_to_page_size(
 }
 
 
-void dcu_align_evict_mask_to_page_size(
+void hcu_align_evict_mask_to_page_size(
     const at::Tensor seq_lens_ptr,
     at::Tensor evict_mask_ptr,
     int64_t page_size,

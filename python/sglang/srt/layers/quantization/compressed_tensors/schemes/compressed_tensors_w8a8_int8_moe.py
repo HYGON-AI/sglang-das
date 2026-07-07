@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.utils import get_bool_env_var, is_dcu, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -35,7 +35,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
 
 
@@ -148,7 +148,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
 
 
 class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
-    """INT8 W8A8 MoE scheme for GPU/DCU (non-NPU).
+    """INT8 W8A8 MoE scheme for GPU/HCU (non-NPU).
 
     Supports channelwise dynamic per-token quantization for MoE layers.
     Uses aiter MoE when available (SGLANG_ROCM_USE_AITER_MOE=true),

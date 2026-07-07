@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, is_dcu
+from sglang.srt.utils import is_cuda, is_hip, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -44,13 +44,13 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
 
 
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
     try:
         from aiter import (  # noqa: F401
             flash_attn_varlen_func,
@@ -104,7 +104,7 @@ class NSAFlashMLAMetadata:
             )
 
     def copy_(self, other: "NSAFlashMLAMetadata"):
-        if _is_dcu:
+        if _is_hcu:
             flashmla_metadata = other.flashmla_metadata
             if hasattr(flashmla_metadata, "flashmla_metadata"):
                 flashmla_metadata = flashmla_metadata.flashmla_metadata
@@ -255,7 +255,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not _is_dcu:
+        if not _is_hcu:
             from sgl_kernel import (
                 fast_topk_transform_fused,
                 fast_topk_transform_ragged_fused,
@@ -1765,7 +1765,7 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        if not _is_dcu:
+        if not _is_hcu:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd 
         else:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
@@ -1778,7 +1778,7 @@ class NativeSparseAttnBackend(
         required_padding = 128 if self.device_sm_major >= 10 else 64
         need_padding = num_heads % required_padding != 0
 
-        if _is_dcu:
+        if _is_hcu:
             q_input = q_all
         elif need_padding:
             assert required_padding % num_heads == 0, (
@@ -1804,7 +1804,7 @@ class NativeSparseAttnBackend(
         )
 
         # Trim output back to original num_heads if we padded
-        if (not _is_dcu) and need_padding:
+        if (not _is_hcu) and need_padding:
             o = o[:, :num_heads, :]
 
         return o
@@ -1819,7 +1819,7 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        if not _is_dcu:
+        if not _is_hcu:
             from sgl_kernel.flash_mla import flash_mla_with_kvcache
         else:
             from flash_mla.flash_mla_interface import flash_mla_with_kvcache
@@ -2270,7 +2270,7 @@ class NativeSparseAttnBackend(
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (
-                    ( is_blackwell() or _is_dcu )
+                    ( is_blackwell() or _is_hcu )
                     and forward_batch is not None
                     and forward_batch.forward_mode == ForwardMode.EXTEND
                 ):
@@ -2320,7 +2320,7 @@ class NativeSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        if not _is_dcu:
+        if not _is_hcu:
             from sgl_kernel.flash_mla import get_mla_metadata
         else:
             from flash_mla.flash_mla_interface import get_mla_metadata

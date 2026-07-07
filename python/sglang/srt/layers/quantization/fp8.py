@@ -87,7 +87,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_dcu,
+    is_hcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -110,12 +110,12 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
-if (_use_aiter or _use_hip_int4) and not _is_dcu:
+if (_use_aiter or _use_hip_int4) and not _is_hcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight

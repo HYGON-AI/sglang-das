@@ -8,9 +8,9 @@ import torch
 
 from sglang.srt.environ import envs
 
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     pass
@@ -107,9 +107,9 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_dcu:
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_hcu:
             self.deep_gemm_metadata = None
-        else: # lightop support get_paged_mqa_logits_metadata but has other potential issues, skip it in dcu
+        else: # lightop support get_paged_mqa_logits_metadata but has other potential issues, skip it in hcu
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata

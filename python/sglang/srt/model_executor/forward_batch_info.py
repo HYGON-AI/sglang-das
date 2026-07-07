@@ -59,14 +59,14 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
-    is_dcu,
+    is_hcu,
     is_npu,
     support_triton,
     get_compiler_backend,
     get_bool_env_var,
 )
 from sglang.srt.utils.common import ceil_align
-from sgl_kernel.kvcacheio import dcu_create_chunked_prefix_cache_kv_indices
+from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
 
 import logging
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
@@ -437,7 +437,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
-    # dcu only
+    # hcu only
     residual_rms_per_quant_int8: Optional[torch.Tensor] = None
     rms_quant_flag: bool = False
     
@@ -861,7 +861,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             chunk_kv_indices = torch.empty(
                 num_chunk_tokens, dtype=torch.int32, device=device
             )
-            dcu_create_chunked_prefix_cache_kv_indices(
+            hcu_create_chunked_prefix_cache_kv_indices(
                     req_to_token = self.req_to_token_pool.req_to_token,
                     req_pool_indices = self.req_pool_indices,
                     chunk_starts = chunk_starts,
@@ -872,7 +872,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     bs = self.batch_size,
                 )
             # if self.use_sglang_create_chunked_prefix_cache_kv_indices:
-            #     dcu_create_chunked_prefix_cache_kv_indices(
+            #     hcu_create_chunked_prefix_cache_kv_indices(
             #         req_to_token = self.req_to_token_pool.req_to_token,
             #         req_pool_indices = self.req_pool_indices,
             #         chunk_starts = chunk_starts,

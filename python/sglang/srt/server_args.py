@@ -13,7 +13,7 @@
 # ==============================================================================
 """The arguments of the server."""
 
-# Temporary PR-only touch to validate DCU auto gate for python/sglang changes.
+# Temporary PR-only touch to validate HCU auto gate for python/sglang changes.
 from __future__ import annotations
 
 import argparse
@@ -52,7 +52,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
-    is_dcu,
+    is_hcu,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -70,7 +70,7 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
-    is_dcu,
+    is_hcu,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -158,7 +158,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # ransplant from vllm
-    "dcu_mla", 
+    "hcu_mla",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1881,7 +1881,7 @@ class ServerArgs:
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 
-                    if is_hip() and not is_dcu() and not aiter_can_use_preshuffle_paged_mqa():
+                    if is_hip() and not is_hcu() and not aiter_can_use_preshuffle_paged_mqa():
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                         # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
@@ -2538,7 +2538,7 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa() or is_npu() or is_dcu()
+                is_cuda() or is_musa() or is_npu() or is_hcu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
@@ -2717,11 +2717,11 @@ class ServerArgs:
         if (
             self.attention_backend == "flashmla"
             or self.decode_attention_backend == "flashmla"
-            or self.attention_backend == "dcu_mla"
-            or self.decode_attention_backend == "dcu_mla"
+            or self.attention_backend == "hcu_mla"
+            or self.decode_attention_backend == "hcu_mla"
         ):
             logger.warning(
-                "FlashMLA/DCU MLA only supports a page_size of 64, change page_size to 64."
+                "FlashMLA/HCU MLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
 
@@ -3180,7 +3180,7 @@ class ServerArgs:
             logger.warning(
                 "LightOp MoE runner is a transitional backend and may be deprecated in future releases. Please use AITER MoE runner."
             )
-            assert is_dcu(), "lightop MoE runner backend is only supported on DCU."
+            assert is_hcu(), "lightop MoE runner backend is only supported on HCU."
             assert (
                 self.quantization == "w8a8_int8"
             ), "lightop MoE runner backend currently supports only w8a8_int8 quantization."
@@ -3190,9 +3190,9 @@ class ServerArgs:
             )
 
         if self.moe_runner_backend == "aiter" and self.quantization == "w8a8_int8":
-            assert is_dcu(), (
+            assert is_hcu(), (
                 "aiter MoE runner backend with w8a8_int8 quantization is only "
-                "supported on DCU."
+                "supported on HCU."
             )
             assert self.moe_a2a_backend == "none", (
                 "aiter MoE runner backend with w8a8_int8 quantization currently "

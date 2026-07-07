@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -38,19 +38,19 @@ register_amd_ci(
 )
 register_cuda_ci(est_time=73, suite="stage-b-test-1-gpu-small")
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local gte-Qwen2 mapping added, but HFRunner/SRTRunner logits comparison hung before DCU allocation on BW1100; OpenAI embedding API smoke is enabled separately.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: local gte-Qwen2 mapping added, but HFRunner/SRTRunner logits comparison hung before HCU allocation on BW1100; OpenAI embedding API smoke is enabled separately.",
 )
 
-if os.environ.get("SGLANG_IS_IN_CI_DCU"):
-    _dcu_embedding_model = os.environ.get(
+if os.environ.get("SGLANG_IS_IN_CI_HCU"):
+    _hcu_embedding_model = os.environ.get(
         "SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME",
         "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
     )
-    MODEL_TO_CONFIG = {_dcu_embedding_model: (1, 1e-5)}
+    MODEL_TO_CONFIG = {_hcu_embedding_model: (1, 1e-5)}
 else:
     MODEL_TO_CONFIG = {
         "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
@@ -149,8 +149,8 @@ class TestEmbeddingModels(CustomTestCase):
 
     def test_matryoshka_embedding(self):
         matryoshka_model = (
-            _dcu_embedding_model
-            if os.environ.get("SGLANG_IS_IN_CI_DCU")
+            _hcu_embedding_model
+            if os.environ.get("SGLANG_IS_IN_CI_HCU")
             else "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
         )
         models_to_test = [(matryoshka_model, *MODEL_TO_CONFIG[matryoshka_model])]

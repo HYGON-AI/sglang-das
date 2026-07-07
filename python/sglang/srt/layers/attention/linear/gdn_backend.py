@@ -18,10 +18,10 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_dcu, get_bool_env_var
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_hcu, get_bool_env_var
 from sglang.srt.utils.common import rank0_log
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -52,9 +52,9 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 _use_causal_conv1d = get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D")
-if _is_dcu and _use_causal_conv1d:
-    from causal_conv1d.causal_conv1d_interface import causal_conv1d_update as causal_conv1d_update_dcu
-    from causal_conv1d import causal_conv1d_fn_dcu
+if _is_hcu and _use_causal_conv1d:
+    from causal_conv1d.causal_conv1d_interface import causal_conv1d_update as causal_conv1d_update_hcu
+    from causal_conv1d import causal_conv1d_fn_hcu
 
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
@@ -297,8 +297,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        if _is_dcu and _use_causal_conv1d:
-            mixed_qkv = causal_conv1d_update_dcu(
+        if _is_hcu and _use_causal_conv1d:
+            mixed_qkv = causal_conv1d_update_hcu(
                 mixed_qkv,
                 conv_states,
                 layer.conv_weights,
@@ -430,8 +430,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            if _is_dcu and _use_causal_conv1d:
-                mixed_qkv = causal_conv1d_fn_dcu(
+            if _is_hcu and _use_causal_conv1d:
+                mixed_qkv = causal_conv1d_fn_hcu(
                     mixed_qkv,
                     layer.conv_weights,
                     layer.bias,

@@ -125,7 +125,7 @@ def assign_req_to_token_pool(
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
 
-from sgl_kernel.kvcacheio import dcu_assign_req_to_token_pool
+from sgl_kernel.kvcacheio import hcu_assign_req_to_token_pool
 from sglang.srt.utils import get_bool_env_var
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
@@ -137,7 +137,7 @@ def assign_req_to_token_pool_func(
 ):
     use_sglang_assign_req_to_token_pool = get_bool_env_var("SGLANG_ASSIGN_REQ_TO_TOKEN_POOL", default="true")
     if use_sglang_assign_req_to_token_pool:
-        dcu_assign_req_to_token_pool(
+        hcu_assign_req_to_token_pool(
             req_pool_indices = req_pool_indices,
             req_to_token = req_to_token,
             allocate_lens = start_offset,

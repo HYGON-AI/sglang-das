@@ -43,7 +43,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 from sglang.srt.utils import get_bool_env_var
-from sgl_kernel.kvcacheio import dcu_assign_extend_cache_locs
+from sgl_kernel.kvcacheio import hcu_assign_extend_cache_locs
 
 import logging
 logger = logging.getLogger(__name__)
@@ -302,7 +302,7 @@ class EagleVerifyInputV2Mixin:
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
             if self.use_sglang_assign_extend_cache_locs:
-                dcu_assign_extend_cache_locs(
+                hcu_assign_extend_cache_locs(
                     batch.req_pool_indices,
                     req_to_token_pool.req_to_token,
                     batch.seq_lens,
@@ -512,7 +512,7 @@ class EagleVerifyInputV2Mixin:
         return predict, num_correct_drafts + 1, accept_index
 
 
-#@torch.compile(dynamic=True, disable=_is_npu)  #disable on dcu, is cause large bubble
+#@torch.compile(dynamic=True, disable=_is_npu)  #disable on hcu, is cause large bubble
 def select_top_k_tokens_tmp(
     i: int,
     topk_p: torch.Tensor,
@@ -579,7 +579,7 @@ def assign_extend_cache_locs_func(
         )
         use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
         if use_sglang_assign_extend_cache_locs:
-            dcu_assign_extend_cache_locs(
+            hcu_assign_extend_cache_locs(
                 req_pool_indices,         
                 req_to_token,
                 start_offset,

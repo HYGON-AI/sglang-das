@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_compiler_backend, is_dcu
+from sglang.srt.utils import get_compiler_backend, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -49,12 +49,12 @@ from flash_attn import varlen_fwd_unified
 from sglang.srt.utils import get_bool_env_var
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
-_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
-    if is_dcu():
+    if is_hcu():
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
         if "gfx938" in gcn_arch and (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2):
@@ -887,7 +887,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if not forward_batch.mha_one_shot
                 else metadata.max_seq_len_k
             )
-            if not _kv_layout_dcu_fa:
+            if not _kv_layout_hcu_fa:
                 output = varlen_fwd_unified(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=key_cache,
@@ -1254,7 +1254,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # page_table = metadata.page_table
                 cu_seqlens_k = metadata.cu_seqlens_k
                 cache_seqlens = metadata.cache_seqlens_int32
-                if not _kv_layout_dcu_fa:
+                if not _kv_layout_hcu_fa:
                     key_cache = key_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.head_dim
                     )
@@ -1275,7 +1275,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_k = metadata.encoder_cu_seqlens_k
                     window_size = (-1, -1)
                 q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                if not _kv_layout_dcu_fa:
+                if not _kv_layout_hcu_fa:
                     result = varlen_fwd_unified(
                         q=q,
                         k=key_cache,
@@ -1314,7 +1314,7 @@ class FlashAttentionBackend(AttentionBackend):
                         num_splits=self.num_splits,
                         **kwargs,
                     )
-                elif _kv_layout_dcu_fa:
+                elif _kv_layout_hcu_fa:
                     result = vllm_flash_attn_with_kvcache(
                         q=q.unsqueeze(1),
                         k_cache=key_cache,
@@ -3042,7 +3042,7 @@ def normal_decode_set_metadata(
             num_stages=3,
         )
     else:
-        if _is_dcu:
+        if _is_hcu:
             from sgl_kernel import normal_decode_metadata_general as normal_decode_metadata_general_sgl
             # General kernel for page_size > 1 or SWA cases
             # SWA parameters

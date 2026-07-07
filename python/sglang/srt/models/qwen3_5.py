@@ -93,7 +93,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_dcu,
+    is_hcu,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -104,7 +104,7 @@ _use_fused_qwen_bailing_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
@@ -112,7 +112,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_amx_available = cpu_has_amx_support()
 
-if _is_dcu and _use_fused_qwen_bailing_rotary:
+if _is_hcu and _use_fused_qwen_bailing_rotary:
     from lightop import gammarms_rotary_embedding_fuse_with_kv_store
 
 cached_get_processor = lru_cache(get_processor)
@@ -871,7 +871,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             
-        if _is_dcu and _use_fused_qwen_bailing_rotary:
+        if _is_hcu and _use_fused_qwen_bailing_rotary:
             # Fused RMSNorm + RoPE + kv_store path through custom op.
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if (cos_sin_cache.device != q.device

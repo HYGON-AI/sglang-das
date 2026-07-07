@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
+from sgl_kernel.flash_mla import hcu_create_flashmla_kv_indices
 from sglang.srt.utils import get_bool_env_var, direct_register_custom_op
 
 _use_fused_mla_cat = get_bool_env_var("SGLANG_USE_FUSED_MLA_CAT")
@@ -19,12 +19,12 @@ _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 import inspect
 import logging
 logger = logging.getLogger(__name__)
-from sglang.srt.utils import is_dcu
-_is_dcu = is_dcu()
+from sglang.srt.utils import is_hcu
+_is_hcu = is_hcu()
 is_fp8 = False
 try:
     
-    if _is_dcu:
+    if _is_hcu:
         try:
             from flash_mla import (
                 flash_mla_with_kvcache,
@@ -104,7 +104,7 @@ class VllmMLADecodeMetadata:
         self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
 
-class DCUMLABackend(AttentionBackend):
+class HCUMLABackend(AttentionBackend):
 
     def __init__(
         self,
@@ -117,7 +117,7 @@ class DCUMLABackend(AttentionBackend):
 
         if model_runner.server_args.page_size != PAGE_SIZE:
             raise ValueError(
-                f"dcu_mla backend requires page_size={PAGE_SIZE}, "
+                f"hcu_mla backend requires page_size={PAGE_SIZE}, "
                 f"but got the {model_runner.server_args.page_size}"
             )
 
@@ -173,7 +173,7 @@ class DCUMLABackend(AttentionBackend):
                 device=forward_batch.seq_lens.device
             )
             if use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr = self.req_to_token.to(torch.int32),
                     req_pool_indices_ptr = forward_batch.req_pool_indices.to(torch.int32),
                     page_kernel_lens_ptr = seq_lens_for_kv.to(torch.int32),
@@ -237,7 +237,7 @@ class DCUMLABackend(AttentionBackend):
                 device=seq_lens.device,
             )
             if use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr = self.req_to_token.to(torch.int32),
                     req_pool_indices_ptr = forward_batch.req_pool_indices.to(torch.int32),
                     page_kernel_lens_ptr = seq_lens.to(torch.int32),
@@ -293,7 +293,7 @@ class DCUMLABackend(AttentionBackend):
 
                     # 调用 Triton kernel 生成 block_kv_indices
                     if use_sglang_create_flashmla_kv_indices_triton:
-                        dcu_create_flashmla_kv_indices(
+                        hcu_create_flashmla_kv_indices(
                             req_to_token_ptr = self.req_to_token.to(torch.int32),
                             req_pool_indices_ptr = forward_batch.req_pool_indices.to(torch.int32),
                             page_kernel_lens_ptr = forward_batch.seq_lens.to(torch.int32),
@@ -405,7 +405,7 @@ class DCUMLABackend(AttentionBackend):
             )
             max_seqlen_pad = triton.cdiv(seq_lens_for_kv.max().item(), PAGE_SIZE)
             if use_sglang_create_flashmla_kv_indices_triton:
-                        dcu_create_flashmla_kv_indices(
+                        hcu_create_flashmla_kv_indices(
                             req_to_token_ptr = self.req_to_token.to(torch.int32),
                             req_pool_indices_ptr = req_pool_indices.to(torch.int32),
                             page_kernel_lens_ptr = seq_lens_for_kv.to(torch.int32),
@@ -446,7 +446,7 @@ class DCUMLABackend(AttentionBackend):
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
             if use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr = self.req_to_token.to(torch.int32),
                     req_pool_indices_ptr = req_pool_indices.to(torch.int32),
                     page_kernel_lens_ptr = seq_lens.to(torch.int32),
@@ -514,7 +514,7 @@ class DCUMLABackend(AttentionBackend):
                 seq_lens_cpu = seq_lens_cpu + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             if use_sglang_create_flashmla_kv_indices_triton:
-                        dcu_create_flashmla_kv_indices(
+                        hcu_create_flashmla_kv_indices(
                             req_to_token_ptr = self.req_to_token.to(torch.int32),
                             req_pool_indices_ptr = req_pool_indices[:bs].to(torch.int32),
                             page_kernel_lens_ptr = seq_lens.to(torch.int32),
@@ -556,7 +556,7 @@ class DCUMLABackend(AttentionBackend):
             seq_lens_cpu = seq_lens_cpu[:bs] + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             if use_sglang_create_flashmla_kv_indices_triton:
-                        dcu_create_flashmla_kv_indices(
+                        hcu_create_flashmla_kv_indices(
                             req_to_token_ptr = self.req_to_token.to(torch.int32),
                             req_pool_indices_ptr = req_pool_indices[:bs].to(torch.int32),
                             page_kernel_lens_ptr = seq_lens.to(torch.int32),
@@ -864,7 +864,7 @@ class DCUMLABackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-class DCUMLAMultiStepDraftBackend:
+class HCUMLAMultiStepDraftBackend:
     """
     Wrap multiple flashmla attention backends as one for multiple consecutive
     draft decoding steps.
@@ -895,7 +895,7 @@ class DCUMLAMultiStepDraftBackend:
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
-                DCUMLABackend(
+                HCUMLABackend(
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],

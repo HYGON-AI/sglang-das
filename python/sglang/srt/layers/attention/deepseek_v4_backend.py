@@ -70,9 +70,9 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align, get_bool_env_var, is_dcu
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hcu
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
 
 if TYPE_CHECKING:
@@ -950,7 +950,7 @@ class DeepseekV4AttnBackend(
                 cache_k=swa_k,
             )
         else:
-            if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
+            if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
                 from lightop import op
                 if hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store"):
                     self.token_to_kv_pool.set_swa_key_buffer_radix_lightop_fused(
