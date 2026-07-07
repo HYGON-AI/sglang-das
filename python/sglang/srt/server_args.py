@@ -54,6 +54,7 @@ from sglang.srt.utils.common import (
     is_dcu_native_fp8_supported,
     is_flashinfer_available,
     is_hip,
+    is_hcu,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -1942,7 +1943,7 @@ class ServerArgs:
 
                     if (
                         is_hip()
-                        and not is_dcu()
+                        and not is_hcu()
                         and not aiter_can_use_preshuffle_paged_mqa()
                     ):
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
@@ -2149,6 +2150,7 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
+            hip_aiter_enabled = is_hip() and envs.SGLANG_USE_AITER.get()
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
@@ -2161,14 +2163,12 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
                     )
-                elif (
-                    is_hip() and envs.SGLANG_USE_AITER.get()
-                ) and is_mxfp4_quant_format:
+                elif hip_aiter_enabled and is_mxfp4_quant_format:
                     self.moe_runner_backend = "auto"
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
-                elif is_hip() and envs.SGLANG_USE_AITER.get():
+                elif hip_aiter_enabled:
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
                     self.moe_runner_backend = "triton"
@@ -2601,7 +2601,7 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa() or is_npu() or is_dcu()
+                is_cuda() or is_musa() or is_npu() or is_hcu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
@@ -2641,11 +2641,12 @@ class ServerArgs:
             else:
                 if not self.disable_radix_cache:
                     if is_hip():
+                        platform = "HCU devices" if is_hcu() else "ROCm devices"
                         # On ROCm, extra_buffer is unsupported.
                         # Automatically disable radix cache instead.
                         logger.warning(
                             f"Speculative decoding for {model_arch} is not compatible "
-                            "with radix cache on ROCm devices. "
+                            f"with radix cache on {platform}. "
                             "Automatically disabling radix cache."
                         )
                         self.disable_radix_cache = True
@@ -2788,7 +2789,7 @@ class ServerArgs:
             or self.decode_attention_backend == "dcu_mla"
         ):
             logger.warning(
-                "FlashMLA/DCU MLA only supports a page_size of 64, change page_size to 64."
+                "FlashMLA/HCU MLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
 
@@ -3373,7 +3374,7 @@ class ServerArgs:
             logger.warning(
                 "LightOp MoE runner is a transitional backend and may be deprecated in future releases. Please use AITER MoE runner."
             )
-            assert is_dcu(), "lightop MoE runner backend is only supported on DCU."
+            assert is_hcu(), "lightop MoE runner backend is only supported on HCU."
             assert (
                 self.quantization == "w8a8_int8"
             ), "lightop MoE runner backend currently supports only w8a8_int8 quantization."
@@ -3383,9 +3384,9 @@ class ServerArgs:
             )
 
         if self.moe_runner_backend == "aiter" and self.quantization == "w8a8_int8":
-            assert is_dcu(), (
+            assert is_hcu(), (
                 "aiter MoE runner backend with w8a8_int8 quantization is only "
-                "supported on DCU."
+                "supported on HCU."
             )
             assert self.moe_a2a_backend == "none", (
                 "aiter MoE runner backend with w8a8_int8 quantization currently "
@@ -4646,12 +4647,11 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    platform = "DCU/DTK" if is_dcu() else "ROCm/HIP"
+                    platform = "HCU/ROCm" if is_hcu() else "AMD/ROCm"
                     # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
-                        "%s: Using 1-stage all-reduce kernel (deterministic)",
-                        platform,
+                        f"{platform}: Using 1-stage all-reduce kernel (deterministic)"
                     )
                 else:
                     # CUDA: use NCCL tree algorithm
@@ -4666,17 +4666,15 @@ class ServerArgs:
             return
         # On HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
-            platform = "DCU/DTK" if is_dcu() else "ROCm/HIP GPUs"
+            platform = "HCU devices" if is_hcu() else "AMD GPUs"
             if not self.disable_cuda_graph:
                 logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on %s",
-                    platform,
+                    f"Cuda graph is disabled for diffusion LLM inference on {platform}"
                 )
                 self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on %s",
-                    platform,
+                    f"Attention backend is set to triton for diffusion LLM inference on {platform}"
                 )
                 self.attention_backend = "triton"
         elif is_npu():
@@ -6023,7 +6021,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). ",
+            "'aiter' (AMD/ROCm or HCU/ROCm only). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
@@ -6787,7 +6785,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for HIP/RCCL, disabled for NVIDIA/CUDA (NCCL).",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

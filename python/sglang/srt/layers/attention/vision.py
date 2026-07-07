@@ -23,7 +23,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_dcu,
+    is_hcu,
     is_npu,
     is_xpu,
     print_info_once,
@@ -38,7 +38,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -50,7 +50,7 @@ if _is_cuda:
 if _is_musa:
     from flash_attn_interface import flash_attn_varlen_func
 
-if _is_dcu:
+if _is_hcu:
     from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func
     flash_attn_func = flash_attn_varlen_func
 if _is_npu:
@@ -392,8 +392,8 @@ class VisionFlash3Attention(nn.Module):
         self,
         **kwargs,
     ):
-        if not (_is_cuda or _is_musa or _is_dcu):
-            raise Exception("VisionFlash3Attention is only available for cuda or musa or dcu")
+        if not (_is_cuda or _is_musa or _is_hcu):
+            raise Exception("VisionFlash3Attention is only available for cuda or musa or hcu")
         super().__init__()
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
@@ -637,20 +637,16 @@ class VisionAiterAttention(nn.Module):
         **kwargs,
     ):
         if not _is_hip:
-            if _is_dcu:
-                raise Exception("aiter_attn is only available for DCU/DTK")
-            raise Exception("aiter_attn is only available for ROCm/HIP")
+            raise Exception("aiter_attn is only available for AMD or HCU")
         try:
             from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
         except ImportError as e:
-            if _is_dcu:
+            if _is_hcu:
                 raise ImportError(
-                    "aiter is DCU/DTK compatible kernel library. "
-                    "Please make sure aiter is installed on your DCU device."
+                    "Please make sure aiter is installed on your HCU device."
                 ) from e
             raise ImportError(
-                "aiter is ROCm/HIP specific kernel library. "
-                "Please make sure aiter is installed on your ROCm/HIP device."
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
             ) from e
 
         self.flash_attn_varlen_func = aiter_flash_attn_varlen_func

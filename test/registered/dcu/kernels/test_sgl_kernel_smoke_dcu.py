@@ -22,7 +22,12 @@ SMOKE_KERNEL_TESTS = [
 
 
 def _sanitize_dcu_log_text(text: str) -> str:
-    return text.replace("AMD", "DCU").replace("amd", "dcu")
+    return (
+        text.replace("AMD", "HCU")
+        .replace("amd", "hcu")
+        .replace("XGMI", "HSL")
+        .replace("xgmi", "hsl")
+    )
 
 
 class TestBW1100SmokeSGLKernelDCU(unittest.TestCase):

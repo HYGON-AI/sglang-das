@@ -23,7 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     log_info_on_rank0,
@@ -31,7 +31,7 @@ from sglang.srt.utils import (
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_musa = is_musa()
 
@@ -387,10 +387,10 @@ def dispatch_custom_allreduce():
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            if _is_dcu:
-                logger.info("[AR] Using AiterCustomAllreduce (DCU/DTK default)")
+            if _is_hcu:
+                logger.info("[AR] Using AiterCustomAllreduce (HCU default)")
             else:
-                logger.info("[AR] Using AiterCustomAllreduce (ROCm/HIP default)")
+                logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             return partial(
                 AiterCustomAllreduce,
