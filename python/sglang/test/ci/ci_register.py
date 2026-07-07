@@ -13,7 +13,7 @@ __all__ = [
     "register_cuda_ci",
     "register_amd_ci",
     "register_npu_ci",
-    "register_dcu_ci",
+    "register_hcu_ci",
     "ut_parse_one_file",
 ]
 
@@ -31,7 +31,7 @@ class HWBackend(Enum):
     CUDA = auto()
     AMD = auto()
     NPU = auto()
-    DCU = auto()
+    HCU = auto()
 
 
 @dataclass
@@ -106,7 +106,7 @@ def register_npu_ci(
     return None
 
 
-def register_dcu_ci(
+def register_hcu_ci(
     est_time: float,
     suite: Optional[str] = None,
     nightly: bool = False,
@@ -115,7 +115,7 @@ def register_dcu_ci(
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
 ):
-    """Marker for DCU CI registration (parsed via AST; runtime no-op)."""
+    """Marker for HCU CI registration (parsed via AST; runtime no-op)."""
     return None
 
 
@@ -124,7 +124,7 @@ REGISTER_MAPPING = {
     "register_cuda_ci": HWBackend.CUDA,
     "register_amd_ci": HWBackend.AMD,
     "register_npu_ci": HWBackend.NPU,
-    "register_dcu_ci": HWBackend.DCU,
+    "register_hcu_ci": HWBackend.HCU,
 }
 
 

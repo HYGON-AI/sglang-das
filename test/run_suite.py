@@ -75,7 +75,7 @@ HW_MAPPING = {
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
     "npu": HWBackend.NPU,
-    "dcu": HWBackend.DCU,
+    "hcu": HWBackend.HCU,
 }
 
 # Per-commit test suites (run on every PR)
@@ -130,12 +130,12 @@ PER_COMMIT_SUITES = {
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
     ],
-    HWBackend.DCU: [
-        "stage-a-test-1-gpu-small-dcu",
-        "stage-b-test-1-gpu-small-dcu",
-        "stage-b-test-1-gpu-large-dcu",
-        "stage-b-test-2-gpu-large-dcu",
-        "stage-c-test-large-8-gpu-dcu",
+    HWBackend.HCU: [
+        "stage-a-test-1-gpu-small-hcu",
+        "stage-b-test-1-gpu-small-hcu",
+        "stage-b-test-1-gpu-large-hcu",
+        "stage-b-test-2-gpu-large-hcu",
+        "stage-c-test-large-8-gpu-hcu",
     ],
 }
 
@@ -187,14 +187,14 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.DCU: [
-        "nightly-dcu",
-        "nightly-dcu-1-gpu",
-        "nightly-dcu-4-gpu",
-        "nightly-dcu-8-gpu",
-        "nightly-dcu-accuracy",
-        "nightly-dcu-perf",
-        "nightly-dcu-vlm",
+    HWBackend.HCU: [
+        "nightly-hcu",
+        "nightly-hcu-1-gpu",
+        "nightly-hcu-4-gpu",
+        "nightly-hcu-8-gpu",
+        "nightly-hcu-accuracy",
+        "nightly-hcu-perf",
+        "nightly-hcu-vlm",
     ],
 }
 
