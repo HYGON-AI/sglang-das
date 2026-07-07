@@ -17,7 +17,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton, quant_to_nope_fp8_rope_bf16_pack_lightop
+    quant_to_nope_fp8_rope_bf16_pack_lightop,
+    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -28,12 +29,21 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils import get_bool_env_var, is_dcu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_dcu
+
 _is_dcu = is_dcu()
-_use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
+_use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
+    "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
+)
 if _is_dcu:
     from lightop import op
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_dcu
+_tgemm = None
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
+
+    _tgemm = tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -102,6 +112,7 @@ class CompressorBackendMixin:
 
             from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
                 hip_compress_forward,
+                hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,
             )
 
@@ -118,14 +129,24 @@ class CompressorBackendMixin:
             norm_eps = (
                 norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
             )
-            hip_compress_fused_norm_rope_inplace(
-                kv_compressed,
-                norm.weight,
-                norm_eps,
-                freqs_cis_cache,
-                plan,
-            )
-            return rotate_activation(kv_compressed) if rotate else kv_compressed
+            if rotate:
+                hip_compress_fused_norm_rope_hadamard_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                    head_dim,
+                )
+            else:
+                hip_compress_fused_norm_rope_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                )
+            return kv_compressed
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -185,9 +206,13 @@ class CompressorBackendMixin:
                 )
                 return
             if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
-                pack = quant_to_nope_fp8_rope_bf16_pack_lightop(new_compressed_kv.bfloat16(), 1e-8)
+                pack = quant_to_nope_fp8_rope_bf16_pack_lightop(
+                    new_compressed_kv.bfloat16(), 1e-8
+                )
             else:
-                pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(
+                    new_compressed_kv.bfloat16()
+                )
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
@@ -402,7 +427,12 @@ class Compressor(nn.Module):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if _tgemm is not None:
+            # linear_bf16_fp32 uses tgemm.mm + .float(); skip the .float() cast
+            # because downstream Triton kernels promote bf16→fp32 internally.
+            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
+        else:
+            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -442,12 +472,9 @@ class Compressor(nn.Module):
             is_paged=True,
         )
 
+
 # TODO: compatibility impl for dsv4 backend on HIP
-if (
-    _is_hip
-    and not _is_dcu
-    and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
-):
+if _is_hip and not _is_dcu and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
     from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
         CompressorHip as Compressor,
     )

@@ -533,11 +533,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
-    def invalidate_loc_cache(self) -> None:
-        # Compatibility with C09 graph runners. DSV4 locations now live in
-        # per-forward metadata, so there is no pool-level cache to invalidate.
-        pass
-
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
         is_speculative = server_args.speculative_algorithm is not None
@@ -545,13 +540,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
-
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
-
-    def get_cached_swa_loc(self, raw_loc: torch.Tensor, layer_id: int) -> torch.Tensor:
-        # Compatibility for out-of-tree DCU callers. Never retain graph input
-        # translations across forwards.
-        return self.translate_loc_from_full_to_swa(raw_loc)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

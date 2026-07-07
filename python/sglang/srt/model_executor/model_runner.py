@@ -142,7 +142,7 @@ from sglang.srt.model_executor.breakable_cuda_graph_runner import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
-    DecodeInputBuffers,
+    _allocate_decode_buffers,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -1427,6 +1427,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+
+        # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
+        if (
+            hasattr(self.model, "quant_config")
+            and hasattr(self.model.quant_config, "quantized_layers")
+            and self.server_args.quantization is not None
+        ):
+            layer_types, quantized_layers_count = (
+                self.model.quant_config.quantized_layers
+            )
+            logger.info(
+                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+            )
+
         if self.server_args.debug_tensor_dump_output_folder is not None:
             dump_folder = self.server_args.debug_tensor_dump_output_folder
             if self.spec_algorithm.is_eagle():
@@ -2416,15 +2430,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
-        if backend_str not in [
+        moe_needs_autotune = backend_str in [
             "flashinfer_trtllm",
-            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
-            # "flashinfer_trtllm_routed",
+            "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
             "flashinfer_cutedsl",
-            # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
-            # "flashinfer_cutlass",
-        ]:
+            "flashinfer_cutlass",
+        ]
+
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        model_uses_fp4 = self.model_config.quantization in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+        )
+        fp4_gemm_needs_autotune = model_uses_fp4 and (
+            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
+            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        )
+
+        if not (moe_needs_autotune or fp4_gemm_needs_autotune):
             return False
 
         major, _ = torch.cuda.get_device_capability()
@@ -2439,6 +2466,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _flashinfer_autotune(self):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
+
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         cache_path = self._flashinfer_autotune_cache_path()
         if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
@@ -2461,7 +2490,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
+            with (
+                torch.inference_mode(),
+                autotune(True, cache=str(autotune_cache)),
+                autotune_dummy_run_mode(),
+            ):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
@@ -2566,7 +2599,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-        buffers: DecodeInputBuffers = DecodeInputBuffers.create(
+        buffers = _allocate_decode_buffers(
             device=self.device,
             max_bs=batch_size,
             max_num_token=num_tokens,
@@ -3359,9 +3392,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
-
-            if self.is_hybrid_swa:
-                self.token_to_kv_pool.invalidate_loc_cache()
 
             # Replay cuda graph if applicable
             if can_run_graph:

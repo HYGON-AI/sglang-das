@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -62,6 +64,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     original_w13_shape: Optional[tuple[int, ...]] = None
     original_w2_shape: Optional[tuple[int, ...]] = None
     layer: Optional[torch.nn.Module] = None
+    fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
 _AITER_ACTIVATIONS = {"silu": "Silu", "swiglu": "Swiglu"}
@@ -107,12 +110,10 @@ def process_weights_after_loading_aiter_w8a8_int8(layer: torch.nn.Module) -> Non
 
     moe_runner_config = getattr(layer, "moe_runner_config", None)
     if getattr(layer, "apply_router_weight_on_input", False) or (
-        moe_runner_config is not None
-        and moe_runner_config.apply_router_weight_on_input
+        moe_runner_config is not None and moe_runner_config.apply_router_weight_on_input
     ):
         raise RuntimeError(
-            "AITER W8A8 INT8 MoE does not support "
-            "apply_router_weight_on_input=True."
+            "AITER W8A8 INT8 MoE does not support apply_router_weight_on_input=True."
         )
 
     setattr(layer, "_aiter_w8a8_int8_original_w13_shape", tuple(layer.w13_weight.shape))
@@ -125,12 +126,10 @@ def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None
 
     moe_runner_config = getattr(layer, "moe_runner_config", None)
     if getattr(layer, "apply_router_weight_on_input", False) or (
-        moe_runner_config is not None
-        and moe_runner_config.apply_router_weight_on_input
+        moe_runner_config is not None and moe_runner_config.apply_router_weight_on_input
     ):
         raise RuntimeError(
-            "AITER FP8 W8A8 MoE does not support "
-            "apply_router_weight_on_input=True."
+            "AITER FP8 W8A8 MoE does not support apply_router_weight_on_input=True."
         )
 
     setattr(layer, "_aiter_w8a8_fp8_original_w13_shape", tuple(layer.w13_weight.shape))
@@ -375,9 +374,7 @@ def _get_aiter_w8a8_weights_for_solution(
     if quant_info.moe_c_weight_layout:
         return quant_info.w13_weight, quant_info.w2_weight
 
-    cache_prefix = (
-        "_aiter_w8a8_fp8" if quant_info.use_fp8_w8a8 else "_aiter_w8a8_int8"
-    )
+    cache_prefix = "_aiter_w8a8_fp8" if quant_info.use_fp8_w8a8 else "_aiter_w8a8_int8"
     layer = quant_info.layer
 
     with torch.no_grad():
@@ -408,8 +405,7 @@ def _run_aiter_w8a8(
     assert not runner_config.no_combine, "no_combine=True is not supported by AITER"
     if runner_config.apply_router_weight_on_input:
         raise RuntimeError(
-            "AITER W8A8 MoE does not support "
-            "apply_router_weight_on_input=True."
+            "AITER W8A8 MoE does not support apply_router_weight_on_input=True."
         )
 
     hidden_states = runner_input.hidden_states
@@ -427,9 +423,7 @@ def _run_aiter_w8a8(
         activation,
         quant_info,
     )
-    w1, w2 = _get_aiter_w8a8_weights_for_solution(
-        quant_info, moe_config
-    )
+    w1, w2 = _get_aiter_w8a8_weights_for_solution(quant_info, moe_config)
     routed_scaling_factor = (
         runner_config.routed_scaling_factor
         if runner_config.routed_scaling_factor is not None
@@ -483,9 +477,9 @@ def _run_aiter_native(
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
-        assert (
-            topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
-        ), "apply_router_weight_on_input requires topk=1"
+        assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
+            "apply_router_weight_on_input requires topk=1"
+        )
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
@@ -512,6 +506,14 @@ def _run_aiter_native(
     return AiterRunnerOutput(hidden_states=output)
 
 
+@functools.cache
+def _aiter_fused_moe_supports_no_combine() -> bool:
+    """Return whether the installed AITER fused_moe supports no_combine."""
+    from aiter.fused_moe import fused_moe
+
+    return "no_combine" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -533,6 +535,24 @@ class AiterRunnerCore(MoeRunnerCore):
         if _is_dcu:
             return _run_aiter_native(runner_input, quant_info, self.config)
 
+        if self.config.no_combine and not _aiter_fused_moe_supports_no_combine():
+            raise NotImplementedError(
+                "no_combine=True requested but the installed aiter.fused_moe does "
+                "not accept a `no_combine` kwarg. Install an aiter build that "
+                "supports fused_moe no_combine output."
+            )
+
+        if runner_input.hidden_states.shape[0] == 0:
+            if self.config.no_combine:
+                topk = runner_input.topk_ids.shape[-1]
+                hidden_size = runner_input.hidden_states.shape[-1]
+                return AiterRunnerOutput(
+                    hidden_states=runner_input.hidden_states.new_empty(
+                        (0, topk, hidden_size)
+                    )
+                )
+            return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
+
         from aiter.fused_moe import fused_moe
         from aiter.ops.flydsl.moe_common import GateMode
 
@@ -545,6 +565,8 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         extra: dict = {}
+        if quant_info.fused_moe_kwargs:
+            extra.update(quant_info.fused_moe_kwargs)
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
@@ -561,6 +583,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 else GateMode.SEPARATED.value
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
+        if self.config.no_combine:
+            extra["no_combine"] = True
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,

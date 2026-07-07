@@ -5,7 +5,6 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
@@ -29,7 +28,9 @@ from sglang.multimodal_gen.runtime.platforms import (
 
 from flash_attn import flash_attn_func as flash_attn_func_interface
 from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func
+
 flash_attn_func = flash_attn_varlen_func
+
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -400,10 +401,13 @@ class FlashAttentionImpl(AttentionImpl):
         return_softmax_lse: bool = False,
     ):
         assert query.ndim == 4, f"Expected fixed length fa ndim == 4, but got {query.ndim}"
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
+        if attn_metadata is None:
+            attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is not None:
+            if attn_metadata.max_seqlen_q is None:
+                attn_metadata.max_seqlen_q = query.shape[1]
+            if attn_metadata.max_seqlen_k is None:
+                attn_metadata.max_seqlen_k = key.shape[1]
             max_seqlen_q = attn_metadata.max_seqlen_q
             max_seqlen_k = attn_metadata.max_seqlen_k
         else:
