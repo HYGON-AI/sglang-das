@@ -144,17 +144,31 @@ def _normalize_mha_kv_infos_for_pp(
     if pp_size <= 1:
         main_start = main_pool_start_layer
         main_end = main_pool_start_layer + main_num_layers
-        main_ptrs_s, main_lens_s, main_item_lens_s = main_ptrs, main_lens, main_item_lens
+        main_ptrs_s, main_lens_s, main_item_lens_s = (
+            main_ptrs,
+            main_lens,
+            main_item_lens,
+        )
     elif main_num_layers == total_main_layers:
         main_ptrs_s = _slice_pair_range(main_ptrs, main_start, main_end)
         main_lens_s = _slice_pair_range(main_lens, main_start, main_end)
         main_item_lens_s = _slice_pair_range(main_item_lens, main_start, main_end)
-    elif main_num_layers == main_end - main_start and main_pool_start_layer == main_start:
-        main_ptrs_s, main_lens_s, main_item_lens_s = main_ptrs, main_lens, main_item_lens
+    elif (
+        main_num_layers == main_end - main_start and main_pool_start_layer == main_start
+    ):
+        main_ptrs_s, main_lens_s, main_item_lens_s = (
+            main_ptrs,
+            main_lens,
+            main_item_lens,
+        )
     else:
         main_start = main_pool_start_layer
         main_end = main_pool_start_layer + main_num_layers
-        main_ptrs_s, main_lens_s, main_item_lens_s = main_ptrs, main_lens, main_item_lens
+        main_ptrs_s, main_lens_s, main_item_lens_s = (
+            main_ptrs,
+            main_lens,
+            main_item_lens,
+        )
 
     total_draft_layers = len(draft_ptrs) // 2 if draft_ptrs else 0
     draft_start, draft_end = _slice_draft_range_for_pp(
@@ -167,9 +181,7 @@ def _normalize_mha_kv_infos_for_pp(
     if total_draft_layers > 0:
         draft_ptrs_s = _slice_pair_range(draft_ptrs, draft_start, draft_end)
         draft_lens_s = _slice_pair_range(draft_lens, draft_start, draft_end)
-        draft_item_lens_s = _slice_pair_range(
-            draft_item_lens, draft_start, draft_end
-        )
+        draft_item_lens_s = _slice_pair_range(draft_item_lens, draft_start, draft_end)
     else:
         draft_ptrs_s, draft_lens_s, draft_item_lens_s = [], [], []
 

@@ -109,6 +109,7 @@ def _normalize_decode_mha_kv_infos(
         len(draft_ptrs) // 2,
     )
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler

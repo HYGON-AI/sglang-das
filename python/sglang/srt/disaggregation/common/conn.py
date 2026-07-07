@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
-from sglang.srt.configs.model_config import ModelConfig
+
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -16,6 +16,7 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -525,7 +526,8 @@ class CommonKVManager(BaseKVManager):
             else:
                 dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
                 dst_v_ptrs = dst_kv_ptrs[
-                    dst_num_total_layers + start_layer : dst_num_total_layers
+                    dst_num_total_layers
+                    + start_layer : dst_num_total_layers
                     + end_layer
                 ]
             return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, len(src_k_ptrs)
@@ -561,7 +563,9 @@ class CommonKVManager(BaseKVManager):
                 num_hidden_layers is not None
                 and len(full_attention_layer_ids) < num_hidden_layers
                 and start_layer > 0
-                and all(layer_id >= start_layer for layer_id in full_attention_layer_ids)
+                and all(
+                    layer_id >= start_layer for layer_id in full_attention_layer_ids
+                )
             ):
                 return None
             return full_attention_layer_ids
@@ -617,7 +621,8 @@ class CommonKVManager(BaseKVManager):
             if compact_end_layer <= main_total_layers:
                 dst_k_ptrs = dst_kv_ptrs[compact_start_layer:compact_end_layer]
                 dst_v_ptrs = dst_kv_ptrs[
-                    main_total_layers + compact_start_layer : main_total_layers
+                    main_total_layers
+                    + compact_start_layer : main_total_layers
                     + compact_end_layer
                 ]
                 layers_current_pp_stage = len(src_k_ptrs)
@@ -649,9 +654,11 @@ class CommonKVManager(BaseKVManager):
                         len(dst_v_ptrs),
                         len(src_kv_ptrs),
                         len(dst_kv_ptrs),
-                        len(full_attention_layer_ids)
-                        if full_attention_layer_ids is not None
-                        else None,
+                        (
+                            len(full_attention_layer_ids)
+                            if full_attention_layer_ids is not None
+                            else None
+                        ),
                     )
                 return (
                     src_k_ptrs,
@@ -707,9 +714,11 @@ class CommonKVManager(BaseKVManager):
                 len(dst_v_ptrs),
                 len(src_kv_ptrs),
                 len(dst_kv_ptrs),
-                len(full_attention_layer_ids)
-                if full_attention_layer_ids is not None
-                else None,
+                (
+                    len(full_attention_layer_ids)
+                    if full_attention_layer_ids is not None
+                    else None
+                ),
                 getattr(self.model_config, "is_draft_model", None),
             )
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
