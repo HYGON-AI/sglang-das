@@ -912,8 +912,21 @@ class FlashAttentionBackend(AttentionBackend):
                     s_aux=kwargs.get('sinks', None)
                 )
             else:
+                q_padded_num_tokens = q.shape[0]
+                q_num_tokens = q_padded_num_tokens
+                if (
+                    get_global_server_args().minimax_opt
+                    and q_padded_num_tokens != 0
+                    and cu_seqlens_q is not None
+                    and q_padded_num_tokens
+                    > max_seqlen_q * (cu_seqlens_q.shape[0] - 1)
+                ):
+                    q_metadata_num_tokens = int(cu_seqlens_q[-1].item())
+                    if q_padded_num_tokens > q_metadata_num_tokens:
+                        q_num_tokens = q_metadata_num_tokens
+                q_for_attn = q[:q_num_tokens]
                 output = try_pack_paged_kv_to_varlen_attention(
-                    q=q,
+                    q=q_for_attn,
                     forward_batch=forward_batch,
                     metadata=metadata,
                     layer=layer,
@@ -929,7 +942,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if output is None:
                     descale_shape = (metadata.cu_seqlens_q.shape[0] - 1, k.shape[2])
                     output = vllm_flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        q=q_for_attn.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=key_cache.view(-1, layer.tp_k_head_num, self.page_size, layer.head_dim),
                         v=value_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim, self.page_size),
                         cu_seqlens_q=metadata.cu_seqlens_q,
@@ -945,6 +958,12 @@ class FlashAttentionBackend(AttentionBackend):
                         k_descale=k_descale,
                         v_descale=v_descale,
                     )
+            if q_num_tokens != q_padded_num_tokens:
+                    output_padded = output.new_zeros(
+                        q_padded_num_tokens, output.shape[1], output.shape[2]
+                    )
+                    output_padded[:q_num_tokens] = output
+                    output = output_padded
             if forward_batch.mha_return_lse:
                 output, lse, *rest = output
                 lse = torch.transpose(lse, 0, 1).contiguous()

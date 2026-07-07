@@ -318,8 +318,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 def _pack_per_expert_deepep(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        #if is_moe_prefill() :
-                        if True :
+                        if is_moe_prefill() :
                             new_expert = weight8bit_nt_kpack2_marlin(
                                 weight[i]).contiguous()
                         else:
