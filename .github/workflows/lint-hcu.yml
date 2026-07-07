@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 30
 
     container:
-      image: harbor.sourcefind.cn:5443/hcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
 
     env:
       PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
