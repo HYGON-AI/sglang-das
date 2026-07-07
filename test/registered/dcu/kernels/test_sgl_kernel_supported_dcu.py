@@ -48,6 +48,15 @@ KERNEL_TEST_SETS = {
 }
 
 
+def _sanitize_dcu_log_text(text: str) -> str:
+    return (
+        text.replace("AMD", "HCU")
+        .replace("amd", "hcu")
+        .replace("XGMI", "HSL")
+        .replace("xgmi", "hsl")
+    )
+
+
 class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
     def test_supported_kernel_whitelist(self):
         test_set = os.environ.get("SGLANG_DCU_KERNEL_TEST_SET", "nightly")
@@ -65,7 +74,8 @@ class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
         test_files = [str(kernel_root / name) for name in KERNEL_TEST_SETS[test_set]]
         missing = [name for name in test_files if not Path(name).exists()]
         if missing:
-            raise AssertionError(f"Missing sgl-kernel tests: {missing}")
+            missing_text = _sanitize_dcu_log_text(str(missing))
+            raise AssertionError(f"Missing sgl-kernel tests: {missing_text}")
 
         env = os.environ.copy()
         env["HF_HUB_OFFLINE"] = "1"
@@ -83,9 +93,9 @@ class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
 
         if result.returncode != 0:
             print("sgl-kernel stdout:")
-            print(result.stdout)
+            print(_sanitize_dcu_log_text(result.stdout))
             print("sgl-kernel stderr:")
-            print(result.stderr)
+            print(_sanitize_dcu_log_text(result.stderr))
         self.assertEqual(result.returncode, 0)
 
 

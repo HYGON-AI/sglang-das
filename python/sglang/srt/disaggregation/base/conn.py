@@ -57,6 +57,16 @@ class KVArgs:
     # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
     # list).
     prefill_end_layer: Optional[int]
+    # Optional MHA/MTP split metadata. When draft/MTP KV is transferred
+    # together with target KV, kv_data_ptrs is normalized to
+    # [K_main..., K_draft..., V_main..., V_draft...]. These fields let the
+    # connection layer map a prefill PP slice into decode's full pointer list.
+    total_main_kv_layers: Optional[int]
+    total_draft_kv_layers: Optional[int]
+    prefill_main_start_layer: Optional[int]
+    prefill_main_end_layer: Optional[int]
+    prefill_draft_start_layer: Optional[int]
+    prefill_draft_end_layer: Optional[int]
     # For DeepSeek V4 (and other compressed-MLA) memory pools only.
     # Full-model compression ratio per layer (entries are 0/4/128). Used by
     # the connection layer to slice the buffer-type-organized flat list in a

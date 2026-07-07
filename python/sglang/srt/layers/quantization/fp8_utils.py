@@ -58,7 +58,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_musa,
-    is_dcu,
+    is_hcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -72,7 +72,7 @@ from lmslim.layers.gemm.fp8_utils import per_token_group_quant_fp8 as per_token_
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
@@ -139,7 +139,7 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-if _is_dcu:
+if _is_hcu:
     import deepgemm
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -441,7 +441,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_aiter():
         if not _use_aiter:
-            aiter_platform = "DCU/DTK devices" if _is_dcu else "ROCm/HIP devices"
+            aiter_platform = "HCU devices" if _is_hcu else "AMD GPUs"
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
                 f"but AITER is not available. AITER requires {aiter_platform} with "
@@ -482,7 +482,7 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif _is_dcu:
+    elif _is_hcu:
         return hipblaslt_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
@@ -1614,13 +1614,13 @@ def apply_fp8_linear(
                             input_2d, group_size=input_2d.shape[1]
                         )
 
-        if _is_dcu:
+        if _is_hcu:
             output = torch.empty(output_shape, device=input.device, dtype=input.dtype)
             deepgemm.fp8_gemm((qinput,x_scale),(weight,weight_scale),output)
 
             return output.view(*output_shape)
 
-    if _is_dcu and type(input) == tuple:
+    if _is_hcu and type(input) == tuple:
         output_shape = [*input[0].shape[:-1], weight.shape[1]]
         output = torch.empty(output_shape, device=input[0].device, dtype=torch.bfloat16)
         deepgemm.fp8_gemm((input[0],input[1]),(weight,weight_scale),output)

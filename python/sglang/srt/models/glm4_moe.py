@@ -94,7 +94,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
@@ -105,7 +105,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1209,7 +1209,7 @@ class Glm4MoeForCausalLM(nn.Module):
         if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            hip_platform = "DCU/DTK-platform" if _is_dcu else "ROCm/HIP-platform"
+            hip_platform = "HCU-platform" if _is_hcu else "AMD-platform"
             disable_reason = (
                 "Only GLM-4.5 on NV-platform with capability >= 80 "
                 f"or {hip_platform} with capability >= gfx942(MI30x) can use shared experts fusion optimization."
@@ -1217,7 +1217,7 @@ class Glm4MoeForCausalLM(nn.Module):
         elif get_moe_expert_parallel_world_size() > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            hip_platform = "DCU/DTK-platform" if _is_dcu else "ROCm/HIP-platform"
+            hip_platform = "HCU-platform" if _is_hcu else "AMD-platform"
             disable_reason = f"Only GLM-4.5 on {hip_platform} with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()

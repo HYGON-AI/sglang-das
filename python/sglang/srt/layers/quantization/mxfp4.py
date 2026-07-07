@@ -49,7 +49,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
-    is_dcu,
+    is_hcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -141,11 +141,11 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _sm120_mxfp4_min_warps_patched = False
 
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
     # import aiter
     try:
         from aiter.ops.shuffle import (
@@ -269,6 +269,10 @@ def dequant_mxfp4(
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
+        if _is_hcu:
+            raise ImportError(
+                "The Quark package is required to use MX-FP4 models. Please install the Quark package."
+            ) from err
         raise ImportError(
             "The package `amd-quark` is required to use "
             "MX-FP4 models. Please install it with `pip install "
@@ -285,6 +289,10 @@ def quant_dequant_mxfp4(
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
+        if _is_hcu:
+            raise ImportError(
+                "The Quark package is required to use MX-FP4 models. Please install the Quark package."
+            ) from err
         raise ImportError(
             "The package `amd-quark` is required to use "
             "MX-FP4 models. Please install it with `pip install "

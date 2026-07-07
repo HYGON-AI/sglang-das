@@ -51,8 +51,10 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_dcu,
+    is_dcu_native_fp8_supported,
     is_flashinfer_available,
     is_hip,
+    is_hcu,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -176,6 +178,57 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "intel_xpu",
 ]
+
+DCU_ATTENTION_BACKEND_CHOICES = {
+    "fa3",
+    "dcu_mla",
+    "triton",
+    "nsa",
+    "dsv4",
+}
+
+DCU_GENERIC_ATTENTION_BACKEND_CHOICES = {
+    "fa3",
+    "dcu_mla",
+    "triton",
+}
+
+DCU_NSA_PREFILL_BACKEND_CHOICES = {
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+}
+
+DCU_NSA_DECODE_BACKEND_CHOICES = {
+    "flashmla_sparse",
+    "flashmla_kv",
+}
+
+DCU_GENERIC_KV_CACHE_DTYPE_CHOICES = {
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e5m2",
+}
+
+DCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES = {
+    *DCU_GENERIC_KV_CACHE_DTYPE_CHOICES,
+    "fp8_e4m3",
+}
+
+DCU_NSA_KV_CACHE_DTYPE_CHOICES = {
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e4m3",
+}
+
+DCU_DSV4_KV_CACHE_DTYPE_CHOICES = {
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e4m3",
+}
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
@@ -941,6 +994,7 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        self._validate_dcu_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
@@ -1722,7 +1776,14 @@ class ServerArgs:
         ):
             return
 
-        if not user_set_prefill and not user_set_decode and is_hip():
+        if not user_set_prefill and not user_set_decode and is_dcu():
+            if kv_cache_dtype == "fp8_e4m3":
+                self.nsa_prefill_backend = "flashmla_auto"
+                self.nsa_decode_backend = "flashmla_kv"
+            else:
+                self.nsa_prefill_backend = "flashmla_sparse"
+                self.nsa_decode_backend = "flashmla_sparse"
+        elif not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
@@ -1882,7 +1943,7 @@ class ServerArgs:
 
                     if (
                         is_hip()
-                        and not is_dcu()
+                        and not is_hcu()
                         and not aiter_can_use_preshuffle_paged_mqa()
                     ):
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
@@ -2089,6 +2150,7 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
+            hip_aiter_enabled = is_hip() and envs.SGLANG_USE_AITER.get()
             if self.moe_runner_backend == "auto":
                 if is_sm100_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
@@ -2101,14 +2163,12 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
                     )
-                elif (
-                    is_hip() and envs.SGLANG_USE_AITER.get()
-                ) and is_mxfp4_quant_format:
+                elif hip_aiter_enabled and is_mxfp4_quant_format:
                     self.moe_runner_backend = "auto"
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
-                elif is_hip() and envs.SGLANG_USE_AITER.get():
+                elif hip_aiter_enabled:
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
                     self.moe_runner_backend = "triton"
@@ -2541,7 +2601,7 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa() or is_npu() or is_dcu()
+                is_cuda() or is_musa() or is_npu() or is_hcu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
@@ -2581,11 +2641,12 @@ class ServerArgs:
             else:
                 if not self.disable_radix_cache:
                     if is_hip():
+                        platform = "HCU devices" if is_hcu() else "ROCm devices"
                         # On ROCm, extra_buffer is unsupported.
                         # Automatically disable radix cache instead.
                         logger.warning(
                             f"Speculative decoding for {model_arch} is not compatible "
-                            "with radix cache on ROCm devices. "
+                            f"with radix cache on {platform}. "
                             "Automatically disabling radix cache."
                         )
                         self.disable_radix_cache = True
@@ -2629,7 +2690,9 @@ class ServerArgs:
 
         if not use_mla_backend:
             # MHA architecture
-            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
+            if is_dcu():
+                return "fa3"
+            elif is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
                 # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
                 # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
                 # ref: https://github.com/sgl-project/sglang/issues/17411
@@ -2654,7 +2717,9 @@ class ServerArgs:
                 return "triton"
         else:
             # MLA architecture
-            if is_hopper_with_cuda_12_3():
+            if is_dcu():
+                return "dcu_mla"
+            elif is_hopper_with_cuda_12_3():
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
@@ -2724,7 +2789,7 @@ class ServerArgs:
             or self.decode_attention_backend == "dcu_mla"
         ):
             logger.warning(
-                "FlashMLA/DCU MLA only supports a page_size of 64, change page_size to 64."
+                "FlashMLA/HCU MLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
 
@@ -2893,6 +2958,132 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+    @staticmethod
+    def _get_dcu_arch_name() -> str:
+        import torch
+
+        try:
+            props = torch.cuda.get_device_properties(0)
+            return getattr(props, "gcnArchName", "") or "unknown"
+        except Exception as e:
+            logger.warning("DCU arch detection failed: %s", e)
+            return "unknown"
+
+    def _validate_dcu_generic_kv_cache_dtype(
+        self,
+        backend: str,
+        label: str,
+        arch_name: str,
+    ) -> None:
+        allowed_dtypes = (
+            DCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES
+            if is_dcu_native_fp8_supported()
+            else DCU_GENERIC_KV_CACHE_DTYPE_CHOICES
+        )
+        if self.kv_cache_dtype in allowed_dtypes:
+            return
+
+        if self.kv_cache_dtype == "fp8_e4m3":
+            raise ValueError(
+                f"DCU {label} '{backend}' does not support "
+                f"--kv-cache-dtype=fp8_e4m3 on {arch_name}. "
+                "fp8_e4m3 for fa3/dcu_mla/triton is only supported on gfx938. "
+                f"Please use one of {sorted(allowed_dtypes)} on this device, "
+                "or use --attention-backend nsa with FlashMLA NSA backends for "
+                "fp8_e4m3 KV cache."
+            )
+
+        raise ValueError(
+            f"DCU {label} '{backend}' supports --kv-cache-dtype in "
+            f"{sorted(allowed_dtypes)}, but got {self.kv_cache_dtype}."
+        )
+
+    def _validate_dcu_nsa_backend(
+        self,
+        attr: str,
+        label: str,
+        allowed_backends: set[str],
+    ) -> None:
+        backend = getattr(self, attr)
+        if backend is None:
+            return
+
+        if backend not in allowed_backends:
+            raise ValueError(
+                f"DCU --nsa-{label}-backend only supports "
+                f"{sorted(allowed_backends)}, but got {backend}. "
+                "Use --attention-backend nsa for NSA models; flashmla_kv, "
+                "flashmla_sparse, and prefill-only flashmla_auto are "
+                "NSA sub-backends, not "
+                "--attention-backend values."
+            )
+
+        if backend == "flashmla_kv" and self.kv_cache_dtype not in (
+            "auto",
+            "fp8_e4m3",
+        ):
+            raise ValueError(
+                f"DCU --nsa-{label}-backend=flashmla_kv requires "
+                f"--kv-cache-dtype=fp8_e4m3, but got {self.kv_cache_dtype}."
+            )
+
+    def _validate_dcu_dsv4_kv_cache_dtype(self) -> None:
+        if self.kv_cache_dtype in DCU_DSV4_KV_CACHE_DTYPE_CHOICES:
+            return
+
+        raise ValueError(
+            "DCU dsv4 attention backend supports --kv-cache-dtype in "
+            f"{sorted(DCU_DSV4_KV_CACHE_DTYPE_CHOICES)}, but got "
+            f"{self.kv_cache_dtype}."
+        )
+
+    def _validate_dcu_attention_backend_compatibility(self):
+        if not is_dcu():
+            return
+
+        arch_name = self._get_dcu_arch_name()
+        prefill_backend, decode_backend = self.get_attention_backends()
+        for label, backend in (
+            ("prefill attention backend", prefill_backend),
+            ("decode attention backend", decode_backend),
+        ):
+            if backend not in DCU_ATTENTION_BACKEND_CHOICES:
+                raise ValueError(
+                    f"DCU only supports attention backends "
+                    f"{sorted(DCU_ATTENTION_BACKEND_CHOICES)}, but got "
+                    f"{backend} for {label}. "
+                    "For FlashMLA NSA kernels, use --attention-backend nsa "
+                    "together with --nsa-prefill-backend/--nsa-decode-backend."
+                )
+
+            if backend in DCU_GENERIC_ATTENTION_BACKEND_CHOICES:
+                self._validate_dcu_generic_kv_cache_dtype(backend, label, arch_name)
+            elif backend == "dsv4":
+                self._validate_dcu_dsv4_kv_cache_dtype()
+
+        if "nsa" not in (prefill_backend, decode_backend) and not (
+            self.nsa_prefill_backend or self.nsa_decode_backend
+        ):
+            return
+
+        if self.kv_cache_dtype not in DCU_NSA_KV_CACHE_DTYPE_CHOICES:
+            raise ValueError(
+                "DCU NSA attention backend supports --kv-cache-dtype in "
+                f"{sorted(DCU_NSA_KV_CACHE_DTYPE_CHOICES)}, but got "
+                f"{self.kv_cache_dtype}."
+            )
+
+        self._validate_dcu_nsa_backend(
+            "nsa_prefill_backend",
+            "prefill",
+            DCU_NSA_PREFILL_BACKEND_CHOICES,
+        )
+        self._validate_dcu_nsa_backend(
+            "nsa_decode_backend",
+            "decode",
+            DCU_NSA_DECODE_BACKEND_CHOICES,
+        )
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
@@ -3183,7 +3374,7 @@ class ServerArgs:
             logger.warning(
                 "LightOp MoE runner is a transitional backend and may be deprecated in future releases. Please use AITER MoE runner."
             )
-            assert is_dcu(), "lightop MoE runner backend is only supported on DCU."
+            assert is_hcu(), "lightop MoE runner backend is only supported on HCU."
             assert (
                 self.quantization == "w8a8_int8"
             ), "lightop MoE runner backend currently supports only w8a8_int8 quantization."
@@ -3193,9 +3384,9 @@ class ServerArgs:
             )
 
         if self.moe_runner_backend == "aiter" and self.quantization == "w8a8_int8":
-            assert is_dcu(), (
+            assert is_hcu(), (
                 "aiter MoE runner backend with w8a8_int8 quantization is only "
-                "supported on DCU."
+                "supported on HCU."
             )
             assert self.moe_a2a_backend == "none", (
                 "aiter MoE runner backend with w8a8_int8 quantization currently "
@@ -4456,12 +4647,11 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    platform = "DCU/DTK" if is_dcu() else "ROCm/HIP"
+                    platform = "HCU/ROCm" if is_hcu() else "AMD/ROCm"
                     # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
-                        "%s: Using 1-stage all-reduce kernel (deterministic)",
-                        platform,
+                        f"{platform}: Using 1-stage all-reduce kernel (deterministic)"
                     )
                 else:
                     # CUDA: use NCCL tree algorithm
@@ -4476,17 +4666,15 @@ class ServerArgs:
             return
         # On HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
-            platform = "DCU/DTK" if is_dcu() else "ROCm/HIP GPUs"
+            platform = "HCU devices" if is_hcu() else "AMD GPUs"
             if not self.disable_cuda_graph:
                 logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on %s",
-                    platform,
+                    f"Cuda graph is disabled for diffusion LLM inference on {platform}"
                 )
                 self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on %s",
-                    platform,
+                    f"Attention backend is set to triton for diffusion LLM inference on {platform}"
                 )
                 self.attention_backend = "triton"
         elif is_npu():
@@ -5833,7 +6021,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). ",
+            "'aiter' (AMD/ROCm or HCU/ROCm only). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
@@ -6597,7 +6785,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for HIP/RCCL, disabled for NVIDIA/CUDA (NCCL).",
+            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
