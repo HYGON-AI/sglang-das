@@ -1106,7 +1106,7 @@ class MiMoV2ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            hidden_states = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1115,7 +1115,7 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            hidden_states = self.model(
                 input_ids,
                 positions,
                 forward_batch,
@@ -1124,6 +1124,7 @@ class MiMoV2ForCausalLM(nn.Module):
             )
 
         if self.pp_group.is_last_rank:
+            hidden_states, hidden_states_before_norm = hidden_states
             return self.logits_processor(
                 input_ids,
                 hidden_states,

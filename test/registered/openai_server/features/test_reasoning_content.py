@@ -32,6 +32,7 @@ register_dcu_ci(
     est_time=89,
     suite="stage-b-test-1-gpu-small-dcu",
 )
+register_dcu_ci(est_time=89, suite="nightly-dcu-api-models", nightly=True)
 
 class TestReasoningContentAPI(CustomTestCase):
     @classmethod

@@ -46,6 +46,7 @@ jobs:
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
         --privileged=true
+        -v /home/github/sgl_whl_temp:/home/github/sgl_whl_temp
 
     # ---- Matrix: 3 个 Python 版本并行编译 ----
     strategy:
@@ -61,6 +62,7 @@ jobs:
       DCU_RUNNER_HOST_UID: ${{ vars.DCU_RUNNER_HOST_UID || '1000' }}
       DCU_RUNNER_HOST_GID: ${{ vars.DCU_RUNNER_HOST_GID || '1000' }}
       WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
 
     steps:
       # =======================================================================
@@ -170,7 +172,7 @@ jobs:
           ls -lh target/wheels/*.whl
 
       # =======================================================================
-      # 修复 (auditwheel) & 上传产物
+      # 修复 (auditwheel) & 保存 PR wheel 到本地 staging
       # =======================================================================
 
       - name: Apply DAS local version to wheels
@@ -188,12 +190,45 @@ jobs:
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
 
-      - name: Skip GitHub artifact upload
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          STAGING_ROOT="${DCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
+          STAGING_DIR="${STAGING_ROOT}/${GITHUB_REPOSITORY_OWNER}_${REPO_NAME}/pr-${GITHUB_RUN_ID}/${WHEEL_COMMIT_SHA}"
+          WHEEL_DIR="${STAGING_DIR}/wheels"
+
+          echo "Saving DCU PR wheels to ${WHEEL_DIR}"
+          rm -rf "${WHEEL_DIR}"
+          mkdir -p "${WHEEL_DIR}"
+          cp -v output/*.whl "${WHEEL_DIR}/"
+
+          export STAGING_DIR LOCAL_VER
+          python3 - <<'PY_MANIFEST'
+          import json
+          import os
+          import pathlib
+
+          staging_dir = pathlib.Path(os.environ["STAGING_DIR"])
+          wheel_dir = staging_dir / "wheels"
+          wheels = sorted(str(path.relative_to(staging_dir)) for path in wheel_dir.glob("*.whl"))
+          manifest = {
+              "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "commit_sha": os.environ.get("WHEEL_COMMIT_SHA", ""),
+              "torch_version": os.environ.get("TORCH_VERSION", ""),
+              "local_version": os.environ.get("LOCAL_VER", ""),
+              "wheels": wheels,
+          }
+          (staging_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY_MANIFEST
+
+          touch "${STAGING_DIR}/READY"
+          chown -R "${DCU_RUNNER_HOST_UID}:${DCU_RUNNER_HOST_GID}" "${STAGING_DIR}" || true
+          echo "DCU PR wheels are staged locally at ${STAGING_DIR}"
+
+      - name: Report staged PR wheels
         run: |
-          echo "DCU PR wheels are uploaded to internal devpi in the previous step."
-          echo "Skipping GitHub artifact upload to avoid blocking PR CI on repository artifact quota."
+          echo "DCU PR wheels are staged locally under /home/github/sgl_whl_temp."
+          echo "Skipping devpi and GitHub artifact upload for PR wheels."
 
       - name: Normalize workspace ownership
         if: always()

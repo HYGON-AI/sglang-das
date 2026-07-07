@@ -164,6 +164,7 @@ def run_eval(args):
             args.num_examples,
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
+            dataset_path=getattr(args, "dataset_path", None),
         )
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval

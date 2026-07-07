@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple, Union
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -15,10 +14,8 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_rope,
-    rmsnorm_self,
-    fused_norm_rope_inplace,
-    fused_q_norm_rope,
     fused_rope_inplace,
+    rmsnorm_self,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
@@ -27,6 +24,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
@@ -37,6 +35,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -56,7 +55,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8, per_token_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import per_token_quant_fp8
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -64,8 +63,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
 )
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -81,10 +78,10 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
+    is_dcu,
     log_info_on_rank0,
     make_layers,
-    is_dcu, 
-    get_bool_env_var
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -97,6 +94,7 @@ _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 
 if _is_dcu:
     from lightop import op
+
     if _use_aiter_tilelang_mhc:
         from aiter.ops.tilelang import mhc_post_fwd, mhc_pre_big_fuse
 
@@ -316,7 +314,7 @@ class MQALayer(nn.Module):
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         if _FP8_WO_A_GEMM and quant_config is not None:
-            quant_config.ignore = [i for i in quant_config.ignore if 'wo_a' not in i]
+            quant_config.ignore = [i for i in quant_config.ignore if "wo_a" not in i]
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -440,12 +438,13 @@ class MQALayer(nn.Module):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        fused_norm_rope_inplace(
-            kv,
-            self.kv_norm.weight.data,
-            self.eps,
+        kv = self.kv_norm(kv).to(torch.bfloat16)
+        q_dummy = kv.new_empty(kv.shape[0], 1, self.qk_rope_head_dim)
+        fused_rope(
+            q_dummy,
+            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
             self.freqs_cis,
-            positions,
+            positions=positions,
         )
         return kv
 
@@ -529,16 +528,15 @@ class MQALayer(nn.Module):
         q = q.view(-1, self.n_local_heads, self.head_dim)
 
         _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
-        _use_lightop_qnorm_rope = (
-            _use_fused_qnorm_rope_kv_rope_quant and _is_dcu
-        )
+        _bf16_kv_cache = forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
+        _use_lightop_qnorm_rope = _use_fused_qnorm_rope_kv_rope_quant and _is_dcu
         if _use_lightop_qnorm_rope:
             cos_sin_cache_fused = self.cos_sin_cache_fused
             assert cos_sin_cache_fused is not None
         else:
             cos_sin_cache_fused = None
 
-        if _use_lightop_qnorm_rope and not _cp_enabled:
+        if _use_lightop_qnorm_rope and not _cp_enabled and not _bf16_kv_cache:
             # Fused kernel: Q no-weight RMSNorm + Q RoPE + KV RMSNorm +
             # K RoPE + K FP8 quant + cache insert.
             pool = forward_batch.token_to_kv_pool
@@ -550,9 +548,15 @@ class MQALayer(nn.Module):
             slot_mapping = pool.translate_loc_from_full_to_swa(raw_loc)
 
             op.fused_deepseek_v4_qnorm_rope_kvnorm_rope_quant_insert_int32(
-                q, kv, self.kv_norm.weight, k_cache, slot_mapping,
-                positions, cos_sin_cache_fused,
-                self.eps, cache_block_size,
+                q,
+                kv,
+                self.kv_norm.weight,
+                k_cache,
+                slot_mapping,
+                positions,
+                cos_sin_cache_fused,
+                self.eps,
+                cache_block_size,
             )
         else:
             if _use_lightop_qnorm_rope:
@@ -640,6 +644,7 @@ class MQALayer(nn.Module):
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
+            and not forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -669,6 +674,7 @@ class MQALayer(nn.Module):
             and not _cp_enabled
             and _is_dcu
             and not enable_multi_stream
+            and not forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
         )
         _cache_already_written = (
             enable_multi_stream
@@ -767,12 +773,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        moe_alt_stream = (
+            alt_streams[0]
+            if (
+                alt_streams is not None
+                and (_is_cuda or envs.SGLANG_ROCM_USE_MULTI_STREAM.get())
+            )
+            else None
+        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
             prefix=add_prefix("mlp", prefix),
             layer_id=self.layer_id,
-            alt_stream=alt_streams[0] if alt_streams is not None else None,
+            alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
         )
@@ -911,14 +925,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             if _is_dcu and _use_aiter_tilelang_mhc:
                 out = mhc_post_fwd(
-                    x, 
+                    x,
                     residual,
-                    post, 
-                    comb, 
+                    post,
+                    comb,
                 )
                 return out
             else:
                 from sglang.srt.layers.mhc import mhc_post
+
                 return mhc_post(x, residual, post, comb)
                 # return mhc_post_torch(x, residual, post, comb)
 
@@ -1025,11 +1040,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-
-        dsv4_2604_submode = getattr(envs, "SGLANG_DSV4_2604_SUBMODE", None)
-        if dsv4_2604_submode is not None and dsv4_2604_submode.get() == "2604B":
-            # assert deepseek_v4_moe_code_path_checker.observed == 1
-            deepseek_v4_moe_code_path_checker.observed = 0
 
         return hidden_states
 
@@ -1158,14 +1168,24 @@ class DeepseekV4Model(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
+            # Dynamo cannot trace the recorder context manager during piecewise
+            # CUDA graph capture, so use a no-op context while capture is enabled.
+            # Otherwise expose the current layer to the recorder; the no-op recorder
+            # makes this safe when expert-distribution recording itself is disabled.
+            ctx = (
+                nullcontext()
+                if not get_global_server_args().disable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            with ctx:
+                layer = self.layers[i]
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
@@ -1705,8 +1725,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     fused_weight = torch.cat(
                                         [bucket["q"], bucket["kv"]], dim=0
                                     )
-                                    param_name = maybe_remap_compressed_tensors_scale_name(
-                                        param_name
+                                    param_name = (
+                                        maybe_remap_compressed_tensors_scale_name(
+                                            param_name
+                                        )
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)

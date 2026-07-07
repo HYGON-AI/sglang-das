@@ -140,5 +140,22 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
+def l2norm_ref(x, eps=1e-6):
+    return x / (x.float().pow(2).sum(-1, keepdim=True) + eps).sqrt().to(x.dtype)
+
+
+@pytest.mark.parametrize("num_rows", [16, 256, 16384, 65536])
+@pytest.mark.parametrize("hidden_size", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_l2norm(num_rows, hidden_size, dtype):
+    x = torch.randn(num_rows, hidden_size, dtype=dtype, device="cuda")
+    y_ref = l2norm_ref(x)
+    y = sgl_kernel.l2norm(x)
+    if dtype == torch.bfloat16:
+        torch.testing.assert_close(y_ref.float(), y.float(), rtol=1e-2, atol=2e-3)
+    else:
+        torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

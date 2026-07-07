@@ -610,13 +610,17 @@ def compress_fused_norm_rope_inplace(
     eps: float,
     freq_cis: torch.Tensor,
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    decode_seq_lens: Optional[torch.Tensor] = None,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    handle = plan[1]
+    if plan.is_decode and decode_seq_lens is not None:
+        handle = decode_seq_lens
     module.forward(
         kv,
         weight,
-        plan[1],
+        handle,
         freq_cis,
         int(plan.is_decode),
         eps,
