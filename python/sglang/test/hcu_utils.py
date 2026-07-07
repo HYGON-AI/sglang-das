@@ -6,8 +6,8 @@ from pathlib import Path
 import openai
 import requests
 
-# DCU CI-owned helpers can auto-run the DCU PR gate.
-DCU_TEXT_SERVER_ARGS = [
+# HCU CI-owned helpers can auto-run the HCU PR gate.
+HCU_TEXT_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
     "--page-size",
@@ -19,7 +19,7 @@ DCU_TEXT_SERVER_ARGS = [
     "warning",
 ]
 
-DCU_VLM_SERVER_ARGS = [
+HCU_VLM_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
     "--mm-attention-backend",
@@ -34,12 +34,12 @@ DCU_VLM_SERVER_ARGS = [
     "warning",
 ]
 
-DCU_MOE_SERVER_ARGS = DCU_TEXT_SERVER_ARGS + [
+HCU_MOE_SERVER_ARGS = HCU_TEXT_SERVER_ARGS + [
     "--tp-size",
     "2",
 ]
 
-DCU_EMBEDDING_SERVER_ARGS = DCU_TEXT_SERVER_ARGS + [
+HCU_EMBEDDING_SERVER_ARGS = HCU_TEXT_SERVER_ARGS + [
     "--is-embedding",
     "--enable-metrics",
 ]
@@ -52,7 +52,7 @@ def get_model_path(env_name: str, default_path: str) -> str:
             raise AssertionError(
                 f"{env_name} points to a missing local model path: {model_path}"
             )
-        raise unittest.SkipTest(f"Default DCU model path does not exist: {model_path}")
+        raise unittest.SkipTest(f"Default HCU model path does not exist: {model_path}")
     return model_path
 
 
