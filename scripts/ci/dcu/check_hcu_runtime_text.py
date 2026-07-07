@@ -5,12 +5,9 @@ The workflow passes only changed files from the PR or push diff. This script
 does not scan the whole repository.
 """
 
-from __future__ import annotations
-
 import ast
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -24,7 +21,7 @@ HCU_EXACT_FILES = {
     "requirements_dcu.txt",
 }
 EXEMPT_FILES = {
-    "scripts/ci/dcu/check_no_amd_runtime_text.py",
+    "scripts/ci/dcu/check_hcu_runtime_text.py",
 }
 VISIBLE_CALLS = {
     "print",
@@ -57,10 +54,12 @@ BLOCKED_TEXT_RE = re.compile(r"AMD|amd|XGMI|xgmi|DCU|dcu")
 MAX_SNIPPET_LEN = 140
 
 
-@dataclass(frozen=True)
 class Replacement:
-    source: str
-    target: str
+    __slots__ = ("source", "target")
+
+    def __init__(self, source, target):
+        self.source = source
+        self.target = target
 
 
 REPLACEMENTS = (
@@ -77,17 +76,19 @@ REPLACEMENTS = (
 )
 
 
-@dataclass(frozen=True)
 class Violation:
-    path: Path
-    lineno: int
-    location: str
-    text: str
+    __slots__ = ("path", "lineno", "location", "text")
 
-    def display_path(self) -> str:
+    def __init__(self, path, lineno, location, text):
+        self.path = path
+        self.lineno = lineno
+        self.location = location
+        self.text = text
+
+    def display_path(self):
         return normalize_path(str(self.path))
 
-    def message(self) -> str:
+    def message(self):
         return (
             f"{self.display_path()}:{self.lineno}: user-visible legacy platform "
             f"text in {self.location}: {text_snippet(self.text)}"
@@ -116,9 +117,18 @@ def function_name(node: ast.AST) -> str:
 
 
 def string_values(node: ast.AST):
+    constant_cls = getattr(ast, "Constant", None)
     for child in ast.walk(node):
-        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+        if (
+            constant_cls is not None
+            and isinstance(child, constant_cls)
+            and isinstance(child.value, str)
+        ):
             yield child.lineno, child.value
+        elif child.__class__.__name__ == "Str" and isinstance(
+            getattr(child, "s", None), str
+        ):
+            yield child.lineno, child.s
 
 
 def text_snippet(text: str) -> str:
@@ -136,7 +146,7 @@ def suggested_text(text: str) -> str:
 
 
 def replacement_hint(text: str) -> str:
-    hits: list[str] = []
+    hits = []
     for replacement in REPLACEMENTS:
         if replacement.source in text:
             hits.append(f"{replacement.source} -> {replacement.target}")
@@ -176,13 +186,13 @@ def has_blocked_text(text: str) -> bool:
     return BLOCKED_TEXT_RE.search(text) is not None
 
 
-def check_python(path: Path) -> list[Violation]:
+def check_python(path: Path):
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except SyntaxError as exc:
         return [violation(path, 1, "Python parser", str(exc))]
 
-    errors: list[Violation] = []
+    errors = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = function_name(node.func)
@@ -198,8 +208,8 @@ def check_python(path: Path) -> list[Violation]:
     return errors
 
 
-def check_text(path: Path) -> list[Violation]:
-    errors: list[Violation] = []
+def check_text(path: Path):
+    errors = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except UnicodeDecodeError:
@@ -211,9 +221,9 @@ def check_text(path: Path) -> list[Violation]:
     return errors
 
 
-def main(argv: list[str]) -> int:
+def main(argv):
     paths = [Path(normalize_path(arg)) for arg in argv if arg.strip()]
-    errors: list[Violation] = []
+    errors = []
 
     for path in paths:
         normalized = normalize_path(str(path))
