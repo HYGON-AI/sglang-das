@@ -73,6 +73,7 @@ from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_f
     fuse_silu_mul_fp8_quant
 from lightop import op as lightop_op
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
+from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -84,6 +85,7 @@ _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
+_use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 
 if _use_aiter and not _is_dcu:
     from aiter import ActivationType, QuantType
@@ -471,6 +473,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
+            self.use_w4a16_marlin = False
         elif isinstance(quant_config, W4AFp8Config):
             self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
@@ -478,6 +481,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
+            self.use_w4a16_marlin = False
         elif isinstance(quant_config, SlimQuantW4A8Int8MarlinConfig):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
@@ -491,6 +495,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = True
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
+            self.use_w4a16_marlin = False
         elif isinstance(quant_config, SlimQuantCompressedTensorsMarlinConfig):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
@@ -504,30 +509,39 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = True
             self.use_bf16_marlin = False
+            self.use_w4a16_marlin = False
         elif _use_fp8_w8a8_moe and _is_dcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = True
             self.use_block_quant = False
-            self.use_w4afp8 = False
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
+            self.use_w4a16_marlin = False
         elif _use_marlin_w16a16_moe and _is_dcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
-            self.use_w4afp8 = False
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = True
+            self.use_w4a16_marlin = False
+        elif _use_marlin_w4a16_moe and _is_dcu:
+            self.use_w4afp8 = False
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.use_w4a8_marlin = False
+            self.use_w8a8_marlin = False
+            self.use_bf16_marlin = False
+            self.use_w4a16_marlin = True
         else:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
-            self.use_w4afp8 = False
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
+            self.use_w4a16_marlin = False
 
         self.deepep_mode = get_deepep_mode()
 
@@ -664,6 +678,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_groupgemm_w8a8_fp8_masked(dispatch_output)
             elif self.use_bf16_marlin:
                 output = self.forward_groupgemm_bf16_masked(dispatch_output)
+            elif self.use_w4a16_marlin:
+                output = self.forward_groupgemm_w4a16_marlin_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
         elif _use_aiter:
@@ -1748,6 +1764,55 @@ class DeepEPMoE(FusedMoE):
 
         return hidden_states
 
+    def forward_groupgemm_w4a16_marlin_masked(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+
+        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+        # base shapes
+        num_groups, m, k = hidden_states.size()
+        expected_m = min(m, expected_m)
+
+        # ---- weights & scales ----
+        w13_weight = self.w13_weight_packed
+        w13_scales = self.w13_weight_scale
+        w2_weight = self.w2_weight_packed
+        w2_scales = self.w2_weight_scale
+
+        n1 = w13_scales.size(1)
+        gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
+
+        # ---- first GEMM ----
+        grouped_gemm_w4a16_nt_masked_entry(
+            hidden_states,
+            w13_weight, w13_scales,
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+
+        q_a2_all = torch.empty((num_groups, m, n1 // 2), device=hidden_states.device, dtype=torch.bfloat16)
+        fuse_silu_and_mul(input=gateup_output, output=q_a2_all, mask_m=masked_m, expect_m=expected_m) 
+        # The first-stage BF16 activation is no longer needed after quantization.
+        # Releasing it here lowers peak memory during low-latency graph capture.
+        del gateup_output
+
+        # ---- second GEMM ----
+        n2 = w2_scales.size(1)
+        down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
+
+        grouped_gemm_w4a16_nt_masked_entry(
+            q_a2_all, 
+            w2_weight, w2_scales,
+            down_output,
+            masked_m,
+            expected_m,
+        )
+
+        return down_output
 
 class NpuFuseEPMoE(DeepEPMoE):
     def __init__(

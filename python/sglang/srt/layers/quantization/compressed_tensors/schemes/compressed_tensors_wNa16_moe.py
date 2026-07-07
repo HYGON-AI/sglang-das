@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from deepgemm.m_group_gemm import w4a16_marlin_weight
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -41,6 +42,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 
 if _use_aiter:
     pass
@@ -447,11 +449,15 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
         w13 = layer.w13_weight_packed.data
         w13 = w13.transpose(1, 2).contiguous().view(torch.uint8)
+        if _use_marlin_w4a16_moe:
+            w13 = w4a16_marlin_weight(w13)
         layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
 
         # Convert w2 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
         w2 = layer.w2_weight_packed.data
         w2 = w2.transpose(1, 2).contiguous().view(torch.uint8)
+        if _use_marlin_w4a16_moe:
+            w2 = w4a16_marlin_weight(w2)
         layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
 
         # Convert w13 scales: [E, K//group_size, N] -> [E, N, K//group_size]

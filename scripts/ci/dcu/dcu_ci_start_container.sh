@@ -17,6 +17,8 @@ set -euo pipefail
 #   DCU_CACHE_HOST / DCU_CI_CACHE_HOST         Host-side cache directory mounted into /sgl-data.
 #   DCU_WHEEL_STAGING_ROOT                  Host-side PR wheel staging directory.
 #   DCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
+#   DCU_MODEL_EXTRA_HOST_PATHS              Colon-separated host model roots to mount read-only
+#                                           at the same path inside the container.
 
 CUSTOM_IMAGE=""
 CONTAINER="${DCU_CI_CONTAINER:-${DCU_CI_CONTAINER_NAME:-ci_sglang}}"
@@ -96,6 +98,21 @@ else
   WHEEL_STAGING_VOLUME=""
 fi
 
+EXTRA_MODEL_VOLUMES=()
+if [[ -n "${DCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
+  IFS=':' read -r -a EXTRA_MODEL_HOST_PATHS <<< "${DCU_MODEL_EXTRA_HOST_PATHS}"
+  for extra_model_path in "${EXTRA_MODEL_HOST_PATHS[@]}"; do
+    if [[ -z "${extra_model_path}" ]]; then
+      continue
+    fi
+    if [[ -d "${extra_model_path}" ]]; then
+      EXTRA_MODEL_VOLUMES+=(-v "${extra_model_path}:${extra_model_path}:ro")
+    else
+      echo "Warning: extra DCU model path does not exist, skip mount: ${extra_model_path}" >&2
+    fi
+  done
+fi
+
 # Remove any leftover container from a previous run.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
@@ -110,6 +127,7 @@ docker run -dt --user root --privileged \
   ${CACHE_VOLUME} \
   ${MODEL_VOLUME} \
   ${WHEEL_STAGING_VOLUME} \
+  "${EXTRA_MODEL_VOLUMES[@]}" \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \

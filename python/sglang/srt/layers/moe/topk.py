@@ -28,9 +28,6 @@ from typing import (
     runtime_checkable,
 )
 
-import numpy as np
-from numpy import dtype
-
 import torch
 import torch.nn.functional as F
 
@@ -82,6 +79,8 @@ try:
 except ImportError:
     pass
 
+import os
+
 from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -104,26 +103,22 @@ from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
-    direct_register_custom_op,
     cpu_has_amx_support,
+    direct_register_custom_op,
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_hip,
     is_musa,
-    is_dcu,
     is_npu,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
-import random
-import os
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_dp_rank,get_attention_dp_size
 
 
 logger = logging.getLogger(__name__)
@@ -184,7 +179,7 @@ if _is_cuda:
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
@@ -203,42 +198,116 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
 if _use_lightop:
     from lightop import op as op
 
+_use_lightop_sqrtsoftplus_gate = (
+    _use_lightop and _is_dcu and hasattr(op, "moe_fused_gate_sqrtsoftplus")
+)
 
-def moe_fused_gate_dcu(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
-                                   topk_group: int, topk: int,
-                                   num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
+
+def moe_fused_gate_dcu(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     topk_weights, topk_ids = op.moe_fused_gate(
-            gating_output,
-            correction_bias,
-            num_expert_group,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-        )
+        gating_output,
+        correction_bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+    )
     return topk_weights, topk_ids
 
-def moe_fused_gate_fake(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
-                                   topk_group: int, topk: int,
-                                   num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty((gating_output.size(0), topk),
-                           dtype=gating_output.dtype,
-                           device=gating_output.device), \
-                    torch.empty((gating_output.size(0), topk),
-                           dtype=gating_output.dtype,
-                           device=gating_output.device)
+
+def moe_fused_gate_fake(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty(
+        (gating_output.size(0), topk),
+        dtype=gating_output.dtype,
+        device=gating_output.device,
+    ), torch.empty(
+        (gating_output.size(0), topk),
+        dtype=gating_output.dtype,
+        device=gating_output.device,
+    )
+
+
 direct_register_custom_op(
-        op_name="moe_fused_gate_dcu",
-        op_func=moe_fused_gate_dcu,
+    op_name="moe_fused_gate_dcu",
+    op_func=moe_fused_gate_dcu,
+    mutates_args=[],
+    fake_impl=moe_fused_gate_fake,
+)
+
+
+if _use_lightop_sqrtsoftplus_gate:
+
+    def moe_fused_gate_sqrtsoftplus_dcu(
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk: int,
+        num_fused_shared_experts: int,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        apply_routed_scaling_factor_on_output: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_weights, topk_ids = op.moe_fused_gate_sqrtsoftplus(
+            gating_output,
+            correction_bias,
+            topk,
+            num_fused_shared_experts,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        return topk_weights, topk_ids
+
+    def moe_fused_gate_sqrtsoftplus_fake(
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk: int,
+        num_fused_shared_experts: int,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        apply_routed_scaling_factor_on_output: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del (
+            correction_bias,
+            num_fused_shared_experts,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        shape = (gating_output.size(0), topk)
+        return (
+            torch.empty(shape, dtype=torch.float32, device=gating_output.device),
+            torch.empty(shape, dtype=torch.int32, device=gating_output.device),
+        )
+
+    direct_register_custom_op(
+        op_name="moe_fused_gate_sqrtsoftplus_dcu",
+        op_func=moe_fused_gate_sqrtsoftplus_dcu,
         mutates_args=[],
-        fake_impl=moe_fused_gate_fake,
+        fake_impl=moe_fused_gate_sqrtsoftplus_fake,
     )
 
 
@@ -693,6 +762,7 @@ def fused_topk(
             )
         elif _is_dcu and _use_fused_topk_softmax:
             from lightop import op
+
             op.topk_softmax(
                 topk_weights,
                 topk_ids,
@@ -957,6 +1027,60 @@ def biased_topk_jit_kernel_impl(
     return topk_weights, topk_ids
 
 
+def _can_use_lightop_sqrtsoftplus_gate(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: Optional[float],
+) -> bool:
+    return (
+        _use_lightop_sqrtsoftplus_gate
+        and gating_output.dtype == torch.float32
+        and correction_bias.dtype == torch.float32
+        and gating_output.is_contiguous()
+        and correction_bias.is_contiguous()
+        and gating_output.dim() == 2
+        and correction_bias.dim() == 1
+        and gating_output.size(1) == correction_bias.size(0)
+        and gating_output.size(1) in (256, 384)
+        and 0 <= num_fused_shared_experts < topk <= 16
+        and routed_scaling_factor is not None
+        and routed_scaling_factor > 0.0
+    )
+
+
+def biased_topk_lightop_impl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sqrtsoftplus",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert scoring_func == "sqrtsoftplus"
+    assert routed_scaling_factor is not None
+
+    topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_sqrtsoftplus_dcu(
+        gating_output,
+        correction_bias,
+        topk,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor,
+        bool(apply_routed_scaling_factor_on_output),
+    )
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
@@ -1100,9 +1224,7 @@ def _try_lightop_topk_ids_postprocess(
     if logical_to_physical_map is None and num_token_non_padded is None:
         return topk_ids
 
-    op.topk_ids_postprocess(
-        topk_ids, logical_to_physical_map, num_token_non_padded
-    )
+    op.topk_ids_postprocess(topk_ids, logical_to_physical_map, num_token_non_padded)
     return topk_ids
 
 
@@ -1267,15 +1389,15 @@ def biased_grouped_topk_gpu(
             num_expert_group,
             topk_group,
             topk,
-            num_fused_shared_experts, 
+            num_fused_shared_experts,
             routed_scaling_factor,
         )
-        if (expert_location_dispatch_info is not None) or (
-            num_token_non_padded is not None
-        ):
-            topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded
-            )
+        # if (expert_location_dispatch_info is not None) or (
+        #     num_token_non_padded is not None
+        # ):
+        #     topk_ids = _biased_grouped_topk_postprocess(
+        #         topk_ids, expert_location_dispatch_info, num_token_non_padded
+        #     )
         return topk_weights, topk_ids
     else:
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
@@ -1568,11 +1690,18 @@ def select_experts(
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         if scoring_func == "sqrtsoftplus":
-            _biased_topk = (
-                biased_topk_jit_kernel_impl
-                if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
-                else biased_topk_impl
-            )
+            if _can_use_lightop_sqrtsoftplus_gate(
+                router_logits,
+                correction_bias,
+                num_routed_topk if _use_aiter else top_k,
+                num_fused_shared_experts,
+                routed_scaling_factor,
+            ):
+                _biased_topk = biased_topk_lightop_impl
+            elif envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+                _biased_topk = biased_topk_jit_kernel_impl
+            else:
+                _biased_topk = biased_topk_impl
 
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
@@ -1700,6 +1829,8 @@ if _is_cuda:
             dtype=torch.int32,
         )
         return topk_weights, topk_ids
+
+
 def batch_write_expert_counts(expert_count: torch.Tensor, num_token: int):
     # 合并所有token的expert_count并写入文件
     rank = torch.distributed.get_rank()

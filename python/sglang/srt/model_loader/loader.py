@@ -732,6 +732,30 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights_and_postprocess(model, weights, target_device):
         model.load_weights(weights)
 
+        # [FST-RECLAIM] empty_cache AFTER load_weights, BEFORE process_weights.
+        # fastsafetensors reads each whole safetensors file onto the GPU, pushing
+        # torch's reserved high-water mark up. By the end of load_weights those
+        # whole-file buffers are already freed (fb.close), so they sit as
+        # reclaimable RESERVED. Returning them to the OS here -- before
+        # process_weights_after_loading allocates repacked/quantized tensors into
+        # (and fragments) that space -- recovers ~10GB/rank of serving headroom.
+        # Mirrors the torch.npu.empty_cache() sglang already does for NPU in the
+        # loop below; extended to CUDA/HIP (DCU), which upstream omitted.
+        #
+        # Gated to fst only: it is the sole loader that leaves reserved >> allocated
+        # (other loaders stage weights on CPU, reserved ~= allocated), so this is a
+        # pure no-op sync elsewhere and every non-fst path is left unchanged. Uses
+        # the same check as this file's other fst branches
+        # (get_global_server_args().load_format == LoadFormat.FASTSAFETENSORS); both
+        # symbols are module-level imports here. synchronize() first drains fst's
+        # async copies/broadcasts so empty_cache can return the full amount at once.
+        if (
+            torch.cuda.is_available()
+            and get_global_server_args().load_format == LoadFormat.FASTSAFETENSORS
+        ):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
