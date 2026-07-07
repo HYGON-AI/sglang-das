@@ -6,7 +6,6 @@ from pathlib import Path
 import openai
 import requests
 
-
 # DCU CI-owned helpers can auto-run the DCU PR gate.
 DCU_TEXT_SERVER_ARGS = [
     "--attention-backend",
@@ -151,7 +150,9 @@ def assert_rerank_scores(base_url: str, api_key: str, query: str, documents: lis
     if not isinstance(payload, list) or not payload:
         raise AssertionError(f"rerank returned invalid response: {payload}")
     if "score" not in payload[0] or not isinstance(payload[0]["score"], (float, int)):
-        raise AssertionError(f"rerank response does not contain numeric score: {payload}")
+        raise AssertionError(
+            f"rerank response does not contain numeric score: {payload}"
+        )
     return payload
 
 
