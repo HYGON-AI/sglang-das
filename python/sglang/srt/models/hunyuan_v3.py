@@ -40,36 +40,31 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.utils import (
-    create_fused_set_kv_buffer_arg,
-    enable_fused_set_kv_buffer,
-)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -176,9 +171,9 @@ class HYV3MoEFused(nn.Module):
         #     quant_config=quant_config,
         #     prefix=f"{prefix}.experts",
         # )
-        
+
         experts_cls = get_moe_impl_class(quant_config)
-        self.experts = experts_cls(        
+        self.experts = experts_cls(
             num_experts=self.n_routed_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
@@ -188,7 +183,7 @@ class HYV3MoEFused(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
-        
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             use_grouped_topk=True,
@@ -218,7 +213,6 @@ class HYV3MoEFused(nn.Module):
             )
         else:
             self.shared_mlp = None
-
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -486,15 +480,12 @@ class HYV3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        can_fuse_set_kv = (
-            self.head_dim == self.rotary_emb.rotary_dim
-            and enable_fused_set_kv_buffer(forward_batch)
-        )
+        used_fused_hunyuan_rotary_kv_store = False
         if (
             _is_dcu
             and _use_fused_hunyuan_rotary
             and self.use_qk_norm
-            and can_fuse_set_kv
+            and self.head_dim == self.rotary_emb.rotary_dim
         ):
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
@@ -528,13 +519,20 @@ class HYV3Attention(nn.Module):
                 v_scale=None,
                 epsilon=self.q_norm.variance_epsilon,
             )
+            used_fused_hunyuan_rotary_kv_store = True
         elif self.use_qk_norm:
             q = self.q_norm(q.reshape(-1, self.head_dim))
             q = q.view(-1, self.q_size)
             k = self.k_norm(k.reshape(-1, self.head_dim))
             k = k.view(-1, self.kv_size)
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not used_fused_hunyuan_rotary_kv_store,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
