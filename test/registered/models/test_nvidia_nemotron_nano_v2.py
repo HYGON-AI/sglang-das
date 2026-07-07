@@ -16,6 +16,7 @@ register_hcu_ci(
     disabled="HCU CSV CI placeholder: NVIDIA Nemotron model path needs HCU-compatible local mapping before enabling.",
 )
 
+
 class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, DefaultServerBase):
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     gsm8k_accuracy_thres = 0.87

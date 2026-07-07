@@ -51,8 +51,8 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_hip,
     is_hcu,
+    is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -70,7 +70,6 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
-    is_hcu,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -1881,7 +1880,11 @@ class ServerArgs:
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 
-                    if is_hip() and not is_hcu() and not aiter_can_use_preshuffle_paged_mqa():
+                    if (
+                        is_hip()
+                        and not is_hcu()
+                        and not aiter_can_use_preshuffle_paged_mqa()
+                    ):
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                         # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).

@@ -125,8 +125,12 @@ def assign_req_to_token_pool(
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
 
+
 from sgl_kernel.kvcacheio import hcu_assign_req_to_token_pool
+
 from sglang.srt.utils import get_bool_env_var
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -135,16 +139,18 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    use_sglang_assign_req_to_token_pool = get_bool_env_var("SGLANG_ASSIGN_REQ_TO_TOKEN_POOL", default="true")
+    use_sglang_assign_req_to_token_pool = get_bool_env_var(
+        "SGLANG_ASSIGN_REQ_TO_TOKEN_POOL", default="true"
+    )
     if use_sglang_assign_req_to_token_pool:
         hcu_assign_req_to_token_pool(
-            req_pool_indices = req_pool_indices,
-            req_to_token = req_to_token,
-            allocate_lens = start_offset,
-            new_allocate_lens = end_offset,
-            out_cache_loc = out_cache_loc,
-            shape = req_to_token.shape[1],
-            bs = batch_size,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            allocate_lens=start_offset,
+            new_allocate_lens=end_offset,
+            out_cache_loc=out_cache_loc,
+            shape=req_to_token.shape[1],
+            bs=batch_size,
         )
     else:
         assign_req_to_token_pool[(batch_size,)](

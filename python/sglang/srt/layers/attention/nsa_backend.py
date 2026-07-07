@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, is_hcu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -262,7 +262,10 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 fast_topk_v2,
             )
         else:
-            from lightop import fast_topk_transform_fused, fast_topk_transform_ragged_fused
+            from lightop import (
+                fast_topk_transform_fused,
+                fast_topk_transform_ragged_fused,
+            )
             from sgl_kernel import fast_topk_v2
 
         if topk_indices_offset_override is not None:
@@ -1766,7 +1769,7 @@ class NativeSparseAttnBackend(
         sm_scale: float,
     ) -> torch.Tensor:
         if not _is_hcu:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd 
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
         else:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
 
@@ -1873,7 +1876,6 @@ class NativeSparseAttnBackend(
             o = o[:, :, :num_q_heads, :]
 
         return o
-
 
     def _forward_standard_mha(
         self,
@@ -2270,7 +2272,7 @@ class NativeSparseAttnBackend(
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (
-                    ( is_blackwell() or _is_hcu )
+                    (is_blackwell() or _is_hcu)
                     and forward_batch is not None
                     and forward_batch.forward_mode == ForwardMode.EXTEND
                 ):

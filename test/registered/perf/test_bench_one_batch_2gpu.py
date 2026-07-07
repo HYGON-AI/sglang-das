@@ -1,12 +1,16 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
 register_hcu_ci(
     est_time=120,
     suite="nightly-hcu-perf",
     nightly=True,
-    disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
 )
 
 from sglang.test.test_utils import (

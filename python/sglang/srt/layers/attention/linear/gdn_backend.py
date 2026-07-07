@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_hcu, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import rank0_log
 
 _is_hcu = is_hcu()
@@ -53,8 +53,11 @@ elif is_cpu():
 
 _use_causal_conv1d = get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D")
 if _is_hcu and _use_causal_conv1d:
-    from causal_conv1d.causal_conv1d_interface import causal_conv1d_update as causal_conv1d_update_hcu
     from causal_conv1d import causal_conv1d_fn_hcu
+    from causal_conv1d.causal_conv1d_interface import (
+        causal_conv1d_update as causal_conv1d_update_hcu,
+    )
+
 
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""

@@ -35,9 +35,9 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
-    is_hcu,
     is_npu,
     is_xpu,
     set_weight_attrs,
@@ -95,6 +95,7 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if is_hcu:
             from lightop import fuse_silu_and_mul
+
             fuse_silu_and_mul(x, out)
         else:
             silu_and_mul(x, out)

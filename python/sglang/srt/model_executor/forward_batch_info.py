@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -37,6 +38,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -57,18 +59,13 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
     is_hcu,
+    is_hip,
     is_npu,
     support_triton,
-    get_compiler_backend,
-    get_bool_env_var,
 )
 from sglang.srt.utils.common import ceil_align
-from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
 
-import logging
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -84,6 +81,7 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_hcu = is_hcu()
+
 
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
@@ -440,7 +438,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # hcu only
     residual_rms_per_quant_int8: Optional[torch.Tensor] = None
     rms_quant_flag: bool = False
-    
+
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -511,13 +509,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.pin_memory().to(device, non_blocking=True)
+                batch.extend_input_logprob_token_ids.pin_memory().to(
+                    device, non_blocking=True
+                )
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).pin_memory().to(
-                device, non_blocking=True
+            ret.num_token_non_padded = (
+                torch.tensor(num_tokens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
             )
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -537,14 +539,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).pin_memory().to(device, non_blocking=True)
+            ret.global_num_tokens_gpu = (
+                torch.tensor(global_num_tokens, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).pin_memory().to(device, non_blocking=True)
+            ret.global_num_tokens_for_logprob_gpu = (
+                torch.tensor(global_num_tokens_for_logprob, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -576,12 +582,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).pin_memory().to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).pin_memory().to(device, non_blocking=True)
+            ret.extend_seq_lens = (
+                torch.tensor(batch.extend_seq_lens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
+            ret.extend_prefix_lens = (
+                torch.tensor(batch.extend_prefix_lens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -731,7 +741,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     if mm_inputs[batch_idx] is None
                     else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
                 )
-                mrope_deltas.append(mrope_delta.pin_memory().to(device=device, non_blocking=True))
+                mrope_deltas.append(
+                    mrope_delta.pin_memory().to(device=device, non_blocking=True)
+                )
             position_chunks = torch.split(batch.spec_info.positions, extend_lens)
             mrope_positions_list = [
                 pos_chunk + delta
@@ -834,10 +846,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
-            [pos for pos in mrope_positions_list],
-            dim=1,
-        ).pin_memory().to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        self.mrope_positions = (
+            torch.cat(
+                [pos for pos in mrope_positions_list],
+                dim=1,
+            )
+            .pin_memory()
+            .to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        )
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
@@ -862,15 +878,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 num_chunk_tokens, dtype=torch.int32, device=device
             )
             hcu_create_chunked_prefix_cache_kv_indices(
-                    req_to_token = self.req_to_token_pool.req_to_token,
-                    req_pool_indices = self.req_pool_indices,
-                    chunk_starts = chunk_starts,
-                    chunk_seq_lens = chunk_seq_lens,
-                    chunk_cu_seq_lens = chunk_cu_seq_lens,
-                    chunk_kv_indices = chunk_kv_indices,
-                    col_num = self.req_to_token_pool.req_to_token.shape[1],
-                    bs = self.batch_size,
-                )
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_indices=self.req_pool_indices,
+                chunk_starts=chunk_starts,
+                chunk_seq_lens=chunk_seq_lens,
+                chunk_cu_seq_lens=chunk_cu_seq_lens,
+                chunk_kv_indices=chunk_kv_indices,
+                col_num=self.req_to_token_pool.req_to_token.shape[1],
+                bs=self.batch_size,
+            )
             # if self.use_sglang_create_chunked_prefix_cache_kv_indices:
             #     hcu_create_chunked_prefix_cache_kv_indices(
             #         req_to_token = self.req_to_token_pool.req_to_token,

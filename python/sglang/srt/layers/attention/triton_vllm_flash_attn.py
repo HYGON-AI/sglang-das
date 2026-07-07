@@ -91,7 +91,9 @@ def _paged_varlen_attn_fwd_kernel(
     q_mask = offs_m < q_len
 
     kv_head = pid_h // (H_Q // H_KV)
-    q_descale_head = tl.where(Q_DESCALE_HEADS == 1, 0, tl.where(Q_DESCALE_HEADS == H_Q, pid_h, kv_head))
+    q_descale_head = tl.where(
+        Q_DESCALE_HEADS == 1, 0, tl.where(Q_DESCALE_HEADS == H_Q, pid_h, kv_head)
+    )
     k_descale_head = tl.where(K_DESCALE_HEADS == 1, 0, kv_head)
     v_descale_head = tl.where(V_DESCALE_HEADS == 1, 0, kv_head)
     q_scale = 1.0
@@ -110,8 +112,15 @@ def _paged_varlen_attn_fwd_kernel(
             V_DESCALE + pid_b * V_DESCALE_STRIDE_B + v_descale_head * V_DESCALE_STRIDE_H
         ).to(tl.float32)
 
-    q_ptrs = Q + (q_start + offs_m[:, None]) * Q_STRIDE_T + pid_h * Q_STRIDE_H + offs_d[None, :] * Q_STRIDE_D
-    q = tl.load(q_ptrs, mask=q_mask[:, None] & (offs_d[None, :] < D), other=0.0).to(tl.float32)
+    q_ptrs = (
+        Q
+        + (q_start + offs_m[:, None]) * Q_STRIDE_T
+        + pid_h * Q_STRIDE_H
+        + offs_d[None, :] * Q_STRIDE_D
+    )
+    q = tl.load(q_ptrs, mask=q_mask[:, None] & (offs_d[None, :] < D), other=0.0).to(
+        tl.float32
+    )
     q = q * q_scale
 
     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
@@ -137,7 +146,9 @@ def _paged_varlen_attn_fwd_kernel(
             + kv_head * K_STRIDE_H
             + offs_d[:, None] * K_STRIDE_D
         )
-        k = tl.load(k_ptrs, mask=kv_mask[None, :] & (offs_d[:, None] < D), other=0.0).to(tl.float32)
+        k = tl.load(
+            k_ptrs, mask=kv_mask[None, :] & (offs_d[:, None] < D), other=0.0
+        ).to(tl.float32)
         k = k * k_scale
         qk = tl.dot(q, k) * SCALE
 
@@ -156,7 +167,9 @@ def _paged_varlen_attn_fwd_kernel(
             + kv_head * V_STRIDE_H
             + offs_vd[None, :] * V_STRIDE_D
         )
-        v = tl.load(v_ptrs, mask=kv_mask[:, None] & (offs_vd[None, :] < D_V), other=0.0).to(tl.float32)
+        v = tl.load(
+            v_ptrs, mask=kv_mask[:, None] & (offs_vd[None, :] < D_V), other=0.0
+        ).to(tl.float32)
         v = v * v_scale
 
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
@@ -164,7 +177,12 @@ def _paged_varlen_attn_fwd_kernel(
         m_i = m_new
 
     acc = acc / l_i[:, None]
-    out_ptrs = O + (q_start + offs_m[:, None]) * O_STRIDE_T + pid_h * O_STRIDE_H + offs_vd[None, :] * O_STRIDE_D
+    out_ptrs = (
+        O
+        + (q_start + offs_m[:, None]) * O_STRIDE_T
+        + pid_h * O_STRIDE_H
+        + offs_vd[None, :] * O_STRIDE_D
+    )
     tl.store(out_ptrs, acc, mask=q_mask[:, None] & (offs_vd[None, :] < D_V))
 
 
@@ -186,7 +204,9 @@ def triton_vllm_flash_attn_varlen_func(
     v_descale: Optional[torch.Tensor],
 ) -> torch.Tensor:
     if window_size != (-1, -1):
-        raise NotImplementedError("Triton reference FA only supports full-context attention.")
+        raise NotImplementedError(
+            "Triton reference FA only supports full-context attention."
+        )
     if q.dim() != 3:
         raise ValueError(f"q must be [total_q, Hq, D], got {tuple(q.shape)}")
     if k.dim() != 4 or v.dim() != 4:
@@ -228,7 +248,7 @@ def triton_vllm_flash_attn_varlen_func(
     if h_q % h_kv != 0:
         raise ValueError(f"Hq must be divisible by Hkv, got Hq={h_q}, Hkv={h_kv}")
     if softmax_scale is None:
-        softmax_scale = d ** -0.5
+        softmax_scale = d**-0.5
     out_dtype = _attention_output_dtype(q.dtype)
     if max_seqlen_k <= 0 or max_seqlen_q <= 0:
         return torch.empty((total_q, h_q, d_v), device=q.device, dtype=out_dtype)
@@ -253,9 +273,13 @@ def triton_vllm_flash_attn_varlen_func(
         elif descale.dim() == 1:
             descale = descale.view(1, descale.shape[0])
         elif descale.dim() != 2:
-            raise ValueError(f"{name} must be scalar, [heads], or [batch, heads], got {tuple(descale.shape)}")
+            raise ValueError(
+                f"{name} must be scalar, [heads], or [batch, heads], got {tuple(descale.shape)}"
+            )
         if descale.shape[0] not in (1, batch):
-            raise ValueError(f"{name} batch dim must be 1 or {batch}, got {tuple(descale.shape)}")
+            raise ValueError(
+                f"{name} batch dim must be 1 or {batch}, got {tuple(descale.shape)}"
+            )
         if descale.shape[1] not in valid_heads:
             raise ValueError(
                 f"{name} head dim must be one of {sorted(valid_heads)}, got {tuple(descale.shape)}"
@@ -353,11 +377,17 @@ def triton_vllm_flash_attn_with_kvcache(
     builds cu_seqlens_q and delegates to triton_vllm_flash_attn_varlen_func.
     """
     if return_softmax_lse:
-        raise NotImplementedError("Triton reference decode FA does not return softmax_lse yet.")
+        raise NotImplementedError(
+            "Triton reference decode FA does not return softmax_lse yet."
+        )
     if softcap not in (0, 0.0, None):
-        raise NotImplementedError("Triton reference decode FA does not support softcap yet.")
+        raise NotImplementedError(
+            "Triton reference decode FA does not support softcap yet."
+        )
     if block_table is None:
-        raise ValueError("block_table/page_table is required for paged decode attention.")
+        raise ValueError(
+            "block_table/page_table is required for paged decode attention."
+        )
     if q.dim() == 3:
         original_shape = q.shape
         q_4d = q.unsqueeze(1)
@@ -387,7 +417,9 @@ def triton_vllm_flash_attn_with_kvcache(
         dtype=torch.int32,
     )
     if isinstance(cache_seqlens, int):
-        seqused_k = torch.full((batch,), cache_seqlens, device=q.device, dtype=torch.int32)
+        seqused_k = torch.full(
+            (batch,), cache_seqlens, device=q.device, dtype=torch.int32
+        )
         max_seqlen_k = cache_seqlens
     else:
         seqused_k = cache_seqlens.to(device=q.device, dtype=torch.int32).contiguous()

@@ -27,6 +27,7 @@ register_hcu_ci(
     disabled="HCU CSV CI placeholder: local attention multi-device path needs BW1100 validation before enabling.",
 )
 
+
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class TestFlashAttention3LocalAttn(CustomTestCase):
     model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION

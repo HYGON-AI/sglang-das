@@ -4,7 +4,11 @@ VLM Performance tests that work on 5090 (32GB) - VLM offline throughput and onli
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
 register_hcu_ci(
     est_time=120,

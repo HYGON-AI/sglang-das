@@ -6,7 +6,11 @@ python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.kits.eval_accuracy_kit import HumanEvalMixin, MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,

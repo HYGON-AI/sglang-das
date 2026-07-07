@@ -1,3 +1,4 @@
+# ruff: noqa: F401, F821
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/fused_moe.py
@@ -10,17 +11,18 @@ import functools
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
-import triton
 import torch.nn.functional as F
+import triton
 import triton.language as tl
+from lightop import get_moe_cuda_marlin_config, moe_gemm_marlin_w8a8_fp8
 
 from sglang.srt.environ import envs
-from lightop import moe_gemm_marlin_w8a8_fp8, get_moe_cuda_marlin_config
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    direct_register_custom_op,
     get_bool_env_var,
     is_cpu,
     is_cuda,
@@ -30,7 +32,6 @@ from sglang.srt.utils import (
     use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils import direct_register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
@@ -40,6 +41,7 @@ from .fused_moe_triton_kernels import (
     support_tensor_descriptor,
 )
 from .moe_align_block_size import moe_align_block_size
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -63,10 +65,10 @@ elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
+
     if _use_lightop:
-        from lightop import op as ops
         from lightop import fuse_silu_and_mul, fuse_silu_mul_fp8_quant
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size as moe_align_block_size_lightop
+        from lightop import op as ops
     if _use_aiter:
         try:
             from aiter import moe_sum
@@ -76,13 +78,15 @@ elif _is_hip:
         try:
             import aiter
             from aiter.moe import (
-                get_aiter_moe_config,
-                aiter_moe,
-                MoeSolutionType,
                 MoeQuantType,
+                MoeSolutionType,
+                aiter_moe,
+                get_aiter_moe_config,
             )
         except ImportError:
-            raise ImportError("aiter is required when SGLANG_ROCM_USE_AITER_MOE is set to True")
+            raise ImportError(
+                "aiter is required when SGLANG_ROCM_USE_AITER_MOE is set to True"
+            )
     # Note: vllm_ops is not needed for HIP when _use_aiter=False
     # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
@@ -103,8 +107,11 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         # Fallback: vllm not available, will use native PyTorch implementations
         _has_vllm_ops = False
 from vllm.platforms import current_platform
+
 device_name = current_platform.get_device_name().replace(" ", "_")
-num_cus= torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+num_cus = torch.cuda.get_device_properties(
+    torch.cuda.current_device()
+).multi_processor_count
 
 padding_size = get_moe_padding_size(_use_aiter)
 
@@ -118,7 +125,7 @@ def inplace_fused_experts(
     topk_ids: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    activation: int = 0,#0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -182,7 +189,7 @@ def inplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    activation: int = 0,#0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -222,7 +229,7 @@ def outplace_fused_experts(
     topk_ids: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    activation: int = 0,#0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -287,7 +294,7 @@ def outplace_fused_experts_fake(
     topk_ids: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    activation: int = 0,#0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -346,11 +353,15 @@ def fused_experts(
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
     act_id = (
-        0 if (
+        0
+        if (
             moe_runner_config.activation == 0
-            or (isinstance(moe_runner_config.activation, str)
-                and moe_runner_config.activation.lower() == "silu")
-        ) else 1
+            or (
+                isinstance(moe_runner_config.activation, str)
+                and moe_runner_config.activation.lower() == "silu"
+            )
+        )
+        else 1
     )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
@@ -458,7 +469,7 @@ def fused_experts_impl_aiter(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     inplace: bool = False,
-    activation: int = 0,#0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -490,13 +501,21 @@ def fused_experts_impl_aiter(
         )
     block_size = 0 if is_channelwise_w8a8 else block_shape[1]
     status, moe_cfg = get_aiter_moe_config(
-        M=M, E=E, N1=N1, N2=N2, K=K, top_k=topk_ids.shape[1], block_size=block_size, dtype=hidden_states.dtype, quant_type=quant_type,
+        M=M,
+        E=E,
+        N1=N1,
+        N2=N2,
+        K=K,
+        top_k=topk_ids.shape[1],
+        block_size=block_size,
+        dtype=hidden_states.dtype,
+        quant_type=quant_type,
     )
     if status:
-        assert moe_cfg.solution_type is not None, \
-            "status=True but solution_type is None"
-        assert moe_cfg.config is not None, \
-            "status=True but config is None"
+        assert (
+            moe_cfg.solution_type is not None
+        ), "status=True but solution_type is None"
+        assert moe_cfg.config is not None, "status=True but config is None"
         assert moe_cfg.solution_type in (
             MoeSolutionType.MOE_C,
             MoeSolutionType.ASM,
@@ -506,13 +525,9 @@ def fused_experts_impl_aiter(
         assert moe_cfg.quant_type in (
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
-        ), \
-            f"Unexpected quant_type: {moe_cfg.quant_type}"
+        ), f"Unexpected quant_type: {moe_cfg.quant_type}"
         dsv4_2604_submode = getattr(envs, "SGLANG_DSV4_2604_SUBMODE", None)
-        is_2604b = (
-            dsv4_2604_submode is not None
-            and dsv4_2604_submode.get() == "2604B"
-        )
+        is_2604b = dsv4_2604_submode is not None and dsv4_2604_submode.get() == "2604B"
         if is_2604b:
             deepseek_v4_moe_code_path_checker.observed += 1
         # print(
@@ -521,16 +536,37 @@ def fused_experts_impl_aiter(
         #     f"config keys={list(moe_cfg.config.keys())}"
         # )
     else:
-        assert moe_cfg.solution_type is None, \
-            "status=False but solution_type is not None"
-        assert moe_cfg.config is None, \
-            "status=False but config is not None"
+        assert (
+            moe_cfg.solution_type is None
+        ), "status=False but solution_type is not None"
+        assert moe_cfg.config is None, "status=False but config is not None"
         print(
             f"[get_config_aiter_moe] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_size}, dtype={hidden_states.dtype}, quant_type={quant_type} "
             f"no solution found (expected on unsupported configs)"
         )
 
-    return aiter_moe(hidden_states, w1, w2, topk_weights, topk_ids, moe_cfg, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, E, None, routed_scaling_factor, output_dtype=hidden_states.dtype)
+    return aiter_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        moe_cfg,
+        inplace,
+        activation,
+        w1_scale,
+        w2_scale,
+        w1_zp,
+        w2_zp,
+        a1_scale,
+        a2_scale,
+        block_shape,
+        E,
+        None,
+        routed_scaling_factor,
+        output_dtype=hidden_states.dtype,
+    )
+
 
 def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
@@ -990,7 +1026,7 @@ def fused_experts_impl(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
-    activation: int = 0,#0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1012,14 +1048,38 @@ def fused_experts_impl(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
 ):
-    if _use_aiter_moe and (use_int4_w4a16 or use_int8_w8a8 or use_fp8_w8a8) and hidden_states.dtype == torch.bfloat16:
+    if (
+        _use_aiter_moe
+        and (use_int4_w4a16 or use_int8_w8a8 or use_fp8_w8a8)
+        and hidden_states.dtype == torch.bfloat16
+    ):
         if use_int4_w4a16:
             quant_type = MoeQuantType.W4A16
         else:
             quant_type = MoeQuantType.FP8_W8A8
-        return fused_experts_impl_aiter(hidden_states, w1, w2, topk_weights, topk_ids, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, routed_scaling_factor, quant_type)
+        return fused_experts_impl_aiter(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            inplace,
+            activation,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            routed_scaling_factor,
+            quant_type,
+        )
 
-    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import hcu_moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+        hcu_moe_align_block_size,
+    )
+
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
     padded_size = padding_size
@@ -1175,8 +1235,8 @@ def fused_experts_impl(
         #     and (not use_int4_w4a16)
         # )
         if _use_lightop:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = hcu_moe_align_block_size(
-                curr_topk_ids, config["BLOCK_SIZE_M"], E
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                hcu_moe_align_block_size(curr_topk_ids, config["BLOCK_SIZE_M"], E)
             )
         else:
             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -1225,7 +1285,7 @@ def fused_experts_impl(
                     intermediate_cache1.view(-1, N), gemm1_limit
                 )
             # elif _use_lightop:
-            elif False: #暂时关闭，开启后性能会很差
+            elif False:  # 暂时关闭，开启后性能会很差
                 fuse_silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             # elif _is_cuda or _is_hip or _is_xpu:
             #     if not filter_expert:
@@ -1374,7 +1434,7 @@ def fused_experts_impl(
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
                 if _use_lightop:
-                        ops.moe_sum(
+                    ops.moe_sum(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         factor=routed_scaling_factor,
@@ -1519,6 +1579,7 @@ def fused_moe(
         block_shape=block_shape,
     )
 
+
 @triton.jit
 def _per_token_quant_fp8(
     x_ptr,
@@ -1529,15 +1590,14 @@ def _per_token_quant_fp8(
     N,
     BLOCK: tl.constexpr,
     fp8_min,
-    fp8_max
+    fp8_max,
 ):
     row_id = tl.program_id(0)
 
     cols = tl.arange(0, BLOCK)
     mask = cols < N
 
-    x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask,
-                other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / fp8_max
     x_q = tl.clamp(x / scale_x, min=fp8_min, max=fp8_max).to(xq_ptr.dtype.element_ty)
@@ -1549,17 +1609,15 @@ def per_token_quant_fp8(x):
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.float8_e4m3fn)
-    scales = torch.empty(x.shape[:-1] + (1, ),
-                         device=x.device,
-                         dtype=torch.float32)
+    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=torch.float32)
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     finfo = torch.finfo(x_q.dtype)
     fp8_min = finfo.min
     fp8_max = finfo.max
-    #assert x.is_contiguous()
-    _per_token_quant_fp8[(M, )](
+    # assert x.is_contiguous()
+    _per_token_quant_fp8[(M,)](
         x,
         x_q,
         scales,
@@ -1570,9 +1628,10 @@ def per_token_quant_fp8(x):
         num_warps=num_warps,
         num_stages=1,
         fp8_min=fp8_min,
-        fp8_max=fp8_max
+        fp8_max=fp8_max,
     )
     return x_q, scales
+
 
 def fused_moe_fp8_w8a8(
     hidden_states: torch.Tensor,
@@ -1625,13 +1684,18 @@ def fused_moe_fp8_w8a8(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import hcu_moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+        hcu_moe_align_block_size,
+    )
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     # assert hidden_states.dtype in [torch.float16, torch.bfloat16]
-    if hidden_states_fp8_input is not None and hidden_states_scale_fp8_input is not None:
+    if (
+        hidden_states_fp8_input is not None
+        and hidden_states_scale_fp8_input is not None
+    ):
         hidden_states_fp8 = hidden_states_fp8_input
         hidden_states_scale_fp8 = hidden_states_scale_fp8_input
         if hidden_states_scale_fp8.dim() == hidden_states_fp8.dim() - 1:
@@ -1667,7 +1731,8 @@ def fused_moe_fp8_w8a8(
             global_num_experts = E
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = hcu_moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts)
+            topk_ids, block_size_m, global_num_experts
+        )
 
         # TODO: tune this further for specific models
         # intermediate_cache2 = torch.empty(
@@ -1680,9 +1745,9 @@ def fused_moe_fp8_w8a8(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        intermediate_cache1 = intermediate_cache13[:m * topk_ids.shape[1] * n1]
+        intermediate_cache1 = intermediate_cache13[: m * topk_ids.shape[1] * n1]
         intermediate_cache1 = intermediate_cache1.view(-1, n1)
-        intermediate_cache3 = intermediate_cache13[:m * topk_ids.shape[1] * k]
+        intermediate_cache3 = intermediate_cache13[: m * topk_ids.shape[1] * k]
         intermediate_cache3 = intermediate_cache3.view(-1, k)
 
         intermediate_cache1 = moe_gemm_marlin_w8a8_fp8(
@@ -1699,7 +1764,9 @@ def fused_moe_fp8_w8a8(
             cuda_config1,
         )
 
-        fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(intermediate_cache1, fp8type=0)
+        fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
+            intermediate_cache1, fp8type=0
+        )
 
         intermediate_cache3 = moe_gemm_marlin_w8a8_fp8(
             fp8_cache2,
@@ -1730,4 +1797,6 @@ def fused_moe_fp8_w8a8(
         )
         return output
     else:
-        raise RuntimeError("No MoE implementation available. Please set: export SGLANG_ROCM_USE_AITER_MOE=true and export SGLANG_USE_FP8_W8A8_MOE=0")
+        raise RuntimeError(
+            "No MoE implementation available. Please set: export SGLANG_ROCM_USE_AITER_MOE=true and export SGLANG_USE_FP8_W8A8_MOE=0"
+        )

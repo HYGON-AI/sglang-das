@@ -13,9 +13,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
-import requests
-from sglang.srt.utils import get_bool_env_var
-import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -46,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -62,6 +60,8 @@ class KVTransferError(Exception):
 
 
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
+
+
 # prefill
 @dataclasses.dataclass
 class TransferKVChunk:
@@ -850,12 +850,8 @@ class MooncakeKVManager(CommonKVManager):
             heads_bytes_to_send = num_heads_to_send * bytes_per_head_to_send
         else:
             # Non-FA layout: head slice within one token slot
-            src_head_slice_offset = (
-                src_head_start_offset * bytes_per_head_slice_to_send
-            )
-            dst_head_slice_offset = (
-                dst_head_start_offset * bytes_per_head_slice_to_send
-            )
+            src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
+            dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
             heads_bytes_per_token_to_send = (
                 num_heads_to_send * bytes_per_head_slice_to_send
             )

@@ -50,8 +50,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
-    _is_hcu,
     _is_fp8_fnuz,
+    _is_hcu,
     _is_hip,
     _is_musa,
     _is_npu,

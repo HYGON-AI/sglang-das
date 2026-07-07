@@ -30,6 +30,7 @@ register_hcu_ci(
     disabled="HCU CSV CI placeholder: W4A8 DeepSeek-V3 quant path needs BW1100 large-model validation before enabling.",
 )
 
+
 class TestDeepseekV3W4afp8(CustomTestCase):
     @classmethod
     def setUpClass(cls):

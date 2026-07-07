@@ -47,13 +47,14 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
     is_cuda_alike,
+    is_hcu,
     is_hip,
     is_musa,
-    is_hcu,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -61,7 +62,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 
-from sglang.srt.utils import get_bool_env_var
 _use_fused_reshape_to_float = get_bool_env_var("SGLANG_USE_FUSED_RESHAPE_TO_FLOAT")
 
 _is_npu = is_npu()
@@ -345,7 +345,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            dispatch_custom_allreduce
+            dispatch_custom_allreduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -915,11 +915,18 @@ class GroupCoordinator:
 
         if _is_hcu and _use_fused_reshape_to_float:
             from lightop import op
-            vocab_size = input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+
+            vocab_size = (
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
             output_tensor = op.reshape_to_float(output_tensor, vocab_size[1])
         else:
             output_tensor = output_tensor.reshape(
-                input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
             )
         return output_tensor
 

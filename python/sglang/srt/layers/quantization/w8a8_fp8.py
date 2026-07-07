@@ -1,3 +1,4 @@
+# ruff: noqa: F401, F821
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -32,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.utils import get_bool_env_var, is_hcu, set_weight_attrs
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -43,9 +45,12 @@ _is_hcu = is_hcu()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 
 try:
-    from lmslim.layers.fused_moe.fuse_moe_w4a8_marlin import fused_experts_impl_w4a8_marlin
+    pass
 except Exception:
-    print("INFO: Please install lmslim if you want to infer the quantitative model of moe.\n")
+    print(
+        "INFO: Please install lmslim if you want to infer the quantitative model of moe.\n"
+    )
+
 
 class W8A8Fp8Config(QuantizationConfig):
     """Config class for W8A8 FP8 Quantization.
@@ -288,28 +293,28 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             w2 = layer.w2_weight
             w1_shape = w1.shape
             w2_shape = w2.shape
-            if (w1.is_cuda and w2.is_cuda):
-                if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(
-                    0):
+            if w1.is_cuda and w2.is_cuda:
+                if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(0):
                     raise RuntimeError("Unexpected MoE weight shapes")
-                twoN, K = w1.size(1), w1.size(2)
+                two_n, K = w1.size(1), w1.size(2)
                 if w2.size(1) != K:
                     raise RuntimeError("Unexpected MoE w2 layout")
                 N = w2.size(2)
-                if twoN != 2 * N:
+                if two_n != 2 * N:
                     raise RuntimeError("Unexpected MoE hidden dims")
-                if (K % 16 != 0 or K % 32 != 0 or N % 16 != 0
-                    or twoN % 32 != 0):
+                if K % 16 != 0 or K % 32 != 0 or N % 16 != 0 or two_n % 32 != 0:
                     raise RuntimeError("Marlin packing requires alignment")
 
                 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-                    w8a8_2_marlin_weight, weight8bit_nt_kpack2_marlin,weight8bit_nt_kpack2_marlin1)
+                    w8a8_2_marlin_weight,
+                    weight8bit_nt_kpack2_marlin,
+                    weight8bit_nt_kpack2_marlin1,
+                )
 
                 def _pack_per_expert(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        new_expert = w8a8_2_marlin_weight(
-                            weight[i]).contiguous()
+                        new_expert = w8a8_2_marlin_weight(weight[i]).contiguous()
                         weight.data[i].view(-1).copy_(new_expert.view(-1))
                     weight = weight.reshape((-1,) + new_expert.shape)
 
@@ -318,12 +323,14 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 def _pack_per_expert_deepep(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        if is_moe_prefill() :
+                        if is_moe_prefill():
                             new_expert = weight8bit_nt_kpack2_marlin(
-                                weight[i]).contiguous()
+                                weight[i]
+                            ).contiguous()
                         else:
                             new_expert = weight8bit_nt_kpack2_marlin1(
-                                weight[i]).contiguous()
+                                weight[i]
+                            ).contiguous()
                         weight.data[i].view(-1).copy_(new_expert.view(-1))
                     weight = weight.reshape((-1,) + new_expert.shape)
                     return weight
@@ -419,19 +426,27 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             return combine_input
 
         if _is_hcu and _use_fp8_w8a8_moe:
-            if (getattr(layer.w13_weight, "_w8a8_fp8_packed", False)
-                or getattr(layer.w2_weight, "_w8a8_fp8_packed", False)):
+            if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
+                layer.w2_weight, "_w8a8_fp8_packed", False
+            ):
                 topk_weights, topk_ids, _ = topk_output
                 use_prequant_input = i_q is not None and i_s is not None
                 if moe_runner_config.apply_router_weight_on_input:
-                    assert topk_weights.dim() == 2, "`topk_weights` should be (num_tokens, topk)"
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be (num_tokens, topk)"
                     _, tk = topk_weights.shape
-                    assert tk == 1, "HCU marlin path: apply_router_weight_on_input requires topk=1"
+                    assert (
+                        tk == 1
+                    ), "HCU marlin path: apply_router_weight_on_input requires topk=1"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                     # Router-weighted input no longer matches precomputed rms-quant activations.
                     use_prequant_input = False
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_fp8_w8a8
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                    fused_moe_fp8_w8a8,
+                )
+
                 origin_w1_shape = getattr(layer.w13_weight, "w1_shape", None)
                 origin_w2_shape = getattr(layer.w2_weight, "w2_shape", None)
                 output = fused_moe_fp8_w8a8(

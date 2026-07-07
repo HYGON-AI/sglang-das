@@ -12,7 +12,11 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(

@@ -19,13 +19,13 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
-
   /*
    * From FlashMLA
    */
-  m.def("hcu_create_flashmla_kv_indices(Tensor req_to_token, Tensor req_pool_indices,Tensor page_kernel_lens, Tensor? kv_start_idx, Tensor kv_indices, int req_to_token_stride, int kv_indices_stride, int PAGED_SIZE) -> ()");
+  m.def(
+      "hcu_create_flashmla_kv_indices(Tensor req_to_token, Tensor req_pool_indices,Tensor page_kernel_lens, Tensor? "
+      "kv_start_idx, Tensor kv_indices, int req_to_token_stride, int kv_indices_stride, int PAGED_SIZE) -> ()");
   m.impl("hcu_create_flashmla_kv_indices", torch::kCUDA, &hcu_create_flashmla_kv_indices);
-
 
   /*
    * From csrc/elementwise
@@ -55,13 +55,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
-
   /*
    * From csrc/attention
    */
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
-    m.def(
+  m.def(
       "normal_decode_metadata_general(Tensor seq_lens, Tensor req_to_token, Tensor req_pool_indices, "
       "Tensor! cache_seqlens_int32, Tensor! cu_seqlens_k, Tensor! page_table, Tensor? swa_page_table, "
       "Tensor? full_to_swa_mapping, int max_seq_pages, int page_size, int seq_len_delta, bool use_swa) -> ()");
@@ -169,23 +168,36 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    * From csrc/kvcacheio
    */
 
-  m.def("hcu_align_evict_mask_to_page_size(Tensor seq_lens,Tensor evict_mask,int page_size,int num_draft_tokens,int bs) -> ()");
+  m.def(
+      "hcu_align_evict_mask_to_page_size(Tensor seq_lens,Tensor evict_mask,int page_size,int num_draft_tokens,int bs) "
+      "-> ()");
   m.impl("hcu_align_evict_mask_to_page_size", torch::kCUDA, &hcu_align_evict_mask_to_page_size);
-  m.def("hcu_create_extend_after_decode_spec_info(Tensor verified_id, Tensor seq_lens, Tensor accept_lens, Tensor positions, Tensor new_verified_id, int bs) -> ()");
+  m.def(
+      "hcu_create_extend_after_decode_spec_info(Tensor verified_id, Tensor seq_lens, Tensor accept_lens, Tensor "
+      "positions, Tensor new_verified_id, int bs) -> ()");
   m.impl("hcu_create_extend_after_decode_spec_info", torch::kCUDA, &hcu_create_extend_after_decode_spec_info);
-  m.def("hcu_create_chunked_prefix_cache_kv_indices(Tensor req_to_token, Tensor req_pool_indices, Tensor chunk_starts, Tensor chunk_seq_lens, Tensor chunk_cu_seq_lens, Tensor chunk_kv_indices, int col_num, int bs) -> ()");
+  m.def(
+      "hcu_create_chunked_prefix_cache_kv_indices(Tensor req_to_token, Tensor req_pool_indices, Tensor chunk_starts, "
+      "Tensor chunk_seq_lens, Tensor chunk_cu_seq_lens, Tensor chunk_kv_indices, int col_num, int bs) -> ()");
   m.impl("hcu_create_chunked_prefix_cache_kv_indices", torch::kCUDA, &hcu_create_chunked_prefix_cache_kv_indices);
-  m.def("hcu_assign_extend_cache_locs(Tensor req_pool_indices, Tensor req_to_token, Tensor start_offset, Tensor end_offset, Tensor out_cache_loc, int pool_len, int bs) -> ()");
+  m.def(
+      "hcu_assign_extend_cache_locs(Tensor req_pool_indices, Tensor req_to_token, Tensor start_offset, Tensor "
+      "end_offset, Tensor out_cache_loc, int pool_len, int bs) -> ()");
   m.impl("hcu_assign_extend_cache_locs", torch::kCUDA, &hcu_assign_extend_cache_locs);
   m.def("hcu_get_last_loc(Tensor req_to_token, Tensor req_pool_indices, Tensor prefix_lens) -> Tensor");
   m.impl("hcu_get_last_loc", torch::kCUDA, &hcu_get_last_loc);
-  m.def("hcu_assign_req_to_token_pool(Tensor req_pool_indices_ptr,Tensor req_to_token_ptr,Tensor allocate_lens_ptr,Tensor new_allocate_lens,Tensor out_cache_loc_ptr,int shape,int bs) -> ()");
-  m.impl("hcu_assign_req_to_token_pool",torch::kCUDA,&hcu_assign_req_to_token_pool);
+  m.def(
+      "hcu_assign_req_to_token_pool(Tensor req_pool_indices_ptr,Tensor req_to_token_ptr,Tensor "
+      "allocate_lens_ptr,Tensor new_allocate_lens,Tensor out_cache_loc_ptr,int shape,int bs) -> ()");
+  m.impl("hcu_assign_req_to_token_pool", torch::kCUDA, &hcu_assign_req_to_token_pool);
 
-
-  m.def("hcu_alloc_extend_kernel(Tensor pre_lens_ptr, Tensor seq_lens_ptr, Tensor last_loc_ptr, Tensor free_page_ptr, Tensor out_indices, int bs, int page_size) -> ()");
+  m.def(
+      "hcu_alloc_extend_kernel(Tensor pre_lens_ptr, Tensor seq_lens_ptr, Tensor last_loc_ptr, Tensor free_page_ptr, "
+      "Tensor out_indices, int bs, int page_size) -> ()");
   m.impl("hcu_alloc_extend_kernel", torch::kCUDA, &hcu_alloc_extend_kernel);
-  m.def("hcu_alloc_decode_kernel(Tensor seq_lens_ptr, Tensor last_loc_ptr, Tensor free_page_ptr, Tensor out_indices, int bs, int page_size) -> ()");
+  m.def(
+      "hcu_alloc_decode_kernel(Tensor seq_lens_ptr, Tensor last_loc_ptr, Tensor free_page_ptr, Tensor out_indices, int "
+      "bs, int page_size) -> ()");
   m.impl("hcu_alloc_decode_kernel", torch::kCUDA, &hcu_alloc_decode_kernel);
   m.def(
       "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "

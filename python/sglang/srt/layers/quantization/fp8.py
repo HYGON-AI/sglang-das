@@ -1,3 +1,4 @@
+# ruff: noqa: F401, F821
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
@@ -84,10 +85,10 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
-    is_hcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -96,10 +97,10 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+
 SGLANG_USE_AITER_FP8_ASM_MOE = False
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
@@ -543,7 +544,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.format_ue8m0 = True
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
-        from sglang.srt.layers.quantization.fp8_utils import hipblaslt_w8a8_block_fp8_linear
+        from sglang.srt.layers.quantization.fp8_utils import (
+            hipblaslt_w8a8_block_fp8_linear,
+        )
 
         if self.w8a8_block_fp8_linear is hipblaslt_w8a8_block_fp8_linear:
             weight = weight.T.contiguous()
@@ -1933,31 +1936,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ) -> Optional[torch.Tensor]:
         topk_weights, topk_ids, _ = topk_output
         if self.block_quant and SGLANG_USE_AITER_FP8_ASM_MOE:
-            return fused_experts_asm_impl(x,
-                            layer.w13_weight,
-                            layer.w2_weight,
-                            topk_weights,
-                            topk_ids,
-                            x.dtype,
-                            False,
-                            activation,
-                            True,
-                            False,
-                            False,
-                            False,
-                            False,
-                            False,
-                            -1,
-                            None,
-                            layer.w13_weight_scale_inv,
-                            layer.w2_weight_scale_inv,
-                            None,
-                            None,
-                            layer.w13_input_scale,
-                            layer.w2_input_scale,
-                            (128,128),
-                            use_shuffle=True
-                )
+            return fused_experts_asm_impl(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                x.dtype,
+                False,
+                activation,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                -1,
+                None,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                None,
+                None,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+                (128, 128),
+                use_shuffle=True,
+            )
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."

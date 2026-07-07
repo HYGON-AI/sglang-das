@@ -332,7 +332,7 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    
+
     # HCU Lightop
     SGLANG_USE_LIGHTOP = EnvBool(False)
 
@@ -378,7 +378,7 @@ class Envs:
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
-    
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)

@@ -30,6 +30,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
+
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
 register_hcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-hcu")
 

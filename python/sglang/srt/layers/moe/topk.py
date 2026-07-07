@@ -28,9 +28,6 @@ from typing import (
     runtime_checkable,
 )
 
-import numpy as np
-from numpy import dtype
-
 import torch
 import torch.nn.functional as F
 
@@ -82,6 +79,8 @@ try:
 except ImportError:
     pass
 
+import os
+
 from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -104,27 +103,24 @@ from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
-    direct_register_custom_op,
     cpu_has_amx_support,
+    direct_register_custom_op,
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
-    is_hcu,
     is_npu,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
-import random
-import os
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_dp_rank,get_attention_dp_size
 
+from sglang.srt.distributed import get_tp_group
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -211,35 +207,53 @@ if _use_lightop:
     from lightop import op as op
 
 
-def moe_fused_gate_hcu(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
-                                   topk_group: int, topk: int,
-                                   num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
+def moe_fused_gate_hcu(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     topk_weights, topk_ids = op.moe_fused_gate(
-            gating_output,
-            correction_bias,
-            num_expert_group,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-        )
+        gating_output,
+        correction_bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+    )
     return topk_weights, topk_ids
 
-def moe_fused_gate_fake(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
-                                   topk_group: int, topk: int,
-                                   num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty((gating_output.size(0), topk),
-                           dtype=gating_output.dtype,
-                           device=gating_output.device), \
-                    torch.empty((gating_output.size(0), topk),
-                           dtype=gating_output.dtype,
-                           device=gating_output.device)
-direct_register_custom_op(
-        op_name="moe_fused_gate_hcu",
-        op_func=moe_fused_gate_hcu,
-        mutates_args=[],
-        fake_impl=moe_fused_gate_fake,
+
+def moe_fused_gate_fake(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty(
+        (gating_output.size(0), topk),
+        dtype=gating_output.dtype,
+        device=gating_output.device,
+    ), torch.empty(
+        (gating_output.size(0), topk),
+        dtype=gating_output.dtype,
+        device=gating_output.device,
     )
+
+
+direct_register_custom_op(
+    op_name="moe_fused_gate_hcu",
+    op_func=moe_fused_gate_hcu,
+    mutates_args=[],
+    fake_impl=moe_fused_gate_fake,
+)
 
 
 # -------------------------------- TopKConfig ---------------------------------------
@@ -693,6 +707,7 @@ def fused_topk(
             )
         elif _is_hcu and _use_fused_topk_softmax:
             from lightop import op
+
             op.topk_softmax(
                 topk_weights,
                 topk_ids,
@@ -1100,9 +1115,7 @@ def _try_lightop_topk_ids_postprocess(
     if logical_to_physical_map is None and num_token_non_padded is None:
         return topk_ids
 
-    op.topk_ids_postprocess(
-        topk_ids, logical_to_physical_map, num_token_non_padded
-    )
+    op.topk_ids_postprocess(topk_ids, logical_to_physical_map, num_token_non_padded)
     return topk_ids
 
 
@@ -1267,7 +1280,7 @@ def biased_grouped_topk_gpu(
             num_expert_group,
             topk_group,
             topk,
-            num_fused_shared_experts, 
+            num_fused_shared_experts,
             routed_scaling_factor,
         )
         if (expert_location_dispatch_info is not None) or (
@@ -1700,6 +1713,8 @@ if _is_cuda:
             dtype=torch.int32,
         )
         return topk_weights, topk_ids
+
+
 def batch_write_expert_counts(expert_count: torch.Tensor, num_token: int):
     # 合并所有token的expert_count并写入文件
     rank = torch.distributed.get_rank()

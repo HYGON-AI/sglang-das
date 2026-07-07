@@ -38,9 +38,9 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
-    is_hip,
     is_hcu,
     is_hcu_native_fp8_supported,
+    is_hip,
     is_npu,
 )
 
@@ -89,8 +89,7 @@ class ModelRunnerKVCacheMixin:
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
                 use_bf16_index_cache = _is_hcu and (
-                    self.kv_cache_dtype
-                    not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    self.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
                     or not is_hcu_native_fp8_supported()
                 )
                 if use_bf16_index_cache:

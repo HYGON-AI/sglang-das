@@ -5,7 +5,11 @@ Performance tests for single GPU that need H200 (80GB) - FP8 and EAGLE tests.
 import unittest
 
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
 register_hcu_ci(
     est_time=120,

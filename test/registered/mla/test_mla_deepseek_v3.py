@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -30,6 +34,7 @@ register_hcu_ci(
     suite="stage-b-test-1-gpu-small-hcu",
     disabled="HCU PR baseline deferred: MLA path needs BW1100 numeric/backend validation before required CI.",
 )
+
 
 class TestMLADeepseekV3(CustomTestCase):
     @classmethod

@@ -1,6 +1,10 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
 register_cuda_ci(est_time=519, suite="stage-b-test-1-gpu-large")
@@ -13,6 +17,7 @@ register_hcu_ci(
     suite="stage-b-test-1-gpu-small-hcu",
     disabled="HCU PR baseline deferred: core/server path needs BW1100 model-runtime repeat validation before required CI.",
 )
+
 
 class TestGptOss1Gpu(BaseTestGptOss):
     def test_mxfp4_20b(self):

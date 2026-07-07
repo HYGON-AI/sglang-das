@@ -85,15 +85,14 @@ from sglang.srt.server_args import get_global_server_args
 # Utils
 from sglang.srt.utils import (
     LazyValue,
-    get_bool_env_var,
     add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
-    is_hip,
     is_hcu,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -870,19 +869,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            
+
         if _is_hcu and _use_fused_qwen_bailing_rotary:
             # Fused RMSNorm + RoPE + kv_store path through custom op.
             cos_sin_cache = self.rotary_emb.cos_sin_cache
-            if (cos_sin_cache.device != q.device
-                    or cos_sin_cache.dtype != q.dtype):
-                cos_sin_cache = cos_sin_cache.to(q.device,
-                                                dtype=q.dtype,
-                                                non_blocking=True)
+            if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
+                cos_sin_cache = cos_sin_cache.to(
+                    q.device, dtype=q.dtype, non_blocking=True
+                )
                 # Persist the converted cache so we don't re-copy/re-allocate
                 # on every forward when the original buffer starts on CPU.
                 self.rotary_emb.cos_sin_cache = cos_sin_cache
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+                self.layer_id
+            )
 
             q, k, v = gammarms_rotary_embedding_fuse_with_kv_store(
                 positions,

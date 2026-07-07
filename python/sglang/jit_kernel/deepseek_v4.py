@@ -13,13 +13,12 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import (
-    is_hcu,
-    get_bool_env_var
-)
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
 _is_hcu = is_hcu()
-_use_linear_bf16_fp32_use_blaslt = get_bool_env_var("SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT")
+_use_linear_bf16_fp32_use_blaslt = get_bool_env_var(
+    "SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT"
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -981,8 +980,8 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
     if _is_hcu and _use_linear_bf16_fp32_use_blaslt:
         source = """
         #include <torch/extension.h>
-        #include <ATen/cuda/CUDAContext.h> 
-        #include <hipblaslt/hipblaslt.h>   
+        #include <ATen/cuda/CUDAContext.h>
+        #include <hipblaslt/hipblaslt.h>
 
         torch::Tensor linear_bf16_fp32(
             torch::Tensor X,
@@ -1003,16 +1002,16 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
 
             hipblasLtMatmulDesc_t matmul_desc;
             hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
-            
+
             int transA = HIPBLAS_OP_T;
             int transB = HIPBLAS_OP_N;
             hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
             hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
 
             hipblasLtMatrixLayout_t layoutA, layoutB, layoutC;
-            hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, in_features, out_features, in_features); 
-            hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, in_features, batch, in_features);        
-            hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_32F, out_features, batch, out_features);       
+            hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, in_features, out_features, in_features);
+            hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, in_features, batch, in_features);
+            hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_32F, out_features, batch, out_features);
 
             float alpha = 1.0f;
             float beta = 0.0f;
@@ -1027,11 +1026,11 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
                 X.data_ptr(), layoutB,
                 &beta,
                 Y.data_ptr(), layoutC,
-                Y.data_ptr(), layoutC, 
-                nullptr, 
-                nullptr, 
-                0,       
-                stream  
+                Y.data_ptr(), layoutC,
+                nullptr,
+                nullptr,
+                0,
+                stream
             );
 
             hipblasLtMatmulDescDestroy(matmul_desc);
@@ -1092,7 +1091,7 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
     m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear (no bias)");
     }
     """
-     
+
     module = torch.utils.cpp_extension.load_inline(
         name="linear_bf16_fp32",
         cpp_sources="",

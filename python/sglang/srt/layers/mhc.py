@@ -11,12 +11,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.utils import get_bool_env_var, is_hcu
+
 _is_hcu = is_hcu()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 if _is_hcu and _use_aiter_tilelang_mhc:
     from aiter.ops.tilelang import pre_big_fuse_tilelang
-    
-    
+
+
 tilelang.set_log_level("WARNING")
 
 
@@ -48,7 +49,9 @@ def _patch_tilelang_decouple_type_cast_for_rocm() -> None:
             return original_allocate(data, dtype, extents, condition, body)
         if span is None:
             return original_allocate(data, dtype, extents, condition, body, annotations)
-        return original_allocate(data, dtype, extents, condition, body, annotations, span)
+        return original_allocate(
+            data, dtype, extents, condition, body, annotations, span
+        )
 
     _dtc.Allocate = _allocate
     _dtc._sglang_rocm_bool_alloc_patch = True
@@ -188,9 +191,7 @@ def hc_split_sinkhorn_torch(
     batch, seq_len, _ = mixes.shape
     mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
 
-    pre = torch.sigmoid(
-        mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    ) + eps
+    pre = torch.sigmoid(mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
     post = 2 * torch.sigmoid(
         mixes_flat[:, hc_mult : 2 * hc_mult] * hc_scale[1]
         + hc_base[hc_mult : 2 * hc_mult]
@@ -236,9 +237,9 @@ def mhc_pre_torch(
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
     mixes = torch.matmul(x_flat, fn.t()) * rsqrt
 
-    pre = torch.sigmoid(
-        mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    ) + hc_pre_eps
+    pre = (
+        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + hc_pre_eps
+    )
     post = (
         2
         * torch.sigmoid(
@@ -251,9 +252,7 @@ def mhc_pre_torch(
     comb = comb + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
     comb = _sinkhorn_matrix_torch(comb, sinkhorn_repeat, hc_sinkhorn_eps)
 
-    layer_input = torch.einsum(
-        "nh,nhd->nd", pre, residual_flat.float()
-    )
+    layer_input = torch.einsum("nh,nhd->nd", pre, residual_flat.float())
     post_mix = post.view(*outer_shape, hc_mult, 1)
     comb_mix = comb.view(*outer_shape, hc_mult, hc_mult)
     layer_input = layer_input.view(*outer_shape, hidden_size).to(torch.bfloat16)
@@ -921,7 +920,7 @@ def mhc_pre(
             big_fuse_n_splits = n_splits
 
     if _is_hcu and _use_aiter_tilelang_mhc:
-       pre_big_fuse_tilelang(
+        pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -938,7 +937,7 @@ def mhc_pre(
             sinkhorn_repeat=sinkhorn_repeat,
             n_splits=n_splits,
             mhc_mult=hc_mult,
-        ) 
+        )
     elif norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
         assert norm_weight.shape == (

@@ -48,8 +48,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
-    is_hip,
     is_hcu,
+    is_hip,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,

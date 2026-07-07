@@ -7,7 +7,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
-from sglang.srt.utils import is_hcu
 import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -25,7 +24,8 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.utils import get_device_capability, is_hcu, set_weight_attrs
+
 _is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)

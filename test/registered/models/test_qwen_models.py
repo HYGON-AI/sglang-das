@@ -4,7 +4,11 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,6 +27,7 @@ register_hcu_ci(
     suite="stage-b-test-1-gpu-small-hcu",
     disabled="HCU PR baseline deferred: model matrix path needs local model mapping and BW1100 repeat validation.",
 )
+
 
 class TestQwen2(CustomTestCase):
     @classmethod

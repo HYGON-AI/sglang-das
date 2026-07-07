@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
-from sglang.srt.utils import is_hip, is_hcu
+from sglang.srt.utils import is_hcu, is_hip
 
 _is_hip = is_hip()
 _is_hcu = is_hcu()

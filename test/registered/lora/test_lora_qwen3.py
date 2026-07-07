@@ -22,7 +22,7 @@ register_hcu_ci(
     est_time=120,
     suite="nightly-hcu",
     nightly=True,
-    disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
 )
 
 from sglang.test.lora_utils import (

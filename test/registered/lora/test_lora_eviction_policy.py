@@ -20,7 +20,12 @@ Tests LRU and FIFO eviction behavior.
 import unittest
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
+
 register_hcu_ci(est_time=200, suite="nightly-hcu", nightly=True)
 
 

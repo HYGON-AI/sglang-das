@@ -15,8 +15,8 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_hip,
     is_hcu,
+    is_hip,
     set_weight_attrs,
 )
 
@@ -35,8 +35,6 @@ _is_hip = is_hip()
 _is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter and not _is_hcu:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
