@@ -1,4 +1,4 @@
-# Allowed legacy dcu strings after HCU rename
+# Allowed legacy image strings after HCU rename
 #
 # Only external image/model paths may remain here. Do not add code symbols,
 # suite names, environment variables, function names, file names, or docs titles.
