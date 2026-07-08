@@ -68,9 +68,19 @@ Rules:
 Execution rules:
 
 - Merge checkpoints in order from C01 to C19.
+- After C10, the default bootstrap step may group two or three adjacent
+  checkpoints into one integration branch, for example C11-C13. The branch,
+  ledger and annotated tag must record every included checkpoint SHA.
 - If a checkpoint produces more than 50 conflicted files, split it by date or
   first-parent subranges before resolving.
+- Split a grouped step when it produces more than 50 conflicted files, when the
+  official API transitions cannot be reviewed as one unit, or when model
+  startup failure cannot be isolated within the group.
 - Tag only after the checkpoint has been merged and the required validation has passed.
+- During larger-step bootstrap, required validation means static gates plus a
+  DCU model startup and one successful short inference request. Accuracy,
+  throughput and graph-performance regressions are documented and tracked but
+  do not block the checkpoint unless they also prevent normal inference.
 - After C19 is merged, switch to daily sync from official `main`.
 
 ## 4. Tags and Milestones
@@ -317,11 +327,12 @@ Tasks:
 
 Validation:
 
-- Qwen3 MoE smoke.
-- DeepEP small and large cases.
-- DeepSeek V4 startup and short request smoke.
-- Small-sample accuracy checks.
-- Nightly-dcu stability.
+- Blocking: static/import gates, DCU registration, DeepSeek V4 startup, and one
+  successful short inference request.
+- Blocking when the corresponding path is changed and assets are available:
+  one Qwen3 MoE or dense-model startup/request smoke.
+- Non-blocking observations: DeepEP small/large, MTP/EAGLE, graph replay,
+  small-sample accuracy, throughput and nightly-dcu stability.
 
 ### Phase 4: Catch-up and Daily Sync
 

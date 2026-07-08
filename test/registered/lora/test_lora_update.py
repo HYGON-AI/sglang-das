@@ -888,7 +888,7 @@ class LoRAUpdateTestSessionBase:
         lora_target_modules: Optional[List[str]] = None,
         lora_backend: str = "csgmv",
         disable_cuda_graph: bool = False,
-        cuda_graph_max_bs: int = 4,
+        cuda_graph_max_bs_decode: int = 4,
     ):
         self.testcase = testcase
         self.model_path = model_path
@@ -899,7 +899,7 @@ class LoRAUpdateTestSessionBase:
         self.max_loaded_loras = max_loaded_loras
         self.lora_backend = lora_backend
         self.disable_cuda_graph = disable_cuda_graph
-        self.cuda_graph_max_bs = cuda_graph_max_bs
+        self.cuda_graph_max_bs_decode = cuda_graph_max_bs_decode
         self.enable_lora = enable_lora
 
         self.expected_adapters = set()
@@ -973,7 +973,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             max_loras_per_batch=self.max_loras_per_batch,
             max_loaded_loras=self.max_loaded_loras,
             disable_cuda_graph=self.disable_cuda_graph,
-            cuda_graph_max_bs=self.cuda_graph_max_bs,
+            cuda_graph_max_bs_decode=self.cuda_graph_max_bs_decode,
             enable_lora=self.enable_lora,
             disable_radix_cache=True,
         )
@@ -1110,8 +1110,8 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
 
     def __enter__(self):
         other_args = [
-            "--cuda-graph-max-bs",
-            str(self.cuda_graph_max_bs),
+            "--cuda-graph-max-bs-decode",
+            str(self.cuda_graph_max_bs_decode),
             "--max-loras-per-batch",
             str(self.max_loras_per_batch),
             "--lora-backend",

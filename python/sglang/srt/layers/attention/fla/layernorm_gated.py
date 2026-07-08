@@ -14,7 +14,12 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -88,7 +93,11 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
     group = tl.program_id(1)
@@ -170,6 +179,9 @@ def _layer_norm_fwd_1pass_kernel(
     # Write output
     tl.store(Y_base, y, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
@@ -184,12 +196,8 @@ def _get_sm_count(device: torch.device) -> int:
 def calc_rows_per_block(M: int, device: torch.device) -> int:
     # When piecewise cuda graph is enabled, use a constant value to avoid
     # torch.compile creating guards on the dynamic batch dimension.
-    try:
-        if not get_global_server_args().disable_piecewise_cuda_graph:
-            return MAX_ROWS_PER_BLOCK
-    except ValueError:
-        # Global server args not initialized (e.g., in unit tests)
-        pass
+    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+        return MAX_ROWS_PER_BLOCK
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
@@ -245,6 +253,7 @@ def _layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     with device_context(x.device):
         if not _use_prefill_layer_norm_fwd:
             _layer_norm_fwd_1pass_kernel[grid](
@@ -269,6 +278,7 @@ def _layer_norm_fwd(
                 IS_RMS_NORM=is_rms_norm,
                 num_warps=num_warps,
                 ACTIVATION=activation,
+                **pdl_kwargs,
             )
         else:
             from lightop import op

@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
-    is_in_piecewise_cuda_graph,
+from sglang.jit_kernel.fused_store_index_cache import (
+    can_use_dsa_fused_store,
+    fused_store_index_k_cache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
@@ -22,6 +22,10 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -64,12 +68,6 @@ if _is_dcu:
         fused_get_logits_head_gate_triton,
         hadamard_transform_optimized,
     )
-else:
-    from sglang.jit_kernel.fused_store_index_cache import (
-        can_use_dsa_fused_store,
-        fused_store_index_k_cache,
-    )
-
 _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
 if _is_dcu and _use_fast_hadamard_transform:
     from fast_hadamard_transform import hadamard_transform
@@ -99,13 +97,13 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -133,8 +131,8 @@ if _is_cuda:
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
-        forward_batch = get_forward_context().forward_batch
-        indexer = get_forward_context().dsa_indexers[layer_id]
+        forward_batch = get_tc_piecewise_forward_context().forward_batch
+        indexer = get_tc_piecewise_forward_context().dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         # slice off padding from piecewise CUDA graph
@@ -213,7 +211,7 @@ def _broadcast_indexer_topk_from_rank0(
     if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
         return topk_indices
 
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         broadcast_indexer_topk_from_rank0_(topk_indices)
     else:
         _broadcast_indexer_topk_from_rank0_impl(topk_indices)
@@ -711,10 +709,7 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
-        # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
-        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
-        # that layout here.
+
         if seqlens_32.dim() == 2:
             seqlens_32_2d = seqlens_32
         else:
@@ -785,24 +780,20 @@ class Indexer(MultiPlatformOp):
                     seqlens_32,
                     block_tables,
                     max_seq_len,
-                    Preshuffle=False,
+                    Preshuffle=_use_aiter_preshuffle,
                     KVBlockSize=block_kv,
-                    ChunkK=128,
-                    TotalCuCount=256,
-                    WavePerEU=5,
                 )
             elif _is_dcu:
-
                 logits = gemmopt.paged_mqa_logits(
-                            q_fp8[:q_offset],
-                            kv_cache_fp8,
-                            weights[:q_offset],
-                            seqlens_32,
-                            block_tables,
-                            schedule_metadata,
-                            max_seq_len,
-                            clean_logits=True
-                        )
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=True,
+                )
             else:
                 logits = deep_gemm.fp8_paged_mqa_logits(
                     q_fp8[:q_offset],
@@ -1202,7 +1193,7 @@ class Indexer(MultiPlatformOp):
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         assert (
-            not is_in_piecewise_cuda_graph()
+            not is_in_tc_piecewise_cuda_graph()
         ), "DSA context parallel (_get_topk_ragged_with_cp) not supported under piecewise CUDA graph"
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1416,7 +1407,7 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
     ) -> Optional[torch.Tensor]:
         assert (
-            not is_in_piecewise_cuda_graph()
+            not is_in_tc_piecewise_cuda_graph()
         ), "DSA forward_indexer (non-CUDA loop path) not supported under piecewise CUDA graph"
         if not _is_npu:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
@@ -1628,10 +1619,10 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # In piecewise CUDA graph mode, metadata is fetched inside custom ops via get_forward_context() to
+        # In piecewise CUDA graph mode, metadata is fetched inside custom ops via get_tc_piecewise_forward_context() to
         # prevent Dynamo from guarding on forward_metadata identity (which changes each
         # replay when init_forward_metadata creates a new ForwardMetadata object).
-        if not is_in_piecewise_cuda_graph():
+        if not is_in_tc_piecewise_cuda_graph():
             metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
             if metadata is None:
                 return None
@@ -1649,7 +1640,7 @@ class Indexer(MultiPlatformOp):
         skip_logits_computation = False
         if (
             not _is_dcu
-            and not is_in_piecewise_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             if forward_batch.seq_lens_cpu is not None:
@@ -1805,7 +1796,7 @@ class Indexer(MultiPlatformOp):
                             act_quant=act_quant,
                         )
                     current_stream.wait_stream(self.alt_stream)
-                elif not is_in_piecewise_cuda_graph():
+                elif not is_in_tc_piecewise_cuda_graph():
                     q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
@@ -1833,7 +1824,7 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = self._get_gate_input_tensor(x)
             if self._use_dcu_bf16_index_cache(forward_batch):
                 weights = self._project_and_scale_head_gates(x_for_gate).unsqueeze(-1) * self.softmax_scale
-            elif is_in_piecewise_cuda_graph():
+            elif is_in_tc_piecewise_cuda_graph():
                 weights = logits_head_gate_pcg(
                     x_for_gate,
                     self.weights_proj.weight,
@@ -1855,7 +1846,7 @@ class Indexer(MultiPlatformOp):
         if _is_cuda or _is_hip:
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
             # Piecewise CUDA graph never has empty batches.
-            if not is_in_piecewise_cuda_graph():
+            if not is_in_tc_piecewise_cuda_graph():
                 assert forward_batch.seq_lens_cpu is not None
                 if len(forward_batch.seq_lens_cpu) == 0:
                     # this seems b/c max-pad, no worries?
@@ -1926,7 +1917,7 @@ class Indexer(MultiPlatformOp):
                     topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
                     return maybe_capture_indexer_topk(layer_id, topk_result)
-                elif is_in_piecewise_cuda_graph():
+                elif is_in_tc_piecewise_cuda_graph():
                     assert (
                         not enable_dual_stream
                     ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"

@@ -22,7 +22,7 @@ register_dcu_ci(
 
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=150, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
 
 
