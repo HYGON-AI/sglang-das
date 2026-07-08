@@ -870,7 +870,9 @@ actual result in the checkpoint note.
   - DCU service, graph, accuracy, PD, HiCache, AITER and kernel runtime tests
     remain pending on the target runner.
 - Manual validation result:
-  - TBD
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
 
 ### C11-C17
 
