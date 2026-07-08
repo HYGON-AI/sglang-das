@@ -44,6 +44,11 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -171,10 +176,11 @@ class HYV3MoEFused(nn.Module):
         #     quant_config=quant_config,
         #     prefix=f"{prefix}.experts",
         # )
-
-        experts_cls = get_moe_impl_class(quant_config)
-        self.experts = experts_cls(
-            num_experts=self.n_routed_experts,
+        
+        experts_cls = get_moe_impl_class(quant_config)        
+        self.experts = experts_cls(        
+            num_experts=self.n_routed_experts
+            + get_global_server_args().ep_num_redundant_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
@@ -257,15 +263,21 @@ class HYV3MoEFused(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=(
-                    forward_batch.num_token_non_padded
-                    if forward_batch is not None
-                    else None
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=(
+                        forward_batch.num_token_non_padded
+                        if forward_batch is not None
+                        else None
+                    ),
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
             if self.shared_mlp is not None:
                 shared_output = self.shared_mlp(hidden_states)
         else:
@@ -315,7 +327,16 @@ class HYV3MoEFused(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-        topk_output = self.topk(hidden_states, router_logits)
+        with get_global_expert_distribution_recorder().with_current_layer(
+            self.layer_id
+        ):
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )        
         if self.shared_mlp is not None:
             shared_output = self.shared_mlp(hidden_states)
             final_hidden_states = self.experts(
@@ -363,7 +384,16 @@ class HYV3MoEFused(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-            topk_output = self.topk(hidden_states, router_logits)
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )            
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
@@ -820,7 +850,8 @@ class HYV3ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())

@@ -23,6 +23,7 @@ from transformers import PretrainedConfig
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -173,12 +174,13 @@ class HYV3ForCausalLMNextN(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        moe_impl_class = get_moe_impl_class(self.quant_config)
+        expert_params_mapping = moe_impl_class.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())
