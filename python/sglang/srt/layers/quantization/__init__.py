@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.slimquant_w4a8_marlin import SlimQuantW4A8In
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    is_cpu,
     is_cuda,
     is_hip,
     is_mps,
@@ -103,7 +104,7 @@ if QuarkConfig is not None:
     BASE_QUANTIZATION_METHODS["quark"] = QuarkConfig
     BASE_QUANTIZATION_METHODS["quark_mxfp4"] = QuarkConfig
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
@@ -134,6 +135,7 @@ CPU_QUANTIZATION_METHODS = {
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
+    "mxfp4": Mxfp4Config,
 }
 
 if is_npu():

@@ -755,32 +755,6 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
 
-        elif forward_batch.forward_mode.is_draft_extend():
-            # Eager only (CG replay bypasses init); explicit D2H here instead of
-            # letting torch.empty inside generate_attn_arg_prefill .item() on a
-            # GPU cumsum tensor.
-            seq_lens_sum = (
-                forward_batch.seq_lens_sum
-                if forward_batch.seq_lens_sum is not None
-                else int(forward_batch.seq_lens.sum())
-            )
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    seq_lens_sum,
-                    self.req_to_token,
-                )
-            )
-            kv_indices = kv_indices.to(torch.int64)
-            mask_indptr = None
-            # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accept_tokens_cpu)`.
-            # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
         else:
             # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
             # from GPU tensor, extra tail unused).
@@ -1006,10 +980,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
-        elif forward_mode.is_draft_extend(include_v2=True):
-            max_extend_len = self.speculative_num_steps + 1
-            if get_global_server_args().enable_multi_layer_eagle:
-                max_extend_len += self.speculative_num_steps - 1
+        elif forward_mode.is_draft_extend_v2():
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -1017,11 +988,7 @@ class TritonAttnBackend(AttentionBackend):
                 # build qo_indptr above, else the extend kernel grid is too small
                 # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
                 # blocks.
-                max_extend_len=(
-                    self.num_draft_tokens
-                    if forward_mode.is_draft_extend_v2()
-                    else max_extend_len
-                ),
+                max_extend_len=self.num_draft_tokens,
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,
@@ -1066,7 +1033,7 @@ class TritonAttnBackend(AttentionBackend):
             self._update_target_verify_buffers(
                 bs, seq_lens, req_pool_indices, spec_info, seq_lens_cpu
             )
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             self._update_draft_extend_buffers(
                 bs,
                 seq_lens,

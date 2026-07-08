@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -15,10 +16,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci, register_dcu_ci
+from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
 # DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
 register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
-
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
@@ -47,6 +48,30 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_config_nested_dict_args_are_json(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("mm-process-config:\n  image:\n    resize: 128\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            value = merged[merged.index("--mm-process-config") + 1]
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(json.loads(value), {"image": {"resize": 128}})
+            self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
+        finally:
+            os.unlink(config_file)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -88,7 +113,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
 
-    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+    def test_pd_decode_radix_cache_rejects_fake_backend(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(
                 model_path="dummy",
@@ -97,8 +122,32 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake')", str(context.exception))
-        self.assertIn("'fake'", str(context.exception))
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with --disaggregation-transfer-backend fake",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_ascend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="ascend",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake_tcp",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
 class TestContextParallelServerArgs(CustomTestCase):
@@ -186,6 +235,19 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertFalse(server_args.enable_prefill_context_parallel)
         self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
         self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+
+    def test_context_parallel_handler_initializes_cp_strategy(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+        )
+
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(is_cp_enabled())
+        self.assertTrue(is_interleave())
 
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
         cases = [
@@ -576,6 +638,14 @@ class TestHiCacheArgs(unittest.TestCase):
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
+                "name": "default_kernel_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
                 "name": "kernel_with_page_first_direct",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -615,8 +685,9 @@ class TestHiCacheArgs(unittest.TestCase):
                     "attention_backend": "triton",
                     "decode_attention_backend": "fa3",
                 },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+                "expected_decode_backend": "fa3",
             },
         ]
 
@@ -628,13 +699,10 @@ class TestHiCacheArgs(unittest.TestCase):
                     args,
                     expected_io_backend=case["expected_io_backend"],
                     expected_mem_layout=case["expected_mem_layout"],
+                    expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
-    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
-    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
-    def test_decode_attention_backend_with_implicit_fa3(
-        self, _mock_flashinfer, _mock_use_mla_backend
-    ):
+    def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend="kernel",
@@ -644,7 +712,9 @@ class TestHiCacheArgs(unittest.TestCase):
 
         args._handle_hicache()
 
-        self.assertEqual(args.decode_attention_backend, "triton")
+        self.assertEqual(args.hicache_io_backend, "kernel")
+        self.assertEqual(args.hicache_mem_layout, "page_first")
+        self.assertIsNone(args.decode_attention_backend)
 
 
 class TestNgramExternalSamArgs(CustomTestCase):

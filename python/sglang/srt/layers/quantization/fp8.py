@@ -131,9 +131,8 @@ if (_use_aiter or _use_hip_int4) and not _is_dcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import (
-        shuffle_scale_a16w4,
+        shuffle_scale,
         shuffle_weight,
-        shuffle_weight_a16w4,
     )
 
 if _use_aiter:
@@ -210,6 +209,8 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if is_npu():
+            return 0  # NPU bypasses CUDA capability checks
         if _is_musa:
             return 31
 
@@ -266,6 +267,12 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
+            if is_npu() and self.use_mxfp8:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUMXFP8LinearMethod,
+                )
+
+                return NPUMXFP8LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
@@ -307,7 +314,7 @@ class Fp8Config(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         if self.ignored_layers:
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
@@ -1156,6 +1163,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert and not _is_dcu:
+            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
             # CK FP4 MoE kernel requires K_packed divisible by 128
@@ -1168,6 +1176,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             padded_inter = (
                 (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
             )
+            # Record the padding so fused_moe is told the real intermediate size
+            # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
+            # 128, SGLang previously defaulted to 0 -> computed the padded region).
+            layer.intermediate_pad = padded_inter - inter_per_part
+            layer.hidden_pad = 0
             if padded_inter != inter_per_part:
                 pad_amount = padded_inter - inter_per_part
                 fp4_block_k = 32
@@ -1234,23 +1247,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
-                # a8w4: aiter flydsl scale layout
                 is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale.data = shuffle_scale_a16w4(
-                    scale.view(num_experts * num_rows, -1), num_experts, is_w13_scale
-                )
+                scale_2d = scale.reshape(-1, scale.shape[-1])
+                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
             is_shuffled = _is_shuffle_moe_mxfp4
             if is_shuffled:
-                # a8w4: aiter flydsl weight layout
-                layer.w13_weight.data = shuffle_weight_a16w4(
-                    layer.w13_weight.contiguous(), 16, True
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight,
+                    is_guinterleave=gu_intv,
+                    gate_up=True,
                 )
-                layer.w2_weight.data = shuffle_weight_a16w4(
-                    layer.w2_weight.contiguous(), 16, False
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight,
+                    is_guinterleave=gu_intv,
+                    gate_up=False,
                 )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
@@ -2095,58 +2109,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         no_combine: bool = False,
-    ) -> Optional[torch.Tensor]:
-        topk_weights, topk_ids, _ = topk_output
-        if self.block_quant and SGLANG_USE_AITER_FP8_ASM_MOE:
-            return fused_experts_asm_impl(x,
-                            layer.w13_weight,
-                            layer.w2_weight,
-                            topk_weights,
-                            topk_ids,
-                            x.dtype,
-                            False,
-                            activation,
-                            True,
-                            False,
-                            False,
-                            False,
-                            False,
-                            False,
-                            -1,
-                            None,
-                            layer.w13_weight_scale_inv,
-                            layer.w2_weight_scale_inv,
-                            None,
-                            None,
-                            layer.w13_input_scale,
-                            layer.w2_input_scale,
-                            (128,128),
-                            use_shuffle=True
-                )
-        if _use_hip_int4:
-            # TODO: add triton kernel and add check _use_aiter
-            assert not no_combine, f"{no_combine=} is not supported."
-            return fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                quant_type=QuantType.per_Token,
-                w1_scale=layer.w13_weight_scale1,
-                w2_scale=layer.w2_weight_scale1,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
-            )
+    ) -> Optional[AiterMoeQuantInfo]:
+        # DCU keeps its validated native/ASM AITER dispatch path. The official
+        # runner-core quant-info path below is for generic ROCm.
+        if _is_dcu or not (_use_aiter or _use_hip_int4):
+            return None
+        assert not no_combine, f"{no_combine=} is not supported."
 
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
         )
 
-        if _use_aiter and self.block_quant:
-            quant_type = AiterQuantType.PER_128X128
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        if self.block_quant:
+            quant_type = (
+                AiterQuantType.PER_1X32
+                if self.is_fp4_expert
+                else AiterQuantType.PER_128X128
+            )
+            if self.is_fp4_expert:
+                fp4_weight_dtype = _require_fp4_dtype()
+                w13_weight = w13_weight.view(fp4_weight_dtype)
+                w2_weight = w2_weight.view(fp4_weight_dtype)
+                if getattr(layer.w13_weight, "is_shuffled", False):
+                    w13_weight.is_shuffled = True
+                    w2_weight.is_shuffled = True
             w13_scale = layer.w13_weight_scale_inv
             w2_scale = layer.w2_weight_scale_inv
         else:
@@ -2154,13 +2144,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale = layer.w13_weight_scale1
             w2_scale = layer.w2_weight_scale1
         return AiterMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
             quant_type=quant_type,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            hidden_pad=getattr(layer, "hidden_pad", 0),
+            intermediate_pad=getattr(layer, "intermediate_pad", 0),
         )
 
 
