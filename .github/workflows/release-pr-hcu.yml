@@ -42,6 +42,7 @@ jobs:
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
+        -v /home/github/sgl_whl_temp:/home/github/sgl_whl_temp
         --shm-size=80G
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
@@ -60,6 +61,8 @@ jobs:
       RESOURCE_SERVER: http://10.16.1.201:8000/
       HCU_RUNNER_HOST_UID: ${{ vars.HCU_RUNNER_HOST_UID || '1000' }}
       HCU_RUNNER_HOST_GID: ${{ vars.HCU_RUNNER_HOST_GID || '1000' }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_REPO_KEY: HYGON-AI_hcu-sglang
       WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
@@ -188,12 +191,46 @@ jobs:
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+
+          REPO_KEY="${HCU_WHEEL_STAGING_REPO_KEY:-HYGON-AI_hcu-sglang}"
+          STAGING_ROOT="${HCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
+          STAGING_DIR="${STAGING_ROOT}/${REPO_KEY}/pr-${GITHUB_RUN_ID}/${WHEEL_COMMIT_SHA}"
+          WHEEL_DIR="${STAGING_DIR}/wheels"
+
+          echo "Saving HCU PR wheels to ${WHEEL_DIR}"
+          rm -rf "${WHEEL_DIR}"
+          mkdir -p "${WHEEL_DIR}"
+          cp -v output/*.whl "${WHEEL_DIR}/"
+
+          export STAGING_DIR LOCAL_VER
+          python3 - <<'PY_MANIFEST'
+          import json
+          import os
+          import pathlib
+
+          staging_dir = pathlib.Path(os.environ["STAGING_DIR"])
+          wheel_dir = staging_dir / "wheels"
+          wheels = sorted(str(path.relative_to(staging_dir)) for path in wheel_dir.glob("*.whl"))
+          manifest = {
+              "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+              "staging_repo_key": os.environ.get("HCU_WHEEL_STAGING_REPO_KEY", ""),
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "commit_sha": os.environ.get("WHEEL_COMMIT_SHA", ""),
+              "torch_version": os.environ.get("TORCH_VERSION", ""),
+              "local_version": os.environ.get("LOCAL_VER", ""),
+              "wheels": wheels,
+          }
+          (staging_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY_MANIFEST
+
+          touch "${STAGING_DIR}/READY"
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${STAGING_DIR}" || true
+          echo "HCU PR wheels are staged locally at ${STAGING_DIR}"
 
       - name: Skip GitHub artifact upload
         run: |
-          echo "HCU PR wheels are uploaded to internal devpi in the previous step."
-          echo "Skipping GitHub artifact upload to avoid blocking PR CI on repository artifact quota."
+          echo "HCU PR wheels are staged locally under /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang."
+          echo "Skipping devpi and GitHub artifact upload for PR wheels."
 
       - name: Normalize workspace ownership
         if: always()

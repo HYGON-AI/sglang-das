@@ -466,7 +466,9 @@ jobs:
     outputs:
       wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
     env:
-      HCU_WHEEL_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_REPO_KEY: HYGON-AI_hcu-sglang
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
       GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
     steps:
@@ -503,91 +505,82 @@ jobs:
         id: wait
         run: |
           set -euo pipefail
+          target_sha="$(git -C "${HCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
           short_sha="${{ steps.sha.outputs.short_sha }}"
-          export CHECKOUT_REF="${short_sha}"
-          echo "Waiting for HCU wheels with g${short_sha}"
+          export target_sha short_sha
+          echo "Waiting for locally staged HCU wheels for ${target_sha} (g${short_sha})"
 
-          python3 - <<'PY_WAIT' | tee /tmp/hcu_wheel_urls.out
-          import html.parser
+          python3 - <<'PY_WAIT' | tee /tmp/hcu_wheel_paths.out
           import os
+          import pathlib
           import sys
           import time
-          import urllib.parse
-          import urllib.request
 
-          base = os.environ["HCU_WHEEL_INDEX_URL"].rstrip("/") + "/"
-          short_sha = os.environ["CHECKOUT_REF"][:12]
+          root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
+          repo_key = os.environ.get("HCU_WHEEL_STAGING_REPO_KEY", "HYGON-AI_hcu-sglang")
+          container_root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_CONTAINER_ROOT", "/hcu-wheel-staging"))
+          target_sha = os.environ["target_sha"]
+          short_sha = os.environ["short_sha"]
           gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
           timeout_s = int(os.environ.get("HCU_WHEEL_WAIT_TIMEOUT", "3600"))
           interval_s = int(os.environ.get("HCU_WHEEL_WAIT_INTERVAL", "60"))
 
-          class LinkParser(html.parser.HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.links = []
-
-              def handle_starttag(self, tag, attrs):
-                  if tag != "a":
-                      return
-                  for key, value in attrs:
-                      if key == "href":
-                          self.links.append(value)
-
-          def fetch_links(project):
-              url = urllib.parse.urljoin(base, project.strip("/") + "/")
-              with urllib.request.urlopen(url, timeout=30) as resp:
-                  parser = LinkParser()
-                  parser.feed(resp.read().decode("utf-8", errors="replace"))
-              return [urllib.parse.urljoin(url, link) for link in parser.links]
-
-          def find_wheel(projects, prefixes):
-              marker = f"g{short_sha}"
-              for project in projects:
-                  try:
-                      links = fetch_links(project)
-                  except Exception as exc:
-                      print(f"[wait-hcu-wheels] {project}: {type(exc).__name__}: {exc}", file=sys.stderr)
-                      continue
-                  for link in links:
-                      filename = urllib.parse.unquote(link.rsplit("/", 1)[-1].split("#", 1)[0])
-                      normalized = filename.replace("-", "_")
-                      if not filename.endswith(".whl") or marker not in filename:
-                          continue
-                      if any(normalized.startswith(prefix.replace("-", "_")) for prefix in prefixes):
-                          return link
-              return None
-
+          base = root / repo_key
           requirements = [
-              ("sglang", ["sglang"], ["sglang_"]),
-              ("sgl-kernel", ["sgl-kernel", "sglang-kernel", "sgl_kernel", "sglang_kernel"], ["sgl_kernel_", "sglang_kernel_"]),
+              ("sglang", ("sglang-", "sglang_")),
+              ("sgl-kernel", ("sgl_kernel-", "sgl_kernel_", "sglang_kernel-", "sglang_kernel_")),
           ]
           if gateway_required:
-              requirements.append(("sgl-model-gateway", ["sgl-model-gateway", "sgl_model_gateway"], ["sgl_model_gateway_"]))
+              requirements.append(("sgl-model-gateway", ("sgl_model_gateway-", "sgl_model_gateway_")))
+
+          def find_staging_dirs():
+              if not base.exists():
+                  return []
+              exact = sorted(base.glob(f"pr-*/{target_sha}"))
+              if exact:
+                  return exact
+              return sorted(base.glob(f"pr-*/*g{short_sha}*"))
+
+          def to_container_path(host_path: pathlib.Path) -> str:
+              return str(container_root / host_path.relative_to(root))
 
           deadline = time.time() + timeout_s
-          found = {}
           while time.time() < deadline:
-              missing = []
-              for name, projects, prefixes in requirements:
-                  if name in found:
+              for staging_dir in reversed(find_staging_dirs()):
+                  ready = staging_dir / "READY"
+                  wheel_dir = staging_dir / "wheels"
+                  if not ready.exists() or not wheel_dir.is_dir():
                       continue
-                  wheel = find_wheel(projects, prefixes)
-                  if wheel:
-                      found[name] = wheel
-                      print(f"[wait-hcu-wheels] found {name}: {wheel}", file=sys.stderr)
-                  else:
-                      missing.append(name)
-              if len(found) == len(requirements):
-                  print(" ".join(found[name] for name, _, _ in requirements))
-                  sys.exit(0)
-              print(f"[wait-hcu-wheels] missing {missing}; sleep {interval_s}s", file=sys.stderr)
+
+                  wheels = sorted(wheel_dir.glob("*.whl"))
+                  found = {}
+                  for name, prefixes in requirements:
+                      for wheel in wheels:
+                          filename = wheel.name
+                          normalized = filename.replace("-", "_")
+                          if f"g{short_sha}" not in filename:
+                              continue
+                          if any(normalized.startswith(prefix.replace("-", "_")) for prefix in prefixes):
+                              found[name] = wheel
+                              break
+
+                  missing = [name for name, _ in requirements if name not in found]
+                  if not missing:
+                      for name in found:
+                          print(f"[wait-hcu-wheels] found {name}: {found[name]}", file=sys.stderr)
+                      print(" ".join(to_container_path(found[name]) for name, _ in requirements))
+                      sys.exit(0)
+                  print(f"[wait-hcu-wheels] {staging_dir}: missing {missing}", file=sys.stderr)
+
+              print(f"[wait-hcu-wheels] no complete local wheels under {base}; sleep {interval_s}s", file=sys.stderr)
               time.sleep(interval_s)
 
-          print(f"Timed out waiting for current commit wheels g{short_sha}; found={found}", file=sys.stderr)
+          print(f"Timed out waiting for local HCU wheels under {base} for {target_sha}", file=sys.stderr)
           sys.exit(1)
           PY_WAIT
-          wheel_urls="$(tail -n 1 /tmp/hcu_wheel_urls.out)"
+          wheel_urls="$(tail -n 1 /tmp/hcu_wheel_paths.out)"
           echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
+
 
   stage-a-test-1-gpu-small-hcu:
     name: Stage A HCU smoke
@@ -606,6 +599,8 @@ jobs:
       HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
       HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
@@ -700,6 +695,8 @@ jobs:
       HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
       HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
