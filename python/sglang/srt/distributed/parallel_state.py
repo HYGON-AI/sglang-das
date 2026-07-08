@@ -72,6 +72,7 @@ _is_musa = is_musa()
 use_quick_custom_allreduce = get_bool_env_var(
     "SGLANG_USE_QUICK_CUSTOM_ALLREDUCE", default="false"
 )
+_ATTN_TP_USE_AITER_CUSTOM_COMM = get_bool_env_var("SGLANG_ENABLE_ATTN_TP_USE_AITER_CUSTOM_COMM")  # all_reduce reduce_scatter all_gather
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -744,6 +745,21 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if _ATTN_TP_USE_AITER_CUSTOM_COMM:
+            ca_comm = self.ca_comm
+            if (
+                ca_comm is not None
+                and not ca_comm.disabled
+                and ca_comm.should_custom_ar(input)
+            ):
+                if ca_comm._IS_CAPTURING:
+                    if torch.cuda.is_current_stream_capturing():
+                        ca_comm.reduce_scatter(input, output, registered=True)
+                        return output
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                    return output
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -808,6 +824,24 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if _ATTN_TP_USE_AITER_CUSTOM_COMM:
+            ca_comm = self.ca_comm
+            # Only use aiter all_gather for small tensors (decode); prefill
+            # performance is worse than NCCL for large tensors.
+            if (
+                ca_comm is not None
+                and not ca_comm.disabled
+                and ca_comm.should_custom_ag(input)
+                and input.numel() <= 256 * 6144  # ~3 MB, typical decode batch
+            ):
+                if ca_comm._IS_CAPTURING:
+                    if torch.cuda.is_current_stream_capturing():
+                        ca_comm.all_gather_reg(input, out=output)
+                        return
+                else:
+                    ca_comm.all_gather_unreg(input, out=output)
+                    return
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -1939,7 +1973,7 @@ def initialize_model_parallel(
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_mscclpp_allreduce=False,
-            use_custom_allreduce=False,
+            use_custom_allreduce=None if _ATTN_TP_USE_AITER_CUSTOM_COMM else False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
