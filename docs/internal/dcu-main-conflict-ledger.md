@@ -954,8 +954,9 @@ actual result in the checkpoint note.
   - `ServerArgs` import smoke passed. This shell reports no HIP GPU and has no
     Docker CLI, so a real service process cannot be launched here.
 - Manual validation result:
-  - pending DCU runner startup and short-request smoke; this is the blocking
-    gate before fast-forwarding bootstrap and creating the C11-C13 milestone tag.
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
 
 ### C18-C19
 
