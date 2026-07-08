@@ -50,7 +50,6 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -170,9 +169,9 @@ class HYV3MoEFused(nn.Module):
         #     quant_config=quant_config,
         #     prefix=f"{prefix}.experts",
         # )
-        
+
         experts_cls = get_moe_impl_class(quant_config)
-        self.experts = experts_cls(        
+        self.experts = experts_cls(
             num_experts=self.n_routed_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
@@ -182,7 +181,7 @@ class HYV3MoEFused(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
-        
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             use_grouped_topk=True,
@@ -213,20 +212,21 @@ class HYV3MoEFused(nn.Module):
         else:
             self.shared_mlp = None
 
-
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight.to(torch.float32))
+
     def get_moe_weights(self):
         return [
-                  x.data
-                  for name, x in self.experts.named_parameters()
-                  if name not in ["correction_bias"]
-                  and filter_moe_weight_param_global_expert(
-                      name, x, self.experts.num_local_experts
-                  )
-              ]
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -768,11 +768,11 @@ class HYV3ForCausalLM(nn.Module):
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
-                 for layer_id, layer in enumerate(self.model.layers)
-                 if isinstance(layer.mlp, HYV3MoEFused)
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, HYV3MoEFused)
             }
         )
- 
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -885,6 +885,7 @@ class HYV3ForCausalLM(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
