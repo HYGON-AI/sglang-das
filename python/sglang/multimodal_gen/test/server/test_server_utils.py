@@ -22,6 +22,7 @@ from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_hcu
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
@@ -509,12 +510,13 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
 
-        For AMD GPUs, uses 100% higher tolerance and issues warning instead of assertion.
+        For AMD/HCU GPUs, uses 100% higher tolerance and issues warning instead of assertion.
         """
         # Check if running on AMD GPU
         is_amd = current_platform.is_hip()
 
         if is_amd:
+            perf_label = "HCU" if is_hcu() else "AMD"
             # Use 100% higher tolerance for AMD (2x the expected value)
             amd_tolerance = 1.0  # 100%
             upper_bound = calculate_upper_bound(
@@ -522,10 +524,10 @@ class PerformanceValidator:
             )
             if actual > upper_bound:
                 logger.warning(
-                    f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
+                    f"[{perf_label} PERF WARNING] Validation would fail for '{name}'.\n"
                     f"  Actual:   {actual:.4f}ms\n"
                     f"  Expected: {expected:.4f}ms\n"
-                    f"  AMD Limit: {upper_bound:.4f}ms "
+                    f"  {perf_label} Limit: {upper_bound:.4f}ms "
                     f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
                     f"  Original tolerance was: {tolerance:.1%}"
                 )
@@ -877,12 +879,13 @@ def get_generate_fn(
                 return (video_id, b"")
 
             if is_amd:
+                timeout_label = "HCU" if is_hcu() else "AMD"
                 logger.warning(
-                    f"[AMD TIMEOUT WARNING] {case_id}: video job {video_id} did not complete "
-                    f"within {timeout}s timeout. This may indicate performance issues on AMD."
+                    f"[{timeout_label} TIMEOUT WARNING] {case_id}: video job {video_id} did not complete "
+                    f"within {timeout}s timeout. This may indicate performance issues on {timeout_label}."
                 )
                 pytest.skip(
-                    f"{case_id}: video job timed out on AMD after {timeout}s - skipping"
+                    f"{case_id}: video job timed out on {timeout_label} after {timeout}s - skipping"
                 )
 
             pytest.fail(f"{case_id}: video job {video_id} did not complete in time")

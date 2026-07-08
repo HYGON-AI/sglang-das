@@ -6007,6 +6007,7 @@ class ServerArgs:
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
+        fp8_aiter_scope = "not available on HCU" if is_hcu() else "AMD/ROCm only"
         parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
@@ -6021,7 +6022,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (AMD/ROCm or HCU/ROCm only). ",
+            f"'aiter' ({fp8_aiter_scope}). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
@@ -6782,10 +6783,11 @@ class ServerArgs:
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
         )
+        pre_warm_default_label = "HCU/HIP" if is_hcu() else "AMD/HIP"
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help=f"Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for {pre_warm_default_label} (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

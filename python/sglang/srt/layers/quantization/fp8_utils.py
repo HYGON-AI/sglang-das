@@ -427,10 +427,14 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_aiter():
         if not _use_aiter:
-            aiter_platform = "HCU devices" if _is_hcu else "AMD GPUs"
+            if _is_hcu:
+                raise RuntimeError(
+                    "AITER backend requested via --fp8-gemm-backend=aiter, "
+                    "but AITER kernel is not available on HCU."
+                )
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
-                f"but AITER is not available. AITER requires {aiter_platform} with "
+                "but AITER is not available. AITER requires AMD GPUs with "
                 "SGLANG_USE_AITER=1 environment variable set."
             )
         return aiter_w8a8_block_fp8_linear
