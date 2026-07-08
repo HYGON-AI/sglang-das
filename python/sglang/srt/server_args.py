@@ -2581,11 +2581,12 @@ class ServerArgs:
             else:
                 if not self.disable_radix_cache:
                     if is_hip():
+                        platform = "HCU devices" if is_hcu() else "ROCm devices"
                         # On ROCm, extra_buffer is unsupported.
                         # Automatically disable radix cache instead.
                         logger.warning(
                             f"Speculative decoding for {model_arch} is not compatible "
-                            "with radix cache on ROCm devices. "
+                            f"with radix cache on {platform}. "
                             "Automatically disabling radix cache."
                         )
                         self.disable_radix_cache = True
@@ -4436,10 +4437,11 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                    platform = "HCU/ROCm" if is_hcu() else "AMD/ROCm"
+                    # HIP path: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
-                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        f"{platform}: Using 1-stage all-reduce kernel (deterministic)"
                     )
                 else:
                     # CUDA: use NCCL tree algorithm
@@ -4452,16 +4454,17 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+        # On HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
+            platform = "HCU devices" if is_hcu() else "AMD GPUs"
             if not self.disable_cuda_graph:
                 logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                    f"Cuda graph is disabled for diffusion LLM inference on {platform}"
                 )
                 self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
-                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                    f"Attention backend is set to triton for diffusion LLM inference on {platform}"
                 )
                 self.attention_backend = "triton"
         elif is_npu():
@@ -5794,6 +5797,7 @@ class ServerArgs:
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
+        fp8_aiter_scope = "not available on HCU" if is_hcu() else "AMD/ROCm only"
         parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
@@ -5808,7 +5812,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). ",
+            f"'aiter' ({fp8_aiter_scope}). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
@@ -6569,10 +6573,11 @@ class ServerArgs:
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
         )
+        pre_warm_default_label = "HCU/HIP" if is_hcu() else "AMD/HIP"
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help=f"Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for {pre_warm_default_label} (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

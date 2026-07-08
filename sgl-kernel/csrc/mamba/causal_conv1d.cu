@@ -13,6 +13,10 @@
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
 
+#ifdef USE_ROCM
+#include <string>
+#endif
+
 #define BOOL_SWITCH(COND, CONST_NAME, ...)                                           \
     [&] {                                                                            \
         if (COND) {                                                                  \
@@ -49,6 +53,25 @@ void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream);
 
 template<typename input_t, typename weight_t>
 void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream);
+
+#ifdef USE_ROCM
+bool is_hcu_runtime_device() {
+    int device_id = 0;
+    if (cudaGetDevice(&device_id) != cudaSuccess) {
+        return false;
+    }
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device_id) != cudaSuccess) {
+        return false;
+    }
+
+    const std::string gcn_arch = prop.gcnArchName;
+    return gcn_arch.find("gfx936") != std::string::npos ||
+           gcn_arch.find("gfx938") != std::string::npos ||
+           gcn_arch.find("gfx928") != std::string::npos;
+}
+#endif
 
 void set_conv_params_fwd(ConvParamsBase &params,
                          // sizes
@@ -515,7 +538,14 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
             // There is a slight signature discrepancy in HIP and CUDA "FuncSetAttribute" function.
             C10_CUDA_CHECK(cudaFuncSetAttribute(
                 (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-            std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+            const bool is_hcu_device = is_hcu_runtime_device();
+            const char* platform_label = is_hcu_device ? "HCU device" : "AMD GPU";
+            const char* stack_label = "ROCm versions";
+            std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on "
+                      << platform_label
+                      << " which is currently a non-op (in " << stack_label
+                      << " <= 6.1). This might lead to undefined behavior. \n"
+                      << std::endl;
             #endif
         }
         kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);

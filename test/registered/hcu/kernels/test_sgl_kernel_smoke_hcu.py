@@ -22,7 +22,12 @@ SMOKE_KERNEL_TESTS = [
 
 
 def _sanitize_hcu_log_text(text: str) -> str:
-    return text.replace("AMD", "HCU").replace("amd", "hcu")
+    return (
+        text.replace("AMD", "HCU")
+        .replace("amd", "hcu")
+        .replace("XGMI", "HSL")
+        .replace("xgmi", "hsl")
+    )
 
 
 class TestBW1100SmokeSGLKernelHCU(unittest.TestCase):

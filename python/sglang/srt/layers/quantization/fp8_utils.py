@@ -429,6 +429,11 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_aiter():
         if not _use_aiter:
+            if _is_hcu:
+                raise RuntimeError(
+                    "AITER backend requested via --fp8-gemm-backend=aiter, "
+                    "but AITER kernel is not available on HCU."
+                )
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
                 "but AITER is not available. AITER requires AMD GPUs with "

@@ -26,7 +26,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_hcu
+
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -48,9 +50,12 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
-    print(
-        "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-    )
+    if _is_hcu:
+        print("Please make sure aiter is installed on your HCU device.")
+    else:
+        print(
+            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+        )
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import (

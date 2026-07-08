@@ -48,6 +48,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
+from sglang.srt.utils import is_hcu
+
+_is_hcu = is_hcu()
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_musa, next_power_of_2
 
 # _is_npu = is_npu()
@@ -352,9 +355,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            build_label = "HCU/HIP" if _is_hcu else "AMD/HIP"
             logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
+                "Tree speculative sampling kernel unavailable (likely %s build). "
+                "Falling back to greedy verification.",
+                build_label,
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:

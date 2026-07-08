@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -12,7 +12,13 @@ register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 torch.manual_seed(0)
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_aiter_skip_reason = (
+    "AITER kernel not available on HCU"
+    if _is_hcu
+    else "Requires AMD GPU plus SGLANG_USE_AITER=1"
+)
 
 
 _CASES = [
@@ -70,7 +76,7 @@ class TestRotaryEmbeddingNative(CustomTestCase):
                 self._run_case(*case)
 
 
-@unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
+@unittest.skipIf(not _use_aiter, reason=_aiter_skip_reason)
 class TestRotaryEmbeddingAITer(CustomTestCase):
     # NOTE: Slightly relaxed tolerance (2e-2 vs 1e-2) for AITER RoPE kernel.
     # Minor precision differences under investigation.

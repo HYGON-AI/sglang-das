@@ -169,8 +169,12 @@ def is_hcu() -> bool:
         supported_archs = ["gfx936", "gfx938", "gfx928"]
         return any(gfx in gcn_arch for gfx in supported_archs)
     except Exception as e:
-        logger.warning("HCU detection failed (not a HCU or HIP misconfigured): %s", e)
+        logger.warning("HCU detection failed (not an HCU or HIP misconfigured): %s", e)
         return False
+
+
+def is_dcu() -> bool:
+    return is_hcu()
 
 
 @lru_cache(maxsize=1)
@@ -1626,6 +1630,10 @@ def get_amdgpu_memory_capacity():
         return min(memory_values)
 
     except FileNotFoundError:
+        if is_hcu():
+            raise RuntimeError(
+                "rocminfo not found. Ensure HCU ROCm-compatible drivers are installed and accessible."
+            )
         raise RuntimeError(
             "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
         )
