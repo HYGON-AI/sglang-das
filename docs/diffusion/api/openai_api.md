@@ -73,7 +73,7 @@ The server implements an OpenAI-compatible Images API under the `/v1/images` nam
 import base64
 from openai import OpenAI
 
-client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+client = OpenAI(api_key="<OPENAI_API_KEY>", base_url="http://localhost:30010/v1")
 
 img = client.images.generate(
     prompt="A calico cat playing a piano on stage",
@@ -92,7 +92,7 @@ with open("output.png", "wb") as f:
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/generations" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -d '{
         "prompt": "A calico cat playing a piano on stage",
         "size": "1024x1024",
@@ -115,7 +115,7 @@ This endpoint accepts a multipart form upload with input images and a text promp
 
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -F "image=@local_input_image.png" \
   -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
@@ -127,7 +127,7 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -F "image=@local_input_image.png" \
   -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
@@ -146,7 +146,7 @@ the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
 ```bash
 curl -sS -L "http://localhost:30010/v1/images/<IMAGE_ID>/content" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -o output.png
 ```
 
@@ -163,7 +163,7 @@ The server implements a subset of the OpenAI Videos API under the `/v1/videos` n
 ```python
 from openai import OpenAI
 
-client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+client = OpenAI(api_key="<OPENAI_API_KEY>", base_url="http://localhost:30010/v1")
 
 video = client.videos.create(
     prompt="A calico cat playing a piano on stage",
@@ -177,7 +177,7 @@ print(f"Video ID: {video.id}, Status: {video.status}")
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/videos" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -d '{
         "prompt": "A calico cat playing a piano on stage",
         "size": "1280x720"
@@ -192,7 +192,7 @@ For I2V or TI2V models (e.g., Wan2.1 I2V, LTX-2.3 two-stage), pass an input imag
 
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/videos" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -F "prompt=A cat playing a piano" \
   -F "input_reference=@input_image.png" \
   -F "size=1280x720"
@@ -203,7 +203,7 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/videos" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -d '{
         "prompt": "A cat playing a piano",
         "reference_url": "https://example.com/input_image.png",
@@ -227,7 +227,7 @@ for item in videos.data:
 
 ```bash
 curl -sS -X GET "http://localhost:30010/v1/videos" \
-  -H "Authorization: Bearer sk-proj-1234567890"
+  -H "Authorization: Bearer <OPENAI_API_KEY>"
 ```
 
 **Download video content**
@@ -257,7 +257,7 @@ with open("output.mp4", "wb") as f:
 
 ```bash
 curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
   -o output.mp4
 ```
 

@@ -1140,10 +1140,10 @@ Clients must supply `Authorization: Bearer <key>` for protected endpoints.
 
 ```bash
 # Add worker with explicit key
-curl -H "Authorization: Bearer router-key" \
+curl -H "Authorization: Bearer <ROUTER_API_KEY>" \
   -X POST http://localhost:8080/workers \
   -H "Content-Type: application/json" \
-  -d '{"url":"http://worker:8000","api_key":"worker-key"}'
+  -d '{"url":"http://worker:8000","api_key":"<WORKER_API_KEY>"}'
 ```
 
 ### Security Configurations
@@ -1208,7 +1208,7 @@ python -m sglang_router.launch_router \
   --client-cert-path /etc/certs/client.crt \
   --client-key-path /etc/certs/client.key \
   --ca-cert-path /etc/certs/ca.crt \
-  --api-key "secure-api-key" \
+  --api-key "<ROUTER_API_KEY>" \
   --policy cache_aware
 ```
 
