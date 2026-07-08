@@ -531,6 +531,53 @@ void dcu_alloc_decode_kernel(
     int64_t bs,          
     int64_t page_size);
 
+void transfer_kv_all_kernel_lf_pf_D2H_dcu(
+    const at::Tensor& src_k,
+    at::Tensor dst_k,
+    const at::Tensor& src_v,
+    at::Tensor dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t srt_layout_dim,
+    int64_t dst_layout_dim,
+    int64_t page_size,
+    int64_t layer_num,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
+    const at::Tensor& src_k,
+    at::Tensor dst_k,
+    const at::Tensor& src_v,
+    at::Tensor dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t layer_id,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_direct_pf_lf_H2D_dcu(
+    const at::Tensor& src_ptrs_k,
+    const at::Tensor& src_ptrs_v,
+    std::vector<at::Tensor> dst_ptrs_k,
+    std::vector<at::Tensor> dst_ptrs_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t start_layer_id,
+    int64_t page_size);
+
+void transfer_kv_all_direct_lf_pf_D2H_dcu(
+    const std::vector<at::Tensor>& src_ptrs_k,
+    const std::vector<at::Tensor>& src_ptrs_v,
+    at::Tensor dst_ptrs_k,
+    at::Tensor dst_ptrs_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t start_layer_id,
+    int64_t page_size);
+
 void transfer_kv_per_layer(
     const at::Tensor src_k,
     at::Tensor dst_k,

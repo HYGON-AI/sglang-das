@@ -3728,7 +3728,8 @@ class ServerArgs:
         self._resolve_storage_layout_compatibility()
 
         # Step 3: IO-decode backend compatibility (may change io backend).
-        io_changed = self._resolve_io_decode_attention_compatibility()
+        # io_changed = self._resolve_io_decode_attention_compatibility()
+        io_changed = False
 
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
@@ -6529,6 +6530,7 @@ class ServerArgs:
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "layout_dcu",
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",

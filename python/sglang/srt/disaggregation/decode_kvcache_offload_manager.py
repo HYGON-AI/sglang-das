@@ -20,14 +20,15 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
+    MHATokenToKVPoolHostDCU,
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
-
+from sglang.srt.utils import get_bool_env_var
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
+_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
 logger = logging.getLogger(__name__)
 
 
@@ -57,13 +58,22 @@ class DecodeKVCacheOffloadManager:
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = MHATokenToKVPoolHost(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-            )
+            if _kv_layout_dcu_fa:
+                self.decode_host_mem_pool = MHATokenToKVPoolHostDCU(
+                    kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                )
+            else:
+                self.decode_host_mem_pool = MHATokenToKVPoolHost(
+                    kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
                 kv_cache,
