@@ -1032,7 +1032,22 @@ actual result in the checkpoint note.
   - DFlash/Spec-V2 graph, MTP/EAGLE, DeepEP fabric mode, HiCache write-back,
     output accuracy, throughput, graph performance, and topology expansion.
 - Manual validation result:
-  - pending.
+  - `blocked` by external GPU contention; this is not a model-startup pass.
+  - Command: `PYTHONPATH=/home/proj_sglang_open/dcu-sglang/python bash
+    /home/scripts/sglang/run_dpsk-v4.sh 31000
+    /parastor/home/public_user/wanglong/DeepSeek-V4-Flash-FP8-Channel`.
+  - Topology: single node, TP4, default DSV4 backend, decode graph max batch
+    size 128, `SGLANG_USE_AITER_AG=0`.
+  - Evidence: `/home/scripts/sglang/c14-c16-20260616/running_dpsk-v4_nmz22.log`.
+    The service reached ServerArgs/tokenizer initialization, then TP ranks
+    rejected startup in `ModelRunner.init_torch_distributed()` because another
+    user's two-node DeepSeek-V4 job reoccupied all eight local DCUs during the
+    launch; reported free-memory capacities were unbalanced (for example
+    133.75, 96.41 and 24.43 GiB against the common 12.94 GiB baseline).
+  - Service readiness: not reached. Short inference request: not run.
+  - The port-31000 process tree exited and no task process remains. Retry only
+    after all eight DCUs are exclusively available; do not fast-forward the
+    bootstrap branch or create the group tag before that retry passes.
 
 ### C18-C19
 
