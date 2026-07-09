@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fail if HCU-owned changed files add user-visible legacy platform text.
+"""Fail if HCU-owned changed files add user-visible platform-sensitive text.
 
 The workflow passes only changed files from the PR or push diff. This script
 does not scan the whole repository.
@@ -104,8 +104,8 @@ class Violation:
 
     def message(self):
         return (
-            f"{self.display_path()}:{self.lineno}: user-visible legacy platform "
-            f"text in {self.location}: {text_snippet(self.text)}"
+            f"{self.display_path()}:{self.lineno}: user-visible "
+            f"platform-sensitive text in {self.location}: {text_snippet(self.text)}"
         )
 
 
@@ -281,7 +281,6 @@ def main(argv):
         print("Detected items:")
         for error in errors:
             print(f" - {error.message()}")
-            print(f"   current: {text_snippet(error.text)}")
             emit_github_error(error)
         return 1
 
