@@ -1,38 +1,7 @@
 name: Nightly Test (NPU)
 
 on:
-  schedule:
-    - cron: '0 18 * * *'  # Execute at 2:00 a.m. Beijing Time every day
-  pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
-        required: false
-        type: string
-        default: ''
-      job_filter:
-        description: 'Select which job to run (leave empty or "all" to run all jobs)'
-        required: false
-        type: string
-        default: 'all'
-      image_a3:
-        description: 'The a3 running docker image of the test task.'
-        required: false
-        type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11'
-      skip_install_flag:
-        description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
-        required: false
-        type: string
-        default: 'false'
-
-
 concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}

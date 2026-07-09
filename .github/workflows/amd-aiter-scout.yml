@@ -1,27 +1,7 @@
 name: AMD AITER Scout
 
 on:
-  schedule:
-    - cron: '0 20 * * 1'   # Monday 20:00 UTC
-    - cron: '0 20 * * 4'   # Thursday 20:00 UTC
   workflow_dispatch:
-    inputs:
-      aiter_ref:
-        description: 'AITER git ref (branch, tag, or SHA). Default: main (latest commit)'
-        required: false
-        type: string
-        default: 'main'
-      job_filter:
-        description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
-        required: false
-        type: string
-        default: 'all'
-      continue_on_error:
-        description: 'Continue running other workflows even if one fails'
-        required: false
-        type: boolean
-        default: true
-
 concurrency:
   group: amd-aiter-scout-${{ github.run_id }}
   cancel-in-progress: true
