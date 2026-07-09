@@ -24,10 +24,12 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import ceil_align
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
 _kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
 logger = logging.getLogger(__name__)
 
