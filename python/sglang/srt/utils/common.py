@@ -172,11 +172,6 @@ def is_hcu() -> bool:
         logger.warning("HCU detection failed (not an HCU or HIP misconfigured): %s", e)
         return False
 
-
-def is_dcu() -> bool:
-    return is_hcu()
-
-
 @lru_cache(maxsize=1)
 def is_hcu_native_fp8_supported() -> bool:
     if not is_hcu():
