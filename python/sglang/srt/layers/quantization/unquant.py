@@ -21,7 +21,6 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    get_moe_a2a_backend
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
@@ -53,8 +52,7 @@ _is_dcu = is_dcu()
 
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_aiter_w16a16_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
-if _use_aiter_w16a16_moe :
-    import aiter
+if _use_aiter_w16a16_moe:
     from aiter.moe import (
         get_aiter_moe_config,
         aiter_moe,
@@ -254,8 +252,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _should_use_aiter_moe = _use_aiter and (
-            get_moe_runner_backend().is_auto() or get_moe_runner_backend().is_aiter()
+        _should_use_aiter_moe = (
+            _use_aiter
+            and (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_aiter()
+            )
+            and self._aiter_ck_moe_supported(layer)
         )
         if _should_use_aiter_moe:
             copy_or_rebind_param(
@@ -485,6 +488,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         param.data = param.data.reshape(expected_shape)
 
+    def _aiter_ck_moe_supported(self, layer) -> bool:
+        # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
+        # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
+        return layer.intermediate_size_per_partition % 128 == 0
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -503,7 +511,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
-        # Separate runner so CK-shape errors fall back to self.runner on every call.
+        # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
@@ -513,7 +521,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             and get_moe_a2a_backend().is_none()
         ):
-            self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+            if self._aiter_ck_moe_supported(layer):
+                self._aiter_runner = MoeRunner(
+                    MoeRunnerBackend.AITER, moe_runner_config
+                )
+            elif get_moe_runner_backend().is_aiter():
+                raise ValueError(
+                    "moe_runner_backend=aiter is not supported for "
+                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    "use --moe-runner-backend triton."
+                )
+            else:
+                logger.warning_once(
+                    "aiter CK fused-MoE does not support "
+                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    "using triton MoE runner."
+                )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -610,38 +633,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            # Skip aiter fused_moe when using non-auto MoE backend (e.g., triton, triton_kernels)
-            # because aiter CK kernels don't support all GEMM dimensions
-            _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
-            if _should_use_aiter_moe:
-                assert not moe_runner_config.no_combine, "unsupported"
-                topk_weights, topk_ids, _ = topk_output
-                if moe_runner_config.apply_router_weight_on_input:
-                    assert (
-                        topk_weights.dim() == 2
-                    ), "`topk_weights` should be in shape (num_tokens, topk)"
-                    _, topk = topk_weights.shape
-                    assert (
-                        topk == 1
-                    ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                    x = x * topk_weights.to(x.dtype)
-                    topk_weights = torch.ones_like(
-                        topk_weights, dtype=torch.float32
-                    )  # topk_weights must be FP32 (float32)
-                output = fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    activation=(
-                        ActivationType.Silu
-                        if moe_runner_config.activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.expert_mask_gpu,
+            if not _is_dcu and self._aiter_runner is not None:
+                from sglang.srt.layers.moe.moe_runner.aiter import (
+                    AiterMoeQuantInfo,
                 )
-                return StandardCombineInput(hidden_states=output)
+
+                quant_info = AiterMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
+                )
+                return self._aiter_runner.run(dispatch_output, quant_info)
             elif _is_dcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe:
                     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe_w16a16
                     K = x.size(1)
@@ -758,7 +760,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     )
                 if moe_cfg.quant_type != MoeQuantType.W16A16:
                     raise RuntimeError(f"Unexpected quant_type: {moe_cfg.quant_type}")
-
                 output = aiter_moe(
                     hidden_states=x,
                     w1=w1,

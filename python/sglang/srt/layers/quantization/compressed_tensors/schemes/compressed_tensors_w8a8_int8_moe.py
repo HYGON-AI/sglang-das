@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.utils import get_bool_env_var, is_dcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -145,6 +144,26 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         return self.kernel.apply(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        # NPU MoE bypasses MoeRunner: expose the kernel's existing
+        # apply_without_routing_weights directly through the scheme.
+        return self.kernel.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )
 
 
 class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):

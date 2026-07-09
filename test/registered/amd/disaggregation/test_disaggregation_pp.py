@@ -20,7 +20,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
     try_cached_model,
@@ -44,7 +43,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model("Qwen/Qwen3-8B")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -137,7 +136,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model("Qwen/Qwen3-8B")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -231,7 +230,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model("Qwen/Qwen3-8B")
 
         # Non blocking start servers
         cls.start_prefill()

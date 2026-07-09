@@ -273,6 +273,33 @@ actual result in the checkpoint note.
 | C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/speculative/eagle_info_v2.py` | speculative | Codex | port to new API | Accept official allocation/commit-watermark lifecycle; centralized `cache_locs.py` retains explicit DCU `dcu_assign_*` dispatch | high | conflict-file compile passed; runtime pending | Spec-V2 page-size/topk follow-up; service startup import | merged |
 | C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `test/registered/unit/server_args/test_server_args.py` | test | Codex | manual merge | Preserve validated DCU suite registration and add official config-merger coverage | low | conflict-file compile passed; registration pending | Run registration and ServerArgs tests | merged |
 
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/pyproject.toml` | dependency | Codex | manual merge | Accept official C17-C19 dependency bumps including FlashAttention/FlashInfer/sglang-kernel while retaining current DCU `tilelang==0.1.9` pin | medium | static gates passed; runtime pending | DCU install/resolver smoke if package image changes | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/multimodal_gen/runtime/layers/attention/layer.py` | multimodal | Codex | manual merge | Keep official multimodal attention contract; no DCU-specific branch was replaced | low | compile/ruff passed | Diffusion/VLM smoke is non-blocking | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/environ.py` | env | Codex | manual merge | Preserve DCU `SGLANG_USE_LIGHTOP=False` default and existing DSV4 FlashMLA backend env while accepting official C19 env additions | medium | DSA env test passed; import smoke passed | Runtime confirms env defaults during service startup | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/attention_registry.py` | attention | Codex | port to new API | Dispatch NPU first, keep generic HIP only for `_is_hip and not _is_dcu`, and retain DCU DeepSeekV4 backend ownership | high | import smoke and targeted ruff passed | DeepSeek-V4 startup/request | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py` | deepseek-v4 | Codex | manual merge | Keep DCU DSV4 backend behavior on the C19 attention contract; remove stale CP imports after official parallel APIs moved | high | compile/ruff/import passed | DSV4 graph and sparse prefill follow-up | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/dsv4/compressor.py` | deepseek-v4 | Codex | manual merge | Combine official `get_parallel`/NPU support with DCU LightOp compressor path; generic AITER remains guarded by `_is_hip and not _is_dcu` | high | compile/ruff/import passed | DSV4 C4/C128/online-MTP startup | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/flashattention_backend.py` | attention | Codex | manual merge | Adopt official CP-v2 KV materialization hook while retaining validated DCU FlashAttention execution body and FA KV layout | high | compile/ruff/import passed | Dense/VLM attention smoke; non-DCU skip-KV parity follow-up | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/flashmla_backend.py` | attention | Codex | manual merge | Combine official parallel-context API with DCU external FlashMLA import and DCU KV-index creation | high | compile/ruff/import passed | DSV4 FlashMLA startup/request | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/triton_backend.py` | attention | Codex | manual merge | Keep DCU optional AITER extend path before official split-KV EAGLE target-verify fast path, then fall back to standard extend | high | compile/ruff/import passed | Spec/EAGLE target-verify follow-up | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/mhc.py` | deepseek-v4 | Codex | manual merge | Preserve DCU AITER TileLang MHC and bool-allocation patch while accepting official TileLang-missing/prewarm handling | high | compile/ruff/import passed | DSV4 MHC startup and graph follow-up | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8_moe.py` | quantization | Codex | manual merge | Combine official parallel/server-args imports with DCU detection and bias/i_q/i_s-aware combine signature | high | compile/ruff/import passed | FP8 compressed MoE smoke | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py` | quantization | Codex | manual merge | Retain official NPU `apply_without_routing_weights` and DCU/GPU `CompressedTensorsW8A8Int8MoE` class | high | compile/ruff/import passed | INT8 compressed MoE smoke | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py` | quantization | Codex | manual merge | Keep DCU default zero-point initialization while accepting official zero-point original-shape tracking | medium | compile/ruff/import passed | WNa16 MoE load smoke | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/quark_int4fp8_moe.py` | quantization | Codex | manual merge | Combine official parallel API with explicit DCU detection; do not let generic HIP override DCU quant path | high | compile/ruff/import passed | Quark INT4/FP8 MoE smoke | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/unquant.py` | quantization | Codex | manual merge | Preserve DCU W16A16/Marlin paths before generic AITER fallback while adopting official `_aiter_runner`/`AiterMoeQuantInfo` for non-DCU | high | compile/ruff/import passed | W16A16/AITER MoE startup | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/mem_cache/common.py` | mem_cache | Codex | manual merge | Keep `dcu_get_last_loc` DCU-only and accept official NPU platform detection | medium | compile/ruff/import passed | Page-size/cache location smoke | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/model_executor/forward_batch_info.py` | model_executor | Codex | theirs | Use official `get_parallel().attn_tp_size` contract instead of stale local TP helper | medium | compile/ruff/import passed | ForwardBatch initialization during startup | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/model_executor/model_runner.py` | model_executor | Codex | manual merge | Retain current DCU warmup/autotune/dummy-run path and port its imports to C19 runner/base-runner APIs | high | compile/ruff/import passed | Service startup and graph warmup follow-up | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/models/bailing_moe.py` | model | Codex | manual merge | Adopt official `get_parallel()` TP/EP sizing while keeping DCU token-pool/model behavior | medium | compile/ruff/import passed | Bailing MoE startup if model available | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/models/deepseek_v2.py` | model | Codex | port to new API | Keep DCU fused RMS/quant, LightOp and DSA token-pool paths while using official common-utils platform state and C19 MHA/MLA helper imports | high | compile/ruff/import passed | DeepSeek V2/V3/V4 startup/request | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/models/deepseek_v4.py` | deepseek-v4 | Codex | manual merge | Combine official NPU/UE8M0 quant changes with DCU LightOp/AITER TileLang MHC and robust WO-A weight layout handling | high | compile/ruff/import passed | Primary DeepSeek-V4 startup/request | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/server_args.py` | server_args | Codex | manual merge | Use official strategy-based Mamba radix-cache handling and include DCU in extra-buffer validation | medium | DSA CLI/env test and import smoke passed | Service CLI parse during startup | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/speculative/draft_utils.py` | speculative | Codex | manual merge | Keep DCU ahead of generic HIP for DSV4 draft/prefill backend selection while accepting official NPU dispatch | high | compile/ruff/import passed | MTP/EAGLE smoke is non-blocking | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `test/registered/dp_attn/test_dp_attention.py` | test | Codex | manual merge | Preserve DCU disabled placeholder and official AMD registration imports | low | DCU registration passed | Enable only after BW1100 DP attention validation | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `test/registered/lora/test_lora_update.py` | test | Codex | manual merge | Preserve DCU disabled placeholder and official AMD registration imports | low | DCU registration passed | Enable only after local LoRA adapter/model validation | merged |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `test/registered/rl/test_patch_torch.py` | test | Codex | manual merge | Preserve DCU disabled placeholder and official AMD registration imports | low | DCU registration passed | Enable only after multiprocessing HIP tensor validation | merged |
+
 ## Per-Checkpoint Notes
 
 ### C01 / `c67b2870569a`
@@ -1036,18 +1063,60 @@ actual result in the checkpoint note.
   - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
   - CI test - ✅
 
-### C18-C19
+### C17-C19 / `62b3c8e17781`
 
-- Expected focus: MTP rejection sampling and XPU import guard.
-- Owner: TBD
-- Required validation:
-  - Daily sync smoke gate.
-- Recommended manual validation:
-  - `daily-sync`: DCU smoke gate, conflict marker scan, DCU registration, and
-    official-lag dashboard update.
-  - `speculative`: MTP rejection sampling smoke if touched.
-  - `platform`: XPU/import guard sanity should not regress DCU imports.
+- Branch: `sync/official-main-C17-C19-20260622`.
+- Base: `sync/official-main-bootstrap@3fe07af4554c`.
+- Exact checkpoints:
+  - C17 `62ab09a47886c05a664113c7f080a913b20a2924` (107 commits after C16).
+  - C18 `f42ec350b431d0305d34d6c70ea45fdfcd29dcad` (64 commits after C17).
+  - C19 `62b3c8e17781f9f64653f9bc5b0cb12689ba3ecb` (38 commits after C18).
+- Scope: 209 official commits, 694 changed files, and 26 textual conflicts; the
+  group stays below the 50-conflict split threshold. The prior placeholder was
+  named C18-C19, but merging the C19 endpoint from the live C16 bootstrap also
+  includes C17, so this ledger records the actual C17-C19 integration unit.
+- Resolution summary:
+  - Official C19 remains canonical for dependency manifests, NPU/XPU import
+    guards, Spec/MTP rejection-sampling structure, CP-v2 attention hooks,
+    staged cache/H2D changes, and the new runner/base-runner helper locations.
+  - DCU behavior is preserved through explicit `_is_dcu` or DCU-only imports for
+    FlashMLA, FlashAttention KV layout, LightOp compressor/top-k/quant/cache,
+    AITER TileLang MHC, W16A16/Marlin/FP8 MoE paths, DSA token-pool access, and
+    `dcu_get_last_loc` cache-location helpers.
+  - Generic HIP paths that are known to conflict with DCU are guarded as
+    `_is_hip and not _is_dcu`, notably DSV4 backend selection, compressor AITER
+    usage, and draft/prefill backend dispatch.
+  - `model_runner.py` retains the current DCU warmup/autotune/dummy-run logic
+    and ports its imports to the C19 `runner.base_runner`/forward-batch APIs.
+  - `deepseek_v2.py` uses the official `deepseek_common.utils` platform state as
+    authoritative, while adding the helper imports required by retained DCU
+    inline MHA/MLA paths.
+  - Test registry conflicts preserve DCU disabled placeholders and absorb
+    official AMD registration imports.
+- Automated validation result:
+  - `git ls-files -u | wc -l`: `0`.
+  - precise conflict-marker scan with `grep -RInE "^(<<<<<<< |=======$|>>>>>>> )" python test docs/internal`: no output.
+  - `git diff --check`: passed.
+  - `python3 -m compileall -q python/sglang test/registered`: passed.
+  - targeted Ruff `E9/F401/F811/F821/F841` for all conflict files: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+    registered test files; it retains the existing warning that
+    `test/registered/cpu/utils.py` has no CI registry.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+    passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`:
+    passed with zero unsupported CUDA calls, 50 replaced kernel launches, and
+    package name `sglang-kernel`.
+  - `PYTHONPATH=python` import smoke for 20 conflict runtime modules: passed.
+- Required functional validation:
+  - verify the imported `sglang` path resolves to this workspace;
+  - start the target DeepSeek-V4 service on DCU;
+  - complete one short inference request successfully.
+- Non-blocking observations:
+  - MTP rejection sampling, EAGLE/FR-Spec graph replay, draft-weight memory
+    accounting, HiCache writing-check/SWA sizing, DP MoE reduce-scatter,
+    compressed MoE accuracy, graph performance, throughput, and full topology
+    expansion.
 - Manual validation result:
-  - TBD
-- Notes:
-  - TBD
+  - pending before the C17-C19 merge commit; fill with the target-node service
+    readiness and short-request evidence before fast-forwarding bootstrap/tagging.

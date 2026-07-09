@@ -10,7 +10,6 @@ import numpy as np
 from sglang.srt.utils import is_dcu
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -25,6 +24,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 _is_dcu = is_dcu()
 
@@ -458,7 +458,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 return
 
             device = get_tp_group().device
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 

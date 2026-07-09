@@ -26,13 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
-    get_moe_data_parallel_world_size,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -40,7 +34,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -79,6 +73,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -248,8 +243,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_moe_tensor_parallel_world_size()
-        self.ep_size = get_moe_expert_parallel_world_size()
+        self.tp_size = get_parallel().moe_tp_size
+        self.ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -292,7 +287,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
@@ -471,8 +466,8 @@ class Qwen3MoeAttention(nn.Module):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.config = config
         self.total_num_heads = num_heads
@@ -494,7 +489,7 @@ class Qwen3MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -815,8 +810,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -1025,9 +1020,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
-        self.attn_cp_size = get_attn_context_model_parallel_world_size()
-        self.attn_cp_rank = get_attn_context_model_parallel_rank()
-        self.moe_dp_size = get_moe_data_parallel_world_size()
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.attn_cp_rank = get_parallel().attn_cp_rank
+        self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (
             f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
@@ -1046,7 +1041,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_prefill_context_parallel_enabled():
+        if is_prefill_context_parallel_enabled() and not is_cp_v2_active(forward_batch):
             if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
