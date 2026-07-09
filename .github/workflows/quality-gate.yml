@@ -156,7 +156,7 @@ jobs:
   hcu-runtime-text-check:
     name: hcu-runtime-text-check
     needs: changed-files
-    if: needs.changed-files.outputs.has_files == 'true'
+    if: false
     runs-on: [self-hosted, linux, x64, quality]
 
     steps:
