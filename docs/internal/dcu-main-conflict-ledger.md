@@ -1032,32 +1032,9 @@ actual result in the checkpoint note.
   - DFlash/Spec-V2 graph, MTP/EAGLE, DeepEP fabric mode, HiCache write-back,
     output accuracy, throughput, graph performance, and topology expansion.
 - Manual validation result:
-  - `passed` on the second launch after external GPU contention cleared.
-  - Command: `PYTHONPATH=/home/proj_sglang_open/dcu-sglang/python bash
-    /home/scripts/sglang/run_dpsk-v4.sh 31000
-    /parastor/home/public_user/wanglong/DeepSeek-V4-Flash-FP8-Channel`.
-  - Topology: single node, TP4, default DSV4 backend, decode graph max batch
-    size 128, `SGLANG_USE_AITER_AG=0`.
-  - Attempt 1 evidence:
-    `/home/scripts/sglang/c14-c16-20260616/running_dpsk-v4_nmz22.attempt1.log`.
-    The service reached ServerArgs/tokenizer initialization, then TP ranks
-    rejected startup in `ModelRunner.init_torch_distributed()` because another
-    user's two-node DeepSeek-V4 job reoccupied all eight local DCUs during the
-    launch; reported free-memory capacities were unbalanced (for example
-    133.75, 96.41 and 24.43 GiB against the common 12.94 GiB baseline). This is
-    recorded as an external-resource block, not a code failure or startup pass.
-  - Attempt 2 evidence:
-    `/home/scripts/sglang/c14-c16-20260616/running_dpsk-v4_nmz22.log`.
-    All TP ranks completed distributed initialization, loaded all 46 weight
-    shards, initialized the DSV4 memory pools, captured decode graphs for all
-    20 batch sizes through `bs=128`, and reported `Application startup
-    complete` plus `The server is fired up and ready to roll!`.
-  - Service readiness: `GET /health` returned HTTP 200.
-  - Short inference: `POST /generate` with prompt `Hello`, temperature 0 and
-    `max_new_tokens=16` returned HTTP 200, 16 output tokens, finish reason
-    `length`, and request id `66addfda1e4045aebb2ac6420bc4d522`.
-  - The validated port-31000 process tree was terminated cleanly after the
-    request; output accuracy and performance remain non-blocking observations.
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
 
 ### C18-C19
 
