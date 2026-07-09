@@ -14,6 +14,7 @@ import triton
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from lightop import moe_gemm_marlin_w8a8_fp8, get_moe_cuda_marlin_config
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -107,6 +108,10 @@ device_name = current_platform.get_device_name().replace(" ", "_")
 num_cus= torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 padding_size = get_moe_padding_size(_use_aiter)
+
+
+def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -765,7 +770,7 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.jit_kernel.deepseek_v4 import silu_and_mul_clamp
+                    from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),
@@ -924,7 +929,7 @@ def _fused_moe_kernel_sequence(
             ).squeeze(dim=1)
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
@@ -944,7 +949,7 @@ def _fused_moe_kernel_sequence(
             )
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,

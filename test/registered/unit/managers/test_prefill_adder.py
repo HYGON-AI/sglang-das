@@ -9,14 +9,22 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-
-register_dcu_ci(est_time=2, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
-
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+    register_dcu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="stage-b", runner_config="1-gpu-small")
+register_dcu_ci(
+    est_time=2,
+    suite="stage-b-test-1-gpu-small-dcu",
+    disabled="DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
+)
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="base-b-test-cpu")
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -79,7 +87,9 @@ class TestPrefillAdder(CustomTestCase):
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.retracted_stain = False
         req.finished.return_value = False
+        req.needs_host_load_back.return_value = False
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -382,7 +392,8 @@ class TestPrefillAdder(CustomTestCase):
         req1.extend_input_len = 56
         req1.host_hit_length = 0
         req1.prefix_indices = []
-        req1.fill_ids = list(range(56))
+        req1.full_untruncated_fill_ids = list(range(56))
+        req1.fill_len = 56
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -416,7 +427,8 @@ class TestPrefillAdder(CustomTestCase):
         req2.extend_input_len = 56
         req2.host_hit_length = 0
         req2.prefix_indices = []
-        req2.fill_ids = list(range(56))
+        req2.full_untruncated_fill_ids = list(range(56))
+        req2.fill_len = 56
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -433,7 +445,8 @@ class TestPrefillAdder(CustomTestCase):
         req3.extend_input_len = 3
         req3.host_hit_length = 0
         req3.prefix_indices = []
-        req3.fill_ids = list(range(3))
+        req3.full_untruncated_fill_ids = list(range(3))
+        req3.fill_len = 3
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
@@ -469,7 +482,8 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
         req.extend_input_len = extend_input_len
         req.prefix_indices = []
-        req.fill_ids = list(range(extend_input_len))
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        req.fill_len = extend_input_len
         req.set_extend_input_len = MagicMock()
         return adder, req
 

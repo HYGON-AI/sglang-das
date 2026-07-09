@@ -5,103 +5,1145 @@ up with official SGLang `main`.
 
 ## Status Legend
 
-| Status | Meaning |
-|---|---|
-| `open` | Conflict exists or owner decision is pending |
-| `merged` | Conflict resolution has been committed to the checkpoint branch |
-| `validated` | Required validation passed |
-| `waived` | Validation or issue is explicitly waived with reason |
+
+| Status      | Meaning                                                         |
+| ----------- | --------------------------------------------------------------- |
+| `open`      | Conflict exists or owner decision is pending                    |
+| `merged`    | Conflict resolution has been committed to the checkpoint branch |
+| `validated` | Required validation passed                                      |
+| `waived`    | Validation or issue is explicitly waived with reason            |
 
 ## Strategy Legend
 
-| Strategy | Meaning |
-|---|---|
-| `ours` | Keep DCU-side implementation |
-| `theirs` | Take official implementation |
-| `manual merge` | Combine both sides manually |
-| `drop DCU patch` | Remove DCU patch because official code supersedes it |
+
+| Strategy          | Meaning                                                |
+| ----------------- | ------------------------------------------------------ |
+| `ours`            | Keep DCU-side implementation                           |
+| `theirs`          | Take official implementation                           |
+| `manual merge`    | Combine both sides manually                            |
+| `drop DCU patch`  | Remove DCU patch because official code supersedes it   |
 | `port to new API` | Re-implement DCU behavior on top of official interface |
+
+## Validation Recording Rule
+
+The `Validation` column records completed mechanical or CI checks. Developer
+owners should choose the concrete runtime commands for their area and fill the
+manual result in the checkpoint notes.
+
+Recommended format for manual validation results:
+
+```text
+Manual validation result:
+- <area>: <passed / failed / waived>, command or CI job: <...>, evidence: <log / run id / issue>
+```
+
+## Recommended Validation Matrix
+
+These are validation recommendations, not fixed commands. Use the closest
+available internal CI, local model path, or targeted reproducer, then record the
+actual result in the checkpoint note.
+
+
+| Area                                 | Recommended validation content                                                                                                            |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `ci` / `test`                        | CI registration scan, workflow dry-run if available, PR label/rerun flow, suite partition generation, DCU runner/image selection          |
+| `dependency`                         | DCU install flow, wheel build/import check, CUDA-only dependency leakage check,`pip` resolver sanity in the target container              |
+| `env` / `server_args`                | CLI parse smoke, env var default/value override check, affected model auto-backend selection                                              |
+| `mem_cache`                          | Radix/cache unit or smoke, CPU offload if touched, DCU FA KV layout path, SWA/hybrid cache path if touched                                |
+| `scheduler` / `model_executor`       | Stage-a/stage-b scheduler smoke, split prefill, pipeline-parallel smoke, forward-batch init, request abort/retract if touched             |
+| `attention`                          | Qwen dense smoke, FlashMLA smoke, DSV4 attention smoke, NSA/topk/index-cache smoke, sparse prefill/chunking if touched                    |
+| `jit-kernel` / `sgl-kernel`          | targeted kernel compile/import, kernel unit or smoke whitelist, DSV4 JIT smoke, deleted-file reference scan                               |
+| `quantization`                       | FP8/W8A8/W4A8/MXFP4 targeted smoke, AITER shuffle path if touched, quantized MoE smoke, accuracy spot check if weights change             |
+| `moe`                                | Qwen3 MoE smoke, EP/TP combination smoke, DeepEP normal and low-latency paths, AITER path, groupgemm/marlin path if touched               |
+| `deepep`                             | DeepEP small and large smoke, normal dispatch and low-latency dispatch, topk/dispatch/combine compatibility, BF16/FP8 dispatch mode check |
+| `aiter`                              | AITER import/init, W8A8/W16A16 MoE path, custom allreduce if related, eager and cuda-graph path if graph behavior is touched              |
+| `model` / `deepseek` / `deepseek-v4` | DeepSeek V2/V3/V4 startup, short request, MTP/NextN if touched, FP8/FP4 checkpoint path, DSV4 JIT and attention path                      |
+| `speculative`                        | EAGLE/EAGLE3/MTP/frozen-KV smoke, draft/target worker path, idle batch path, cuda graph draft path if touched                             |
 
 ## Active Conflict Board
 
-| Checkpoint | Merge branch | Conflict file | Area | Owner | Strategy | Reason | Risk | Validation | Follow-up | Status |
-|---|---|---|---|---|---|---|---|---|---|---|
-| C02 / `425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` | deepep | TBD | manual merge | DeepEP API and DCU runtime behavior both need review | high | DCU MoE smoke | Confirm topk and low-latency dispatch compatibility | open |
-| C07 / `a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/flashmla_backend.py` | attention | TBD | port to new API | Official attention interfaces changed while DCU FlashMLA paths must remain available | high | Qwen dense plus DSV4 smoke | Assign attention owner | open |
-| C10 / `47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-dcu.yml` | ci | TBD | manual merge | Keep official workflow structure and DCU runner/wheel overlays | medium | CI dry-run and DCU registration check | Fill exact runner/image validation command | open |
-| C13 / `125ef888921b` | `sync/official-main-C13-20260610` | `sgl-kernel/**` | sgl-kernel | TBD | manual merge | sgl-kernel interfaces and DCU/HIP glue both changed | high | sgl-kernel DCU smoke whitelist | Assign kernel owner | open |
+
+| Checkpoint          | Merge branch                      | Conflict file                                                                      | Area           | Owner | Strategy        | Reason                                                                                                                               | Risk   | Validation                                                            | Follow-up                                                                                          | Status    |
+| ------------------- | --------------------------------- | ---------------------------------------------------------------------------------- | -------------- | ----- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------ | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --------- |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `.github/workflows/_pr-test-stage.yml`                                             | ci             | Codex | theirs          | Official renamed`check-stage-health` to `check-pr-test-health`; this is a pure workflow action rename                                | low    | precise marker scan passed; DCU registration passed                   | None                                                                                               | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `.github/workflows/pr-states.yml`                                                  | ci             | Codex | manual merge    | Keep official`workflow_run` PR lookup and preserve DCU `/rerun-failed-ci` stale-run wording                                          | low    | precise marker scan passed; DCU registration passed                   | Verify real GitHub workflow behavior in CI dry-run                                                 | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/environ.py`                                                     | env            | Codex | manual merge    | Keep both DCU`SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` and official `SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN` env switches                  | low    | syntax compile passed; DCU registration passed                        | None                                                                                               | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/mem_cache/memory_pool.py`                                       | mem_cache      | Codex | manual merge    | Preserve DCU FA KV layout copy/load while taking official`current_platform.synchronize()`                                            | medium | syntax compile passed; DCU registration passed                        | Add CPU-offload smoke on DCU FA layout when CI command is available                                | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/managers/scheduler_pp_mixin.py`                                 | scheduler      | Codex | manual merge    | Combine official`hc_hidden_size` fallback with DCU proxy hidden-state shape helper                                                   | medium | syntax compile passed; DCU registration passed                        | Pipeline-parallel smoke if available                                                               | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `test/registered/tokenizer/test_multi_detokenizer.py`                              | test           | Codex | theirs          | Official C01 renames CUDA suite from`stage-b-*` to `base-b-*`; AMD registration remains from DCU tree                                | low    | syntax compile passed; DCU registration passed                        | None                                                                                               | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/moe/ep_moe/layer.py`                                     | moe            | Codex | ours            | High-risk official MoE runner restructuring overlaps DCU DeepEP/AITER paths; preserve known DCU runtime for C01                      | high   | syntax compile passed; DCU registration passed                        | Owner should port official runner-core changes onto DCU path in later checkpoint                   | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/moe/moe_runner/aiter.py`                                 | aiter          | Codex | ours            | Official AITER runner refactor conflicts with DCU W8A8/W16A16 handling; avoid semantic rewrite in first checkpoint                   | high   | syntax compile passed; DCU registration passed                        | Create dedicated AITER merge task before enabling official runner-core behavior                    | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/layers/quantization/unquant.py`                                 | quantization   | Codex | ours            | Conflict is inside MoE execution fallback; keep DCU behavior until AITER/MoE owner ports official path                               | high   | syntax compile passed; DCU registration passed                        | Revisit together with`moe_runner/aiter.py`                                                         | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/models/deepseek_v2.py`                                          | model          | Codex | ours            | DeepSeek forward path overlaps DCU fused RMS/quant behavior; preserve current DCU model path in C01                                  | high   | syntax compile passed; DCU registration passed                        | Run DeepSeek V2/V3 smoke after C01; port official output-buffer context if needed                  | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/models/deepseek_v4.py`                                          | model          | Codex | ours            | DeepSeek V4 has many DCU-specific imports/kernels and official changes are not safe to fold blindly                                  | high   | syntax compile passed; DCU registration passed                        | DSV4 owner should review skipped official C01 hunks before C02/C03                                 | validated |
+| C01 /`c67b2870569a` | `sync/official-main-C01-20260517` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | ours            | Preserve DCU speculative-algorithm alias helper; official side did not supersede it in C01                                           | medium | syntax compile passed; DCU registration passed                        | Confirm Gemma4 assistant draft CLI path still works if used internally                             | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `.github/workflows/pr-states.yml`                                                  | ci             | Codex | manual merge    | Keep official run status icon/link behavior and preserve DCU`/rerun-failed-ci` stale-run wording                                     | low    | marker scan passed; targeted compile passed; DCU registration passed  | Verify real GitHub workflow behavior in CI dry-run                                                 | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/pyproject.toml`                                                            | dependency     | Codex | ours            | Avoid adding unconditional CUDA`flashinfer_python[cu13]` and `flashinfer_cubin` dependencies to DCU install path                     | medium | marker scan passed; targeted compile passed; DCU registration passed  | Revisit with CUDA/Docker owner if internal main must match official CUDA dependency set exactly    | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/csrc/deepseek_v4/rmsnorm.cuh`                            | jit-kernel     | Codex | theirs          | File was deleted upstream and no current tree references remained                                                                    | medium | marker scan passed; targeted compile passed; DCU registration passed  | None                                                                                               | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/csrc/deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh` | jit-kernel     | Codex | theirs          | File was deleted upstream and no current tree references remained                                                                    | medium | marker scan passed; targeted compile passed; DCU registration passed  | None                                                                                               | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/jit_kernel/deepseek_v4.py`                                          | jit-kernel     | Codex | manual merge    | Keep DCU BLASLt env path while adding official HIP/AITER imports and guard                                                           | medium | marker scan passed; targeted compile passed; DCU registration passed  | DSV4 JIT smoke on DCU                                                                              | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | attention      | Codex | manual merge    | Use official dynamic TOPK from output shape instead of fixed 512                                                                     | low    | marker scan passed; targeted compile passed; DCU registration passed  | DSV4 sparse prefill/topk smoke                                                                     | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/flashmla_backend.py`                           | attention      | Codex | theirs          | Official tuple-style forward mode check is equivalent and cleaner                                                                    | low    | marker scan passed; targeted compile passed; DCU registration passed  | FlashMLA/DSV4 smoke                                                                                | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/nsa/index_buf_accessor.py`                     | attention      | Codex | manual merge    | Preserve DCU page-size 64 assertion while accepting official HIP preshuffle page-size check for non-DCU HIP                          | medium | marker scan passed; targeted compile passed; DCU registration passed  | NSA/DCU index cache smoke                                                                          | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/attention/nsa/nsa_indexer.py`                            | attention      | Codex | manual merge    | Preserve DCU BF16 index-cache path and adopt official`device_index` budget API                                                       | high   | marker scan passed; targeted compile passed; DCU registration passed  | NSA topk/chunking smoke                                                                            | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/ep_moe/layer.py`                                     | moe            | Codex | ours            | Official low-latency MoE runner updates overlap DCU AITER/DeepEP/groupgemm paths; keep known DCU implementation for C02              | high   | marker scan passed; targeted compile passed; DCU registration passed  | Dedicated MoE owner should port official C02 hunks separately                                      | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py`                          | deepep         | Codex | ours            | Official DeepEP dispatcher API changes conflict with DCU quantized dispatch and low-latency dispatch parameters                      | high   | marker scan passed; targeted compile passed; DCU registration passed  | Confirm topk, BF16 dispatch, and low-latency dispatch compatibility before later checkpoints       | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/layers/quantization/fp8.py`                                     | quantization   | Codex | ours            | Preserve DCU AITER/ASM FP8 MoE shuffle behavior; official shuffle path is CUDA/HIP-generic and needs DCU review                      | high   | marker scan passed; targeted compile passed; DCU registration passed  | Review with AITER/MoE owner                                                                        | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/managers/tp_worker.py`                                          | scheduler      | Codex | theirs          | Official fix avoids undefined`model_worker_batch` in split prefill sampling                                                          | low    | marker scan passed; targeted compile passed; DCU registration passed  | Split-prefill smoke if available                                                                   | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/model_executor/forward_batch_info.py`                           | model_executor | Codex | ours            | Preserve current DCU pinned-memory construction for extend lengths                                                                   | medium | marker scan passed; targeted compile passed; DCU registration passed  | Forward batch init smoke                                                                           | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/models/deepseek_v4.py`                                          | model          | Codex | manual merge    | Keep DCU FP8 WO-A GEMM shape compatibility and add official`ceil_to_ue8m0` scale conversion / rotary import                          | high   | marker scan passed; targeted compile passed; DCU registration passed  | DeepSeek V4 startup and short request smoke                                                        | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | theirs          | Official Gemma4 backend selection supports causal and conditional arch plus split backend validation                                 | low    | marker scan passed; targeted compile passed; DCU registration passed  | Server args unit smoke                                                                             | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/srt/speculative/eagle_worker_v2.py`                                 | speculative    | Codex | theirs          | Official side fixes stale`model_worker_batch` references to use `batch`                                                              | medium | marker scan passed; targeted compile passed; DCU registration passed  | EAGLE/MTP smoke if available                                                                       | validated |
+| C02 /`425dffbde339` | `sync/official-main-C02-20260519` | `python/sglang/test/ci/ci_register.py`                                             | ci             | Codex | manual merge    | Keep DCU backend/marker and add official XPU backend/marker                                                                          | low    | marker scan passed; targeted compile passed; DCU registration passed  | DCU registration script                                                                            | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/jit_kernel/csrc/deepseek_v4/topk_1024.cuh`                          | jit-kernel     | Codex | theirs          | Official unified 512/1024 top-k into`topk_v1.cuh`; the standalone header is no longer referenced                                     | medium | reference scan passed; targeted compile passed                        | Run DSV4 top-k 512/1024 JIT smoke on DCU                                                           | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/jit_kernel/csrc/deepseek_v4/topk_v1.cuh`                            | jit-kernel     | Codex | manual merge    | Adopt official dynamic top-k kernel and preserve DCU`SGL_GRID_CONSTANT` plus HIP shared-memory attribute setup                       | high   | marker scan passed; targeted compile passed                           | Run DSV4 top-k 512/1024 compile and numeric smoke on DCU                                           | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/jit_kernel/deepseek_v4.py`                                          | jit-kernel     | Codex | port to new API | Remove the monolithic module and use official`sglang.jit_kernel.dsv4` split modules; model imports were ported                       | high   | deleted-file reference scan passed; targeted compile passed           | Validate DSV4 JIT, BF16-FP32 GEMM, compressor, and fused RoPE paths                                | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/disaggregation/mooncake/conn.py`                                | disaggregation | Codex | manual merge    | Keep DCU requests/ZMQ helpers and add official failed-session probe metrics counter                                                  | medium | marker scan passed; targeted compile passed                           | Mooncake reconnect and failed-session probe smoke                                                  | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/environ.py`                                                     | env            | Codex | manual merge    | Keep DCU FA KV-layout env and add official Mooncake failed-session probe env settings                                                | low    | DSA env/CLI alias test passed; targeted compile passed                | Verify DCU FA KV-layout env override in server startup                                             | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/dsv4/metadata.py`                              | attention      | Codex | port to new API | Import top-k planning from split`dsv4` module while retaining the non-HIP top-k-v2 enable condition                                  | high   | targeted compile passed; DSA alias test passed                        | DSV4 metadata planning and sparse top-k smoke                                                      | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | port to new API | Preserve DCU fused cache-write guards and move pool access to official ForwardContext-owned backend state                            | high   | targeted compile passed; old ForwardBatch pool reference scan passed  | Qwen dense, MLA, and fused Qwen cache-store smoke                                                  | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/nsa/index_buf_accessor.py`                     | attention      | Codex | theirs          | Official converted the old NSA file into a compatibility shim; DCU implementation was ported to`dsa/index_buf_accessor.py`           | high   | targeted compile passed; DSA alias test passed                        | DCU DSA index-cache gather/store smoke                                                             | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/nsa/nsa_indexer.py`                            | attention      | Codex | port to new API | Keep official compatibility shim and three-way port DCU BF16/FP8 indexer behavior into`dsa/dsa_indexer.py`                           | high   | targeted compile passed; DSA alias test passed                        | DSA decode, ragged prefill, chunking, BF16 index-cache, and FP8 index-cache smoke                  | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/nsa/tilelang_kernel.py`                        | attention      | Codex | port to new API | Keep official compatibility shim and port DCU TileLang/gfx behavior into`dsa/tilelang_kernel.py`                                     | high   | targeted compile passed                                               | TileLang DSA kernel compile and numeric smoke                                                      | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/nsa/triton_kernel.py`                          | attention      | Codex | port to new API | Keep official compatibility shim and port DCU Triton helper kernels into`dsa/triton_kernel.py`                                       | high   | targeted compile passed                                               | DCU DSA Triton quant/gate helper smoke                                                             | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/attention/nsa_backend.py`                                | attention      | Codex | port to new API | Keep official compatibility shim and port DCU backend deltas into canonical`dsa_backend.py`                                          | high   | targeted compile passed; DSA registry test passed                     | DSA prefill/decode backend selection and MTP smoke                                                 | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/moe/ep_moe/layer.py`                                     | moe            | Codex | ours            | Preserve current DCU DeepEP/AITER/Marlin/group-GEMM implementation; official C03 mainly removes the legacy NPU path                  | high   | targeted compile passed; DCU registration passed                      | Dedicated owner must port relevant official runner changes; run DeepEP normal/LL and quantized MoE | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/layers/moe/fused_moe_triton/layer.py`                           | moe            | Codex | manual merge    | Preserve DCU extended forward arguments and add official Ascend FuseEP dispatch                                                      | high   | targeted compile passed                                               | DCU fused MoE, shared-output, and AITER/group-GEMM smoke                                           | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/managers/overlap_utils.py`                                      | scheduler      | Codex | manual merge    | Keep DCU empty-slice helper and add official speculative`seq_lens_cpu` resolution                                                    | medium | targeted compile passed                                               | Overlap scheduler plus speculative decode smoke                                                    | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/mem_cache/memory_pool.py`                                       | mem_cache      | Codex | port to new API | Rename NSA state to DSA, retain DCU BF16 index-cache/lightop store paths, and adopt official non-DCU HIP preshuffle rules            | high   | targeted compile passed; old NSA symbol scan passed                   | DSA cache write/read, retract/offload, BF16/FP8 index cache, and SWA cache smoke                   | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/mem_cache/memory_pool_host.py`                                  | mem_cache      | Codex | manual merge    | Use canonical DSA pool type while preserving DCU BF16 index-cache host sizing                                                        | high   | targeted compile passed; GPU unit collection blocked by no HIP GPU    | Run`test_dsa_pool_host_unit.py` on a DCU runner                                                    | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/models/deepseek_v2.py`                                          | model          | Codex | port to new API | Adopt DSA naming and ForwardContext access while retaining DCU fused MLA/cache paths                                                 | high   | targeted compile passed; old ForwardBatch context scan passed         | DeepSeek V2/V3.2 startup, DSA, CP, and short-request smoke                                         | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/models/deepseek_v4.py`                                          | model          | Codex | port to new API | Adopt official split JIT, DSA naming, ForwardContext, and fused cache-write structure while retaining DCU Q/RoPE helpers             | high   | targeted compile passed; old ForwardBatch context scan passed         | DeepSeek V4 startup, CP+EP/DP+EP, MTP, compressor, and FP8 WO-A smoke                              | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/models/qwen3_5.py`                                              | model          | Codex | manual merge    | Preserve DCU fused RMSNorm/RoPE/KV-store path and add official native/NPU prepare split using ForwardContext pool access             | high   | targeted compile passed                                               | Qwen3.5 dense/MoE short request with fused path on and off                                         | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/models/utils.py`                                                | model          | Codex | port to new API | Move fused KV-buffer eligibility to ForwardContext pool while preserving DCU exclusion from generic HIP fallback                     | medium | targeted compile passed                                               | Dense fused cache-store path and context-parallel exclusion smoke                                  | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | manual merge    | Preserve DCU page-size 64 behavior, adopt DSA naming and deprecated aliases, and restore official alias action import                | high   | 24 DSA CLI/registry/env tests passed                                  | DCU DSA backend auto-selection and page-size startup smoke                                         | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `test/registered/core/test_srt_engine.py`                                          | test           | Codex | manual merge    | Preserve DCU stage-b registration while taking official consolidated core test structure                                             | low    | DCU registration passed                                               | Execute the registered test on the normal DCU stage-b runner when enabled                          | validated |
+| C03 /`7cf193fe1faf` | `sync/official-main-C03-20260521` | `test/registered/language/test_srt_backend.py`                                     | test           | Codex | theirs          | Official replaced the legacy backend suite with consolidated basic sanity kits                                                       | low    | deleted-file reference scan passed; DCU registration passed           | Decide whether`test_basic_sanity.py` should receive a DCU stage-a registration                     | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh`                             | jit-kernel     | Codex | manual merge    | Adopt official`kDLGPU` device checks while retaining the C03 planner extensions                                                      | high   | static/registration passed; DCU runtime pending                       | DSV4 JIT planner compile and runtime smoke                                                         | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/dsv4/elementwise.py`                                     | jit-kernel     | Codex | manual merge    | Keep DCU uint8 JIT storage, use official sgl-kernel on non-DCU HIP, and retain official CUDA JIT                                     | high   | static/registration passed; DCU runtime pending                       | DSV4 FP8 elementwise numeric smoke on DCU                                                          | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/deepseek_v4/fp8_utils.cuh`            | jit-kernel     | Codex | ours            | Preserve the validated DCU HIP FP8 pack; official AMD sgl-kernel keeps its separate software conversion path                         | high   | static/registration passed; DCU runtime pending                       | DCU FP8 pack compile and numeric smoke                                                             | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh`                          | jit-kernel     | Codex | theirs          | Adopt official`kDLGPU` aliases and HIP runtime fallback required by the new JIT interface                                            | medium | static/registration passed; DCU runtime pending                       | Compile a DSV4 JIT module in the target DCU container                                              | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh`                            | jit-kernel     | Codex | manual merge    | Combine official device/memcpy additions with DCU launch, shuffle, sync, and shared-memory helpers                                   | high   | static/registration passed; DCU runtime pending                       | Compile and launch a representative DCU JIT kernel                                                 | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh`                             | jit-kernel     | Codex | manual merge    | Adopt official wave64 mask behavior while retaining DCU shuffle and synchronization helpers                                          | high   | static/registration passed; DCU runtime pending                       | Wave64 shuffle/sync kernel smoke                                                                   | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/disaggregation/mooncake/conn.py`                                | disaggregation | Codex | manual merge    | Use official common`TransferKVChunk` while preserving the DCU FA KV-layout environment and transfer layout                           | medium | static/registration passed; DCU runtime pending                       | Mooncake transfer smoke with`SGLANG_KV_LAYOUT_DCU_FA`                                              | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/attention/dsa/dsa_indexer.py`                            | attention      | Codex | port to new API | Port official piecewise CUDA-graph structure around the existing DCU BF16/FP8 cache, LightOp, and page-size-64 paths                 | high   | static/registration passed; DCU runtime pending                       | DSA BF16/FP8 cache, sparse prefill, ragged decode, and graph smoke                                 | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | port to new API | Add official MLA context parallelism while retaining DCU fused cache-write ownership guards                                          | high   | static/registration passed; DCU runtime pending                       | Dense, MLA CP, DSV4, and fused cache-write smoke                                                   | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/attention/triton_backend.py`                             | attention      | Codex | manual merge    | Adopt official pool API and cache invalidation while retaining CPU last-index handling for graph capture                             | high   | static/registration passed; DCU runtime pending                       | Decode/extend and CUDA graph cache-invalidation smoke                                              | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/layers/deepseek_v4_rope.py`                                     | dependency     | Codex | theirs          | Adopt the official ImportError-guarded TileLang initialization                                                                       | medium | static/registration passed; DCU runtime pending                       | Import with and without TileLang, then DSV4 RoPE smoke                                             | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/managers/overlap_utils.py`                                      | scheduler      | Codex | manual merge    | Adopt official FutureIndices/spec-extras APIs while keeping the native token resolver on DCU                                         | medium | static/registration passed; DCU runtime pending                       | Overlap scheduler plus speculative decode smoke                                                    | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/managers/schedule_batch.py`                                     | scheduler      | Codex | theirs          | Adopt official tensor flatten and speculative batch interface updates                                                                | medium | static/registration passed; DCU runtime pending                       | Batch flatten, overlap scheduling, and speculative decode smoke                                    | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/models/deepseek_v2.py`                                          | model          | Codex | manual merge    | Keep DCU fused RMS/quant returns while adding official DSA/MLA CP parameters and MoE output-buffer context                           | high   | static/registration passed; DCU runtime pending                       | DeepSeek V2/V3 fused RMS/quant, CP, MoE, and short-request smoke                                   | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep DCU fused cos/sin and LightOp/JIT paths; restrict official fused QK/sgl-kernel behavior to non-DCU HIP                          | high   | static/registration passed; DCU runtime pending                       | DSV4 TP, CP+EP, DP+EP, MTP, graph capture, and FP8 WO-A smoke                                      | validated |
+| C04 /`af8f66940e9b` | `sync/official-main-C04-20260523` | `sgl-kernel/csrc/common_extension_rocm.cc`                                         | sgl-kernel     | Codex | manual merge    | Register both DCU decode metadata operators and official DSV4 top-k/norm/RoPE operators                                              | high   | static/registration passed; DCU runtime pending                       | `gfx938` metadata check plus DCU sgl-kernel smoke whitelist                                        | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/multimodal_gen/envs.py`                                             | diffusion      | Codex | manual merge    | Keep the DCU ring-attention setting while adopting official CFG gating and model-aware VAE channels-last policy                      | low    | compile and isolated env-default check passed                         | Diffusion runtime smoke on its target platform                                                     | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/layers/attention/dsa_backend.py`                                | attention      | Codex | port to new API | Adopt official`DSATopKBackend`; move the DCU LightOp fused transform into the new backend module                                     | high   | compile, CLI/env, and DCU LightOp route mock passed                   | DSA fused/unfused top-k, paged/ragged transform, graph, and sparse prefill smoke                   | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/layers/moe/hash_topk.py`                                        | moe            | Codex | manual merge    | Preserve DCU fused hash-top-k and LightOp postprocess, then invoke the official EPLB expert-distribution recorder                    | high   | compile and DCU semantic audit passed; runtime pending                | DSV4 hash top-k with EPLB off/on, padding, and logical-to-physical dispatch                        | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep DCU tuning-path imports and kernel branches while adding official EPLB per-layer recording context                              | high   | compile and DCU path audit passed; runtime pending                    | DSV4 pure TP, EPLB, MTP, CUDA graph, and short-request inference                                   | validated |
+| C05 /`8805f4cf1666` | `sync/official-main-C05-20260525` | `test/registered/distributed/test_dp_attention_large.py`                           | test           | Codex | theirs          | Follow the official registered-test directory split and retain the existing DCU nightly registration at the new path                 | low    | DCU registration passed with 211 files; move scan passed              | Execute the moved nightly test on its configured DCU runner                                        | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/activation.py`                                           | aiter          | Codex | manual merge    | Accept the official AITER activation gate on generic HIP while keeping the existing DCU activation implementation                    | medium | compile and DCU path audit passed; runtime pending                    | AITER import plus activation eager and graph smoke on DCU                                          | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py`                        | attention      | Codex | manual merge    | Adopt official FlashMLA metadata API but keep the external`flash_mla` package on DCU and sgl-kernel on other platforms               | high   | compile and DCU path audit passed; runtime pending                    | DSV4 pure TP, context parallel, FlashMLA metadata, and graph capture                               | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/dsv4/compressor.py`                            | attention      | Codex | manual merge    | Restrict official HIP compressor fallback to non-DCU HIP so the validated DCU JIT/compressor-v2 selection remains intact             | high   | compile and DCU path audit passed; runtime pending                    | DSV4 compressor with JIT norm and compressor-v2 toggles                                            | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | attention      | Codex | manual merge    | Accept the official cached vectorized fallback while preserving LightOp top-k as the sole DCU-priority transform path                | high   | compile and DCU path audit passed; runtime pending                    | LightOp top-k, index cache, sparse prefill, and graph replay                                       | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/dsv4/metadata.py`                              | attention      | Codex | manual merge    | Use official compact HIP metadata copy only outside DCU and keep full DCU metadata plus DeepGEMM disable guards                      | high   | compile and DCU path audit passed; runtime pending                    | DSV4 extend/decode metadata under pure TP, CP, MTP, and CUDA graph                                 | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | theirs          | Adopt official per-request varlen encoder metadata and retain the previously merged DCU cache-write guards                           | medium | compile and DCU path audit passed; runtime pending                    | Dense/VLM encoder attention plus DCU fused cache-write smoke                                       | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/moe/hash_topk.py`                                        | moe            | Codex | manual merge    | Preserve DCU hash top-k and EPLB recording, then apply the official optional DeepEP waterfill transformation                         | high   | compile and DCU path audit passed; runtime pending                    | Hash top-k with EPLB and DeepEP waterfill independently enabled and combined                       | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/moe/moe_runner/aiter.py`                                 | aiter          | Codex | manual merge    | Add official activation/quant runner inputs for generic HIP while preserving DCU W8A8 and native AITER runner paths                  | high   | compile and DCU path audit passed; runtime pending                    | DCU AITER W8A8/W16A16 MoE, DeepEP, eager, and CUDA graph                                           | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/layers/quantization/fp8.py`                                     | quantization   | Codex | manual merge    | Accept official gfx95 MXFP4/AITER transforms only outside DCU and retain DCU FP8 shuffle and loading behavior                        | high   | compile and DCU path audit passed; runtime pending                    | DSV4 FP8 channel scale plus W8A8/MXFP4 load and accuracy spot check                                | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/managers/overlap_utils.py`                                      | scheduler      | Codex | manual merge    | Adopt official overlap helpers while disabling their torch-compile path on both NPU and DCU                                          | medium | compile and DCU path audit passed; runtime pending                    | Overlap scheduling, idle batch, request retract, and speculative decode                            | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep five DCU alternate streams and DCU preparation while accepting the official two-stream generic HIP implementation               | high   | compile and DCU path audit passed; runtime pending                    | DSV4 pure TP, CP+EP, DP+EP, MTP, DeepEP, and CUDA graph                                            | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/srt/speculative/eagle_info.py`                                      | speculative    | Codex | manual merge    | Combine official async NaN/OOB probes with the existing DCU sgl-kernel KV-cache I/O functions                                        | high   | compile and DCU path audit passed; runtime pending                    | EAGLE/MTP draft-target KV transfer, async probes, and graph smoke                                  | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `python/sglang/test/ci/ci_register.py`                                             | ci             | Codex | manual merge    | Export both the internal DCU registration decorator and the newly added official XPU decorator                                       | low    | DCU registration passed with 211 files                                | DCU and XPU suite import/registration scan                                                         | validated |
+| C06 /`0abe6a85a51f` | `sync/official-main-C06-20260527` | `test/run_suite.py`                                                                | test           | Codex | manual merge    | Keep DCU suite mappings and schedules while adding the official XPU suite mappings and schedules                                     | low    | compile and DCU registration passed                                   | Generate/list DCU and XPU per-commit and nightly suites                                            | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `.gitignore`                                                                       | build          | Codex | manual merge    | Keep both DCU HIP generated-file ignores and official`.humanize/`                                                                    | low    | static passed; DCU runtime not required                               | None                                                                                               | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/jit_kernel/utils.py`                                                | jit-kernel     | Codex | manual merge    | Accept official MUSA/PDL detection while preserving DCU hipcc, FP8 target flags, and the DCU JIT cache key                           | medium | static/registration passed; DCU runtime pending                       | Compile representative DSV4 JIT kernels on gfx938                                                  | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/multimodal_gen/runtime/layers/attention/layer.py`                   | attention      | Codex | manual merge    | Keep DCU ring-attention overlap selection and add official varlen FlashAttention fast path                                           | medium | static/registration passed; DCU runtime pending                       | Diffusion ring-attention and varlen attention smoke                                                | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/distributed/device_communicators/custom_all_reduce.py`          | aiter          | Codex | port to new API | Adopt`(group, device)` dispatch and CUDA V2 checks while preserving DCU AITER selection, deterministic AR, and graph registration    | high   | static/registration passed; DCU runtime pending                       | AITER custom-allreduce eager plus CUDA graph replay                                                | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/layers/attention/triton_backend.py`                             | attention      | Codex | port to new API | Use official unified graph metadata helpers; retain DCU CPU seq-lens, SWA location translation/cache invalidation, and draft offsets | high   | static/registration passed; DCU runtime pending                       | Triton SWA/hybrid cache, target verify, EAGLE/MTP draft graph, and replay smoke                    | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/model_executor/forward_batch_info.py`                           | model_executor | Codex | manual merge    | Adopt official grouped fields and GPU-only extend lengths while retaining DCU quant fields and pinned H2D for list inputs            | high   | static/registration passed; DCU runtime pending                       | ForwardBatch list/GPU-only init, overlap scheduling, and speculative decode                        | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | port to new API | Follow official`eae03ce3b` no-prewarm lifecycle while retaining DCU `deepgemm`, LightOp paths, and safe HIP multistream              | high   | static/registration and DCU runtime passed                            | DSV4 TP, CP+EP, DP+EP+MTP, graph capture, and GSM8K accuracy                                       | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/debug_utils/test_crash_dump.py`                                   | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Run on the registered DCU suite when available                                                     | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/debug_utils/test_soft_watchdog.py`                                | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Run on the registered DCU suite when available                                                     | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/lora/test_lora_eviction_policy.py`                                | test           | Codex | manual merge    | Preserve DCU registration and disabled reason while accepting official CPU registration                                              | low    | static/registration passed; DCU runtime pending                       | LoRA eviction policy smoke on DCU                                                                  | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/lora/test_lora_openai_api.py`                                     | test           | Codex | manual merge    | Preserve DCU registration and disabled reason while accepting official CPU registration                                              | low    | static/registration passed; DCU runtime pending                       | LoRA OpenAI API smoke on DCU                                                                       | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/model_loading/test_external_models.py`                            | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | External-model loading smoke on DCU                                                                | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/scheduler/test_routing_key_scheduling.py`                         | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Routing-key scheduler smoke and registered CPU unit test                                           | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/managers/test_io_struct.py`                                  | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Run focused CPU unit test and registered DCU suite                                                 | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/managers/test_prefill_adder.py`                              | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Run focused CPU unit test and prefill scheduler smoke                                              | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/managers/test_profile_merger_http_api.py`                    | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Run focused CPU unit test and registered DCU suite                                                 | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/unit/utils/test_profile_merger.py`                                | test           | Codex | manual merge    | Preserve DCU registration while accepting official CPU registration                                                                  | low    | static/registration passed; DCU runtime pending                       | Run focused CPU unit test and registered DCU suite                                                 | validated |
+| C07 /`a5e6a8887a94` | `sync/official-main-C07-20260529` | `test/registered/vlm/test_evs.py`                                                  | test           | Codex | manual merge    | Preserve DCU VLM registration and disabled reason while accepting official CPU registration                                          | low    | static/registration passed; DCU runtime pending                       | EVS/VLM startup and short-request smoke on DCU                                                     | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/layers/moe/token_dispatcher/deepep.py`                          | deepep         | Codex | manual merge    | Accept official dispatcher dtype refresh and NPU INT8 override while retaining DCU group-GEMM, FP8/W16A16, and custom quant paths    | high   | compile/ruff/registration passed; DCU runtime pending                 | DeepEP normal/low-latency BF16/FP8 dispatch, group-GEMM, MTP, and graph smoke                      | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/managers/overlap_utils.py`                                      | scheduler      | Codex | port to new API | Adopt official FutureMap-based deferred prefill H2D and input resolution; keep DCU out of compiled debug-assert helpers              | high   | compile/ruff/registration passed; DCU runtime pending                 | Overlap prefill/decode/mixed batch, eager/graph replay, and speculative decoding                   | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/model_executor/forward_batch_info.py`                           | model_executor | Codex | manual merge    | Accept KV-canary IDs and pin-memory API; retain DCU chunked-prefix operator and native clamp-position implementation                 | high   | compile/ruff/registration passed; DCU runtime pending                 | ForwardBatch prefill/decode/mixed/spec inputs, chunked prefix, token oracle, and CUDA graph        | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/models/deepseek_nextn.py`                                       | speculative    | Codex | manual merge    | Add official NPU MTP unquant context while retaining DCU SBO stream and MTP top-k reuse                                              | high   | compile/ruff/registration passed; DCU runtime pending                 | DeepSeek NextN/MTP eager and graph, reused top-k, CP, and DeepEP dispatch                          | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/models/deepseek_v4.py`                                          | deepseek-v4    | Codex | manual merge    | Keep official fused MHC structure for non-DCU; DCU remains on AITER pre/post and does not restore model prewarm                      | high   | compile/ruff/registration passed; DCU runtime pending                 | DSV4 pure TP, CP+EP, DP+EP+MTP, graph to bs=128, repeated accuracy, and MHC path audit             | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/server_args.py`                                                 | server_args    | Codex | port to new API | Import moved argparse actions, remove duplicate local definitions, and accept official KV-canary/parallel CLI                        | medium | compile/ruff; 48 unit tests passed and 8 blocked by no-device LightOp | CLI parse for DCU launch arguments, KV-canary default-off, and moe-dense-tp validation             | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/speculative/eagle_info_v2.py`                                   | speculative    | Codex | manual merge    | Use official cache-location helper API with a single`_is_dcu` branch that preserves the DCU kvcache operator                         | high   | compile/ruff/registration passed; DCU runtime pending                 | EAGLE/MTP target verify, page-size-64 cache locations, graph replay, and fallback Triton path      | validated |
+| C08 /`373cadc92ea4` | `sync/official-main-C08-20260531` | `python/sglang/srt/speculative/eagle_worker_v2.py`                                 | speculative    | Codex | theirs          | Accept official KV-canary contexts around draft eager/graph execution while retaining existing DCU HIP top-k behavior                | high   | compile/ruff/registration passed; DCU runtime pending                 | EAGLE draft/decode graph, multi-step draft, MTP112, and KV-canary disabled/enabled smoke           | validated |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/pyproject.toml`                                                            | dependency     | Codex | manual merge    | Accept official FlashAttention 4 dependency while retaining the internally validated `sgl-deep-gemm==0.1.0` pin                      | medium | static install-flow audit passed; runtime pending                                       | DCU install/resolver smoke; assess upgrading the internal DeepGEMM package to 0.1.2                 | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py`                        | attention      | Codex | port to new API | Adopt the three-method metadata lifecycle and SM120 path; retain DCU external FlashMLA, LightOp quant cache, and sparse prefill       | high   | compile/ruff/registration passed; DCU runtime pending                             | DSV4 TP/CP/PD, split prefill/decode, graph to bs=128, sparse prefill, and FlashMLA                  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | attention      | Codex | manual merge    | Accept official FP4/SM120 indexer support while preserving DCU LightOp top-k as the sole DCU-priority transform                       | high   | compile/ruff/registration passed; DCU runtime pending                             | DCU FP8 index cache, LightOp top-k, graph replay; verify FP4 flag remains rejected off SM100        | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/layers/attention/flashattention_backend.py`                     | attention      | Codex | port to new API | Move metadata kernels to official `triton_ops/metadata.py`, keep DCU FA layout/SWA translation, and restore required `cu_seqlens_q` | high   | compile/ruff/registration passed; DCU runtime pending                             | Dense/VLM, DSV4, SWA, cross-attention, speculative graph, and DCU FA-layout smoke                  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/model_executor/model_runner.py`                                 | model_executor | Codex | port to new API | Use official `hc_hidden_size` graph-buffer contract, which replaces the removed DSV4 PP proxy-shape argument                         | high   | compile/ruff/registration passed; DCU runtime pending                             | DeepSeek-V4 PP/PD startup, graph capture, flattened MHC hidden-state transfer                      | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/speculative/eagle_info_v2.py`                                   | speculative    | Codex | port to new API | Consume official centralized cache-location/EAGLE helpers; DCU operator dispatch moved with the helper rather than duplicated        | high   | compile/ruff/registration passed; DCU runtime pending                             | EAGLE/MTP draft and target verify, page-size 1/64, eager/graph, operator-disabled Triton fallback  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `python/sglang/srt/speculative/spec_utils.py`                                      | speculative    | Codex | port to new API | Remove duplicated Triton cache kernels and import the official centralized helpers, including the migrated DCU req-pool operator     | high   | compile/ruff/registration passed; DCU runtime pending                             | Spec V1/V2 cache assignment, retract/abort, graph replay, and `SGLANG_ASSIGN_REQ_TO_TOKEN_POOL=0`  | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-bootstrap`   | `python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py`                           | mem_cache      | Codex | backport upstream fix | Backport official `c9ca56da8c`: compute full-to-SWA write locations once in per-forward graph metadata instead of retaining pool-level locations across replay; preserve DCU LightOp stores | high | compile/ruff/registration passed; DCU runtime pending | Graph on/off parity; standalone CP+EP; PD prefill/decode; EAGLE/MTP; GSM8K 10; HiCache mapping reload | merged |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_a.py`                                 | test           | Codex | port to new API | Accept official test deletion and migrate the DCU placeholder registration to the new core/top-k EAGLE suites                        | medium | registration passed; DCU runtime pending                                            | Enable after BW1100 draft/target model mapping is available                                       | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_b.py`                                 | test           | Codex | port to new API | Accept official test deletion and migrate page-size/tree coverage plus the DCU disabled reason to the split test files                | medium | registration passed; DCU runtime pending                                            | Run new core/page/top-k suites on a DCU runner                                                     | merged    |
+| C09 /`c55548ba115c` | `sync/official-main-C09-20260602` | `test/registered/spec/eagle/test_eagle_infer_beta.py`                              | test           | Codex | port to new API | Accept official beta-test deletion and preserve its DCU placeholder intent in the new EAGLE core/page suites                         | medium | registration passed; DCU runtime pending                                            | Validate EAGLE3 overlap, logprob parity, page-size 64, and graph replay on BW1100                  | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `.github/workflows/pr-test-npu.yml`                                                | ci             | Codex | theirs          | Accept the official NPU workflow rewrite; it does not replace or modify the internal DCU workflow                                     | low    | YAML/diff check; runtime pending                                       | NPU workflow syntax check; confirm DCU workflow remains registered                                 | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/pyproject.toml`                                                            | dependency     | Codex | manual merge    | Accept C10 dependencies while retaining the DCU omission of CUDA-only FlashInfer wheels and the internal DeepGEMM pin                 | medium | dependency diff audit; runtime pending                                | DCU editable/wheel install and import smoke                                                       | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/jit_kernel/utils.py`                                                | jit-kernel     | Codex | manual merge    | Add the official local-source hash and MUSA detection while retaining DCU hipcc flags, device key, FP8 target flag, and cache split   | high   | syntax and JIT path audit; runtime pending                            | DCU JIT cache hit/miss, gfx938 FP8 compile, and source-change rebuild                              | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/multimodal_gen/runtime/layers/attention/backends/flash_attn.py`     | diffusion      | Codex | manual merge    | Use supplied metadata when available and fall back to forward context; derive query/key lengths independently                         | medium | syntax passed; runtime pending                                        | Diffusion FlashAttention fixed/variable-length smoke                                               | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/configs/model_config.py`                                        | model          | Codex | manual merge    | Preserve internal slimquant/W8A8/modelslim formats and add official Quark MXFP4                                                       | medium | syntax/config audit; runtime pending                                  | Existing DCU quantized model load plus Quark config parse                                          | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/environ.py`                                                     | environment    | Codex | manual merge    | Keep all DCU FlashMLA/split-MLA/FP4/FP8/WO-A knobs and accept the official C10 environment additions                                 | high   | env symbol audit; runtime pending                                     | Parse launch-script envs and test graph/sparse-prefill combinations                                | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py`                        | deepseek-v4    | Codex | port to new API | Adopt official per-forward SWA metadata, sparse prefill and direct sgl-kernel paths; retain DCU external FlashMLA and LightOp paths   | high   | syntax/ruff/path audit; runtime pending                               | DSV4 TP/CP/PD, eager/graph, sparse prefill, split MLA, MTP and GSM8K accuracy                       | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py`              | attention      | Codex | manual merge    | Accept official lifecycle documentation while preserving the existing HIP radix implementation                                      | medium | syntax passed; runtime pending                                        | HIP radix decode/prefill and graph replay                                                          | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/dsv4/compressor.py`                            | deepseek-v4    | Codex | manual merge    | Add official HIP fused compressor/AITER tgemm only outside DCU; retain DCU LightOp quant-store path                                  | high   | syntax/ruff/DCU guard audit; runtime pending                         | C4/C128 compressor, fused norm/RoPE/Hadamard, LightOp cache store and graph replay                  | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/dsv4/dequant_k_cache.py`                       | deepseek-v4    | Codex | theirs          | Take the official superset with corrected FP32 scale math and reference validation; no historical DCU branch exists                  | high   | syntax passed; runtime pending                                        | FP8 K-cache dequant numerical comparison on gfx938                                                  | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/dsv4/indexer.py`                               | deepseek-v4    | Codex | manual merge    | Accept official local-batch validation while retaining robust option lookup and DCU LightOp TopK priority                            | high   | syntax/path audit; runtime pending                                    | LightOp TopK, FP8 index cache, local batch, eager/graph parity                                      | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/dsv4/metadata.py`                              | deepseek-v4    | Codex | manual merge    | Accept official DeepGEMM/JIT thresholds and top-k-v2, but keep DeepGEMM metadata disabled on DCU                                     | high   | syntax/DCU guard audit; runtime pending                               | Metadata copy/replay, top-k selection, batch-size boundaries and graph to bs=128                   | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py`                  | deepseek-v4    | Codex | theirs          | Take the official superset containing request-local rebasing, mask fixes and reusable chunk cache; no DCU branch exists              | high   | syntax passed; runtime pending                                        | Sparse prefill C4/C128 boundary sizes, chunk reuse, CP off/on and accuracy                          | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/attention/triton_backend.py`                             | attention      | Codex | manual merge    | Use official SWA translation lifecycle while retaining DCU CPU seq-lens, AITER extend and GPU-scalar synchronization avoidance        | high   | syntax/path audit; runtime pending                                    | Dense/VLM Triton attention, SWA, target verify, speculative graph and replay                        | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/moe/moe_runner/aiter.py`                                 | aiter          | Codex | manual merge    | Add C10 optional kwargs/no-combine only to generic HIP; DCU remains on validated W8A8/native AITER runners                            | high   | syntax/ruff/DCU dispatch audit; runtime pending                      | DCU W8A8 INT8/FP8, native AITER MoE, eager/graph, DeepEP and no-combine isolation                  | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/quantization/__init__.py`                               | quantization   | Codex | manual merge    | Register both optional Quark loaders without losing internal quantization registrations                                               | medium | import/config audit; runtime pending                                  | Quant-method registry import with and without Quark installed                                      | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py`          | quantization   | Codex | manual merge    | Accept online MXFP4 support for capable ROCm GPUs while explicitly excluding DCU from unsupported AITER quant imports                 | medium | syntax/import guard audit; runtime pending                            | DCU import smoke; gfx95 online MXFP4 remains a non-DCU validation                                  | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py`                           | mem_cache      | Codex | port to new API | Complete the C10 per-forward SWA translation lifecycle and return native mapping dtype; call sites cast to kernel-required int32      | high   | syntax/call-site audit; runtime pending                               | DSV4 graph replay, allocator reuse, PD transfer and HiCache load-back                              | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/mem_cache/swa_memory_pool.py`                                   | mem_cache      | Codex | port to new API | Accept official allocator relocation and remove obsolete pool-level translation cache; port DCU duplicate-free protection to allocator | high | syntax/import audit; runtime pending                                | SWA allocation/free/reuse, radix eviction, HiCache and graph replay                                | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/srt/model_executor/input_buffers.py`                                | model_executor | Codex | theirs          | Accept the official buffer API cleanup used by CudaGraphBufferRegistry                                                               | high   | syntax/API audit; runtime pending                                     | Decode/prefill graph buffer capture and replay across batch sizes                                  | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `python/sglang/test/kits/attention_unittest/attention_methods/dsv4_attention.py`   | test           | Codex | manual merge    | Update the test to use pool-owned SWA location translation                                                                           | medium | syntax passed; runtime pending                                        | Run DSV4 attention unit/accuracy test on DCU                                                      | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `test/registered/lora/test_lora_eviction_policy.py`                                | test           | Codex | manual merge    | Preserve DCU registration and add official XPU registration                                                                          | low    | registration check pending                                            | DCU LoRA eviction smoke                                                                           | merged    |
+| C10 /`47377525cb32` | `sync/official-main-C10-20260604` | `test/registered/spec/eagle/test_spec_eagle_topk.py`                               | test           | Codex | manual merge    | Preserve disabled DCU coverage and accept official CUDA registration/estimate update                                                 | medium | registration check pending                                            | EAGLE top-k/page-size graph validation when DCU model assets are available                         | merged    |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `.github/workflows/release-docker-intel-xpu-nightly.yml` | ci | Codex | theirs | Accept official XPU nightly workflow; DCU workflow is independent | low | workflow/static check pending | Confirm DCU workflows remain registered | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `docs_new/index.mdx` | docs | Codex | theirs | Accept official documentation layout | low | docs syntax not a runtime gate | None | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/jit_kernel/csrc/deepseek_v4/hisparse_transfer.cuh` | jit-kernel | Codex | theirs | Follow official deletion after HiSparse restructuring | medium | deleted-reference scan pending | DSV4 startup/short request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py` | model_executor | Codex | port to new API | Follow deletion and use TC piecewise runner APIs | high | import/compile pending | Graph capture is optional; model startup remains required | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/speculative/eagle_worker.py` | speculative | Codex | port to new API | Follow official EAGLE worker-v2 migration | high | import/compile pending | EAGLE/MTP startup smoke if enabled | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/jit_kernel/utils.py` | jit-kernel | Codex | manual merge | Combine deterministic prebuilt cache reuse with DCU backend key, source hash, hipcc and gfx flags | high | compile pending | gfx938 JIT compile/import smoke | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/disaggregation/mooncake/conn.py` | disaggregation | Codex | port to new API | Use common KVTransferError while retaining DCU FA KV layout switch | high | compile pending | PD prefill/decode startup and one request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` | attention | Codex | port to new API | Adopt TC piecewise/fused-store interfaces while retaining DCU BF16/FP8 index cache and LightOp paged MQA | high | compile pending | DSA model startup and one short request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/attention/dsa_backend.py` | attention | Codex | manual merge | Keep DeepGEMM schedule metadata off DCU and accept official non-DCU target-verify metadata | high | compile pending | DSA metadata init and request smoke | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/attention/fla/layernorm_gated.py` | attention | Codex | manual merge | Keep LightOp layernorm and add official PDL launch kwargs to Triton | medium | compile pending | FLA model startup if available | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/attention/flashattention_backend.py` | attention | Codex | port to new API | Keep DCU FA interface, LightOp metadata and fused-store guards on official KVWriteLoc/SWA lifecycle | high | compile pending | Dense/VLM and DCU FA startup plus short request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/attention/flashmla_backend.py` | attention | Codex | port to new API | DCU uses external FlashMLA and DCU index builder; other platforms use official sgl-kernel FlashMLA and 2D grid | high | compile pending | DeepSeek-V4 startup and short request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/attention/triton_backend.py` | attention | Codex | manual merge | Accept official draft-v2 buffer sizing/SWA metadata and retain DCU token-pool path | high | compile pending | Triton dense startup and one request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/moe/ep_moe/layer.py` | moe | Codex | port to new API | Adopt TC piecewise graph query while retaining DCU DeepEP/AITER/offloader helpers | high | compile pending | Qwen/DeepSeek MoE startup and one request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/moe/fused_moe_triton/layer.py` | moe | Codex | manual merge | Keep DCU LightOp fused sum and accept official NPU dispatch state | medium | compile pending | MoE startup smoke | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/moe/hash_topk.py` | moe | Codex | theirs | Accept official padded-token weight masking and waterfill ordering | medium | compile pending | EPLB/hash-topk model startup | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py` | moe | Codex | manual merge | Add official experimental LoRA env while retaining DCU align helper | medium | compile pending | Triton MoE startup | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/moe/topk.py` | moe | Codex | manual merge | Preserve DCU LightOp top-k priority before official fused top-k pack | high | compile pending | MoE startup and token generation | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/quantization/__init__.py` | quantization | Codex | manual merge | Keep SlimQuant registrations and accept official platform registry | medium | import check pending | Quantized model config/load smoke | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/quantization/fp8_utils.py` | quantization | Codex | manual merge | Preserve tuple input path and add official inductor static-scale path | high | compile pending | FP8 model startup and one request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py` | quantization | Codex | manual merge | Keep DCU exclusion from gfx95 AITER path and accept official custom-op registration | medium | import check pending | Clean DCU import; MXFP4 is non-blocking | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/managers/overlap_utils.py` | scheduler | Codex | port to new API | Use official fused gather generally and retain DCU non-Triton compiled gather fallback | high | compile pending | Parallel request startup/inference smoke | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/mem_cache/memory_pool.py` | mem_cache | Codex | manual merge | Add official vectorized 5D layout/OOB checks while retaining DCU FA page layout, graph copy and DSA offload | high | compile pending | KV allocation, model startup and one request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/model_executor/forward_batch_info.py` | model_executor | Codex | manual merge | Keep DCU logging/metadata and accept official deprecation warnings | medium | compile pending | ForwardBatch init through server startup | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py` | model_executor | Codex | theirs | Drop rename-conflicted legacy runner body and use official phase-aware runner | high | compile pending | Graph is non-blocking; eager startup/request required | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/models/bailing_moe.py` | model | Codex | manual merge | Keep token-pool accessor and add official capture-state API | medium | compile pending | Bailing MoE startup if available | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/models/deepseek_common/utils.py` | model | Codex | manual merge | Keep DCU platform state and accept official gfx95 bpreshuffle capability | high | compile pending | DeepSeek model import/startup | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/models/deepseek_v2.py` | model | Codex | port to new API | Keep DCU fused RMS/quant input layernorm and migrate capture checks to new runner APIs | high | compile pending | DeepSeek V2/V3/V4 startup and request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/models/deepseek_v4.py` | deepseek-v4 | Codex | manual merge | Keep DCU fused RoPE alias and accept official compilation split-op registration | high | compile pending | Primary DeepSeek-V4 startup and short request | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/models/qwen3_5.py` | model | Codex | manual merge | Keep token-pool accessor and add official capture-state API | medium | compile pending | Qwen3.5 startup if available | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py` | speculative | Codex | theirs | Use official shape-key/backend capture interface; AMD top-k guard remains upstream | high | compile pending | EAGLE/MTP startup if enabled | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py` | speculative | Codex | port to new API | Remove obsolete skip-attention-init argument from target worker call | high | compile pending | Multi-layer EAGLE startup if enabled | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `python/sglang/srt/utils/hf_transformers/config.py` | config | Codex | theirs | Formatting-only conflict around DSA raw config recovery | low | compile pending | DeepSeek config parse | merged |
+| C11-C13 /`125ef888921b` | `sync/official-main-C11-C13-20260610` | `test/registered/spec/eagle/test_spec_eagle_page.py` | test | Codex | manual merge | Accept official estimate and preserve disabled DCU registration | low | registration check pending | Enable only after DCU EAGLE page validation | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `.github/workflows/pr-test-npu.yml` | ci | Codex | theirs | Take the official NPU workflow rewrite; internal DCU workflows are independent | low | YAML/static check pending | Confirm DCU workflow and suite registration remain intact | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `.github/workflows/release-docker-intel-xpu-nightly.yml` | ci | Codex | theirs | Take the official isolated checkout/build-context fix for Intel XPU nightly | low | YAML/static check pending | None for DCU runtime | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/bench_serving.py` | benchmark | Codex | theirs | Accept official p90 TTFT/TPOT metrics additions | low | Python compile passed; full static gate pending | Benchmark output schema smoke is non-blocking | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` | attention | Codex | manual merge | Add official LoRA-aware gate projection and TC-piecewise guard while retaining DCU BF16/FP8 index cache, LightOp fused Q/K quant-store, and DCU gate-input handling | high | conflict-file compile passed; runtime pending | DeepSeek-V4 startup/request; DSA BF16/FP8 cache and LoRA follow-up | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/dsa_backend.py` | attention | Codex | manual merge | Retain nullable/nested external-FlashMLA metadata copy semantics on DCU; use normal tensor copies elsewhere | high | conflict-file compile passed; runtime pending | DSA metadata capture/replay and startup request | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/dsv4/compressor.py` | deepseek-v4 | Codex | manual merge | Keep explicit DCU detection and LightOp quant-cache path while accepting official weight-attribute plumbing | high | conflict-file compile passed; runtime pending | DSV4 C4/C128/online-MTP compressor startup and request | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/dsv4/metadata.py` | deepseek-v4 | Codex | manual merge | Keep DCU deep-gemm metadata tensor copying separate from generic HIP assignment semantics | high | conflict-file compile passed; runtime pending | Metadata copy under eager/graph and DSV4 request | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/flashattention_backend.py` | attention | Codex | ours | Preserve the validated DCU FA KV layout, varlen/vLLM adapters and page-size behavior; official non-DCU FA skip-KV execution refactor remains outside the DCU functional gate | high | conflict-file compile passed; runtime pending | DCU dense/VLM smoke; review non-DCU `fa_skip_kv_cache` parity separately | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/linear/gdn_backend.py` | attention | Codex | manual merge | Combine official generic HIP fused GDN imports with DCU LightOp/env dispatch | medium | conflict-file compile passed; runtime pending | GDN model smoke when assets are available | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/attention/triton_backend.py` | attention | Codex | manual merge | Retain validated Spec-V2 draft-extend length/QO planning and accept official removal of Spec-V1 graph metadata | high | conflict-file compile passed; runtime pending | Spec-V2 draft extend and Triton startup/request | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/mhc.py` | deepseek-v4 | Codex | manual merge | Preserve DCU AITER TileLang MHC and ROCm bool-allocation patch while accepting official startup prewarm state | high | conflict-file compile passed; runtime pending | DSV4 startup confirms MHC prewarm and no removed model hook | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/moe/fused_moe_triton/layer.py` | moe | Codex | manual merge | Keep DCU bias/i_q/i_s-aware runner call and add official deferred FlashInfer finalize entry point | high | conflict-file compile passed; runtime pending | MoE startup/request and deferred-finalize non-DCU follow-up | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/moe/moe_runner/aiter.py` | aiter | Codex | port to new API | Adopt official Mori/DeepEP quant-aware pre/post-permute contracts and registrations while retaining DCU runner fields, backend key and explicit DCU detection | high | conflict-file compile passed; runtime pending | DCU AITER MoE/DeepEP startup and one request; AG remains disabled | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/quantization/fp8.py` | quantization | Codex | manual merge | Keep DCU on validated native/ASM AITER dispatch; accept generic ROCm FP4 quant-info, padding and shuffled-weight handling outside DCU | high | conflict-file compile passed; runtime pending | FP8 DSV4 startup/request; generic ROCm FP4 follow-up | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/layers/quantization/fp8_kernel.py` | quantization | Codex | manual merge | Keep LightOp import DCU-only and accept official CUDA/MUSA per-token group-quant JIT registrations | high | conflict-file compile passed; runtime pending | DCU FP8 quant startup/request and import smoke | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/managers/overlap_utils.py` | scheduler | Codex | manual merge | Adopt official verified-id/topk/bonus capability flags while routing the fused gather helper through the existing DCU implementation | high | conflict-file compile passed; runtime pending | Overlap startup and short request; Spec-V2 follow-up | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/managers/scheduler.py` | scheduler | Codex | port to new API | Use official `carries_draft_hidden_states()` lifecycle and retain robust fallback for configs without `spec_hidden_size` | high | conflict-file compile passed; runtime pending | PD/standalone metadata buffer startup and request | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/mem_cache/allocator/swa.py` | mem_cache | Codex | manual merge | Adopt official full-page mapping expansion and preserve DCU duplicate/free-page filtering before allocator release | high | conflict-file compile passed; runtime pending | SWA allocate/free/reuse and HiCache load-back | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/mem_cache/common.py` | mem_cache | Codex | manual merge | Accept official pinned-memory helper and keep `dcu_get_last_loc` behind an explicit DCU-only import | high | conflict-file compile passed; runtime pending | Page-size allocation/get-last-loc through model startup | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/model_executor/forward_batch_info.py` | model_executor | Codex | theirs | Take official vectorized multimodal mRoPE delta construction; the prior side was stale list-mutation code | high | conflict-file compile passed; runtime pending | ForwardBatch initialization during service startup | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/server_args.py` | server_args | Codex | port to new API | Drop the obsolete in-class speculative handler; C14-C16 routes validation and defaults through `arg_groups.speculative_hook` | high | conflict-file compile passed; CLI/import gate pending | ServerArgs parse plus service startup | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/speculative/eagle_info.py` | speculative | Codex | port to new API | Accept official compact Spec-V2-only Eagle data model and remove retired Spec-V1 bodies | high | conflict-file compile passed; runtime pending | EAGLE/MTP is non-blocking; startup import must pass | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `python/sglang/srt/speculative/eagle_info_v2.py` | speculative | Codex | port to new API | Accept official allocation/commit-watermark lifecycle; centralized `cache_locs.py` retains explicit DCU `dcu_assign_*` dispatch | high | conflict-file compile passed; runtime pending | Spec-V2 page-size/topk follow-up; service startup import | merged |
+| C14-C16 /`2ad00faae1f4` | `sync/official-main-C14-C16-20260616` | `test/registered/unit/server_args/test_server_args.py` | test | Codex | manual merge | Preserve validated DCU suite registration and add official config-merger coverage | low | conflict-file compile passed; registration pending | Run registration and ServerArgs tests | merged |
+
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/pyproject.toml` | dependency | Codex | manual merge | Accept official C17-C19 dependency bumps including FlashAttention/FlashInfer/sglang-kernel while retaining current DCU `tilelang==0.1.9` pin | medium | static gates passed; runtime passed | DCU install/resolver smoke if package image changes | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/multimodal_gen/runtime/layers/attention/layer.py` | multimodal | Codex | manual merge | Keep official multimodal attention contract; no DCU-specific branch was replaced | low | compile/ruff passed | Diffusion/VLM smoke is non-blocking | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/environ.py` | env | Codex | manual merge | Preserve DCU `SGLANG_USE_LIGHTOP=False` default and existing DSV4 FlashMLA backend env while accepting official C19 env additions | medium | DSA env test passed; import smoke passed | Runtime confirms env defaults during service startup | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/attention_registry.py` | attention | Codex | port to new API | Dispatch NPU first, keep generic HIP only for `_is_hip and not _is_dcu`, and retain DCU DeepSeekV4 backend ownership | high | import smoke and targeted ruff passed | DeepSeek-V4 startup/request passed | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/deepseek_v4_backend.py` | deepseek-v4 | Codex | manual merge | Keep DCU DSV4 backend behavior on the C19 attention contract; remove stale CP imports after official parallel APIs moved | high | compile/ruff/import passed | DSV4 graph and sparse prefill follow-up | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/dsv4/compressor.py` | deepseek-v4 | Codex | manual merge | Combine official `get_parallel`/NPU support with DCU LightOp compressor path; generic AITER remains guarded by `_is_hip and not _is_dcu` | high | compile/ruff/import passed | DSV4 C4/C128/online-MTP startup | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/flashattention_backend.py` | attention | Codex | manual merge | Adopt official CP-v2 KV materialization hook while retaining validated DCU FlashAttention execution body and FA KV layout | high | compile/ruff/import passed | Dense/VLM attention smoke; non-DCU skip-KV parity follow-up | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/flashmla_backend.py` | attention | Codex | manual merge | Combine official parallel-context API with DCU external FlashMLA import and DCU KV-index creation | high | compile/ruff/import passed | DSV4 FlashMLA startup/request passed | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/attention/triton_backend.py` | attention | Codex | manual merge | Keep DCU optional AITER extend path before official split-KV EAGLE target-verify fast path, then fall back to standard extend | high | compile/ruff/import passed | Spec/EAGLE target-verify follow-up | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/mhc.py` | deepseek-v4 | Codex | manual merge | Preserve DCU AITER TileLang MHC and bool-allocation patch while accepting official TileLang-missing/prewarm handling | high | compile/ruff/import passed | DSV4 MHC startup and graph follow-up | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8_moe.py` | quantization | Codex | manual merge | Combine official parallel/server-args imports with DCU detection and bias/i_q/i_s-aware combine signature | high | compile/ruff/import passed | FP8 compressed MoE smoke | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py` | quantization | Codex | manual merge | Retain official NPU `apply_without_routing_weights` and DCU/GPU `CompressedTensorsW8A8Int8MoE` class | high | compile/ruff/import passed | INT8 compressed MoE smoke | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py` | quantization | Codex | manual merge | Keep DCU default zero-point initialization while accepting official zero-point original-shape tracking | medium | compile/ruff/import passed | WNa16 MoE load smoke | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/quark_int4fp8_moe.py` | quantization | Codex | manual merge | Combine official parallel API with explicit DCU detection; do not let generic HIP override DCU quant path | high | compile/ruff/import passed | Quark INT4/FP8 MoE smoke | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/layers/quantization/unquant.py` | quantization | Codex | manual merge | Preserve DCU W16A16/Marlin paths before generic AITER fallback while adopting official `_aiter_runner`/`AiterMoeQuantInfo` for non-DCU | high | compile/ruff/import passed | W16A16/AITER MoE startup | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/mem_cache/common.py` | mem_cache | Codex | manual merge | Keep `dcu_get_last_loc` DCU-only and accept official NPU platform detection | medium | compile/ruff/import passed | Page-size/cache location smoke | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/model_executor/forward_batch_info.py` | model_executor | Codex | theirs | Use official `get_parallel().attn_tp_size` contract instead of stale local TP helper | medium | compile/ruff/import passed | ForwardBatch initialization during startup | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/model_executor/model_runner.py` | model_executor | Codex | manual merge | Retain current DCU warmup/autotune/dummy-run path and port its imports to C19 runner/base-runner APIs | high | compile/ruff/import passed | Service startup and graph warmup follow-up | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/models/bailing_moe.py` | model | Codex | manual merge | Adopt official `get_parallel()` TP/EP sizing while keeping DCU token-pool/model behavior | medium | compile/ruff/import passed | Bailing MoE startup if model available | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/models/deepseek_v2.py` | model | Codex | port to new API | Keep DCU fused RMS/quant, LightOp and DSA token-pool paths while using official common-utils platform state and C19 MHA/MLA helper imports | high | compile/ruff/import passed | DeepSeek V2/V3/V4 startup/request passed | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/models/deepseek_v4.py` | deepseek-v4 | Codex | manual merge | Combine official NPU/UE8M0 quant changes with DCU LightOp/AITER TileLang MHC and robust WO-A weight layout handling | high | compile/ruff/import passed | Primary DeepSeek-V4 startup/request passed | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/server_args.py` | server_args | Codex | manual merge | Use official strategy-based Mamba radix-cache handling and include DCU in extra-buffer validation | medium | DSA CLI/env test and import smoke passed | Service CLI parse during startup | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `python/sglang/srt/speculative/draft_utils.py` | speculative | Codex | manual merge | Keep DCU ahead of generic HIP for DSV4 draft/prefill backend selection while accepting official NPU dispatch | high | compile/ruff/import passed | MTP/EAGLE smoke is non-blocking | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `test/registered/dp_attn/test_dp_attention.py` | test | Codex | manual merge | Preserve DCU disabled placeholder and official AMD registration imports | low | DCU registration passed | Enable only after BW1100 DP attention validation | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `test/registered/lora/test_lora_update.py` | test | Codex | manual merge | Preserve DCU disabled placeholder and official AMD registration imports | low | DCU registration passed | Enable only after local LoRA adapter/model validation | validated |
+| C17-C19 /`62b3c8e17781` | `sync/official-main-C17-C19-20260622` | `test/registered/rl/test_patch_torch.py` | test | Codex | manual merge | Preserve DCU disabled placeholder and official AMD registration imports | low | DCU registration passed | Enable only after multiprocessing HIP tensor validation | validated |
 
 ## Per-Checkpoint Notes
 
 ### C01 / `c67b2870569a`
 
 - Expected focus: test registry and CI overlap.
-- Owner: TBD
+- Owner: Codex for initial mechanical merge; runtime owners still required for high-risk MoE/AITER/DeepSeek follow-ups.
 - Required validation:
   - `python3 scripts/ci/dcu/verify_dcu_registration.py`
   - DCU CI dry-run command, to be filled.
 - Notes:
-  - TBD
+  - Branch: `sync/official-main-C01-20260517`.
+  - Low-risk CI/test/env conflicts were resolved by taking official suite/action
+    naming and preserving DCU-specific workflow wording/env flags.
+  - High-risk runtime files were resolved DCU-first for C01:
+    `ep_moe/layer.py`, `moe_runner/aiter.py`, `quantization/unquant.py`,
+    `deepseek_v2.py`, `deepseek_v4.py`, and `server_args.py`.
+  - Reason for DCU-first runtime resolution: these files contain existing DCU
+    AITER, DeepEP, fused quant/RMS, and DeepSeek V4 paths; blindly porting the
+    official C01 runner/model refactors would be higher risk than preserving
+    known behavior for the first checkpoint.
+  - Follow-up: assign MoE/AITER/DSV owner to review skipped official hunks before
+    C02/C03 if those hunks become required by later checkpoints.
+  - Validation completed:
+    - precise conflict marker scan: passed.
+    - syntax compile for all conflicted Python files: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      212 DCU registered test files.
+  - Recommended manual validation:
+    - `ci` / `test`: PR workflow dry-run and `/rerun-failed-ci` flow.
+    - `mem_cache`: CPU offload smoke covering DCU FA KV layout.
+    - `scheduler`: pipeline-parallel proxy tensor smoke.
+    - `moe` / `deepep` / `aiter`: Qwen3 MoE or DeepEP smoke covering current
+      DCU AITER path.
+    - `model` / `deepseek-v4`: DeepSeek V2/V4 startup and short request smoke.
+    - `server_args`: speculative algorithm alias CLI parse smoke if used.
+  - Manual validation result:
+    - TBD
 
 ### C02 / `425dffbde339`
 
 - Expected focus: DeepSeek V4 MTP, attention, DeepEP.
-- Owner: TBD
+- Owner: Codex for initial mechanical merge; runtime owners required for DeepEP/MoE/AITER follow-up.
 - Required validation:
   - DCU MoE smoke, exact command to be filled.
   - DSV4 smoke, exact command to be filled.
 - Notes:
-  - TBD
+  - Branch: `sync/official-main-C02-20260519`.
+  - Low/medium-risk conflicts were merged hunk-by-hunk.
+  - High-risk MoE/DeepEP/FP8 files were resolved DCU-first:
+    `ep_moe/layer.py`, `token_dispatcher/deepep.py`, and
+    `quantization/fp8.py`.
+  - Official C02 DeepEP dispatcher and EP MoE runner changes should be reviewed
+    as a dedicated task before relying on later upstream MoE behavior.
+  - Validation completed:
+    - precise conflict marker scan: passed.
+    - syntax compile for all conflicted Python files: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      212 DCU registered test files.
+  - Recommended manual validation:
+    - `dependency`: DCU install flow to confirm CUDA-only flashinfer cu13 deps
+      are not required by internal workflow.
+    - `jit-kernel`: DSV4 JIT smoke and deleted-header reference check in the
+      target build container.
+    - `attention`: DSV4 sparse prefill/topk, FlashMLA, NSA BF16 index-cache, and
+      NSA chunking smoke.
+    - `moe` / `deepep`: DeepEP normal dispatch and low-latency dispatch smoke,
+      including topk/dispatch/combine compatibility.
+    - `quantization` / `aiter`: FP8 MoE path, AITER/ASM shuffle path, and
+      quantized MoE smoke.
+    - `scheduler` / `model_executor`: split prefill and forward-batch init smoke.
+    - `model` / `deepseek-v4`: DeepSeek V4 startup, short request, and FP8 WO-A
+      GEMM path if the checkpoint is available.
+    - `speculative`: EAGLE/MTP smoke covering idle and prefill paths.
+    - `ci`: DCU registration, XPU marker coexistence, and PR workflow dry-run.
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
 
 ### C03 / `7cf193fe1faf`
 
 - Expected focus: cache, model, attention.
-- Owner: TBD
+- Owner: Codex for the initial merge; DCU attention, DeepSeek V4, cache, and
+  MoE owners are required for runtime validation.
 - Required validation:
+
   - Dense smoke.
   - Cache-related unit or smoke test, exact command to be filled.
-- Notes:
+- Recommended manual validation:
+
+  - `attention`: Qwen dense smoke and attention backend selection smoke.
+  - `mem_cache`: radix cache, SWA/hybrid cache, and retract/decode cache smoke.
+  - `model`: affected model startup and short request smoke.
+- Manual validation result:
+
   - TBD
+- Notes:
+
+  - Branch: `sync/official-main-C03-20260521`.
+  - Resolved 24 Git conflicts.
+  - Adopted the official NSA-to-DSA rename as the canonical structure. Old
+    `nsa/*` modules remain compatibility shims, while DCU indexer, TileLang,
+    Triton, and backend differences were three-way ported into `dsa/*`.
+  - Adopted the official DSV4 JIT split under `sglang.jit_kernel.dsv4`.
+    The old monolithic `deepseek_v4.py` and standalone `topk_1024.cuh` were
+    removed. DCU HIP compile guards were retained in `topk_v1.cuh`.
+  - Ported DCU code away from C03-removed `ForwardBatch.token_to_kv_pool` and
+    `ForwardBatch.attn_backend` fields to ForwardContext accessors.
+  - Kept `ep_moe/layer.py` DCU-first because it contains active DeepEP,
+    AITER, Marlin, and group-GEMM implementations. This remains a high-risk
+    follow-up rather than a completed upstream runner migration.
+  - Validation completed:
+
+    - no unmerged Git entries: passed.
+    - precise conflict marker scan: passed.
+    - targeted Python compile for conflict and ForwardContext fallout files:
+      passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      211 DCU registered test files.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - staged `git diff --check`: passed.
+    - `test/registered/unit/mem_cache/test_dsa_pool_host_unit.py`: not run to
+      assertions because the current host has no HIP GPU and `lightop`
+      initialization cannot determine `LIGHTOP_GPU_CUS`.
+  - Additional recommended manual validation:
+
+    - `attention` / `deepseek-v4`: DSA BF16/FP8 index-cache, sparse prefill,
+      chunking, DSV4 top-k 512/1024, compressor, and FlashMLA smoke.
+    - `mem_cache`: DSA host backup/restore, retract/resume, SWA translation,
+      and DCU page-size 64 smoke.
+    - `model`: Qwen dense, Qwen3.5 fused path, DeepSeek V2/V3.2, and DeepSeek V4
+      startup plus short request.
+    - `moe` / `deepep`: DeepEP normal and low-latency dispatch, AITER,
+      Marlin/group-GEMM, and quantized MoE smoke.
+    - `scheduler`: overlap scheduler plus EAGLE/MTP seq-len publication smoke.
+  - Manual validation result:
+
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
 
 ### C04 / `af8f66940e9b`
 
 - Expected focus: AMD DSV4 runtime and jit-kernel.
-- Owner: TBD
+- Owner: Codex for the mechanical merge; DCU DSV4, attention, model, and kernel
+  owners are required for runtime validation.
 - Required validation:
+
   - jit-kernel or sgl-kernel DCU smoke.
-- Notes:
+- Manual validation result:
+
   - TBD
+- Notes:
 
-### C05-C10
+  - Branch: `sync/official-main-C04-20260523`.
+  - Resolved 16 Git conflicts as one checkpoint; no checkpoint split was
+    required.
+  - Adopted official `kDLGPU`, HIP runtime fallback, context-parallel APIs,
+    common disaggregation types, scheduler flattening, and DSV4 sgl-kernel
+    registrations.
+  - Preserved DCU-first behavior for uint8-backed FP8 JIT output, HIP FP8 pack,
+    fused cache writes, DSA page-size-64/BF16/FP8 cache, LightOp top-k, fused
+    RMS/quant, and fused cos/sin caches.
+  - Non-conflict HIP semantic audit:
 
-- Expected focus: PD, scheduler, attention, mem_cache, embedding, workflows.
-- Owner: TBD
+    - `dsv4/attn.py` keeps the JIT fused-store path on DCU; Triton store is
+      limited to non-DCU HIP.
+    - `dsv4/moe.py` keeps the JIT hash top-k path on DCU; Triton hash top-k is
+      limited to non-DCU HIP.
+    - `dsv4/gemm.py` preserves DCU deep-gemm priority and FP32 AITER output;
+      official non-DCU HIP behavior remains unchanged.
+    - `dsa_indexer.py` preserves the DCU page-table-64 path for ragged prefill.
+    - `deepseek_v2.py` limits the official fused-clamp AITER path to non-DCU
+      HIP so DCU keeps the existing JIT elementwise path.
+    - `deepseek_v4.py` limits official fused QK norm/RoPE and gfx95 FP8 input
+      quantization to non-DCU HIP, while retaining DCU alt streams.
+    - `overlap_utils.py` adopts the official speculative data model but keeps
+      the native future-token resolver on DCU.
+    - `attention/dsv4/indexer.py` still routes DCU top-k to
+      `lightop_topk_transform_512`; the removed JIT shared-memory workaround was
+      not restored.
+  - Automated validation completed:
+
+    - no unmerged Git entries: passed.
+    - precise conflict marker scan: passed.
+    - staged `git diff --check`: passed.
+    - compile for every changed Python file: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      211 DCU registered test files.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - `AMDGPU_TARGET=gfx938 python3 setup_rocm.py --name`, run from
+      `sgl-kernel/`: passed; the new DSV4 top-k and norm/RoPE sources hipified
+      successfully.
+    - removed JIT cast-file reference scan: passed.
+    - official C04 commit object was repacked locally and remains readable
+      without an alternate object directory.
+  - Recommended manual validation:
+
+    - `jit-kernel` / `sgl-kernel`: DSV4 JIT build/import, FP8 elementwise,
+      wave64 helpers, LightOp top-k, compressor, and kernel smoke whitelist.
+    - `attention`: DSA BF16/FP8 index cache, sparse prefill, FlashMLA, MLA CP,
+      fused cache write, and graph cache invalidation.
+    - `model` / `deepseek-v4`: DeepSeek V2/V3 fused RMS/quant and DeepSeek V4
+      pure TP, CP+EP, DP+EP, MTP, FP8 WO-A, and CUDA graph capture.
+    - `disaggregation`: Mooncake transfer with the DCU FA KV layout.
+    - `scheduler` / `speculative`: overlap scheduler and speculative decode.
+    - `dependency`: DCU container install/build sanity and guarded TileLang import.
+  - Manual validation result:
+
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+
+### C05 / `8805f4cf1666`
+
+- Expected focus: PD/scheduler fail-fast, DSA top-k backend, DSV4 EPLB,
+  hybrid-cache dispatch, and registered-test directory split.
+- Owner: Codex for merge and static validation; DCU DSA/DSV4 owners for runtime.
 - Required validation:
-  - Stage-b small model smoke.
-  - Qwen2.5 dense server smoke.
-  - Qwen2.5-VL smoke.
+
+  - conflict marker scan, compile, and DCU registration.
+  - scheduler fail-fast and PD subprocess-exit behavior.
+  - DSA top-k backend CLI/env plus DCU LightOp route.
 - Notes:
-  - TBD
 
-### C11-C17
+  - Five conflicts were resolved as one checkpoint; no split was required.
+  - The new official `DSATopKBackend.SGL_KERNEL` keeps `fast_topk_v2` from
+    sgl-kernel, while DCU fused paged/ragged transforms route to LightOp.
+  - `ScheduleBatch.loc_tensor` and all existing DeepSeek-V4 `_is_dcu` kernel
+    paths remain present after the automatic merge.
+  - The official hybrid-cache strategy refactor was accepted unchanged; it
+    already contains dedicated DeepSeek-V4 FULL+SWA dispatch.
+  - Automated validation completed:
 
-- Expected focus: MLA EAGLE, spec naming, MoE, DeepEP, DeepSeek V4, AITER,
-  DeepGEMM, and model changes.
-- Owner: TBD
+    - no unmerged entries, marker scan, and `git diff --check`: passed.
+    - full `python/sglang` and registered-test compile: passed.
+    - DCU registration: passed with 211 registered files.
+    - existing DSA alias/CLI/env suite: 24 tests passed.
+    - C05 DSA top-k CLI/env defaults and DCU LightOp fused-route mock: passed.
+    - official metrics collector dependency-injection suite: 14 tests passed.
+    - diffusion merged env defaults: passed with isolated module loading.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls; C04 DSV4 sources remain in the build manifest.
+  - Runtime validation pending:
+
+    - hybrid-cache dispatch/radix unit collection is blocked locally by LightOp
+      and lmslim device initialization because no HIP device is available.
+    - scheduler/PD fail-fast, DSA kernels, DSV4 EPLB/hash top-k, pure-TP server,
+      and CUDA graph validation require a DCU runner.
+  - Recommended manual validation:
+
+    - `scheduler` / `PD`: scheduler exception, subprocess exit, overlap idle batch,
+      and disaggregation prefill/decode failure propagation.
+    - `attention`: DSA `sgl-kernel` backend with fused/unfused paged and ragged
+      top-k; confirm DCU uses LightOp only for fused transforms.
+    - `deepseek-v4` / `moe`: pure TP, MTP, graph capture, hash top-k, and EPLB
+      recording with EPLB both disabled and enabled.
+    - `mem_cache`: hybrid SWA/HiCache strategy selection, cache hit/retract, and
+      DeepSeek-V4 FULL+SWA pool construction.
+    - `test`: DCU registry after the official directory split.
+  - Manual validation result:
+
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+    - DCU EPLB recording enabled validation - ✅
+    - HiCache - ❓
+    - PD disaggregation validation - ✅
+
+### C06 / `0abe6a85a51f`
+
+- Expected focus: DSV4 compressor/FlashMLA/MTP, AITER and FP8 MoE,
+  DeepEP waterfill, overlap scheduling, unified radix cache, and HiCache.
+- Owner: Codex for merge and static validation; DCU attention, MoE, cache,
+  and speculative owners for runtime validation.
 - Required validation:
-  - Qwen3 MoE smoke.
-  - DeepEP small and large.
-  - DeepSeek V4 startup and short request.
-  - Nightly-dcu.
+  - conflict marker scan, Python compile, DCU registration, and HIP build metadata.
+  - DSV4 DCU-priority path audit for compressor, LightOp top-k, FlashMLA,
+    metadata copy, AITER/FP8, alternate streams, and draft attention backend.
+  - unified radix cache and HiCache targeted tests where the local environment
+    can import the DCU runtime.
 - Notes:
-  - TBD
+  - Fourteen conflicts were resolved as one checkpoint; no split was required.
+  - Official C06 was merged at exact SHA `0abe6a85a51f`; later official commits
+    are not included.
+  - Official generic HIP behavior is preserved for AMD ROCm, while `_is_dcu`
+    retains the existing external FlashMLA package, LightOp top-k, full DSV4
+    metadata copy, five alternate streams, and DCU AITER/FP8 paths.
+  - The automatically merged speculative draft backend was corrected so the
+    new HIP radix backend is selected only on non-DCU HIP.
+  - `ScheduleBatch.loc_tensor` remains device-resident and the C04 DSV4
+    sgl-kernel AOT sources remain in `setup_hip.py`.
+  - CUDA Graph runtime follow-up (2026-07-02):
+    - with graph disabled, startup and inference accuracy pass; with graph
+      enabled, a single request repeats an incorrect short phrase and a
+      multi-request GSM8K run faults after prefill enters graph decode.
+    - the VMFault queue identifies `per_token_quant_fp8_kernel`, downstream of
+      DSV4 attention output; the kernel implementation itself predates C06.
+    - root cause: official `3f5e2c7688` added an HIP-specific conservative
+      multi-stream path that overlaps only the core/indexer compressors. The C06
+      merge resolution changed its dispatch from `_is_hip` to
+      `_is_hip and not _is_dcu`, so DCU combined newly enabled fused WQA/WKV
+      with the old three-stream Q/KV/indexer path during graph capture.
+    - resolution: DCU now follows `_forward_prepare_multi_stream_hip()`.
+      Fused WQA/WKV, Q projection, KV cache write, and complete indexer work
+      remain on the main stream; only core and indexer compressor work runs on
+      auxiliary streams. Existing DCU LightOp, FP8, RoPE, and fused cache-write
+      branches remain unchanged.
+    - the temporary DCU guard in generic `can_cp_split()` was removed. The
+      reported DeepSeek-V4 launch uses DSA round-robin CP through
+      `can_dsa_cp_split()`, so that guard was not on the failing call path and
+      only disabled multi-request CP for other generic CP users.
+    - the old DCU three-stream topology is not restored. Revisit it only with
+      dedicated cross-stream lifetime and graph-replay validation.
+    - follow-up static validation passed: targeted Python compile,
+      `git diff --check`, DCU registration with 211 registered files, HIP helper
+      dispatch audit, and DCU LightOp/compressor priority-path audit.
+    - follow-up runtime validation remains pending on the target DCU node.
+  - Automated validation completed:
+    - no unmerged entries, precise marker scan, and `git diff --check`: passed.
+    - full `python/sglang` and registered-test syntax compile: passed.
+    - DCU registration: passed with 211 registered files.
+    - existing DSA alias/CLI/env suite: 24 tests passed.
+    - field-validator suite: 18 tests and 13 subtests passed.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls; DSV4 top-k and norm/RoPE sources remain present.
+    - targeted undefined-name audit found and fixed the merged `is_hip` import
+      in DSV4 metadata. Full-file ruff still reports inherited C05 lint debt.
+  - Runtime validation pending:
+    - unified-radix registry collection is blocked locally because LightOp
+      cannot initialize without a visible HIP device.
+    - model, kernel, HiCache, DeepEP, MTP, and graph tests require a DCU runner
+      and model weights.
+    - rerun the reported completion request with CUDA Graph enabled and verify
+      a coherent 128-token answer rather than a repeated phrase.
+    - run `bench_sglang.py --num-questions 10` and verify no VMFault; the log
+      should show multi-request prefill with `cuda graph: False` followed by
+      stable graph decode.
+  - Recommended manual validation:
+    - `deepseek-v4` / `attention`: pure TP, CP batch greater than one, CP+EP,
+      DP+EP+MTP, FlashMLA, compressor, sparse prefill, and CUDA graph capture.
+    - `moe` / `deepep` / `aiter`: DeepEP normal mode, waterfill disabled/enabled,
+      EPLB disabled/enabled, hash top-k, W8A8/W16A16, and graph replay.
+    - `quantization`: FP8 channel scale plus FP8/MXFP4 load and accuracy spot check.
+    - `mem_cache`: unified radix cache, HiCache, cache hit/retract, and Mooncake
+      or CPU-offload path when available.
+    - `scheduler` / `speculative`: overlap idle batch and MTP/EAGLE draft-target
+      KV-cache transfer with async NaN/OOB probes.
+    - `ci` / `test`: DCU and XPU registration plus suite partition generation.
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+    - HiCache - ❓
 
-### C18-C19
+### C07 / `a5e6a8887a94`
 
-- Expected focus: MTP rejection sampling and XPU import guard.
-- Owner: TBD
+- Expected focus: attention graph unification, ForwardBatch grouping, custom
+  allreduce V2 dispatch, DeepSeek-V4 MHC/DeepGEMM, and test registration moves.
+- Owner: Codex for merge and static validation; DCU attention, DSV4, AITER,
+  speculative, and CI owners for runtime validation.
 - Required validation:
-  - Daily sync smoke gate.
+  - conflict marker scan, Python compile, DCU registration, and HIP build metadata.
+  - custom-allreduce signature/call-site audit and DSV4 DCU-priority path audit.
+  - CUDA graph replay through `bs=128`, single-request accuracy, and GSM8K 10.
 - Notes:
-  - TBD
+  - Branch: `sync/official-main-C07-20260529`.
+  - Git reported 18 textual conflicts. The planned modify/delete conflict for
+    GPT-OSS was automatically recognized as a rename to
+    `test_gpt_oss_4gpu_mxfp4.py`; it is recorded as a semantic audit rather
+    than an artificial nineteenth conflict.
+  - Official C07 unified Triton capture/replay helpers are the canonical
+    structure. DCU retains CPU seq-lens publication for the Triton backend,
+    SWA full-to-window location translation, cache invalidation, variable MTP
+    draft lengths, and sliding-window offsets.
+  - The DSV4 backend continues to inherit `needs_cpu_seq_lens=True`; it does
+    not enter Triton's non-DCU GPU-only seq-lens path.
+  - DeepSeek-V4 keeps the C06 conservative HIP multistream topology: only core
+    and indexer compressor work uses auxiliary streams. DCU retains the
+    `deepgemm` package path; non-DCU uses the official DeepGEMM wrapper.
+  - Runtime follow-up aligned DCU with official `eae03ce3b`: model-specific MHC
+    prewarm and its `ModelRunner` hook were removed. This also fixes decode
+    startup with a NextN draft model, whose wrapper does not expose the removed
+    prewarm API. Target-node runtime validation passed.
+  - GPT-OSS DCU nightly placeholder registration now follows both official
+    split files: BF16 and MXFP4. Both remain disabled pending BW1100 validation.
+  - Non-conflict semantic audit:
+    - official DSV4 graph metadata copy/replay structure and page-size 64 are
+      retained; DSV4 remains CPU-seq-lens aware.
+    - official HIP `Event.synchronize()` TPOT workaround is accepted while the
+      DCU native future-token resolver remains present.
+    - MXFP4 AITER shuffle imports stay restricted to non-DCU HIP; gfx938 DCU
+      does not enter the gfx95 shuffle path.
+    - all DCU per-commit and nightly suite mappings remain in `test/run_suite.py`.
+  - Automated validation completed:
+    - no unmerged entries and precise conflict marker scan: passed.
+    - staged `git diff --check`: passed after normalizing the official
+      `pr-test-npu.yml` CRLF line endings; workflow content is unchanged.
+    - syntax compile for every C07 changed Python file: passed.
+    - targeted undefined-name/unused-import ruff gate for conflict and semantic
+      audit files: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed, collected
+      212 DCU registered test files. Both GPT-OSS BF16 and MXFP4 registrations
+      appear in `nightly-dcu-4-gpu`.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - custom-allreduce AST signature check: passed with exactly
+      `(group, device)`; the sole framework call site passes both arguments.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`, run from
+      `sgl-kernel/`: passed with zero unsupported CUDA calls.
+    - source audit confirmed the DCU safe HIP multistream dispatch, `deepgemm`,
+      LightOp top-k, DCU-only model warmup, and Triton CPU seq-lens contract.
+    - conflict-related CPU unit collections were attempted but blocked before
+      assertions: this host has no HIP device, so installed `lightop` obtains
+      no CU count from `rocminfo` and raises while assigning
+      `LIGHTOP_GPU_CUS=None`.
+    - DCU model, graph, custom-allreduce, and kernel runtime validation remains
+      pending on the target runner.
+  - Recommended manual validation:
+    - `deepseek-v4` / `attention`: graph capture through `bs=128`, three
+      repeated short requests, GSM8K 10, pure TP, CP+EP, DP+EP+MTP, FlashMLA,
+      compressor, and confirmation that no model-specific MHC prewarm runs.
+    - `speculative` / `mem_cache`: Triton target verify, EAGLE/MTP draft graph,
+      SWA/hybrid-cache location translation, and cache invalidation.
+    - `aiter`: custom-allreduce eager and graph replay, deterministic mode,
+      and the graph registration workaround.
+    - `jit-kernel`: representative gfx938 DSV4 JIT compile and FP8 target flags.
+    - `model`: Qwen2.5 dense, VLM, embedding, and reranker smoke.
+    - `ci` / `test`: stage-a plus available stage-b DCU CI and split GPT-OSS
+      registration generation.
+  - Manual validation result:
+    - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112 validation - ✅
+    - CI test - ✅
+    - HiCache - ❓
 
+### C08 / `373cadc92ea4`
+
+- Expected focus: KV-canary, allocator package split, deferred prefill H2D,
+  EAGLE/NextN, DeepSeek-V4 fused MHC, Mooncake, and CI utilities.
+- Owner: Codex for merge and static validation; DCU scheduler, speculative,
+  DeepEP, DSV4, and Mooncake owners for runtime validation.
+- Required validation:
+  - conflict marker scan, changed-Python compile, targeted ruff, DCU
+    registration, and `gfx938` HIP build metadata.
+  - FutureMap/deferred-H2D prefill, decode, mixed batch, overlap, and graph.
+  - DeepSeek-V4 and NextN/MTP with DCU MHC and cache-location paths.
+  - Mooncake intra-node custom pool and HiCache double-tag regression.
+- Notes:
+  - Branch: `sync/official-main-C08-20260531`.
+  - C08 contains 57 commits but touches 275 files because it introduces the
+    KV-canary subsystem. Git reported eight textual conflicts; checkpoint
+    splitting was not required.
+  - The official FutureMap/deferred-H2D scheduler structure is retained. DCU
+    keeps native clamp-position and disables compiled debug assertions.
+  - The official fused MHC post-pre implementation is retained for non-DCU.
+    It is gated off on DCU so existing AITER MHC pre/post remains authoritative;
+    unused prewarm methods reintroduced by the upstream commit were removed.
+  - EAGLE has one cache-location helper. Its `_is_dcu` branch uses
+    `dcu_assign_extend_cache_locs`; CUDA, generic HIP, MUSA, and NPU retain the
+    official implementations.
+  - The allocator module-to-package split keeps existing imports compatible
+    through `mem_cache/allocator/__init__.py`.
+  - KV-canary is accepted with its default `none` mode. Enabling it on DCU is
+    experimental and requires dedicated kernel/graph validation.
+  - Automated validation completed:
+    - no unmerged entries, precise marker scan, and `git diff --check`: passed.
+    - syntax compile for every C08 changed Python file: passed.
+    - targeted `E9/F401/F811/F821` ruff gate for conflict files: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+      registered files.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls.
+    - PhaseChecker tests: 29 passed; 32 require a HIP device and failed because
+      this host reports no HIP GPU.
+    - ServerArgs tests: 48 passed; 8 were blocked when installed `lightop`
+      received no CU count from the device-less host.
+    - unified-radix-cache test collection was blocked by the same no-device
+      `lightop` initialization.
+- Recommended manual validation:
+  - `scheduler`: overlap on/off, chunked prefill, mixed prefill/decode, PD
+    prefill/decode, CUDA graph to bs=128, and repeated short requests.
+  - `deepseek-v4` / `speculative`: pure TP, CP+EP, DP+EP+MTP112, NextN top-k
+    reuse, EAGLE draft/verify graph, GSM8K 10, and no model prewarm log.
+  - `deepep`: normal and low-latency BF16/FP8 dispatch, group-GEMM, eager, and graph.
+  - `mem_cache` / `kv-canary`: allocator compatibility, radix/HiCache, default-off
+    startup, then opt-in token-oracle and real-KV checks on a dedicated runner.
+  - `mooncake`: intra-node custom memory pool plus HiCache existence checks for
+    KV-only and hybrid page components.
+  - `jit-kernel`: large-tensor add-constant and KV-canary JIT compile on gfx938.
+- Manual validation result:
+  - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - CI test - ✅
+
+### C09 / `c55548ba115c`
+
+- Expected focus: three-method attention metadata lifecycle, DSV4 FP4/SM120,
+  FlashAttention metadata kernel centralization, EAGLE test/helper refactor,
+  PD HiCache transfer, embedding replication, and mem-cache changes.
+- Owner: Codex for merge and static validation; DCU DSV4, speculative, PD,
+  HiCache, PP, and dependency owners for runtime validation.
+- Required validation:
+  - precise conflict-marker scan, changed-Python compile, targeted ruff, DCU
+    registration, DSA alias/CLI/env tests, and `gfx938` HIP build metadata.
+  - DSV4 pure TP, CP+EP, DP+EP+MTP, PD prefill/decode, sparse prefill, LightOp
+    top-k, FlashMLA, and CUDA graph capture/replay through `bs=128`.
+  - EAGLE/MTP cache-location operators and their Triton fallbacks with page
+    sizes 1 and 64, overlap on/off, retract/abort, and graph replay.
+  - HiCache optimistic prefetch/incremental transfer, dense/VLM attention,
+    embedding/reranker, and PP hidden-state transfer.
+- Notes:
+  - Branch: `sync/official-main-C09-20260602`.
+  - C09 contains 103 official commits and reported seven textual conflicts
+    plus three modify/delete test conflicts; checkpoint splitting was not
+    required.
+  - Official attention metadata kernels now live in
+    `layers/attention/triton_ops/metadata.py`. The DCU FA layout and SWA
+    location translation remain in the backend; `cu_seqlens_q` is retained
+    because the DCU varlen/decode paths still consume it.
+  - Runtime audit restored the DCU LightOp implementation of
+    `normal_decode_set_metadata` in the centralized metadata module. This was a
+    real C09 migration omission, but the failing DeepSeek-V4 runs use the DSV4
+    backend, so it does not explain their decode corruption.
+  - DeepSeek-V4 uses official `init_forward_metadata_out_graph()` plus
+    `init_forward_metadata_in_graph()`. Raw metadata is upgraded in-graph;
+    the removed `_maybe_upgrade_forward_metadata()` hook is not restored.
+  - DCU keeps the external FlashMLA adapter, split prefill/decode behavior,
+    sparse-prefill workspace, LightOp KV quantization, and LightOp top-k.
+    SM120 and other non-DCU platforms use the official C09 implementations.
+  - Official FP4 indexer support is accepted but remains guarded by the
+    existing SM100 server-argument check, so gfx938 DCU stays on FP8.
+  - EAGLE cache-location kernels are centralized in
+    `speculative/triton_ops/cache_locs.py`; both DCU kvcache operators and
+    their `SGLANG_ASSIGN_*` fallback switches moved into that module.
+  - The old EAGLE A/B/Beta files are removed upstream. Their DCU disabled
+    registrations are preserved in the new core, page-size, and top-k suites.
+  - `flash-attn-4` is accepted. The internal `sgl-deep-gemm==0.1.0` pin is
+    retained pending a DCU package upgrade/compatibility decision for 0.1.2.
+  - Runtime accuracy follow-up: standalone CP+EP and PD decode both produce a
+    correct first token followed by corrupted CUDA Graph decode output. This
+    excludes PD transfer and EAGLE as necessary causes and points to DSV4 KV
+    write locations during graph replay.
+  - Official C10 commit `c9ca56da8c` fixes this exact lifetime problem by
+    recording full-to-SWA translation in `init_forward_metadata_in_graph()` and
+    removing the pool-level cross-forward cache. Its DSV4 changes were
+    backported while retaining DCU external FlashMLA, LightOp quant/store,
+    fused norm/RoPE/cache-write, and conservative HIP multi-stream paths.
+  - Direct C10 merge was rejected for this runtime fix: C10 contains 115
+    commits and 364 changed files, while merge-tree reports roughly 60
+    dual-modified conflicts. C09 accuracy must pass before C10 integration.
+  - Automated validation completed:
+    - no unmerged entries, precise marker scan, and `git diff --check`: passed.
+    - full `python/sglang` and registered-test syntax compile: passed.
+    - targeted `E9/F401/F811/F821/F841` ruff gate: passed.
+    - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+      registered files; the new EAGLE core/page/top-k placeholders are present.
+    - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+      passed, 24 tests.
+    - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+      unsupported CUDA calls and 50 converted kernel launches.
+    - AST dispatch check confirmed both centralized DCU cache-location calls
+      and their Triton fallback branches.
+    - the EAGLE top-k=1 fast-path unit test was attempted but blocked during
+      collection because this host has no HIP device; installed `lightop`
+      receives `LIGHTOP_GPU_CUS=None`. No test assertion was reached.
+    - DCU model, graph, PD, HiCache, EAGLE, and kernel runtime validation remains
+      pending on the target runner.
+    - SWA-loc backport validation: changed-file `py_compile`, targeted ruff,
+      `git diff --check`, and DCU registration with 212 files passed. Runtime
+      graph replay remains pending on a DCU node.
+- Recommended manual validation:
+  - `deepseek-v4` / `attention`: pure TP, CP+EP, DP+EP+MTP112, PD prefill and
+    decode, split FlashMLA prefill/decode, sparse prefill, CUDA graph to
+    `bs=128`, three repeated requests, and GSM8K 10.
+  - `speculative`: EAGLE3/MTP eager and graph, page-size 1/64, cache-location
+    operator enabled/disabled, overlap on/off, abort/retract, and logprob parity.
+  - `mem_cache` / `disaggregation`: HiCache optimistic prefetch, incremental
+    transfer, radix reuse/eviction, and Mooncake/NIXL paths used internally.
+  - `model_executor`: DeepSeek-V4 PP hidden-state shape and PD startup.
+  - `model`: Qwen2.5 dense/VLM, embedding, reranker, and replicated embedding.
+  - `dependency`: DCU install/resolver and import checks with FlashAttention 4
+    present or intentionally omitted by the internal image.
+- Manual validation result:
+  - DCU DeepSeek-V4 CP+EP/DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - SGLANG_USE_AITER_AG=0 to ensure accuracy ✅ （temporarily disable it）
+  - CI test - ✅
+
+### C10 / `47377525cb32`
+
+- Branch: `sync/official-main-C10-20260604`.
+- Base: `sync/official-main-bootstrap@f02dd9d1d`.
+- Exact official checkpoint: `47377525cb32c21c72949e52804b49ea17ba0c66`.
+- Scope: 115 official commits; 23 merge conflicts, kept as one checkpoint.
+- Owner: Codex for merge/static validation; DCU runtime owners remain required.
+- Resolution summary:
+  - Official CudaGraphBufferRegistry, per-forward SWA translation lifecycle,
+    DSV4 sparse-prefill/dequant fixes, and moved SWA allocator are the new
+    structure.
+  - DCU continues to prefer LightOp TopK/cache stores, external FlashMLA,
+    gfx938 JIT flags, CPU sequence-length metadata, and the validated AITER
+    W8A8/native MoE runners.
+  - C10's AITER optional kwargs/no-combine support is enabled only after the
+    DCU dispatch returns. The earlier official DeepEP/Mori AITER runner-core
+    migration remains a separate tracked task and is not silently enabled here.
+  - The SWA allocator relocation retains the internal duplicate/free-page
+    protection in `mem_cache/allocator/swa.py`.
+  - Automatic HIP semantic audit found and fixed an import hazard in
+    `quark_w4a4_mxfp4_moe.py`: online gfx95 MXFP4 quantization is now guarded by
+    `_is_hip and not _is_dcu`, matching the dense Quark scheme.
+  - Backported `6a4ffcc34a` (`Make Cohere2MoeConfig a dataclass`) from an
+    official maintenance branch. Without it, the C10 config blocks
+    `server_args` import with current `huggingface_hub` strict dataclasses.
+  - Targeted lint found and fixed two additional merge defects: diffusion
+    FlashAttention had a duplicated function import and missing forward-context
+    import; Triton graph metadata referenced `seq_lens_cpu` without carrying it
+    through the helper signature. The latter retains the DCU no-GPU-scalar-sync
+    path for sliding-window graph replay.
+  - `SGLANG_USE_AITER_AG=0` remains the current DCU accuracy workaround. C10's
+    test-only upstream AITER AG workaround does not prove the runtime operator
+    correct; re-enable only after the dedicated graph reproducer passes.
+- Required validation:
+  - `graph-registry`: capture/replay across `bs=1..128`, padding transitions,
+    prefill graph, DP attention, PP proxy tensors, MHC hidden states, MTP/EAGLE,
+    and graph-on/off output parity.
+  - `deepseek-v4`: pure TP, CP+EP, DP+EP+MTP, PD prefill/decode, sparse prefill,
+    split FlashMLA, C4/C128 compressor, LightOp TopK, and GSM8K accuracy.
+  - `mem-cache`: SWA allocation/free/reuse, radix eviction, duplicate frees,
+    HiCache load-back, Mooncake/NIXL PD transfer, and page-size 64 mapping.
+  - `aiter`: W8A8 INT8/FP8 and native MoE eager/graph; AITER MLA page-size > 1;
+    custom AG must stay disabled for service validation and be tested separately
+    with `test/manual/test_aiter_custom_ag_graph.py`.
+  - `attention`: Qwen2.5 dense/VLM, Triton SWA, FlashAttention metadata,
+    embedding/reranker, target verify, and speculative replay.
+  - `jit-kernel`: gfx938 source-hash cache invalidation, FP8 compiler flags,
+    DSV4 compressor/dequant numerical comparison, and sgl-kernel smoke.
+  - `quantization`: DCU import/load smoke for existing formats; confirm online
+    MXFP4 remains rejected cleanly on gfx938 rather than failing at import.
+  - `ci`: DCU registration, stage-a, available stage-b suites, and install flow.
+- Automated validation result:
+  - no unmerged entries, precise conflict-marker scan, and `git diff --check`:
+    passed.
+  - `python3 -m compileall -q python/sglang test/registered`: passed.
+  - targeted `E9/F401/F811/F821/F841` ruff gate for all C10 conflict and DCU
+    semantic-fix files: passed. A whole-tree run is not used as a gate because
+    the checkpoint contains unrelated existing lint debt.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+    registered test files.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+    passed, 24 tests, after the Cohere config compatibility backport.
+  - CudaGraphBufferRegistry and AITER runner focused CPU tests: 38 passed.
+  - SWA allocator focused test: blocked during collection because this host has
+    no HIP device and installed LightOp receives `LIGHTOP_GPU_CUS=None`; no SWA
+    assertion executed.
+  - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+    unsupported CUDA calls and 50 converted kernel launches.
+  - DCU service, graph, accuracy, PD, HiCache, AITER and kernel runtime tests
+    remain pending on the target runner.
+- Manual validation result:
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
+
+### C11-C13 / `125ef888921b`
+
+- Branch: `sync/official-main-C11-C13-20260610`.
+- Base: `sync/official-main-bootstrap@4bb5b6558`.
+- Exact checkpoints: C11 `5160f7914ebf`, C12 `3fe6bc390bdc`, and C13
+  `125ef888921bdd657022c4b2f6a264ac86714b38`.
+- Scope: 262 official commits and 34 merge conflicts. The checkpoints were
+  intentionally grouped under the updated larger-step workflow.
+- Resolution summary:
+  - Official phase-aware graph runners, TC piecewise APIs, speculative worker
+    v2, SWA write-location metadata, vectorized KV layout and test moves form
+    the new structure.
+  - DCU retains external FlashMLA, DCU FA layout, LightOp metadata/top-k/cache
+    store, BF16/FP8 DSA index cache, SlimQuant, DeepEP/AITER helpers and gfx938
+    JIT flags through explicit `_is_dcu` paths.
+  - Official CUDA DeepGEMM native target-verify layout and PDL optimizations are
+    accepted where they do not replace DCU paths. They are not DCU functional
+    gates in this checkpoint.
+  - Accuracy, throughput, graph replay and large-batch stability are recorded
+    as follow-up observations, not merge blockers for the larger-step phase.
+- Required functional validation:
+  - static import/compile, conflict-marker and DCU registration checks.
+  - DeepSeek-V4 service starts successfully on a DCU runner.
+  - one short completion request returns normally; content accuracy is not a
+    checkpoint gate.
+  - when available, one dense or MoE model startup/request smoke confirms the
+    generic attention/MoE path is not import-broken.
+- Recommended non-blocking validation:
+  - graph capture/replay, MTP/EAGLE, PD prefill/decode, DeepEP normal/low
+    latency, FlashMLA, DSA, quantized formats and sgl-kernel smoke.
+  - accuracy and performance measurements should be attached as observations
+    and tracked separately when they fail.
+- Automated validation result:
+  - no unmerged entries, precise conflict-marker scan and `git diff --check`:
+    passed.
+  - `python3 -m compileall -q python/sglang test/registered`: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+    registered test files.
+  - DSA alias/CLI/env manual test: 19 tests passed.
+  - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+    unsupported CUDA calls and 50 converted kernel launches.
+  - targeted undefined-name audit found one new merge issue in
+    `overlap_utils.py` (`Optional` import), which was fixed. Remaining findings
+    reproduce on the C10 base and are tracked as pre-existing DCU lint debt.
+  - `ServerArgs` import smoke passed. This shell reports no HIP GPU and has no
+    Docker CLI, so a real service process cannot be launched here.
+- Manual validation result:
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
+
+### C14-C16 / `2ad00faae1f4`
+
+- Branch: `sync/official-main-C14-C16-20260616`.
+- Base: `sync/official-main-bootstrap@e75c585867`.
+- Exact checkpoints:
+  - C14 `fda7955890978801727a388d05c14c301f4f7286` (109 commits after C13).
+  - C15 `000fc975c7b312ae03f046199e117abbfb7f5b40` (70 commits after C14).
+  - C16 `2ad00faae1f4f413330fbc1241dc2c79f44ac4d4` (92 commits after C15).
+- Scope: 271 official commits, 896 changed files, and 24 textual conflicts; the
+  group stays below the 50-conflict split threshold.
+- Resolution summary:
+  - Official Spec-V2-only Eagle/DFLASH structures, Mori/DeepEP AITER contracts,
+    page-aware SWA release, MHC prewarm state, and new JIT/HiCache interfaces
+    form the canonical structure.
+  - DCU retains explicit LightOp DSA/cache/top-k, external FA/FlashMLA layout,
+    AITER TileLang MHC, native/ASM FP8 MoE, duplicate-safe SWA release, fused
+    speculative gather, and gfx938 behavior.
+  - `SGLANG_USE_AITER_AG=0` remains the service workaround; AITER allreduce is
+    not disabled.
+  - The conflict in `flashattention_backend.py` kept the validated DCU FA
+    execution body. Official non-DCU `fa_skip_kv_cache` execution parity is a
+    named follow-up and is not claimed as validated by the DCU gate.
+- Automated validation result:
+  - no unmerged entries, conflict-file Python compile, and `git diff --check`:
+    passed.
+  - `python3 -m compileall -q python/sglang test/registered`: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+    registered test files.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+    passed, 19 tests.
+  - `AMDGPU_TARGET=gfx938 python3 setup_hip.py --name`: passed with zero
+    unsupported CUDA calls and 50 converted kernel launches.
+  - current-workspace path check resolved `sglang.__file__` to this repository;
+    imports for all 19 conflict runtime modules passed.
+  - focused ServerArgs test first found the stale post-init call to the removed
+    `_handle_speculative_decoding()` method. It was ported to the official
+    `arg_groups.speculative_hook.handle_speculative_decoding(self)` API and the
+    focused test then passed.
+  - targeted Ruff is blocked: Ruff/Pyflakes/Flake8 are absent in the container,
+    and `pip install ruff` could not reach the package index. This is not
+    recorded as passed; compile, imports and focused tests are the available
+    evidence.
+- Required functional validation:
+  - verify the imported `sglang` path resolves to this workspace;
+  - start the target DeepSeek-V4 service on DCU;
+  - complete one short inference request successfully.
+- Non-blocking observations:
+  - DFlash/Spec-V2 graph, MTP/EAGLE, DeepEP fabric mode, HiCache write-back,
+    output accuracy, throughput, graph performance, and topology expansion.
+- Manual validation result:
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
+
+### C17-C19 / `62b3c8e17781`
+
+- Branch: `sync/official-main-C17-C19-20260622`.
+- Base: `sync/official-main-bootstrap@3fe07af4554c`.
+- Exact checkpoints:
+  - C17 `62ab09a47886c05a664113c7f080a913b20a2924` (107 commits after C16).
+  - C18 `f42ec350b431d0305d34d6c70ea45fdfcd29dcad` (64 commits after C17).
+  - C19 `62b3c8e17781f9f64653f9bc5b0cb12689ba3ecb` (38 commits after C18).
+- Scope: 209 official commits, 694 changed files, and 26 textual conflicts; the
+  group stays below the 50-conflict split threshold. The prior placeholder was
+  named C18-C19, but merging the C19 endpoint from the live C16 bootstrap also
+  includes C17, so this ledger records the actual C17-C19 integration unit.
+- Resolution summary:
+  - Official C19 remains canonical for dependency manifests, NPU/XPU import
+    guards, Spec/MTP rejection-sampling structure, CP-v2 attention hooks,
+    staged cache/H2D changes, and the new runner/base-runner helper locations.
+  - DCU behavior is preserved through explicit `_is_dcu` or DCU-only imports for
+    FlashMLA, FlashAttention KV layout, LightOp compressor/top-k/quant/cache,
+    AITER TileLang MHC, W16A16/Marlin/FP8 MoE paths, DSA token-pool access, and
+    `dcu_get_last_loc` cache-location helpers.
+  - Generic HIP paths that are known to conflict with DCU are guarded as
+    `_is_hip and not _is_dcu`, notably DSV4 backend selection, compressor AITER
+    usage, and draft/prefill backend dispatch.
+  - `model_runner.py` retains the current DCU warmup/autotune/dummy-run logic
+    and ports its imports to the C19 `runner.base_runner`/forward-batch APIs.
+  - `deepseek_v2.py` uses the official `deepseek_common.utils` platform state as
+    authoritative, while adding the helper imports required by retained DCU
+    inline MHA/MLA paths.
+  - Test registry conflicts preserve DCU disabled placeholders and absorb
+    official AMD registration imports.
+- Automated validation result:
+  - `git ls-files -u | wc -l`: `0`.
+  - precise conflict-marker scan with `grep -RInE "^(<<<<<<< |=======$|>>>>>>> )" python test docs/internal`: no output.
+  - `git diff --check`: passed.
+  - `python3 -m compileall -q python/sglang test/registered`: passed.
+  - targeted Ruff `E9/F401/F811/F821/F841` for all conflict files: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU
+    registered test files; it retains the existing warning that
+    `test/registered/cpu/utils.py` has no CI registry.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`:
+    passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`:
+    passed with zero unsupported CUDA calls, 50 replaced kernel launches, and
+    package name `sglang-kernel`.
+  - `PYTHONPATH=python` import smoke for 20 conflict runtime modules: passed.
+- Required functional validation:
+  - verify the imported `sglang` path resolves to this workspace;
+  - start the target DeepSeek-V4 service on DCU;
+  - complete one short inference request successfully.
+- Non-blocking observations:
+  - MTP rejection sampling, EAGLE/FR-Spec graph replay, draft-weight memory
+    accounting, HiCache writing-check/SWA sizing, DP MoE reduce-scatter,
+    compressed MoE accuracy, graph performance, throughput, and full topology
+    expansion.
+- Manual validation result:
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
+
+
+### Main bootstrap landing / `dcu-main-bootstrap-C01-C19-main-20260709`
+
+- Branch: `main`.
+- Source branch: `sync/official-main-bootstrap@a5088379e6c886b42cbc95ab9609afabf52830a0`.
+- Target base: `origin/main@3ed3bcc06c8e13c80c2cb0f78686bc226cf9c3ee`.
+- Scope: land the completed C01-C19 bootstrap into internal `main`; code merged
+  without textual conflicts.
+- Textual conflicts:
+  - `docs/internal/dcu-main-conflict-ledger.md` (`add/add`): resolved with the
+    bootstrap-side ledger because it contains the complete C01-C19 conflict and
+    validation history; the `origin/main` side was only the initial skeleton.
+  - `docs/internal/dcu-main-migration-plan.md` (`add/add`): resolved with the
+    bootstrap-side plan, then updated for the post-bootstrap workflow requested
+    on 2026-07-09: continue official catch-up on `main`, enter daily sync only
+    after reaching current official `main`, then forward-port `v0.5.12_dev` in
+    small batches until only `main` remains maintained.
+- Validation result:
+  - `git ls-files -u | wc -l`: `0` after staging the two resolved documentation
+    conflicts.
+  - Precise conflict-marker scan on the two resolved docs and whitespace-touched
+    files: no output.
+  - `git diff --check` and `git diff --cached --check`: passed after normalizing
+    upstream CRLF/trailing whitespace in `.github/workflows/pr-test-npu.yml` and
+    one space-before-tab instance in `docs_new/docs/advanced_features/pd_disaggregation.mdx`.

@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
 from sglang.srt.utils import get_bool_env_var, direct_register_custom_op
 
@@ -730,7 +731,7 @@ class DCUMLABackend(AttentionBackend):
         if k is not None:
             if k_rope is not None:  # cat in save kv cache; when enable fused rmsnorm_rope, skip this cat
                 if save_kv_cache and not _use_fused_rmsnorm_rope:
-                    forward_batch.token_to_kv_pool.set_kv_buffer_opt(
+                    get_token_to_kv_pool().set_kv_buffer_opt(
                         layer,
                         cache_loc,
                         k,
@@ -739,7 +740,7 @@ class DCUMLABackend(AttentionBackend):
             else:
                 assert v is not None
                 if save_kv_cache and not _use_fused_rmsnorm_rope:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    get_token_to_kv_pool().set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -747,7 +748,7 @@ class DCUMLABackend(AttentionBackend):
                     )
 
         bs = forward_batch.batch_size
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = get_token_to_kv_pool().get_key_buffer(layer.layer_id)
         num_draft_tokens = self.num_draft_tokens if self.num_draft_tokens is not None else 0
         if num_draft_tokens == 0:
             cache_seqlens = forward_batch.seq_lens.to(torch.int32)
@@ -811,7 +812,7 @@ class DCUMLABackend(AttentionBackend):
         if k is not None:
             if k_rope is not None:  # mla maybe better
                 if save_kv_cache and not _use_fused_rmsnorm_rope:  # TODO: handwrite kernel, maybe triton is enough
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    get_token_to_kv_pool().set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -820,7 +821,7 @@ class DCUMLABackend(AttentionBackend):
             else:
                 assert v is not None
                 if save_kv_cache and not _use_fused_rmsnorm_rope:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    get_token_to_kv_pool().set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -828,7 +829,7 @@ class DCUMLABackend(AttentionBackend):
                     )
 
         bs = forward_batch.batch_size
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = get_token_to_kv_pool().get_key_buffer(layer.layer_id)
         # 入图+去除非mtp的冗余操作
         num_draft_tokens = self.num_draft_tokens if self.num_draft_tokens is not None else 0
         if num_draft_tokens == 0:

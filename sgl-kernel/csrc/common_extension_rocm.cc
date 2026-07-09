@@ -55,18 +55,36 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
-
   /*
    * From csrc/attention
    */
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
-    m.def(
+  m.def(
       "normal_decode_metadata_general(Tensor seq_lens, Tensor req_to_token, Tensor req_pool_indices, "
       "Tensor! cache_seqlens_int32, Tensor! cu_seqlens_k, Tensor! page_table, Tensor? swa_page_table, "
       "Tensor? full_to_swa_mapping, int max_seq_pages, int page_size, int seq_len_delta, bool use_swa) -> ()");
   m.impl("normal_decode_metadata_general", torch::kCUDA, &normal_decode_metadata_general);
-  
+
+  m.def(
+      "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
+      "page_indices, int page_size, Tensor!? raw_indices) -> ()");
+  m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
+
+  m.def(
+      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
+  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
+
+  m.def(
+      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
+      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
+  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
+
+  m.def(
+      "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
+      "Tensor! weights_out, float weight_scale, Tensor freqs_cis, Tensor positions) -> ()");
+  m.impl("dsv4_fused_q_indexer_rope_hadamard_quant", torch::kCUDA, &dsv4_fused_q_indexer_rope_hadamard_quant);
+
   /*
    * From csrc/allreduce
    */

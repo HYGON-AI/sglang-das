@@ -8,7 +8,7 @@ register_dcu_ci(
 )
 
 
-register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py

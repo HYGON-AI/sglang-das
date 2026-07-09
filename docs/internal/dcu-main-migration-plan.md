@@ -3,8 +3,8 @@
 Analysis date: 2026-06-22 UTC
 
 This document is the operating plan for creating an internal `main` branch from
-`v0.5.12_dev` and incrementally merging the upstream SGLang community `main`
-branch into it.
+`v0.5.12_dev`, landing the C01-C19 official bootstrap, then continuing official
+`main` catch-up on internal `main` before broad stable-branch forward-ports.
 
 ## 1. Current Snapshot
 
@@ -21,22 +21,46 @@ Key facts:
 - About 309 files are touched by both sides, so the first bootstrap will have real conflict pressure.
 - The chosen strategy is to create internal `main` from `v0.5.12_dev`, then merge official `main` by checkpoints.
 
+
+### 1.1 Post-Bootstrap Workflow Update (2026-07-09 CST)
+
+C01-C19 bootstrap is complete and is being landed into internal `main`. Because
+`v0.5.12_dev` has continued to move quickly, the post-bootstrap order is now:
+
+1. Merge `sync/official-main-bootstrap` into `main` and tag the landing point.
+2. Continue syncing newer official SGLang `main` commits on top of internal
+   `main` using `sync/official-main-catchup-YYYYMMDD` branches until internal
+   `main` reaches the current official upstream head.
+3. Once the lag is under the daily-sync threshold, switch to the normal
+   `sync/official-main-daily-YYYYMMDD` workflow.
+4. Only after official catch-up is stable, progressively forward-port still
+   relevant `v0.5.12_dev` changes into `main` in separate, reviewable commits or
+   PRs.
+5. Retire `v0.5.12_dev` once its required changes are forward-ported and the
+   project is ready to maintain only `main`.
+
+This replaces the earlier every-one-or-two-days forward-port cadence during the
+bootstrap period. Emergency production fixes may still land on `v0.5.12_dev`,
+but broad forward-porting is intentionally delayed until official `main` catch-up
+is complete.
+
 ## 2. Branch Strategy
 
 Target branches:
 
 - `v0.5.12_dev`: stable delivery branch. It continues to receive current business fixes.
-- `main`: future internal trunk, initially created from `v0.5.12_dev`.
-- `sync/official-main-bootstrap`: long-lived bootstrap integration branch.
-- `sync/official-main-Cxx-*`: short-lived branch for each official checkpoint.
-- `sync/official-main-daily-YYYYMMDD`: daily sync branch after bootstrap catches up.
+- `main`: internal trunk after the C01-C19 bootstrap lands. Official catch-up and future architecture work target this branch first.
+- `sync/official-main-bootstrap`: completed C01-C19 bootstrap integration branch; keep it as historical evidence.
+- `sync/official-main-Cxx-*`: historical short-lived branch for each bootstrap checkpoint or checkpoint group.
+- `sync/official-main-catchup-YYYYMMDD`: temporary branch for post-bootstrap official `main` catch-up until internal `main` reaches the current upstream head.
+- `sync/official-main-daily-YYYYMMDD`: normal daily sync branch after catch-up is current.
 
 Rules:
 
 - Do not freeze `v0.5.12_dev` during bootstrap.
 - Do not merge official checkpoints directly into `v0.5.12_dev`.
-- Forward-port new `v0.5.12_dev` changes into `main` every one or two days.
-- Keep official checkpoint merge PRs separate from DCU feature or bugfix PRs.
+- Delay broad `v0.5.12_dev` forward-porting until internal `main` catches up to current official `main` and the daily-sync lane is active.
+- Keep official catch-up/daily-sync work separate from DCU feature or bugfix PRs.
 - Do not rewrite public branch history and do not force-push `v0.5.12_dev` or `main`.
 - Enable `git rerere` in the migration workspace to reuse repeated conflict resolutions.
 
@@ -68,10 +92,20 @@ Rules:
 Execution rules:
 
 - Merge checkpoints in order from C01 to C19.
+- After C10, the default bootstrap step may group two or three adjacent
+  checkpoints into one integration branch, for example C11-C13. The branch,
+  ledger and annotated tag must record every included checkpoint SHA.
 - If a checkpoint produces more than 50 conflicted files, split it by date or
   first-parent subranges before resolving.
+- Split a grouped step when it produces more than 50 conflicted files, when the
+  official API transitions cannot be reviewed as one unit, or when model
+  startup failure cannot be isolated within the group.
 - Tag only after the checkpoint has been merged and the required validation has passed.
-- After C19 is merged, switch to daily sync from official `main`.
+- During larger-step bootstrap, required validation means static gates plus a
+  DCU model startup and one successful short inference request. Accuracy,
+  throughput and graph-performance regressions are documented and tracked but
+  do not block the checkpoint unless they also prevent normal inference.
+- After C19 is merged, land `sync/official-main-bootstrap` into `main`, then continue official catch-up on `main` until the latest upstream head is reached. Switch to daily sync only after catch-up is current.
 
 ## 4. Tags and Milestones
 
@@ -82,6 +116,7 @@ dcu-main-bootstrap-C01-official-20260517
 dcu-main-bootstrap-C02-official-20260519
 ...
 dcu-main-bootstrap-C19-official-20260622
+dcu-main-bootstrap-C01-C19-main-YYYYMMDD
 dcu-main-sync-official-YYYYMMDD
 ```
 
@@ -136,7 +171,8 @@ flowchart LR
 
     subgraph trunk["Green: internal future trunk"]
         MAIN["main<br/>created from v0.5.12_dev"]
-        FWD["forward-port from v0.5.12_dev<br/>every 1-2 days"]
+        CATCHUP["official main catch-up<br/>on main first"]
+        FWD["forward-port from v0.5.12_dev<br/>after official catch-up"]
         MAIN_NOTE["new architecture / upstream adaptation<br/>targets main first"]
     end
 
@@ -159,7 +195,8 @@ flowchart LR
     end
 
     DEV --> MAIN
-    DEV -.-> FWD -.-> MAIN
+    MAIN --> CATCHUP --> FWD
+    FWD -. selected stable fixes .-> MAIN
     MAIN --> BOOT
     C01 -. official checkpoint .-> MERGE
     C02 -. official checkpoint .-> MERGE
@@ -180,7 +217,7 @@ flowchart LR
     classDef tag fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12;
 
     class DEV,BUGFIX stable;
-    class MAIN,FWD,MAIN_NOTE trunk;
+    class MAIN,CATCHUP,FWD,MAIN_NOTE trunk;
     class OFF,C01,C02,CX,C19 upstream;
     class BOOT,MERGE,LEDGER bootstrap;
     class CONFLICT,CI gate;
@@ -194,14 +231,14 @@ flowchart LR
     DEVPR["DCU feature / bugfix PR"] --> TARGET{"target branch?"}
     TARGET -- current delivery --> DEV["v0.5.12_dev"]
     TARGET -- future trunk --> MAIN["main"]
-    DEV --> NEEDMAIN{"needed on main?"}
-    NEEDMAIN -- yes --> FWD["forward-port PR<br/>v0.5.12_dev -> main"]
+    DEV --> NEEDMAIN{"needed on main later?"}
+    NEEDMAIN -- yes --> FWDQUEUE["queue for forward-port<br/>after official catch-up"]
     NEEDMAIN -- no --> DEVONLY["stay on v0.5.12_dev only"]
+    FWDQUEUE --> FWD["forward-port PR<br/>v0.5.12_dev -> main"]
     FWD --> MAIN
 
-    OFFCP["official checkpoint PR"] --> SYNC["sync/official-main-Cxx-*"]
-    SYNC --> BOOT["sync/official-main-bootstrap"]
-    BOOT --> MAIN
+    OFFCP["official sync PR"] --> SYNC["sync/official-main-catchup-*<br/>then daily sync"]
+    SYNC --> MAIN
 
     MAIN --> NEEDSTABLE{"production fix needed<br/>on v0.5.12_dev?"}
     NEEDSTABLE -- yes --> BACKPORT["backport PR<br/>main -> v0.5.12_dev"]
@@ -218,19 +255,24 @@ flowchart LR
     classDef neutral fill:#f8fafc,stroke:#64748b,stroke-width:1px,color:#334155;
 
     class DEV,DEVONLY stable;
-    class MAIN,MAINONLY,FWD,BACKPORT trunk;
+    class MAIN,MAINONLY,FWD,FWDQUEUE,BACKPORT trunk;
     class OFFCP,SYNC,BOOT sync;
     class TARGET,NEEDMAIN,NEEDSTABLE gate;
     class DEVPR,GUARD1,GUARD2 neutral;
 ```
 
-### 6.3 Daily Sync Flow After Bootstrap
+### 6.3 Official Catch-up and Daily Sync Flow After Bootstrap
 
 ```mermaid
 flowchart LR
-    MAIN["main<br/>internal trunk"] --> DAILY["sync/official-main-daily-YYYYMMDD<br/>temporary daily sync branch"]
-    OFF["official/main<br/>latest upstream HEAD"] -. merge .-> DAILY
-    DAILY --> CONFLICT{"conflicts?"}
+    MAIN["main<br/>internal trunk"] --> CATCHUP["sync/official-main-catchup-YYYYMMDD<br/>until current upstream HEAD"]
+    CATCHUP --> CURRENT{"lag < 24h?"}
+    CURRENT -- no --> CATCHUP
+    CURRENT -- yes --> DAILY["sync/official-main-daily-YYYYMMDD<br/>normal daily sync branch"]
+    OFF["official/main<br/>latest upstream HEAD"] -. merge .-> CATCHUP
+    OFF -. merge .-> DAILY
+    CATCHUP --> CONFLICT{"conflicts?"}
+    DAILY --> CONFLICT
     CONFLICT -- yes --> FIX["resolve conflicts<br/>update conflict ledger if needed"]
     CONFLICT -- no --> TEST
     FIX --> TEST{"DCU smoke / CI passed?"}
@@ -248,8 +290,8 @@ flowchart LR
 
     class MAIN,MERGE trunk;
     class OFF upstream;
-    class DAILY,FIX,RETRY daily;
-    class CONFLICT,TEST gate;
+    class CATCHUP,DAILY,FIX,RETRY daily;
+    class CURRENT,CONFLICT,TEST gate;
     class TAG tag;
 ```
 
@@ -317,22 +359,24 @@ Tasks:
 
 Validation:
 
-- Qwen3 MoE smoke.
-- DeepEP small and large cases.
-- DeepSeek V4 startup and short request smoke.
-- Small-sample accuracy checks.
-- Nightly-dcu stability.
+- Blocking: static/import gates, DCU registration, DeepSeek V4 startup, and one
+  successful short inference request.
+- Blocking when the corresponding path is changed and assets are available:
+  one Qwen3 MoE or dense-model startup/request smoke.
+- Non-blocking observations: DeepEP small/large, MTP/EAGLE, graph replay,
+  small-sample accuracy, throughput and nightly-dcu stability.
 
-### Phase 4: Catch-up and Daily Sync
+### Phase 4: Bootstrap Landing, Official Catch-up, and Daily Sync
 
-Checkpoints: C18-C19 and then daily official `main`.
+Checkpoints: C18-C19, post-C19 official catch-up, then daily official `main`.
 
 Tasks:
 
-- Merge `sync/official-main-bootstrap` into `main`.
-- Start `sync/official-main-daily-YYYYMMDD`.
-- Track official SHA, internal main SHA, commit lag, and last successful sync time.
-- Make new development main-first, except production-only fixes for `v0.5.12_dev`.
+- Merge `sync/official-main-bootstrap` into `main` and tag the landing point as `dcu-main-bootstrap-C01-C19-main-YYYYMMDD`.
+- Continue official `main` catch-up directly on internal `main` using `sync/official-main-catchup-YYYYMMDD` branches until internal `main` reaches the latest official head.
+- Track official SHA, internal main SHA, commit lag, and last successful sync time for every catch-up or daily branch.
+- Switch to `sync/official-main-daily-YYYYMMDD` only after the catch-up branch brings lag under the daily threshold.
+- Delay broad `v0.5.12_dev` forward-port work until official catch-up is stable; production-only fixes may continue on `v0.5.12_dev` meanwhile.
 
 Validation:
 
@@ -343,29 +387,30 @@ Validation:
 
 ## 8. Parallel Development Rules
 
-- Current delivery and emergency fixes continue on `v0.5.12_dev`.
-- New architecture, new models, and upstream adaptation work should target `main`.
+- Current delivery and emergency fixes may continue on `v0.5.12_dev` until retirement.
+- New architecture, new models, upstream adaptation, and official sync work target `main`.
 - PR labels should include one of:
   - `target: v0.5.12_dev`
   - `target: main`
   - `needs-forward-port`
   - `needs-backport`
   - `dcu-main-only`
-- Forward-port from `v0.5.12_dev` to `main` every one or two days.
-- Do not mix official checkpoint merges and DCU feature work in one PR.
+- Do not run broad `v0.5.12_dev` forward-port batches until internal `main` has caught up to current official `main` and entered daily sync.
+- After daily sync is active, forward-port still-relevant `v0.5.12_dev` commits in small, reviewable batches until `v0.5.12_dev` can be retired.
+- Do not mix official catch-up/daily-sync merges and DCU feature work in one PR.
 - High-risk changes in attention, MoE, DeepEP, or sgl-kernel require main migration owner review.
 
 ## 9. Completion Criteria
 
 Migration is complete when:
 
-- Internal `main` reaches official `62b3c8e17781` or a newer official checkpoint.
-- Internal `main` lags official `main` by less than 24 hours.
+- Internal `main` contains the C01-C19 bootstrap and is tagged at the bootstrap landing point.
+- Internal `main` catches up to the current official upstream head and then lags official `main` by less than 24 hours under daily sync.
 - DCU regular model smoke is stable.
 - MoE, DeepEP, and DeepSeek V4 are at least covered in nightly with known issue tracking.
 - No unowned high-risk conflict remains in the conflict ledger.
 - Milestone tags exist for C01-C19.
-- New development has switched to main-first, with `v0.5.12_dev` in maintenance mode.
+- Required `v0.5.12_dev` changes have been forward-ported after official catch-up, new development is main-first, and `v0.5.12_dev` is retired or in emergency-only maintenance.
 
 ## 10. Local Helper
 

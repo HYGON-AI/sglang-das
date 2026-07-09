@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -14,12 +17,13 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
-    _topk_ids_postprocess,
+    _zero_topk_weights_padded_region,
 )
-from sglang.srt.utils import get_compiler_backend, is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -33,8 +37,23 @@ class HashTopK(nn.Module):
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
         apply_routed_scaling_factor_on_output=False,
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
+        from sglang.srt.server_args import get_global_server_args
+
+        self.enable_deepep_waterfill = (
+            num_fused_shared_experts > 0
+            and get_global_server_args().enable_deepep_waterfill
+        )
+        self.deepep_waterfill_balancer = None
+
+        if self.enable_deepep_waterfill:
+            # Waterfill appends the shared expert after EPLB maps routed IDs.
+            topk -= num_fused_shared_experts
+            num_fused_shared_experts = 0
+
         self.num_experts = num_experts
         self.topk = topk
         self.routed_scaling_factor = routed_scaling_factor
@@ -44,15 +63,64 @@ class HashTopK(nn.Module):
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
         )
+        self._init_default_tid2eid()
 
-        assert not apply_routed_scaling_factor_on_output, "not implemented"
+        self.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
+        if apply_routed_scaling_factor_on_output and num_fused_shared_experts > 0:
+            raise NotImplementedError(
+                "HashTopK + apply_routed_scaling_factor_on_output is not supported "
+                "with fused shared experts; pass --disable-shared-experts-fusion."
+            )
 
-    def empty_topk_output(self, device: torch.device):
+    def _init_default_tid2eid(self) -> None:
+        topk = self.tid2eid.shape[1]
+        if topk == 0:
+            return
+
+        # DummyModelLoader only initializes floating tensors, so keep this int
+        # lookup table valid until real checkpoints overwrite it.
+        token_ids = torch.arange(
+            self.tid2eid.shape[0], dtype=self.tid2eid.dtype, device=self.tid2eid.device
+        ).unsqueeze(1)
+        expert_offsets = torch.arange(
+            topk, dtype=self.tid2eid.dtype, device=self.tid2eid.device
+        ).unsqueeze(0)
+        tid2eid = (token_ids + expert_offsets) % self.num_experts
+        with torch.no_grad():
+            self.tid2eid.copy_(tid2eid.to(self.tid2eid.dtype))
+
+    def empty_topk_output(
+        self, device: torch.device, *, layer_id: Optional[int] = None
+    ):
         topk = self.topk - self.num_fused_shared_experts
+        if layer_id is not None:
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                lplb_solver.solve(
+                    torch.empty((0, topk), dtype=torch.int32, device=device)
+                )
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        return self._apply_deepep_waterfill(
+            StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            num_tokens=0,
+        )
+
+    def _apply_deepep_waterfill(
+        self, topk_output: StandardTopKOutput, num_tokens: int
+    ) -> StandardTopKOutput:
+        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+            raise RuntimeError(
+                "DeepEP waterfill HashTopK must be prepared by ModelRunner before forward."
+            )
+        if self.deepep_waterfill_balancer is None:
+            return topk_output
+        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
@@ -112,10 +180,8 @@ class HashTopK(nn.Module):
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.deepseek_v4 import hash_topk
+            from sglang.jit_kernel.dsv4 import hash_topk
 
-            if input_ids.dtype is not torch.int64:
-                input_ids = input_ids.to(torch.int64)
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
                 input_ids=input_ids,
@@ -126,111 +192,40 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
-
-        if is_hip():
+        if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 
-        # topk_ids = _maybe_override_topk_ids_random(topk_ids, self.num_experts)
-        topk_ids = _topk_ids_postprocess(
-            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        if self.apply_routed_scaling_factor_on_output:
+            topk_weights = topk_weights * self.routed_scaling_factor
+
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+            == "lp"
+        ):
+            if self.layer_id is None:
+                raise RuntimeError("HashTopK LP dispatch requires layer_id.")
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(self.layer_id)
+            if lplb_solver is not None:
+                log2phy_prob = lplb_solver.solve(topk_ids)
+
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids, expert_location_dispatch_info, log2phy_prob
         )
+        if is_hip():
+            _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        else:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        return topk_output
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def biased_topk_impl(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    scoring_func: str = "sigmoid",
-    num_fused_shared_experts: int = 0,
-    routed_scaling_factor: Optional[float] = None,
-    num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    if scoring_func == "sigmoid":
-        scores = gating_output.sigmoid()
-    elif scoring_func == "sqrtsoftplus":
-        scores = torch.nn.functional.softplus(gating_output).sqrt()
-
-    num_token = scores.shape[0]
-    num_experts = scores.shape[1]
-
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-    _, topk_ids = torch.topk(
-        scores_for_choice,
-        k=topk,
-        dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
-    )
-    topk_weights = scores.gather(1, topk_ids)
-
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+        topk_output = self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        if is_hip():
+            _zero_topk_weights_padded_region(
+                topk_output.topk_weights, num_token_non_padded
             )
-
-    if renormalize:
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-        )
-        topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
-
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-    return topk_weights, topk_ids
-
-
-def biased_topk_jit_kernel_impl(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    scoring_func: str = "sigmoid",
-    num_fused_shared_experts: int = 0,
-    routed_scaling_factor: Optional[float] = None,
-    num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
-
-    topk_weights, topk_ids = moe_fused_gate(
-        gating_output,
-        correction_bias,
-        topk=topk,
-        scoring_func=scoring_func,
-        num_fused_shared_experts=num_fused_shared_experts,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-    )
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    topk_ids = _topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
-    )
-    return topk_weights, topk_ids
+        return topk_output

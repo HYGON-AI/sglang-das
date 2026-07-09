@@ -2,7 +2,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 register_dcu_ci(est_time=270, suite="nightly-dcu-vlm", nightly=True, disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
-register_cuda_ci(est_time=156, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=156, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
 """
 Usage:

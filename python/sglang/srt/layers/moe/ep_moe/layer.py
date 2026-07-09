@@ -10,7 +10,6 @@ from sglang.srt.layers.quantization.slimquant_w4a8_marlin import SlimQuantW4A8In
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -55,8 +54,19 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, get_int_env_var, is_hip, is_npu, is_dcu, \
-    direct_register_custom_op
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.utils import (
+    ceil_div,
+    direct_register_custom_op,
+    dispose_tensor,
+    get_bool_env_var,
+    get_int_env_var,
+    is_dcu,
+    is_hip,
+    is_npu,
+)
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
@@ -568,7 +578,7 @@ class DeepEPMoE(FusedMoE):
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
     ):
-        if is_in_piecewise_cuda_graph():
+        if is_in_tc_piecewise_cuda_graph():
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"

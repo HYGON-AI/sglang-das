@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_dcu, is_hip
 
 _is_dcu = is_dcu()
 
@@ -51,7 +51,6 @@ Some other notes:
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
-
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 def copy_metadata(
@@ -107,14 +106,23 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_dcu:
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or _is_dcu
+        ):
             self.deep_gemm_metadata = None
-        else: # lightop support get_paged_mqa_logits_metadata but has other potential issues, skip it in dcu
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
-                from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
+        else:
+            import deep_gemm
+
+            use_jit_indexer = (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            )
+            if use_jit_indexer:
+                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
-                from lightop.gemmopt import get_paged_mqa_logits_metadata
+                from deep_gemm import get_paged_mqa_logits_metadata
 
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
@@ -122,14 +130,14 @@ class PagedIndexerMetadata:
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
                 _c4,
                 self.c4_page_size,
-                props.multi_processor_count,
+                deep_gemm.get_num_sms(),
             )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get() and torch.version.hip is None:
-            from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+        from sglang.jit_kernel.dsv4 import plan_topk_v2
 
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_dcu:
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
@@ -149,17 +157,19 @@ class PagedIndexerMetadata:
         return self.page_table.shape[1] * self.c4_page_size
 
     def copy_(self, other: "PagedIndexerMetadata"):
-        copy_fields = [
-            "page_table",
-            "c4_seq_lens",
-            "deep_gemm_metadata",
-            "topk_metadata",
-        ]
+        if is_hip() and not _is_dcu:
+            copy_fields = ["page_table", "c4_seq_lens"]
+            assign_fields = ["deep_gemm_metadata"]
+        else:
+            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            assign_fields = []
+        copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
+            assign_fields=assign_fields,
         )
 
 

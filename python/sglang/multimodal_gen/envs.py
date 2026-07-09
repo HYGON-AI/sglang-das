@@ -27,12 +27,14 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_RING_ATTN_OVERLAP: int = 0
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
+    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -57,7 +59,8 @@ if TYPE_CHECKING:
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
-    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = True
+    SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -239,6 +242,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
         "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
+    # Internal per-worker platform override used by disaggregated role launch.
+    # Empty means normal platform auto-detection.
+    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
+        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
+    ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
@@ -254,8 +262,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_RING_ATTN_OVERLAP": _lazy_int(
         "SGLANG_DIFFUSION_RING_ATTN_OVERLAP", 0
     ),
-    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
-        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "true"
+    # Fraction of denoising steps that run both CFG branches before reusing the
+    # last conditional-minus-unconditional residual. Keep 1.0 to disable.
+    "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
+        "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
+        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
@@ -287,6 +300,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
+    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
     # Supported values:
     # - auto
     # - flashinfer_cudnn
@@ -295,6 +309,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy aliases `cudnn` and `trtllm` are also accepted.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # Experimental opt-in for W8A8 FP8 GEMM in diffusion weight-only FP8 linears.
+    # When disabled, FP8 weights are dequantized to compute dtype before matmul.
+    "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

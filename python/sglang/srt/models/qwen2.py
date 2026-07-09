@@ -24,8 +24,7 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -46,10 +45,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers,is_dcu,get_bool_env_var
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -126,7 +127,7 @@ class Qwen2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -213,7 +214,7 @@ class Qwen2Attention(nn.Module):
                 # Persist the converted cache so we don't re-copy/re-allocate
                 # on every forward when the original buffer starts on CPU.
                 self.rotary_emb.cos_sin_cache = cos_sin_cache
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+            k_buffer, v_buffer = get_token_to_kv_pool().get_kv_buffer(self.layer_id)
             q, k, v = split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant(positions,
                 qkv.contiguous(),
                 self.q_size,
@@ -251,12 +252,14 @@ class Qwen2DecoderLayer(nn.Module):
         self,
         config: Qwen2Config,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.start_layer = start_layer
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
@@ -346,10 +349,16 @@ class Qwen2Model(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
+                start_layer=pp_start_layer,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -444,8 +453,8 @@ class Qwen2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
