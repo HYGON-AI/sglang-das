@@ -52,25 +52,6 @@ _kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
 
 _is_dcu = is_dcu()
 
-
-def _flash_attn_varlen_func_compat(**kwargs):
-    try:
-        return flash_attn_varlen_func(**kwargs)
-    except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
-        out = kwargs.pop("out", None)
-        result = flash_attn_varlen_func(**kwargs)
-        if out is not None:
-            if isinstance(result, tuple):
-                out.copy_(result[0])
-                result = (out, *result[1:])
-            else:
-                out.copy_(result)
-                result = out
-        return result
-
-
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_dcu():
         props = torch.cuda.get_device_properties(0)
@@ -967,7 +948,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert forward_batch.mha_return_lse
                     k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
                     v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
-                    output = _flash_attn_varlen_func_compat(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -998,7 +979,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
                     v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
-                    output = _flash_attn_varlen_func_compat(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -3038,14 +3019,8 @@ def normal_decode_set_metadata(
             num_stages=3,
         )
     else:
-        normal_decode_metadata_general_sgl = None
         if _is_dcu:
-            try:
-                from sgl_kernel import normal_decode_metadata_general as normal_decode_metadata_general_sgl
-            except ImportError:
-                pass
-
-        if normal_decode_metadata_general_sgl is not None:
+            from sgl_kernel import normal_decode_metadata_general as normal_decode_metadata_general_sgl
             # General kernel for page_size > 1 or SWA cases
             # SWA parameters
             if use_swa:

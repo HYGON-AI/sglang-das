@@ -7,7 +7,7 @@ from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
-MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla", "dcu_mla"]
+MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
 
 class AttentionBackendRegistry:
@@ -112,10 +112,6 @@ def handle_attention_flashmla(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "flashmla")
 
 
-def handle_attention_dcu_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "dcu_mla")
-
-
 def handle_attention_cutlass_mla(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
 
@@ -190,7 +186,6 @@ AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
 AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
-AttentionBackendRegistry.register("dcu_mla", handle_attention_dcu_mla)
 AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
 AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)

@@ -31,10 +31,8 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_dcu,
     is_npu,
     set_weight_attrs,
 )
@@ -57,38 +55,6 @@ elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_update_npu as causal_conv1d_update,
     )
-elif is_dcu() and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
-    from causal_conv1d import causal_conv1d_fn_dcu
-    from causal_conv1d.causal_conv1d_interface import (
-        causal_conv1d_update as causal_conv1d_update_dcu,
-    )
-
-    def causal_conv1d_fn_triton(
-        x,
-        weight,
-        bias=None,
-        activation=None,
-        conv_states=None,
-        has_initial_state=None,
-        cache_indices=None,
-        query_start_loc=None,
-        seq_lens_cpu=None,
-    ):
-        return causal_conv1d_fn_dcu(
-            x,
-            weight,
-            bias,
-            initial_states=conv_states,
-            query_start_loc=query_start_loc,
-            cache_indices=cache_indices,
-            has_initial_state=has_initial_state,
-            seq_lens_cpu=seq_lens_cpu,
-            activation=activation,
-        )
-
-    causal_conv1d_fn = causal_conv1d_fn_triton
-    causal_conv1d_update = causal_conv1d_update_dcu
-    causal_conv1d_update_triton = causal_conv1d_update_dcu
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 

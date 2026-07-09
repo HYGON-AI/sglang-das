@@ -17,6 +17,7 @@ def _is_dcu():
 register_dcu_ci(
     est_time=25,
     suite="stage-b-test-1-gpu-small-dcu",
+    disabled="Runtime-side DCU Triton tile-size reduction is required to fit shared memory; keep disabled after removing CI runtime patch.",
 )
 
 from sglang.test.test_utils import CustomTestCase

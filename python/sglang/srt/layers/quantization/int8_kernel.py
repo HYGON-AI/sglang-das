@@ -8,16 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name, is_cuda, is_hip
+from sglang.srt.utils import get_device_name, is_cuda
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
-_aiter_per_token_quant_hip = None
-if _is_hip:
-    try:
-        from aiter import per_token_quant_hip as _aiter_per_token_quant_hip
-    except ImportError:
-        _aiter_per_token_quant_hip = None
 if _is_cuda:
     # Temporary
     try:
@@ -66,38 +59,6 @@ def _per_token_quant_int8(
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
-
-    if _is_hip:
-        if (
-            _aiter_per_token_quant_hip is not None
-            and x.is_contiguous()
-            and scale_dtype == torch.float32
-        ):
-            try:
-                x_q, scales = _aiter_per_token_quant_hip(x, quant_dtype=torch.int8)
-                if cal_sum:
-                    x_sum = x.reshape(M, N).sum(dim=-1).reshape(x.shape[:-1]).to(x.dtype)
-                    return x_q, scales, x_sum
-                else:
-                    return x_q, scales
-            except RuntimeError:
-                pass
-
-        x_2d = x.reshape(M, N)
-        x_float = x_2d.to(torch.float32)
-        absmax = torch.maximum(
-            x_float.abs().amax(dim=-1, keepdim=True),
-            torch.tensor(1e-10, device=x.device, dtype=torch.float32),
-        )
-        scales = (absmax / 127).to(scale_dtype).reshape(x.shape[:-1] + (1,))
-        x_q = torch.round(x_float * (127 / absmax)).clamp(-128, 127).to(torch.int8)
-        x_q = x_q.reshape_as(x)
-        if cal_sum:
-            x_sum = x_2d.sum(dim=-1).reshape(x.shape[:-1]).to(x.dtype)
-            return x_q, scales, x_sum
-        else:
-            return x_q, scales
-
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
     scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=scale_dtype)
     if cal_sum:

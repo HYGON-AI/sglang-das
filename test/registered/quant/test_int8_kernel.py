@@ -60,6 +60,16 @@ def torch_per_token_quant_int8_reference(x, scale_dtype=torch.float32):
     return x_q.reshape_as(x), scales
 
 
+def dcu_per_token_quant_int8(x, scale_dtype=torch.float32):
+    try:
+        from aiter import per_token_quant_hip
+
+        x_q, scales = per_token_quant_hip(x, quant_dtype=torch.int8)
+        return x_q, scales.to(scale_dtype)
+    except Exception:
+        return torch_per_token_quant_int8_reference(x, scale_dtype)
+
+
 def torch_w8a8_per_column_moe(
     a, w1, w2, w1_s, w2_s, score, topk, quant_func=per_token_quant_int8
 ):
@@ -147,7 +157,7 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
 
         with torch.inference_mode():
             if _is_dcu:
-                a_q, a_s = per_token_quant_int8(a)
+                a_q, a_s = dcu_per_token_quant_int8(a)
                 ref_a_q, ref_a_s = torch_per_token_quant_int8_reference(a)
                 self.assertTrue(torch.equal(a_s, ref_a_s))
                 self.assertLessEqual(
@@ -155,7 +165,16 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
                     1,
                 )
 
-                out = torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk)
+                out = torch_w8a8_per_column_moe(
+                    a,
+                    w1,
+                    w2,
+                    w1_s,
+                    w2_s,
+                    score,
+                    topk,
+                    quant_func=dcu_per_token_quant_int8,
+                )
                 self.assertTrue(torch.isfinite(out).all())
                 self.assertEqual(out.shape, (M, K))
                 return

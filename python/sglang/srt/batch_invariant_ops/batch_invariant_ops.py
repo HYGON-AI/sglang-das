@@ -15,7 +15,6 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device_core_count,
     get_dispatch_device_backend,
-    is_dcu,
 )
 
 if ENABLE_JIT_DEEPGEMM:
@@ -218,33 +217,6 @@ def _matmul_persistent_triton(
             "num_warps": 8,
         },
     }
-    if is_dcu():
-        configs = {
-            torch.bfloat16: {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 4,
-                "num_stages": 2,
-                "num_warps": 4,
-            },
-            torch.float16: {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 4,
-                "num_stages": 2,
-                "num_warps": 4,
-            },
-            torch.float32: {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 4,
-                "num_stages": 2,
-                "num_warps": 4,
-            },
-        }
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
@@ -795,33 +767,6 @@ def bmm_batch_invariant(a, b, *, out=None):
                 "num_warps": 8,
             },
         }
-        if is_dcu():
-            configs = {
-                torch.bfloat16: {
-                    "BLOCK_SIZE_M": 64,
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 32,
-                    "GROUP_SIZE_M": 4,
-                    "num_stages": 2,
-                    "num_warps": 4,
-                },
-                torch.float16: {
-                    "BLOCK_SIZE_M": 64,
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 32,
-                    "GROUP_SIZE_M": 4,
-                    "num_stages": 2,
-                    "num_warps": 4,
-                },
-                torch.float32: {
-                    "BLOCK_SIZE_M": 64,
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 32,
-                    "GROUP_SIZE_M": 4,
-                    "num_stages": 2,
-                    "num_warps": 4,
-                },
-            }
 
         config = configs.get(dtype)
         if config is None:

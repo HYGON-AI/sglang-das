@@ -93,7 +93,7 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if _is_dcu:
+        if is_dcu:
             from lightop import fuse_silu_and_mul
             fuse_silu_and_mul(x, out)
         else:

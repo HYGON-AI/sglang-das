@@ -27,6 +27,7 @@ register_dcu_ci(
     est_time=120,
     suite="stage-b-test-1-gpu-small-dcu",
     nightly=False,
+    disabled="Runtime-side DCU causal_conv1d bridge in mamba.py is required; keep disabled after removing CI runtime patch.",
 )
 
 DCU_NEMOTRON_MODEL = "/public/opendas/DL_DATA/llm-models/vllm-optest-models/nvidia/Nemotron-H-8B-Base-8K"
@@ -120,6 +121,8 @@ class TestNvidiaNemotronNanoV2BF16(DCUNemotronServerBase, GSM8KMixin, DefaultSer
     other_args = ["--max-mamba-cache-size", "256"]
     if _is_dcu():
         model = DCU_NEMOTRON_MODEL
+        __unittest_skip__ = True
+        __unittest_skip_why__ = "Runtime-side DCU causal_conv1d bridge in mamba.py is required."
 
 
 class TestNvidiaNemotronNanoV2BF16PP(DCUNemotronServerBase, GSM8KMixin, DefaultServerBase):
