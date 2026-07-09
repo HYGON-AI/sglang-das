@@ -179,9 +179,8 @@ def escape_annotation_property(text: str) -> str:
 
 def emit_github_error(error: Violation) -> None:
     message = (
-        "HCU-owned user-visible output contains legacy AMD/XGMI/DCU wording. "
-        f"Suggested mapping: {replacement_hint(error.text)}. "
-        f"Suggested text: {text_snippet(suggested_text(error.text))}"
+        "HCU user-visible output contains platform-sensitive wording. "
+        "Please update the reported runtime text according to the HCU wording rules above."
     )
     print(
         "::error "
@@ -259,10 +258,6 @@ def main(argv):
         print("HCU runtime text check failed.")
         print()
         print("This check found platform-sensitive wording in user-visible output.")
-        print(
-            "For HCU related runtime paths, logs, errors, warnings, skip reasons, "
-            "and CI-visible messages should avoid exposing AMD/DCU/XGMI wording."
-        )
         print()
         print("Checked scope:")
         print(" - Only changed files reported by quality-gate changed-files are checked.")
@@ -287,7 +282,6 @@ def main(argv):
         for error in errors:
             print(f" - {error.message()}")
             print(f"   current: {text_snippet(error.text)}")
-            print(f"   suggested: {text_snippet(suggested_text(error.text))}")
             emit_github_error(error)
         return 1
 
