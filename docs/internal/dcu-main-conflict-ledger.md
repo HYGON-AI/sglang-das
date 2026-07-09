@@ -1118,22 +1118,6 @@ actual result in the checkpoint note.
     compressed MoE accuracy, graph performance, throughput, and full topology
     expansion.
 - Manual validation result:
-  - Workspace path proof: `PYTHONPATH=/home/proj_sglang_open/dcu-sglang/python`
-    resolved `sglang.__file__` to
-    `/home/proj_sglang_open/dcu-sglang/python/sglang/__init__.py` before
-    launching the service.
-  - DeepSeek-V4 service readiness: passed on `zz-nmz22` / `rye_sglang_open`,
-    command run from `/home/scripts/sglang/c17-c19-20260622`:
-    `PYTHONPATH=/home/proj_sglang_open/dcu-sglang/python bash /home/scripts/sglang/run_dpsk-v4.sh 31000 /parastor/home/public_user/wanglong/DeepSeek-V4-Flash-FP8-Channel`.
-    Evidence: `/home/scripts/sglang/c17-c19-20260622/running_dpsk-v4_nmz22.log`
-    line 273 shows `The server is fired up and ready to roll!` at
-    `2026-07-09 11:42:02 CST`; graph capture covered decode batches through
-    `bs=128` and completed for all TP ranks.
-  - Short request gate: passed. `curl http://127.0.0.1:31000/health` returned
-    HTTP 200; `curl http://127.0.0.1:31000/generate` with prompt
-    `Hello, briefly introduce yourself.` and `max_new_tokens=16` returned HTTP
-    200, request id `be010164c8e4435f8685d076259576f5`, `completion_tokens=16`,
-    and `e2e_latency=1.371s`. Output accuracy/content was not a blocking gate.
-  - Cleanup: the 31000 service started for validation was stopped; follow-up
-    check showed no remaining `sglang serve --port 31000` process, connect rc
-    `111` for port 31000, and `hy-smi` VRAM back to 0% on all HCUs.
+  - DCU DeepSeek-V4 DP+EP+MTP112/PD disaggregation of intranode validation - ✅
+  - DCU DeepSeek-V4 TP/CP+EP accuracy validation - ❌(--parallel 1 ✅)
+  - CI test - ✅
