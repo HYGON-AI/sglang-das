@@ -74,12 +74,8 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-<<<<<<< HEAD
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu
 from sglang.srt.utils.common import LazyValue
-=======
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, make_layers
->>>>>>> 876bb08e9 ([feat]: HY3 support PP)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_dcu = is_dcu()
@@ -847,8 +843,10 @@ class HYV3ForCausalLM(nn.Module):
                     "different pipeline stages."
                 )
             self.lm_head.weight = self.model.embed_tokens.weight
-<<<<<<< HEAD
-        self.logits_processor = LogitsProcessor(config)
+        if self.pp_group.is_last_rank:
+            self.logits_processor = LogitsProcessor(config)
+        else:
+            self.logits_processor = PPMissingLayer()
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
@@ -859,13 +857,7 @@ class HYV3ForCausalLM(nn.Module):
 
     @property
     def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
-=======
-        if self.pp_group.is_last_rank:
-            self.logits_processor = LogitsProcessor(config)
-        else:
-            self.logits_processor = PPMissingLayer()
->>>>>>> 876bb08e9 ([feat]: HY3 support PP)
+        return self._routed_experts_weights_of_layer.value    
 
     @torch.no_grad()
     def forward(
