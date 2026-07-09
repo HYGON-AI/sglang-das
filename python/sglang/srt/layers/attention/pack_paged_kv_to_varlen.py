@@ -50,6 +50,7 @@ def can_pack_paged_kv_to_varlen(
         and metadata.cu_seqlens_k.shape[0] >= batch_size + 1
         and metadata.max_seq_len_k > 0
         and int(seq_lens_cpu.min().item()) > 0
+        and server_args.minimax_opt
     )
     if not correctness_ok:
         return False
