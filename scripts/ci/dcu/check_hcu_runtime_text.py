@@ -258,33 +258,36 @@ def main(argv):
     if errors:
         print("HCU runtime text check failed.")
         print()
+        print("This check found platform-sensitive wording in user-visible output.")
         print(
-            "Detected user-visible AMD/amd, XGMI/xgmi, or DCU/dcu text in "
-            "HCU-owned changed files. This blocks PR merge because HCU runtime "
-            "logs and CI output should use HCU wording."
+            "For HCU related runtime paths, logs, errors, warnings, skip reasons, "
+            "and CI-visible messages should avoid exposing AMD/DCU/XGMI wording."
         )
         print()
-        print("Scope:")
-        print(" - Only changed files passed by quality-gate changed-files are checked.")
-        print(" - Python checks only user-visible strings in print/logger/raise/skip/help.")
-        print(" - Shell/YAML checks only visible output fields such as echo/printf/name/description.")
+        print("Checked scope:")
+        print(" - Only changed files reported by quality-gate changed-files are checked.")
+        print(" - Python: user-visible strings in print/logger/raise/skip/help.")
+        print(" - Shell/YAML: visible output fields such as echo/printf/name/description.")
+        print(
+            " - Source identifiers such as file names, variable names, function names, "
+            "imports, and comments are not the target of this check."
+        )
         print()
-        print("How to fix:")
-        print(" 1. Open each file:line reported below.")
-        print(" 2. Apply these mappings only to user-visible output:")
-        print("    - AMD / AMD GPU(s) -> HCU / HCU device(s)")
-        print("    - amd -> hcu")
-        print("    - XGMI / xgmi -> HSL / hsl")
-        print("    - DCU / dcu -> HCU / hcu")
-        print("    - AMD/ROCm -> HCU/ROCm")
-        print("    - AMD/HIP -> HCU/HIP")
-        print(" 3. Keep ROCm and HIP unchanged.")
-        print(" 4. Do not rename files or change variable/function names just for this check.")
+        print("Recommended wording:")
+        print(" - Use HCU / HCU device(s) for HCU hardware visible messages.")
+        print(" - Use HSL / hsl for HCU fabric/link visible messages.")
+        print(
+            " - Use HCU/ROCm or HCU/HIP only when the message describes a combined "
+            "hardware/software stack."
+        )
+        print(" - Keep ROCm and HIP unchanged when they refer to the software/runtime stack.")
+        print(" - Do not rename files or internal identifiers only to satisfy this check.")
         print()
-        print("Violations:")
+        print("Detected items:")
         for error in errors:
             print(f" - {error.message()}")
-            print(f"   Suggested: {text_snippet(suggested_text(error.text))}")
+            print(f"   current: {text_snippet(error.text)}")
+            print(f"   suggested: {text_snippet(suggested_text(error.text))}")
             emit_github_error(error)
         return 1
 
