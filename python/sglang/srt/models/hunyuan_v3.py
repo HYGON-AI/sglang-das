@@ -21,8 +21,6 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
-    get_pp_group,
-    get_pp_indices,
     get_tensor_model_parallel_world_size,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
@@ -40,7 +38,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -69,17 +66,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-<<<<<<< HEAD
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu
 from sglang.srt.utils.common import LazyValue
-=======
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, make_layers
->>>>>>> 876bb08e9 ([feat]: HY3 support PP)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_dcu = is_dcu()
@@ -736,44 +728,29 @@ class HYV3Model(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
 
-        if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
-                prefix=f"{prefix}.embed_tokens",
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
+            prefix=f"{prefix}.embed_tokens",
+        )
 
         self.alt_stream = torch.cuda.Stream() if is_cuda() else None
 
-        self.start_layer, self.end_layer = get_pp_indices(
-            config.num_hidden_layers,
-            self.pp_group.rank_in_group,
-            self.pp_group.world_size,
-        )
-        self.layers, self.start_layer, self.end_layer = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: (
+        self.layers = nn.ModuleList(
+            [
                 HYV3DecoderLayer(
                     config=config,
-                    layer_id=idx,
+                    layer_id=i,
                     quant_config=quant_config,
-                    prefix=prefix,
+                    prefix=f"{prefix}.layers.{i}",
                     alt_stream=self.alt_stream,
                 )
-            ),
-            prefix=f"{prefix}.layers",
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
+                for i in range(config.num_hidden_layers)
+            ]
         )
-        if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer(return_tuple=True)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     @torch.no_grad()
     def forward(
@@ -782,33 +759,16 @@ class HYV3Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
         else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
+            hidden_states = input_embeds
+        residual = None
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
-
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -825,29 +785,17 @@ class HYV3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
 
         self.model = HYV3Model(config, quant_config, prefix=f"{prefix}.model")
-        if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.lm_head",
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.lm_head",
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
         if getattr(self.config, "tie_word_embeddings", False):
-            if not (self.pp_group.is_first_rank and self.pp_group.is_last_rank):
-                raise ValueError(
-                    "Pipeline parallelism for Hunyuan3 with tied word embeddings "
-                    "is not supported because embed_tokens and lm_head live on "
-                    "different pipeline stages."
-                )
             self.lm_head.weight = self.model.embed_tokens.weight
-<<<<<<< HEAD
         self.logits_processor = LogitsProcessor(config)
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -860,12 +808,6 @@ class HYV3ForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
-=======
-        if self.pp_group.is_last_rank:
-            self.logits_processor = LogitsProcessor(config)
-        else:
-            self.logits_processor = PPMissingLayer()
->>>>>>> 876bb08e9 ([feat]: HY3 support PP)
 
     @torch.no_grad()
     def forward(
@@ -874,13 +816,8 @@ class HYV3ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-        )
-        if not self.pp_group.is_last_rank:
-            return hidden_states
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -927,12 +864,6 @@ class HYV3ForCausalLM(nn.Module):
                 continue
 
             if "rotary_emb.inv_freq" in name:
-                continue
-
-            layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
-            ):
                 continue
 
             if num_nextn_layers > 0 and name.startswith("model.layers."):
