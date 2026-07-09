@@ -294,9 +294,14 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     )
+    dcp_kv_mask = getattr(forward_batch, "dcp_kv_mask", None)
     if _is_dcu:
         return cuda_enabled
-    return cuda_enabled or (_is_hip and not is_prefill_context_parallel_enabled())
+    return cuda_enabled or (
+        _is_hip
+        and not is_prefill_context_parallel_enabled()
+        and dcp_kv_mask is None
+    )
 
 
 def create_fused_set_kv_buffer_arg(

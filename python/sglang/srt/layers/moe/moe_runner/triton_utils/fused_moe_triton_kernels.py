@@ -53,6 +53,14 @@ elif _is_hip:
 padding_size = get_moe_padding_size(_use_aiter)
 
 
+class _CodePathChecker:
+    def __init__(self):
+        self.observed = 0
+
+
+deepseek_v4_moe_code_path_checker = _CodePathChecker()
+
+
 def support_tensor_descriptor():
     return _support_tensor_descriptor
 

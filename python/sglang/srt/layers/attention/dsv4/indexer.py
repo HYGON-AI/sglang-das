@@ -20,8 +20,8 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_dcu, is_hip
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils import add_prefix, is_dcu, is_gfx95_supported, is_hip
+from sglang.srt.utils.common import is_gfx942_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _is_dcu = is_dcu()
+_is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
 if is_hip():
     FP8_DTYPE = torch.float8_e4m3fnuz
     FP8_MAX = torch.finfo(FP8_DTYPE).max
@@ -66,6 +67,8 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
@@ -548,7 +551,10 @@ class C4IndexerBackendMixin:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+        elif (
+            envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and _is_aiter_fp8_paged_mqa_logits_supported
+        ):
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if is_sm120_supported():
@@ -589,7 +595,11 @@ class C4IndexerBackendMixin:
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
-        _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+        _use_aiter = (
+            envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and _is_aiter_fp8_paged_mqa_logits_supported
+            and not use_fp4_indexer
+        )
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(

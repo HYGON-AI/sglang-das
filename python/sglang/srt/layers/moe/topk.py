@@ -28,11 +28,10 @@ from typing import (
     runtime_checkable,
 )
 
-import numpy as np
-from numpy import dtype
-
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.runtime_context import get_parallel
 
@@ -117,15 +116,12 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
-import random
 import os
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_dp_rank,get_attention_dp_size
 
 
 logger = logging.getLogger(__name__)
@@ -145,6 +141,13 @@ _use_lightop_topk_ids_postprocess = get_bool_env_var(
 )
 simulated_expert_balance = get_bool_env_var("SGLANG_SIMULATED_EXPERT_BALANCE")
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
+
+# Experimental: skip the HIP padded-token routing-weight masking entirely.
+# Padded (CUDA-graph) rows are discarded downstream and the MoE combine is
+# per-token, so zeroing their weights is in principle unnecessary. Gated off by
+# default because it is a numerics-affecting change that must be validated with
+# an accuracy run before becoming the default.
+_skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -186,7 +189,7 @@ if _is_cuda:
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
@@ -205,7 +208,7 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
@@ -881,6 +884,8 @@ def grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -931,6 +936,9 @@ def grouped_topk_gpu(
             topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_ids = _biased_grouped_topk_postprocess(
+        topk_ids, expert_location_dispatch_info, num_token_non_padded
+    )
 
     return topk_weights, topk_ids
 
@@ -1193,6 +1201,71 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+@triton.jit
+def _fill_padded_rows_kernel(
+    out_ptr,
+    num_token_non_padded_ptr,
+    n_cols,
+    fill_value,
+    stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_valid = tl.load(num_token_non_padded_ptr)
+    if row >= n_valid:
+        cols = tl.arange(0, BLOCK_COLS)
+        mask = cols < n_cols
+        ptrs = out_ptr + row * stride_row + cols
+        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+        tl.store(ptrs, fill, mask=mask)
+
+
+def _can_fuse_padded_region(x: torch.Tensor) -> bool:
+    # The fused kernel uses one program per row and assumes a row-major 2D
+    # tensor (columns contiguous); fall back to eager for anything else.
+    return x.dim() == 2 and x.stride(1) == 1
+
+
+def _fill_padded_rows(
+    x: torch.Tensor,
+    num_token_non_padded: torch.Tensor,
+    fill_value,
+) -> None:
+    """Set ``x[row, :] = fill_value`` for every padded row (row index
+    ``>= num_token_non_padded``) using a single Triton launch.
+
+    Replaces the eager ``arange + (>=) + boolean index_put_`` sequence, which
+    issues several launch-latency-bound kernels per call. The grid is static
+    (one program per row) and the pad count is read from device memory inside
+    the kernel, so this is safe to capture inside a CUDA/HIP graph.
+    """
+    # Metadata-only checks (no device sync): the kernel reads a single scalar
+    # routing count from device memory, so it must be a 1-element integer tensor
+    # on the same device as ``x``.
+    assert isinstance(
+        num_token_non_padded, torch.Tensor
+    ), "num_token_non_padded must be a torch.Tensor"
+    assert num_token_non_padded.numel() == 1, (
+        "num_token_non_padded must be a single-element tensor, got shape "
+        f"{tuple(num_token_non_padded.shape)}"
+    )
+    assert (
+        not num_token_non_padded.dtype.is_floating_point
+    ), f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
+    assert (
+        num_token_non_padded.device == x.device
+    ), "num_token_non_padded and x must be on the same device"
+    n_rows, n_cols = x.shape
+    _fill_padded_rows_kernel[(n_rows,)](
+        x,
+        num_token_non_padded,
+        n_cols,
+        fill_value,
+        x.stride(0),
+        BLOCK_COLS=triton.next_power_of_2(n_cols),
+    )
+
+
 def _eplb_remap_enabled() -> bool:
     # A real logical->physical mapping only exists when EPLB is enabled, the
     # initial expert placement is non-trivial, or there are redundant physical
@@ -1231,6 +1304,8 @@ def _mask_topk_ids_padded_region(
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         mask = (indices >= num_token_non_padded).unsqueeze(-1)
         topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
+    elif _can_fuse_padded_region(topk_ids):
+        _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = fill_value
@@ -1241,6 +1316,9 @@ def _zero_topk_weights_padded_region(
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     if num_token_non_padded is None:
+        return
+    if _can_fuse_padded_region(topk_weights):
+        _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
     indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
     topk_weights[indices >= num_token_non_padded, :] = 0.0
@@ -1341,6 +1419,8 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
 
     num_tokens = gating_output.shape[0]
@@ -1739,9 +1819,10 @@ def _post_process_topk_ids(
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
-        # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely, so
-        # padded tokens are neutralized by zeroing their routing weights.
-        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
+        # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
+        # That final pass re-zeros after any shared-expert append/remap, so a
+        # second zeroing here would be redundant (zeroing is idempotent).
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
@@ -1783,7 +1864,7 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    if _is_hip:
+    if _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -1859,6 +1940,8 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
             )
 
     elif torch_native and custom_routing_function is None:

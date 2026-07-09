@@ -1147,3 +1147,59 @@ actual result in the checkpoint note.
   - `git diff --check` and `git diff --cached --check`: passed after normalizing
     upstream CRLF/trailing whitespace in `.github/workflows/pr-test-npu.yml` and
     one space-before-tab instance in `docs_new/docs/advanced_features/pd_disaggregation.mdx`.
+
+### Official main catch-up 20260623 / `6842335fcfb0`
+
+- Branch: `sync/official-main-catchup-20260623`.
+- Base: DCU `main@f3b7a57b3d4e1740dc6dce4c8f83a3cc74ccf904`, official previous checkpoint `62b3c8e17781f9f64653f9bc5b0cb12689ba3ecb`.
+- Endpoint: official `main@6842335fcfb0cf8fbca537ca79d90576d026cd8f`.
+- Scope: 96 official commits, 2026-06-22 to 2026-06-23. This step includes official `v0.5.14` release branch point `7e6587c94a1d0305815a14067c5d3cc02a9b0f36`.
+- Release marker note:
+  - `v0.5.14` annotated tag object remains `4289f36ef960fad8268a6b94935686e792a81432`, peeled commit `49e384ce9d304648e9959666ecb8ce8cd98d0deb`.
+  - Current audit still treats `v0.5.14` as an off-main release tag on `origin/release/v0.5.14`, not as part of official `main`; this step does not merge release-branch cherry-picks.
+  - After this step lands on DCU `main` and functional validation passes, create marker tag `dcu-main-official-v0.5.14-branchpoint-20260622` on the DCU main merge commit. The tag message must state the official branch point SHA, DCU main SHA, and that this is a DCU `v0.5.14` baseline point that excludes the release branch's 8 cherry-pick commits.
+- Textual conflicts and decisions:
+  - `python/sglang/jit_kernel/include/sgl_kernel/deepseek_v4/fp8_utils.cuh` (`jit-kernel`, `manual merge`): started from the official HIP/ROCm software FP8 conversion path, then fixed gfx938/DTK compilation by returning the packed FP8x2 value through a `uint16_t`/`fp8x2_e4m3_t` union bit reinterpret instead of relying on an unavailable integer-to-FP8x2 conversion; no separate old-DCU branch existed in the conflicted hunk.
+  - `python/sglang/multimodal_gen/runtime/layers/attention/turbo_layer.py` (`diffusion/attention`, `theirs`): accepted official backend resolver using `AttentionBackendEnum` and global server args; no `_is_dcu` path existed.
+  - `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` (`attention/dsa`, `manual merge`): inserted official `_uses_dsa_attention_backend()` helper while preserving DCU fast-Hadamard, LightOp/topk, device property, and indexer paths; cleaned stale unused DCU temporaries after Ruff.
+  - `python/sglang/srt/layers/attention/dsa_backend.py` (`attention/dsa`, `manual merge`): combined official `SGLANG_DSA_TRITON_PREFILL` / gfx95 detection with existing `is_dcu` import and preserved `if _is_hip and not _is_dcu` AITER imports.
+  - `python/sglang/srt/layers/attention/triton_backend.py` (`attention`, `manual merge`): kept DCU `seq_lens_cpu` argument while adopting official four-return decode KV buffer update and `num_kv_splits_lens` use.
+  - `python/sglang/srt/mem_cache/allocator/paged.py` (`mem_cache`, `manual merge`): retained DCU `dcu_alloc_decode_kernel` / `dcu_alloc_extend_kernel` and `SGLANG_KVALLOC_KERNEL`, while adding official HIP `torch.unique` warm-up.
+  - `python/sglang/srt/mem_cache/memory_pool.py` (`mem_cache`, `manual merge`): kept DCU FA KV layout copy path first and returning before generic writes; added official `dcp_kv_mask` masked write for non-DCU-layout cases.
+  - `python/sglang/srt/model_executor/forward_batch_info.py` (`model_executor`, `manual merge`): preserved DCU `residual_rms_per_quant_int8` / `rms_quant_flag` and added official `dcp_kv_mask`.
+  - `python/sglang/srt/models/deepseek_v2.py` (`deepseek/moe`, `manual merge`): combined DCU residual RMS/LightOp MoE parameters with official `skip_shared_experts`; retained `_is_dcu` exclusion in routed-scaling logic and guarded fused shared-expert hooks with `not skip_shared_experts`.
+  - `python/sglang/srt/models/deepseek_v4.py` (`deepseek-v4`, `manual merge`): kept DCU exclusion for generic AITER (`SGLANG_USE_AITER` remains `_is_hip and not _is_dcu`) and added official `_SHARED_EXPERT_LOCAL`.
+  - `python/sglang/srt/models/utils.py` (`model/cache`, `manual merge`): added official `dcp_kv_mask` guard while preserving DCU behavior that does not enable the generic HIP fused set-kv path.
+  - `python/sglang/srt/server_args.py` (`server_args`, `port to new API`): adopted official `A[...]` CLI auto-registration structure, preserved DCU `record_nolora_graph`, and replaced the stale duplicate manual CLI block with official dynamic/deprecated-only `add_cli_args()` after DSA alias tests caught duplicate `--tool-server` registration.
+- Non-textual `_is_dcu` refactor audit fixes:
+  - `python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py`: official functionized `fused_experts_impl` into `_fused_moe_kernel_sequence`; removed an unreachable stale DCU chunk implementation left after the new return path, preserving the active DCU/HIP LightOp path in the new function sequence.
+  - `python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py` and `fused_moe_triton_kernels.py`: added minimal `deepseek_v4_moe_code_path_checker` objects so retained 2604B DCU instrumentation has a defined counter.
+  - `python/sglang/srt/layers/moe/topk.py`: ported DCU LightOp biased grouped top-k to official EPLB/padded-token top-k API by accepting `expert_location_dispatch_info` and `num_token_non_padded` in CPU/GPU helper signatures and forwarding them from `select_experts()`.
+  - `python/sglang/srt/layers/attention/dsv4/indexer.py`: official introduced an AITER FP8 paged-MQA logits path that asserts only gfx942/gfx950 are supported. On gfx938 DCU, guard that AITER path with `is_gfx942_supported() or is_gfx95_supported()` so gfx938 falls back to the torch implementation instead of aborting during graph capture; also squeeze `[B, 1]` `seq_lens` to `[B]` before the torch fallback assertion.
+- `_is_hip` audit:
+  - New official HIP gates were reviewed in DCP, MoE mxfp8, unified-kv-triton, qwen3.5, tests, and server args.
+  - Existing high-risk DCU exclusions remain explicit for generic AITER in DeepSeek V4 and DSA backend.
+  - `is_unified_kv_triton()` remains generic HIP because `server_args` already forces `SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton` back to `tilelang` on unsupported non-NVIDIA paths; no DCU path is enabled by default.
+- Move/delete audit:
+  - `git diff --name-status --find-renames 62b3c8e17781f9f64653f9bc5b0cb12689ba3ecb..6842335fcfb0cf8fbca537ca79d90576d026cd8f` showed deleted Ascend documentation files only; no deleted/renamed DCU runtime file required porting.
+  - Three-repo keyword scan (`_is_dcu`, `is_dcu`, `dcu_`, `LightOp`, `flash_mla`, `AITER`, `DeepEP`, `DeepSeekV4`, `SGLANG_USE_AITER_AG`) completed across current DCU, old DCU, and official trees; current DCU retains the expected DCU-specific symbol surface.
+- Automated validation result:
+  - `git ls-files -u`: no output.
+  - Precise conflict marker scan with `grep -RInE "^(<<<<<<< |=======$|>>>>>>> )"`: no output.
+  - `git diff --check`: passed.
+  - `python3 -m py_compile` over 271 changed Python files: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841` on conflict/high-risk DCU files: passed.
+  - Full changed-file Ruff `E9,F821`: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning about `test/registered/cpu/utils.py` having no CI registry.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed; output package name `sglang-kernel`, zero unsupported CUDA calls, 50 replaced kernel launches.
+  - `PYTHONPATH=python python3 -c 'import sglang; print(sglang.__file__)'`: resolved to `/home/proj_sglang_open/dcu-sglang/python/sglang/__init__.py`.
+- Required functional validation:
+  - Attempt 1 with `/home/scripts/sglang/run_dpsk-v4.sh 31000 /parastor/home/public_user/wanglong/DeepSeek-V4-Flash-FP8-Channel` from this workspace failed during decode graph capture because `fp8_utils.cuh` returned a `uint16_t` where DTK expected `__hip_fp8x2_e4m3`; fixed by the union bit reinterpret above.
+  - Attempt 2 passed that JIT compile point but failed on gfx938 because official AITER `deepgemm_fp8_paged_mqa_logits` asserted gfx942/gfx950 only; fixed by the DSV4 indexer support guard above.
+  - Attempt 3 reached the torch fallback and failed on `seq_lens.shape == (batch_size,)` because graph capture passed `[B, 1]`; fixed by squeezing singleton trailing dimension before the assertion.
+  - Attempt 4 with the default `--cuda-graph-max-bs 128` reached decode graph capture but the gfx938 torch fallback attempted an 8 GiB `torch.bmm()` allocation and failed with HIP OOM. This is recorded as a large-batch graph observation, not a correctness regression in the earlier failed code paths.
+  - Attempt 5 used a temporary launcher copied from `run_dpsk-v4.sh` with only `--cuda-graph-max-bs 128` replaced by `--cuda-graph-max-bs-decode 16`, but the machine was blocked by an unrelated existing host SGLang service (`python -m sglang.launch_server ... --port 10030`) occupying all eight DCUs at about 87% VRAM. The smoke failed at weight allocation (`GPU 2 ... 470 MiB free`) before reaching service readiness. Do not kill that external service without owner approval; rerun service `/health` and short `/generate` after GPUs are free.
+- Non-blocking observations:
+  - v0.5.14 release-branch cherry-picks, accuracy/perf/full topology/large-batch graph, and AITER all-gather graph workaround removal remain out of scope for this catch-up step.
+  - The default bs=128 decode graph currently remains unvalidated on gfx938 after the torch fallback OOM. A smaller graph bucket or graph-disabled smoke is acceptable for the catch-up functional gate once the external GPU occupancy is cleared, but do not claim bs=128 graph validation without a successful capture/replay run.

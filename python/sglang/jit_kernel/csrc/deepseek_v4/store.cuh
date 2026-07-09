@@ -58,7 +58,7 @@ __global__ void fused_store_flashmla_cache(const SGL_GRID_CONSTANT FusedStoreCac
     const auto x = elems_fp32.x;
     const auto y = elems_fp32.y;
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const auto result = pack_fp8(x * inv_scale, y * inv_scale);
@@ -114,7 +114,7 @@ __global__ void fused_store_indexer_cache(const SGL_GRID_CONSTANT FusedStoreCach
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
   // use normal fp32 scale
-  const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+  const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
   const auto inv_scale = 1.0f / scale;
   const int32_t page = index >> kPageBits;
   const int32_t offset = index & ((1 << kPageBits) - 1);
