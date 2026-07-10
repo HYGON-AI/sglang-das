@@ -272,12 +272,16 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            weight8bit_nt_kpack2_marlin,
+        )
+
         w1_marlin_list = []
         for ii in range(layer.w13_weight.shape[0]):
             if not self.use_deepep:
                 w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
             else:
-                w1_marlin_in = weight8bit_nt_kpack2_marlin1(layer.w13_weight[ii])
+                w1_marlin_in = weight8bit_nt_kpack2_marlin(layer.w13_weight[ii])
             w1_marlin_list.append(w1_marlin_in)
         w1_marlin = torch.stack(w1_marlin_list, dim=0)
 
@@ -286,7 +290,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             if not self.use_deepep:
                 w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
             else:
-                w2_marlin_in = weight8bit_nt_kpack2_marlin1(layer.w2_weight[ii])
+                w2_marlin_in = weight8bit_nt_kpack2_marlin(layer.w2_weight[ii])
             w2_marlin_list.append(w2_marlin_in)
         w2_marlin = torch.stack(w2_marlin_list, dim=0)
 

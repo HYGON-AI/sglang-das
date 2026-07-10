@@ -15,12 +15,14 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
+import os
 import logging
 from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
@@ -35,6 +37,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -64,6 +67,9 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_int8_marlin_for_minimax_m2 import (
+    fused_experts_impl_int8_marlin_minimax_m2,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -92,6 +98,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_cuda,
+    is_dcu,
     is_non_idle_and_non_empty,
     is_npu,
     make_layers,
@@ -101,10 +108,39 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_npu = is_npu()
+
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+
+from lmslim.layers.gemm.int8_utils import per_token_quant_int8
+
+if _is_dcu:
+    from lightop.rmsnorm import fused_rms_norm_contiguous
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
+
+_FP32GEMM_GATE = None
+
+def _gate_fp32gemm(
+    hidden_states: torch.Tensor, weight: torch.Tensor,
+) -> torch.Tensor:
+    global _FP32GEMM_GATE
+    if _FP32GEMM_GATE is None:
+        if os.environ.get("SGLANG_USE_FP32GEMM_GATE_CUSTOM", "0") == "1":
+            try:
+                import fp32gemm
+                _FP32GEMM_GATE = fp32gemm
+            except ImportError:
+                _FP32GEMM_GATE = False
+        else:
+            _FP32GEMM_GATE = False
+
+    if _FP32GEMM_GATE is not False and hidden_states.dtype == torch.bfloat16:
+        return _FP32GEMM_GATE.gemm_abt(hidden_states, weight)
+
+    return F.linear(hidden_states.float(), weight, bias=None)
 
 
 @triton.jit
@@ -279,11 +315,16 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
     def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
+        self.minimax_opt = get_global_server_args().minimax_opt
+        self.tp_world = get_tensor_model_parallel_world_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
         # Align with QKVParallelLinear pattern
-        if self.attn_tp_size >= num_heads:
+        if self.minimax_opt:
+            self.num_heads = num_heads
+            self.num_head_replicas = 1
+        elif self.attn_tp_size >= num_heads:
             assert (
                 self.attn_tp_size % num_heads == 0
             ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
@@ -309,6 +350,10 @@ class MiniMaxM2RMSNormTP(nn.Module):
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
+        if self.minimax_opt:
+            param.data.copy_(loaded_weight)
+            return
+
         shard_id = self.attn_tp_rank // self.num_head_replicas
         shard_size = param.data.shape[0]
         shard_end = (shard_id + 1) * shard_size
@@ -382,7 +427,12 @@ class MiniMaxM2QKRMSNorm:
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
 
         self._forward_impl = self._forward_naive
-        if self._world_size > 1 and _is_cuda and use_fused_norm:
+        if (
+            not self._q_norm.minimax_opt
+            and self._world_size > 1
+            and _is_cuda
+            and use_fused_norm
+        ):
             occupancy = get_fused_parallel_qknorm_max_occupancy(
                 q_norm.weight.dtype,
                 self._world_size,
@@ -428,6 +478,32 @@ class MiniMaxM2QKRMSNorm:
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return self._forward_impl(q, k)
+
+    def forward_opt(self, q: torch.Tensor, k: torch.Tensor):
+        q, k = q.contiguous(), k.contiguous()
+        if _is_dcu:
+            q = fused_rms_norm_contiguous(
+                torch.empty_like(q), q, self._q_norm.weight, self._eps
+            )
+            k = fused_rms_norm_contiguous(
+                torch.empty_like(k), k, self._k_norm.weight, self._eps
+            )
+            return q, k
+
+        orig_dtype = q.dtype
+        q_f = q.float()
+        k_f = k.float()
+        q = (
+            q_f
+            * torch.rsqrt(q_f.pow(2).mean(dim=-1, keepdim=True) + self._eps)
+            * self._q_norm.weight
+        ).to(orig_dtype)
+        k = (
+            k_f
+            * torch.rsqrt(k_f.pow(2).mean(dim=-1, keepdim=True) + self._eps)
+            * self._k_norm.weight
+        ).to(orig_dtype)
+        return q, k
 
     def _forward_naive(self, q: torch.Tensor, k: torch.Tensor):
         q, k = q.contiguous(), k.contiguous()
@@ -533,6 +609,10 @@ class MiniMaxM2MoE(nn.Module):
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
+            if get_global_server_args().minimax_opt:
+                return self.forward_normal_opt(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
             return self.forward_normal(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
@@ -550,7 +630,7 @@ class MiniMaxM2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = _gate_fp32gemm(hidden_states, self.gate.weight)
             topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -565,12 +645,71 @@ class MiniMaxM2MoE(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+    def forward_normal_opt(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        local_tokens, hidden_dim = hidden_states.shape
+        num_tokens = local_tokens * self.tp_size
+        adtype = hidden_states.dtype
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        router_logits = _gate_fp32gemm(hidden_states, self.gate.weight)
+        topk_output = self.topk(hidden_states, router_logits)
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+        tp_group = get_tp_group()
+        i_q, i_s = per_token_quant_int8(hidden_states)
+
+        i_q = tp_group.all_gather(i_q, dim=0)
+        i_s = tp_group.all_gather(i_s, dim=0)
+        topk_weights = tp_group.all_gather(topk_weights, dim=0)
+        topk_ids = tp_group.all_gather(topk_ids, dim=0)
+
+        final_hidden_states = fused_experts_impl_int8_marlin_minimax_m2(
+            num_tokens,
+            hidden_dim,
+            hidden_states.device,
+            adtype,
+            self.experts.w13_weight,
+            self.experts.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=False,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            use_int8_w8a8=True,
+            per_channel_quant=True,
+            global_num_experts=self.experts.num_experts,
+            w1_scale=self.experts.w13_weight_scale,
+            w2_scale=self.experts.w2_weight_scale,
+            a1_scale=self.experts.w13_input_scale,
+            a2_scale=self.experts.w2_input_scale,
+            i_q=i_q,
+            i_s=i_s,
+            routed_scaling_factor=1.0,
+        )
+        if self.tp_size > 1:
+            chunks = final_hidden_states.chunk(self.tp_size)
+            reduced = torch.empty(
+                num_tokens // self.tp_size,
+                hidden_dim,
+                device=final_hidden_states.device,
+                dtype=final_hidden_states.dtype,
+            )
+            tp_group.reduce_scatter(reduced, list(chunks))
+            return reduced
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = _gate_fp32gemm(hidden_states, self.gate.weight)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -595,6 +734,9 @@ class MiniMaxM2MoE(nn.Module):
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):  # router_logits: (num_tokens, num_experts)
             state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            # state.router_logits = _gate_fp32gemm(
+            #     state.hidden_states_mlp_input, self.gate.weight
+            # )
         else:
             state.router_logits = None
 
@@ -727,6 +869,8 @@ class MiniMaxM2Attention(nn.Module):
         )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.q_size_full = self.total_num_heads * self.head_dim
+        self.kv_size_full = self.total_num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
@@ -741,28 +885,47 @@ class MiniMaxM2Attention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
 
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-            reduce_results=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("o_proj", prefix),
-        )
+        if get_global_server_args().minimax_opt:
+            self.qkv_proj = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=0,
+                tp_size=1,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+            self.o_proj = ReplicatedLinear(
+                self.total_num_heads * self.head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                self.hidden_size,
+                bias=False,
+                reduce_results=False,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("o_proj", prefix),
+            )
 
         # Setup RoPE with partial rotary dimension
         self.rotary_emb = get_rope(
@@ -807,17 +970,65 @@ class MiniMaxM2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ):
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, rms_weight=rms_weight, residual=residual)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self.qk_norm_impl.forward(q, k)
         q, k = self.rotary_emb(positions, q, k)
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
+    def forward_prepare_opt(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, forward_batch, None
+
+        attn_tp_group = get_attention_tp_group()
+        attn_tp_size = attn_tp_group.world_size
+        tokens_per_rank = hidden_states.shape[0]
+
+        qkv, _ = self.qkv_proj(hidden_states, rms_weight=rms_weight, residual=residual)
+        q, k, v = qkv.split(
+            [self.q_size_full, self.kv_size_full, self.kv_size_full], dim=-1
+        )
+        if self.use_qk_norm:
+            q, k = q.contiguous(), k.contiguous()
+            q, k = self.qk_norm_impl.forward_opt(q, k)
+        q, k = self.rotary_emb.forward_native(positions, q, k)
+
+        q = q.view(tokens_per_rank, attn_tp_size, self.q_size)
+        if self.total_num_kv_heads >= attn_tp_size:
+            k = k.view(tokens_per_rank, attn_tp_size, self.kv_size)
+            v = v.view(tokens_per_rank, attn_tp_size, self.kv_size)
+        else:
+            kv_replicas = attn_tp_size // self.total_num_kv_heads
+            k = k.view(tokens_per_rank, self.total_num_kv_heads, self.head_dim)
+            v = v.view(tokens_per_rank, self.total_num_kv_heads, self.head_dim)
+            k = k.repeat_interleave(kv_replicas, dim=1)
+            v = v.repeat_interleave(kv_replicas, dim=1)
+        qkv_by_head_rank = torch.cat([q, k, v], dim=-1).permute(1, 0, 2).contiguous()
+
+        qkv_restored = torch.empty_like(qkv_by_head_rank)
+        attn_tp_group.all_to_all_single(qkv_restored, qkv_by_head_rank)
+        qkv_restored = qkv_restored.view(
+            tokens_per_rank * attn_tp_size, self.q_size + 2 * self.kv_size
+        )
+        q, k, v = qkv_restored.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -866,17 +1077,53 @@ class MiniMaxM2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def forward_core_opt(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+
+        attn_output = self.attn(*inner_state)
+        attn_tp_group = get_attention_tp_group()
+        attn_tp_size = attn_tp_group.world_size
+        tokens_per_rank = attn_output.shape[0] // attn_tp_size
+
+        attn_output = attn_output.view(attn_tp_size, tokens_per_rank, self.q_size)
+        attn_output_restored = torch.empty_like(attn_output)
+        attn_tp_group.all_to_all_single(attn_output_restored, attn_output)
+        attn_output_restored = (
+            attn_output_restored.permute(1, 0, 2)
+            .contiguous()
+            .view(tokens_per_rank, attn_tp_size * self.q_size)
+        )
+
+        output, _ = self.o_proj(attn_output_restored)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if get_global_server_args().minimax_opt:
+            s = self.forward_prepare_opt(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                rms_weight=rms_weight,
+                residual=residual,
+            )
+            return self.forward_core_opt(s)
+
         if not _is_npu:
             s = self.forward_prepare(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                rms_weight=rms_weight,
+                residual=residual,
             )
         else:
             s = self.forward_prepare_npu(
@@ -887,11 +1134,18 @@ class MiniMaxM2Attention(nn.Module):
         return self.forward_core(s)
 
     def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
+        if get_global_server_args().minimax_opt:
+            state.attn_intermediate_state = self.forward_prepare_opt(
+                positions=state.positions,
+                hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+                forward_batch=state.forward_batch,
+            )
+        else:
+            state.attn_intermediate_state = self.forward_prepare(
+                positions=state.positions,
+                hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+                forward_batch=state.forward_batch,
+            )
 
     def op_core(self, state):
         state.hidden_states_after_attn = self.forward_core(
@@ -963,27 +1217,57 @@ class MiniMaxM2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        # Self Attention
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
+        if get_global_server_args().minimax_opt:
+            return self.forward_opt(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
             )
-        )
-        if not forward_batch.forward_mode.is_idle():
+
+        if _use_fused_rms_quant:
+            pre_norm = hidden_states.clone() if residual is None else residual
+            hidden_states, _ = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch, skip_layernorm=True
+            )
+            if residual is not None:
+                assert residual.shape[0] == hidden_states.shape[0], (
+                    f"Fused RMS quant requires hidden_states ({hidden_states.shape[0]}) "
+                    f"and residual ({residual.shape[0]}) to have the same token count. "
+                    f"Set SGLANG_USE_FUSED_RMS_QUANT=0 or disable --moe-a2a-backend."
+                )
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                rms_weight=self.input_layernorm.weight,
+                residual=residual,
             )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, pre_norm, forward_batch
+            )
+        else:
+            # Self Attention
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                )
+            )
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
-        # Fully Connected (MLP or MoE)
+            # Fully Connected (MLP or MoE)
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -1006,6 +1290,48 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+        return hidden_states, residual
+
+    def forward_opt(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
+
+        if _use_fused_rms_quant:
+            pre_norm = hidden_states.clone() if residual is None else residual
+            if residual is not None:
+                assert residual.shape[0] == hidden_states.shape[0], (
+                    f"Fused RMS quant requires hidden_states ({hidden_states.shape[0]}) "
+                    f"and residual ({residual.shape[0]}) to have the same token count."
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                rms_weight=self.input_layernorm.weight,
+                residual=residual,
+            )
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, pre_norm)
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual, None)
+
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
         return hidden_states, residual
 
     # TBO Operations for MiniMax Decoder Layer
@@ -1136,8 +1462,21 @@ class MiniMaxM2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        use_minimax_sp = get_global_server_args().minimax_opt
+        if use_minimax_sp:
+            attn_tp_group = get_attention_tp_group()
+            attn_tp_size = attn_tp_group.world_size
+            attn_tp_rank = attn_tp_group.rank_in_group
+            num_tokens = hidden_states.shape[0]
+            tokens_per_rank = num_tokens // attn_tp_size
+            start = attn_tp_rank * tokens_per_rank
+            hidden_states = hidden_states[start : start + tokens_per_rank]
+            positions = positions[start : start + tokens_per_rank]
+            if residual is not None:
+                residual = residual[start : start + tokens_per_rank]
+
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and not get_global_server_args().minimax_opt:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
@@ -1176,6 +1515,18 @@ class MiniMaxM2Model(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
             else:
                 hidden_states = self.norm(hidden_states)
+
+        if use_minimax_sp:
+            attn_tp_group = get_attention_tp_group()
+            attn_tp_size = attn_tp_group.world_size
+            hidden_states_gathered = torch.empty(
+                hidden_states.shape[0] * attn_tp_size,
+                hidden_states.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            attn_tp_group.all_gather_into_tensor(hidden_states_gathered, hidden_states)
+            hidden_states = hidden_states_gathered
 
         if len(aux_hidden_states) == 0:
             return hidden_states

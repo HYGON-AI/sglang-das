@@ -633,6 +633,9 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    pack_paged_kv_to_varlen: Literal["auto", "on", "off"] = "auto"
+    pack_paged_kv_to_varlen_min_kv_tokens: int = 16384
+    pack_paged_kv_to_varlen_min_q_tokens: int = 8192
     mamba_backend: str = "triton"
 
     # Speculative decoding
@@ -828,6 +831,8 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    # MiniMax M2 optimization: sequence-parallel prefill over TP ranks.
+    minimax_opt: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
@@ -6015,6 +6020,30 @@ class ServerArgs:
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
+            "--pack-paged-kv-to-varlen",
+            type=str,
+            choices=["auto", "on", "off"],
+            default=ServerArgs.pack_paged_kv_to_varlen,
+            help=(
+                "Control the optional path that packs paged KV cache into "
+                "contiguous varlen K/V and calls upstream flash_attn_varlen_func. "
+                "'auto' uses shape/platform heuristics, 'on' bypasses performance "
+                "heuristics but keeps correctness guards, and 'off' disables it."
+            ),
+        )
+        parser.add_argument(
+            "--pack-paged-kv-to-varlen-min-kv-tokens",
+            type=int,
+            default=ServerArgs.pack_paged_kv_to_varlen_min_kv_tokens,
+            help="Minimum total KV tokens required by the packed paged-KV varlen auto policy.",
+        )
+        parser.add_argument(
+            "--pack-paged-kv-to-varlen-min-q-tokens",
+            type=int,
+            default=ServerArgs.pack_paged_kv_to_varlen_min_q_tokens,
+            help="Minimum query tokens required by the packed paged-KV varlen auto policy.",
+        )
+        parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
@@ -7039,6 +7068,11 @@ class ServerArgs:
             "--enable-attn-tp-input-scattered",
             action="store_true",
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        )
+        parser.add_argument(
+            "--minimax-opt",
+            action="store_true",
+            help="Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
         )
         parser.add_argument(
             "--enable-nsa-prefill-context-parallel",

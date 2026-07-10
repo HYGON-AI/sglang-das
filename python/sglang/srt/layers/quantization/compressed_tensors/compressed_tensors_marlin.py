@@ -62,8 +62,17 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
     def override_quantization_method(
             cls, hf_quant_cfg, user_quant) -> Optional[str]:
         if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
+                and hf_quant_cfg.get("format") == "int-quantized" \
                 and user_quant == "slimquant_marlin":
             return cls.get_name()
+        if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
+                and user_quant == "slimquant_marlin":
+            logger.info(
+                "Using compressed-tensors quantization instead of "
+                "slimquant_marlin for model with format=%s.",
+                hf_quant_cfg.get("format"),
+            )
+            return "compressed-tensors"
         return None
     @classmethod
     def get_name(cls) -> str:

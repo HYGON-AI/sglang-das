@@ -522,7 +522,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
         mul_base *= 2
         num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
 
-    if require_gathered_buffer(server_args):
+    if require_gathered_buffer(server_args) or server_args.minimax_opt:
         mul_base *= get_attention_tp_size()
 
     if mul_base % get_attention_cp_size() != 0:
