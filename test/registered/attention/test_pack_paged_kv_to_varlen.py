@@ -8,6 +8,10 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
+from sglang.test.ci.ci_register import register_dcu_ci
+
+register_dcu_ci(est_time=60, suite="stage-b-test-1-gpu-small-dcu")
+
 
 def _import_pack_module():
     if not torch.cuda.is_available():

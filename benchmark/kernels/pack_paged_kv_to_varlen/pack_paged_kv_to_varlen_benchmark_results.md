@@ -20,11 +20,11 @@ correctness guards.
 
 ## Benchmark Setup
 
-- Script: `test/registered/attention/bench_pack_paged_kv_to_varlen.py`
+- Script: `benchmark/kernels/pack_paged_kv_to_varlen/bench_pack_paged_kv_to_varlen.py`
 - Kernel-gap command:
 
 ```bash
-python3 test/registered/attention/bench_pack_paged_kv_to_varlen.py --kernel-gap
+python3 benchmark/kernels/pack_paged_kv_to_varlen/bench_pack_paged_kv_to_varlen.py --kernel-gap
 ```
 
 - Dtype: fp16
