@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import copy
@@ -34,7 +48,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_musa, next_power_of_2
+
+_is_hcu = is_hcu()
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -440,9 +456,11 @@ class NgramVerifyInput(SpecInput):
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            build_label = "HCU/HIP" if _is_hcu else "AMD/HIP"
             logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
+                "Tree speculative sampling kernel unavailable (likely %s build). "
+                "Falling back to greedy verification.",
+                build_label,
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:

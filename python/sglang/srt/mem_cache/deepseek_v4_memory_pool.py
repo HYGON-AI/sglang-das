@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -6,7 +20,11 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.deepseek_v4 import (
+    fused_k_norm_rope_flashmla,
+    fused_norm_rope_inplace,
+    fused_store_cache,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import (
@@ -17,6 +35,10 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.utils import (
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_masked,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
 
@@ -89,6 +111,9 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.is_bf16_attention_kv_cache:
+            return self.logical_kv_dim * torch._utils._element_size(self.dtype)
+
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -97,8 +122,26 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         return dim_per_token
 
+    @property
+    def is_bf16_attention_kv_cache(self) -> bool:
+        return self.dtype == torch.bfloat16
+
+    @property
+    def logical_kv_dim(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
+        if self.is_bf16_attention_kv_cache:
+            self.kv_cache_total_dim = self.logical_kv_dim
+            self.bytes_per_page_padded = self.page_size * bytes_per_token
+            return torch.zeros(
+                num_pages,
+                self.page_size * self.logical_kv_dim,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
@@ -122,6 +165,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        assert not self.is_bf16_attention_kv_cache
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -134,7 +178,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
+        if self.is_bf16_attention_kv_cache:
+            return self.set_key_buffer_bf16(layer_id, loc, cache_k, valid_mask)
+
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -142,6 +190,56 @@ class DeepSeekV4SingleKVPool(KVCache):
             page_size=self.page_size,
             type="flashmla",
         )
+
+    def set_key_buffer_lightop_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> None:
+        from lightop import op
+
+        op.quantize_nope_fp8_rope_bf16_pack_store(
+            cache_k,
+            self.kv_buffer[layer_id],
+            loc,
+            self.page_size,
+            eps,
+        )
+
+    def set_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        assert self.is_bf16_attention_kv_cache
+        assert cache_k.shape[-1] == self.logical_kv_dim, (
+            f"expected cache_k last dim {self.logical_kv_dim}, got {cache_k.shape}"
+        )
+        values = cache_k.to(torch.bfloat16).contiguous().view(-1, self.logical_kv_dim)
+        n_values = values.shape[0]
+        assert loc.numel() == n_values, (
+            f"expected loc to match cache_k rows, got {loc.numel()=} {n_values=}"
+        )
+        if n_values == 0:
+            return
+        kv_buffer = self.kv_buffer[layer_id].view(-1, self.logical_kv_dim)
+        loc = loc.long()
+        cache_k_nope = values[..., : self.qk_nope_head_dim]
+        cache_k_rope = values[..., self.qk_nope_head_dim :]
+        if valid_mask is None:
+            set_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_triton_masked(
+                kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                valid_mask.contiguous(),
+            )
 
     def get_key_buffer(self, layer_id: int):
         return self.kv_buffer[layer_id]
@@ -228,9 +326,10 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().set_key_buffer_fused(layer_id, loc, cache_k)
+        return super().set_key_buffer_fused(layer_id, loc, cache_k, valid_mask)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -481,6 +580,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
         self.cached_loc = None
+
+    @property
+    def is_bf16_attention_kv_cache(self) -> bool:
+        return self.swa_kv_pool.is_bf16_attention_kv_cache
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
@@ -772,6 +875,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             swa_loc = self.cached_loc
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if self.is_bf16_attention_kv_cache:
+            kv = kv.contiguous()
+            fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+            return self.swa_kv_pool.set_key_buffer_fused(
+                self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -783,15 +892,48 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             page_size=self.swa_kv_pool.page_size,
         )
 
+    def set_swa_key_buffer_radix_lightop_fused(
+        self,
+        layer_id: int,
+        raw_loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> None:
+        if self._should_cache_swa:
+            if layer_id == self.start_layer or self.cached_loc is None:
+                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
+            swa_loc = self.cached_loc
+        else:
+            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        return self.swa_kv_pool.set_key_buffer_lightop_fused(
+            self._swa_local_layer_id(layer_id), swa_loc, cache_k, eps
+        )
+
     def set_extra_key_buffer_fused(
         self,
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
-        return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
+        return compress_kv_pool.set_key_buffer_fused(
+            compress_layer_id, loc, cache_k, valid_mask
+        )
+
+    def set_extra_key_buffer_lightop_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> None:
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.set_key_buffer_lightop_fused(
+            compress_layer_id, loc, cache_k, eps
+        )
 
     def set_index_k_fused(
         self,

@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -euo pipefail
 
 # Start a DCU CI container.
@@ -15,6 +29,10 @@ set -euo pipefail
 #   DCU_DEVICE_FLAGS / DCU_CI_DEVICE_FLAGS    Additional `--device ...` flags.
 #   DCU_CI_VISIBLE_DEVICES                    Comma-separated DCU devices to expose.
 #   DCU_CACHE_HOST / DCU_CI_CACHE_HOST         Host-side cache directory mounted into /sgl-data.
+#   DCU_WHEEL_STAGING_ROOT                  Host-side PR wheel staging directory.
+#   DCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
+#   DCU_MODEL_EXTRA_HOST_PATHS              Colon-separated host model roots to mount read-only
+#                                           at the same path inside the container.
 
 CUSTOM_IMAGE=""
 CONTAINER="${DCU_CI_CONTAINER:-${DCU_CI_CONTAINER_NAME:-ci_sglang}}"
@@ -85,6 +103,30 @@ else
   MODEL_VOLUME=""
 fi
 
+WHEEL_STAGING_HOST="${DCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
+WHEEL_STAGING_CONTAINER="${DCU_WHEEL_STAGING_CONTAINER_ROOT:-/dcu-wheel-staging}"
+if [[ -n "${WHEEL_STAGING_HOST}" ]]; then
+  mkdir -p "${WHEEL_STAGING_HOST}" || true
+  WHEEL_STAGING_VOLUME="-v ${WHEEL_STAGING_HOST}:${WHEEL_STAGING_CONTAINER}:ro"
+else
+  WHEEL_STAGING_VOLUME=""
+fi
+
+EXTRA_MODEL_VOLUMES=()
+if [[ -n "${DCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
+  IFS=':' read -r -a EXTRA_MODEL_HOST_PATHS <<< "${DCU_MODEL_EXTRA_HOST_PATHS}"
+  for extra_model_path in "${EXTRA_MODEL_HOST_PATHS[@]}"; do
+    if [[ -z "${extra_model_path}" ]]; then
+      continue
+    fi
+    if [[ -d "${extra_model_path}" ]]; then
+      EXTRA_MODEL_VOLUMES+=(-v "${extra_model_path}:${extra_model_path}:ro")
+    else
+      echo "Warning: extra DCU model path does not exist, skip mount: ${extra_model_path}" >&2
+    fi
+  done
+fi
+
 # Remove any leftover container from a previous run.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
@@ -98,6 +140,8 @@ docker run -dt --user root --privileged \
   -v /opt/hyhal:/opt/hyhal:ro \
   ${CACHE_VOLUME} \
   ${MODEL_VOLUME} \
+  ${WHEEL_STAGING_VOLUME} \
+  "${EXTRA_MODEL_VOLUMES[@]}" \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \

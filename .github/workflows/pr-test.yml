@@ -1,45 +1,7 @@
 name: PR Test
 
 on:
-  schedule:
-    - cron: '0 1,9,17 * * *'  # Run 3x daily: 2am / 10am / 6pm Pacific (PDT)
-  pull_request:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      force_continue_on_error:
-        description: "Force continue-on-error (test scheduled CI behavior)"
-        required: false
-        type: boolean
-        default: false
-      test_parallel_dispatch:
-        description: "Test parallel dispatch behavior (simulates scheduled run)"
-        required: false
-        type: boolean
-        default: false
-      run_all_tests:
-        description: "Run all tests (mirrors the scheduled cron's behavior — combine with test_parallel_dispatch for full sim)"
-        required: false
-        type: boolean
-        default: false
-  workflow_call:
-    inputs:
-      git_ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
-        required: false
-        type: string
-        default: ''
-      run_all_tests:
-        description: "Run all tests (for releasing or testing purpose)"
-        required: false
-        type: boolean
-        default: false
-      skip_stage_health_check:
-        description: "Skip stage health check fast-fail (e.g. for release branch cuts)"
-        required: false
-        type: boolean
-        default: false
-
 concurrency:
   # Concurrency group structure: pr-test-{event}-{branch}-{git_ref}
   # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'

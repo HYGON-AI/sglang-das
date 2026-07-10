@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -146,9 +160,9 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         else:
             self.swa_v_head_dim = None
-            if hasattr(model_runner.token_to_kv_pool, 'v_head_dim'):
-                self.v_head_dim = model_runner.token_to_kv_pool.v_head_dim #nhb
-            elif hasattr(model_runner.token_to_kv_pool, 'get_value_buffer'):
+            if hasattr(model_runner.token_to_kv_pool, "v_head_dim"):
+                self.v_head_dim = model_runner.token_to_kv_pool.v_head_dim
+            elif hasattr(model_runner.token_to_kv_pool, "get_value_buffer"):
                 try:
                     self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
                 except KeyError:

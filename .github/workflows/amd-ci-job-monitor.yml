@@ -1,24 +1,7 @@
 name: AMD CI Job Monitor
 
 on:
-  schedule:
-    - cron: '0 0 * * *'  # Daily at midnight UTC
-  pull_request:
-    paths:
-      - '.github/workflows/amd-ci-job-monitor.yml'
-      - 'scripts/ci/utils/query_job_status.py'
   workflow_dispatch:
-    inputs:
-      hours:
-        description: 'Time window in hours'
-        required: false
-        default: '24'
-        type: string
-      job_filter:
-        description: 'Job name filter (leave empty for all AMD jobs)'
-        required: false
-        type: string
-
 jobs:
   fetch-actions-data:
     name: Fetch Actions Snapshot

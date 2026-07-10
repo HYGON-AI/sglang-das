@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Memory pool configurators for profiling and sizing KV cache pools.
 
 Each model architecture has its own configurator that computes pool sizes
@@ -320,6 +334,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.compression_ratios = cfg.compress_ratios
+        self.kv_cache_dtype = mr.kv_cache_dtype
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
@@ -363,7 +378,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self.kv_cache_dtype == torch.bfloat16:
+            kv_bytes = (
+                self.qk_nope_head_dim + self.qk_rope_head_dim
+            ) * torch._utils._element_size(self.kv_cache_dtype)
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
         indexer_bytes = (

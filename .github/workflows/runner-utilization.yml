@@ -1,24 +1,7 @@
 name: Runner Utilization Report
 
 on:
-  schedule:
-    - cron: '0 8 * * *'  # Daily at 8 AM UTC
-  pull_request:
-    paths:
-      - '.github/workflows/runner-utilization.yml'
-      - 'scripts/ci/utils/runner_utilization_report.py'
   workflow_dispatch:
-    inputs:
-      hours:
-        description: 'Time window in hours'
-        required: false
-        default: '24'
-        type: string
-      filter:
-        description: 'Filter runner labels (e.g., 5090, h200)'
-        required: false
-        type: string
-
 jobs:
   report:
     name: Generate Report

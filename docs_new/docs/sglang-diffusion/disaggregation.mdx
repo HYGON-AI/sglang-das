@@ -104,36 +104,36 @@ The exact same CLI pattern — just replace `127.0.0.1` with actual IPs and add
 RDMA flags for direct transfer:
 
 ```bash
-# Machine A (10.0.0.1): Encoder
+# Machine A (203.0.113.11): Encoder
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role encoder \
-    --disagg-server-addr tcp://10.0.0.4:19655 \
+    --disagg-server-addr tcp://203.0.113.14:19655 \
     --scheduler-port 19000 \
     --num-gpus 1 \
-    --disagg-p2p-hostname 10.0.0.1 --disagg-ib-device mlx5_0
+    --disagg-p2p-hostname 203.0.113.11 --disagg-ib-device mlx5_0
 
-# Machine B (10.0.0.2): Denoiser (4 GPUs with SP)
+# Machine B (203.0.113.12): Denoiser (4 GPUs with SP)
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role denoiser \
-    --disagg-server-addr tcp://10.0.0.4:19655 \
+    --disagg-server-addr tcp://203.0.113.14:19655 \
     --scheduler-port 19001 \
     --num-gpus 4 --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2 \
-    --disagg-p2p-hostname 10.0.0.2 --disagg-ib-device mlx5_0
+    --disagg-p2p-hostname 203.0.113.12 --disagg-ib-device mlx5_0
 
-# Machine C (10.0.0.3): Decoder
+# Machine C (203.0.113.13): Decoder
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role decoder \
-    --disagg-server-addr tcp://10.0.0.4:19655 \
+    --disagg-server-addr tcp://203.0.113.14:19655 \
     --scheduler-port 19002 \
     --num-gpus 1 \
-    --disagg-p2p-hostname 10.0.0.3 --disagg-ib-device mlx5_0
+    --disagg-p2p-hostname 203.0.113.13 --disagg-ib-device mlx5_0
 
-# Machine D (10.0.0.4): DiffusionServer head
+# Machine D (203.0.113.14): DiffusionServer head
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
     --disagg-role server \
-    --encoder-urls  "tcp://10.0.0.1:19000" \
-    --denoiser-urls "tcp://10.0.0.2:19001" \
-    --decoder-urls  "tcp://10.0.0.3:19002" \
+    --encoder-urls  "tcp://203.0.113.11:19000" \
+    --denoiser-urls "tcp://203.0.113.12:19001" \
+    --decoder-urls  "tcp://203.0.113.13:19002" \
     --host 0.0.0.0 --port 30000 \
     --scheduler-port 19655 \
     --disagg-dispatch-policy max_free_slots
@@ -148,9 +148,9 @@ Use semicolons in `--*-urls` to register multiple instances:
 ```bash
 # 2 encoders + 2 denoisers (4-GPU SP each) + 1 decoder
 sglang serve --model-path ... --disagg-role server \
-    --encoder-urls  "tcp://10.0.0.1:35000;tcp://10.0.0.2:35000" \
-    --denoiser-urls "tcp://10.0.0.3:35000;tcp://10.0.0.4:35000" \
-    --decoder-urls  "tcp://10.0.0.5:35000"
+    --encoder-urls  "tcp://203.0.113.11:35000;tcp://203.0.113.12:35000" \
+    --denoiser-urls "tcp://203.0.113.13:35000;tcp://203.0.113.14:35000" \
+    --decoder-urls  "tcp://203.0.113.15:35000"
 ```
 
 ## Port Convention

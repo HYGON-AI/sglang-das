@@ -1,25 +1,6 @@
 name: DCU Full Enabled
 
 on:
-  pull_request:
-    types:
-      - labeled
-      - synchronize
-      - reopened
-      - ready_for_review
-    branches:
-      - v0.5.12_dev
-      - main
-      - dcu-ci-pr
-    paths:
-      - ".github/workflows/dcu-full-enabled.yml"
-      - ".github/workflows/pr-test-dcu.yml"
-      - "scripts/ci/dcu/**"
-      - "python/pyproject*.toml"
-      - "python/sglang/**"
-      - "test/run_suite.py"
-      - "test/registered/**"
-      - "sgl-kernel/**"
   workflow_dispatch:
     inputs:
       ref:
@@ -42,6 +23,11 @@ on:
         required: false
         type: boolean
         default: true
+      force_wheel_mode:
+        description: "Force waiting for and installing current commit DCU wheels"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -96,9 +82,26 @@ jobs:
       continue_on_error_flag: ${{ steps.resolve.outputs.continue_on_error_flag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+        env:
+          CHECKOUT_REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-full-validate"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Resolve DCU runner and image
         id: resolve
@@ -142,30 +145,169 @@ jobs:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
           DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
           DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
-        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+        run: |
+          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
+              --image "${DCU_CI_IMAGE}" \
+              --container-name "${DCU_CI_CONTAINER_NAME}"
 
       - name: Verify DCU registration in container
         env:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
-        run: bash scripts/ci/dcu/dcu_ci_exec.sh --container-name "${DCU_CI_CONTAINER_NAME}" -w /sglang-checkout -- python3 scripts/ci/dcu/verify_dcu_registration.py
+        run: |
+          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" \
+            --container-name "${DCU_CI_CONTAINER_NAME}" \
+            -w /sglang-checkout \
+            -- python3 scripts/ci/dcu/verify_dcu_registration.py
 
       - name: Cleanup DCU validation container
         if: always()
         env:
           DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+
+  wait-dcu-wheels:
+    name: Wait DCU wheels
+    needs: validate-config
+    if: needs.validate-config.result == 'success' && inputs.force_wheel_mode == true
+    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    outputs:
+      wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
+    env:
+      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
+      CHECKOUT_REF: ${{ inputs.ref || github.sha }}
+    steps:
+      - name: Checkout code
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
+          set -euo pipefail
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-full-wait-wheels"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
+
+      - name: Resolve wheel target SHA
+        id: sha
+        run: |
+          set -euo pipefail
+          full_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
+          short_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
+          echo "full_sha=${full_sha}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Using wheel SHA: ${full_sha} (${short_sha})"
+
+      - name: Wait for current commit DCU wheels
+        id: wait
+        run: |
+          set -euo pipefail
+          full_sha="${{ steps.sha.outputs.full_sha }}"
+          short_sha="${{ steps.sha.outputs.short_sha }}"
+          export DCU_WHEEL_TARGET_SHA="${full_sha}"
+          export DCU_WHEEL_TARGET_SHORT_SHA="${short_sha}"
+          echo "Waiting for locally staged DCU wheels for ${full_sha}"
+          echo "Host staging root: ${DCU_WHEEL_STAGING_ROOT}"
+
+          python3 - <<'PY_WAIT' | tee /tmp/dcu_wheel_paths.out
+          import os
+          import pathlib
+          import sys
+          import time
+
+          root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
+          container_root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_CONTAINER_ROOT", "/dcu-wheel-staging"))
+          target_sha = os.environ["DCU_WHEEL_TARGET_SHA"]
+          short_sha = os.environ.get("DCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
+          repo = os.environ["GITHUB_REPOSITORY"]
+          owner, repo_name = repo.split("/", 1)
+          repo_key = f"{owner}_{repo_name}"
+          gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
+          timeout_s = int(os.environ.get("DCU_WHEEL_WAIT_TIMEOUT", "3600"))
+          interval_s = int(os.environ.get("DCU_WHEEL_WAIT_INTERVAL", "60"))
+
+          requirements = ["sglang", "sgl-kernel"]
+          if gateway_required:
+              requirements.append("sgl-model-gateway")
+
+          def wheel_kind(path: pathlib.Path):
+              name = path.name.replace("-", "_")
+              if name.startswith(("sgl_kernel_", "sglang_kernel_")):
+                  return "sgl-kernel"
+              if name.startswith("sgl_model_gateway_"):
+                  return "sgl-model-gateway"
+              if name.startswith("sglang_"):
+                  return "sglang"
+              return None
+
+          def to_container_path(path: pathlib.Path) -> str:
+              return str(container_root / path.relative_to(root))
+
+          def candidate_dirs():
+              base = root / repo_key
+              return sorted(
+                  [path for path in base.glob(f"pr-*/{target_sha}") if path.is_dir()],
+                  key=lambda path: path.stat().st_mtime,
+                  reverse=True,
+              )
+
+          deadline = time.time() + timeout_s
+          while time.time() < deadline:
+              candidates = candidate_dirs()
+              if not candidates:
+                  print(f"[wait-dcu-wheels] no staged dirs under {root / repo_key}/pr-*/{target_sha}", file=sys.stderr)
+              for staging_dir in candidates:
+                  ready = staging_dir / "READY"
+                  wheel_dir = staging_dir / "wheels"
+                  if not ready.exists():
+                      print(f"[wait-dcu-wheels] {staging_dir} has no READY", file=sys.stderr)
+                      continue
+                  if not wheel_dir.is_dir():
+                      print(f"[wait-dcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
+                      continue
+                  found = {}
+                  for wheel in sorted(wheel_dir.glob("*.whl")):
+                      kind = wheel_kind(wheel)
+                      if kind and kind not in found:
+                          found[kind] = wheel
+                  missing = [name for name in requirements if name not in found]
+                  if not missing:
+                      paths = [to_container_path(found[name]) for name in requirements]
+                      print(f"[wait-dcu-wheels] found staged wheels in {staging_dir}: {' '.join(paths)}", file=sys.stderr)
+                      print(" ".join(paths))
+                      sys.exit(0)
+                  print(f"[wait-dcu-wheels] {staging_dir} missing {missing}; found={list(found)}", file=sys.stderr)
+              print(f"[wait-dcu-wheels] waiting for local staged wheels for {short_sha}; sleep {interval_s}s", file=sys.stderr)
+              time.sleep(interval_s)
+
+          print(f"Timed out waiting for locally staged DCU wheels for {target_sha}", file=sys.stderr)
+          sys.exit(1)
+          PY_WAIT
+          wheel_urls="$(tail -n 1 /tmp/dcu_wheel_paths.out)"
+          if [[ -z "${wheel_urls}" ]]; then
+            echo "No local staged wheel paths were produced." >&2
+            exit 1
           fi
+          echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
   full-enabled-dcu:
     name: Full enabled DCU (${{ matrix.name }})
-    needs: validate-config
-    if: needs.validate-config.result == 'success'
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    needs:
+      - validate-config
+      - wait-dcu-wheels
+    if: always() && needs.validate-config.result == 'success' && (needs.wait-dcu-wheels.result == 'success' || needs.wait-dcu-wheels.result == 'skipped')
+    runs-on: ${{ needs.validate-config.outputs.runner_label }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -291,6 +433,133 @@ jobs:
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
+          - name: nightly-dcu-2gpu
+            suite: nightly-dcu-2-gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 1200
+            timeout_minutes: 90
+          - name: core-functional
+            suite: nightly-dcu-core-functional
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 3000
+            timeout_minutes: 90
+          - name: accuracy-text-0
+            suite: nightly-dcu-accuracy-text
+            nightly: "true"
+            part: 0
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: accuracy-text-1
+            suite: nightly-dcu-accuracy-text
+            nightly: "true"
+            part: 1
+            parts: 2
+            timeout_per_file: 7800
+            timeout_minutes: 300
+          - name: perf-text-0
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 0
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-1
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 1
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-2
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 2
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-3
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 3
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: perf-text-4
+            suite: nightly-dcu-perf-text
+            nightly: "true"
+            part: 4
+            parts: 5
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-4gpu
+            suite: nightly-dcu-large-model-4gpu
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 7800
+            timeout_minutes: 180
+            visible_devices: "4,5,6,7"
+          - name: large-model-8gpu-0
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 0
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-1
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 1
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-2
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 2
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: large-model-8gpu-3
+            suite: nightly-dcu-large-model-8gpu
+            nightly: "true"
+            part: 3
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-0
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 0
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-1
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 1
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-2
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 2
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
+          - name: quant-opt-3
+            suite: nightly-dcu-quant-opt
+            nightly: "true"
+            part: 3
+            parts: 4
+            timeout_per_file: 15000
+            timeout_minutes: 480
     env:
       DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
@@ -298,7 +567,11 @@ jobs:
       DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
       DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      DCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
+      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
+      DCU_CI_USE_INSTALLED_WHEELS: ${{ inputs.force_wheel_mode == true && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -306,9 +579,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/".[!.]* "${GITHUB_WORKSPACE:?}/"..?* 2>/dev/null || true
-          git init "${GITHUB_WORKSPACE}"
-          cd "${GITHUB_WORKSPACE}"
+          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-full-${{ matrix.name }}"
+          rm -rf "${CHECKOUT_DIR}"
+          mkdir -p "${CHECKOUT_DIR}"
+          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          git init "${CHECKOUT_DIR}"
+          cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
@@ -320,10 +596,14 @@ jobs:
           git checkout --force FETCH_HEAD
 
       - name: Setup DCU container
-        run: bash scripts/ci/dcu/dcu_ci_start_container.sh --image "${DCU_CI_IMAGE}" --container-name "${DCU_CI_CONTAINER_NAME}"
+        run: |
+          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
+            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
+              --image "${DCU_CI_IMAGE}" \
+              --container-name "${DCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash scripts/ci/dcu/dcu_ci_install_dependency.sh
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
 
       - name: Run full enabled DCU suite
         run: |
@@ -333,7 +613,7 @@ jobs:
           fi
 
           echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }} nightly=${{ matrix.nightly }}"
-          bash scripts/ci/dcu/dcu_ci_exec.sh -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw dcu \
               --suite "${{ matrix.suite }}" \
@@ -345,19 +625,14 @@ jobs:
 
       - name: Cleanup DCU container
         if: always()
-        run: |
-          if docker ps -a --format '{{.Names}}' | grep -Fxq "${DCU_CI_CONTAINER_NAME}"; then
-            host_uid="$(id -u)"
-            host_gid="$(id -g)"
-            docker exec "${DCU_CI_CONTAINER_NAME}" bash -lc "chown -R ${host_uid}:${host_gid} /sglang-checkout || true" || true
-            docker rm -f "${DCU_CI_CONTAINER_NAME}"
-          fi
+        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
 
   dcu-full-enabled-finish:
     name: DCU Full Enabled finish
     needs:
       - check-full-trigger
       - validate-config
+      - wait-dcu-wheels
       - full-enabled-dcu
     if: always()
     runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}

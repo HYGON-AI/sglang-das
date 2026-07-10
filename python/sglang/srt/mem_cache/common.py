@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +30,8 @@ from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils import support_triton,get_bool_env_var
 from sgl_kernel.kvcacheio import dcu_get_last_loc
-
+from sglang.srt.utils import is_dcu
+_is_dcu = is_dcu()
 _is_hip = is_hip()
 
 if TYPE_CHECKING:
@@ -160,7 +175,7 @@ def get_last_loc(
     attn_backend = get_global_server_args().attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
-    if _is_hip and uses_triton_dispatch:
+    if _is_hip and uses_triton_dispatch and not _is_dcu:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +

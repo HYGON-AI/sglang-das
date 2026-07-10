@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Int8MoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -723,9 +724,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
             else:
-                raise NotImplementedError(
-                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
-                )
+                logger.info_once("Using CompressedTensorsW8A8Int8MoE")
+                return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")

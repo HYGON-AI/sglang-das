@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_norm.py
 
 import sys
@@ -138,6 +152,23 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+def l2norm_ref(x, eps=1e-6):
+    return x / (x.float().pow(2).sum(-1, keepdim=True) + eps).sqrt().to(x.dtype)
+
+
+@pytest.mark.parametrize("num_rows", [16, 256, 16384, 65536])
+@pytest.mark.parametrize("hidden_size", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_l2norm(num_rows, hidden_size, dtype):
+    x = torch.randn(num_rows, hidden_size, dtype=dtype, device="cuda")
+    y_ref = l2norm_ref(x)
+    y = sgl_kernel.l2norm(x)
+    if dtype == torch.bfloat16:
+        torch.testing.assert_close(y_ref.float(), y.float(), rtol=1e-2, atol=2e-3)
+    else:
+        torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

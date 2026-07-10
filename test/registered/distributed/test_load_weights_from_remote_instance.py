@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Test loading weights from remote instance.
 
 This test suite simulates loading weights from a remote instance.
@@ -26,12 +40,11 @@ import torch.multiprocessing as mp
 import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
 register_dcu_ci(
-    est_time=120,
-    suite="nightly-dcu",
+    est_time=240,
+    suite="nightly-dcu-2-gpu",
     nightly=True,
-    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+    disabled="DCU nightly disabled: remote weight loading OOMs or times out on BW1100; pending fix.",
 )
 
 from sglang.test.test_utils import (
@@ -49,6 +62,28 @@ mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
+
+
+def _dcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return {}
+    return {
+        "attention_backend": "fa3",
+        "page_size": 64,
+        "trust_remote_code": True,
+    }
+
+
+def _dcu_server_args():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return ()
+    return (
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--trust-remote-code",
+    )
 
 
 def verify_params_close(params1, params2, error_msg):
@@ -138,7 +173,8 @@ def init_process_seed(
             "--tp-size",
             str(tp_size),
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
-        ),
+        )
+        + _dcu_server_args(),
     )
     torch.cuda.synchronize()
 
@@ -205,6 +241,7 @@ def init_process_dst(
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
             remote_instance_weight_loader_start_seed_via_transfer_engine=False,
+            **_dcu_engine_kwargs(),
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -237,7 +274,8 @@ def init_process_dst(
                 "--remote-instance-weight-loader-start-seed-via-transfer-engine",
                 "--engine-info-bootstrap-port",
                 str(6789 + rank),
-            ),
+            )
+            + _dcu_server_args(),
         )
     torch.cuda.synchronize()
 

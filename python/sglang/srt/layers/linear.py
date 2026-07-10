@@ -57,6 +57,7 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
 _use_fused_bailing_silu_mul_fp8_quant = get_bool_env_var("SGLANG_USE_FUSED_BAILING_SILU_MUL_FP8_QUANT")
+_use_fused_dpskv4_silu_mul_fp8_quant = get_bool_env_var("SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT")
 
 if _use_fused_rms_quant:
     try:
@@ -69,10 +70,10 @@ if _use_fused_silu_mul_quant:
     except Exception as e:
         print(f"Error: Import fused silu_mul_quant error: {e}")
 
-if _use_fused_bailing_silu_mul_fp8_quant:
+if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
     from lightop import fuse_silu_mul_fp8_quant
 
-if _use_fused_bailing_silu_mul_fp8_quant:
+if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
     import deepgemm
 
 logger = logging.getLogger(__name__)

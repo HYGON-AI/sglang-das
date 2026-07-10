@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import itertools
 import sys
 
@@ -12,7 +26,20 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+def is_hcu() -> bool:
+    if not is_hip():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
+        return any(gfx in gcn_arch for gfx in ("gfx936", "gfx938", "gfx928"))
+    except Exception:
+        return False
+
+
 _is_hip = is_hip()
+_is_hcu = is_hcu()
+_hip_skip_reason = "Skip for HCU device" if _is_hcu else "Skip for AMD GPU"
 
 
 def ceil_div(a, b):
@@ -260,7 +287,7 @@ def test_moe_align_block_size_compare_implementations(
 @pytest.mark.parametrize("topk", [2, 6])
 @pytest.mark.parametrize("k", [128, 511, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
+@pytest.mark.skipif(_is_hip, reason=_hip_skip_reason)
 def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
     input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
     actual = torch.empty((m, k), device="cuda", dtype=dtype)

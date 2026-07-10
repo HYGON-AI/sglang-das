@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -432,14 +446,14 @@ def _set_k_and_s_triton(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
 
-    if _is_hip and not _is_dcu: #nhb
+    if _is_hip and not _is_dcu:
         assert buf_numel_per_page == 1 * (128 + 4)
     else:
         assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
-    if _is_hip and not _is_dcu: #nhb
+    if _is_hip and not _is_dcu:
         assert page_size == 1
     else:
         assert page_size == 64

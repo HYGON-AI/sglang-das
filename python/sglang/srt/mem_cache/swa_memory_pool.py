@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 from typing import Dict, List, Optional, Tuple
 
@@ -613,9 +627,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        has_swa = swa_indices > 0
+        free_index = free_index[has_swa]
+        swa_indices = swa_indices[has_swa]
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices)
+            freed_swa_pages = torch.unique(
+                swa_indices // self.swa_attn_allocator.page_size
+            )
+            all_swa = self.full_to_swa_index_mapping
+            all_swa_pages = all_swa // self.swa_attn_allocator.page_size
+            stale = torch.isin(all_swa_pages, freed_swa_pages) & (all_swa > 0)
+            if stale.any():
+                self.full_to_swa_index_mapping[stale] = 0
+        else:
+            self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
         return [

@@ -41,20 +41,20 @@ from unittest.mock import patch
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
     is_cuda_alike,
+    is_dcu,
     is_hip,
     is_musa,
-    is_dcu,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -62,7 +62,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 
-from sglang.srt.utils import get_bool_env_var
 _use_fused_reshape_to_float = get_bool_env_var("SGLANG_USE_FUSED_RESHAPE_TO_FLOAT")
 
 _is_npu = is_npu()
@@ -73,6 +72,9 @@ _is_musa = is_musa()
 use_quick_custom_allreduce = get_bool_env_var(
     "SGLANG_USE_QUICK_CUSTOM_ALLREDUCE", default="false"
 )
+_ATTN_TP_USE_AITER_CUSTOM_COMM = get_bool_env_var(
+    "SGLANG_ENABLE_ATTN_TP_USE_AITER_CUSTOM_COMM"
+)  # all_reduce reduce_scatter all_gather
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -346,7 +348,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            dispatch_custom_allreduce, DCUCustomAllreduce
+            dispatch_custom_allreduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -393,17 +395,11 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                if is_hip() and ops.use_dcu_custom_allreduce:
-                    self.ca_comm = DCUCustomAllreduce(
-                        group=self.cpu_group,
-                        device=self.device,
-                    )
-                else:
-                    CAClass = dispatch_custom_allreduce()
-                    self.ca_comm = CAClass(
-                        group=self.cpu_group,
-                        device=self.device,
-                    )
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
@@ -751,6 +747,21 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if _ATTN_TP_USE_AITER_CUSTOM_COMM:
+            ca_comm = self.ca_comm
+            if (
+                ca_comm is not None
+                and not ca_comm.disabled
+                and ca_comm.should_custom_ar(input)
+            ):
+                if ca_comm._IS_CAPTURING:
+                    if torch.cuda.is_current_stream_capturing():
+                        ca_comm.reduce_scatter(input, output, registered=True)
+                        return output
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                    return output
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -815,6 +826,24 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if _ATTN_TP_USE_AITER_CUSTOM_COMM:
+            ca_comm = self.ca_comm
+            # Only use aiter all_gather for small tensors (decode); prefill
+            # performance is worse than NCCL for large tensors.
+            if (
+                ca_comm is not None
+                and not ca_comm.disabled
+                and ca_comm.should_custom_ag(input)
+                and input.numel() <= 256 * 6144  # ~3 MB, typical decode batch
+            ):
+                if ca_comm._IS_CAPTURING:
+                    if torch.cuda.is_current_stream_capturing():
+                        ca_comm.all_gather_reg(input, out=output)
+                        return
+                else:
+                    ca_comm.all_gather_unreg(input, out=output)
+                    return
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -922,11 +951,18 @@ class GroupCoordinator:
 
         if _is_dcu and _use_fused_reshape_to_float:
             from lightop import op
-            vocab_size = input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+
+            vocab_size = (
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
             output_tensor = op.reshape_to_float(output_tensor, vocab_size[1])
         else:
             output_tensor = output_tensor.reshape(
-                input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
             )
         return output_tensor
 
@@ -1946,7 +1982,7 @@ def initialize_model_parallel(
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_mscclpp_allreduce=False,
-            use_custom_allreduce=False,
+            use_custom_allreduce=None if _ATTN_TP_USE_AITER_CUSTOM_COMM else False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",

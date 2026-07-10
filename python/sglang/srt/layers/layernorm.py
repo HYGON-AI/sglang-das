@@ -660,7 +660,8 @@ class GemmaRMSNorm(MultiPlatformOp):
                     output, x, residual, residual_out, w, self.variance_epsilon
                 )
                 return output, residual_out
-            return rms_norm(x, w, self.variance_epsilon)
+            op.rms_norm_opt(output, x, w, self.variance_epsilon)
+            return output
         else:
             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
             #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
@@ -682,7 +683,7 @@ class GemmaRMSNorm(MultiPlatformOp):
                 )
                     return out, residual_out
             out = torch.empty_like(x)
-            rms_norm(out, x, w, self.variance_epsilon)
+            op.rms_norm_opt(out, x, w, self.variance_epsilon)
             return out
 
     def forward_cpu(

@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 MMMU evaluation for VLMs using the run_eval simple-evals interface.
 
@@ -6,7 +20,9 @@ MMMU evaluation for VLMs using the run_eval simple-evals interface.
 from __future__ import annotations
 
 import base64
+import glob
 import io
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -59,11 +75,15 @@ class MMMUVLMEval(Eval):
         num_threads: int = 32,
         seed: int = 42,
         response_answer_regex: str = None,
+        dataset_path: Optional[str] = None,
     ):
         """Create MMMU VLM eval (Math subset, 100 fixed samples by default)."""
         self.num_examples = num_examples
         self.num_threads = num_threads
         self.seed = seed
+        self.dataset_path = dataset_path or os.environ.get(
+            "SGLANG_DCU_MMMU_DATASET_PATH"
+        )
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)
         # For example, "<\|begin_of_box\|>foo<\|end_of_box\|>" could be used to extract "foo" as the answer from the response text
@@ -100,7 +120,20 @@ class MMMUVLMEval(Eval):
         datasets = []
         for subj in subjects:
             try:
-                d = load_dataset("MMMU/MMMU", subj, split="validation")
+                if self.dataset_path and os.path.isdir(self.dataset_path):
+                    files = sorted(
+                        glob.glob(
+                            os.path.join(
+                                self.dataset_path, subj, "validation-*.parquet"
+                            )
+                        )
+                    )
+                    if not files:
+                        continue
+                    d = load_dataset("parquet", data_files=files, split="train")
+                else:
+                    data_source = self.dataset_path or "MMMU/MMMU"
+                    d = load_dataset(data_source, subj, split="validation")
                 # attach subject info via transform
                 d = d.add_column("__subject__", [subj] * len(d))
                 datasets.append(d)

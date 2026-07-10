@@ -11,9 +11,12 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -29,6 +32,29 @@ typedef __hip_bfloat16 nv_bfloat16;
 namespace sglang {
 
 constexpr int kMaxBlocks = 64;
+constexpr int kAllReduceGPUSmall = 4;
+constexpr int kAllReduceGPULarge = 8;
+constexpr size_t kAllReduceSmallThreshold = 512 * 1024;
+constexpr size_t kAllReduceLargeThreshold = 256 * 1024;
+constexpr int kInputFenceNone = 0;
+constexpr int kInputFenceAllThreads = 1;
+constexpr int kInputFenceThread0 = 2;
+
+inline int get_input_fence_mode_from_env() {
+  const char* env_mode = std::getenv("SGLANG_CUSTOM_ALLREDUCE_INPUT_FENCE");
+  if (env_mode == nullptr || std::strcmp(env_mode, "all") == 0 || std::strcmp(env_mode, "all_threads") == 0) {
+    return kInputFenceAllThreads;
+  }
+  if (std::strcmp(env_mode, "thread0") == 0 || std::strcmp(env_mode, "single") == 0) {
+    return kInputFenceThread0;
+  }
+  if (std::strcmp(env_mode, "none") == 0 || std::strcmp(env_mode, "off") == 0) {
+    return kInputFenceNone;
+  }
+  throw std::runtime_error(
+      "Invalid SGLANG_CUSTOM_ALLREDUCE_INPUT_FENCE: " + std::string(env_mode) +
+      ". Valid values: all, all_threads, thread0, single, none, off");
+}
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
 struct Signal {
@@ -159,16 +185,31 @@ DINLINE void start_sync(
     volatile
 #endif
     Signal* self_sg,
-    int rank) {
+    int rank,
+    int input_fence_mode) {
 #ifdef USE_ROCM
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  // In the unregistered path each rank first copies its input into a shared
+  // IPC buffer, then launches this kernel. Peers start reading that buffer
+  // after observing our start flag, so publish prior device writes before the
+  // flag becomes visible to other GPUs.
+  if (input_fence_mode == kInputFenceAllThreads) {
+    __threadfence_system();
+    __syncthreads();
+  } else if (input_fence_mode == kInputFenceThread0) {
+    if (threadIdx.x == 0) __threadfence_system();
+    __syncthreads();
+  }
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __hip_atomic_store(
-        &sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_store_n(
+        &sg.signals[threadIdx.x]->start[blockIdx.x][rank],
+        flag,
+        __ATOMIC_RELAXED);
     // wait until we got true from all ranks
-    while (__hip_atomic_load(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+    while (__atomic_load_n(
+               &self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED) <
            flag)
       ;
   }
@@ -211,16 +252,14 @@ DINLINE void end_sync(
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __hip_atomic_store(
+    __atomic_store_n(
         &sg.signals[threadIdx.x]->end[blockIdx.x][rank],
         flag,
-        final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
-        __HIP_MEMORY_SCOPE_SYSTEM);
+        final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE);
     // wait until we got true from all ranks
-    while (__hip_atomic_load(
+    while (__atomic_load_n(
                &self_sg->end[blockIdx.x][threadIdx.x],
-               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-               __HIP_MEMORY_SCOPE_AGENT) < flag)
+               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE) < flag)
       ;
   }
   __syncthreads();
@@ -267,13 +306,14 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
     Signal* self_sg,
     T* __restrict__ result,
     int rank,
-    int size) {
+    int size,
+    int input_fence_mode) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   // note: we don't reorder the address so the accumulation order is the same
   // for all ranks, ensuring bitwise identical results
   auto dp = *_dp;
-  start_sync<ngpus>(sg, self_sg, rank);
+  start_sync<ngpus>(sg, self_sg, rank, input_fence_mode);
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
@@ -300,7 +340,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     Signal* self_sg,
     T* __restrict__ result,
     int rank,
-    int size) {
+    int size,
+    int input_fence_mode) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -318,7 +359,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
-  start_sync<ngpus>(sg, self_sg, rank);
+  start_sync<ngpus>(sg, self_sg, rank, input_fence_mode);
   // stage 1: reduce scatter
   for (int idx = start + tid; idx < end; idx += stride) {
     tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
@@ -362,6 +403,7 @@ class CustomAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
+  hipEvent_t stopEvent;
 
   /**
    * meta is a pointer to device metadata and temporary buffer for allreduce.
@@ -397,6 +439,7 @@ class CustomAllreduce {
       }
       sg_.signals[i] = rank_sg;
     }
+    CUDACHECK(hipEventCreate(&stopEvent));
   }
 
   char* open_ipc_handle(const void* ipc_handle) {
@@ -501,6 +544,7 @@ class CustomAllreduce {
       T* input,
       T* output,
       int size,
+      int input_fence_mode = kInputFenceAllThreads,
 #ifndef USE_ROCM
       int threads = 512,
       int block_limit = 36){
@@ -535,21 +579,54 @@ class CustomAllreduce {
   size /= d;
   auto bytes = size * sizeof(typename packed_t<T>::P);
   int blocks = ::min(block_limit, (size + threads - 1) / threads);
-#define KL(ngpus, name) \
-  hipLaunchKernelGGL(   \
-      (name<T, ngpus>), dim3(blocks), dim3(threads), 0, stream, ptrs, sg_, self_sg_, output, rank_, size);
-#define REDUCE_CASE(ngpus)                                                                        \
-  case ngpus: {                                                                                   \
-    if (world_size_ == 2) {                                                                       \
-      KL(ngpus, cross_device_reduce_1stage);                                                      \
-    } else if (full_nvlink_) {                                                                    \
-      if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024)) { \
-        KL(ngpus, cross_device_reduce_1stage);                                                    \
-      } else {                                                                                    \
-        KL(ngpus, cross_device_reduce_2stage);                                                    \
-      }                                                                                           \
-    }                                                                                             \
-    break;                                                                                        \
+
+  const char* env_algo = std::getenv("SGLANG_CUSTOM_ALLREDUCE_ALGO");
+  bool force_1stage = false;
+  bool force_2stage = false;
+  if (env_algo != nullptr) {
+    if (std::strcmp(env_algo, "1stage") == 0 || std::strcmp(env_algo, "oneshot") == 0) {
+      force_1stage = true;
+    } else if (std::strcmp(env_algo, "2stage") == 0 || std::strcmp(env_algo, "twoshot") == 0) {
+      force_2stage = true;
+    } else {
+      throw std::runtime_error(
+          "Invalid SGLANG_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
+          ". Valid values: 1stage, oneshot, 2stage, twoshot");
+    }
+  }
+
+#define KL(ngpus, name)                                                       \
+  {                                                                           \
+    void* kernelArgs[] = {                                                    \
+        &ptrs, &sg_, &self_sg_, &output, &rank_, &size, &input_fence_mode};   \
+    hipExtLaunchKernel(                                                       \
+        (void*)name<T, ngpus>,                                                \
+        blocks,                                                               \
+        threads,                                                              \
+        kernelArgs,                                                           \
+        0,                                                                    \
+        stream,                                                               \
+        nullptr,                                                              \
+        stopEvent,                                                            \
+        0);                                                                   \
+  }
+#define REDUCE_CASE(ngpus)                                                             \
+  case ngpus: {                                                                        \
+    if (force_1stage) {                                                                \
+      KL(ngpus, cross_device_reduce_1stage);                                           \
+    } else if (force_2stage) {                                                         \
+      KL(ngpus, cross_device_reduce_2stage);                                           \
+    } else if (world_size_ == 2) {                                                     \
+      KL(ngpus, cross_device_reduce_1stage);                                           \
+    } else if (full_nvlink_) {                                                         \
+      if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) ||   \
+          (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) {   \
+        KL(ngpus, cross_device_reduce_1stage);                                         \
+      } else {                                                                         \
+        KL(ngpus, cross_device_reduce_2stage);                                         \
+      }                                                                                \
+    }                                                                                  \
+    break;                                                                             \
   }
 
   switch (world_size_) {
@@ -571,6 +648,7 @@ class CustomAllreduce {
   for (auto [_, ptr] : ipc_handles_) {
     CUDACHECK(hipIpcCloseMemHandle(ptr));
   }
+  CUDACHECK(hipEventDestroy(stopEvent));
 }
 };  // namespace sglang
 /**

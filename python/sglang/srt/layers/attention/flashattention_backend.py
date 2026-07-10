@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -45,6 +59,7 @@ from sgl_kernel import merge_state_v2
 # )
 # from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func, flash_attn_with_kvcache, vllm_flash_attn_varlen_func, vllm_flash_attn_with_kvcache
+from flash_attn import varlen_fwd_unified
 from sglang.srt.utils import get_bool_env_var
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
@@ -886,23 +901,25 @@ class FlashAttentionBackend(AttentionBackend):
                 if not forward_batch.mha_one_shot
                 else metadata.max_seq_len_k
             )
-            if self.disable_radix_cache and not _kv_layout_dcu_fa:
-                k = k.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else k
-                v = v.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else v
-                output = flash_attn_varlen_func(
-                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=metadata.max_seq_len_q,
-                    max_seqlen_k=max_seqlen_k,
+            if not _kv_layout_dcu_fa:
+                output = varlen_fwd_unified(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=cache_seqlens,
+                    block_table=page_table,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=self.max_context_len,
                     softmax_scale=layer.scaling,
-                    causal=True,
+                    causal=False if use_cascade_attn else causal,
+                    softcap=layer.logit_cap,
+                    window_size=window_size,
+                    q_descale=k_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=forward_batch.mha_return_lse,
-                    **kwargs,
+                    return_softmax_lse=use_cascade_attn,
+                    s_aux=kwargs.get('sinks', None)
                 )
             else:
                 descale_shape = (metadata.cu_seqlens_q.shape[0] - 1, k.shape[2])
@@ -1248,7 +1265,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q = metadata.cu_seqlens_q
                 max_seqlen_q = metadata.max_seq_len_q
                 max_seqlen_k = metadata.max_seq_len_k
-                page_table = metadata.page_table
+                # page_table = metadata.page_table
                 cu_seqlens_k = metadata.cu_seqlens_k
                 cache_seqlens = metadata.cache_seqlens_int32
                 if not _kv_layout_dcu_fa:
@@ -1256,7 +1273,7 @@ class FlashAttentionBackend(AttentionBackend):
                         -1, self.page_size, layer.tp_k_head_num, layer.head_dim
                     )
                     value_cache = value_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
                 else:
                     key_cache = key_cache.view(
@@ -1272,7 +1289,27 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_k = metadata.encoder_cu_seqlens_k
                     window_size = (-1, -1)
                 q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                if max_seqlen_q > 1:
+                if not _kv_layout_dcu_fa:
+                    result = varlen_fwd_unified(
+                        q=q,
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=cache_seqlens,
+                        block_table=page_table,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=self.max_context_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        softcap=layer.logit_cap,
+                        window_size=window_size,
+                        q_descale=k_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        s_aux=kwargs.get('sinks', None)
+                    )
+                elif max_seqlen_q > 1:
                     result = flash_attn_varlen_func(
                         q=q,
                         k=key_cache,
@@ -2008,14 +2045,14 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
-
-                    normal_decode_set_metadata(
+                    if _is_dcu:
+                        normal_decode_set_metadata_lightop(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
                         metadata.page_table,
                         self.req_to_token,
                         req_pool_indices,
-                        self.decode_cuda_graph_metadata["strided_indices"],
+                        #self.decode_cuda_graph_metadata["strided_indices"],
                         max_seq_pages,
                         seq_lens,
                         self.speculative_step_id + 1,
@@ -2027,6 +2064,25 @@ class FlashAttentionBackend(AttentionBackend):
                             else None
                         ),
                     )
+                    else:
+                        normal_decode_set_metadata(
+                            metadata.cache_seqlens_int32,
+                            metadata.cu_seqlens_k,
+                            metadata.page_table,
+                            self.req_to_token,
+                            req_pool_indices,
+                            self.decode_cuda_graph_metadata["strided_indices"],
+                            max_seq_pages,
+                            seq_lens,
+                            self.speculative_step_id + 1,
+                            self.page_size,
+                            metadata.swa_page_table,
+                            (
+                                self.token_to_kv_pool
+                                if self.use_sliding_window_kv_pool
+                                else None
+                            ),
+                        )
 
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -2082,14 +2138,14 @@ class FlashAttentionBackend(AttentionBackend):
                 max_len = seq_lens_cpu.max().item()
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
-
-                normal_decode_set_metadata(
+                if _is_dcu:
+                    normal_decode_set_metadata_lightop(
                     metadata.cache_seqlens_int32,
                     metadata.cu_seqlens_k,
                     metadata.page_table,
                     self.req_to_token,
                     req_pool_indices,
-                    self.decode_cuda_graph_metadata["strided_indices"],
+                    #self.decode_cuda_graph_metadata["strided_indices"],
                     max_seq_pages,
                     seq_lens,
                     0,
@@ -2097,6 +2153,21 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table,
                     self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
+                else:
+                    normal_decode_set_metadata(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        self.decode_cuda_graph_metadata["strided_indices"],
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+                    )
 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
@@ -2935,8 +3006,42 @@ def _fused_metadata_kernel_ps1_no_swa(
     # page_table = page_index // 1 = page_index
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
-
-
+def normal_decode_set_metadata_lightop(
+    cache_seqlens_int32: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,       
+    max_seq_pages: int,
+    seq_lens: torch.Tensor,
+    seq_len_delta: int,
+    page_size: int,
+    swa_page_table: Optional[torch.Tensor] = None,
+    token_to_kv_pool: Optional[SWAKVPool] = None,
+):
+    assert (
+        page_size > 0 and (page_size & (page_size - 1)) == 0
+    ), f"page_size must be a power of two, got {page_size}"
+    use_swa = swa_page_table is not None and token_to_kv_pool is not None
+    from lightop import fused_metadata_kernel_general    
+    fused_metadata_kernel_general(
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        cache_seqlens_int32=cache_seqlens_int32,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=page_table,
+        swa_page_table=swa_page_table if use_swa else None,
+        full_to_swa_mapping=(
+            token_to_kv_pool.full_to_swa_index_mapping
+            if use_swa else None
+        ),
+        B=cache_seqlens_int32.shape[0],
+        max_seq_pages=max_seq_pages,
+        page_size=page_size,
+        seq_len_delta=seq_len_delta,
+        use_swa=use_swa,
+    )
 # Fused Triton kernel implementation
 def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
@@ -3028,7 +3133,7 @@ def normal_decode_set_metadata(
                 swa_page_table = swa_page_table.contiguous()
                 # Extract the full_to_swa_index_mapping from token_to_kv_pool
                 full_to_swa_mapping = (
-                    token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+                    token_to_kv_pool.full_to_swa_index_mapping.to(torch.int32).contiguous()
                 )
             else:
                 # Dummy tensors (not used)

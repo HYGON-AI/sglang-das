@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -66,6 +80,7 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+_use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 
 use_groupgemm = get_bool_env_var(
     "SGLANG_GROUPGEMM", default="true"
@@ -635,6 +650,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
+            topk_weights,
         )
         return (
             hidden_states,
@@ -681,6 +697,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
@@ -725,6 +742,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
+                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type = 2,
@@ -733,11 +751,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif _use_marlin_w16a16_moe:
+            elif _use_marlin_w16a16_moe or _use_marlin_w4a16_moe:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
+                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type = 0,
@@ -751,6 +770,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     buffer.low_latency_dispatch(
                         hidden_states,
                         topk_ids,
+                        topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
                         quant_type=1,
@@ -764,6 +784,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 buffer.low_latency_dispatch(
                     hidden_states,
                     topk_ids,
+                    topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
                     quant_type = 0,

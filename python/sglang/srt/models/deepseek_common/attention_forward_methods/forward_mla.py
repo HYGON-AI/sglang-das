@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
@@ -238,7 +252,15 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if not self.skip_topk or prev_topk_indices is None:
+                # skip_topk (shared) layers carry no indexer weights in the
+                # checkpoint, so they must reuse the carried topk and never run
+                # the indexer. Do NOT widen this to `or prev_topk_indices is
+                # None` (the upstream gate): that recomputes with an
+                # uninitialized indexer whenever cross-layer propagation is
+                # unavailable (e.g. the TBO op path drops topk_indices),
+                # reintroducing the >index_topk garbling. The is_nextn clause is
+                # the sole intentional fallback (layer 78 has its own weights).
+                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -257,7 +279,12 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    if not self.skip_topk or prev_topk_indices is None:
+                    # See the skip_topk note above: shared layers have no
+                    # indexer weights, so this gate must not fall back to
+                    # computing when prev_topk_indices is None.
+                    if not self.skip_topk or (
+                        self.is_nextn and prev_topk_indices is None
+                    ):
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,

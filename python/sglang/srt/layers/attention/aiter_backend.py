@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 """
@@ -26,7 +40,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_hcu, is_gfx95_supported
+
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -48,9 +64,14 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
-    print(
-        "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-    )
+    if _is_hcu:
+        print(
+            "Please make sure aiter is installed on your HCU device."
+        )
+    else:
+        print(
+            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+        )
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import (

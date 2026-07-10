@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Optional, Tuple, Union
@@ -13,6 +27,13 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import (
+    is_dcu,
+    get_bool_env_var
+)
+
+_is_dcu = is_dcu()
+_use_linear_bf16_fp32_use_blaslt = get_bool_env_var("SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT")
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -232,7 +253,7 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant (no norm)."""
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        make_name("main_q_indexer_rope_hadamard_quant"),
+        make_name("main_q_indexer_rope_hadamard_quant_u8"),
         *args,
         cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
@@ -603,13 +624,17 @@ def compress_fused_norm_rope_inplace(
     eps: float,
     freq_cis: torch.Tensor,
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    decode_seq_lens: Optional[torch.Tensor] = None,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    handle = plan[1]
+    if plan.is_decode and decode_seq_lens is not None:
+        handle = decode_seq_lens
     module.forward(
         kv,
         weight,
-        plan[1],
+        handle,
         freq_cis,
         int(plan.is_decode),
         eps,
@@ -674,15 +699,28 @@ def fused_q_indexer_rope_hadamard_quant(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    # tvm_ffi converts torch tensors through DLPack, which does not support
+    # torch.float8 dtypes. Pass uint8 storage to the JIT wrapper and reinterpret
+    # the one-byte fp8 payload for downstream consumers.
+    q_fp8_storage = torch.empty(q_input.shape, dtype=torch.uint8, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
     module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
     module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
+        q_input,
+        q_fp8_storage,
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
     )
+    q_fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+    q_fp8 = q_fp8_storage.view(q_fp8_dtype)
     return q_fp8, weights_out
 
 
@@ -954,51 +992,121 @@ def rmsnorm_self(
 def _jit_torch_cublas_bf16_fp32() -> Any:
     import torch.utils.cpp_extension
 
-    source = """
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cublas_v2.h>
+    if _is_dcu and _use_linear_bf16_fp32_use_blaslt:
+        source = """
+        #include <torch/extension.h>
+        #include <ATen/cuda/CUDAContext.h> 
+        #include <hipblaslt/hipblaslt.h>   
 
-torch::Tensor linear_bf16_fp32(
-    torch::Tensor X,
-    torch::Tensor W)
-{
-    int batch = X.size(0);
-    int in_features = X.size(1);
-    int out_features = W.size(0);
+        torch::Tensor linear_bf16_fp32(
+            torch::Tensor X,
+            torch::Tensor W)
+        {
+            int batch = X.size(0);
+            int in_features = X.size(1);
+            int out_features = W.size(0);
 
-    auto Y = torch::empty(
-        {batch, out_features},
-        torch::dtype(torch::kFloat32).device(X.device()));
+            auto Y = torch::empty(
+                {batch, out_features},
+                torch::dtype(torch::kFloat32).device(X.device()));
 
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+            static thread_local hipblasLtHandle_t handle = nullptr;
+            if (handle == nullptr) {
+                hipblasLtCreate(&handle);
+            }
 
-    float alpha = 1.0f;
-    float beta = 0.0f;
+            hipblasLtMatmulDesc_t matmul_desc;
+            hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+            
+            int transA = HIPBLAS_OP_T;
+            int transB = HIPBLAS_OP_N;
+            hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
+            hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
 
-    cublasGemmEx(
-        handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        out_features,
-        batch,
-        in_features,
-        &alpha,
-        W.data_ptr(), CUDA_R_16BF, in_features,
-        X.data_ptr(), CUDA_R_16BF, in_features,
-        &beta,
-        Y.data_ptr(), CUDA_R_32F, out_features,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
+            hipblasLtMatrixLayout_t layoutA, layoutB, layoutC;
+            hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, in_features, out_features, in_features); 
+            hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, in_features, batch, in_features);        
+            hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_32F, out_features, batch, out_features);       
 
-    return Y;
-}
+            float alpha = 1.0f;
+            float beta = 0.0f;
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear (no bias)");
-}
-"""
+            hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+            hipblasLtMatmul(
+                handle,
+                matmul_desc,
+                &alpha,
+                W.data_ptr(), layoutA,
+                X.data_ptr(), layoutB,
+                &beta,
+                Y.data_ptr(), layoutC,
+                Y.data_ptr(), layoutC, 
+                nullptr, 
+                nullptr, 
+                0,       
+                stream  
+            );
+
+            hipblasLtMatmulDescDestroy(matmul_desc);
+            hipblasLtMatrixLayoutDestroy(layoutA);
+            hipblasLtMatrixLayoutDestroy(layoutB);
+            hipblasLtMatrixLayoutDestroy(layoutC);
+
+            return Y;
+        }
+
+        PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+            m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear using hipblasLt");
+        }
+        """
+    else:
+        source = """
+    #include <torch/extension.h>
+    #include <ATen/cuda/CUDAContext.h>
+    #include <cublas_v2.h>
+
+    torch::Tensor linear_bf16_fp32(
+        torch::Tensor X,
+        torch::Tensor W)
+    {
+        int batch = X.size(0);
+        int in_features = X.size(1);
+        int out_features = W.size(0);
+
+        auto Y = torch::empty(
+            {batch, out_features},
+            torch::dtype(torch::kFloat32).device(X.device()));
+
+        cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            out_features,
+            batch,
+            in_features,
+            &alpha,
+            W.data_ptr(), CUDA_R_16BF, in_features,
+            X.data_ptr(), CUDA_R_16BF, in_features,
+            &beta,
+            Y.data_ptr(), CUDA_R_32F, out_features,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+
+        return Y;
+    }
+
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear (no bias)");
+    }
+    """
+     
     module = torch.utils.cpp_extension.load_inline(
         name="linear_bf16_fp32",
         cpp_sources="",

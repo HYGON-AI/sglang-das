@@ -79,6 +79,37 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
+def _split_kv_infos(values: List[int]) -> tuple[List[int], List[int]]:
+    mid = len(values) // 2
+    return list(values[:mid]), list(values[mid:])
+
+
+def _normalize_decode_mha_kv_infos(
+    main_ptrs: List[int],
+    main_lens: List[int],
+    main_item_lens: List[int],
+    draft_ptrs: Optional[List[int]],
+    draft_lens: Optional[List[int]],
+    draft_item_lens: Optional[List[int]],
+) -> tuple[List[int], List[int], List[int], int]:
+    if not draft_ptrs:
+        return main_ptrs, main_lens, main_item_lens, 0
+
+    main_k_ptrs, main_v_ptrs = _split_kv_infos(main_ptrs)
+    draft_k_ptrs, draft_v_ptrs = _split_kv_infos(draft_ptrs)
+    main_k_lens, main_v_lens = _split_kv_infos(main_lens)
+    draft_k_lens, draft_v_lens = _split_kv_infos(draft_lens)
+    main_k_item_lens, main_v_item_lens = _split_kv_infos(main_item_lens)
+    draft_k_item_lens, draft_v_item_lens = _split_kv_infos(draft_item_lens)
+    return (
+        main_k_ptrs + draft_k_ptrs + main_v_ptrs + draft_v_ptrs,
+        main_k_lens + draft_k_lens + main_v_lens + draft_v_lens,
+        main_k_item_lens + draft_k_item_lens + main_v_item_lens + draft_v_item_lens,
+        len(draft_ptrs) // 2,
+    )
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -389,15 +420,32 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+        main_kv_layers = len(kv_data_ptrs) // 2
+        draft_kv_data_ptrs = draft_kv_data_lens = draft_kv_item_lens = None
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+            if not self.is_mla_backend:
+                (
+                    kv_data_ptrs,
+                    kv_data_lens,
+                    kv_item_lens,
+                    total_draft_layers,
+                ) = _normalize_decode_mha_kv_infos(
+                    kv_data_ptrs,
+                    kv_data_lens,
+                    kv_item_lens,
+                    draft_kv_data_ptrs,
+                    draft_kv_data_lens,
+                    draft_kv_item_lens,
+                )
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

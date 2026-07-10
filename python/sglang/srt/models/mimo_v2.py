@@ -352,14 +352,17 @@ class MiMoV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
@@ -1106,7 +1109,7 @@ class MiMoV2ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            hidden_states = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1115,7 +1118,7 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            hidden_states = self.model(
                 input_ids,
                 positions,
                 forward_batch,
@@ -1124,6 +1127,7 @@ class MiMoV2ForCausalLM(nn.Module):
             )
 
         if self.pp_group.is_last_rank:
+            hidden_states, hidden_states_before_norm = hidden_states
             return self.logits_processor(
                 input_ids,
                 hidden_states,
@@ -1311,9 +1315,64 @@ class MiMoV2ForCausalLM(nn.Module):
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                         self.config
                     )
-                    load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
-                    )
+                    attn_tp_size = get_attention_tp_size()
+
+                    if attn_tp_size == 1 and expected_fused_tp_size is not None:
+                        fused_tp = expected_fused_tp_size
+                        layer_id = get_layer_id(name)
+                        is_swa = (
+                            layer_id is not None
+                            and hasattr(self.config, "hybrid_layer_pattern")
+                            and self.config.hybrid_layer_pattern[layer_id] == 1
+                        )
+                        if is_swa and hasattr(self.config, "swa_num_attention_heads"):
+                            total_q = (
+                                self.config.swa_num_attention_heads
+                                * self.config.swa_head_dim
+                            )
+                            total_k = (
+                                self.config.swa_num_key_value_heads
+                                * self.config.swa_head_dim
+                            )
+                            total_v = self.config.swa_num_key_value_heads * getattr(
+                                self.config, "swa_v_head_dim", self.config.swa_head_dim
+                            )
+                        else:
+                            total_q = (
+                                self.config.num_attention_heads * self.config.head_dim
+                            )
+                            total_k = (
+                                self.config.num_key_value_heads * self.config.head_dim
+                            )
+                            total_v = self.config.num_key_value_heads * getattr(
+                                self.config, "v_head_dim", self.config.head_dim
+                            )
+                        per_rank_q = total_q // fused_tp
+                        per_rank_k = total_k // fused_tp
+                        per_rank_v = total_v // fused_tp
+                        per_rank_total = per_rank_q + per_rank_k + per_rank_v
+
+                        chunks = loaded_weight.split([per_rank_total] * fused_tp, dim=0)
+                        q_parts = [ch[:per_rank_q] for ch in chunks]
+                        k_parts = [
+                            ch[per_rank_q : per_rank_q + per_rank_k] for ch in chunks
+                        ]
+                        v_parts = [
+                            ch[
+                                per_rank_q
+                                + per_rank_k : per_rank_q
+                                + per_rank_k
+                                + per_rank_v
+                            ]
+                            for ch in chunks
+                        ]
+
+                        reordered = torch.cat(q_parts + k_parts + v_parts, dim=0)
+                        default_weight_loader(param, reordered)
+                    else:
+                        load_mimo_v2_qkv_proj_weight(
+                            name, param, loaded_weight, expected_fused_tp_size
+                        )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

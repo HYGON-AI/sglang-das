@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -40,6 +54,7 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_dcu,
+    is_dcu_native_fp8_supported,
     is_npu,
 )
 
@@ -56,6 +71,7 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 _is_dcu = is_dcu()
 
 
@@ -86,12 +102,14 @@ class ModelRunnerKVCacheMixin:
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
-                if _is_dcu and self.kv_cache_dtype not in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                ):
+                use_bf16_index_cache = _is_dcu and (
+                    self.kv_cache_dtype
+                    not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    or not is_dcu_native_fp8_supported()
+                )
+                if use_bf16_index_cache:
                     indexer_size_per_token = index_head_dim
-                    element_size = torch._utils._element_size(self.kv_cache_dtype)
+                    element_size = torch._utils._element_size(torch.bfloat16)
                 else:
                     indexer_size_per_token = (
                         index_head_dim

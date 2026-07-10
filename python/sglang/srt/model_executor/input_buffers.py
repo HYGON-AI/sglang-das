@@ -1,14 +1,46 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from sglang.srt.utils import is_npu
 
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
+
+
+def get_pp_proxy_hidden_states_shape(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    model_config,
+) -> Tuple[int, ...]:
+    architectures = getattr(getattr(model_config, "hf_config", None), "architectures", [])
+    if any(
+        arch in ("DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN")
+        for arch in architectures
+    ):
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        hc_mult = getattr(hf_text_config, "hc_mult", getattr(hf_config, "hc_mult", 1))
+        return (num_tokens, hc_mult, hidden_size)
+    return (num_tokens, hidden_size)
 
 
 @dataclass

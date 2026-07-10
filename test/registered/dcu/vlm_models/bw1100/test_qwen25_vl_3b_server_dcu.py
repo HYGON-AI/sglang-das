@@ -1,3 +1,17 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -21,6 +35,10 @@ register_dcu_ci(est_time=1800, suite="stage-b-test-1-gpu-small-dcu")
 DEFAULT_QWEN25_VL_3B_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 
+def _default_vlm_args() -> list[str]:
+    return DCU_VLM_SERVER_ARGS + ["--disable-cuda-graph"]
+
+
 class TestBW1100Qwen25VLThreeBServerDCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -35,7 +53,7 @@ class TestBW1100Qwen25VLThreeBServerDCU(unittest.TestCase):
             timeout=get_int_env("SGLANG_DCU_QWEN25_VL_3B_TIMEOUT", 1800),
             api_key=cls.api_key,
             other_args=get_server_args(
-                "SGLANG_DCU_VLM_SERVER_ARGS", DCU_VLM_SERVER_ARGS
+                "SGLANG_DCU_VLM_SERVER_ARGS", _default_vlm_args()
             ),
         )
 

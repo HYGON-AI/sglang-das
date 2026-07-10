@@ -52,13 +52,13 @@ spec:
           - --page-size
           - "64"
           #          - --init-expert-location
-          #          - /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
+          #          - <TUNED_CONFIG_PATH>/prefill_in1024.json
           - --ep-dispatch-algorithm
           - dynamic
           - --eplb-algorithm
           - deepseek
           #          - --deepep-config
-          #          -  /home/aiges/tuned/tuned_8sms.json
+          #          -  <TUNED_CONFIG_PATH>/tuned_8sms.json
           - --enable-dp-lm-head
           - --enable-dp-attention
           - --dp-size
@@ -199,13 +199,13 @@ spec:
           - --page-size
           - "64"
           #- --init-expert-location
-          #- /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
+          #- <TUNED_CONFIG_PATH>/prefill_in1024.json
           - --ep-dispatch-algorithm
           - dynamic
           - --eplb-algorithm
           - deepseek
 #          - --deepep-config
-#          -  /home/aiges/tuned/tuned_8sms.json
+#          -  <TUNED_CONFIG_PATH>/tuned_8sms.json
           - --enable-dp-lm-head
           - --enable-dp-attention
           - --dp-size
@@ -754,7 +754,7 @@ deepseekr10528-prefill-main-0            1/1     Running   0          74m
 deepseekr10528-prefill-main-0-1          1/1     Running   0          74m
 [root@ecs-cbm-x1-pd-cpu-001 main_doc]# kubectl  get svc |grep dee
 deepseekr10528-decode-main    ClusterIP   None             <none>        <none>           97m
-deepseekr10528-lb-service     NodePort    172.16.242.169   <none>        8000:30800/TCP   22m
+deepseekr10528-lb-service     NodePort    <cluster-ip>   <none>        8000:30800/TCP   22m
 deepseekr10528-prefill-main   ClusterIP   None             <none>        <none>           97m
 ```
 
@@ -763,7 +763,7 @@ At this point, select a nodePort:30800 to access:
 ```bash
 [root@ecs-001]# curl -X POST "http://{nodePort}:30800/v1/chat/completions" \
 >     -H "Content-Type: application/json" \
->     -H "Authorization: Bearer None" \
+>     -H "Authorization: Bearer <API_KEY>" \
 >     -d '{
 >        "rid":"ccccdd",
 >         "model": "r1",

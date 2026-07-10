@@ -1306,6 +1306,13 @@ class CudaGraphRunner:
         )
         attn_backend._replay_forward_batch = None
 
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                set_mega_moe_cuda_graph_num_tokens,
+            )
+
+            set_mega_moe_cuda_graph_num_tokens(raw_num_token)
+
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
@@ -1383,7 +1390,9 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

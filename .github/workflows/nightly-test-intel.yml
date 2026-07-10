@@ -1,22 +1,7 @@
 name: Nightly Test (Intel)
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
   workflow_dispatch:
-  workflow_call:
-    inputs:
-      ref:
-        description: "Branch, tag or SHA to checkout"
-        required: false
-        type: string
-        default: ""
-
 concurrency:
   group: nightly-test-intel-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}

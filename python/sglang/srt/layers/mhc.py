@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import functools
 import math
 from typing import Tuple
@@ -10,7 +24,13 @@ from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
-
+from sglang.srt.utils import get_bool_env_var, is_dcu
+_is_dcu = is_dcu()
+_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
+if _is_dcu and _use_aiter_tilelang_mhc:
+    from aiter.ops.tilelang import pre_big_fuse_tilelang
+    
+    
 tilelang.set_log_level("WARNING")
 
 
@@ -914,7 +934,26 @@ def mhc_pre(
             gemm_last_dim = hc_mult3
             big_fuse_n_splits = n_splits
 
-    if norm_weight is not None:
+    if _is_dcu and _use_aiter_tilelang_mhc:
+       pre_big_fuse_tilelang(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            post_mix,
+            comb_mix,
+            layer_input,
+            hidden_size,
+            rms_eps=rms_eps,
+            mhc_pre_eps=hc_pre_eps,
+            mhc_sinkhorn_eps=hc_sinkhorn_eps,
+            mhc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            n_splits=n_splits,
+            mhc_mult=hc_mult,
+        ) 
+    elif norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
         assert norm_weight.shape == (
             hidden_size,

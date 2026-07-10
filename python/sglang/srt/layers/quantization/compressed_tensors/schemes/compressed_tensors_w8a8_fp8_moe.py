@@ -1,7 +1,21 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -27,8 +41,9 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, is_dcu, set_weight_attrs
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var, is_dcu, is_hip, set_weight_attrs
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -44,23 +59,27 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_aiter_fp8_w8a8_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
+_use_shufle = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE_WITH_SHUFFLE")
+if _use_shufle:
+    from aiter.ops.shuffle import asm_shuffle_weight_b8
 if _use_aiter_fp8_w8a8_moe:
-    import aiter
     from aiter.moe import (
-        get_aiter_moe_config,
-        aiter_moe,
-        MoeSolutionType,
         MoeQuantType,
-            )
+        MoeSolutionType,
+        aiter_moe,
+        get_aiter_moe_config,
+    )
 if _use_aiter and not _is_dcu:
     from aiter.ops.shuffle import shuffle_weight
 
 
 logger = logging.getLogger(__name__)
 
+
 def is_moe_prefill_or_normal():
     args = get_global_server_args()
-    return (args.disaggregation_mode == "prefill" or args.deepep_mode == "normal")
+    return args.disaggregation_mode == "prefill" or args.deepep_mode == "normal"
+
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
@@ -285,6 +304,16 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
         layer._dsv4_channel_fp8_deepgemm_repacked = True
 
+        # Save original weight shapes before deletion — needed by
+        # DeepEPMoE.forward_groupgemm_w8a8_fp8_contiguous for N dimension
+        layer._dsv4_w13_weight_shape = tuple(w13.shape)
+        layer._dsv4_w2_weight_shape = tuple(w2.shape)
+
+        # Clean up weights that won't be used
+        del layer.w13_weight
+        del layer.w2_weight
+        torch.cuda.empty_cache()
+
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
@@ -360,6 +389,19 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
+        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+            if self.weight_quant.strategy != QuantizationStrategy.CHANNEL:
+                raise RuntimeError(
+                    "DCU W8A8 MegaMoE requires channelwise FP8 expert weights "
+                    "with dynamic per-token activation scales"
+                )
+            from sglang.srt.layers.moe.mega_moe import (
+                build_dcu_w8a8_mega_moe_experts_weights,
+            )
+
+            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            return
+
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
             with torch.no_grad():
                 # Pre-shuffle weights
@@ -373,17 +415,31 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_deepgemm_moe and _is_dcu:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_deepgemm_moe
+            and _is_dcu
+        ):
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
-        elif (_use_fp8_w8a8_moe and _is_dcu
-            and not getattr(layer, "_w8a8_fp8_packed", False)):
+        elif _is_dcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe and _use_shufle:
+            w13_weight = asm_shuffle_weight_b8(layer.w13_weight, 1)
+            layer.w13_weight.copy_(w13_weight)
+            del w13_weight
+            w2_weight = asm_shuffle_weight_b8(layer.w2_weight, 2)
+            layer.w2_weight.copy_(w2_weight)
+            del w2_weight
+
+        elif (
+            _use_fp8_w8a8_moe
+            and _is_dcu
+            and not getattr(layer, "_w8a8_fp8_packed", False)
+        ):
             w1 = layer.w13_weight
             w2 = layer.w2_weight
             w1_shape = w1.shape
             w2_shape = w2.shape
-            if (w1.is_cuda and w2.is_cuda):
-                if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(
-                    0):
+            if w1.is_cuda and w2.is_cuda:
+                if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(0):
                     raise RuntimeError("Unexpected MoE weight shapes")
                 twoN, K = w1.size(1), w1.size(2)
                 if w2.size(1) != K:
@@ -391,19 +447,21 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 N = w2.size(2)
                 if twoN != 2 * N:
                     raise RuntimeError("Unexpected MoE hidden dims")
-                if (K % 16 != 0 or K % 32 != 0 or N % 16 != 0
-                    or twoN % 32 != 0):
+                if K % 16 != 0 or K % 32 != 0 or N % 16 != 0 or twoN % 32 != 0:
                     raise RuntimeError("Marlin packing requires alignment")
 
-                from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-                    w8a8_2_marlin_weight, weight8bit_nt_kpack2_marlin,weight8bit_nt_kpack2_marlin1)
                 from torch.nn.parameter import Parameter
+
+                from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                    w8a8_2_marlin_weight,
+                    weight8bit_nt_kpack2_marlin,
+                    weight8bit_nt_kpack2_marlin1,
+                )
 
                 def _pack_per_expert(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        new_expert = w8a8_2_marlin_weight(
-                            weight[i]).contiguous()
+                        new_expert = w8a8_2_marlin_weight(weight[i]).contiguous()
                         weight.data[i].view(-1).copy_(new_expert.view(-1))
                     weight = weight.reshape((-1,) + new_expert.shape)
 
@@ -414,10 +472,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     for i in range(num_experts):
                         if is_moe_prefill_or_normal():
                             new_expert = weight8bit_nt_kpack2_marlin(
-                                weight[i]).contiguous()
+                                weight[i]
+                            ).contiguous()
                         else:
                             new_expert = weight8bit_nt_kpack2_marlin1(
-                                weight[i]).contiguous()
+                                weight[i]
+                            ).contiguous()
                         weight.data[i].view(-1).copy_(new_expert.view(-1))
                     weight = weight.reshape((-1,) + new_expert.shape)
                     return weight
@@ -501,8 +561,30 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-        if self.runner.runner_backend.is_aiter():
+        if (
+            _is_dcu
+            and self.runner.runner_backend.is_aiter()
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        ):
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_fp8_quant_info,
+            )
+
+            assert not moe_runner_config.no_combine, "unsupported"
+            quant_info = get_aiter_w8a8_fp8_quant_info(layer)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            if bias is not None:
+                from sglang.srt.layers.moe.token_dispatcher import (
+                    StandardCombineInput,
+                )
+
+                return StandardCombineInput(
+                    hidden_states=combine_input.hidden_states + bias
+                )
+            return combine_input
+        elif self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
                 AiterQuantType,
@@ -553,19 +635,28 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 )
             return self.runner.run(dispatch_output, quant_info)
         elif _is_dcu and _use_fp8_w8a8_moe:
-            if (getattr(layer.w13_weight, "_w8a8_fp8_packed", False)
-                or getattr(layer.w2_weight, "_w8a8_fp8_packed", False)):
+            if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
+                layer.w2_weight, "_w8a8_fp8_packed", False
+            ):
                 topk_weights, topk_ids, _ = topk_output
                 use_prequant_input = i_q is not None and i_s is not None
                 if moe_runner_config.apply_router_weight_on_input:
-                    assert topk_weights.dim() == 2, "`topk_weights` should be (num_tokens, topk)"
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be (num_tokens, topk)"
                     _, tk = topk_weights.shape
-                    assert tk == 1, "DCU marlin path: apply_router_weight_on_input requires topk=1"
+                    assert (
+                        tk == 1
+                    ), "DCU marlin path: apply_router_weight_on_input requires topk=1"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                     # Router-weighted input no longer matches precomputed rms-quant activations.
                     use_prequant_input = False
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_fp8_w8a8
+                # from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_fp8_w8a8
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    fused_moe_fp8_w8a8,
+                )
+
                 origin_w1_shape = getattr(layer.w13_weight, "w1_shape", None)
                 origin_w2_shape = getattr(layer.w2_weight, "w2_shape", None)
                 output = fused_moe_fp8_w8a8(
@@ -588,34 +679,38 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
                 return StandardCombineInput(hidden_states=output)
-        elif  _is_dcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe:
-            if isinstance(layer.w13_weight,tuple):
-                w1=layer.w13_weight[0]
-                w2=layer.w2_weight[0]
+        elif _is_dcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe:
+            if isinstance(layer.w13_weight, tuple):
+                w1 = layer.w13_weight[0]
+                w2 = layer.w2_weight[0]
             else:
-                w1=layer.w13_weight
-                w2=layer.w2_weight
+                w1 = layer.w13_weight
+                w2 = layer.w2_weight
             topk_weights, topk_ids, _ = topk_output
             if moe_runner_config.apply_router_weight_on_input:
-                assert topk_weights.dim() == 2, "`topk_weights` should be (num_tokens, topk)"
+                assert (
+                    topk_weights.dim() == 2
+                ), "`topk_weights` should be (num_tokens, topk)"
                 _, tk = topk_weights.shape
-                assert tk == 1, "DCU marlin path: apply_router_weight_on_input requires topk=1"
+                assert (
+                    tk == 1
+                ), "DCU marlin path: apply_router_weight_on_input requires topk=1"
                 x = x * topk_weights.to(x.dtype)
                 topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                 # Router-weighted input no longer matches precomputed rms-quant activations.
                 use_prequant_input = False
             if isinstance(layer.w13_weight_scale, tuple):
-                w1_scale=layer.w13_weight_scale[0]
-                w2_scale=layer.w2_weight_scale[0]
+                w1_scale = layer.w13_weight_scale[0]
+                w2_scale = layer.w2_weight_scale[0]
             else:
-                w1_scale=layer.w13_weight_scale
-                w2_scale=layer.w2_weight_scale
-            M, K = x.shape 
+                w1_scale = layer.w13_weight_scale
+                w2_scale = layer.w2_weight_scale
+            M, K = x.shape
             E = self.moe_runner_config.num_experts
             top_k = topk_ids.shape[1]
             N1 = w1.shape[1]
             N2 = w2.shape[1]
-            activation="silu" if moe_runner_config.activation == "silu" else "gelu"
+            activation = "silu" if moe_runner_config.activation == "silu" else "gelu"
             # -----------------------------------------------------------------
             # Query backend config
             # ------------------------------------------------------------------
@@ -629,12 +724,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 block_size=0,
                 dtype=x.dtype,
                 quant_type=MoeQuantType.FP8_W8A8,
+                use_shuffle=_use_shufle
             )
             if not status:
                 raise RuntimeError(
-                "[aiter_moe_fp8_w8a8] no suitable backend found: "
-                f"M={M}, N1={N1}, N2={N2}, K={K}, "
-                f"E={E}, topk={top_k}")
+                    "[aiter_moe_fp8_w8a8] no suitable backend found: "
+                    f"M={M}, N1={N1}, N2={N2}, K={K}, "
+                    f"E={E}, topk={top_k}"
+                )
             if moe_cfg.solution_type not in {
                 MoeSolutionType.MOE_C,
                 MoeSolutionType.ASM,
@@ -646,23 +743,29 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 )
             # for debug：
             # aiter.logger.info(f"moe_cfg.solution_type {moe_cfg.solution_type}")
-            #在 moe_c 后端需要对weight做shuffle，如果不做此 shuffle 直接传入 moe_c_fused_experts，
-            #底层 Marlin/CUDA kernel 会按错误的内存偏移读取权重，导致结果错误。
-            if moe_cfg.solution_type==MoeSolutionType.MOE_C:
-                from aiter.ops.shuffle import moe_layout_shuffle_gemm1,moe_layout_shuffle_gemm2
+            # 在 moe_c 后端需要对weight做shuffle，如果不做此 shuffle 直接传入 moe_c_fused_experts，
+            # 底层 Marlin/CUDA kernel 会按错误的内存偏移读取权重，导致结果错误。
+            if moe_cfg.solution_type == MoeSolutionType.MOE_C:
+                from aiter.ops.shuffle import (
+                    moe_layout_shuffle_gemm1,
+                    moe_layout_shuffle_gemm2,
+                )
+
                 if not getattr(layer, "_moec_shuffled", False):
-                    layer.w13_weight.data = moe_layout_shuffle_gemm1(layer.w13_weight.data).view(*layer.w13_weight.data.shape)
-                    layer.w2_weight.data = moe_layout_shuffle_gemm2(layer.w2_weight.data).view(*layer.w2_weight.data.shape)
+                    layer.w13_weight.data = moe_layout_shuffle_gemm1(
+                        layer.w13_weight.data
+                    ).view(*layer.w13_weight.data.shape)
+                    layer.w2_weight.data = moe_layout_shuffle_gemm2(
+                        layer.w2_weight.data
+                    ).view(*layer.w2_weight.data.shape)
                     layer._moec_shuffled = True
                 w1 = layer.w13_weight
                 w2 = layer.w2_weight
             if moe_cfg.quant_type != MoeQuantType.FP8_W8A8:
-                raise RuntimeError(
-                    f"Unexpected quant_type: {moe_cfg.quant_type}"
-                )
+                raise RuntimeError(f"Unexpected quant_type: {moe_cfg.quant_type}")
             if moe_runner_config.routed_scaling_factor is None:
-                moe_runner_config.routed_scaling_factor=1.0
-            output=aiter_moe(
+                moe_runner_config.routed_scaling_factor = 1.0
+            output = aiter_moe(
                 hidden_states=x,
                 w1=w1,
                 w2=w2,
@@ -676,6 +779,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 block_shape=None,
                 global_num_experts=E,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                use_weight_shuffle=_use_shufle
             )
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

@@ -56,27 +56,41 @@ bool _is_weak_contiguous(torch::Tensor& t) {
           t.numel() * t.element_size());
 }
 
-void _all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
-                 hipStream_t stream) {
+void _all_reduce(
+    fptr_t _fa,
+    torch::Tensor& inp,
+    torch::Tensor& out,
+    hipStream_t stream,
+    int input_fence_mode = sglang::kInputFenceNone) {
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
   TORCH_CHECK(_is_weak_contiguous(out));
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
-      fa->allreduce<float>(stream, reinterpret_cast<float*>(inp.data_ptr()),
-                           reinterpret_cast<float*>(out.data_ptr()),
-                           out.numel());
+      fa->allreduce<float>(
+          stream,
+          reinterpret_cast<float*>(inp.data_ptr()),
+          reinterpret_cast<float*>(out.data_ptr()),
+          out.numel(),
+          input_fence_mode);
       break;
     }
     case at::ScalarType::Half: {
-      fa->allreduce<half>(stream, reinterpret_cast<half*>(inp.data_ptr()),
-                          reinterpret_cast<half*>(out.data_ptr()), out.numel());
+      fa->allreduce<half>(
+          stream,
+          reinterpret_cast<half*>(inp.data_ptr()),
+          reinterpret_cast<half*>(out.data_ptr()),
+          out.numel(),
+          input_fence_mode);
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
       fa->allreduce<nv_bfloat16>(
-          stream, reinterpret_cast<nv_bfloat16*>(inp.data_ptr()),
-          reinterpret_cast<nv_bfloat16*>(out.data_ptr()), out.numel());
+          stream,
+          reinterpret_cast<nv_bfloat16*>(inp.data_ptr()),
+          reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+          out.numel(),
+          input_fence_mode);
       break;
     }
 #endif
@@ -106,7 +120,12 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
               "registered buffer is too small to contain the input");
   AT_CUDA_CHECK(hipMemcpyAsync(reg_buffer.data_ptr(), inp.data_ptr(),
                                 input_size, hipMemcpyDeviceToDevice, stream));
-  _all_reduce(_fa, reg_buffer, out, stream);
+  _all_reduce(
+      _fa,
+      reg_buffer,
+      out,
+      stream,
+      sglang::get_input_fence_mode_from_env());
 }
 
 void dispose(fptr_t _fa) {

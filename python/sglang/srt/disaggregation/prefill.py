@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -65,6 +66,142 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _split_kv_infos(values: List[int]) -> tuple[List[int], List[int]]:
+    mid = len(values) // 2
+    return list(values[:mid]), list(values[mid:])
+
+
+def _merge_kv_infos(k_values: List[int], v_values: List[int]) -> List[int]:
+    return list(k_values) + list(v_values)
+
+
+def _slice_pair_range(values: List[int], start: int, end: int) -> List[int]:
+    k_values, v_values = _split_kv_infos(values)
+    return _merge_kv_infos(k_values[start:end], v_values[start:end])
+
+
+def _slice_draft_range_for_pp(
+    *,
+    total_main_layers: int,
+    total_draft_layers: int,
+    pp_rank: int,
+    pp_size: int,
+) -> tuple[int, int]:
+    if total_draft_layers <= 0:
+        return 0, 0
+
+    # Treat MTP/draft layers as tail layers after the main model. This assigns
+    # a small number of nextn layers to the final PP stage instead of letting
+    # every PP rank overwrite the same decode-side draft KV.
+    try:
+        stage_start, stage_end = get_pp_indices(
+            total_main_layers + total_draft_layers, pp_rank, pp_size
+        )
+    except ValueError:
+        if pp_rank == pp_size - 1:
+            return 0, total_draft_layers
+        return 0, 0
+    draft_start = max(stage_start, total_main_layers) - total_main_layers
+    draft_end = max(
+        min(stage_end, total_main_layers + total_draft_layers), total_main_layers
+    )
+    draft_end -= total_main_layers
+    return max(0, draft_start), max(0, draft_end)
+
+
+def _normalize_mha_kv_infos_for_pp(
+    main_ptrs: List[int],
+    main_lens: List[int],
+    main_item_lens: List[int],
+    draft_ptrs: Optional[List[int]],
+    draft_lens: Optional[List[int]],
+    draft_item_lens: Optional[List[int]],
+    *,
+    pp_rank: int,
+    pp_size: int,
+    total_main_layers: int,
+    main_pool_start_layer: int,
+) -> tuple[
+    List[int],
+    List[int],
+    List[int],
+    int,
+    int,
+    int,
+    int,
+    int,
+]:
+    """Normalize MHA target + optional MTP KV infos for PP transfer.
+
+    Returns normalized [K_main, K_draft, V_main, V_draft] infos plus
+    main/draft local ranges.
+    """
+    main_num_layers = len(main_ptrs) // 2
+    main_start, main_end = get_pp_indices(total_main_layers, pp_rank, pp_size)
+
+    if pp_size <= 1:
+        main_start = main_pool_start_layer
+        main_end = main_pool_start_layer + main_num_layers
+        main_ptrs_s, main_lens_s, main_item_lens_s = (
+            main_ptrs,
+            main_lens,
+            main_item_lens,
+        )
+    elif main_num_layers == total_main_layers:
+        main_ptrs_s = _slice_pair_range(main_ptrs, main_start, main_end)
+        main_lens_s = _slice_pair_range(main_lens, main_start, main_end)
+        main_item_lens_s = _slice_pair_range(main_item_lens, main_start, main_end)
+    elif (
+        main_num_layers == main_end - main_start and main_pool_start_layer == main_start
+    ):
+        main_ptrs_s, main_lens_s, main_item_lens_s = (
+            main_ptrs,
+            main_lens,
+            main_item_lens,
+        )
+    else:
+        main_start = main_pool_start_layer
+        main_end = main_pool_start_layer + main_num_layers
+        main_ptrs_s, main_lens_s, main_item_lens_s = (
+            main_ptrs,
+            main_lens,
+            main_item_lens,
+        )
+
+    total_draft_layers = len(draft_ptrs) // 2 if draft_ptrs else 0
+    draft_start, draft_end = _slice_draft_range_for_pp(
+        total_main_layers=total_main_layers,
+        total_draft_layers=total_draft_layers,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+    )
+
+    if total_draft_layers > 0:
+        draft_ptrs_s = _slice_pair_range(draft_ptrs, draft_start, draft_end)
+        draft_lens_s = _slice_pair_range(draft_lens, draft_start, draft_end)
+        draft_item_lens_s = _slice_pair_range(draft_item_lens, draft_start, draft_end)
+    else:
+        draft_ptrs_s, draft_lens_s, draft_item_lens_s = [], [], []
+
+    main_k_ptrs, main_v_ptrs = _split_kv_infos(main_ptrs_s)
+    draft_k_ptrs, draft_v_ptrs = _split_kv_infos(draft_ptrs_s)
+    main_k_lens, main_v_lens = _split_kv_infos(main_lens_s)
+    draft_k_lens, draft_v_lens = _split_kv_infos(draft_lens_s)
+    main_k_item_lens, main_v_item_lens = _split_kv_infos(main_item_lens_s)
+    draft_k_item_lens, draft_v_item_lens = _split_kv_infos(draft_item_lens_s)
+
+    return (
+        main_k_ptrs + draft_k_ptrs + main_v_ptrs + draft_v_ptrs,
+        main_k_lens + draft_k_lens + main_v_lens + draft_v_lens,
+        main_k_item_lens + draft_k_item_lens + main_v_item_lens + draft_v_item_lens,
+        main_start,
+        main_end,
+        draft_start,
+        draft_end,
+        total_draft_layers,
+    )
 
 
 def release_req_to_metadata_buffer(
@@ -152,6 +289,7 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        draft_kv_data_ptrs = draft_kv_data_lens = draft_kv_item_lens = None
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -159,6 +297,45 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+
+        kv_args.total_main_kv_layers = None
+        kv_args.total_draft_kv_layers = None
+        kv_args.prefill_main_start_layer = None
+        kv_args.prefill_main_end_layer = None
+        kv_args.prefill_draft_start_layer = None
+        kv_args.prefill_draft_end_layer = None
+
+        if not self.is_mla_backend:
+            (
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                main_start,
+                main_end,
+                draft_start,
+                draft_end,
+                total_draft_layers,
+            ) = _normalize_mha_kv_infos_for_pp(
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                draft_kv_data_ptrs,
+                draft_kv_data_lens,
+                draft_kv_item_lens,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                total_main_layers=self.scheduler.model_config.num_hidden_layers,
+                main_pool_start_layer=self.token_to_kv_pool.start_layer,
+            )
+            kv_args.prefill_start_layer = main_start
+            kv_args.prefill_end_layer = main_end
+            kv_args.total_main_kv_layers = self.scheduler.model_config.num_hidden_layers
+            kv_args.total_draft_kv_layers = total_draft_layers
+            kv_args.prefill_main_start_layer = main_start
+            kv_args.prefill_main_end_layer = main_end
+            kv_args.prefill_draft_start_layer = draft_start
+            kv_args.prefill_draft_end_layer = draft_end
+        elif self.draft_token_to_kv_pool is not None:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens

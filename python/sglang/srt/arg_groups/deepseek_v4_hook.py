@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -29,8 +43,11 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         logger.warning(
             f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
         )
+    if server_args.kv_cache_dtype == "bf16":
+        server_args.kv_cache_dtype = "bfloat16"
     assert server_args.kv_cache_dtype in [
-        "fp8_e4m3"
+        "bfloat16",
+        "fp8_e4m3",
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:
@@ -51,12 +68,12 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
-    if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
-        # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized
-        # flat KV ptrs by PP layer range.
-        raise ValueError(
-            f"V4 PD disaggregation requires pp_size=1, got pp_size={server_args.pp_size}."
-        )
+    # if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
+    #     # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized
+    #     # flat KV ptrs by PP layer range.
+    #     raise ValueError(
+    #         f"V4 PD disaggregation requires pp_size=1, got pp_size={server_args.pp_size}."
+    #     )
 
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:

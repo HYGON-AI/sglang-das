@@ -172,6 +172,15 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     const auto raw_num_input = s_num_input[r_idx];
     const auto num_input = raw_num_input < SMEM_INPUT_SIZE ? raw_num_input : SMEM_INPUT_SIZE;
 
+    if (num_input <= remain_topk) {
+      for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        output[pos] = s_input_idx[r_idx][i];
+      }
+      __syncthreads();
+      return;
+    }
+
     run_cumsum();
     if (tx < RADIX && s_histogram[tx] > remain_topk && s_histogram[tx + 1] <= remain_topk) {
       s_threshold_bin_id = tx;
@@ -233,7 +242,8 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 }
 
 template <bool kUsePDL>
-__global__ void topk_512_transform(const SGL_GRID_CONSTANT TopK512Params params) {
+__global__ __launch_bounds__(kTopKBlockSize, 1) void topk_512_transform(
+    const SGL_GRID_CONSTANT TopK512Params params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits // sizes

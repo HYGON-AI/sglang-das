@@ -1,4 +1,19 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
+import os
 import random
 import time
 import unittest
@@ -11,9 +26,10 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 
 register_dcu_ci(
-    est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU PR baseline deferred: RL runtime path needs BW1100 memory/model validation before required CI.",
+    est_time=210,
+    suite="nightly-dcu-1-gpu",
+    nightly=True,
+    disabled="DCU nightly disabled: cache flush fails on BW1100; pending fix.",
 )
 
 from sglang.test.test_utils import (
@@ -33,6 +49,28 @@ register_cuda_ci(
 )
 
 
+def _dcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return {}
+    return {
+        "attention_backend": "fa3",
+        "page_size": 64,
+        "trust_remote_code": True,
+    }
+
+
+def _dcu_server_args():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return ()
+    return (
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--trust-remote-code",
+    )
+
+
 ###############################################################################
 # Engine Mode Tests (Single-configuration)
 ###############################################################################
@@ -40,7 +78,7 @@ class TestEngineUpdateWeightsFromDisk(CustomTestCase):
     def setUp(self):
         self.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         # Initialize the engine in offline (direct) mode.
-        self.engine = sgl.Engine(model_path=self.model)
+        self.engine = sgl.Engine(model_path=self.model, **_dcu_engine_kwargs())
 
     def tearDown(self):
         self.engine.shutdown()
@@ -94,7 +132,10 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=_dcu_server_args(),
         )
 
     @classmethod

@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import Literal, NamedTuple, Optional, Union
@@ -74,11 +88,13 @@ def _jit_compress_128_online_module(head_dim: int) -> Module:
 @cache_once
 def _jit_compress_plan_module() -> Module:
     return load_jit(
-        make_name(f"compress_plan"),
+        make_name(f"compress_plan_out_rocm_v2"),
         cuda_files=[f"deepseek_v4/c_plan.cuh"],
         cuda_wrappers=[
             ("plan_prefill", "plan_compress_prefill"),
+            ("plan_prefill_out", "plan_compress_prefill_out"),
             ("plan_decode", "plan_compress_decode"),
+            ("plan_decode_out", "plan_compress_decode_out"),
             ("plan_prefill_legacy", "plan_compress_prefill_legacy"),
             ("plan_decode_legacy", "plan_compress_decode_legacy"),
         ],
@@ -116,18 +132,24 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
-    ) -> CompressorDecodePlan:
+        ) -> CompressorDecodePlan:
         module = _jit_compress_plan_module()
-        plan_d = module.plan_decode(
+        plan_d = torch.empty(
+            (req_pool_indices.shape[0], 16),
+            dtype=torch.uint8,
+            device=req_pool_indices.device,
+        )
+        module.plan_decode_out(
             req_pool_indices,
             req_to_token,
             full_to_swa,
             seq_lens,
+            plan_d,
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
         )
-        return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
+        return CompressorDecodePlan(compress_ratio, plan_d)
 
     @staticmethod
     def generate_legacy(
@@ -195,14 +217,19 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
+        device = req_pool_indices.device
+        plan_c = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
+        plan_w = torch.empty((num_q_tokens, 8), dtype=torch.uint8, device=device)
         module = _jit_compress_plan_module()
-        plan_c, plan_w = module.plan_prefill(
+        plan_lens = module.plan_prefill_out(
             req_pool_indices,
             req_to_token,
             full_to_swa,
             seq_lens,
             extend_lens,
             pin_buffer,
+            plan_c,
+            plan_w,
             int(num_q_tokens),
             int(compress_ratio),
             int(swa_page_size),
@@ -211,8 +238,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c),
-            torch.from_dlpack(plan_w),
+            plan_c[: int(plan_lens[0])],
+            plan_w[: int(plan_lens[1])],
             pin_buffer,
         )
 

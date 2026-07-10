@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -5,7 +19,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
@@ -26,7 +45,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs, is_hip, is_dcu, set_weight_attrs, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_dcu, set_weight_attrs
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -38,9 +58,14 @@ _is_dcu = is_dcu()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 
 try:
-    from lmslim.layers.fused_moe.fuse_moe_w4a8_marlin import fused_experts_impl_w4a8_marlin
+    from lmslim.layers.fused_moe.fuse_moe_w4a8_marlin import (  # noqa: F401
+        fused_experts_impl_w4a8_marlin,
+    )
 except Exception:
-    print("INFO: Please install lmslim if you want to infer the quantitative model of moe.\n")
+    print(
+        "INFO: Please install lmslim if you want to infer the quantitative model of moe.\n"
+    )
+
 
 class W8A8Fp8Config(QuantizationConfig):
     """Config class for W8A8 FP8 Quantization.
@@ -278,14 +303,30 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_dcu_w8a8_mega_moe_experts_weights,
+                get_dcu_mega_moe_runtime,
+            )
+
+            if (
+                get_dcu_mega_moe_runtime() == "megamoe"
+                and not self.quant_config.is_checkpoint_fp8_serialized
+            ):
+                raise ValueError(
+                    "standalone megamoe requires an FP8-serialized "
+                    "channelwise W8A8 checkpoint"
+                )
+            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            return
+
         if _is_dcu and _use_fp8_w8a8_moe:
             w1 = layer.w13_weight
             w2 = layer.w2_weight
             w1_shape = w1.shape
             w2_shape = w2.shape
-            if (w1.is_cuda and w2.is_cuda):
-                if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(
-                    0):
+            if w1.is_cuda and w2.is_cuda:
+                if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(0):
                     raise RuntimeError("Unexpected MoE weight shapes")
                 twoN, K = w1.size(1), w1.size(2)
                 if w2.size(1) != K:
@@ -293,18 +334,19 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 N = w2.size(2)
                 if twoN != 2 * N:
                     raise RuntimeError("Unexpected MoE hidden dims")
-                if (K % 16 != 0 or K % 32 != 0 or N % 16 != 0
-                    or twoN % 32 != 0):
+                if K % 16 != 0 or K % 32 != 0 or N % 16 != 0 or twoN % 32 != 0:
                     raise RuntimeError("Marlin packing requires alignment")
 
                 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-                    w8a8_2_marlin_weight, weight8bit_nt_kpack2_marlin,weight8bit_nt_kpack2_marlin1)
+                    w8a8_2_marlin_weight,
+                    weight8bit_nt_kpack2_marlin,
+                    weight8bit_nt_kpack2_marlin1,
+                )
 
                 def _pack_per_expert(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        new_expert = w8a8_2_marlin_weight(
-                            weight[i]).contiguous()
+                        new_expert = w8a8_2_marlin_weight(weight[i]).contiguous()
                         weight.data[i].view(-1).copy_(new_expert.view(-1))
                     weight = weight.reshape((-1,) + new_expert.shape)
 
@@ -313,12 +355,14 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 def _pack_per_expert_deepep(weight: torch.Tensor) -> torch.Tensor:
                     num_experts = weight.shape[0]
                     for i in range(num_experts):
-                        if is_moe_prefill() :
+                        if is_moe_prefill():  # noqa: F821
                             new_expert = weight8bit_nt_kpack2_marlin(
-                                weight[i]).contiguous()
+                                weight[i]
+                            ).contiguous()
                         else:
                             new_expert = weight8bit_nt_kpack2_marlin1(
-                                weight[i]).contiguous()
+                                weight[i]
+                            ).contiguous()
                         weight.data[i].view(-1).copy_(new_expert.view(-1))
                     weight = weight.reshape((-1,) + new_expert.shape)
                     return weight
@@ -363,7 +407,16 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend.is_aiter() and _is_dcu:
+            self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+        elif moe_runner_backend.is_triton():
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        else:
+            raise ValueError(f"Unsupported MoE runner backend: {moe_runner_backend}")
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -390,20 +443,42 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if _is_dcu and self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_fp8_quant_info,
+            )
+
+            quant_info = get_aiter_w8a8_fp8_quant_info(layer)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            if bias is not None:
+                return StandardCombineInput(
+                    hidden_states=combine_input.hidden_states + bias
+                )
+            return combine_input
+
         if _is_dcu and _use_fp8_w8a8_moe:
-            if (getattr(layer.w13_weight, "_w8a8_fp8_packed", False)
-                or getattr(layer.w2_weight, "_w8a8_fp8_packed", False)):
+            if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
+                layer.w2_weight, "_w8a8_fp8_packed", False
+            ):
                 topk_weights, topk_ids, _ = topk_output
                 use_prequant_input = i_q is not None and i_s is not None
                 if moe_runner_config.apply_router_weight_on_input:
-                    assert topk_weights.dim() == 2, "`topk_weights` should be (num_tokens, topk)"
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be (num_tokens, topk)"
                     _, tk = topk_weights.shape
-                    assert tk == 1, "DCU marlin path: apply_router_weight_on_input requires topk=1"
+                    assert (
+                        tk == 1
+                    ), "DCU marlin path: apply_router_weight_on_input requires topk=1"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                     # Router-weighted input no longer matches precomputed rms-quant activations.
                     use_prequant_input = False
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe_fp8_w8a8
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                    fused_moe_fp8_w8a8,
+                )
+
                 origin_w1_shape = getattr(layer.w13_weight, "w1_shape", None)
                 origin_w2_shape = getattr(layer.w2_weight, "w2_shape", None)
                 output = fused_moe_fp8_w8a8(
@@ -424,15 +499,14 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                     hidden_states_scale_fp8_input=i_s if use_prequant_input else None,
                 )
                 return StandardCombineInput(hidden_states=output)
-        else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                per_channel_quant=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
-            return self.runner.run(dispatch_output, quant_info)
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+        )
+        return self.runner.run(dispatch_output, quant_info)
