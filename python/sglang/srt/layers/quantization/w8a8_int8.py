@@ -39,7 +39,7 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 # from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod, UnquantizedEmbeddingMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -134,7 +134,7 @@ class W8A8Int8Config(QuantizationConfig):
             if should_ignore_layer(
                 prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
             ):
-                return UnquantizedLinearMethod()
+                return UnquantizedEmbeddingMethod()
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if should_ignore_layer(
@@ -145,7 +145,12 @@ class W8A8Int8Config(QuantizationConfig):
                 )
             return W8A8Int8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
-            return Fp8KVCacheMethod(self)
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return None
+            else:
+                return Fp8KVCacheMethod(self)
         return None
 
     def is_layer_skipped(
