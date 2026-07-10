@@ -53,8 +53,8 @@ from sglang.srt.utils.common import (
     is_dcu,
     is_dcu_native_fp8_supported,
     is_flashinfer_available,
-    is_hip,
     is_hcu,
+    is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -2215,9 +2215,15 @@ class ServerArgs:
                 effective_attn_tp_size = (
                     self.tp_size // attn_dp_size // self.attn_cp_size
                 )
+                # When effective_attn_tp_size == 1, attention does not apply TP
+                # splitting, so the expected_attn_tp_size check is skipped. In
+                # this case, the fused qkv_proj weights (which are stored with
+                # TP-interleaved layout) will be reordered and loaded in full
+                # by the weight loader.
                 if (
                     expected_attn_tp_size is not None
                     and effective_attn_tp_size != expected_attn_tp_size
+                    and effective_attn_tp_size != 1
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "

@@ -1315,9 +1315,64 @@ class MiMoV2ForCausalLM(nn.Module):
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                         self.config
                     )
-                    load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
-                    )
+                    attn_tp_size = get_attention_tp_size()
+
+                    if attn_tp_size == 1 and expected_fused_tp_size is not None:
+                        fused_tp = expected_fused_tp_size
+                        layer_id = get_layer_id(name)
+                        is_swa = (
+                            layer_id is not None
+                            and hasattr(self.config, "hybrid_layer_pattern")
+                            and self.config.hybrid_layer_pattern[layer_id] == 1
+                        )
+                        if is_swa and hasattr(self.config, "swa_num_attention_heads"):
+                            total_q = (
+                                self.config.swa_num_attention_heads
+                                * self.config.swa_head_dim
+                            )
+                            total_k = (
+                                self.config.swa_num_key_value_heads
+                                * self.config.swa_head_dim
+                            )
+                            total_v = self.config.swa_num_key_value_heads * getattr(
+                                self.config, "swa_v_head_dim", self.config.swa_head_dim
+                            )
+                        else:
+                            total_q = (
+                                self.config.num_attention_heads * self.config.head_dim
+                            )
+                            total_k = (
+                                self.config.num_key_value_heads * self.config.head_dim
+                            )
+                            total_v = self.config.num_key_value_heads * getattr(
+                                self.config, "v_head_dim", self.config.head_dim
+                            )
+                        per_rank_q = total_q // fused_tp
+                        per_rank_k = total_k // fused_tp
+                        per_rank_v = total_v // fused_tp
+                        per_rank_total = per_rank_q + per_rank_k + per_rank_v
+
+                        chunks = loaded_weight.split([per_rank_total] * fused_tp, dim=0)
+                        q_parts = [ch[:per_rank_q] for ch in chunks]
+                        k_parts = [
+                            ch[per_rank_q : per_rank_q + per_rank_k] for ch in chunks
+                        ]
+                        v_parts = [
+                            ch[
+                                per_rank_q
+                                + per_rank_k : per_rank_q
+                                + per_rank_k
+                                + per_rank_v
+                            ]
+                            for ch in chunks
+                        ]
+
+                        reordered = torch.cat(q_parts + k_parts + v_parts, dim=0)
+                        default_weight_loader(param, reordered)
+                    else:
+                        load_mimo_v2_qkv_proj_weight(
+                            name, param, loaded_weight, expected_fused_tp_size
+                        )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
