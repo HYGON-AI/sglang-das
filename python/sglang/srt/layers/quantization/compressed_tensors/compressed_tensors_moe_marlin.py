@@ -276,6 +276,36 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             weight8bit_nt_kpack2_marlin,
         )
 
+        if self.use_deepep:
+            layer._dsv4_w13_weight_shape = tuple(layer.w13_weight.shape)
+            layer._dsv4_w2_weight_shape = tuple(layer.w2_weight.shape)
+            w13_marlin_list = []
+            for ii in range(layer.w13_weight.shape[0]):
+                w13_marlin_list.append(
+                    w8a8_nt_kpack2_marlin_weight(layer.w13_weight[ii])
+                )
+            w13_lightop = torch.stack(w13_marlin_list, dim=0)
+            layer.w13_weight = Parameter(w13_lightop, requires_grad=False)
+            layer.register_buffer(
+                "w13_weight_deepgemm", layer.w13_weight.data, persistent=False
+            )
+            del w13_marlin_list, w13_lightop
+            torch.cuda.empty_cache()
+
+            w2_marlin_list = []
+            for ii in range(layer.w2_weight.shape[0]):
+                w2_marlin_list.append(
+                    w8a8_nt_kpack2_marlin_weight(layer.w2_weight[ii])
+                )
+            w2_lightop = torch.stack(w2_marlin_list, dim=0)
+            layer.w2_weight = Parameter(w2_lightop, requires_grad=False)
+            layer.register_buffer(
+                "w2_weight_deepgemm", layer.w2_weight.data, persistent=False
+            )
+            del w2_marlin_list, w2_lightop
+            torch.cuda.empty_cache()
+            return
+
         w1_marlin_list = []
         for ii in range(layer.w13_weight.shape[0]):
             if not self.use_deepep:
