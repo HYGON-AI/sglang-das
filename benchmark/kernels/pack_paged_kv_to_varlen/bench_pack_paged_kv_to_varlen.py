@@ -18,7 +18,9 @@ def import_pack_module():
     set_global_server_args_for_scheduler(
         ServerArgs(model_path="dummy", pack_paged_kv_to_varlen="on")
     )
-    return importlib.import_module("sglang.srt.layers.attention.pack_paged_kv_to_varlen")
+    return importlib.import_module(
+        "sglang.srt.layers.attention.pack_paged_kv_to_varlen"
+    )
 
 
 def measure(fn, iters):
@@ -202,9 +204,9 @@ def bench_kernel_gap_case(
         .permute(0, 2, 3, 1)
         .contiguous()
     )
-    block_table = torch.arange(
-        num_blocks, dtype=torch.int32, device="cuda"
-    ).reshape(batch_size, blocks_per_seq)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device="cuda").reshape(
+        batch_size, blocks_per_seq
+    )
     seqused_k = torch.full(
         (batch_size,), total_kv_len, dtype=torch.int32, device="cuda"
     )
@@ -354,9 +356,7 @@ def main():
         print(
             "bs={batch_size} kv={kv_len} hit={hit_rate:.2f} q={query_len} "
             "baseline_ms={baseline_ms:.3f} packed_ms={packed_ms:.3f} "
-            "pack_only_ms={pack_only_ms:.3f} speedup={speedup:.3f}".format(
-                **result
-            )
+            "pack_only_ms={pack_only_ms:.3f} speedup={speedup:.3f}".format(**result)
         )
 
 

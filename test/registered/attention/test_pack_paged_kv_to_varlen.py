@@ -8,12 +8,18 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
+from sglang.test.ci.ci_register import register_dcu_ci
+
+register_dcu_ci(est_time=60, suite="stage-b-test-1-gpu-small-dcu")
+
 
 def _import_pack_module():
     if not torch.cuda.is_available():
         raise unittest.SkipTest("Test requires an available GPU")
 
-    return importlib.import_module("sglang.srt.layers.attention.pack_paged_kv_to_varlen")
+    return importlib.import_module(
+        "sglang.srt.layers.attention.pack_paged_kv_to_varlen"
+    )
 
 
 class TestPackPagedKVToVarlen(unittest.TestCase):
@@ -59,14 +65,14 @@ class TestPackPagedKVToVarlen(unittest.TestCase):
             page_count = (seq_len + page_size - 1) // page_size
             pages = page_table[batch_idx, :page_count].to(torch.long)
             expected_k.append(
-                key_tokens.index_select(0, pages).reshape(
-                    -1, num_heads, head_dim
-                )[:seq_len]
+                key_tokens.index_select(0, pages).reshape(-1, num_heads, head_dim)[
+                    :seq_len
+                ]
             )
             expected_v.append(
-                value_tokens.index_select(0, pages).reshape(
-                    -1, num_heads, head_dim
-                )[:seq_len]
+                value_tokens.index_select(0, pages).reshape(-1, num_heads, head_dim)[
+                    :seq_len
+                ]
             )
 
         self.assertTrue(torch.equal(packed_k, torch.cat(expected_k, dim=0)))
