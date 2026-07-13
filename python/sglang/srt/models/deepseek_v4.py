@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
@@ -21,6 +22,7 @@ import torch.nn.functional as F
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
+    fused_q_norm_rope,
     fused_rope_inplace,
 )
 fused_rope = fused_rope_inplace
@@ -535,11 +537,12 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        # if q_out is None:
-        #     q_out = torch.empty_like(q)
-        # # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-        # fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        # return q_out
+        if not _is_dcu:
+            if q_out is None:
+                q_out = torch.empty_like(q)
+            # Official fused warp-per-(token, head) RMSNorm + RoPE path.
+            fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+            return q_out
 
         if _is_dcu and _use_dpskv4_lightop_rmsnorm:
             op.rms_norm_no_weight(None, q, None, self.eps)
