@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
 register_hcu_ci(est_time=1200, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=1200, suite="nightly-hcu-api-models", nightly=True)
 
-DEFAULT_HCU_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_HCU_EMBEDDING_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Embedding-0.6B"
 
 
 class TestBW1100QwenEmbeddingHCU(unittest.TestCase):

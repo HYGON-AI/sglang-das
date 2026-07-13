@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 
 register_hcu_ci(est_time=2400, suite="nightly-hcu", nightly=True, disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
-DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
+DEFAULT_QWEN3_MOE_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-30B-A3B"
 
 
 class TestBW1100Qwen3ThirtyBMoEServerHCU(unittest.TestCase):

@@ -29,8 +29,8 @@ from sglang.test.test_utils import (
 
 register_hcu_ci(est_time=1800, suite="nightly-hcu-quant-opt", nightly=True)
 
-DEFAULT_QWEN3_MOE_MODEL = "Qwen/Qwen3-30B-A3B"
-DEFAULT_QWEN3_MOE_EAGLE_DRAFT = "Tengyunw/qwen3_30b_moe_eagle3"
+DEFAULT_QWEN3_MOE_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-30B-A3B"
+DEFAULT_QWEN3_MOE_EAGLE_DRAFT = "/public/opendas/DL_DATA/llm-models/eagle/qwen3_30b_moe_eagle3"
 
 
 def _default_eagle_args() -> list[str]:
