@@ -25,13 +25,13 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=117,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
 )
-register_dcu_ci(est_time=117, suite="nightly-dcu-functional-long", nightly=True)
+register_hcu_ci(est_time=117, suite="nightly-hcu-functional-long", nightly=True)
 
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,

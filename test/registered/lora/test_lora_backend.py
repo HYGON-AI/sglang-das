@@ -17,7 +17,7 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,
@@ -35,10 +35,10 @@ register_amd_ci(
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/13107",
 )
-register_dcu_ci(
+register_hcu_ci(
     est_time=200,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: LoRA CI matrix uses remote base/adapters; needs local base and adapter mapping before enabling.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: LoRA CI matrix uses remote base/adapters; needs local base and adapter mapping before enabling.",
 )
 
 

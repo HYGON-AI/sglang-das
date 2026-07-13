@@ -20,7 +20,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_STANDALONE,
@@ -34,12 +34,12 @@ from sglang.test.test_utils import (
 # Standalone speculative decoding tests (FA3, Triton, FlashInfer backends)
 register_cuda_ci(est_time=308, suite="stage-b-test-1-gpu-large")
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: standalone speculative decoding path needs BW1100 draft model validation before enabling.",
+    disabled="HCU CSV CI placeholder: standalone speculative decoding path needs BW1100 draft model validation before enabling.",
 )
 
 GSM_DATASET_PATH = None

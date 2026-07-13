@@ -25,7 +25,7 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -36,10 +36,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=32, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(
+register_hcu_ci(
     est_time=32,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: metrics endpoint starts with local Qwen3-0.6B on BW1100, but metrics output is missing sglang:cached_tokens_total; needs metrics/runtime validation before required CI.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: metrics endpoint starts with local Qwen3-0.6B on BW1100, but metrics output is missing sglang:cached_tokens_total; needs metrics/runtime validation before required CI.",
 )
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"

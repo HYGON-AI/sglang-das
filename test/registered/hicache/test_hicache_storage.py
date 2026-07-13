@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=300,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: hierarchical cache server fails during BW1100 startup with VMFault, scheduler exit -6/EOFError before MMLU begins.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: hierarchical cache server fails during BW1100 startup with VMFault, scheduler exit -6/EOFError before MMLU begins.",
 )
 
 

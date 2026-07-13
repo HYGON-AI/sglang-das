@@ -21,16 +21,16 @@ import torch.nn as nn
 
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=6, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
 )
 
 HOOK_CALLS = []

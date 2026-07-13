@@ -23,12 +23,12 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=278,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: deterministic suite spans flashinfer/fa3/triton backends; needs BW1100 backend repeat validation with local Qwen3-8B.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: deterministic suite spans flashinfer/fa3/triton backends; needs BW1100 backend repeat validation with local Qwen3-8B.",
 )
 
 from sglang.test.test_deterministic_utils import (
