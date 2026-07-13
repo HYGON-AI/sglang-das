@@ -22,7 +22,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_hcu_ci
-register_hcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=120, suite="stage-b-test-1-hcu-small")
 
 
 class TestBuildEagleTree(unittest.TestCase):

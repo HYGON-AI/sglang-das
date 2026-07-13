@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
 
 register_hcu_ci(
     est_time=600,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled=(
         "HCU disabled retest: page-size/top-k parameters can be adapted, "
         "but runtime still requires missing sgl_kernel.reconstruct_indices_from_tree_mask."

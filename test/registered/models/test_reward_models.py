@@ -28,7 +28,7 @@ register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=132, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 register_hcu_ci(
     est_time=132,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: reward-model matrix uses remote HF models; local reward model mapping is not yet validated on BW1100.",
 )
 

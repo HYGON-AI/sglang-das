@@ -42,7 +42,7 @@ register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: local Qwen3-0.6B passed three runs.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
 )
 
 class TestEnableThinking(CustomTestCase):

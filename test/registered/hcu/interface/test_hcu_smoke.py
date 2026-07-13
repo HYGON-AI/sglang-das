@@ -16,7 +16,7 @@
 
 Purpose:
     Provide one minimal registered test under test/registered/hcu/ so that
-    `python3 test/run_suite.py --hw hcu --suite stage-a-test-1-gpu-small-hcu`
+    `python3 test/run_suite.py --hw hcu --suite stage-a-test-1-hcu-small`
     is able to collect and execute at least one file end-to-end.
 
 This file deliberately performs no real HCU work. It only validates that
@@ -30,7 +30,7 @@ import unittest
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_hcu_ci(est_time=10, suite="stage-a-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=10, suite="stage-a-test-1-hcu-small")
 
 
 class TestHCUSmoke(CustomTestCase):

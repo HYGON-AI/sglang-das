@@ -44,7 +44,7 @@ register_amd_ci(est_time=89, suite="stage-b-test-1-gpu-small-amd")
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: local DeepSeek-R1-Distill-Qwen-7B passed three runs.
 register_hcu_ci(
     est_time=89,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
 )
 register_hcu_ci(est_time=89, suite="nightly-hcu-api-models", nightly=True)
 

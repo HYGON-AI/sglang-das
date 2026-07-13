@@ -31,7 +31,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
 )
 from sglang.test.ci.ci_register import register_hcu_ci
-register_hcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=30, suite="nightly-hcu-api-models", nightly=True)
 
 

@@ -15,7 +15,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="BW1100 quick validation timed out after 900s: inclusionAI/LLaDA2.0-mini server stayed running with flashinfer/DLLM path and did not finish the first pytest item.",
 )
 

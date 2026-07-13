@@ -30,7 +30,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_hcu_ci(est_time=600, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=600, suite="stage-b-test-1-hcu-small")
 
 DEFAULT_QWEN25_0P5B_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 

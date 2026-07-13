@@ -17,7 +17,7 @@ import unittest
 
 from sglang.srt.managers.io_struct import ProfileReqInput
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
-register_hcu_ci(est_time=9, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=9, suite="stage-b-test-1-hcu-small")
 
 
 register_cuda_ci(est_time=8, stage="stage-b", runner_config="1-gpu-small")

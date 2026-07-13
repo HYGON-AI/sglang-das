@@ -18,7 +18,7 @@ from sglang import Engine
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_utils import RED_DOT_IMAGE_DATA_URL, get_model_path
 
-register_hcu_ci(est_time=1800, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=1800, suite="stage-b-test-1-hcu-small")
 
 DEFAULT_QWEN25_VL_3B_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 

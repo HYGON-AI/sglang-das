@@ -315,35 +315,35 @@ jobs:
       matrix:
         include:
           - name: stage-a
-            suite: stage-a-test-1-gpu-small-hcu
+            suite: stage-a-test-1-hcu-small
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
           - name: stage-b-small-0
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 0
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-1
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 1
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-2
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 2
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-3
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 3
             parts: 4

@@ -37,7 +37,7 @@ register_amd_ci(
 )
 register_hcu_ci(
     est_time=200,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: LoRA CI matrix uses remote base/adapters; needs local base and adapter mapping before enabling.",
 )
 

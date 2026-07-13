@@ -36,8 +36,8 @@ on:
         default: ""
         options:
           - ""
-          - stage-a-test-1-gpu-small-hcu
-          - stage-b-test-1-gpu-small-hcu
+          - stage-a-test-1-hcu-small
+          - stage-b-test-1-hcu-small
       target_stage:
         description: "Or type comma-separated HCU stage names"
         required: false
@@ -207,10 +207,10 @@ jobs:
           run_stage_a=false
           run_stage_b=false
 
-          if [[ "${requested}" == *",stage-a-test-1-gpu-small-hcu,"* ]]; then
+          if [[ "${requested}" == *",stage-a-test-1-hcu-small,"* ]]; then
             run_stage_a=true
           fi
-          if [[ "${requested}" == *",stage-b-test-1-gpu-small-hcu,"* ]]; then
+          if [[ "${requested}" == *",stage-b-test-1-hcu-small,"* ]]; then
             run_stage_b=true
           fi
 
@@ -590,7 +590,7 @@ jobs:
           fi
           echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
-  stage-a-test-1-gpu-small-hcu:
+  stage-a-test-1-hcu-small:
     name: Stage A HCU smoke
     needs:
       - check-changes
@@ -644,13 +644,13 @@ jobs:
       - name: Install dependencies
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
-      - name: Run stage-a-test-1-gpu-small-hcu
+      - name: Run stage-a-test-1-hcu-small
         timeout-minutes: 30
         run: |
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw hcu \
-              --suite stage-a-test-1-gpu-small-hcu \
+              --suite stage-a-test-1-hcu-small \
               --include-file registered/hcu/interface/test_hcu_smoke.py \
               --timeout-per-file 120 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
@@ -659,13 +659,13 @@ jobs:
         if: always()
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  stage-b-test-1-gpu-small-hcu:
+  stage-b-test-1-hcu-small:
     name: Stage B HCU required (${{ matrix.name }})
     needs:
       - check-changes
       - call-gate
       - validate-config
-      - stage-a-test-1-gpu-small-hcu
+      - stage-a-test-1-hcu-small
       - wait-hcu-wheels
     if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-hcu-wheels.result == 'success' || needs.wait-hcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
@@ -741,14 +741,14 @@ jobs:
       - name: Install dependencies
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
-      - name: Run stage-b-test-1-gpu-small-hcu required partition
+      - name: Run stage-b-test-1-hcu-small required partition
         run: |
-          echo "Running stage-b-test-1-gpu-small-hcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
+          echo "Running stage-b-test-1-hcu-small required partition ${{ matrix.part }}/${{ matrix.parts }}"
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" \
             -e SGLANG_HCU_RERANKER_MODEL="${SGLANG_HCU_RERANKER_MODEL}" -- \
             python3 run_suite.py \
               --hw hcu \
-              --suite stage-b-test-1-gpu-small-hcu \
+              --suite stage-b-test-1-hcu-small \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_0.py \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_1.py \
               --include-file registered/unit/observability/test_metrics_utils.py \
@@ -814,8 +814,8 @@ jobs:
       - call-gate
       - validate-config
       - wait-hcu-wheels
-      - stage-a-test-1-gpu-small-hcu
-      - stage-b-test-1-gpu-small-hcu
+      - stage-a-test-1-hcu-small
+      - stage-b-test-1-hcu-small
     if: always()
     runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:

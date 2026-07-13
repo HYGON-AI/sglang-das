@@ -23,7 +23,7 @@ from sglang.test.test_utils import CustomTestCase, run_mmlu_test, run_mulit_requ
 
 register_cuda_ci(est_time=312, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=312, suite="stage-b-test-1-gpu-small-amd")
-register_hcu_ci(est_time=312, suite="stage-b-test-1-gpu-small-hcu", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_hcu_ci(est_time=312, suite="stage-b-test-1-hcu-small", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestChunkedPrefill(CustomTestCase):

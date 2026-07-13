@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU PR baseline deferred: test is registered for HCU coverage but lacks three-pass BW1100 PR-gate repeat evidence.",
 )
 

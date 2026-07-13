@@ -19,7 +19,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_hcu_ci
 
-register_hcu_ci(est_time=60, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=60, suite="stage-b-test-1-hcu-small")
 
 
 class TestMamba2MixerHCU(unittest.TestCase):

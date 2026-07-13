@@ -25,7 +25,7 @@ register_cuda_ci(est_time=132, suite="stage-b-test-2-gpu-large")
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     nightly=False,
     disabled="HCU CSV CI placeholder: NVIDIA Nemotron model path needs HCU-compatible local mapping before enabling.",
 )

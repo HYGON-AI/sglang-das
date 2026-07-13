@@ -36,7 +36,7 @@ from sglang.srt.utils import (
 )
 from sglang.test.ci.ci_register import register_hcu_ci
 
-register_hcu_ci(est_time=300, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=300, suite="stage-b-test-1-hcu-small")
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

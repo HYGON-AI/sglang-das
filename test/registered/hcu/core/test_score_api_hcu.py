@@ -26,7 +26,7 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_hcu_ci(
     est_time=600,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled=(
         "HCU disabled retest candidate: verify whether score API passes with "
         "explicit fa3/page-size-64 server settings before enabling."

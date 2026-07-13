@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_hcu_ci(est_time=1200, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=1200, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=1200, suite="nightly-hcu-api-models", nightly=True)
 
 DEFAULT_HCU_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"

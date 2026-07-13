@@ -34,7 +34,7 @@ register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=420, suite="stage-b-test-1-gpu-small-amd")
 register_hcu_ci(
     est_time=420,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: broad eval requires human_eval dependency and overlaps with dedicated nightly-hcu-accuracy baselines.",
 )
 
