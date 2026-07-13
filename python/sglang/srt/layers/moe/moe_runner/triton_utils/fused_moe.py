@@ -1019,7 +1019,7 @@ def fused_experts_impl(
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(hidden_states, w1, w2, topk_weights, topk_ids, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, routed_scaling_factor, quant_type)
 
-    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import hcu_moe_align_block_size
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
     padded_size = padding_size
@@ -1175,7 +1175,7 @@ def fused_experts_impl(
         #     and (not use_int4_w4a16)
         # )
         if _use_lightop:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(
+            sorted_token_ids, expert_ids, num_tokens_post_padded = hcu_moe_align_block_size(
                 curr_topk_ids, config["BLOCK_SIZE_M"], E
             )
         else:
@@ -1625,8 +1625,8 @@ def fused_moe_fp8_w8a8(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    # from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
-    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import dcu_moe_align_block_size
+    # from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import hcu_moe_align_block_size
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import hcu_moe_align_block_size
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1667,7 +1667,7 @@ def fused_moe_fp8_w8a8(
         if global_num_experts == -1:
             global_num_experts = E
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(
+        sorted_token_ids, expert_ids, num_tokens_post_padded = hcu_moe_align_block_size(
             topk_ids, block_size_m, global_num_experts)
 
         # TODO: tune this further for specific models

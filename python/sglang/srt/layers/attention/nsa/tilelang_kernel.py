@@ -20,7 +20,7 @@ import tilelang.language as T
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_dcu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_hcu
 
 tilelang.set_log_level("WARNING")
 
@@ -37,7 +37,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
 FP32 = "float32"
@@ -152,7 +152,7 @@ def act_quant(
     else:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
-    if _is_dcu:
+    if _is_hcu:
         from lightop import op
         use_ue8m0 = scale_fmt is not None
         op.per_token_group_quant_fp8(y, x, s, block_size, 1e-5, use_ue8m0)

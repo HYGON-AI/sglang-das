@@ -22,9 +22,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import is_blackwell, is_dcu
+from sglang.srt.utils import is_blackwell, is_hcu
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 
 class SboFlags:
@@ -38,7 +38,7 @@ class SboFlags:
             and (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 or (get_moe_runner_backend().is_deep_gemm() and not is_blackwell())
-                or _is_dcu
+                or _is_hcu
             )
         )
 

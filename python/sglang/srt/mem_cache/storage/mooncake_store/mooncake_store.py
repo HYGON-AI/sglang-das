@@ -25,7 +25,7 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 from sglang.srt.utils import get_bool_env_var
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
-_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 logger = logging.getLogger(__name__)
 
 
@@ -284,7 +284,7 @@ class MooncakeBaseStore:
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             ptr_k = tensor[0].data_ptr()
             ptr_v = tensor[1].data_ptr()
             size_k = tensor[0].numel() * tensor[0].element_size()
@@ -564,7 +564,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first_direct",
             "page_head",
             "page_first_kv_split",
-            "layout_dcu",
+            "layout_hcu",
         ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
         buffer = self.mem_pool_host.kv_buffer
         try:

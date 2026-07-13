@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_dcu, is_hip
+from sglang.srt.utils import add_prefix, is_hcu, is_hip
 
 # from sglang.srt.layers.attention.compressed.metadata import (
 #     PagedCoreMetadata,
@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 if is_hip():
     FP8_DTYPE = torch.float8_e4m3fnuz
     FP8_MAX = torch.finfo(FP8_DTYPE).max
@@ -280,7 +280,7 @@ class C4IndexerBackendMixin:
 
         # q = c4_indexer.compute_q(q_lora, positions=positions)
 
-        # if _is_dcu and _use_lightop_group_fp8_quant:
+        # if _is_hcu and _use_lightop_group_fp8_quant:
         #     from lightop import op as ops
         #     def act_quant_group_lightop(
         #         x: torch.Tensor,

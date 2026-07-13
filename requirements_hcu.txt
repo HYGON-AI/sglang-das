@@ -20,6 +20,7 @@ traitlets==5.14.3
 typing_extensions==4.15.0
 wcwidth==0.2.14
 xgrammar==0.1.25
+causal-conv1d @ https://pypi.sourcefind.cn/customer/dtk2604-rc4/+f/3e9/32ae6224d55da/causal_conv1d-1.5.4+das.opt1.dtk2604.torch2100.2607091657.g5e5a32-cp310-cp310-linux_x86_64.whl#sha256=3e932ae6224d55daa820a2499618d1be1a883ab57af51e8ff28681b1e8b678f4
 
 setuptools
 wheel

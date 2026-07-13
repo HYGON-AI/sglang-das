@@ -109,7 +109,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -124,7 +124,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -206,11 +206,11 @@ if _use_lightop:
     from lightop import op as op
 
 _use_lightop_sqrtsoftplus_gate = (
-    _use_lightop and _is_dcu and hasattr(op, "moe_fused_gate_sqrtsoftplus")
+    _use_lightop and _is_hcu and hasattr(op, "moe_fused_gate_sqrtsoftplus")
 )
 
 
-def moe_fused_gate_dcu(
+def moe_fused_gate_hcu(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
     num_expert_group: int,
@@ -252,8 +252,8 @@ def moe_fused_gate_fake(
 
 
 direct_register_custom_op(
-    op_name="moe_fused_gate_dcu",
-    op_func=moe_fused_gate_dcu,
+    op_name="moe_fused_gate_hcu",
+    op_func=moe_fused_gate_hcu,
     mutates_args=[],
     fake_impl=moe_fused_gate_fake,
 )
@@ -261,7 +261,7 @@ direct_register_custom_op(
 
 if _use_lightop_sqrtsoftplus_gate:
 
-    def moe_fused_gate_sqrtsoftplus_dcu(
+    def moe_fused_gate_sqrtsoftplus_hcu(
         gating_output: torch.Tensor,
         correction_bias: torch.Tensor,
         topk: int,
@@ -304,8 +304,8 @@ if _use_lightop_sqrtsoftplus_gate:
         )
 
     direct_register_custom_op(
-        op_name="moe_fused_gate_sqrtsoftplus_dcu",
-        op_func=moe_fused_gate_sqrtsoftplus_dcu,
+        op_name="moe_fused_gate_sqrtsoftplus_hcu",
+        op_func=moe_fused_gate_sqrtsoftplus_hcu,
         mutates_args=[],
         fake_impl=moe_fused_gate_sqrtsoftplus_fake,
     )
@@ -760,7 +760,7 @@ def fused_topk(
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
             )
-        elif _is_dcu and _use_fused_topk_softmax:
+        elif _is_hcu and _use_fused_topk_softmax:
             from lightop import op
 
             op.topk_softmax(
@@ -1067,7 +1067,7 @@ def biased_topk_lightop_impl(
     assert scoring_func == "sqrtsoftplus"
     assert routed_scaling_factor is not None
 
-    topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_sqrtsoftplus_dcu(
+    topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_sqrtsoftplus_hcu(
         gating_output,
         correction_bias,
         topk,
@@ -1383,7 +1383,7 @@ def biased_grouped_topk_gpu(
         )
     elif _use_lightop:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_dcu(
+        topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_hcu(
             gating_output,
             correction_bias,
             num_expert_group,

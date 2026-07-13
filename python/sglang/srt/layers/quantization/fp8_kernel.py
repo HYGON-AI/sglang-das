@@ -36,7 +36,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_sm100_supported,
@@ -61,7 +61,7 @@ if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if _is_hip:
     _has_vllm = False
@@ -1927,7 +1927,7 @@ Returns:
 Raises:
     AssertionError: If input is not 2D or if static scale's numel != 1
 """
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
 
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""

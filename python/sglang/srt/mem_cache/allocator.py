@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kernel
+from sgl_kernel.kvcacheio import hcu_alloc_decode_kernel, hcu_alloc_extend_kernel
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
@@ -44,7 +44,7 @@ def _get_lightop_alloc_extend_kernel():
         from lightop import op as lightop_op
 
         _LIGHTOP_ALLOC_EXTEND_KERNEL = getattr(
-            lightop_op, "dcu_alloc_extend_kernel", None
+            lightop_op, "hcu_alloc_extend_kernel", None
         )
     except Exception:
         _LIGHTOP_ALLOC_EXTEND_KERNEL = None
@@ -470,7 +470,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size=self.page_size,
             )
         elif self.sglang_kvalloc_kernel:
-            dcu_alloc_extend_kernel(
+            hcu_alloc_extend_kernel(
                 pre_lens_ptr=prefix_lens.to(torch.int64),
                 seq_lens_ptr=seq_lens.to(torch.int64),
                 last_loc_ptr=last_loc.to(torch.int64),
@@ -523,7 +523,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
         if self.sglang_kvalloc_kernel:
-            dcu_alloc_decode_kernel(
+            hcu_alloc_decode_kernel(
                 seq_lens_ptr=seq_lens,
                 last_loc_ptr=last_loc,
                 free_page_ptr=self.free_pages,
