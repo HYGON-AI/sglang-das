@@ -35,7 +35,7 @@ class TestTritonAttnBackend(CustomTestCase):
                 "--attention-backend",
                 "triton",
                 "--enable-torch-compile",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 4,
             ],
         )

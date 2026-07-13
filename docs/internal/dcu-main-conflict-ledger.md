@@ -1246,3 +1246,35 @@ actual result in the checkpoint note.
   - Per the 2026-07-13 workflow, only the pure-TP command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel` is in scope after checking `hy-smi` on both shared-home environments. CI and other models/topologies are owner-run.
   - The previously observed empty-output/NaN accuracy issue is explicitly deferred. Do not add further trace instrumentation or accuracy fixes in this catch-up step.
   - `SGLANG_USE_AITER_AG=0` remains the required operational workaround until the DCU AITER all-gather graph reproducer passes.
+
+### Official main catch-up 20260629 / `f920a37da46e`
+
+- Branch: `sync/official-main-catchup-20260629`.
+- Base: DCU `main@b97ca20827da8b9eed8db0cbe0b128f33ccc7aee`, official previous checkpoint `eeee3abbbf8196e54c227faecfd5faba7b1dfc4b`.
+- Endpoint: official `main@f920a37da46e1cbb6ba27b76365a622eba593811` (`[AMD] Copy decode result on forward_stream instead of copy_stream (#29642)`).
+- Scope: 129 immutable official commits (the planning estimate was 131), 2026-06-26 to 2026-06-29; 799 files changed in the merged result.
+- Textual conflicts and decisions (6 files, below the 50-file fallback threshold):
+  - `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` (`attention/dsa`, `manual merge`): adopted official CUDA indexer fusion, graph split-op, and fused K/Q preparation; retained a DCU-first branch for fused LayerNorm/RoPE, BF16 index cache, FP8 QK quant/store, page-size-64 top-k, and DCU logits behavior. The shared helper now returns the official `weights_raw` tuple without sending DCU through CUDA-only JIT fusion.
+  - `python/sglang/srt/layers/attention/flashattention_backend.py` (`attention`, `manual merge`): adopted official prefill-aware SWA, scheduler metadata, cascade merge, and device-side page-table generation for non-DCU devices; retained DCU NHD/HND FA layouts, VLLM decode kernel, and `normal_decode_set_metadata_lightop` with bounded host page counts.
+  - `python/sglang/srt/layers/attention/linear/gdn_backend.py` (`linear-attention`, `manual merge`): kept `causal_conv1d_fn_dcu` dispatch and passed official page-major contiguous state copies and identity cache indices, allowing the official post-kernel scatter back to the strided pool.
+  - `python/sglang/srt/managers/scheduler.py` (`scheduler/disaggregation`, `theirs`): used official `get_draft_recurrent_hidden_state_spec()` output for both decode and prefill metadata buffers instead of the stale model-config hidden-size approximation.
+  - `python/sglang/srt/mem_cache/memory_pool.py` (`mem_cache`, `manual merge`): kept the validated DCU FA K/V physical layout ahead of generic HND/vectorized/NHD allocation, while accepting official HND copy restrictions and page-major pool infrastructure.
+  - `python/sglang/srt/models/deepseek_v2.py` (`deepseek/moe`, `manual merge`): adopted official JIT router/fused-A imports and the shared-expert-before-routed launch order; retained DCU BMM, HIP decode helpers, and fused residual-RMS shared-expert arguments inside the alternate stream.
+- High-risk semantic audit:
+  - Official page-major MHA/Mamba state layout, HiCache/session changes, DSA fusion, DFlash device-side metadata, DeepSeek-V4 PP SWA layer mapping, and dual-stream MoE ordering were reviewed. Official structure remains canonical, with DCU overrides limited to existing `_is_dcu`/LightOp/layout paths.
+  - The endpoint's HIP scheduler change intentionally performs the small decode result D2H copy on the forward stream for DCU/ROCm, avoiding the cross-stream synchronization cost described by the official fix.
+  - Deleted runtime files in this range contain no DCU implementation requiring a forward port; the large `.claude` skill deletion and multimodal test moves follow official structure.
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still exports `SGLANG_USE_AITER_AG=0`; this catch-up does not remove the workaround.
+- Automated validation result before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on changed files: no output.
+  - `git diff --check`: passed.
+  - `python3 -m py_compile` over 587 changed Python files: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841`: blocked because Ruff/Pyflakes/Flake8 are absent; an isolated `/tmp` Ruff install stalled at the configured package source and was stopped without changing project or system dependencies. This gate is not reported as passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - `PYTHONPATH=python python3 -c 'import sglang; print(sglang.__file__)'`: resolved to `/home/proj_sglang_open/dcu-sglang/python/sglang/__init__.py`.
+- Functional validation policy:
+  - Run only `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, then require service readiness, `/health` HTTP 200, and one short `/generate` request completion.
+  - Accuracy, throughput, alternate models/topologies, and full CI remain owner-run/non-blocking. If the pure-TP smoke exposes a regression, perform at most one focused fix and one confirmation attempt before returning it for review.

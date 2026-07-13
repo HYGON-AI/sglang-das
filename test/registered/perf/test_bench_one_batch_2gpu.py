@@ -27,7 +27,8 @@ class TestBenchOneBatch2GPU(CustomTestCase):
 
     def test_moe_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
-            DEFAULT_MOE_MODEL_NAME_FOR_TEST, ["--tp", "2", "--cuda-graph-max-bs", "2"]
+            DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+            ["--tp", "2", "--cuda-graph-max-bs-decode", "2"],
         )
 
         if is_in_ci():
@@ -43,7 +44,7 @@ class TestBenchOneBatch2GPU(CustomTestCase):
     def test_torch_compile_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
-            ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs", "2"],
+            ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs-decode", "2"],
         )
 
         if is_in_ci():
