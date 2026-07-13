@@ -156,19 +156,22 @@ jobs:
   hcu-runtime-text-check:
     name: hcu-runtime-text-check
     needs: changed-files
-    if: false
-    runs-on: [self-hosted, linux, x64, quality]
+    if: ${{ false }}
+    runs-on: [self-hosted, Linux, X64, internal, quality]
 
     steps:
-      - name: Checkout
+      - name: Checkout target commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Check HCU user-visible runtime text
         shell: bash
         env:
           CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
-          python3 scripts/ci/hcu/check_hcu_runtime_text.py ${CHANGED_FILES}
+          mapfile -t files < <(printf '%s\n' "$CHANGED_FILES")
+          python3 scripts/ci/hcu/check_hcu_runtime_text.py -- "${files[@]}"
 
   secret-check:
     name: secret-check

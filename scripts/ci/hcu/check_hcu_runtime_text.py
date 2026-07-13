@@ -13,20 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fail if HCU-owned changed files add user-visible platform-sensitive text.
+"""Check changed HCU runtime paths for platform-sensitive visible text.
 
-The workflow passes only changed files from the PR or push diff. This script
-does not scan the whole repository.
+The checker is intentionally read-only. It reports violations and returns a
+non-zero exit code, but never modifies source files.
 """
 
 import ast
+import os
 import re
 import sys
 from pathlib import Path
 
 
 HCU_PATH_PREFIXES = (
-    ".github/workflows/",
     "scripts/ci/hcu/",
     "test/registered/hcu/",
 )
@@ -37,6 +37,13 @@ HCU_EXACT_FILES = {
 EXEMPT_FILES = {
     "scripts/ci/hcu/check_hcu_runtime_text.py",
 }
+EXEMPT_PATH_PREFIXES = (
+    "scripts/ci/hcu/tests/",
+)
+HCU_CODE_MARKER_RE = re.compile(
+    r"\b(?:is_hcu|_is_hcu|register_hcu_ci)\b|"
+    r"\bHWBackend\.HCU\b"
+)
 VISIBLE_CALLS = {
     "print",
     "warning",
@@ -50,6 +57,9 @@ VISIBLE_CALLS = {
     "skipif",
     "xfail",
     "add_argument",
+    "log_info_on_rank0",
+    "log_warning_on_rank0",
+    "log_error_on_rank0",
     "RuntimeError",
     "ValueError",
     "AssertionError",
@@ -57,37 +67,32 @@ VISIBLE_CALLS = {
     "ImportError",
     "NotImplementedError",
 }
-TEXT_EXTS = {".py", ".sh", ".bash", ".yml", ".yaml"}
+TEXT_EXTS = {
+    ".py",
+    ".sh",
+    ".bash",
+    ".yml",
+    ".yaml",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".cu",
+    ".h",
+    ".hpp",
+}
 VISIBLE_TEXT_RE = re.compile(
     r"^\s*(?:-?\s*)?(?:name|description):|"
-    r"\b(?:echo|printf)\b|"
+    r"\b(?:echo|printf|fprintf|sprintf|snprintf|puts)\s*\(|"
+    r"\bstd::(?:cerr|cout|clog)\b|"
+    r"\b(?:LOG|LOG_INFO|LOG_WARNING|LOG_ERROR|SPDLOG_[A-Z]+)\s*\(|"
+    r"\bthrow\s+(?:std::)?\w+|"
     r"::(?:error|warning|notice)\b",
     re.IGNORECASE,
 )
-BLOCKED_TEXT_RE = re.compile(r"AMD|amd|XGMI|xgmi|DCU|dcu")
+BLOCKED_TEXT_RE = re.compile(r"AMD|XGMI|DCU", re.IGNORECASE)
 MAX_SNIPPET_LEN = 140
-
-
-class Replacement:
-    __slots__ = ("source", "target")
-
-    def __init__(self, source, target):
-        self.source = source
-        self.target = target
-
-
-REPLACEMENTS = (
-    Replacement("AMD/ROCm", "HCU/ROCm"),
-    Replacement("AMD/HIP", "HCU/HIP"),
-    Replacement("AMD GPUs", "HCU devices"),
-    Replacement("AMD GPU", "HCU device"),
-    Replacement("AMD", "HCU"),
-    Replacement("amd", "hcu"),
-    Replacement("XGMI", "HSL"),
-    Replacement("xgmi", "hsl"),
-    Replacement("DCU", "HCU"),
-    Replacement("dcu", "hcu"),
-)
+UNKNOWN = object()
 
 
 class Violation:
@@ -102,6 +107,9 @@ class Violation:
     def display_path(self):
         return normalize_path(str(self.path))
 
+    def key(self):
+        return (self.display_path(), self.lineno, self.location, self.text)
+
     def message(self):
         return (
             f"{self.display_path()}:{self.lineno}: user-visible "
@@ -109,20 +117,45 @@ class Violation:
         )
 
 
-def normalize_path(name: str) -> str:
-    return name.replace("\\", "/").lstrip("./")
+class ScanFailure:
+    __slots__ = ("path", "message")
+
+    def __init__(self, path, message):
+        self.path = path
+        self.message = message
+
+    def display(self):
+        return f"{normalize_path(str(self.path))}: {self.message}"
 
 
-def is_hcu_owned(path: str) -> bool:
+def normalize_path(name):
+    normalized = name.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def is_hcu_owned_path(path):
     path = normalize_path(path)
     if path in HCU_EXACT_FILES:
         return True
     if path.startswith(".github/workflows/"):
-        return any(token in Path(path).name.lower() for token in ("dcu", "hcu"))
-    return any(path.startswith(prefix) for prefix in HCU_PATH_PREFIXES[1:])
+        return "hcu" in Path(path).name.lower()
+    return any(path.startswith(prefix) for prefix in HCU_PATH_PREFIXES)
 
 
-def function_name(node: ast.AST) -> str:
+def is_exempt(path):
+    path = normalize_path(path)
+    return path in EXEMPT_FILES or any(
+        path.startswith(prefix) for prefix in EXEMPT_PATH_PREFIXES
+    )
+
+
+def has_hcu_code_marker(text):
+    return HCU_CODE_MARKER_RE.search(text) is not None
+
+
+def function_name(node):
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
@@ -130,54 +163,125 @@ def function_name(node: ast.AST) -> str:
     return ""
 
 
-def string_values(node: ast.AST):
+def is_string_node(node):
     constant_cls = getattr(ast, "Constant", None)
-    for child in ast.walk(node):
-        if (
-            constant_cls is not None
-            and isinstance(child, constant_cls)
-            and isinstance(child.value, str)
-        ):
-            yield child.lineno, child.value
-        elif child.__class__.__name__ == "Str" and isinstance(
-            getattr(child, "s", None), str
-        ):
-            yield child.lineno, child.s
+    if constant_cls is not None and isinstance(node, constant_cls):
+        return isinstance(node.value, str)
+    return node.__class__.__name__ == "Str" and isinstance(
+        getattr(node, "s", None), str
+    )
 
 
-def text_snippet(text: str) -> str:
+def string_node_value(node):
+    if hasattr(node, "value"):
+        return node.value
+    return node.s
+
+
+def is_true_on_hcu(node):
+    platform_names = {
+        "is_hcu",
+        "_is_hcu",
+        "is_hip",
+        "_is_hip",
+    }
+    if isinstance(node, ast.Name):
+        return node.id in platform_names
+    if isinstance(node, ast.Attribute):
+        return node.attr in platform_names
+    if isinstance(node, ast.Call):
+        return function_name(node.func) in {"is_hcu", "is_hip"}
+    return False
+
+
+def evaluate_for_hcu(node):
+    """Evaluate known HCU conditions while leaving unrelated values unknown."""
+    if is_true_on_hcu(node):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        value = evaluate_for_hcu(node.operand)
+        return UNKNOWN if value is UNKNOWN else not value
+    if isinstance(node, ast.BoolOp):
+        values = [evaluate_for_hcu(value) for value in node.values]
+        if isinstance(node.op, ast.And):
+            if False in values:
+                return False
+            return True if all(value is True for value in values) else UNKNOWN
+        if isinstance(node.op, ast.Or):
+            if True in values:
+                return True
+            return False if all(value is False for value in values) else UNKNOWN
+    if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+        if is_true_on_hcu(node.left):
+            comparator = node.comparators[0]
+            constant_cls = getattr(ast, "Constant", ast.AST)
+            if isinstance(comparator, (ast.NameConstant, constant_cls)):
+                value = getattr(comparator, "value", None)
+                if isinstance(value, bool):
+                    if isinstance(node.ops[0], (ast.Eq, ast.Is)):
+                        return value
+                    if isinstance(node.ops[0], (ast.NotEq, ast.IsNot)):
+                        return not value
+    return UNKNOWN
+
+
+def expression_strings(node):
+    if node is None:
+        return
+    if is_string_node(node):
+        yield node.lineno, string_node_value(node)
+        return
+    if isinstance(node, ast.IfExp):
+        value = evaluate_for_hcu(node.test)
+        if value is not False:
+            yield from expression_strings(node.body)
+        if value is not True:
+            yield from expression_strings(node.orelse)
+        return
+    if isinstance(node, ast.Call):
+        for arg in node.args:
+            yield from expression_strings(arg)
+        for keyword in node.keywords:
+            yield from expression_strings(keyword.value)
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from expression_strings(child)
+
+
+def visible_call_strings(node, name):
+    if name == "add_argument":
+        for keyword in node.keywords:
+            if keyword.arg in {"help", "description", "epilog"}:
+                yield from expression_strings(keyword.value)
+        return
+    if name == "skipif":
+        for keyword in node.keywords:
+            if keyword.arg == "reason":
+                yield from expression_strings(keyword.value)
+        return
+    for arg in node.args:
+        yield from expression_strings(arg)
+    for keyword in node.keywords:
+        if keyword.arg in {"reason", "help", "description", "epilog"}:
+            yield from expression_strings(keyword.value)
+
+
+def text_snippet(text):
     snippet = " ".join(text.split())
     if len(snippet) > MAX_SNIPPET_LEN:
         snippet = snippet[: MAX_SNIPPET_LEN - 3] + "..."
     return repr(snippet)
 
 
-def suggested_text(text: str) -> str:
-    result = text
-    for replacement in REPLACEMENTS:
-        result = result.replace(replacement.source, replacement.target)
-    return result
-
-
-def replacement_hint(text: str) -> str:
-    hits = []
-    for replacement in REPLACEMENTS:
-        if replacement.source in text:
-            hits.append(f"{replacement.source} -> {replacement.target}")
-    if not hits:
-        return "Apply HCU wording: AMD->HCU, XGMI->HSL, DCU->HCU; keep ROCm/HIP."
-    return "; ".join(hits)
-
-
-def escape_annotation_message(text: str) -> str:
+def escape_annotation_message(text):
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
-def escape_annotation_property(text: str) -> str:
+def escape_annotation_property(text):
     return escape_annotation_message(text).replace(":", "%3A").replace(",", "%2C")
 
 
-def emit_github_error(error: Violation) -> None:
+def emit_github_error(error):
     message = (
         "HCU user-visible output contains platform-sensitive wording. "
         "Please update the reported runtime text according to the HCU wording rules above."
@@ -191,92 +295,191 @@ def emit_github_error(error: Violation) -> None:
     )
 
 
-def violation(path: Path, lineno: int, location: str, text: str) -> Violation:
-    return Violation(path=path, lineno=lineno, location=location, text=text)
+def emit_github_tool_error(failure):
+    print(
+        "::error title=HCU runtime text checker error::"
+        f"{escape_annotation_message(failure.display())}"
+    )
 
 
-def has_blocked_text(text: str) -> bool:
+def has_blocked_text(text):
     return BLOCKED_TEXT_RE.search(text) is not None
 
 
-def check_python(path: Path):
+class HcuVisibleTextVisitor(ast.NodeVisitor):
+    def __init__(self, path):
+        self.path = path
+        self.errors = []
+
+    def add_strings(self, location, values):
+        for lineno, value in values:
+            if has_blocked_text(value):
+                self.errors.append(Violation(self.path, lineno, location, value))
+
+    def visit_block(self, statements):
+        for statement in statements:
+            self.visit(statement)
+            if statement_terminates_on_hcu(statement):
+                break
+
+    def visit_Module(self, node):
+        self.visit_block(node.body)
+
+    def visit_ClassDef(self, node):
+        self.visit_block(node.body)
+
+    def visit_FunctionDef(self, node):
+        self.visit_block(node.body)
+
+    def visit_AsyncFunctionDef(self, node):
+        self.visit_block(node.body)
+
+    def visit_If(self, node):
+        value = evaluate_for_hcu(node.test)
+        if value is not False:
+            self.visit_block(node.body)
+        if value is not True:
+            self.visit_block(node.orelse)
+
+    def visit_ExceptHandler(self, node):
+        self.visit_block(node.body)
+
+    def visit_Try(self, node):
+        self.visit_block(node.body)
+        for handler in node.handlers:
+            self.visit(handler)
+        self.visit_block(node.orelse)
+        self.visit_block(node.finalbody)
+
+    def visit_With(self, node):
+        self.visit_block(node.body)
+
+    def visit_AsyncWith(self, node):
+        self.visit_block(node.body)
+
+    def visit_For(self, node):
+        self.visit_block(node.body)
+        self.visit_block(node.orelse)
+
+    def visit_AsyncFor(self, node):
+        self.visit_block(node.body)
+        self.visit_block(node.orelse)
+
+    def visit_While(self, node):
+        self.visit_block(node.body)
+        self.visit_block(node.orelse)
+
+    def visit_Raise(self, node):
+        self.add_strings("raise", expression_strings(node.exc))
+
+    def visit_Call(self, node):
+        name = function_name(node.func)
+        if name in VISIBLE_CALLS:
+            self.add_strings(f"{name}()", visible_call_strings(node, name))
+        self.generic_visit(node)
+
+
+def block_terminates_on_hcu(statements):
+    return any(statement_terminates_on_hcu(statement) for statement in statements)
+
+
+def statement_terminates_on_hcu(statement):
+    if isinstance(statement, (ast.Raise, ast.Return)):
+        return True
+    if isinstance(statement, ast.If):
+        value = evaluate_for_hcu(statement.test)
+        if value is True:
+            return block_terminates_on_hcu(statement.body)
+        if value is False:
+            return block_terminates_on_hcu(statement.orelse)
+        return bool(statement.orelse) and block_terminates_on_hcu(
+            statement.body
+        ) and block_terminates_on_hcu(statement.orelse)
+    return False
+
+
+def check_python(path, text):
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = ast.parse(text, filename=str(path))
     except SyntaxError as exc:
-        return [violation(path, 1, "Python parser", str(exc))]
+        raise ValueError(f"Python parse failed at line {exc.lineno}: {exc.msg}")
+    visitor = HcuVisibleTextVisitor(path)
+    visitor.visit(tree)
+    return visitor.errors
 
+
+def check_text(path, text):
     errors = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = function_name(node.func)
-            if name not in VISIBLE_CALLS:
-                continue
-            for lineno, value in string_values(node):
-                if has_blocked_text(value):
-                    errors.append(violation(path, lineno, f"{name}()", value))
-        elif isinstance(node, ast.Raise) and node.exc is not None:
-            for lineno, value in string_values(node.exc):
-                if has_blocked_text(value):
-                    errors.append(violation(path, lineno, "raise", value))
-    return errors
-
-
-def check_text(path: Path):
-    errors = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except UnicodeDecodeError:
-        return []
-
-    for lineno, line in enumerate(lines, start=1):
+    for lineno, line in enumerate(text.splitlines(), start=1):
         if VISIBLE_TEXT_RE.search(line) and has_blocked_text(line):
-            errors.append(violation(path, lineno, "visible text", line.strip()))
+            errors.append(Violation(path, lineno, "visible text", line.strip()))
     return errors
+
+
+def changed_paths(argv):
+    values = argv if argv else os.environ.get("CHANGED_FILES", "").splitlines()
+    return [Path(normalize_path(value.strip())) for value in values if value.strip()]
+
+
+def deduplicate(errors):
+    result = []
+    seen = set()
+    for error in errors:
+        if error.key() not in seen:
+            seen.add(error.key())
+            result.append(error)
+    return result
 
 
 def main(argv):
-    paths = [Path(normalize_path(arg)) for arg in argv if arg.strip()]
     errors = []
+    failures = []
 
-    for path in paths:
+    for path in changed_paths(argv):
         normalized = normalize_path(str(path))
-        if normalized in EXEMPT_FILES:
-            continue
-        if not is_hcu_owned(normalized):
-            continue
-        if not path.exists() or not path.is_file():
-            continue
-        if path.suffix.lower() not in TEXT_EXTS and normalized not in HCU_EXACT_FILES:
+        if is_exempt(normalized) or not path.exists() or not path.is_file():
             continue
 
-        if path.suffix.lower() == ".py":
-            errors.extend(check_python(path))
-        else:
-            errors.extend(check_text(path))
+        suffix = path.suffix.lower()
+        if suffix not in TEXT_EXTS and normalized not in HCU_EXACT_FILES:
+            continue
 
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            failures.append(ScanFailure(path, f"unable to read UTF-8 text: {exc}"))
+            continue
+
+        if not is_hcu_owned_path(normalized) and not has_hcu_code_marker(text):
+            continue
+
+        try:
+            if suffix == ".py":
+                errors.extend(check_python(path, text))
+            else:
+                errors.extend(check_text(path, text))
+        except ValueError as exc:
+            failures.append(ScanFailure(path, str(exc)))
+
+    if failures:
+        print("HCU runtime text checker could not complete.")
+        for failure in failures:
+            print(f" - {failure.display()}")
+            emit_github_tool_error(failure)
+        return 2
+
+    errors = deduplicate(errors)
     if errors:
         print("HCU runtime text check failed.")
         print()
         print("This check found platform-sensitive wording in user-visible output.")
         print()
         print("Checked scope:")
-        print(" - Only changed files reported by quality-gate changed-files are checked.")
+        print(" - Only files changed by the pull request or push are checked.")
+        print(" - HCU-owned paths, HCU-specific files, and files with HCU code markers are covered.")
         print(" - Python: user-visible strings in print/logger/raise/skip/help.")
-        print(" - Shell/YAML: visible output fields such as echo/printf/name/description.")
-        print(
-            " - Source identifiers such as file names, variable names, function names, "
-            "imports, and comments are not the target of this check."
-        )
-        print()
-        print("Recommended wording:")
-        print(" - Use HCU / HCU device(s) for HCU hardware visible messages.")
-        print(" - Use HSL / hsl for HCU fabric/link visible messages.")
-        print(
-            " - Use HCU/ROCm or HCU/HIP only when the message describes a combined "
-            "hardware/software stack."
-        )
-        print(" - Keep ROCm and HIP unchanged when they refer to the software/runtime stack.")
-        print(" - Do not rename files or internal identifiers only to satisfy this check.")
+        print(" - Shell/YAML/C/C++: common visible output statements and fields.")
+        print(" - Source identifiers, imports, comments, and file names are not checked.")
         print()
         print("Detected items:")
         for error in errors:
