@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.distributed import ReduceOp
 
+from sglang.srt.utils.common import is_hcu
+
 logger = logging.getLogger(__name__)
 
 
@@ -358,15 +360,21 @@ class NCCLLibrary:
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:
+            accelerator_platforms = (
+                "NVIDIA/HCU/MTHREADS devices"
+                if is_hcu()
+                else "NVIDIA/AMD/MTHREADS GPUs"
+            )
             logger.error(
                 "Failed to load NCCL library from %s . "
-                "It is expected if you are not running on NVIDIA/AMD/MTHREADS GPUs. "
+                "It is expected if you are not running on %s. "
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s. "
                 "If you already have the library, please set the "
                 "environment variable SGLANG_NCCL_SO_PATH"
                 " to point to the correct nccl library path.",
                 so_file,
+                accelerator_platforms,
                 platform.platform(),
             )
             raise e

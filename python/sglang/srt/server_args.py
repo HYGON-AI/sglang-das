@@ -4798,6 +4798,7 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        hip_hardware_platform = "HCU" if is_hcu() else "AMD"
 
         # Model and tokenizer
         parser.add_argument(
@@ -6056,7 +6057,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (AMD/ROCm or HCU/ROCm only). ",
+            f"'aiter' ({hip_hardware_platform}/ROCm only). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
@@ -6821,7 +6822,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help=f"Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for {hip_hardware_platform}/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

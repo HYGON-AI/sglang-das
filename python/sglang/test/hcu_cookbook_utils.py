@@ -168,7 +168,7 @@ VLM_COOKBOOK_ENV = {
 
 
 @dataclass(frozen=True)
-class DcuCookbookModelConfig:
+class HcuCookbookModelConfig:
     name: str
     env_name: str
     default_path: str
@@ -461,7 +461,7 @@ def _vlm_args(tp_size: int, quantization: str | None = None) -> list[str]:
     return args
 
 
-QWEN3_NEXT_80B_4GPU = DcuCookbookModelConfig(
+QWEN3_NEXT_80B_4GPU = HcuCookbookModelConfig(
     name="Qwen3-Next-80B-A3B-Instruct",
     env_name="SGLANG_HCU_QWEN3_NEXT_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Next-80B-A3B-Instruct",
@@ -472,7 +472,7 @@ QWEN3_NEXT_80B_4GPU = DcuCookbookModelConfig(
     server_args=_qwen3_next_args(4),
 )
 
-QWEN3_30B_A3B_4GPU = DcuCookbookModelConfig(
+QWEN3_30B_A3B_4GPU = HcuCookbookModelConfig(
     name="Qwen3-30B-A3B",
     env_name="SGLANG_HCU_QWEN3_30B_A3B_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-30B-A3B",
@@ -483,7 +483,7 @@ QWEN3_30B_A3B_4GPU = DcuCookbookModelConfig(
     server_args=_common_text_args(4),
 )
 
-QWEN3_32B_4GPU = DcuCookbookModelConfig(
+QWEN3_32B_4GPU = HcuCookbookModelConfig(
     name="Qwen3-32B",
     env_name="SGLANG_HCU_QWEN3_32B_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-32B",
@@ -494,7 +494,7 @@ QWEN3_32B_4GPU = DcuCookbookModelConfig(
     server_args=_common_text_args(4),
 )
 
-QWEN3_30B_A3B_W8A8_4GPU = DcuCookbookModelConfig(
+QWEN3_30B_A3B_W8A8_4GPU = HcuCookbookModelConfig(
     name="Qwen3-30B-A3B-w8a8",
     env_name="SGLANG_HCU_QWEN3_30B_A3B_W8A8_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/Qwen3-30B-A3B-w8a8",
@@ -505,7 +505,7 @@ QWEN3_30B_A3B_W8A8_4GPU = DcuCookbookModelConfig(
     server_args=_common_text_args(4),
 )
 
-GLM51_CHANNEL_FP8_8GPU = DcuCookbookModelConfig(
+GLM51_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
     name="GLM-5.1-Channel-FP8",
     env_name="SGLANG_HCU_GLM51_CHANNEL_FP8_MODEL",
     default_path="/public4/share/GLM-5.1-Channel-fp8",
@@ -516,7 +516,7 @@ GLM51_CHANNEL_FP8_8GPU = DcuCookbookModelConfig(
     server_args=_glm51_args("w8a8_fp8"),
 )
 
-GLM51_CHANNEL_INT8_8GPU = DcuCookbookModelConfig(
+GLM51_CHANNEL_INT8_8GPU = HcuCookbookModelConfig(
     name="GLM-5.1-Channel-INT8",
     env_name="SGLANG_HCU_GLM51_CHANNEL_INT8_MODEL",
     default_path="/public4/share/GLM-5.1-Channel-INT8",
@@ -527,7 +527,7 @@ GLM51_CHANNEL_INT8_8GPU = DcuCookbookModelConfig(
     server_args=_glm51_args("w8a8_int8"),
 )
 
-DEEPSEEK_V32_CHANNEL_FP8_8GPU = DcuCookbookModelConfig(
+DEEPSEEK_V32_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
     name="DeepSeek-V3.2-Channel-FP8",
     env_name="SGLANG_HCU_DEEPSEEK_V32_CHANNEL_FP8_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/deepseek-v3.2/DeepSeek-V3.2-channel-fp8",
@@ -538,7 +538,7 @@ DEEPSEEK_V32_CHANNEL_FP8_8GPU = DcuCookbookModelConfig(
     server_args=_deepseek_v32_args("w8a8_fp8"),
 )
 
-DEEPSEEK_V32_CHANNEL_INT8_8GPU = DcuCookbookModelConfig(
+DEEPSEEK_V32_CHANNEL_INT8_8GPU = HcuCookbookModelConfig(
     name="DeepSeek-V3.2-Channel-INT8",
     env_name="SGLANG_HCU_DEEPSEEK_V32_CHANNEL_INT8_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/deepseek-v3.2/vllm-w8a8-models/DeepSeek-V3.2-Channel-INT8",
@@ -549,7 +549,7 @@ DEEPSEEK_V32_CHANNEL_INT8_8GPU = DcuCookbookModelConfig(
     server_args=_deepseek_v32_args("w8a8_int8"),
 )
 
-MINIMAX_M25_FP8_8GPU = DcuCookbookModelConfig(
+MINIMAX_M25_FP8_8GPU = HcuCookbookModelConfig(
     name="MiniMax-M2.5",
     env_name="SGLANG_HCU_MINIMAX_M25_FP8_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/MiniMax-M2.5",
@@ -560,7 +560,7 @@ MINIMAX_M25_FP8_8GPU = DcuCookbookModelConfig(
     server_args=_minimax_m25_args(),
 )
 
-MINIMAX_M25_W8A8_8GPU = DcuCookbookModelConfig(
+MINIMAX_M25_W8A8_8GPU = HcuCookbookModelConfig(
     name="MiniMax-M2.5-W8A8",
     env_name="SGLANG_HCU_MINIMAX_M25_W8A8_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/MiniMax-M2.5-Channel-INT8-w8a8",
@@ -571,7 +571,7 @@ MINIMAX_M25_W8A8_8GPU = DcuCookbookModelConfig(
     server_args=_minimax_m25_args("slimquant_marlin"),
 )
 
-KIMI_K26_8GPU = DcuCookbookModelConfig(
+KIMI_K26_8GPU = HcuCookbookModelConfig(
     name="Kimi-K2.6",
     env_name="SGLANG_HCU_KIMI_K26_MODEL",
     default_path="/public4/opendas/DL_DATA/llm-models/Kimi-K2.6",
@@ -582,7 +582,7 @@ KIMI_K26_8GPU = DcuCookbookModelConfig(
     server_args=_kimi_k26_args(),
 )
 
-MIMO_V2_FLASH_8GPU = DcuCookbookModelConfig(
+MIMO_V2_FLASH_8GPU = HcuCookbookModelConfig(
     name="MiMo-V2-Flash",
     env_name="SGLANG_HCU_MIMO_V2_FLASH_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/Xiaomi/MiMo-V2-Flash",
@@ -593,7 +593,7 @@ MIMO_V2_FLASH_8GPU = DcuCookbookModelConfig(
     server_args=_mimo_v2_flash_args(),
 )
 
-QWEN3_VL_4B_INSTRUCT = DcuCookbookModelConfig(
+QWEN3_VL_4B_INSTRUCT = HcuCookbookModelConfig(
     name="Qwen3-VL-4B-Instruct",
     env_name="SGLANG_HCU_QWEN3_VL_4B_INSTRUCT_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-VL-4B-Instruct",
@@ -604,7 +604,7 @@ QWEN3_VL_4B_INSTRUCT = DcuCookbookModelConfig(
     server_args=_vlm_args(1),
 )
 
-GLM41V_9B_THINKING = DcuCookbookModelConfig(
+GLM41V_9B_THINKING = HcuCookbookModelConfig(
     name="GLM-4.1V-9B-Thinking",
     env_name="SGLANG_HCU_GLM41V_9B_THINKING_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/glm4/GLM-4.1V-9B-Thinking",
@@ -615,7 +615,7 @@ GLM41V_9B_THINKING = DcuCookbookModelConfig(
     server_args=_vlm_args(1),
 )
 
-QWEN3_VL_32B_INSTRUCT = DcuCookbookModelConfig(
+QWEN3_VL_32B_INSTRUCT = HcuCookbookModelConfig(
     name="Qwen3-VL-32B-Instruct",
     env_name="SGLANG_HCU_QWEN3_VL_32B_INSTRUCT_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-VL-32B-Instruct",
@@ -626,7 +626,7 @@ QWEN3_VL_32B_INSTRUCT = DcuCookbookModelConfig(
     server_args=_vlm_args(4),
 )
 
-QWEN25_VL_72B_W8A8 = DcuCookbookModelConfig(
+QWEN25_VL_72B_W8A8 = HcuCookbookModelConfig(
     name="Qwen2.5-VL-72B-Instruct-W8A8",
     env_name="SGLANG_HCU_QWEN25_VL_72B_W8A8_MODEL",
     default_path="/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/Qwen2.5-VL-72B-Instruct-quantized.w8a8",
@@ -666,8 +666,8 @@ COOKBOOK_MMMU_EVAL_MODELS = [QWEN3_VL_4B_INSTRUCT, QWEN3_VL_32B_INSTRUCT]
 
 
 def selected_configs(
-    configs: list[DcuCookbookModelConfig], env_name: str
-) -> list[DcuCookbookModelConfig]:
+    configs: list[HcuCookbookModelConfig], env_name: str
+) -> list[HcuCookbookModelConfig]:
     pattern = os.environ.get(env_name, "").strip()
     if not pattern:
         return list(configs)
@@ -690,7 +690,7 @@ def _threshold_suffix(model_name: str) -> str:
 
 
 def _get_threshold(
-    config: DcuCookbookModelConfig, defaults: dict[str, float], env_prefix: str
+    config: HcuCookbookModelConfig, defaults: dict[str, float], env_prefix: str
 ) -> float | None:
     suffix = _threshold_suffix(config.name)
     for key in (f"{env_prefix}_{suffix}", f"{env_prefix}_DEFAULT", env_prefix):
@@ -701,7 +701,7 @@ def _get_threshold(
 
 
 def assert_cookbook_min_score(
-    config: DcuCookbookModelConfig,
+    config: HcuCookbookModelConfig,
     metrics: dict,
     defaults: dict[str, float],
     env_prefix: str,
@@ -716,7 +716,7 @@ def assert_cookbook_min_score(
 
 
 def assert_cookbook_min_output_throughput(
-    config: DcuCookbookModelConfig,
+    config: HcuCookbookModelConfig,
     result: dict,
     defaults: dict[str, float],
     env_prefix: str,
@@ -749,7 +749,7 @@ def assert_server_info_ready(base_url: str, api_key: str) -> dict:
 
 
 class CookbookServer:
-    def __init__(self, config: DcuCookbookModelConfig, base_url: str):
+    def __init__(self, config: HcuCookbookModelConfig, base_url: str):
         self.config = config
         self.base_url = base_url
         self.model_path = config.resolve_model_path()
@@ -837,7 +837,7 @@ class CookbookServer:
 
 
 def run_random_serving_perf(
-    config: DcuCookbookModelConfig,
+    config: HcuCookbookModelConfig,
     base_url: str,
     output_dir: str,
     num_prompts: int = 64,
@@ -912,7 +912,7 @@ def run_random_serving_perf(
 
 
 def run_cookbook_accuracy_eval(
-    config: DcuCookbookModelConfig,
+    config: HcuCookbookModelConfig,
     base_url: str,
     eval_name: str,
     num_examples: int,
