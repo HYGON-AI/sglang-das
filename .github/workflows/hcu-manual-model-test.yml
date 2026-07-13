@@ -1,4 +1,4 @@
-name: Manual DCU Unattended Model Test
+name: Manual HCU Unattended Model Test
 
 on:
   workflow_dispatch:
@@ -9,17 +9,17 @@ on:
         type: string
         default: ""
       suite:
-        description: "DCU model suite. Empty defaults to nightly-dcu-accuracy."
+        description: "HCU model suite. Empty defaults to nightly-hcu-accuracy."
         required: false
         type: string
-        default: "nightly-dcu-accuracy"
+        default: "nightly-hcu-accuracy"
       include_file:
-        description: "Optional. Leave empty to run all tests in the selected suite. To run one file only, set a registered test path, e.g. test/registered/dcu/accuracy/bw1100/test_gsm8k_eval_dcu.py"
+        description: "Optional. Leave empty to run all tests in the selected suite. To run one file only, set a registered test path, e.g. test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py"
         required: false
         type: string
         default: ""
       model_name:
-        description: "Optional model/path for DCU accuracy tests. Passed to SGLANG_DCU_GSM8K_MODEL and SGLANG_DCU_MMLU_MODEL."
+        description: "Optional model/path for HCU accuracy tests. Passed to SGLANG_HCU_GSM8K_MODEL and SGLANG_HCU_MMLU_MODEL."
         required: false
         type: string
         default: ""
@@ -29,27 +29,27 @@ on:
         type: string
         default: ""
       extra_test_env:
-        description: "Optional extra env vars for the test process. Accepts KEY=VALUE or export KEY=VALUE; separate multiple vars with semicolons. Example: export SGLANG_DCU_GSM8K_NUM_SHOTS=5"
+        description: "Optional extra env vars for the test process. Accepts KEY=VALUE or export KEY=VALUE; separate multiple vars with semicolons. Example: export SGLANG_HCU_GSM8K_NUM_SHOTS=5"
         required: false
         type: string
         default: ""
       eval_num_examples:
-        description: "Accuracy-only. Shared sample count for GSM8K/MMLU tests in nightly-dcu-accuracy. Empty uses test defaults."
+        description: "Accuracy-only. Shared sample count for GSM8K/MMLU tests in nightly-hcu-accuracy. Empty uses test defaults."
         required: false
         type: string
         default: ""
       gsm8k_num_examples:
-        description: "Accuracy-only. GSM8K sample count override for nightly-dcu-accuracy. Empty uses eval_num_examples or the test default."
+        description: "Accuracy-only. GSM8K sample count override for nightly-hcu-accuracy. Empty uses eval_num_examples or the test default."
         required: false
         type: string
         default: ""
       mmlu_num_examples:
-        description: "Accuracy-only. MMLU sample count override for nightly-dcu-accuracy. Empty uses eval_num_examples or the test default."
+        description: "Accuracy-only. MMLU sample count override for nightly-hcu-accuracy. Empty uses eval_num_examples or the test default."
         required: false
         type: string
         default: ""
       mmlu_num_threads:
-        description: "MMLU client thread count. 128 is the validated quick/unattended default on the DCU runner."
+        description: "MMLU client thread count. 128 is the validated quick/unattended default on the HCU runner."
         required: false
         type: string
         default: "128"
@@ -84,17 +84,17 @@ on:
         type: boolean
         default: true
       runner_label:
-        description: "DCU runner label. Empty uses vars.DCU_CI_RUNNER_LABEL, then dcu-ci-pr-2."
+        description: "HCU runner label. Empty uses vars.HCU_CI_RUNNER_LABEL, then hcu-ci-pr-2."
         required: false
         type: string
         default: ""
       container_name:
-        description: "CI container name. Empty uses a per-run ci_sglang_dcu_manual_* name."
+        description: "CI container name. Empty uses a per-run ci_sglang_hcu_manual_* name."
         required: false
         type: string
         default: ""
       image:
-        description: "DCU CI Docker image."
+        description: "HCU CI Docker image."
         required: false
         type: string
         default: "10.16.1.152:5000/jenkins/model_test_env/sglang:latest"
@@ -108,20 +108,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: dcu-manual-model-test-${{ github.ref_name }}-${{ inputs.test_branch || 'selected-ref' }}-${{ inputs.suite || 'nightly-dcu-accuracy' }}
+  group: hcu-manual-model-test-${{ github.ref_name }}-${{ inputs.test_branch || 'selected-ref' }}-${{ inputs.suite || 'nightly-hcu-accuracy' }}
   cancel-in-progress: false
 
 env:
-  DEFAULT_DCU_MODEL_SUITE: nightly-dcu-accuracy
-  DEFAULT_DCU_CI_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:latest
+  DEFAULT_HCU_MODEL_SUITE: nightly-hcu-accuracy
+  DEFAULT_HCU_CI_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:latest
 
 jobs:
-  manual-dcu-model-test:
-    name: Manual DCU model validation
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
+  manual-hcu-model-test:
+    name: Manual HCU model validation
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-pr-2' }}
     timeout-minutes: 720
     env:
-      SELECTED_RUNNER_LABEL: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
+      SELECTED_RUNNER_LABEL: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-pr-2' }}
       INPUT_TEST_BRANCH: ${{ inputs.test_branch || '' }}
       INPUT_SUITE: ${{ inputs.suite || '' }}
       INPUT_INCLUDE_FILE: ${{ inputs.include_file || '' }}
@@ -141,25 +141,25 @@ jobs:
       INPUT_CONTAINER_NAME: ${{ inputs.container_name || '' }}
       INPUT_IMAGE: ${{ inputs.image || '' }}
       INPUT_REBUILD_SGL_KERNEL: ${{ inputs.rebuild_sgl_kernel }}
-      VAR_DCU_CI_IMAGE: ${{ vars.DCU_CI_IMAGE || '' }}
-      DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
-      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '1' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+      VAR_HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+      HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '1' }}
+      HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
       HF_TOKEN: ${{ secrets.HF_TOKEN || '' }}
     steps:
-      - name: Resolve manual DCU configuration
+      - name: Resolve manual HCU configuration
         id: config
         run: |
           set -euo pipefail
 
           checkout_ref="${INPUT_TEST_BRANCH:-${GITHUB_REF}}"
-          suite="${INPUT_SUITE:-${DEFAULT_DCU_MODEL_SUITE}}"
-          image="${INPUT_IMAGE:-${VAR_DCU_CI_IMAGE:-${DEFAULT_DCU_CI_IMAGE}}}"
-          container_name="${INPUT_CONTAINER_NAME:-ci_sglang_dcu_manual_${GITHUB_RUN_ID}}"
+          suite="${INPUT_SUITE:-${DEFAULT_HCU_MODEL_SUITE}}"
+          image="${INPUT_IMAGE:-${VAR_HCU_CI_IMAGE:-${DEFAULT_HCU_CI_IMAGE}}}"
+          container_name="${INPUT_CONTAINER_NAME:-ci_sglang_hcu_manual_${GITHUB_RUN_ID}}"
           timeout_per_file="${INPUT_TIMEOUT_PER_FILE:-4200}"
-          log_dir="${RUNNER_TEMP}/dcu-manual-model-test-${GITHUB_RUN_ID}-logs"
+          log_dir="${RUNNER_TEMP}/hcu-manual-model-test-${GITHUB_RUN_ID}-logs"
 
           if [[ ! "${timeout_per_file}" =~ ^[0-9]+$ ]]; then
             echo "::error::timeout_per_file must be a positive integer, got '${timeout_per_file}'."
@@ -213,7 +213,7 @@ jobs:
           fi
 
           nightly_flag=""
-          if [[ "${suite}" == nightly-dcu* ]]; then
+          if [[ "${suite}" == nightly-hcu* ]]; then
             nightly_flag="--nightly"
           fi
 
@@ -230,12 +230,12 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
           {
-            echo "DCU_CI_IMAGE=${image}"
-            echo "DCU_CI_CONTAINER_NAME=${container_name}"
-            echo "DCU_MANUAL_LOG_DIR=${log_dir}"
-            echo "DCU_MANUAL_SUITE=${suite}"
-            echo "DCU_MANUAL_NIGHTLY_FLAG=${nightly_flag}"
-            echo "DCU_MANUAL_TIMEOUT_PER_FILE=${timeout_per_file}"
+            echo "HCU_CI_IMAGE=${image}"
+            echo "HCU_CI_CONTAINER_NAME=${container_name}"
+            echo "HCU_MANUAL_LOG_DIR=${log_dir}"
+            echo "HCU_MANUAL_SUITE=${suite}"
+            echo "HCU_MANUAL_NIGHTLY_FLAG=${nightly_flag}"
+            echo "HCU_MANUAL_TIMEOUT_PER_FILE=${timeout_per_file}"
           } >> "${GITHUB_ENV}"
 
       - name: Checkout selected ref
@@ -244,10 +244,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-manual-model-test"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-manual-model-test"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
 
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
@@ -262,13 +262,13 @@ jobs:
           git checkout --force FETCH_HEAD
 
           checked_sha="$(git rev-parse HEAD)"
-          echo "DCU_MANUAL_CHECKED_SHA=${checked_sha}" >> "${GITHUB_ENV}"
+          echo "HCU_MANUAL_CHECKED_SHA=${checked_sha}" >> "${GITHUB_ENV}"
           echo "Checked out ${CHECKOUT_REF} -> ${checked_sha}"
 
       - name: Write manual test summary
         run: |
           set -euo pipefail
-          summary="${DCU_MANUAL_LOG_DIR}/summary.md"
+          summary="${HCU_MANUAL_LOG_DIR}/summary.md"
           partition="full"
           if [[ -n "${INPUT_AUTO_PARTITION_ID}" && -n "${INPUT_AUTO_PARTITION_SIZE}" ]]; then
             partition="${INPUT_AUTO_PARTITION_ID}/${INPUT_AUTO_PARTITION_SIZE}"
@@ -277,21 +277,21 @@ jobs:
           if [[ -n "${INPUT_MODEL_NAMES}" ]]; then
             model_note="${INPUT_MODEL_NAMES} (sequential; semicolon separated; overrides model_name)"
           elif [[ -n "${INPUT_MODEL_NAME}" ]]; then
-            model_note="${INPUT_MODEL_NAME} (passed as SGLANG_DCU_GSM8K_MODEL, SGLANG_DCU_MMLU_MODEL, and SGLANG_TEST_DEFAULT_MODEL_NAME)"
+            model_note="${INPUT_MODEL_NAME} (passed as SGLANG_HCU_GSM8K_MODEL, SGLANG_HCU_MMLU_MODEL, and SGLANG_TEST_DEFAULT_MODEL_NAME)"
           fi
 
           {
-            echo "## Manual DCU Unattended Model Test"
+            echo "## Manual HCU Unattended Model Test"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Ref | \`${{ steps.config.outputs.checkout_ref }}\` |"
-            echo "| Commit | \`${DCU_MANUAL_CHECKED_SHA}\` |"
+            echo "| Commit | \`${HCU_MANUAL_CHECKED_SHA}\` |"
             echo "| Runner label | \`${SELECTED_RUNNER_LABEL}\` |"
-            echo "| Container | \`${DCU_CI_CONTAINER_NAME}\` |"
-            echo "| Image | \`${DCU_CI_IMAGE}\` |"
-            echo "| Suite | \`${DCU_MANUAL_SUITE}\` |"
-            echo "| Nightly mode | \`${DCU_MANUAL_NIGHTLY_FLAG:-false}\` |"
+            echo "| Container | \`${HCU_CI_CONTAINER_NAME}\` |"
+            echo "| Image | \`${HCU_CI_IMAGE}\` |"
+            echo "| Suite | \`${HCU_MANUAL_SUITE}\` |"
+            echo "| Nightly mode | \`${HCU_MANUAL_NIGHTLY_FLAG:-false}\` |"
             echo "| Include file | \`${INPUT_INCLUDE_FILE:-not set}\` |"
             echo "| Model name | \`${model_note}\` |"
             echo "| Eval examples | \`${INPUT_EVAL_NUM_EXAMPLES:-test default}\` |"
@@ -301,23 +301,23 @@ jobs:
             echo "| GSM8K threshold | \`${INPUT_GSM8K_THRESHOLD:-test default}\` |"
             echo "| MMLU threshold | \`${INPUT_MMLU_THRESHOLD:-test default}\` |"
             echo "| Rebuild sgl-kernel | \`${INPUT_REBUILD_SGL_KERNEL}\` |"
-            echo "| Timeout per file | \`${DCU_MANUAL_TIMEOUT_PER_FILE}\` |"
+            echo "| Timeout per file | \`${HCU_MANUAL_TIMEOUT_PER_FILE}\` |"
             echo "| Partition | \`${partition}\` |"
             echo "| Continue on error | \`${INPUT_CONTINUE_ON_ERROR}\` |"
             echo ""
-            echo "Artifacts from this run are uploaded as \`dcu-manual-model-test-${GITHUB_RUN_ID}\`."
+            echo "Artifacts from this run are uploaded as \`hcu-manual-model-test-${GITHUB_RUN_ID}\`."
           } | tee "${summary}" >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Setup DCU container
+      - name: Setup HCU container
         run: |
           set -euo pipefail
-          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
-              --image "${DCU_CI_IMAGE}" \
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
       - name: Rebuild selected-ref sgl-kernel
         if: ${{ inputs.rebuild_sgl_kernel }}
@@ -325,28 +325,28 @@ jobs:
           set -euo pipefail
           {
             echo "Rebuilding sgl-kernel from selected ref to match /sglang-checkout/python source."
-            docker exec -w /sglang-checkout/sgl-kernel "${DCU_CI_CONTAINER_NAME}" \
+            docker exec -w /sglang-checkout/sgl-kernel "${HCU_CI_CONTAINER_NAME}" \
               bash -lc "source /opt/dtk/env.sh && python setup_hip.py bdist_wheel && ls -lh dist/*.whl"
-            docker exec "${DCU_CI_CONTAINER_NAME}" \
+            docker exec "${HCU_CI_CONTAINER_NAME}" \
               bash -lc "pip install --force-reinstall /sglang-checkout/sgl-kernel/dist/sglang_kernel-*.whl"
-            docker exec "${DCU_CI_CONTAINER_NAME}" \
+            docker exec "${HCU_CI_CONTAINER_NAME}" \
               bash -lc 'python3 -c "import sgl_kernel; print(sgl_kernel.__file__); ok = hasattr(sgl_kernel, \"normal_decode_metadata_general\"); print(\"normal_decode_metadata_general=\", ok); raise SystemExit(0 if ok else \"rebuilt sgl-kernel does not expose normal_decode_metadata_general\")"'
-          } 2>&1 | tee "${DCU_MANUAL_LOG_DIR}/rebuild-sgl-kernel.log"
+          } 2>&1 | tee "${HCU_MANUAL_LOG_DIR}/rebuild-sgl-kernel.log"
 
-      - name: Run manual DCU model suite
+      - name: Run manual HCU model suite
         id: test
         run: |
           set -euo pipefail
 
           run_suite_cmd=(
             python3 run_suite.py
-            --hw dcu
-            --suite "${DCU_MANUAL_SUITE}"
-            --timeout-per-file "${DCU_MANUAL_TIMEOUT_PER_FILE}"
+            --hw hcu
+            --suite "${HCU_MANUAL_SUITE}"
+            --timeout-per-file "${HCU_MANUAL_TIMEOUT_PER_FILE}"
           )
 
-          if [[ -n "${DCU_MANUAL_NIGHTLY_FLAG}" ]]; then
-            run_suite_cmd+=("${DCU_MANUAL_NIGHTLY_FLAG}")
+          if [[ -n "${HCU_MANUAL_NIGHTLY_FLAG}" ]]; then
+            run_suite_cmd+=("${HCU_MANUAL_NIGHTLY_FLAG}")
           fi
 
           if [[ "${INPUT_CONTINUE_ON_ERROR}" == "true" ]]; then
@@ -364,22 +364,22 @@ jobs:
 
           base_test_env_cmd=(env)
           if [[ -n "${INPUT_EVAL_NUM_EXAMPLES}" ]]; then
-            base_test_env_cmd+=("SGLANG_DCU_EVAL_NUM_EXAMPLES=${INPUT_EVAL_NUM_EXAMPLES}")
+            base_test_env_cmd+=("SGLANG_HCU_EVAL_NUM_EXAMPLES=${INPUT_EVAL_NUM_EXAMPLES}")
           fi
           if [[ -n "${INPUT_GSM8K_NUM_EXAMPLES}" ]]; then
-            base_test_env_cmd+=("SGLANG_DCU_GSM8K_NUM_EXAMPLES=${INPUT_GSM8K_NUM_EXAMPLES}")
+            base_test_env_cmd+=("SGLANG_HCU_GSM8K_NUM_EXAMPLES=${INPUT_GSM8K_NUM_EXAMPLES}")
           fi
           if [[ -n "${INPUT_MMLU_NUM_EXAMPLES}" ]]; then
-            base_test_env_cmd+=("SGLANG_DCU_MMLU_NUM_EXAMPLES=${INPUT_MMLU_NUM_EXAMPLES}")
+            base_test_env_cmd+=("SGLANG_HCU_MMLU_NUM_EXAMPLES=${INPUT_MMLU_NUM_EXAMPLES}")
           fi
           if [[ -n "${INPUT_MMLU_NUM_THREADS}" ]]; then
-            base_test_env_cmd+=("SGLANG_DCU_MMLU_NUM_THREADS=${INPUT_MMLU_NUM_THREADS}")
+            base_test_env_cmd+=("SGLANG_HCU_MMLU_NUM_THREADS=${INPUT_MMLU_NUM_THREADS}")
           fi
           if [[ -n "${INPUT_GSM8K_THRESHOLD}" ]]; then
-            base_test_env_cmd+=("SGLANG_DCU_GSM8K_THRESHOLD=${INPUT_GSM8K_THRESHOLD}")
+            base_test_env_cmd+=("SGLANG_HCU_GSM8K_THRESHOLD=${INPUT_GSM8K_THRESHOLD}")
           fi
           if [[ -n "${INPUT_MMLU_THRESHOLD}" ]]; then
-            base_test_env_cmd+=("SGLANG_DCU_MMLU_THRESHOLD=${INPUT_MMLU_THRESHOLD}")
+            base_test_env_cmd+=("SGLANG_HCU_MMLU_THRESHOLD=${INPUT_MMLU_THRESHOLD}")
           fi
           if [[ -n "${INPUT_EXTRA_TEST_ENV}" ]]; then
             while IFS= read -r extra_env_line; do
@@ -419,22 +419,22 @@ jobs:
             exit 1
           fi
 
-          : > "${DCU_MANUAL_LOG_DIR}/command.txt"
+          : > "${HCU_MANUAL_LOG_DIR}/command.txt"
 
           {
             echo ""
             echo "### Final Commands"
             echo ""
             echo '```bash'
-          } | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          } | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
 
-          echo "===== Manual DCU unattended model test configuration ====="
+          echo "===== Manual HCU unattended model test configuration ====="
           echo "ref=${{ steps.config.outputs.checkout_ref }}"
-          echo "commit=${DCU_MANUAL_CHECKED_SHA}"
+          echo "commit=${HCU_MANUAL_CHECKED_SHA}"
           echo "runner_label=${SELECTED_RUNNER_LABEL}"
-          echo "container_name=${DCU_CI_CONTAINER_NAME}"
-          echo "image=${DCU_CI_IMAGE}"
-          echo "suite=${DCU_MANUAL_SUITE}"
+          echo "container_name=${HCU_CI_CONTAINER_NAME}"
+          echo "image=${HCU_CI_IMAGE}"
+          echo "suite=${HCU_MANUAL_SUITE}"
           echo "include_file=${INPUT_INCLUDE_FILE:-}"
           echo "model_name=${INPUT_MODEL_NAME:-}"
           echo "model_names=${INPUT_MODEL_NAMES:-}"
@@ -445,7 +445,7 @@ jobs:
           echo "gsm8k_threshold=${INPUT_GSM8K_THRESHOLD:-}"
           echo "mmlu_threshold=${INPUT_MMLU_THRESHOLD:-}"
           echo "rebuild_sgl_kernel=${INPUT_REBUILD_SGL_KERNEL}"
-          echo "timeout_per_file=${DCU_MANUAL_TIMEOUT_PER_FILE}"
+          echo "timeout_per_file=${HCU_MANUAL_TIMEOUT_PER_FILE}"
           echo "auto_partition_id=${INPUT_AUTO_PARTITION_ID:-}"
           echo "auto_partition_size=${INPUT_AUTO_PARTITION_SIZE:-}"
           echo "continue_on_error=${INPUT_CONTINUE_ON_ERROR}"
@@ -458,18 +458,18 @@ jobs:
             model_display="${model:-test default}"
             model_number=$((model_index + 1))
             model_total="${#models_to_test[@]}"
-            run_log="${DCU_MANUAL_LOG_DIR}/run-model-${model_number}.log"
+            run_log="${HCU_MANUAL_LOG_DIR}/run-model-${model_number}.log"
 
             test_env_cmd=("${base_test_env_cmd[@]}")
             if [[ -n "${model}" ]]; then
               test_env_cmd+=("SGLANG_TEST_DEFAULT_MODEL_NAME=${model}")
-              test_env_cmd+=("SGLANG_DCU_GSM8K_MODEL=${model}")
-              test_env_cmd+=("SGLANG_DCU_MMLU_MODEL=${model}")
+              test_env_cmd+=("SGLANG_HCU_GSM8K_MODEL=${model}")
+              test_env_cmd+=("SGLANG_HCU_MMLU_MODEL=${model}")
             fi
 
             exec_cmd=(
-              bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh"
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+              bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh"
+              --container-name "${HCU_CI_CONTAINER_NAME}"
               -w /sglang-checkout/test
               -- "${test_env_cmd[@]}" "${run_suite_cmd[@]}"
             )
@@ -479,9 +479,9 @@ jobs:
               printf '%q ' "${exec_cmd[@]}"
               echo
               echo
-            } | tee -a "${DCU_MANUAL_LOG_DIR}/command.txt" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+            } | tee -a "${HCU_MANUAL_LOG_DIR}/command.txt" | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
 
-            echo "===== Manual DCU model ${model_number}/${model_total} ====="
+            echo "===== Manual HCU model ${model_number}/${model_total} ====="
             echo "model=${model_display}"
             echo "log=${run_log}"
             echo "=========================================================="
@@ -492,46 +492,46 @@ jobs:
             set -e
 
             if [[ "${test_exit}" -eq 0 ]]; then
-              echo "**Model ${model_number}/${model_total}:** success - \`${model_display}\`" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+              echo "**Model ${model_number}/${model_total}:** success - \`${model_display}\`" | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
             else
-              echo "**Model ${model_number}/${model_total}:** failure, exit code ${test_exit} - \`${model_display}\`" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+              echo "**Model ${model_number}/${model_total}:** failure, exit code ${test_exit} - \`${model_display}\`" | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
               if [[ "${overall_exit}" -eq 0 ]]; then
                 overall_exit="${test_exit}"
               fi
             fi
           done
 
-          cat "${DCU_MANUAL_LOG_DIR}"/run-model-*.log > "${DCU_MANUAL_LOG_DIR}/run.log"
+          cat "${HCU_MANUAL_LOG_DIR}"/run-model-*.log > "${HCU_MANUAL_LOG_DIR}/run.log"
 
-          echo '```' | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
-          echo "" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
 
           echo "exit_code=${overall_exit}" >> "${GITHUB_OUTPUT}"
           if [[ "${overall_exit}" -eq 0 ]]; then
             echo "result=success" >> "${GITHUB_OUTPUT}"
-            echo "**Result:** success" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+            echo "**Result:** success" | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           else
             echo "result=failure" >> "${GITHUB_OUTPUT}"
-            echo "**Result:** failure, exit code ${overall_exit}" | tee -a "${DCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+            echo "**Result:** failure, exit code ${overall_exit}" | tee -a "${HCU_MANUAL_LOG_DIR}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
           exit "${overall_exit}"
 
-      - name: Cleanup DCU container
+      - name: Cleanup HCU container
         if: always()
         run: |
           set -euo pipefail
-          if [[ -n "${DCU_CI_CHECKOUT_DIR:-}" && -f "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh" ]]; then
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+          if [[ -n "${HCU_CI_CHECKOUT_DIR:-}" && -f "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh" ]]; then
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
           else
-            echo "DCU checkout directory is unavailable; skipping container cleanup."
+            echo "HCU checkout directory is unavailable; skipping container cleanup."
           fi
 
-      - name: Upload manual DCU model test artifacts
+      - name: Upload manual HCU model test artifacts
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: dcu-manual-model-test-${{ github.run_id }}
-          path: ${{ env.DCU_MANUAL_LOG_DIR }}
+          name: hcu-manual-model-test-${{ github.run_id }}
+          path: ${{ env.HCU_MANUAL_LOG_DIR }}
           if-no-files-found: warn

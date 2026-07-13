@@ -168,7 +168,7 @@ jobs:
         env:
           CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
-          python3 scripts/ci/dcu/check_hcu_runtime_text.py ${CHANGED_FILES}
+          python3 scripts/ci/hcu/check_hcu_runtime_text.py ${CHANGED_FILES}
 
   secret-check:
     name: secret-check

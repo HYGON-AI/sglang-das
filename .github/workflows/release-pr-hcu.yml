@@ -1,37 +1,17 @@
-name: Release DCU Nightly Wheels
+name: Release PR HCU Wheels
 
 permissions:
   contents: read
   pull-requests: read
 
 on:
-  push:
-    branches:
-      - v0.5.12_dev
+  pull_request:
     paths:
       - 'python/**'
       - 'sgl-kernel/**'
       - 'sgl-model-gateway/**'
-      - 'requirements_dcu.txt'
-      - '.github/workflows/release-pypi-nightly-dcu.yml'
-
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref, branch, tag, or SHA to build'
-        required: false
-        default: ''
-        type: string
-      torch_version:
-        description: 'PyTorch version to install'
-        required: false
-        default: '2.10.0'
-        type: string
-      skip_gateway:
-        description: 'Skip sgl-model-gateway build'
-        required: false
-        default: false
-        type: boolean
+      - 'requirements_hcu.txt'
+      - '.github/workflows/release-pr-hcu.yml'
 
   # ---- 手动触发，可传参 ----
   workflow_dispatch:
@@ -51,10 +31,10 @@ jobs:
   compile:
     # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
     concurrency:
-      group: release-nightly-dcu-${{ github.ref }}-py${{ matrix.python-version }}
+      group: release-pr-hcu-${{ github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
-    # ---- 自托管 DCU runner，在 Docker 容器内执行 ----
-    runs-on: [self-hosted, dcu, nmz4]
+    # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
+    runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 180
 
     container:
@@ -62,11 +42,11 @@ jobs:
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
-        -v /home/github/sgl_whl_temp/HYGON-AI_dcu-sglang:/home/github/sgl_whl_temp/HYGON-AI_dcu-sglang
         --shm-size=80G
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
         --privileged=true
+        -v /home/github/sgl_whl_temp:/home/github/sgl_whl_temp
 
     # ---- Matrix: 3 个 Python 版本并行编译 ----
     strategy:
@@ -75,33 +55,33 @@ jobs:
 
     env:
       TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
-      SKIP_GATEWAY: ${{ inputs.skip_gateway != false }}
+      SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
-      WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
+      HCU_RUNNER_HOST_UID: ${{ vars.HCU_RUNNER_HOST_UID || '1000' }}
+      HCU_RUNNER_HOST_GID: ${{ vars.HCU_RUNNER_HOST_GID || '1000' }}
+      WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
 
     steps:
       # =======================================================================
       # 环境准备
       # =======================================================================
 
+      - name: Normalize workspace ownership before checkout
+        run: |
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
 
-      - name: Resolve wheel commit SHA
-        run: |
-          WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
-          echo "WHEEL_COMMIT_SHA=${WHEEL_COMMIT_SHA}" >> "${GITHUB_ENV}"
-          echo "Building DCU wheels for ${WHEEL_COMMIT_SHA}"
-
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |
-          yum install -y perl-IPC-Cmd perl-Time-Piece
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" ciupload
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -180,19 +160,19 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Build sgl-model-gateway
-        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') }}
+        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch') }}
         run: |
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
           cd sgl-model-gateway && cargo build --release
-          cd bindings/python && maturin build --release --skip-auditwheel --features vendored-openssl
+          cd bindings/python && maturin build --release --skip-auditwheel
           echo "=== sgl-model-gateway wheel ==="
           ls -lh target/wheels/*.whl
 
       # =======================================================================
-      # 修复 (auditwheel) & 上传产物
+      # 修复 (auditwheel) & 保存 PR wheel 到本地 staging
       # =======================================================================
 
       - name: Apply DAS local version to wheels
@@ -201,7 +181,7 @@ jobs:
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-6)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
@@ -210,5 +190,47 @@ jobs:
           done
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
-          rm -rf /home/github/sgl_whl_temp/HYGON-AI_dcu-sglang/* || true
+
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          STAGING_ROOT="${HCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
+          STAGING_DIR="${STAGING_ROOT}/${GITHUB_REPOSITORY_OWNER}_${REPO_NAME}/pr-${GITHUB_RUN_ID}/${WHEEL_COMMIT_SHA}"
+          WHEEL_DIR="${STAGING_DIR}/wheels"
+
+          echo "Saving HCU PR wheels to ${WHEEL_DIR}"
+          rm -rf "${WHEEL_DIR}"
+          mkdir -p "${WHEEL_DIR}"
+          cp -v output/*.whl "${WHEEL_DIR}/"
+
+          export STAGING_DIR LOCAL_VER
+          python3 - <<'PY_MANIFEST'
+          import json
+          import os
+          import pathlib
+
+          staging_dir = pathlib.Path(os.environ["STAGING_DIR"])
+          wheel_dir = staging_dir / "wheels"
+          wheels = sorted(str(path.relative_to(staging_dir)) for path in wheel_dir.glob("*.whl"))
+          manifest = {
+              "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "commit_sha": os.environ.get("WHEEL_COMMIT_SHA", ""),
+              "torch_version": os.environ.get("TORCH_VERSION", ""),
+              "local_version": os.environ.get("LOCAL_VER", ""),
+              "wheels": wheels,
+          }
+          (staging_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY_MANIFEST
+
+          touch "${STAGING_DIR}/READY"
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${STAGING_DIR}" || true
+          echo "HCU PR wheels are staged locally at ${STAGING_DIR}"
+
+      - name: Report staged PR wheels
+        run: |
+          echo "HCU PR wheels are staged locally under /home/github/sgl_whl_temp."
+          echo "Skipping devpi and GitHub artifact upload for PR wheels."
+
+      - name: Normalize workspace ownership
+        if: always()
+        run: |
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true

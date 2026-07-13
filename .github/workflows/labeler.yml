@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   label:
-    runs-on: ${{ vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
+    runs-on: ${{ vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-pr-2' }}
     steps:
       - name: Auto-label by file changes
         uses: actions/labeler@v5

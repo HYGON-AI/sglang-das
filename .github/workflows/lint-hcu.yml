@@ -1,4 +1,4 @@
-name: Lint (DCU)
+name: Lint (HCU)
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  lint-dcu:
-    runs-on: [self-hosted, dcu, nmz4]
+  lint-hcu:
+    runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 30
 
     container:

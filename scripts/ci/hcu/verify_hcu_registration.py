@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dry-run verifier for the DCU CI registration.
+"""Dry-run verifier for the HCU CI registration.
 
 This script does **not** execute any test. It only:
   1. globs test/registered/**/*.py
   2. parses each file with the AST-based collector
-  3. filters by HWBackend.DCU + DCU suite list
-  4. prints a summary so we can confirm DCU tests are wired in correctly
+  3. filters by HWBackend.HCU + HCU suite list
+  4. prints a summary so we can confirm HCU tests are wired in correctly
 
 Usage (from the repository root):
-    python scripts/ci/dcu/verify_dcu_registration.py
+    python scripts/ci/hcu/verify_hcu_registration.py
 
-Exit code 0 means the DCU registration is structurally healthy:
-    - At least one DCU test was collected.
-    - Every DCU test belongs to a known DCU per-commit or nightly suite.
+Exit code 0 means the HCU registration is structurally healthy:
+    - At least one HCU test was collected.
+    - Every HCU test belongs to a known HCU per-commit or nightly suite.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _load_ci_register():
     path = os.path.join(
         REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
     )
-    spec = importlib.util.spec_from_file_location("dcu_ci_register", path)
+    spec = importlib.util.spec_from_file_location("hcu_ci_register", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load ci_register from {path}")
     module = importlib.util.module_from_spec(spec)
@@ -104,20 +104,20 @@ def main() -> int:
         elif name == "NIGHTLY_SUITES" and isinstance(stmt.value, ast.Dict):
             nightly = _extract_dict(stmt.value)
 
-    dcu_per_commit = set(per_commit.get("DCU", []))
-    dcu_nightly = set(nightly.get("DCU", []))
+    hcu_per_commit = set(per_commit.get("HCU", []))
+    hcu_nightly = set(nightly.get("HCU", []))
 
-    print("Configured DCU suites:")
-    print(f"  per-commit ({len(dcu_per_commit)}):")
-    for s in sorted(dcu_per_commit):
+    print("Configured HCU suites:")
+    print(f"  per-commit ({len(hcu_per_commit)}):")
+    for s in sorted(hcu_per_commit):
         print(f"    - {s}")
-    print(f"  nightly    ({len(dcu_nightly)}):")
-    for s in sorted(dcu_nightly):
+    print(f"  nightly    ({len(hcu_nightly)}):")
+    for s in sorted(hcu_nightly):
         print(f"    - {s}")
     print()
 
-    if not dcu_per_commit and not dcu_nightly:
-        print("ERROR: No DCU suites configured in run_suite.py.", file=sys.stderr)
+    if not hcu_per_commit and not hcu_nightly:
+        print("ERROR: No HCU suites configured in run_suite.py.", file=sys.stderr)
         return 2
 
     registered_dir = os.path.join(test_dir, "registered")
@@ -130,11 +130,11 @@ def main() -> int:
     ]
 
     tests = collect_tests(files, sanity_check=False)
-    dcu_tests = [t for t in tests if t.backend == HWBackend.DCU]
+    hcu_tests = [t for t in tests if t.backend == HWBackend.HCU]
 
-    print(f"Collected {len(dcu_tests)} DCU registered test file(s):")
+    print(f"Collected {len(hcu_tests)} HCU registered test file(s):")
     by_suite: dict[str, list[str]] = defaultdict(list)
-    for t in dcu_tests:
+    for t in hcu_tests:
         by_suite[t.suite].append(
             f"{os.path.relpath(t.filename, REPO_ROOT)} "
             f"(est={t.est_time}s, nightly={t.nightly}, disabled={t.disabled})"
@@ -147,11 +147,11 @@ def main() -> int:
     print()
 
     unknown_suites = [
-        s for s in by_suite if s not in dcu_per_commit and s not in dcu_nightly
+        s for s in by_suite if s not in hcu_per_commit and s not in hcu_nightly
     ]
     if unknown_suites:
         print(
-            "ERROR: DCU tests reference suites that are not declared in "
+            "ERROR: HCU tests reference suites that are not declared in "
             "run_suite.py:",
             file=sys.stderr,
         )
@@ -159,15 +159,15 @@ def main() -> int:
             print(f"  - {s}", file=sys.stderr)
         return 3
 
-    if not dcu_tests:
+    if not hcu_tests:
         print(
-            "ERROR: No DCU tests collected. Did you forget to add "
-            "register_dcu_ci() to a test file under test/registered/dcu/?",
+            "ERROR: No HCU tests collected. Did you forget to add "
+            "register_hcu_ci() to a test file under test/registered/hcu/?",
             file=sys.stderr,
         )
         return 4
 
-    print("OK: DCU registration looks healthy.")
+    print("OK: HCU registration looks healthy.")
     return 0
 
 

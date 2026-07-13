@@ -1,4 +1,4 @@
-name: PR Test (DCU)
+name: PR Test (HCU)
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
@@ -11,35 +11,35 @@ on:
       - ready_for_review
     branches:
       - v0.5.12_dev
-      - dcu-ci-pr
+      - hcu-ci-pr
       - main
     paths:
-      - ".github/workflows/pr-test-dcu.yml"
+      - ".github/workflows/pr-test-hcu.yml"
       - ".github/workflows/pr-gate.yml"
-      - ".github/workflows/release-pr-dcu.yml"
-      - ".github/workflows/dcu-full-enabled.yml"
-      - ".github/workflows/release-pypi-nightky-dcu.yml"
-      - "scripts/ci/dcu/**"
+      - ".github/workflows/release-pr-hcu.yml"
+      - ".github/workflows/hcu-full-enabled.yml"
+      - ".github/workflows/release-pypi-nightky-hcu.yml"
+      - "scripts/ci/hcu/**"
       - "python/pyproject*.toml"
       - "python/sglang/**"
       - "test/run_suite.py"
       - "test/registered/**"
       - "sgl-kernel/**"
       - "sgl-model-gateway/**"
-      - "requirements_dcu.txt"
+      - "requirements_hcu.txt"
   workflow_dispatch:
     inputs:
       target_stage_select:
-        description: "Select a DCU stage to run from dropdown (leave empty for all)"
+        description: "Select a HCU stage to run from dropdown (leave empty for all)"
         required: false
         type: choice
         default: ""
         options:
           - ""
-          - stage-a-test-1-gpu-small-dcu
-          - stage-b-test-1-gpu-small-dcu
+          - stage-a-test-1-gpu-small-hcu
+          - stage-b-test-1-gpu-small-hcu
       target_stage:
-        description: "Or type comma-separated DCU stage names"
+        description: "Or type comma-separated HCU stage names"
         required: false
         type: string
         default: ""
@@ -54,12 +54,12 @@ on:
         type: string
         default: ""
       runner_label:
-        description: "DCU runner label override"
+        description: "HCU runner label override"
         required: false
         type: string
         default: ""
       image:
-        description: "DCU CI container image override"
+        description: "HCU CI container image override"
         required: false
         type: string
         default: ""
@@ -69,7 +69,7 @@ on:
         type: boolean
         default: false
       force_wheel_mode:
-        description: "Force waiting for and installing DCU wheels"
+        description: "Force waiting for and installing HCU wheels"
         required: false
         type: boolean
         default: false
@@ -81,17 +81,17 @@ on:
         type: string
         default: ""
       run_all_tests:
-        description: "Run all DCU PR tests"
+        description: "Run all HCU PR tests"
         required: false
         type: boolean
         default: false
       runner_label:
-        description: "DCU runner label override"
+        description: "HCU runner label override"
         required: false
         type: string
         default: ""
       image:
-        description: "DCU CI container image override"
+        description: "HCU CI container image override"
         required: false
         type: string
         default: ""
@@ -101,7 +101,7 @@ on:
         type: boolean
         default: false
       force_wheel_mode:
-        description: "Force waiting for and installing DCU wheels"
+        description: "Force waiting for and installing HCU wheels"
         required: false
         type: boolean
         default: false
@@ -113,15 +113,15 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-test-dcu-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage || inputs.target_stage_select || 'all' }}
+  group: pr-test-hcu-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage || inputs.target_stage_select || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   check-changes:
     name: Check changes
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
-      dcu: ${{ steps.filter.outputs.dcu || steps.run-mode.outputs.run_all_tests }}
+      hcu: ${{ steps.filter.outputs.hcu || steps.run-mode.outputs.run_all_tests }}
       auto_run_ci: ${{ steps.filter.outputs.auto_run_ci || 'false' }}
       run_stage_a: ${{ steps.plan.outputs.run_stage_a }}
       run_stage_b: ${{ steps.plan.outputs.run_stage_b }}
@@ -135,10 +135,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-check"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-check"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -163,16 +163,16 @@ jobs:
             echo "run_all_tests=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Detect DCU-relevant changes
+      - name: Detect HCU-relevant changes
         id: filter
         if: steps.run-mode.outputs.run_all_tests != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          cd "${DCU_CI_CHECKOUT_DIR}"
+          cd "${HCU_CI_CHECKOUT_DIR}"
           if [[ -z "${BASE_SHA}" ]]; then
-            echo "dcu=true" >> "${GITHUB_OUTPUT}"
+            echo "hcu=true" >> "${GITHUB_OUTPUT}"
             echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
@@ -181,17 +181,17 @@ jobs:
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
-          dcu_path_pattern='^(\.github/workflows/(pr-test-dcu|pr-gate|release-pr-dcu|dcu-full-enabled|release-pypi-nightky-dcu)\.yml|scripts/ci/dcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_dcu\.txt$)'
+          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightky-hcu)\.yml|scripts/ci/hcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_hcu\.txt$)'
 
-          if echo "${changed_files}" | grep -Eq "${dcu_path_pattern}"; then
-            echo "dcu=true" >> "${GITHUB_OUTPUT}"
+          if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
+            echo "hcu=true" >> "${GITHUB_OUTPUT}"
             echo "auto_run_ci=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "dcu=false" >> "${GITHUB_OUTPUT}"
+            echo "hcu=false" >> "${GITHUB_OUTPUT}"
             echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Select DCU stages
+      - name: Select HCU stages
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -207,22 +207,22 @@ jobs:
           run_stage_a=false
           run_stage_b=false
 
-          if [[ "${requested}" == *",stage-a-test-1-gpu-small-dcu,"* ]]; then
+          if [[ "${requested}" == *",stage-a-test-1-gpu-small-hcu,"* ]]; then
             run_stage_a=true
           fi
-          if [[ "${requested}" == *",stage-b-test-1-gpu-small-dcu,"* ]]; then
+          if [[ "${requested}" == *",stage-b-test-1-gpu-small-hcu,"* ]]; then
             run_stage_b=true
           fi
 
           if [[ "${run_stage_a}" == "false" && "${run_stage_b}" == "false" ]]; then
-            echo "::error::Unknown DCU target_stage '${TARGET_STAGE}'."
+            echo "::error::Unknown HCU target_stage '${TARGET_STAGE}'."
             exit 1
           fi
 
           echo "run_stage_a=${run_stage_a}" >> "${GITHUB_OUTPUT}"
           echo "run_stage_b=${run_stage_b}" >> "${GITHUB_OUTPUT}"
 
-      - name: Classify DCU wheel sync mode
+      - name: Classify HCU wheel sync mode
         id: wheel
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -246,7 +246,7 @@ jobs:
             exit 0
           fi
 
-          cd "${DCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
+          cd "${HCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
 
           git fetch --no-tags --depth=1 origin "${BASE_SHA}"
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
@@ -255,7 +255,7 @@ jobs:
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-dcu\.yml$|sgl-kernel/|requirements_dcu\.txt$|python/pyproject.*\.toml|python/sglang/)'; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|sgl-kernel/|requirements_hcu\.txt$|python/pyproject.*\.toml|python/sglang/)'; then
             wheel_required=true
           fi
 
@@ -271,8 +271,8 @@ jobs:
   call-gate:
     name: Call PR gate
     needs: check-changes
-    if: github.event_name == 'pull_request' && needs.check-changes.outputs.dcu == 'true'
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    if: github.event_name == 'pull_request' && needs.check-changes.outputs.hcu == 'true'
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Fetch latest PR info
         id: pr
@@ -291,33 +291,33 @@ jobs:
 
       - name: Log PR info
         run: |
-          echo "===== DCU PR Gate Info ====="
+          echo "===== HCU PR Gate Info ====="
           echo "PR Event: ${{ github.event_name }}"
           echo "PR Labels: ${{ steps.pr.outputs.labels }}"
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: true"
-          echo "Auto run DCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
+          echo "Auto run HCU CI: ${{ needs.check-changes.outputs.auto_run_ci }}"
           echo "============================"
 
       - name: Block draft PR
         if: fromJson(steps.pr.outputs.draft)
         run: |
-          echo "PR is draft. Blocking DCU CI."
+          echo "PR is draft. Blocking HCU CI."
           exit 1
 
-      - name: Require run-ci label or DCU auto-run
+      - name: Require run-ci label or HCU auto-run
         env:
           AUTO_RUN_CI: ${{ needs.check-changes.outputs.auto_run_ci || 'false' }}
           HAS_RUN_CI_LABEL: ${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}
         run: |
           if [[ "${HAS_RUN_CI_LABEL}" == "true" ]]; then
-            echo "Found run-ci label. Proceeding with DCU CI."
+            echo "Found run-ci label. Proceeding with HCU CI."
             exit 0
           fi
 
           if [[ "${AUTO_RUN_CI}" == "true" ]]; then
-            echo "Auto-run DCU CI because DCU-impact paths changed."
+            echo "Auto-run HCU CI because HCU-impact paths changed."
             exit 0
           fi
 
@@ -325,12 +325,12 @@ jobs:
           exit 1
 
   validate-config:
-    name: Validate DCU config
+    name: Validate HCU config
     needs:
       - check-changes
       - call-gate
-    if: always() && needs.check-changes.outputs.dcu == 'true' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    if: always() && needs.check-changes.outputs.hcu == 'true' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
@@ -343,10 +343,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-validate"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-validate"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -366,10 +366,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-validate"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-validate"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -382,25 +382,25 @@ jobs:
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
 
-      - name: Resolve DCU runner and image
+      - name: Resolve HCU runner and image
         id: resolve
         env:
           INPUT_RUNNER_LABEL: ${{ inputs.runner_label || '' }}
           INPUT_IMAGE: ${{ inputs.image || '' }}
-          VAR_RUNNER_LABEL: ${{ vars.DCU_CI_RUNNER_LABEL || '' }}
-          VAR_IMAGE: ${{ vars.DCU_CI_IMAGE || '' }}
+          VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
+          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || false }}
         run: |
           runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
           image="${INPUT_IMAGE:-${VAR_IMAGE}}"
 
           if [[ -z "${runner_label}" ]]; then
-            echo "::error::DCU runner label is required. Set vars.DCU_CI_RUNNER_LABEL or workflow input runner_label."
+            echo "::error::HCU runner label is required. Set vars.HCU_CI_RUNNER_LABEL or workflow input runner_label."
             exit 1
           fi
 
           if [[ -z "${image}" ]]; then
-            echo "::error::DCU CI image is required. Set vars.DCU_CI_IMAGE or workflow input image."
+            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE or workflow input image."
             exit 1
           fi
 
@@ -416,54 +416,54 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify DCU registration
+      - name: Verify HCU registration
         if: github.event_name != 'workflow_dispatch'
         run: |
-          cd "${DCU_CI_CHECKOUT_DIR}"
-          python3.9 scripts/ci/dcu/verify_dcu_registration.py || python3 scripts/ci/dcu/verify_dcu_registration.py
+          cd "${HCU_CI_CHECKOUT_DIR}"
+          python3.9 scripts/ci/hcu/verify_hcu_registration.py || python3 scripts/ci/hcu/verify_hcu_registration.py
 
-      - name: Setup DCU validation container
+      - name: Setup HCU validation container
         if: github.event_name == 'workflow_dispatch'
         env:
-          DCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
-          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
-          DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
-          DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+          HCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
+          HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_validate
+          HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+          HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
         run: |
-          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
-              --image "${DCU_CI_IMAGE}" \
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
 
-      - name: Verify DCU registration in container
+      - name: Verify HCU registration in container
         if: github.event_name == 'workflow_dispatch'
         env:
-          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
+          HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_validate
         run: |
-          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" \
-            --container-name "${DCU_CI_CONTAINER_NAME}" \
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" \
+            --container-name "${HCU_CI_CONTAINER_NAME}" \
             -w /sglang-checkout \
-            -- python3 scripts/ci/dcu/verify_dcu_registration.py
+            -- python3 scripts/ci/hcu/verify_hcu_registration.py
 
-      - name: Cleanup DCU validation container
+      - name: Cleanup HCU validation container
         if: always() && github.event_name == 'workflow_dispatch'
         env:
-          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_validate
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+          HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_validate
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  wait-dcu-wheels:
-    name: Wait DCU wheels
+  wait-hcu-wheels:
+    name: Wait HCU wheels
     needs:
       - check-changes
       - call-gate
       - validate-config
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.wheel_required == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.wheel_required == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     outputs:
       wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
     env:
-      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
-      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
       GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
     steps:
@@ -472,10 +472,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-wait-wheels"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-wait-wheels"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -492,39 +492,39 @@ jobs:
         id: sha
         run: |
           set -euo pipefail
-          full_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
-          short_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
+          full_sha="$(git -C "${HCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
+          short_sha="$(git -C "${HCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
           echo "full_sha=${full_sha}" >> "${GITHUB_OUTPUT}"
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
           echo "Using wheel SHA: ${full_sha} (${short_sha})"
 
-      - name: Wait for current commit DCU wheels
+      - name: Wait for current commit HCU wheels
         id: wait
         run: |
           set -euo pipefail
           full_sha="${{ steps.sha.outputs.full_sha }}"
           short_sha="${{ steps.sha.outputs.short_sha }}"
-          export DCU_WHEEL_TARGET_SHA="${full_sha}"
-          export DCU_WHEEL_TARGET_SHORT_SHA="${short_sha}"
-          echo "Waiting for locally staged DCU wheels for ${full_sha}"
-          echo "Host staging root: ${DCU_WHEEL_STAGING_ROOT}"
+          export HCU_WHEEL_TARGET_SHA="${full_sha}"
+          export HCU_WHEEL_TARGET_SHORT_SHA="${short_sha}"
+          echo "Waiting for locally staged HCU wheels for ${full_sha}"
+          echo "Host staging root: ${HCU_WHEEL_STAGING_ROOT}"
 
-          python3 - <<'PY_WAIT' | tee /tmp/dcu_wheel_paths.out
+          python3 - <<'PY_WAIT' | tee /tmp/hcu_wheel_paths.out
           import os
           import pathlib
           import sys
           import time
 
-          root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
-          container_root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_CONTAINER_ROOT", "/dcu-wheel-staging"))
-          target_sha = os.environ["DCU_WHEEL_TARGET_SHA"]
-          short_sha = os.environ.get("DCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
+          root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
+          container_root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_CONTAINER_ROOT", "/hcu-wheel-staging"))
+          target_sha = os.environ["HCU_WHEEL_TARGET_SHA"]
+          short_sha = os.environ.get("HCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
           repo = os.environ["GITHUB_REPOSITORY"]
           owner, repo_name = repo.split("/", 1)
           repo_key = f"{owner}_{repo_name}"
           gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
-          timeout_s = int(os.environ.get("DCU_WHEEL_WAIT_TIMEOUT", "3600"))
-          interval_s = int(os.environ.get("DCU_WHEEL_WAIT_INTERVAL", "60"))
+          timeout_s = int(os.environ.get("HCU_WHEEL_WAIT_TIMEOUT", "3600"))
+          interval_s = int(os.environ.get("HCU_WHEEL_WAIT_INTERVAL", "60"))
 
           requirements = ["sglang", "sgl-kernel"]
           if gateway_required:
@@ -555,15 +555,15 @@ jobs:
           while time.time() < deadline:
               candidates = candidate_dirs()
               if not candidates:
-                  print(f"[wait-dcu-wheels] no staged dirs under {root / repo_key}/pr-*/{target_sha}", file=sys.stderr)
+                  print(f"[wait-hcu-wheels] no staged dirs under {root / repo_key}/pr-*/{target_sha}", file=sys.stderr)
               for staging_dir in candidates:
                   ready = staging_dir / "READY"
                   wheel_dir = staging_dir / "wheels"
                   if not ready.exists():
-                      print(f"[wait-dcu-wheels] {staging_dir} has no READY", file=sys.stderr)
+                      print(f"[wait-hcu-wheels] {staging_dir} has no READY", file=sys.stderr)
                       continue
                   if not wheel_dir.is_dir():
-                      print(f"[wait-dcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
+                      print(f"[wait-hcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
                       continue
                   found = {}
                   for wheel in sorted(wheel_dir.glob("*.whl")):
@@ -573,44 +573,44 @@ jobs:
                   missing = [name for name in requirements if name not in found]
                   if not missing:
                       paths = [to_container_path(found[name]) for name in requirements]
-                      print(f"[wait-dcu-wheels] found staged wheels in {staging_dir}: {' '.join(paths)}", file=sys.stderr)
+                      print(f"[wait-hcu-wheels] found staged wheels in {staging_dir}: {' '.join(paths)}", file=sys.stderr)
                       print(" ".join(paths))
                       sys.exit(0)
-                  print(f"[wait-dcu-wheels] {staging_dir} missing {missing}; found={list(found)}", file=sys.stderr)
-              print(f"[wait-dcu-wheels] waiting for local staged wheels for {short_sha}; sleep {interval_s}s", file=sys.stderr)
+                  print(f"[wait-hcu-wheels] {staging_dir} missing {missing}; found={list(found)}", file=sys.stderr)
+              print(f"[wait-hcu-wheels] waiting for local staged wheels for {short_sha}; sleep {interval_s}s", file=sys.stderr)
               time.sleep(interval_s)
 
-          print(f"Timed out waiting for locally staged DCU wheels for {target_sha}", file=sys.stderr)
+          print(f"Timed out waiting for locally staged HCU wheels for {target_sha}", file=sys.stderr)
           sys.exit(1)
           PY_WAIT
-          wheel_urls="$(tail -n 1 /tmp/dcu_wheel_paths.out)"
+          wheel_urls="$(tail -n 1 /tmp/hcu_wheel_paths.out)"
           if [[ -z "${wheel_urls}" ]]; then
             echo "No local staged wheel paths were produced." >&2
             exit 1
           fi
           echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
-  stage-a-test-1-gpu-small-dcu:
-    name: Stage A DCU smoke
+  stage-a-test-1-gpu-small-hcu:
+    name: Stage A HCU smoke
     needs:
       - check-changes
       - call-gate
       - validate-config
-      - wait-dcu-wheels
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-dcu-wheels.result == 'success' || needs.wait-dcu-wheels.result == 'skipped')
+      - wait-hcu-wheels
+    if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_a == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-hcu-wheels.result == 'success' || needs.wait-hcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     env:
-      DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
-      DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_a
-      DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
-      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
-      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
-      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
-      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
-      DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+      HCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
+      HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_stage_a
+      HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -618,10 +618,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-stage-a"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-stage-a"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -634,40 +634,40 @@ jobs:
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
 
-      - name: Setup DCU container
+      - name: Setup HCU container
         run: |
-          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
-              --image "${DCU_CI_IMAGE}" \
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
-      - name: Run stage-a-test-1-gpu-small-dcu
+      - name: Run stage-a-test-1-gpu-small-hcu
         timeout-minutes: 30
         run: |
-          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
-              --hw dcu \
-              --suite stage-a-test-1-gpu-small-dcu \
-              --include-file registered/dcu/interface/test_dcu_smoke.py \
+              --hw hcu \
+              --suite stage-a-test-1-gpu-small-hcu \
+              --include-file registered/hcu/interface/test_hcu_smoke.py \
               --timeout-per-file 120 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
-      - name: Cleanup DCU container
+      - name: Cleanup HCU container
         if: always()
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  stage-b-test-1-gpu-small-dcu:
-    name: Stage B DCU required (${{ matrix.name }})
+  stage-b-test-1-gpu-small-hcu:
+    name: Stage B HCU required (${{ matrix.name }})
     needs:
       - check-changes
       - call-gate
       - validate-config
-      - stage-a-test-1-gpu-small-dcu
-      - wait-dcu-wheels
-    if: always() && needs.check-changes.outputs.dcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-dcu-wheels.result == 'success' || needs.wait-dcu-wheels.result == 'skipped')
+      - stage-a-test-1-gpu-small-hcu
+      - wait-hcu-wheels
+    if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-hcu-wheels.result == 'success' || needs.wait-hcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
@@ -696,18 +696,18 @@ jobs:
             timeout_per_file: 600
             timeout_minutes: 60
     env:
-      DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
-      DCU_CI_CONTAINER_NAME: ci_sglang_dcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
-      DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
-      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
-      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
-      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
-      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
-      DCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
-      SGLANG_DCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
+      HCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
+      HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
+      HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+      SGLANG_HCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
     steps:
       - name: Checkout code
         env:
@@ -715,10 +715,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-stage-b-${{ matrix.part }}"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-stage-b-${{ matrix.part }}"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -731,26 +731,26 @@ jobs:
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
 
-      - name: Setup DCU container
+      - name: Setup HCU container
         run: |
-          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
-              --image "${DCU_CI_IMAGE}" \
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
-      - name: Run stage-b-test-1-gpu-small-dcu required partition
+      - name: Run stage-b-test-1-gpu-small-hcu required partition
         run: |
-          echo "Running stage-b-test-1-gpu-small-dcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
-          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" \
-            -e SGLANG_DCU_RERANKER_MODEL="${SGLANG_DCU_RERANKER_MODEL}" -- \
+          echo "Running stage-b-test-1-gpu-small-hcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" \
+            -e SGLANG_HCU_RERANKER_MODEL="${SGLANG_HCU_RERANKER_MODEL}" -- \
             python3 run_suite.py \
-              --hw dcu \
-              --suite stage-b-test-1-gpu-small-dcu \
-              --include-file registered/dcu/interface/test_dcu_stage_b_flow_0.py \
-              --include-file registered/dcu/interface/test_dcu_stage_b_flow_1.py \
+              --hw hcu \
+              --suite stage-b-test-1-gpu-small-hcu \
+              --include-file registered/hcu/interface/test_hcu_stage_b_flow_0.py \
+              --include-file registered/hcu/interface/test_hcu_stage_b_flow_1.py \
               --include-file registered/unit/observability/test_metrics_utils.py \
               --include-file registered/unit/parser/test_harmony_parser.py \
               --include-file registered/unit/parser/test_jinja_template_utils.py \
@@ -777,47 +777,47 @@ jobs:
               --include-file registered/openai_server/basic/test_serving_completions.py \
               --include-file registered/openai_server/validation/test_large_max_new_tokens.py \
               --include-file registered/openai_server/validation/test_openai_server_ignore_eos.py \
-              --include-file registered/dcu/sampling/bw1100/test_original_logprobs_dcu.py \
+              --include-file registered/hcu/sampling/bw1100/test_original_logprobs_hcu.py \
               --include-file registered/openai_server/validation/test_request_length_validation.py \
               --include-file registered/sampling/test_pytorch_sampling_backend.py \
               --include-file registered/sampling/test_penalty.py \
-              --include-file registered/dcu/core/bw1100/test_hidden_states_dcu.py \
+              --include-file registered/hcu/core/bw1100/test_hidden_states_hcu.py \
               --include-file registered/openai_server/basic/test_anthropic_server.py \
               --include-file registered/constrained_decoding/test_constrained_decoding.py \
               --include-file registered/openai_server/features/test_json_mode.py \
               --include-file registered/metrics/test_priority_metrics.py \
-              --include-file registered/dcu/srt/bw1100/test_qwen25_0p5b_server_dcu.py \
-              --include-file registered/dcu/openai_server/test_function_calling_dcu.py \
-              --include-file registered/dcu/openai_server/test_hidden_states_base_dcu.py \
-              --include-file registered/dcu/openai_server/test_protocol_dcu.py \
-              --include-file registered/dcu/openai_server/test_serving_chat_dcu.py \
-              --include-file registered/dcu/openai_server/test_tool_choice_dcu.py \
-              --include-file registered/dcu/reranker/bw1100/test_qwen3_reranker_dcu.py \
-              --include-file registered/dcu/rotary/test_mrope_smoke_dcu.py \
-              --include-file registered/dcu/spec/test_build_eagle_tree_dcu.py \
-              --include-file registered/dcu/unit/function_call/test_json_schema_constraint_dcu.py \
-              --include-file registered/dcu/unit/test_profile_merger_dcu.py \
-              --include-file registered/dcu/vlm_models/bw1100/test_qwen25_vl_3b_server_dcu.py \
+              --include-file registered/hcu/srt/bw1100/test_qwen25_0p5b_server_hcu.py \
+              --include-file registered/hcu/openai_server/test_function_calling_hcu.py \
+              --include-file registered/hcu/openai_server/test_hidden_states_base_hcu.py \
+              --include-file registered/hcu/openai_server/test_protocol_hcu.py \
+              --include-file registered/hcu/openai_server/test_serving_chat_hcu.py \
+              --include-file registered/hcu/openai_server/test_tool_choice_hcu.py \
+              --include-file registered/hcu/reranker/bw1100/test_qwen3_reranker_hcu.py \
+              --include-file registered/hcu/rotary/test_mrope_smoke_hcu.py \
+              --include-file registered/hcu/spec/test_build_eagle_tree_hcu.py \
+              --include-file registered/hcu/unit/function_call/test_json_schema_constraint_hcu.py \
+              --include-file registered/hcu/unit/test_profile_merger_hcu.py \
+              --include-file registered/hcu/vlm_models/bw1100/test_qwen25_vl_3b_server_hcu.py \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size ${{ matrix.parts }} \
               --timeout-per-file ${{ matrix.timeout_per_file }} \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
-      - name: Cleanup DCU container
+      - name: Cleanup HCU container
         if: always()
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  pr-test-dcu-finish:
-    name: PR Test (DCU) finish
+  pr-test-hcu-finish:
+    name: PR Test (HCU) finish
     needs:
       - check-changes
       - call-gate
       - validate-config
-      - wait-dcu-wheels
-      - stage-a-test-1-gpu-small-dcu
-      - stage-b-test-1-gpu-small-dcu
+      - wait-hcu-wheels
+      - stage-a-test-1-gpu-small-hcu
+      - stage-b-test-1-gpu-small-hcu
     if: always()
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Check all dependent job statuses
         run: |
@@ -834,4 +834,4 @@ jobs:
             fi
           done
 
-          echo "All required DCU jobs completed successfully or were skipped."
+          echo "All required HCU jobs completed successfully or were skipped."

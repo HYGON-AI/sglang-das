@@ -1,4 +1,4 @@
-name: DCU Full Enabled
+name: HCU Full Enabled
 
 on:
   workflow_dispatch:
@@ -9,12 +9,12 @@ on:
         type: string
         default: ""
       runner_label:
-        description: "DCU runner label override"
+        description: "HCU runner label override"
         required: false
         type: string
         default: ""
       image:
-        description: "DCU CI container image override"
+        description: "HCU CI container image override"
         required: false
         type: string
         default: ""
@@ -24,7 +24,7 @@ on:
         type: boolean
         default: true
       force_wheel_mode:
-        description: "Force waiting for and installing current commit DCU wheels"
+        description: "Force waiting for and installing current commit HCU wheels"
         required: false
         type: boolean
         default: false
@@ -34,23 +34,23 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: dcu-full-enabled-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.ref || 'current' }}
+  group: hcu-full-enabled-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.ref || 'current' }}
   cancel-in-progress: true
 
 jobs:
   check-full-trigger:
     name: Check full trigger
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
     outputs:
       should_run: ${{ steps.trigger.outputs.should_run }}
     steps:
-      - name: Check run-dcu-full label
+      - name: Check run-hcu-full label
         id: trigger
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action || '' }}
           EVENT_LABEL: ${{ github.event.label.name || '' }}
-          HAS_FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-dcu-full') || contains(github.event.pull_request.labels.*.name, 'run-ci') }}
+          HAS_FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-hcu-full') || contains(github.event.pull_request.labels.*.name, 'run-ci') }}
         run: |
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             echo "should_run=true" >> "${GITHUB_OUTPUT}"
@@ -58,12 +58,12 @@ jobs:
           fi
 
           if [[ "${HAS_FULL_LABEL}" != "true" ]]; then
-            echo "DCU full enabled run is disabled. Add the 'run-dcu-full' label to this PR, or use the temporary 'run-ci' compatibility gate on the dcu-ci-pr validation branch."
+            echo "HCU full enabled run is disabled. Add the 'run-hcu-full' label to this PR, or use the temporary 'run-ci' compatibility gate on the hcu-ci-pr validation branch."
             echo "should_run=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          if [[ "${EVENT_ACTION}" == "labeled" && "${EVENT_LABEL}" != "run-dcu-full" ]]; then
+          if [[ "${EVENT_ACTION}" == "labeled" && "${EVENT_LABEL}" != "run-hcu-full" ]]; then
             echo "Ignoring unrelated label event: ${EVENT_LABEL}"
             echo "should_run=false" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -72,10 +72,10 @@ jobs:
           echo "should_run=true" >> "${GITHUB_OUTPUT}"
 
   validate-config:
-    name: Validate DCU full config
+    name: Validate HCU full config
     needs: check-full-trigger
     if: needs.check-full-trigger.outputs.should_run == 'true'
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
     outputs:
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
@@ -87,10 +87,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-full-validate"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-full-validate"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -103,30 +103,30 @@ jobs:
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
 
-      - name: Resolve DCU runner and image
+      - name: Resolve HCU runner and image
         id: resolve
         env:
           INPUT_RUNNER_LABEL: ${{ inputs.runner_label || '' }}
           INPUT_IMAGE: ${{ inputs.image || '' }}
-          VAR_RUNNER_LABEL: ${{ vars.DCU_CI_RUNNER_LABEL || '' }}
-          VAR_IMAGE: ${{ vars.DCU_CI_IMAGE || '' }}
+          VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
+          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
         run: |
           runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
-          if [[ "${runner_label}" == "dcu-ci-pr" ]]; then
-            echo "Routing validation runner label dcu-ci-pr to dcu-ci-pr-2 for nmz4 test runner."
-            runner_label="dcu-ci-pr-2"
+          if [[ "${runner_label}" == "hcu-ci-pr" ]]; then
+            echo "Routing validation runner label hcu-ci-pr to hcu-ci-pr-2 for nmz4 test runner."
+            runner_label="hcu-ci-pr-2"
           fi
           image="${INPUT_IMAGE:-${VAR_IMAGE}}"
           continue_on_error="${CONTINUE_ON_ERROR:-true}"
 
           if [[ -z "${runner_label}" ]]; then
-            echo "::error::DCU runner label is required. Set vars.DCU_CI_RUNNER_LABEL or workflow input runner_label."
+            echo "::error::HCU runner label is required. Set vars.HCU_CI_RUNNER_LABEL or workflow input runner_label."
             exit 1
           fi
 
           if [[ -z "${image}" ]]; then
-            echo "::error::DCU CI image is required. Set vars.DCU_CI_IMAGE or workflow input image."
+            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE or workflow input image."
             exit 1
           fi
 
@@ -139,43 +139,43 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Setup DCU validation container
+      - name: Setup HCU validation container
         env:
-          DCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
-          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
-          DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
-          DCU_CI_VISIBLE_DEVICES: ${{ vars.DCU_CI_VISIBLE_DEVICES || '' }}
+          HCU_CI_IMAGE: ${{ steps.resolve.outputs.image }}
+          HCU_CI_CONTAINER_NAME: ci_sglang_hcu_full_${{ github.run_id }}_validate
+          HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+          HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
         run: |
-          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
-              --image "${DCU_CI_IMAGE}" \
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
 
-      - name: Verify DCU registration in container
+      - name: Verify HCU registration in container
         env:
-          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
+          HCU_CI_CONTAINER_NAME: ci_sglang_hcu_full_${{ github.run_id }}_validate
         run: |
-          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" \
-            --container-name "${DCU_CI_CONTAINER_NAME}" \
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" \
+            --container-name "${HCU_CI_CONTAINER_NAME}" \
             -w /sglang-checkout \
-            -- python3 scripts/ci/dcu/verify_dcu_registration.py
+            -- python3 scripts/ci/hcu/verify_hcu_registration.py
 
-      - name: Cleanup DCU validation container
+      - name: Cleanup HCU validation container
         if: always()
         env:
-          DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_validate
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+          HCU_CI_CONTAINER_NAME: ci_sglang_hcu_full_${{ github.run_id }}_validate
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  wait-dcu-wheels:
-    name: Wait DCU wheels
+  wait-hcu-wheels:
+    name: Wait HCU wheels
     needs: validate-config
     if: needs.validate-config.result == 'success' && inputs.force_wheel_mode == true
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     outputs:
       wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
     env:
-      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
-      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.ref || github.sha }}
     steps:
       - name: Checkout code
@@ -183,10 +183,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-full-wait-wheels"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-full-wait-wheels"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -203,39 +203,39 @@ jobs:
         id: sha
         run: |
           set -euo pipefail
-          full_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
-          short_sha="$(git -C "${DCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
+          full_sha="$(git -C "${HCU_CI_CHECKOUT_DIR}" rev-parse HEAD)"
+          short_sha="$(git -C "${HCU_CI_CHECKOUT_DIR}" rev-parse --short=12 HEAD)"
           echo "full_sha=${full_sha}" >> "${GITHUB_OUTPUT}"
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
           echo "Using wheel SHA: ${full_sha} (${short_sha})"
 
-      - name: Wait for current commit DCU wheels
+      - name: Wait for current commit HCU wheels
         id: wait
         run: |
           set -euo pipefail
           full_sha="${{ steps.sha.outputs.full_sha }}"
           short_sha="${{ steps.sha.outputs.short_sha }}"
-          export DCU_WHEEL_TARGET_SHA="${full_sha}"
-          export DCU_WHEEL_TARGET_SHORT_SHA="${short_sha}"
-          echo "Waiting for locally staged DCU wheels for ${full_sha}"
-          echo "Host staging root: ${DCU_WHEEL_STAGING_ROOT}"
+          export HCU_WHEEL_TARGET_SHA="${full_sha}"
+          export HCU_WHEEL_TARGET_SHORT_SHA="${short_sha}"
+          echo "Waiting for locally staged HCU wheels for ${full_sha}"
+          echo "Host staging root: ${HCU_WHEEL_STAGING_ROOT}"
 
-          python3 - <<'PY_WAIT' | tee /tmp/dcu_wheel_paths.out
+          python3 - <<'PY_WAIT' | tee /tmp/hcu_wheel_paths.out
           import os
           import pathlib
           import sys
           import time
 
-          root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
-          container_root = pathlib.Path(os.environ.get("DCU_WHEEL_STAGING_CONTAINER_ROOT", "/dcu-wheel-staging"))
-          target_sha = os.environ["DCU_WHEEL_TARGET_SHA"]
-          short_sha = os.environ.get("DCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
+          root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_ROOT", "/home/github/sgl_whl_temp"))
+          container_root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_CONTAINER_ROOT", "/hcu-wheel-staging"))
+          target_sha = os.environ["HCU_WHEEL_TARGET_SHA"]
+          short_sha = os.environ.get("HCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
           repo = os.environ["GITHUB_REPOSITORY"]
           owner, repo_name = repo.split("/", 1)
           repo_key = f"{owner}_{repo_name}"
           gateway_required = os.environ.get("GATEWAY_WHEEL_REQUIRED", "false") == "true"
-          timeout_s = int(os.environ.get("DCU_WHEEL_WAIT_TIMEOUT", "3600"))
-          interval_s = int(os.environ.get("DCU_WHEEL_WAIT_INTERVAL", "60"))
+          timeout_s = int(os.environ.get("HCU_WHEEL_WAIT_TIMEOUT", "3600"))
+          interval_s = int(os.environ.get("HCU_WHEEL_WAIT_INTERVAL", "60"))
 
           requirements = ["sglang", "sgl-kernel"]
           if gateway_required:
@@ -266,15 +266,15 @@ jobs:
           while time.time() < deadline:
               candidates = candidate_dirs()
               if not candidates:
-                  print(f"[wait-dcu-wheels] no staged dirs under {root / repo_key}/pr-*/{target_sha}", file=sys.stderr)
+                  print(f"[wait-hcu-wheels] no staged dirs under {root / repo_key}/pr-*/{target_sha}", file=sys.stderr)
               for staging_dir in candidates:
                   ready = staging_dir / "READY"
                   wheel_dir = staging_dir / "wheels"
                   if not ready.exists():
-                      print(f"[wait-dcu-wheels] {staging_dir} has no READY", file=sys.stderr)
+                      print(f"[wait-hcu-wheels] {staging_dir} has no READY", file=sys.stderr)
                       continue
                   if not wheel_dir.is_dir():
-                      print(f"[wait-dcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
+                      print(f"[wait-hcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
                       continue
                   found = {}
                   for wheel in sorted(wheel_dir.glob("*.whl")):
@@ -284,29 +284,29 @@ jobs:
                   missing = [name for name in requirements if name not in found]
                   if not missing:
                       paths = [to_container_path(found[name]) for name in requirements]
-                      print(f"[wait-dcu-wheels] found staged wheels in {staging_dir}: {' '.join(paths)}", file=sys.stderr)
+                      print(f"[wait-hcu-wheels] found staged wheels in {staging_dir}: {' '.join(paths)}", file=sys.stderr)
                       print(" ".join(paths))
                       sys.exit(0)
-                  print(f"[wait-dcu-wheels] {staging_dir} missing {missing}; found={list(found)}", file=sys.stderr)
-              print(f"[wait-dcu-wheels] waiting for local staged wheels for {short_sha}; sleep {interval_s}s", file=sys.stderr)
+                  print(f"[wait-hcu-wheels] {staging_dir} missing {missing}; found={list(found)}", file=sys.stderr)
+              print(f"[wait-hcu-wheels] waiting for local staged wheels for {short_sha}; sleep {interval_s}s", file=sys.stderr)
               time.sleep(interval_s)
 
-          print(f"Timed out waiting for locally staged DCU wheels for {target_sha}", file=sys.stderr)
+          print(f"Timed out waiting for locally staged HCU wheels for {target_sha}", file=sys.stderr)
           sys.exit(1)
           PY_WAIT
-          wheel_urls="$(tail -n 1 /tmp/dcu_wheel_paths.out)"
+          wheel_urls="$(tail -n 1 /tmp/hcu_wheel_paths.out)"
           if [[ -z "${wheel_urls}" ]]; then
             echo "No local staged wheel paths were produced." >&2
             exit 1
           fi
           echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
-  full-enabled-dcu:
-    name: Full enabled DCU (${{ matrix.name }})
+  full-enabled-hcu:
+    name: Full enabled HCU (${{ matrix.name }})
     needs:
       - validate-config
-      - wait-dcu-wheels
-    if: always() && needs.validate-config.result == 'success' && (needs.wait-dcu-wheels.result == 'success' || needs.wait-dcu-wheels.result == 'skipped')
+      - wait-hcu-wheels
+    if: always() && needs.validate-config.result == 'success' && (needs.wait-hcu-wheels.result == 'success' || needs.wait-hcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
@@ -315,189 +315,189 @@ jobs:
       matrix:
         include:
           - name: stage-a
-            suite: stage-a-test-1-gpu-small-dcu
+            suite: stage-a-test-1-gpu-small-hcu
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
           - name: stage-b-small-0
-            suite: stage-b-test-1-gpu-small-dcu
+            suite: stage-b-test-1-gpu-small-hcu
             nightly: "false"
             part: 0
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-1
-            suite: stage-b-test-1-gpu-small-dcu
+            suite: stage-b-test-1-gpu-small-hcu
             nightly: "false"
             part: 1
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-2
-            suite: stage-b-test-1-gpu-small-dcu
+            suite: stage-b-test-1-gpu-small-hcu
             nightly: "false"
             part: 2
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-3
-            suite: stage-b-test-1-gpu-small-dcu
+            suite: stage-b-test-1-gpu-small-hcu
             nightly: "false"
             part: 3
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-large
-            suite: stage-b-test-1-gpu-large-dcu
+            suite: stage-b-test-1-gpu-large-hcu
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 2400
             timeout_minutes: 150
           - name: stage-b-2gpu
-            suite: stage-b-test-2-gpu-large-dcu
+            suite: stage-b-test-2-gpu-large-hcu
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
-          - name: nightly-dcu-0
-            suite: nightly-dcu
+          - name: nightly-hcu-0
+            suite: nightly-hcu
             nightly: "true"
             part: 0
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-dcu-1
-            suite: nightly-dcu
+          - name: nightly-hcu-1
+            suite: nightly-hcu
             nightly: "true"
             part: 1
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-dcu-2
-            suite: nightly-dcu
+          - name: nightly-hcu-2
+            suite: nightly-hcu
             nightly: "true"
             part: 2
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-dcu-1gpu
-            suite: nightly-dcu-1-gpu
+          - name: nightly-hcu-1gpu
+            suite: nightly-hcu-1-gpu
             nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
           - name: accuracy-0
-            suite: nightly-dcu-accuracy
+            suite: nightly-hcu-accuracy
             nightly: "true"
             part: 0
             parts: 2
             timeout_per_file: 4200
             timeout_minutes: 180
           - name: accuracy-1
-            suite: nightly-dcu-accuracy
+            suite: nightly-hcu-accuracy
             nightly: "true"
             part: 1
             parts: 2
             timeout_per_file: 4200
             timeout_minutes: 180
           - name: perf-0
-            suite: nightly-dcu-perf
+            suite: nightly-hcu-perf
             nightly: "true"
             part: 0
             parts: 2
             timeout_per_file: 2400
             timeout_minutes: 150
           - name: perf-1
-            suite: nightly-dcu-perf
+            suite: nightly-hcu-perf
             nightly: "true"
             part: 1
             parts: 2
             timeout_per_file: 2400
             timeout_minutes: 150
           - name: vlm-0
-            suite: nightly-dcu-vlm
+            suite: nightly-hcu-vlm
             nightly: "true"
             part: 0
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
           - name: vlm-1
-            suite: nightly-dcu-vlm
+            suite: nightly-hcu-vlm
             nightly: "true"
             part: 1
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
-          - name: nightly-dcu-2gpu
-            suite: nightly-dcu-2-gpu
+          - name: nightly-hcu-2gpu
+            suite: nightly-hcu-2-gpu
             nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
           - name: core-functional
-            suite: nightly-dcu-core-functional
+            suite: nightly-hcu-core-functional
             nightly: "true"
             part: 0
             parts: 1
             timeout_per_file: 3000
             timeout_minutes: 90
           - name: accuracy-text-0
-            suite: nightly-dcu-accuracy-text
+            suite: nightly-hcu-accuracy-text
             nightly: "true"
             part: 0
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
           - name: accuracy-text-1
-            suite: nightly-dcu-accuracy-text
+            suite: nightly-hcu-accuracy-text
             nightly: "true"
             part: 1
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
           - name: perf-text-0
-            suite: nightly-dcu-perf-text
+            suite: nightly-hcu-perf-text
             nightly: "true"
             part: 0
             parts: 5
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: perf-text-1
-            suite: nightly-dcu-perf-text
+            suite: nightly-hcu-perf-text
             nightly: "true"
             part: 1
             parts: 5
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: perf-text-2
-            suite: nightly-dcu-perf-text
+            suite: nightly-hcu-perf-text
             nightly: "true"
             part: 2
             parts: 5
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: perf-text-3
-            suite: nightly-dcu-perf-text
+            suite: nightly-hcu-perf-text
             nightly: "true"
             part: 3
             parts: 5
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: perf-text-4
-            suite: nightly-dcu-perf-text
+            suite: nightly-hcu-perf-text
             nightly: "true"
             part: 4
             parts: 5
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-4gpu
-            suite: nightly-dcu-large-model-4gpu
+            suite: nightly-hcu-large-model-4gpu
             nightly: "true"
             part: 0
             parts: 1
@@ -505,73 +505,73 @@ jobs:
             timeout_minutes: 180
             visible_devices: "4,5,6,7"
           - name: large-model-8gpu-0
-            suite: nightly-dcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8gpu
             nightly: "true"
             part: 0
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-8gpu-1
-            suite: nightly-dcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8gpu
             nightly: "true"
             part: 1
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-8gpu-2
-            suite: nightly-dcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8gpu
             nightly: "true"
             part: 2
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-8gpu-3
-            suite: nightly-dcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8gpu
             nightly: "true"
             part: 3
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: quant-opt-0
-            suite: nightly-dcu-quant-opt
+            suite: nightly-hcu-quant-opt
             nightly: "true"
             part: 0
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: quant-opt-1
-            suite: nightly-dcu-quant-opt
+            suite: nightly-hcu-quant-opt
             nightly: "true"
             part: 1
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: quant-opt-2
-            suite: nightly-dcu-quant-opt
+            suite: nightly-hcu-quant-opt
             nightly: "true"
             part: 2
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: quant-opt-3
-            suite: nightly-dcu-quant-opt
+            suite: nightly-hcu-quant-opt
             nightly: "true"
             part: 3
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
     env:
-      DCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
-      DCU_CI_CONTAINER_NAME: ci_sglang_dcu_full_${{ github.run_id }}_${{ matrix.name }}
-      DCU_CI_SKIP_PULL: ${{ vars.DCU_CI_SKIP_PULL || '' }}
-      DCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.DCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      DCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.DCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      DCU_CI_SKIP_SGLANG_BUILD: ${{ vars.DCU_CI_SKIP_SGLANG_BUILD || '' }}
-      DCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.DCU_CI_VISIBLE_DEVICES || '' }}
-      DCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-dcu-wheels.outputs.wheel_urls || '' }}
-      DCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
-      DCU_WHEEL_STAGING_CONTAINER_ROOT: /dcu-wheel-staging
-      DCU_CI_USE_INSTALLED_WHEELS: ${{ inputs.force_wheel_mode == true && '1' || '' }}
+      HCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
+      HCU_CI_CONTAINER_NAME: ci_sglang_hcu_full_${{ github.run_id }}_${{ matrix.name }}
+      HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
+      HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
+      HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ inputs.force_wheel_mode == true && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -579,10 +579,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CHECKOUT_DIR="${RUNNER_TEMP}/dcu-sglang-${GITHUB_RUN_ID}-full-${{ matrix.name }}"
+          CHECKOUT_DIR="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-full-${{ matrix.name }}"
           rm -rf "${CHECKOUT_DIR}"
           mkdir -p "${CHECKOUT_DIR}"
-          echo "DCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
+          echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
@@ -595,17 +595,17 @@ jobs:
             fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
           git checkout --force FETCH_HEAD
 
-      - name: Setup DCU container
+      - name: Setup HCU container
         run: |
-          GITHUB_WORKSPACE="${DCU_CI_CHECKOUT_DIR}" \
-            bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_start_container.sh" \
-              --image "${DCU_CI_IMAGE}" \
-              --container-name "${DCU_CI_CONTAINER_NAME}"
+          GITHUB_WORKSPACE="${HCU_CI_CHECKOUT_DIR}" \
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_start_container.sh" \
+              --image "${HCU_CI_IMAGE}" \
+              --container-name "${HCU_CI_CONTAINER_NAME}"
 
       - name: Install dependencies
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_install_dependency.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
-      - name: Run full enabled DCU suite
+      - name: Run full enabled HCU suite
         run: |
           nightly_flag=""
           if [[ "${{ matrix.nightly }}" == "true" ]]; then
@@ -613,9 +613,9 @@ jobs:
           fi
 
           echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }} nightly=${{ matrix.nightly }}"
-          bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${DCU_CI_CONTAINER_NAME}" -- \
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
-              --hw dcu \
+              --hw hcu \
               --suite "${{ matrix.suite }}" \
               ${nightly_flag} \
               --auto-partition-id "${{ matrix.part }}" \
@@ -623,19 +623,19 @@ jobs:
               --timeout-per-file "${{ matrix.timeout_per_file }}" \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
-      - name: Cleanup DCU container
+      - name: Cleanup HCU container
         if: always()
-        run: bash "${DCU_CI_CHECKOUT_DIR}/scripts/ci/dcu/dcu_ci_cleanup_container.sh"
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  dcu-full-enabled-finish:
-    name: DCU Full Enabled finish
+  hcu-full-enabled-finish:
+    name: HCU Full Enabled finish
     needs:
       - check-full-trigger
       - validate-config
-      - wait-dcu-wheels
-      - full-enabled-dcu
+      - wait-hcu-wheels
+      - full-enabled-hcu
     if: always()
-    runs-on: ${{ inputs.runner_label || vars.DCU_CI_RUNNER_LABEL }}
+    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
     steps:
       - name: Check all dependent job statuses
         run: |
@@ -656,4 +656,4 @@ jobs:
             fi
           done
 
-          echo "All DCU full enabled jobs completed successfully or were skipped."
+          echo "All HCU full enabled jobs completed successfully or were skipped."

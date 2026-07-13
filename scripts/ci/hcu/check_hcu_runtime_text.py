@@ -27,15 +27,15 @@ from pathlib import Path
 
 HCU_PATH_PREFIXES = (
     ".github/workflows/",
-    "scripts/ci/dcu/",
-    "test/registered/dcu/",
+    "scripts/ci/hcu/",
+    "test/registered/hcu/",
 )
 HCU_EXACT_FILES = {
-    "python/sglang/test/dcu_utils.py",
-    "requirements_dcu.txt",
+    "python/sglang/test/hcu_utils.py",
+    "requirements_hcu.txt",
 }
 EXEMPT_FILES = {
-    "scripts/ci/dcu/check_hcu_runtime_text.py",
+    "scripts/ci/hcu/check_hcu_runtime_text.py",
 }
 VISIBLE_CALLS = {
     "print",

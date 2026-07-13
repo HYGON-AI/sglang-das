@@ -15,27 +15,27 @@
 
 set -euo pipefail
 
-# Start a DCU CI container.
+# Start a HCU CI container.
 #
 # Required env / inputs:
-#   DCU_CI_IMAGE     Docker image to use. Must point to a DTK/DCU enabled image
+#   HCU_CI_IMAGE     Docker image to use. Must point to a DTK/HCU enabled image
 #                    that has sglang build dependencies preinstalled.
 #                    Override with: --custom-image <image> or --image <image>
 #   GITHUB_WORKSPACE Mount point for the checkout. Defaults to $PWD.
 #   HF_TOKEN         Optional, forwarded into the container.
 #
 # Optional env:
-#   DCU_CI_CONTAINER / DCU_CI_CONTAINER_NAME  Container name. Defaults to ci_sglang.
-#   DCU_DEVICE_FLAGS / DCU_CI_DEVICE_FLAGS    Additional `--device ...` flags.
-#   DCU_CI_VISIBLE_DEVICES                    Comma-separated DCU devices to expose.
-#   DCU_CACHE_HOST / DCU_CI_CACHE_HOST         Host-side cache directory mounted into /sgl-data.
-#   DCU_WHEEL_STAGING_ROOT                  Host-side PR wheel staging directory.
-#   DCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
-#   DCU_MODEL_EXTRA_HOST_PATHS              Colon-separated host model roots to mount read-only
+#   HCU_CI_CONTAINER / HCU_CI_CONTAINER_NAME  Container name. Defaults to ci_sglang.
+#   HCU_DEVICE_FLAGS / HCU_CI_DEVICE_FLAGS    Additional `--device ...` flags.
+#   HCU_CI_VISIBLE_DEVICES                    Comma-separated HCU devices to expose.
+#   HCU_CACHE_HOST / HCU_CI_CACHE_HOST         Host-side cache directory mounted into /sgl-data.
+#   HCU_WHEEL_STAGING_ROOT                  Host-side PR wheel staging directory.
+#   HCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
+#   HCU_MODEL_EXTRA_HOST_PATHS              Colon-separated host model roots to mount read-only
 #                                           at the same path inside the container.
 
 CUSTOM_IMAGE=""
-CONTAINER="${DCU_CI_CONTAINER:-${DCU_CI_CONTAINER_NAME:-ci_sglang}}"
+CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -51,27 +51,27 @@ done
 
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
   IMAGE="${CUSTOM_IMAGE}"
-elif [[ -n "${DCU_CI_IMAGE:-}" ]]; then
-  IMAGE="${DCU_CI_IMAGE}"
+elif [[ -n "${HCU_CI_IMAGE:-}" ]]; then
+  IMAGE="${HCU_CI_IMAGE}"
 else
-  echo "Error: DCU_CI_IMAGE env var not set and --custom-image not provided." >&2
-  echo "Set DCU_CI_IMAGE to a DTK/DCU enabled sglang dev image." >&2
+  echo "Error: HCU_CI_IMAGE env var not set and --custom-image not provided." >&2
+  echo "Set HCU_CI_IMAGE to a DTK/HCU enabled sglang dev image." >&2
   exit 1
 fi
 
-echo "Using DCU image: ${IMAGE}"
+echo "Using HCU image: ${IMAGE}"
 
 # Pull only if not already present locally, unless explicitly skipped.
-if [[ -z "${DCU_CI_SKIP_PULL:-}" ]] && ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+if [[ -z "${HCU_CI_SKIP_PULL:-}" ]] && ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   echo "Pulling Docker image: ${IMAGE}"
   docker pull "${IMAGE}"
 fi
 
-# DCU exposes /dev/kfd + /dev/dri the same way ROCm does. Allow override.
-DEVICE_FLAGS="${DCU_DEVICE_FLAGS:-${DCU_CI_DEVICE_FLAGS:---device=/dev/kfd --device=/dev/dri}}"
-VISIBLE_DEVICES="${DCU_CI_VISIBLE_DEVICES:-}"
-DTK_ROOT="${DCU_DTK_ROOT:-/opt/dtk}"
-DCU_LD_LIBRARY_PATH="${DCU_LD_LIBRARY_PATH:-${DTK_ROOT}/hip/lib:${DTK_ROOT}/lib:${DTK_ROOT}/lib64:${DTK_ROOT}/hsa/lib:${DTK_ROOT}/llvm/lib:${DTK_ROOT}/dcc/gcvm/lib:${DTK_ROOT}/.hyhal/lib:${DTK_ROOT}/.hyhal/lib64:${DTK_ROOT}/.hyhal/rocm_smi/lib:${DTK_ROOT}/.hyhal/hydm/lib:/opt/hyhal/lib:/opt/hyhal/lib64}"
+# HCU exposes /dev/kfd + /dev/dri the same way ROCm does. Allow override.
+DEVICE_FLAGS="${HCU_DEVICE_FLAGS:-${HCU_CI_DEVICE_FLAGS:---device=/dev/kfd --device=/dev/dri}}"
+VISIBLE_DEVICES="${HCU_CI_VISIBLE_DEVICES:-}"
+DTK_ROOT="${HCU_DTK_ROOT:-/opt/dtk}"
+HCU_LD_LIBRARY_PATH="${HCU_LD_LIBRARY_PATH:-${DTK_ROOT}/hip/lib:${DTK_ROOT}/lib:${DTK_ROOT}/lib64:${DTK_ROOT}/hsa/lib:${DTK_ROOT}/llvm/lib:${DTK_ROOT}/dcc/gcvm/lib:${DTK_ROOT}/.hyhal/lib:${DTK_ROOT}/.hyhal/lib64:${DTK_ROOT}/.hyhal/rocm_smi/lib:${DTK_ROOT}/.hyhal/hydm/lib:/opt/hyhal/lib:/opt/hyhal/lib64}"
 
 VISIBLE_ENV_ARGS=()
 if [[ -n "${VISIBLE_DEVICES}" ]]; then
@@ -83,28 +83,28 @@ if [[ -n "${VISIBLE_DEVICES}" ]]; then
   # the same numeric ordinal can make torch fail GPU initialization. HIP is
   # enough for SGLang CI device selection; expose ROCR only when explicitly
   # requested for lower-level runtime diagnostics.
-  if [[ "${DCU_CI_SET_ROCR_VISIBLE_DEVICES:-0}" == "1" ]]; then
+  if [[ "${HCU_CI_SET_ROCR_VISIBLE_DEVICES:-0}" == "1" ]]; then
     VISIBLE_ENV_ARGS+=(-e "ROCR_VISIBLE_DEVICES=${VISIBLE_DEVICES}")
   fi
 fi
 
-CACHE_HOST="${DCU_CACHE_HOST:-${DCU_CI_CACHE_HOST:-/home/runner/sgl-data}}"
+CACHE_HOST="${HCU_CACHE_HOST:-${HCU_CI_CACHE_HOST:-/home/runner/sgl-data}}"
 if [[ -d "${CACHE_HOST}" ]]; then
   CACHE_VOLUME="-v ${CACHE_HOST}:/sgl-data"
 else
   CACHE_VOLUME=""
 fi
 
-MODEL_HOST_PATH="${DCU_MODEL_HOST_PATH:-/public/opendas/DL_DATA/llm-models}"
+MODEL_HOST_PATH="${HCU_MODEL_HOST_PATH:-/public/opendas/DL_DATA/llm-models}"
 if [[ -d "${MODEL_HOST_PATH}" ]]; then
-  # This mount also exposes the default DCU accuracy datasets under llm-models.
+  # This mount also exposes the default HCU accuracy datasets under llm-models.
   MODEL_VOLUME="-v ${MODEL_HOST_PATH}:${MODEL_HOST_PATH}:ro"
 else
   MODEL_VOLUME=""
 fi
 
-WHEEL_STAGING_HOST="${DCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
-WHEEL_STAGING_CONTAINER="${DCU_WHEEL_STAGING_CONTAINER_ROOT:-/dcu-wheel-staging}"
+WHEEL_STAGING_HOST="${HCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
+WHEEL_STAGING_CONTAINER="${HCU_WHEEL_STAGING_CONTAINER_ROOT:-/hcu-wheel-staging}"
 if [[ -n "${WHEEL_STAGING_HOST}" ]]; then
   mkdir -p "${WHEEL_STAGING_HOST}" || true
   WHEEL_STAGING_VOLUME="-v ${WHEEL_STAGING_HOST}:${WHEEL_STAGING_CONTAINER}:ro"
@@ -113,8 +113,8 @@ else
 fi
 
 EXTRA_MODEL_VOLUMES=()
-if [[ -n "${DCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
-  IFS=':' read -r -a EXTRA_MODEL_HOST_PATHS <<< "${DCU_MODEL_EXTRA_HOST_PATHS}"
+if [[ -n "${HCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
+  IFS=':' read -r -a EXTRA_MODEL_HOST_PATHS <<< "${HCU_MODEL_EXTRA_HOST_PATHS}"
   for extra_model_path in "${EXTRA_MODEL_HOST_PATHS[@]}"; do
     if [[ -z "${extra_model_path}" ]]; then
       continue
@@ -122,7 +122,7 @@ if [[ -n "${DCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
     if [[ -d "${extra_model_path}" ]]; then
       EXTRA_MODEL_VOLUMES+=(-v "${extra_model_path}:${extra_model_path}:ro")
     else
-      echo "Warning: extra DCU model path does not exist, skip mount: ${extra_model_path}" >&2
+      echo "Warning: extra HCU model path does not exist, skip mount: ${extra_model_path}" >&2
     fi
   done
 fi
@@ -150,10 +150,10 @@ docker run -dt --user root --privileged \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e ROCM_PATH="${DTK_ROOT}" \
-  -e LD_LIBRARY_PATH="${DCU_LD_LIBRARY_PATH}" \
+  -e LD_LIBRARY_PATH="${HCU_LD_LIBRARY_PATH}" \
   "${VISIBLE_ENV_ARGS[@]}" \
   -e SGLANG_IS_IN_CI=1 \
-  -e SGLANG_IS_IN_CI_DCU=1 \
+  -e SGLANG_IS_IN_CI_HCU=1 \
   -e SGLANG_USE_AITER=0 \
   -e SGLANG_ROCM_USE_AITER_MOE=0 \
   --security-opt seccomp=unconfined \
