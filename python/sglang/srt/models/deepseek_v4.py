@@ -1955,6 +1955,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.cp_rank = get_parallel().attn_cp_rank
             self.cp_size = get_parallel().attn_cp_size
 
+        # update_weights_from_disk/_tensor/_distributed re-enter load_weights
+        # mid-serving (RL refit sends many partial batches); the prewarm and
+        # its barrier must only run on the first (startup) load.
+        self._mhc_prewarmed_at_load = False
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -1964,28 +1969,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        # Waterfill needs shared-experts fusion so it can dispatch shared
-        # expert tokens to least-loaded EP ranks.
-        if get_global_server_args().enable_deepep_waterfill:
+        disable_reason = None
+        if get_global_server_args().enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
-                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={self.config.n_shared_experts}."
                 )
-            self.num_fused_shared_experts = self.config.n_shared_experts
+        else:
+            disable_reason = "Config does not support fused shared expert(s)."
+
+        if disable_reason is not None:
+            get_global_server_args().disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
-                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
-                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+                f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
-        get_global_server_args().disable_shared_experts_fusion = True
-        log_info_on_rank0(
-            logger,
-            "DeepSeek V4 requires different clamping for shared and routed experts. "
-            "Shared experts fusion optimization is disabled.",
-        )
+        self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
     def forward(
@@ -2135,18 +2137,74 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if "self_attn" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        if "self_attn" in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+        if "mlp" in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         return name
+
+    def _prewarm_mhc_pre_kernels(self) -> None:
+        """One-shot mhc_pre() JIT prewarm at load time, synced across ranks.
+
+        Runs before any forward so the compile burst stays off the serving
+        path; the barrier keeps ranks from proceeding while a peer is still
+        compiling. The early returns below must stay rank-uniform.
+        """
+        if self._mhc_prewarmed_at_load:
+            return
+        self._mhc_prewarmed_at_load = True
+        if _is_npu or not (
+            envs.SGLANG_DSV4_MHC_PREWARM.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
+            return
+        layer = next(
+            (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
+            None,
+        )
+        if layer is None:
+            return
+
+        from sglang.srt.layers.mhc import prewarm_mhc_pre
+
+        tic = time.perf_counter()
+        prewarm_mhc_pre(
+            # Template carrying dtype/device; buckets allocate their own sizes.
+            residual=torch.zeros(
+                (1, layer.hc_mult, layer.hidden_size),
+                dtype=torch.bfloat16,
+                device=layer.hc_attn_fn.device,
+            ),
+            fn=layer.hc_attn_fn,
+            hc_scale=layer.hc_attn_scale,
+            hc_base=layer.hc_attn_base,
+            rms_eps=layer.rms_norm_eps,
+            hc_pre_eps=layer.hc_eps,
+            hc_sinkhorn_eps=layer.hc_eps,
+            hc_post_mult_value=_MHC_POST_MULT_VALUE,
+            sinkhorn_repeat=layer.hc_sinkhorn_iters,
+            n_splits=1,
+            n_splits_pre=32,
+            norm_weight=layer.input_layernorm.weight.data,
+            norm_eps=layer.input_layernorm.variance_epsilon,
+        )
+        torch.cuda.synchronize()
+        compile_secs = time.perf_counter() - tic
+        # Runs before init_memory_pool(); don't let transients skew pool sizing.
+        torch.cuda.empty_cache()
+        get_tp_group().barrier()
+        logger.info(
+            "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
+            compile_secs,
+            time.perf_counter() - tic - compile_secs,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
@@ -2527,6 +2585,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+        if not is_nextn:
+            self._prewarm_mhc_pre_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

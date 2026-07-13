@@ -1282,3 +1282,50 @@ actual result in the checkpoint note.
   - The exact required command completed weight loading and the default decode graph capture for every bucket from batch size 128 through 1 on all four TP ranks, then reported service readiness on port 10015.
   - `GET /health` returned HTTP 200, and one short `POST /generate` returned HTTP 200 with a completed eight-token response; no worker crash or corrective code change was required.
   - The response contained empty text with eight zero token IDs. This remains the already-deferred, non-blocking accuracy observation and is not reported as an accuracy pass. The test service was stopped cleanly after the request.
+
+### Official main catch-up 20260703 / `88db9e033a11`
+
+- Branch: `sync/official-main-catchup-20260703`.
+- Base: DCU `main@ec49eb80ae6bb9044bc6c31b5fd3d3621516b877`, official previous checkpoint `f920a37da46e1cbb6ba27b76365a622eba593811`.
+- Endpoint: official `main@88db9e033a11b2d366a8f9d037f027a46ccb9940` (`Adjust KL_THRESHOLD for log probability calculations (#30101)`).
+- Scope: 148 immutable official commits (the planning estimate was 156), 2026-06-30 to 2026-07-03; 546 files changed. Git reported 20 textual conflict files, below the 50-file `20260701` split threshold.
+- Textual conflicts and decisions:
+  - `python/pyproject.toml` (`dependencies`, `theirs`): accepted official TileLang `0.1.11`, paired with the endpoint's tvm-ffi/sgl-deep-gemm upgrade.
+  - `python/sglang/jit_kernel/csrc/add_constant.cuh` (`JIT/ROCm`, `theirs`): accepted official `kDLGPU` TensorMatcher dispatch; the shared JIT utility maps it to `kDLROCM` under HIP and to `kDLCUDA` otherwise.
+  - `python/sglang/jit_kernel/dsv4/elementwise.py` (`DSV4 JIT`, `manual merge`): combined official XPU dispatch with the retained DCU-specific module selection and cache behavior.
+  - `python/sglang/srt/environ.py` (`environment`, `manual merge`): kept DCU FlashMLA split/backend, FP4/FP8, and SWA eviction controls while accepting the official sparse-prefill default. The endpoint's DeepSeek-V4 hook explicitly resets sparse prefill to false on HIP/DCU unless the user sets it.
+  - `python/sglang/srt/layers/attention/deepseek_v4_backend.py` (`DSV4 attention`, `manual merge`): combined XPU imports with DCU LightOp controls and retained the validated DCU decode/prefill split. The official generic FlashMLA tail was not allowed to become a DCU fallback after the existing DCU branches.
+  - `python/sglang/srt/layers/attention/dsa_backend.py` (`DSA/CP`, `theirs`): added the official TRT-LLM FP8 KV all-gather helper and retained the existing `_is_hip and not _is_dcu` AITER import boundary.
+  - `python/sglang/srt/layers/attention/dsv4/compressor.py` (`DSV4 compressor`, `manual merge`): retained DCU LightOp quant/store selection, accepted the always-V2 official compressor contract, and removed the obsolete non-DCU legacy compressor alias and now-dead AITER tuned-GEMM imports.
+  - `python/sglang/srt/layers/attention/dsv4/indexer.py` (`DSV4 indexer`, `manual merge`): added official CUDA-only non-paged indexer planning while retaining DCU detection and the gfx942/gfx95 gate that keeps unsupported gfx938 away from AITER paged-MQA logits.
+  - `python/sglang/srt/layers/attention/fla/layernorm_gated.py` (`linear attention`, `manual merge`): combined the official XPU Dynamo-safe device context with the DCU LightOp `layer_norm_fwd_1pass_opt` branch.
+  - `python/sglang/srt/layers/attention/triton_backend.py` (`attention/cache`, `manual merge`): adopted official unified-pool deferred full/SWA location translation and removed the superseded per-step CPU-length plumbing, while preserving the existing backend interfaces outside the refactored graph metadata lifecycle.
+  - `python/sglang/srt/layers/mhc.py` (`DSV4 MHC`, `theirs`): removed two stale commented TileLang GEMM arguments; no DCU runtime branch changed.
+  - `python/sglang/srt/layers/moe/fused_moe_triton/layer.py` (`MoE`, `manual merge`): retained the DCU LightOp sum/mul/add selector while accepting official per-rank shared-slot and FP8-to-FP4 shared-expert loading changes; dropped an obsolete unused NPU local.
+  - `python/sglang/srt/layers/moe/topk.py` (`MoE top-k`, `manual merge`): retained the DCU LightOp grouped-top-k and EPLB/padded-token postprocess arguments, added the official return annotation, and dropped the obsolete eager Kimi import after routing moved to the JIT path.
+  - `python/sglang/srt/layers/quantization/unquant.py` (`quant/MoE`, `ours`): retained DCU W16A16 Marlin expert packing and fallback behavior ahead of the official NPU postprocess.
+  - `python/sglang/srt/model_executor/forward_batch_info.py` (`model executor`, `manual merge`): retained DCU residual-RMS INT8 fields and accepted the official decode-context-parallel type/lifecycle documentation.
+  - `python/sglang/srt/speculative/draft_utils.py` (`spec/DSV4`, `manual merge`): accepted the official Ascend DSV4 draft backends while retaining the DCU exclusion from generic HIP draft routing and removing a stale global-ServerArgs import.
+  - `python/sglang/srt/speculative/eagle_utils.py` (`spec`, `theirs`): accepted official Triton tree-build and greedy-verify helpers alongside the existing sgl-kernel route.
+  - `python/sglang/srt/speculative/triton_ops/cache_locs.py` (`spec/cache location`, `manual merge`): retained the DCU `kvcacheio` assign-extend fast path ahead of the generic HIP route and added official XPU support to the generic Triton path.
+  - `test/registered/quant/test_int8_kernel.py` (`test registry`, `manual merge`): retained the disabled DCU placeholder and added the official AMD nightly registration.
+  - `test/run_suite.py` (`test registry`, `manual merge`): retained all DCU nightly suites and added the official XPU nightly suite list.
+- High-risk semantic audit:
+  - Official DSV4 MHC prewarm is a newer one-shot load-time implementation guarded against NextN reloads; it replaces, rather than restores, the obsolete prewarm hook removed at C07. Its DCU runtime behavior remains part of the pure-TP gate.
+  - Official sparse FlashMLA prefill now defaults on globally, but `apply_deepseek_v4_defaults()` disables it by default on HIP/DCU due known ROCm incorrect output. Explicit user overrides remain possible.
+  - Unified Mamba/SWA memory-pool location translation, DCP helper moves, shared logits buffers, DSV4 C128 request-state cleanup, and shared-expert fusion were reviewed against retained DCU layout and dispatch paths. Official object lifecycles remain canonical.
+  - No deleted runtime file in this range contained a DCU/LightOp/AITER workaround requiring a forward port. `deepseek_v4.py` still excludes DCU from generic AITER, and `/home/scripts/sglang/run_dpsk-v4.sh` still sets `SGLANG_USE_AITER_AG=0`.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on changed files: passed.
+  - `git diff --cached --check`: passed.
+  - `python3 -m py_compile` over 435 changed Python files: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841`: blocked because Ruff/Pyflakes/Flake8 remain unavailable; no dependency installation was attempted in this step.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - `PYTHONPATH=python python3 -c 'import sglang; print(sglang.__file__)'`: resolved to `/home/proj_sglang_open/dcu-sglang/python/sglang/__init__.py`.
+  - `python/pyproject.toml` parsed successfully using setuptools' vendored TOML parser.
+- Functional validation policy:
+  - Run only `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, then require readiness, `/health` HTTP 200, and one short `/generate` completion.
+  - Accuracy, throughput, alternate models/topologies, and broad CI remain owner-run/non-blocking. If this smoke fails, perform at most one focused fix and one confirmation attempt before returning exact evidence for review.

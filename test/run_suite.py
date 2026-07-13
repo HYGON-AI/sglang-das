@@ -241,7 +241,11 @@ NIGHTLY_SUITES = {
         "nightly-dcu-perf",
         "nightly-dcu-vlm",
     ],
-    HWBackend.XPU: [],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
+    ],
 }
 
 

@@ -11,6 +11,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 
@@ -19,6 +20,7 @@ _is_hip = is_hip()
 _is_dcu = is_dcu()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 if _is_dcu:
     from sgl_kernel.kvcacheio import (
@@ -400,7 +402,7 @@ def assign_extend_cache_locs_func(
             )
         return out_cache_loc
 
-    if _is_cuda or _is_hip or _is_musa:
+    if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,
