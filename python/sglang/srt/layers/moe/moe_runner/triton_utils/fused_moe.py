@@ -53,6 +53,7 @@ _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
+_aiter_w4a16_moec_inplace_scale_keys: set[Any] = set()
 
 
 if _is_cuda:
@@ -451,6 +452,85 @@ def _shape_str(tensor: Optional[torch.Tensor]) -> str:
     return "None" if tensor is None else str(tuple(tensor.shape))
 
 
+def _should_force_aiter_w4a16_moec(quant_type: Optional["MoeQuantType"]) -> bool:
+    if quant_type != MoeQuantType.W4A16:
+        return False
+
+    try:
+        return get_global_server_args().disaggregation_mode == "prefill"
+    except Exception:
+        return False
+
+
+def _aiter_moec_solution_type(moe_cfg: Any) -> bool:
+    solution_type = getattr(moe_cfg, "solution_type", None)
+    if solution_type == MoeSolutionType.MOE_C:
+        return True
+    solution_type_str = str(solution_type).lower()
+    return solution_type_str in ("moe_c", "moec", "moesolutiontype.moe_c")
+
+
+def _get_aiter_moe_config_w4a16(config_kwargs: Dict[str, Any], force_moec: bool):
+    if not force_moec:
+        return get_aiter_moe_config(**config_kwargs)
+
+    try:
+        status, moe_cfg = get_aiter_moe_config(
+            **config_kwargs, spec_sol_type=MoeSolutionType.MOE_C
+        )
+    except TypeError as err:
+        raise RuntimeError(
+            "AITER W4A16 prefill requires MOE_C, but the installed "
+            "aiter get_aiter_moe_config does not support spec_sol_type."
+        ) from err
+
+    if status and _aiter_moec_solution_type(moe_cfg):
+        return status, moe_cfg
+
+    raise RuntimeError(
+        "AITER W4A16 prefill requires MOE_C, but "
+        f"get_aiter_moe_config returned status={status}, "
+        f"selected={getattr(moe_cfg, 'solution_type', None)}, "
+        f"config_kwargs={config_kwargs}."
+    )
+
+
+def _get_aiter_w4a16_moec_shuffled_scales(
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    moe_cfg: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if w1_scale is None or w2_scale is None:
+        raise RuntimeError("AITER W4A16 MOE_C requires w1_scale and w2_scale.")
+
+    inplace_key = (
+        w1_scale.data_ptr(),
+        w2_scale.data_ptr(),
+        tuple(w1_scale.shape),
+        tuple(w2_scale.shape),
+        w1_scale.dtype,
+        w2_scale.dtype,
+        w1_scale.device,
+        w2_scale.device,
+    )
+    if inplace_key in _aiter_w4a16_moec_inplace_scale_keys:
+        return w1_scale, w2_scale
+
+    from aiter.moe import aiter_moe_shfl_scale
+
+    try:
+        shuffled_scales = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg, w1, w2)
+    except TypeError:
+        shuffled_scales = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
+    with torch.no_grad():
+        w1_scale.copy_(shuffled_scales[0])
+        w2_scale.copy_(shuffled_scales[1])
+    _aiter_w4a16_moec_inplace_scale_keys.add(inplace_key)
+    return w1_scale, w2_scale
+
+
 def fused_experts_impl_aiter(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -472,6 +552,8 @@ def fused_experts_impl_aiter(
     M, K = hidden_states.shape
     E, N1, _ = w1.shape
     _, N2, _ = w2.shape
+    if isinstance(activation, int):
+        activation = "silu" if activation == 0 else "gelu"
     is_channelwise_w8a8 = quant_type == MoeQuantType.FP8_W8A8 and block_shape is None
     if not is_channelwise_w8a8 and (block_shape is None or len(block_shape) < 2):
         raise ValueError(
@@ -489,8 +571,20 @@ def fused_experts_impl_aiter(
             f"a2_scale_shape={_shape_str(a2_scale)}"
         )
     block_size = 0 if is_channelwise_w8a8 else block_shape[1]
-    status, moe_cfg = get_aiter_moe_config(
-        M=M, E=E, N1=N1, N2=N2, K=K, top_k=topk_ids.shape[1], block_size=block_size, dtype=hidden_states.dtype, quant_type=quant_type,
+    config_kwargs = dict(
+        M=M,
+        E=E,
+        N1=N1,
+        N2=N2,
+        K=K,
+        top_k=topk_ids.shape[1],
+        block_size=block_size,
+        dtype=hidden_states.dtype,
+        quant_type=quant_type,
+    )
+    force_w4a16_moec = _should_force_aiter_w4a16_moec(quant_type)
+    status, moe_cfg = _get_aiter_moe_config_w4a16(
+        config_kwargs, force_w4a16_moec
     )
     if status:
         assert moe_cfg.solution_type is not None, \
@@ -530,6 +624,15 @@ def fused_experts_impl_aiter(
             f"no solution found (expected on unsupported configs)"
         )
 
+    if (
+        quant_type == MoeQuantType.W4A16
+        and status
+        and _aiter_moec_solution_type(moe_cfg)
+        and getattr(moe_cfg, "need_shuffle_scale", False)
+    ):
+        w1_scale, w2_scale = _get_aiter_w4a16_moec_shuffled_scales(
+            w1_scale, w2_scale, w1, w2, moe_cfg
+        )
     return aiter_moe(hidden_states, w1, w2, topk_weights, topk_ids, moe_cfg, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape, E, None, routed_scaling_factor, output_dtype=hidden_states.dtype)
 
 def _prepare_fused_moe_run(
