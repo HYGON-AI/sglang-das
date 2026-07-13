@@ -60,7 +60,7 @@ register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
 
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 # Mock TokenizerManager for embedding tests

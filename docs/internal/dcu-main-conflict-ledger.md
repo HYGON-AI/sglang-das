@@ -1204,3 +1204,45 @@ actual result in the checkpoint note.
 - Non-blocking observations:
   - v0.5.14 release-branch cherry-picks, accuracy/perf/full topology/large-batch graph, and AITER all-gather graph workaround removal remain out of scope for this catch-up step.
   - The default bs=128 decode graph currently remains unvalidated on gfx938 after the torch fallback OOM. A smaller graph bucket or graph-disabled smoke is acceptable for the catch-up functional gate once the external GPU occupancy is cleared, but do not claim bs=128 graph validation without a successful capture/replay run.
+
+### Official main catch-up 20260625 / `eeee3abbbf81`
+
+- Branch: `sync/official-main-catchup-20260625`.
+- Base: DCU `main@d3edaf356`, official previous checkpoint `6842335fcfb0cf8fbca537ca79d90576d026cd8f`.
+- Endpoint: official `main@eeee3abbbf8196e54c227faecfd5faba7b1dfc4b`.
+- Scope: 110 immutable official commits (the planning estimate was 101), 2026-06-24 to 2026-06-25; 477 files changed in the official range.
+- Release marker note:
+  - Official `v0.5.14` tag still peels to `49e384ce9d304648e9959666ecb8ce8cd98d0deb`, which is not an ancestor of this official-main endpoint.
+  - The tag therefore remains release-branch-only. This step does not merge the eight release-branch cherry-picks and must not create `dcu-main-official-v0.5.14-tag-20260625`.
+- Textual conflicts and decisions:
+  - `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` (`attention/dsa`, `manual merge`): preserved DCU LightOp Q/K fusion, BF16/FP8 index-cache paths, page-size-64 handling, and DCU logits behavior; absorbed official BCG/PCG split-op graph surfaces and CUDA-only full-graph split-op checks. Generic HIP FP8 MQA follows official `clean_logits=False`, while DCU keeps `op.mqa_logits`.
+  - `python/sglang/srt/layers/attention/triton_backend.py` (`attention`, `manual merge`): retained V1/V2 draft-extend semantics, CPU/tensor extend-length fallback, and SWA metadata updates; replaced the stale deleted `eagle_info_v2` wording with the current draft-extend path.
+  - `python/sglang/srt/layers/quantization/unquant.py` (`quantization`, `manual merge`): retained official `topk_output` and `moe_runner_config` plumbing and restored `StandardCombineInput`, which is required by retained DCU Marlin/AITER branches.
+  - `python/sglang/srt/managers/overlap_utils.py` (`scheduler/overlap`, `manual merge`): absorbed official `RelayPayload` dataclass typing and removed the obsolete `Union` import.
+  - `python/sglang/srt/mem_cache/common.py` (`mem_cache`, `manual merge`): combined official CUDA support with retained DCU environment helpers and `dcu_get_last_loc`.
+  - `python/sglang/srt/model_executor/forward_batch_info.py` (`model_executor`, `manual merge`): retained DCU residual RMS quantization fields and added official `attn_dcp_metadata`.
+  - `python/sglang/srt/models/deepseek_v2.py` (`deepseek`, `manual merge`): retained DCU BMM/backend mapping and residual-RMS arguments; absorbed official CUDA-only PCG dual-stream and FlashInfer TRT-LLM bypass arguments without widening them to DCU.
+  - `python/sglang/srt/models/qwen3_5.py` (`qwen/attention`, `manual merge`): retained DCU LightOp fused RMSNorm/RoPE/KV-store `forward_batch` path and added the official CUDA-only fused QK-norm/RoPE/gate path.
+- Non-textual `_is_dcu` refactor audit fixes:
+  - `python/sglang/srt/distributed/parallel_state.py`: official added an AITER custom reduce-scatter path whose HIP default would include DCU. Added `not _is_dcu` so DCU uses the registered RCCL fallback until the AITER graph path is independently validated; this does not change AITER all-reduce/all-gather policy.
+  - `python/sglang/srt/layers/quantization/fp8.py`: restored the installed AITER `asm_shuffle_weight_b8` import for the retained ASM FP8 MoE path and removed stale unused imports/local state found by Ruff.
+  - `python/sglang/srt/utils/common.py`: restored local `get_libnuma` / `numa_bind_to_node` imports after the official NUMA refactor, avoiding undefined names without introducing a top-level circular import.
+  - DeepSeek-V4 `enable_multi_stream` remains available to the DCU fused-qnorm path; no prohibited `and not (_is_dcu and _use_fused_qnorm_rope_kv_rope_quant)` bypass was introduced.
+- `_is_hip` and move/delete audit:
+  - Reviewed new HIP/platform conditions in DCP, DSA graph split, DeepSeek MLA, Qwen fused attention, MoE/DeepEP/top-k, FlashMLA, and AITER collectives. CUDA graph split and Qwen fused paths remain CUDA-only; DCP generic HIP paths intentionally include DCU.
+  - `git diff --name-status --find-renames 6842335fcfb0cf8fbca537ca79d90576d026cd8f..eeee3abbbf8196e54c227faecfd5faba7b1dfc4b` removed `moe_runner/flashinfer_mxfp4.py`, `speculative/eagle_info_v2.py`, `dflash_prepare_block.py`, and one NPU test, and renamed `dflash_accept_bonus.py` to `dflash.py`. The removed runtime files contained no DCU path; retained centralized MXFP4 registration and renamed DFlash call sites are not dangling.
+  - Three-repo keyword scan (`_is_dcu`, `is_dcu`, `dcu_`, `LightOp`, `flash_mla`, `AITER`, `DeepEP`, `DeepSeekV4`, `SGLANG_USE_AITER_AG`) completed across current DCU, old DCU, and official trees; match counts were 1444, 1244, and 754 respectively.
+- Automated validation result:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on changed files: no output.
+  - `git diff --check`: passed.
+  - `python3 -m py_compile` over 363 changed Python files: passed.
+  - Full changed-file Ruff `E9,F821` and targeted conflict/high-risk Ruff `E9,F401,F811,F821,F841`: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`.
+  - `PYTHONPATH=python python3 -c 'import sglang; print(sglang.__file__)'`: resolved to `/home/proj_sglang_open/dcu-sglang/python/sglang/__init__.py`.
+- Functional validation policy:
+  - Per the 2026-07-13 workflow, only the pure-TP command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel` is in scope after checking `hy-smi` on both shared-home environments. CI and other models/topologies are owner-run.
+  - The previously observed empty-output/NaN accuracy issue is explicitly deferred. Do not add further trace instrumentation or accuracy fixes in this catch-up step.
+  - `SGLANG_USE_AITER_AG=0` remains the required operational workaround until the DCU AITER all-gather graph reproducer passes.

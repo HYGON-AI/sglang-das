@@ -129,12 +129,13 @@ def _require_fp4_dtype():
 
 
 if (_use_aiter or _use_hip_int4) and not _is_dcu:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import (
         shuffle_scale,
         shuffle_weight,
     )
+
+if _use_aiter or SGLANG_USE_AITER_FP8_ASM_MOE:
+    from aiter.ops.shuffle import asm_shuffle_weight_b8
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -596,7 +597,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+        backend = get_fp8_gemm_runner_backend()
+        if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
@@ -637,7 +639,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -800,9 +802,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            backend = get_fp8_gemm_runner_backend()
+            if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
-            elif get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
@@ -1200,7 +1203,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.intermediate_pad = padded_inter - inter_per_part
             layer.hidden_pad = 0
             if padded_inter != inter_per_part:
-                pad_amount = padded_inter - inter_per_part
                 fp4_block_k = 32
 
                 # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)

@@ -568,7 +568,7 @@ class TritonAttnBackend(AttentionBackend):
         )
         qo_indptr = self.qo_indptr[: bs + 1]
         if forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+            # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by the draft-extend path).
             # Triton extend kernel receives extend K/V as separate tensors, so
             # kv_indptr/kv_indices must cover only the prefix portion.
             # extend_seq_lens_tensor is only attached to spec_info at real
