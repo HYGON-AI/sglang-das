@@ -13,9 +13,13 @@
 # limitations under the License.
 
 import os
+import tempfile
 import time
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+
+import requests
 
 from sglang.test.ci.ci_register import register_amd_ci, register_dcu_ci
 
@@ -43,22 +47,219 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
 
 
+def _is_dcu():
+    return os.getenv("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+_DCU_MODEL_NAME = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B"
+
+
+def _dcu_disagg_server_args():
+    return [
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--disable-cuda-graph",
+        "--max-total-tokens",
+        "1024",
+        "--max-running-requests",
+        "8",
+    ]
+
+
+@contextmanager
+def _temporary_env(name, value):
+    old_value = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old_value
+
+
+@contextmanager
+def _temporary_envs(updates):
+    old_values = {name: os.environ.get(name) for name in updates}
+    for name, value in updates.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    try:
+        yield
+    finally:
+        for name, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
+
+
+_DCU_KERNEL_ALIAS_DIR = None
+
+
+def _ensure_dcu_kvcacheio_symbol():
+    try:
+        from sgl_kernel import kvcacheio
+    except Exception as exc:
+        raise unittest.SkipTest(f"sgl_kernel.kvcacheio is unavailable: {exc}") from exc
+
+    if hasattr(kvcacheio, "dcu_create_chunked_prefix_cache_kv_indices"):
+        return
+    if hasattr(kvcacheio, "hcu_create_chunked_prefix_cache_kv_indices"):
+        return
+
+    raise unittest.SkipTest(
+        "sgl_kernel.kvcacheio has neither dcu_create_chunked_prefix_cache_kv_indices "
+        "nor hcu_create_chunked_prefix_cache_kv_indices."
+    )
+
+
+def _ensure_dcu_gpu_resources(required_gpus):
+    if os.getenv("SGLANG_DCU_SKIP_GPU_RESOURCE_CHECK") == "1":
+        return
+
+    try:
+        import torch
+    except Exception as exc:
+        raise unittest.SkipTest(f"torch is unavailable for DCU resource check: {exc}") from exc
+
+    if not torch.cuda.is_available():
+        raise unittest.SkipTest("DCU resource check requires torch.cuda to be available.")
+
+    device_count = torch.cuda.device_count()
+    if device_count < required_gpus:
+        raise unittest.SkipTest(
+            f"DCU PP disaggregation requires {required_gpus} visible GPUs, "
+            f"but only {device_count} are visible."
+        )
+
+    min_free_ratio = float(os.getenv("SGLANG_DCU_MIN_FREE_GPU_RATIO", "0.80"))
+    low_memory_devices = []
+    for device_id in range(required_gpus):
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
+        free_ratio = free_bytes / total_bytes if total_bytes else 0.0
+        if free_ratio < min_free_ratio:
+            low_memory_devices.append(
+                f"{device_id}: {free_bytes / (1024**3):.1f}/"
+                f"{total_bytes / (1024**3):.1f} GiB free"
+            )
+
+    if low_memory_devices:
+        raise unittest.SkipTest(
+            f"DCU PP disaggregation requires {required_gpus} mostly idle GPUs "
+            f"(free ratio >= {min_free_ratio:.2f}); low-memory devices: "
+            + ", ".join(low_memory_devices)
+        )
+
+
+def _dcu_kernel_alias_dir():
+    global _DCU_KERNEL_ALIAS_DIR
+    if _DCU_KERNEL_ALIAS_DIR is not None:
+        return _DCU_KERNEL_ALIAS_DIR
+
+    _ensure_dcu_kvcacheio_symbol()
+    sitecustomize_dir = tempfile.mkdtemp(prefix="sglang_dcu_kernel_alias_")
+    sitecustomize_path = os.path.join(sitecustomize_dir, "sitecustomize.py")
+    with open(sitecustomize_path, "w", encoding="utf-8") as f:
+        f.write(
+            """
+try:
+    from sgl_kernel import kvcacheio as _kvcacheio
+
+    for _name in dir(_kvcacheio):
+        if _name.startswith("hcu_"):
+            _dcu_name = "dcu_" + _name[4:]
+            if not hasattr(_kvcacheio, _dcu_name):
+                setattr(_kvcacheio, _dcu_name, getattr(_kvcacheio, _name))
+except Exception:
+    pass
+"""
+        )
+    _DCU_KERNEL_ALIAS_DIR = sitecustomize_dir
+    return _DCU_KERNEL_ALIAS_DIR
+
+
+def _configure_disaggregation_class(cls):
+    if _is_dcu():
+        _ensure_dcu_kvcacheio_symbol()
+        _ensure_dcu_gpu_resources(getattr(cls, "dcu_required_gpus", 6))
+        cls.model = _DCU_MODEL_NAME
+        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+        cls.rdma_devices = []
+        return
+
+    # set up ROCm env
+    os.environ["SGLANG_USE_AITER"] = "1"
+    rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+
+    if rdma_env:
+        cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
+        print(f"Found RDMA devices in env: {rdma_env}")
+    else:
+        print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+        cls.rdma_devices = []
+
+    cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+
+
+def _launch_pd_process(cls, attr_name, url, args):
+    if _is_dcu():
+        alias_dir = _dcu_kernel_alias_dir()
+        old_pythonpath = os.environ.get("PYTHONPATH")
+        pythonpath = alias_dir
+        if old_pythonpath:
+            pythonpath = alias_dir + os.pathsep + old_pythonpath
+        env_context = _temporary_envs(
+            {"SGLANG_USE_AITER": "0", "PYTHONPATH": pythonpath}
+        )
+    else:
+        env_context = nullcontext()
+
+    with env_context:
+        setattr(
+            cls,
+            attr_name,
+            popen_launch_pd_server(
+                cls.model,
+                url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=args,
+            ),
+        )
+
+
+def _assert_dcu_generate(test_case):
+    response = requests.post(
+        test_case.lb_url + "/generate",
+        json={
+            "text": "The capital of France is",
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 8,
+                "ignore_eos": True,
+            },
+        },
+        timeout=60,
+    )
+    test_case.assertEqual(response.status_code, 200, response.text)
+    test_case.assertIn("text", response.json())
+
+
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
+    dcu_required_gpus = 6
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # set up ROCm env
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
-
-        if rdma_env:
-            cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
-            print(f"Found RDMA devices in env: {rdma_env}")
-        else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
-            cls.rdma_devices = []
-
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        _configure_disaggregation_class(cls)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -86,12 +287,26 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
         ]
+        if _is_dcu():
+            prefill_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "prefill",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp-size",
+                "2",
+                "--pp-size",
+                "2",
+                "--disable-overlap-schedule",
+                *_dcu_disagg_server_args(),
+            ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
+        _launch_pd_process(
+            cls,
+            "process_prefill",
             cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
+            prefill_args,
         )
 
     @classmethod
@@ -109,15 +324,32 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
         ]
+        if _is_dcu():
+            decode_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "decode",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp-size",
+                "2",
+                "--base-gpu-id",
+                "4",
+                *_dcu_disagg_server_args(),
+            ]
         decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
+        _launch_pd_process(
+            cls,
+            "process_decode",
             cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
+            decode_args,
         )
 
     def test_gsm8k(self):
+        if _is_dcu():
+            _assert_dcu_generate(self)
+            return
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -137,21 +369,12 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 
 # register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
+    dcu_required_gpus = 6
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # set up ROCm env
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
-
-        if rdma_env:
-            cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
-            print(f"Found RDMA devices in env: {rdma_env}")
-        else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
-            cls.rdma_devices = []
-
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        _configure_disaggregation_class(cls)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -180,12 +403,27 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--attention-backend",
             "aiter",
         ]
+        if _is_dcu():
+            prefill_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "prefill",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp-size",
+                "2",
+                "--pp-size",
+                "2",
+                "--disable-overlap-schedule",
+                "--enable-dynamic-chunking",
+                *_dcu_disagg_server_args(),
+            ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
+        _launch_pd_process(
+            cls,
+            "process_prefill",
             cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
+            prefill_args,
         )
 
     @classmethod
@@ -203,15 +441,32 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--attention-backend",
             "aiter",
         ]
+        if _is_dcu():
+            decode_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "decode",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp-size",
+                "2",
+                "--base-gpu-id",
+                "4",
+                *_dcu_disagg_server_args(),
+            ]
         decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
+        _launch_pd_process(
+            cls,
+            "process_decode",
             cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
+            decode_args,
         )
 
     def test_gsm8k(self):
+        if _is_dcu():
+            _assert_dcu_generate(self)
+            return
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -231,21 +486,12 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
 # register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
+    dcu_required_gpus = 8
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # set up ROCm env
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
-
-        if rdma_env:
-            cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
-            print(f"Found RDMA devices in env: {rdma_env}")
-        else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
-            cls.rdma_devices = []
-
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        _configure_disaggregation_class(cls)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -273,12 +519,26 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
         ]
+        if _is_dcu():
+            prefill_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "prefill",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp-size",
+                "2",
+                "--pp-size",
+                "2",
+                "--disable-overlap-schedule",
+                *_dcu_disagg_server_args(),
+            ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
+        _launch_pd_process(
+            cls,
+            "process_prefill",
             cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
+            prefill_args,
         )
 
     @classmethod
@@ -298,15 +558,34 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
         ]
+        if _is_dcu():
+            decode_args = [
+                "--trust-remote-code",
+                "--disaggregation-mode",
+                "decode",
+                "--disaggregation-bootstrap-port",
+                cls.bootstrap_port,
+                "--tp-size",
+                "2",
+                "--pp-size",
+                "2",
+                "--base-gpu-id",
+                "4",
+                *_dcu_disagg_server_args(),
+            ]
         decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
+        _launch_pd_process(
+            cls,
+            "process_decode",
             cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
+            decode_args,
         )
 
     def test_gsm8k(self):
+        if _is_dcu():
+            _assert_dcu_generate(self)
+            return
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,

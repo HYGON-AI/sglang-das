@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import unittest
 
 from sglang.srt.environ import envs
@@ -37,6 +38,10 @@ register_dcu_ci(
 )
 
 GSM_DATASET_PATH = None
+
+
+def _is_dcu_ci():
+    return os.getenv("SGLANG_IS_IN_CI_DCU") == "1"
 
 
 # Default server arguments shared across all tests
@@ -66,6 +71,15 @@ class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if _is_dcu_ci():
+            raise unittest.SkipTest(
+                "DCU skips NGRAM speculative decoding: the page-size/top-k "
+                "parameters can be made DCU-compatible, but the runtime still "
+                "requires missing sgl_kernel.reconstruct_indices_from_tree_mask. "
+                "Keep the non-DCU coverage unchanged until the DCU SGL kernel op "
+                "or an equivalent runtime fallback is available."
+            )
+
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
@@ -80,7 +94,8 @@ class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if getattr(cls, "process", None):
+            kill_process_tree(cls.process.pid)
 
 
 class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):

@@ -14,6 +14,7 @@
 
 import json
 import os
+import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -50,6 +51,12 @@ def _is_dcu():
 
 
 _DCU_MODEL_NAME = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B"
+_DCU_TRANSFER_BACKEND_ENV = "SGLANG_DCU_DISAGG_TRANSFER_BACKEND"
+_DCU_TRANSFER_BACKEND_MODULES = {
+    "nixl": "nixl._api",
+    "mooncake": "mooncake",
+    "mori": "mori",
+}
 
 
 def _dcu_disagg_server_args():
@@ -67,19 +74,176 @@ def _dcu_disagg_server_args():
 
 
 @contextmanager
-def _temporary_env(name, value):
-    old_value = os.environ.get(name)
-    if value is None:
-        os.environ.pop(name, None)
-    else:
-        os.environ[name] = value
+def _temporary_envs(updates):
+    old_values = {name: os.environ.get(name) for name in updates}
+    for name, value in updates.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
     try:
         yield
     finally:
-        if old_value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = old_value
+        for name, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
+
+
+def _check_dcu_transfer_backend(backend):
+    module_name = _DCU_TRANSFER_BACKEND_MODULES.get(backend)
+    if module_name is None:
+        raise unittest.SkipTest(
+            f"Unsupported DCU disaggregation transfer backend: {backend}."
+        )
+
+    try:
+        __import__(module_name)
+    except Exception as exc:
+        raise unittest.SkipTest(
+            f"DCU disaggregation transfer backend {backend!r} is unavailable: {exc}"
+        ) from exc
+
+
+def _resolve_dcu_transfer_backend():
+    requested_backend = os.getenv(_DCU_TRANSFER_BACKEND_ENV)
+    if requested_backend:
+        _check_dcu_transfer_backend(requested_backend)
+        return requested_backend
+
+    unavailable = []
+    for backend in ("nixl", "mooncake", "mori"):
+        try:
+            _check_dcu_transfer_backend(backend)
+            return backend
+        except unittest.SkipTest as exc:
+            unavailable.append(str(exc))
+
+    raise unittest.SkipTest(
+        "No DCU disaggregation transfer backend is installed; checked nixl, "
+        "mooncake, and mori. Details: " + "; ".join(unavailable)
+    )
+
+
+_DCU_KERNEL_ALIAS_DIR = None
+
+
+def _ensure_dcu_kvcacheio_symbol():
+    try:
+        from sgl_kernel import kvcacheio
+    except Exception as exc:
+        raise unittest.SkipTest(f"sgl_kernel.kvcacheio is unavailable: {exc}") from exc
+
+    if hasattr(kvcacheio, "dcu_create_chunked_prefix_cache_kv_indices"):
+        return
+    if hasattr(kvcacheio, "hcu_create_chunked_prefix_cache_kv_indices"):
+        return
+
+    raise unittest.SkipTest(
+        "sgl_kernel.kvcacheio has neither dcu_create_chunked_prefix_cache_kv_indices "
+        "nor hcu_create_chunked_prefix_cache_kv_indices."
+    )
+
+
+def _ensure_dcu_gpu_resources(required_gpus):
+    if os.getenv("SGLANG_DCU_SKIP_GPU_RESOURCE_CHECK") == "1":
+        return
+
+    try:
+        import torch
+    except Exception as exc:
+        raise unittest.SkipTest(f"torch is unavailable for DCU resource check: {exc}") from exc
+
+    if not torch.cuda.is_available():
+        raise unittest.SkipTest("DCU resource check requires torch.cuda to be available.")
+
+    device_count = torch.cuda.device_count()
+    if device_count < required_gpus:
+        raise unittest.SkipTest(
+            f"DCU basic disaggregation requires {required_gpus} visible GPUs, "
+            f"but only {device_count} are visible."
+        )
+
+    min_free_ratio = float(os.getenv("SGLANG_DCU_MIN_FREE_GPU_RATIO", "0.80"))
+    low_memory_devices = []
+    for device_id in range(required_gpus):
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
+        free_ratio = free_bytes / total_bytes if total_bytes else 0.0
+        if free_ratio < min_free_ratio:
+            low_memory_devices.append(
+                f"{device_id}: {free_bytes / (1024**3):.1f}/"
+                f"{total_bytes / (1024**3):.1f} GiB free"
+            )
+
+    if low_memory_devices:
+        raise unittest.SkipTest(
+            f"DCU basic disaggregation requires {required_gpus} mostly idle GPUs "
+            f"(free ratio >= {min_free_ratio:.2f}); low-memory devices: "
+            + ", ".join(low_memory_devices)
+        )
+
+
+def _dcu_kernel_alias_dir():
+    global _DCU_KERNEL_ALIAS_DIR
+    if _DCU_KERNEL_ALIAS_DIR is not None:
+        return _DCU_KERNEL_ALIAS_DIR
+
+    _ensure_dcu_kvcacheio_symbol()
+    sitecustomize_dir = tempfile.mkdtemp(prefix="sglang_dcu_kernel_alias_")
+    sitecustomize_path = os.path.join(sitecustomize_dir, "sitecustomize.py")
+    with open(sitecustomize_path, "w", encoding="utf-8") as f:
+        f.write(
+            """
+try:
+    from sgl_kernel import kvcacheio as _kvcacheio
+
+    for _name in dir(_kvcacheio):
+        if _name.startswith("hcu_"):
+            _dcu_name = "dcu_" + _name[4:]
+            if not hasattr(_kvcacheio, _dcu_name):
+                setattr(_kvcacheio, _dcu_name, getattr(_kvcacheio, _name))
+except Exception:
+    pass
+"""
+        )
+    _DCU_KERNEL_ALIAS_DIR = sitecustomize_dir
+    return _DCU_KERNEL_ALIAS_DIR
+
+
+def _configure_dcu_disaggregation_class(cls):
+    backend = _resolve_dcu_transfer_backend()
+    _ensure_dcu_kvcacheio_symbol()
+    _ensure_dcu_gpu_resources(required_gpus=2)
+    cls.model = _DCU_MODEL_NAME
+    cls.transfer_backend = ["--disaggregation-transfer-backend", backend]
+    cls.rdma_devices = []
+
+
+def _launch_pd_process(cls, attr_name, url, args):
+    if _is_dcu():
+        alias_dir = _dcu_kernel_alias_dir()
+        old_pythonpath = os.environ.get("PYTHONPATH")
+        pythonpath = alias_dir
+        if old_pythonpath:
+            pythonpath = alias_dir + os.pathsep + old_pythonpath
+        env_context = _temporary_envs(
+            {"SGLANG_USE_AITER": "0", "PYTHONPATH": pythonpath}
+        )
+    else:
+        env_context = nullcontext()
+
+    with env_context:
+        setattr(
+            cls,
+            attr_name,
+            popen_launch_pd_server(
+                cls.model,
+                url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=args,
+            ),
+        )
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -87,9 +251,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         if _is_dcu():
-            cls.model = _DCU_MODEL_NAME
-            cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-            cls.rdma_devices = []
+            _configure_dcu_disaggregation_class(cls)
             cls.start_prefill()
             cls.start_decode()
             cls.wait_server_ready(
@@ -150,16 +312,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
                 *_dcu_disagg_server_args(),
             ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
-        env_context = (
-            _temporary_env("SGLANG_USE_AITER", "0") if _is_dcu() else nullcontext()
-        )
-        with env_context:
-            cls.process_prefill = popen_launch_pd_server(
-                cls.model,
-                cls.prefill_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=prefill_args,
-            )
+        _launch_pd_process(cls, "process_prefill", cls.prefill_url, prefill_args)
 
     @classmethod
     def start_decode(cls):
@@ -194,18 +347,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
                 *_dcu_disagg_server_args(),
             ]
         decode_args += cls.transfer_backend + cls.rdma_devices
-        print("Debug")
-        print(decode_args)
-        env_context = (
-            _temporary_env("SGLANG_USE_AITER", "0") if _is_dcu() else nullcontext()
-        )
-        with env_context:
-            cls.process_decode = popen_launch_pd_server(
-                cls.model,
-                cls.decode_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=decode_args,
-            )
+        _launch_pd_process(cls, "process_decode", cls.decode_url, decode_args)
 
     def test_gsm8k(self):
         if _is_dcu():

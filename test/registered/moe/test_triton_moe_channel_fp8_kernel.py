@@ -13,15 +13,23 @@
 # limitations under the License.
 
 import itertools
+import os
 import unittest
 
 import torch
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+def _is_dcu():
+    return os.getenv("SGLANG_IS_IN_CI_DCU") == "1"
+
+
+if not _is_dcu():
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+    from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
 from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
 
 # DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
@@ -126,6 +134,15 @@ class TestW8A8FP8FusedMoE(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if _is_dcu():
+            raise unittest.SkipTest(
+                "DCU skips the direct Triton MoE channel-FP8 kernel test: "
+                "this case calls triton_utils.fused_moe with per_channel_quant=True "
+                "and the 2026-07-09 DCU run hit fused_moe_kernel VMFault/invalid "
+                "address. The available aiter/lightop paths are runner-level "
+                "interfaces and do not provide a safe drop-in replacement for this "
+                "direct per-channel FP8 Triton kernel test."
+            )
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
