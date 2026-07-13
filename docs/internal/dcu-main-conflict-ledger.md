@@ -1278,3 +1278,7 @@ actual result in the checkpoint note.
 - Functional validation policy:
   - Run only `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, then require service readiness, `/health` HTTP 200, and one short `/generate` request completion.
   - Accuracy, throughput, alternate models/topologies, and full CI remain owner-run/non-blocking. If the pure-TP smoke exposes a regression, perform at most one focused fix and one confirmation attempt before returning it for review.
+- Pure-TP functional validation result:
+  - The exact required command completed weight loading and the default decode graph capture for every bucket from batch size 128 through 1 on all four TP ranks, then reported service readiness on port 10015.
+  - `GET /health` returned HTTP 200, and one short `POST /generate` returned HTTP 200 with a completed eight-token response; no worker crash or corrective code change was required.
+  - The response contained empty text with eight zero token IDs. This remains the already-deferred, non-blocking accuracy observation and is not reported as an accuracy pass. The test service was stopped cleanly after the request.
