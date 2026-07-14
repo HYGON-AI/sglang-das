@@ -1427,3 +1427,6 @@ actual result in the checkpoint note.
 - Functional validation status:
   - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
   - Accuracy, throughput, other models/topologies, broad CI, and AITER all-gather workaround removal remain owner-run/non-blocking.
+- Code conflict review artifact:
+  - `docs/internal/dcu-main-catchup-20260709-conflict-review.md` records the 11 actual textual conflict files and 20 reconstructed conflict hunks against resolved merge `f4d00bcaae4dd4288fcc206fb70ac27a7211ed3d`.
+  - As required by the updated workflow, the artifact contains only conflict-producing files and is intended for VS Code Markdown preview review.
