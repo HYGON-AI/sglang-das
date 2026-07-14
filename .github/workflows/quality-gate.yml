@@ -177,7 +177,7 @@ jobs:
   hcu-runtime-text-check:
     name: hcu-runtime-text-check
     needs: changed-files
-    if: ${{ false }}
+    if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
 
     steps:
@@ -698,6 +698,7 @@ jobs:
     needs:
       - changed-files
       - encoding-check
+      - hcu-runtime-text-check
       - secret-check
       - symlink-check
       - large-file-check
@@ -709,6 +710,7 @@ jobs:
       HAS_FILES: ${{ needs.changed-files.outputs.has_files }}
       CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
       ENCODING_RESULT: ${{ needs.encoding-check.result }}
+      HCU_RUNTIME_TEXT_RESULT: ${{ needs.hcu-runtime-text-check.result }}
       SECRET_RESULT: ${{ needs.secret-check.result }}
       SYMLINK_RESULT: ${{ needs.symlink-check.result }}
       LARGE_FILE_RESULT: ${{ needs.large-file-check.result }}
@@ -746,10 +748,12 @@ jobs:
 
           if [ "$HAS_FILES" = "true" ]; then
             require_success "encoding-check" "$ENCODING_RESULT"
+            require_success "hcu-runtime-text-check" "$HCU_RUNTIME_TEXT_RESULT"
             require_success "symlink-check" "$SYMLINK_RESULT"
             require_success "large-file-check" "$LARGE_FILE_RESULT"
           elif [ "$HAS_FILES" = "false" ]; then
             require_skipped "encoding-check" "$ENCODING_RESULT"
+            require_skipped "hcu-runtime-text-check" "$HCU_RUNTIME_TEXT_RESULT"
             require_skipped "symlink-check" "$SYMLINK_RESULT"
             require_skipped "large-file-check" "$LARGE_FILE_RESULT"
           else
