@@ -2160,6 +2160,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         path; the barrier keeps ranks from proceeding while a peer is still
         compiling. The early returns below must stay rank-uniform.
         """
+        if _is_dcu:
+            # DCU AITER TileLang MHC kernels are specialized lazily from real
+            # request shapes. The generic bucket prewarm reuses that kernel
+            # across synthetic n_splits shapes and can violate its cached input
+            # contract. Preserve the pre-20260703 DCU behavior here.
+            return
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
