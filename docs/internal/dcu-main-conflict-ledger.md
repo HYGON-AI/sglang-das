@@ -1500,3 +1500,5 @@ actual result in the checkpoint note.
   - The service reported readiness on port 10015. `GET /health` returned HTTP 200; one short `POST /generate` returned HTTP 200 and completed eight tokens without a worker crash.
   - The response remained empty with eight zero token IDs. This is the already deferred non-blocking NaN/accuracy observation and is not reported as an accuracy pass.
   - The service was stopped cleanly after the request and port 10015 was released. No broader CI, model, topology, accuracy, or throughput test was run.
+- Integration decision:
+  - Static and functional gates passed under the scoped policy. Fast-forward this validated branch to `main` and create annotated tag `dcu-main-sync-official-20260710`; do not push as part of this step.
