@@ -1492,3 +1492,11 @@ actual result in the checkpoint note.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260710-conflict-review.md` records the 22 actual textual conflict files and 37 reconstructed conflict hunks against resolved merge `18d1216680858500bd12d12a739059a24037f026`.
   - The artifact compares the saved auto-conflict state with the merge resolution only; later runtime-only fixes, if any, must stay in this ledger and outside the conflict document.
+- Pure-TP functional validation follow-up (2026-07-14):
+  - `hy-smi` showed all eight devices on both `zz-nmz22` and `zz-nmz26` at `VRAM 0% / HCU 0.0%`; the test used `zz-nmz22 / rye_sglang_open` and the exact required command.
+  - Attempt 1 reached TP worker initialization, then failed before weight loading because conflict-resolved `model_runner.py` still imported the removed `dp_attention.get_attention_tp_size` helper. Official endpoint code now owns attention-TP state in `get_parallel().attn_tp_size`.
+  - Focused fix `b37ba82b1631dca586d90772cd2afc6c1a11cf7b` removes the stale import and reads the runtime parallel context for the retained warmup-padding block. File-level `py_compile`, Ruff `E9,F401,F811,F821,F841`, and `git diff --check` passed.
+  - Before the one permitted confirmation, `hy-smi` again showed all eight `zz-nmz22` devices idle. The confirmation completed distributed initialization, loaded all 46 shards, initialized the DSV4 pools, and captured every decode graph bucket from batch size 128 through 1.
+  - The service reported readiness on port 10015. `GET /health` returned HTTP 200; one short `POST /generate` returned HTTP 200 and completed eight tokens without a worker crash.
+  - The response remained empty with eight zero token IDs. This is the already deferred non-blocking NaN/accuracy observation and is not reported as an accuracy pass.
+  - The service was stopped cleanly after the request and port 10015 was released. No broader CI, model, topology, accuracy, or throughput test was run.
