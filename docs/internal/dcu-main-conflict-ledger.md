@@ -1489,3 +1489,6 @@ actual result in the checkpoint note.
   - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
   - Before starting, both `zz-nmz22` and `zz-nmz26` must be checked with `hy-smi`; if neither is fully idle, stop and leave runtime validation to the owner. The two containers share `/home`, so no rsync is permitted.
   - Accuracy, throughput, other models/topologies, broad CI, and the deferred empty-output/NaN issue remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
+- Code conflict review artifact:
+  - `docs/internal/dcu-main-catchup-20260710-conflict-review.md` records the 22 actual textual conflict files and 37 reconstructed conflict hunks against resolved merge `18d1216680858500bd12d12a739059a24037f026`.
+  - The artifact compares the saved auto-conflict state with the merge resolution only; later runtime-only fixes, if any, must stay in this ledger and outside the conflict document.
