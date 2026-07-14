@@ -132,7 +132,6 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -2775,7 +2774,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Keep warmup aligned with scheduler MLP-sync padding.
         if require_mlp_sync(self.server_args):
-            attn_tp_size = get_attention_tp_size()
+            attn_tp_size = get_parallel().attn_tp_size
             if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
                 num_tokens = ceil_align(num_tokens, attn_tp_size)
                 batch_size = num_tokens // num_tokens_per_bs
