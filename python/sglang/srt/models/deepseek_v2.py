@@ -666,6 +666,11 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            elif _is_dcu and self.is_deepseek_v4:
+                # DCU Hash-MoE JIT requires FP32 router logits.
+                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+
+                logits = linear_bf16_fp32(hidden_states, self.weight)
             elif not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
