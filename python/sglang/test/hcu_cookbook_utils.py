@@ -48,6 +48,14 @@ QWEN3_COOKBOOK_ENV = {
     "SGLANG_USE_AITER_LINEAR_ATTN": "1",
 }
 
+QWEN36_27B_COOKBOOK_ENV = dict(QWEN3_COOKBOOK_ENV)
+
+QWEN36_35B_A3B_COOKBOOK_ENV = {
+    **QWEN3_COOKBOOK_ENV,
+    "SGLANG_USE_CUDA_IPC_TRANSPORT": "1",
+    "SGLANG_USE_MARLIN_W16A16_MOE": "1",
+}
+
 GLM51_COOKBOOK_ENV = {
     "NCCL_MIN_NCHANNELS": "16",
     "NCCL_MAX_NCHANNELS": "16",
@@ -217,6 +225,75 @@ def _qwen3_next_args(tp_size: int) -> list[str]:
         "--max-running-requests",
         "4",
         "--disable-custom-all-reduce",
+    ]
+
+
+def _qwen36_27b_args() -> list[str]:
+    return [
+        "--attention-backend",
+        "fa3",
+        "--mm-attention-backend",
+        "fa3",
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--tp-size",
+        "2",
+        "--pp-size",
+        "1",
+        "--page-size",
+        "64",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--reasoning-parser",
+        "qwen3",
+        "--trust-remote-code",
+        "--log-level",
+        "warning",
+        "--log-level-http",
+        "warning",
+    ]
+
+
+def _qwen36_35b_a3b_args() -> list[str]:
+    return [
+        "--attention-backend",
+        "fa3",
+        "--mm-attention-backend",
+        "fa3",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--enable-piecewise-cuda-graph",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--tp-size",
+        "2",
+        "--pp-size",
+        "1",
+        "--page-size",
+        "64",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--trust-remote-code",
+        "--chunked-prefill-size",
+        "-1",
+        "--log-level",
+        "warning",
+        "--log-level-http",
+        "warning",
     ]
 
 
@@ -508,6 +585,28 @@ QWEN3_30B_A3B_W8A8_4GPU = HcuCookbookModelConfig(
     server_args=_common_text_args(4),
 )
 
+QWEN36_27B_2GPU = HcuCookbookModelConfig(
+    name="Qwen3.6-27B",
+    env_name="SGLANG_HCU_QWEN36_27B_MODEL",
+    default_path="/public/opendas/DL_DATA/llm-models/qwen3.6/Qwen3.6-27B",
+    tp_size=2,
+    timeout=3600,
+    dtype_or_quant="bf16",
+    env=QWEN36_27B_COOKBOOK_ENV,
+    server_args=_qwen36_27b_args(),
+)
+
+QWEN36_35B_A3B_2GPU = HcuCookbookModelConfig(
+    name="Qwen3.6-35B-A3B",
+    env_name="SGLANG_HCU_QWEN36_35B_A3B_MODEL",
+    default_path="/public/opendas/DL_DATA/llm-models/qwen3.6/Qwen3.6-35B-A3B",
+    tp_size=2,
+    timeout=3600,
+    dtype_or_quant="bf16",
+    env=QWEN36_35B_A3B_COOKBOOK_ENV,
+    server_args=_qwen36_35b_a3b_args(),
+)
+
 GLM51_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
     name="GLM-5.1-Channel-FP8",
     env_name="SGLANG_HCU_GLM51_CHANNEL_FP8_MODEL",
@@ -643,6 +742,7 @@ QWEN25_VL_72B_W8A8 = HcuCookbookModelConfig(
 QWEN3_4GPU_MODELS = [QWEN3_NEXT_80B_4GPU, QWEN3_30B_A3B_4GPU, QWEN3_32B_4GPU]
 QWEN3_4GPU_PERF_MODELS = [QWEN3_30B_A3B_4GPU, QWEN3_32B_4GPU]
 QWEN3_4GPU_QUANT_MODELS = [QWEN3_30B_A3B_W8A8_4GPU]
+QWEN36_2GPU_MODELS = [QWEN36_27B_2GPU, QWEN36_35B_A3B_2GPU]
 GLM51_8GPU_MODELS = [GLM51_CHANNEL_FP8_8GPU, GLM51_CHANNEL_INT8_8GPU]
 GLM51_8GPU_PERF_MODELS = [GLM51_CHANNEL_FP8_8GPU]
 DEEPSEEK_V32_8GPU_MODELS = [
@@ -663,7 +763,11 @@ VLM_COOKBOOK_MODELS = [
     QWEN25_VL_72B_W8A8,
 ]
 VLM_COOKBOOK_QUANT_MODELS = [QWEN25_VL_72B_W8A8]
-COOKBOOK_GSM8K_EVAL_MODELS = [QWEN3_32B_4GPU, QWEN3_30B_A3B_4GPU]
+COOKBOOK_GSM8K_EVAL_MODELS = [
+    QWEN3_32B_4GPU,
+    QWEN3_30B_A3B_4GPU,
+    QWEN36_35B_A3B_2GPU,
+]
 COOKBOOK_MMLU_EVAL_MODELS = [QWEN3_32B_4GPU]
 COOKBOOK_MMMU_EVAL_MODELS = [QWEN3_VL_4B_INSTRUCT, QWEN3_VL_32B_INSTRUCT]
 
