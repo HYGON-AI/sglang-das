@@ -34,7 +34,6 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_dcu, is_hip, is_npu
 _use_fused_qwen_bailing_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 
@@ -116,7 +115,7 @@ class Qwen3Attention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
@@ -162,11 +161,11 @@ class Qwen3Attention(nn.Module):
         self.alt_stream = alt_stream
         self.page_size = 64
         self.layer_id = layer_id
-        if get_global_server_args().kv_cache_dtype == "fp8_e4m3":
+        if get_server_args().kv_cache_dtype == "fp8_e4m3":
             self.kv_cache_dtype = torch.float8_e4m3fn
-        elif get_global_server_args().kv_cache_dtype == "fp8_e5m2":
+        elif get_server_args().kv_cache_dtype == "fp8_e5m2":
             self.kv_cache_dtype = torch.float8_e5m2
-        elif get_global_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
+        elif get_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
 
         self.use_fused_qk_norm_mrope = (
@@ -319,14 +318,14 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
-            and get_global_server_args().rl_on_policy_target is None
+            and get_server_args().rl_on_policy_target is None
         )
 
         if use_aiter_fused:
@@ -347,7 +346,7 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -411,7 +410,7 @@ class Qwen3DecoderLayer(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(

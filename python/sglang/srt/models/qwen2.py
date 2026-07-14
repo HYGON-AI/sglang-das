@@ -51,14 +51,17 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers,is_dcu,get_bool_env_var
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_dcu, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
 _is_dcu = is_dcu()
 if _is_dcu:
     from lightop import split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant
-_use_fused_rms_rotary=get_bool_env_var("SGLANG_USE_FUSED_SPLIT_QKV_RMS_ROTARY_EMBEDDING")
+
+_use_fused_rms_rotary = get_bool_env_var(
+    "SGLANG_USE_FUSED_SPLIT_QKV_RMS_ROTARY_EMBEDDING"
+)
 
 Qwen2Config = None
 
@@ -102,7 +105,7 @@ class Qwen2MLP(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
@@ -135,11 +138,11 @@ class Qwen2Attention(nn.Module):
         self.total_num_kv_heads = num_kv_heads
         self.layer_id = layer_id
         self.page_size=64
-        if get_global_server_args().kv_cache_dtype == "fp8_e4m3":
+        if get_server_args().kv_cache_dtype == "fp8_e4m3":
             self.kv_cache_dtype = torch.float8_e4m3fn
-        elif get_global_server_args().kv_cache_dtype == "fp8_e5m2":
+        elif get_server_args().kv_cache_dtype == "fp8_e5m2":
             self.kv_cache_dtype = torch.float8_e5m2
-        elif get_global_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
+        elif get_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
         else:
             self.kv_cache_dtype = torch.bfloat16
@@ -344,7 +347,7 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
+                    if get_server_args().rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -380,7 +383,7 @@ class Qwen2Model(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target is not None
+                if get_server_args().rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(

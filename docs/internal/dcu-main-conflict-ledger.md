@@ -1439,3 +1439,53 @@ actual result in the checkpoint note.
   - Per the scoped workflow, the EP topology was not rerun by Codex; owner-run EP confirmation should verify that graph capture advances past the former line 788 failure. If a new failure appears, return it for review instead of repeatedly debugging this checkpoint.
 - Pure-TP gate note:
   - The first 20260709 pure-TP invocation completed distributed initialization and loaded all 46 shards, but the active tool session was interrupted when the user supplied the EP follow-up request before graph capture/service readiness. It produced no code failure and did not reach `/health` or `/generate`; it is not counted as a passed or failed functional gate.
+
+### Official main catch-up 20260710 / `e1d51be91f6b`
+
+- Branch: `sync/official-main-catchup-20260710`.
+- Base: DCU `main@68d965671265f5d3859ba767cc3bd4e94cc03dce`, official previous checkpoint `bd7e54d7379e437cf5f027382d6ca214e046626b`.
+- Endpoint: official `main@e1d51be91f6be39e585756568a8f66b99ac2c512` (`[AMD] Optimize RMSNorm for gfx950 (#30690)`).
+- Scope: 93 immutable official commits; 751 files changed, 34,706 insertions, 11,075 deletions, 65 detected renames, and 9 deletions. Git reported 22 textual conflict files and 37 conflict hunks, below the 50-file split threshold.
+- Textual conflicts and decisions:
+  - `python/pyproject.toml` (`dependency`, `manual merge`): accepted official FlashInfer `0.6.14` and repaired the adjacent `smg`/`soundfile` dependency split without restoring CUDA-only DCU dependencies.
+  - `python/sglang/srt/batch_overlap/two_batch_overlap.py` (`batch overlap`, `manual merge`): adopted runtime-context `get_server_args()` while retaining the DCU pinned host buffers.
+  - `python/sglang/srt/layers/attention/dsv4/indexer.py` (`DSV4 indexer`, `manual merge`): retained DCU LightOp/gfx support and absorbed official FP8-FNUZ handling.
+  - `python/sglang/srt/layers/attention/triton_backend.py` (`attention`, `manual merge`): moved Triton imports to `sglang.kernels`, retained the optional DCU AITER extend path, and kept official metadata contracts.
+  - `python/sglang/srt/layers/linear.py` (`linear/FP8`, `manual merge`): adopted official runtime parallel/forward flags while preserving DCU fused SiLU and pre-quantized FP8 tuple paths.
+  - `python/sglang/srt/layers/moe/ep_moe/kernels.py` (`EP MoE`, `theirs`): accepted the official expert-quant block-size API and removed stale locals exposed by the new contract.
+  - `python/sglang/srt/layers/moe/fused_moe_triton/layer.py` (`MoE`, `manual merge`): combined official environment/TBO/NPU plumbing with retained DCU LightOp flags.
+  - `python/sglang/srt/layers/moe/moe_align_block_size.py` (`MoE kernel`, `port to new API`): followed the official kernel namespace move without changing DCU dispatch semantics.
+  - `python/sglang/srt/layers/moe/topk.py` (`MoE top-k`, `port to new API`): followed the official kernel namespace move and retained DCU LightOp grouped-top-k/postprocess priority.
+  - `python/sglang/srt/layers/quantization/fp8_utils.py` (`FP8`, `manual merge`): retained DCU DeepGEMM tuple/prequantized handling while accepting official runtime-context and MXFP8 updates.
+  - `python/sglang/srt/managers/overlap_utils.py` (`scheduler overlap`, `manual merge`): accepted official relay/runtime-context types and kept the DCU-compatible pinned result path.
+  - `python/sglang/srt/mem_cache/common.py` (`mem cache`, `port to new API`): moved common Triton helpers to `sglang.kernels.ops.memory` and retained DCU cache allocation/location behavior.
+  - `python/sglang/srt/mem_cache/memory_pool.py` (`KV cache`, `manual merge`): adopted official descriptor/index-buffer allocation and `_write_mla_kv_buffer(dst_buffer, ...)` contracts while retaining DCU LightOp stores and BF16/FP8 DSA index caches.
+  - `python/sglang/srt/mem_cache/memory_pool_host.py` (`host cache`, `manual merge`): ported DCU host transfer behavior to the official descriptor/helper interface.
+  - `python/sglang/srt/model_executor/model_runner.py` (`model executor`, `manual merge`): accepted official runtime-context and pool lifecycle changes while preserving the active DCU model/graph configuration.
+  - `python/sglang/srt/models/bailing_moe.py` (`MoE/model`, `manual merge`): adopted official scoped forward state and removed retired threaded-allreduce arguments, retaining DCU fused RMS inputs and SBO flags.
+  - `python/sglang/srt/models/deepseek_v2.py` (`DeepSeek/MoE`, `manual merge`): adopted official main-first dual-stream/prefetch/forward-flags flow and retained DCU fused RMS inputs plus tuple-output normalization.
+  - `python/sglang/srt/models/deepseek_v4.py` (`DeepSeek-V4`, `port to new API`): adopted the official `MqaAttentionBase` to `MQALayer` split and HC helpers; moved the DCU cos/sin buffer and q/WO-A DeepGEMM paths into the new structure, kept generic HIP branches behind DCU-specific behavior, and retained the validated DCU MHC prewarm skip.
+  - `python/sglang/srt/models/qwen2.py` (`Qwen`, `manual merge`): adopted runtime `get_server_args()` while retaining the DCU fused attention/RMS path.
+  - `python/sglang/srt/models/qwen3.py` (`Qwen`, `manual merge`): adopted runtime `get_server_args()` while retaining the DCU fused attention/RMS path.
+  - `python/sglang/srt/models/utils.py` (`model utilities`, `manual merge`): combined official runtime flags with retained DCU model utility hooks.
+  - `test/registered/unit/mem_cache/test_radix_cache_unit.py` (`test registry`, `manual merge`): accepted official test updates and retained the DCU registration.
+- High-risk semantic and `_is_dcu` move audit:
+  - The endpoint introduces the canonical `python/sglang/kernels` namespace. DCU `normal_decode_set_metadata_lightop` moved from the old attention Triton module to `kernels/ops/attention/metadata.py`, and both DCU speculative cache-location operators moved to `kernels/ops/speculative/cache_locs.py`; their DCU call guards and LightOp imports remain present.
+  - A source-only stale-import scan found one automatically merged DCU/HIP import in `deepseek_v2.py` still pointing to the removed `srt.layers.attention.triton_ops.rocm_mla_decode_rope`. It was ported to `sglang.kernels.ops.attention.rocm_mla_decode_rope`; the follow-up scan found only intentional migration comments and no stale source imports.
+  - DSV4's removed `models/triton_ops/deepseek_v4.py` contained only RMS-normalization helpers. The active DSV4 MHC/normalization implementation remains in `deepseek_v4.py`, `deepseek_common/amd/deepseek_v4_fused_mhc.py`, and the shared/JIT layernorm modules; no deleted symbol remains referenced.
+  - Reviewed new HIP conditions in DSA metadata generation, layernorm, MXFP8, DCP cache allocation, MiniMax-M3, ServerArgs overrides, radix attention, and the unified kernel registry. DSA fused metadata remains disabled on HIP; gfx95-only MXFP8 paths do not select gfx938 DCU; DCP/cache and PCG-tail behavior intentionally include DCU. No new generic HIP/AITER branch displaced an existing dedicated DCU path.
+  - Three-repository review used official endpoint structure, current DCU behavior, and `/home/proj_dpsk-v4/dcu-sglang` intent for `_is_dcu`, `dcu_`, LightOp, FlashMLA, AITER, DeepEP, DeepSeek-V4, and `SGLANG_USE_AITER_AG` paths. `SGLANG_USE_AITER_AG=0` remains unchanged and is not waived by this merge.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on staged changed files: no output.
+  - `git diff --cached --check`: passed after normalizing the official `test/manual/ep/test_eplb.py` CRLF blob to LF.
+  - `python3 -m py_compile` over 698 changed Python files: passed.
+  - Ruff `E9,F401,F811,F821,F841` over changed Python files: passed.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - Workspace import resolved `sglang`, `deepseek_v2.py`, and `deepseek_v4.py` under `/home/proj_sglang_open/dcu-sglang/python`; `_is_dcu=True`.
+- Functional validation status:
+  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
+  - Before starting, both `zz-nmz22` and `zz-nmz26` must be checked with `hy-smi`; if neither is fully idle, stop and leave runtime validation to the owner. The two containers share `/home`, so no rsync is permitted.
+  - Accuracy, throughput, other models/topologies, broad CI, and the deferred empty-output/NaN issue remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.

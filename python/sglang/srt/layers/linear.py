@@ -16,7 +16,6 @@ from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
     get_tp_group,
-    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -26,9 +25,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -39,8 +38,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1626,7 +1624,14 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None, use_fused_silu_mul_quant: Optional[bool] = False, use_fused_silu_mul_fp8_quant: Optional[bool] = False):
+    def forward(
+        self,
+        input_,
+        skip_all_reduce=False,
+        forward_batch=None,
+        use_fused_silu_mul_quant: Optional[bool] = False,
+        use_fused_silu_mul_fp8_quant: Optional[bool] = False,
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1640,13 +1645,22 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        if self.use_dp_attention_reduce:
+            symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
+        else:
+            symm_ctx = use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            )
+
         if use_fused_silu_mul_quant:
             xq, xs = lm_fuse_silu_mul_quant(input_parallel)
             silu_quant_args = [xq, xs]
-            with use_symmetric_memory(get_tp_group()) as sm:
-                output_parallel = self.quant_method.apply(self, input_parallel,
-                                                          bias=bias_,
-                                                          silu_quant_args=silu_quant_args
+            with symm_ctx as sm:
+                output_parallel = self.quant_method.apply(
+                    self,
+                    input_parallel,
+                    bias=bias_,
+                    silu_quant_args=silu_quant_args,
                 )
                 if sm is not None:
                     sm.tag(output_parallel)
@@ -1654,30 +1668,38 @@ class RowParallelLinear(LinearBase):
             output_shape = [*input_.shape[:-1], self.weight.shape[1]]
             input_x, x_scale = fuse_silu_mul_fp8_quant(input_parallel, fp8type=0)
 
-            with use_symmetric_memory(get_tp_group()) as sm:
-                output = torch.empty(output_shape, device=input_.device, dtype=input_.dtype)
-                deepgemm.fp8_gemm((input_x, x_scale),(self.weight, self.weight_scale),output)
+            with symm_ctx as sm:
+                output = torch.empty(
+                    output_shape, device=input_.device, dtype=input_.dtype
+                )
+                deepgemm.fp8_gemm(
+                    (input_x, x_scale),
+                    (self.weight, self.weight_scale),
+                    output,
+                )
                 output_parallel = output.view(*output_shape)
                 if sm is not None:
                     sm.tag(output_parallel)
         else:
-            if self.use_dp_attention_reduce:
-                symm_ctx = use_symmetric_memory(get_attention_tp_group())
-            else:
-                symm_ctx = use_symmetric_memory(
-                    get_tp_group(), disabled=not is_allocation_symmetric()
-                )
             with symm_ctx:
                 output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+        # skip_all_reduce: explicit call-site override. Also honor
+        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
+        # the decoder — callers should not thread those flags into modules.
+        if (
+            self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
+        ):
             if self.use_dp_attention_reduce:
-                output = get_attention_tp_group().all_reduce(output_parallel)
+                output = get_parallel().attn_tp_group.all_reduce(output_parallel)
             else:
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_global_server_args().enable_quant_communications
+                        and get_server_args().enable_quant_communications
                     )
                     if forward_batch is not None
                     else False

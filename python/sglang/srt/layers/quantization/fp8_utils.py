@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_min,
     is_fp8_fnuz,
     mxfp8_block_scaled_matmul_triton,
+    pack_mxfp8_scales_triton,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
@@ -32,9 +33,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
-    vllm_triton_scaled_mm_fp8,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -457,9 +457,65 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
+    if backend.is_deep_gemm():
+        return _deepgemm_w8a8_mxfp8_linear_with_fallback
+    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
+    elif backend.is_triton():
+        return triton_mxfp8_blockscaled_linear
+    elif _is_hip and _is_gfx95_supported:
+        from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (
+            dot_scaled_mxfp8_blockscaled_linear,
+        )
+
+        return dot_scaled_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
+
+
+def _deepgemm_w8a8_mxfp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    weight_scale_fallback: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+        w8a8_mxfp8_matmul_deepgemm,
+    )
+
+    assert input_scale is None
+    output_dtype = input.dtype
+
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    dtype_supported = output_dtype == torch.bfloat16
+
+    if not (shape_supported and dtype_supported):
+        return triton_mxfp8_blockscaled_linear(
+            input, weight, weight_scale_fallback, input_scale, bias
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        32,
+        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+    # weight_scale format is set per-backend by _process_mxfp8_linear_weight_scale
+    # (int32 packed TMA-aligned on Blackwell, float32 on Hopper); NOT uint8 — Triton form is routed to the fallback above.
+
+    output = w8a8_mxfp8_matmul_deepgemm(
+        q_input, weight, x_scale, weight_scale, output_dtype=output_dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
@@ -1049,6 +1105,14 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
+    if (
+        _is_hip
+        and _is_gfx95_supported
+        and scale_u8.is_cuda
+        and scale_u8.shape[0] % 128 != 0
+    ):
+        return pack_mxfp8_scales_triton(scale_u8)
+
     # Pack (M, K//32) UE8M0 scales into the layout expected by tl.dot_scaled.
     assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
     scale_u8 = scale_u8.contiguous()
@@ -1116,8 +1180,13 @@ def _raw_triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    if not (_is_cuda and (_is_sm100_supported or _is_sm120_supported)):
-        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100/SM120).")
+    if not (
+        (_is_cuda and (_is_sm100_supported or _is_sm120_supported))
+        or (_is_hip and _is_gfx95_supported)
+    ):
+        raise RuntimeError(
+            "MXFP8 dense linear requires Blackwell GPUs (SM100/SM120) or ROCm gfx95."
+        )
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -1133,6 +1202,13 @@ def _raw_triton_mxfp8_blockscaled_linear(
     assert n % block_n == 0, f"{n=} must be divisible by {block_n}"
     assert weight.dtype == torch.float8_e4m3fn, "MXFP8 weight must be FP8 E4M3."
     assert weight_scale.dtype == torch.uint8, "MXFP8 weight_scale must be UE8M0 uint8."
+    assert weight_scale.dim() in (
+        2,
+        5,
+    ), (
+        "MXFP8 weight_scale must be canonical 2D or packed 5D, "
+        f"got {weight_scale.dim()}D."
+    )
 
     if input_scale is None:
         q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
@@ -1166,7 +1242,11 @@ def _raw_triton_mxfp8_blockscaled_linear(
         x_scale_u8 = torch.cat([x_scale_u8, pad_scale], dim=0)
 
     a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
-    b_scale_packed = _pack_mxfp8_scales(weight_scale)
+    b_scale_packed = (
+        weight_scale.contiguous()
+        if weight_scale.dim() == 5
+        else _pack_mxfp8_scales(weight_scale)
+    )
 
     num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
     output = triton_mxfp8_block_scaled_matmul(
@@ -1748,7 +1828,7 @@ def apply_fp8_linear(
         pad_output = not cutlass_fp8_supported and not _sglang_enable_torch_compile
     output_padding = 17 if pad_output else None
 
-    if not type(input) == tuple:
+    if not isinstance(input, tuple):
         # View input as 2D matrix for fp8 methods
         input_2d = input.view(-1, input.shape[-1])
         output_shape = [*input.shape[:-1], weight.shape[1]]
@@ -1763,7 +1843,7 @@ def apply_fp8_linear(
             if (
                 input_scale is not None
                 and input_scale.numel() == 1
-                and get_global_server_args().cuda_graph_config.prefill.tc_compiler
+                and get_server_args().cuda_graph_config.prefill.tc_compiler
                 == "inductor"
             ):
                 qinput = (
@@ -1812,7 +1892,7 @@ def apply_fp8_linear(
 
             return output.view(*output_shape)
 
-    if _is_dcu and type(input) == tuple:
+    if _is_dcu and isinstance(input, tuple):
         output_shape = [*input[0].shape[:-1], weight.shape[1]]
         output = torch.empty(output_shape, device=input[0].device, dtype=torch.bfloat16)
         deepgemm.fp8_gemm((input[0],input[1]),(weight,weight_scale),output)

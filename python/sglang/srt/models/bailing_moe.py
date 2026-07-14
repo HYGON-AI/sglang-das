@@ -81,9 +81,20 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, add_prefix, is_cuda, is_dcu, is_non_idle_and_non_empty, make_layers
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_dcu,
+    is_non_idle_and_non_empty,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -141,8 +152,6 @@ class BailingMoEMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         hidden_states_tensor = (
             hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
@@ -153,14 +162,16 @@ class BailingMoEMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(hidden_states)
         if _use_fused_bailing_silu_mul_fp8_quant:
             hidden_states, _ = self.down_proj(
-                gate_up, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter, use_fused_silu_mul_fp8_quant = True
+                gate_up,
+                forward_batch=forward_batch,
+                use_fused_silu_mul_fp8_quant=True,
             )
         else:
             hidden_states = self.act_fn(gate_up)
             hidden_states, _ = self.down_proj(
-                hidden_states, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+                hidden_states,
+                forward_batch=forward_batch,
             )
-
         return hidden_states
 
 
@@ -227,7 +238,7 @@ class BailingMoESparseMoeBlock(nn.Module):
         self.score_function = getattr(config, "score_function", None)
         self.num_fused_shared_experts = (
             0
-            if get_global_server_args().disable_shared_experts_fusion or get_moe_a2a_backend().is_deepep()
+            if get_server_args().disable_shared_experts_fusion or get_moe_a2a_backend().is_deepep()
             else config.num_shared_experts
         )
 
@@ -247,7 +258,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert get_global_server_args().ep_num_redundant_experts == 0
+        assert get_server_args().ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -262,7 +273,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.use_grouped_topk = False
 
         self.num_experts = (
-            config.num_experts + get_global_server_args().ep_num_redundant_experts
+            config.num_experts + get_server_args().ep_num_redundant_experts
         )
 
         self.gate = BailingMoEGate(
@@ -306,7 +317,7 @@ class BailingMoESparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
             + self.num_fused_shared_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=self.top_k + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -359,16 +370,12 @@ class BailingMoESparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         moe_i_q: Optional[torch.Tensor] = None,
         moe_i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(
                 hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
                 moe_i_q=moe_i_q,
                 moe_i_s=moe_i_s,
             )
@@ -449,8 +456,6 @@ class BailingMoESparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         moe_i_q: Optional[torch.Tensor] = None,
         moe_i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -498,8 +503,6 @@ class BailingMoESparseMoeBlock(nn.Module):
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
@@ -787,11 +790,11 @@ class BailingMoEAttention(nn.Module):
         self.alt_stream = alt_stream
         self.page_size = 64
         self.layer_id = layer_id
-        if get_global_server_args().kv_cache_dtype == "fp8_e4m3":
+        if get_server_args().kv_cache_dtype == "fp8_e4m3":
             self.kv_cache_dtype = torch.float8_e4m3fn
-        elif get_global_server_args().kv_cache_dtype == "fp8_e5m2":
+        elif get_server_args().kv_cache_dtype == "fp8_e5m2":
             self.kv_cache_dtype = torch.float8_e5m2
-        elif get_global_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
+        elif get_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
 
     def forward(
@@ -1003,13 +1006,13 @@ class BailingMoEBlock(nn.Module):
             _is_dcu
             and _use_fused_bailing_rms_quant
             and (not self.is_layer_sparse)
-            and (not is_dp_attention_enabled() or get_global_server_args().ep_size > 1)
+            and (not is_dp_attention_enabled() or get_server_args().ep_size > 1)
         )
         sparse_rms_quant_fusion = (
             _is_dcu
             and _use_fused_bailing_rms_quant
             and self.is_layer_sparse
-            and (not is_dp_attention_enabled() or get_global_server_args().ep_size > 1)
+            and (not is_dp_attention_enabled() or get_server_args().ep_size > 1)
         )
         rms_quant_fusion = dense_rms_quant_fusion or sparse_rms_quant_fusion
         prev_rms_quant_flag = forward_batch.rms_quant_flag
@@ -1043,32 +1046,32 @@ class BailingMoEBlock(nn.Module):
         forward_batch.bailing_sparse_rms_quant_fusion = prev_sparse_rms_quant_fusion
         forward_batch.bailing_sparse_norm_hidden_states = prev_sparse_norm_hidden_states
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        if self.is_layer_sparse:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-                moe_i_q=sparse_moe_i_q,
-                moe_i_s=sparse_moe_i_s,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-            )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            if self.is_layer_sparse:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    moe_i_q=sparse_moe_i_q,
+                    moe_i_s=sparse_moe_i_s,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states, forward_batch)
 
-        if should_allreduce_fusion:
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1218,7 +1221,7 @@ class BailingMoEForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.num_fused_shared_experts = (
             0
-            if get_global_server_args().disable_shared_experts_fusion or get_moe_a2a_backend().is_deepep()
+            if get_server_args().disable_shared_experts_fusion or get_moe_a2a_backend().is_deepep()
             else config.num_shared_experts
         )
 

@@ -98,10 +98,7 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states = self.mlp(
-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-          )
+      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -158,10 +155,7 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states = self.mlp(
-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-          )
+      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
