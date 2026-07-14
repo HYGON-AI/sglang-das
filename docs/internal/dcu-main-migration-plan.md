@@ -138,7 +138,7 @@ Milestone tags:
 - `dcu-main-milestone-moe-nightly-ready`
 - `dcu-main-milestone-daily-sync-ready`
 
-## 5. Conflict Board
+## 5. Conflict Board and Code Review Artifact
 
 The live conflict board is kept in:
 
@@ -156,6 +156,27 @@ Every conflict entry should record:
 - Risk level.
 - Validation performed.
 - Follow-up and status.
+
+In addition to the ledger, every completed catch-up branch must generate:
+
+```text
+docs/internal/dcu-main-catchup-YYYYMMDD-conflict-review.md
+```
+
+This is a mandatory code-review artifact, not a replacement for the ledger. It
+must be committed on the catch-up branch before handoff or merge to `main`, even
+when runtime validation is pending or failed. It contains only files that
+actually produced textual conflicts; automatically merged files and later
+runtime-only fixes are excluded.
+
+The document follows the existing `20260629` and `20260703` format: record the
+exact DCU parent, common official base, official endpoint, and resolved merge
+SHAs; give the conflict-file and reconstructed-hunk counts; then use one
+collapsible section per file with a concise resolution intent and a Markdown
+`diff` block comparing the reconstructed three-way auto-conflict text with the
+committed resolution. This preserves VS Code Markdown Preview's red/green code
+review experience. A catch-up with no textual conflicts still produces the
+document, records zero conflicts, and omits code sections.
 
 ## 6. Workflow
 
@@ -273,9 +294,10 @@ flowchart LR
     OFF -. merge .-> DAILY
     CATCHUP --> CONFLICT{"conflicts?"}
     DAILY --> CONFLICT
-    CONFLICT -- yes --> FIX["resolve conflicts<br/>update conflict ledger if needed"]
-    CONFLICT -- no --> TEST
-    FIX --> TEST{"DCU smoke / CI passed?"}
+    CONFLICT -- yes --> FIX["resolve conflicts<br/>update conflict ledger"]
+    CONFLICT -- no --> REVIEW
+    FIX --> REVIEW["generate code conflict review<br/>conflict files only"]
+    REVIEW --> TEST{"DCU smoke / CI passed?"}
     TEST -- no --> RETRY["fix, split, or recreate<br/>daily branch"]
     RETRY --> DAILY
     TEST -- yes --> MERGE["merge PR back to main"]
@@ -290,7 +312,7 @@ flowchart LR
 
     class MAIN,MERGE trunk;
     class OFF upstream;
-    class CATCHUP,DAILY,FIX,RETRY daily;
+    class CATCHUP,DAILY,FIX,REVIEW,RETRY daily;
     class CURRENT,CONFLICT,TEST gate;
     class TAG tag;
 ```

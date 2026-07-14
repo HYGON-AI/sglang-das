@@ -1386,3 +1386,6 @@ actual result in the checkpoint note.
   - The one permitted confirmation reran the exact command. All four TP ranks loaded the model, captured every decode graph bucket from batch size 128 through 1, and reported service readiness on port 10015; the Hash-MoE dtype failure did not recur.
   - `GET /health` returned HTTP 200. One short `POST /generate` returned HTTP 200 and completed eight tokens without a worker crash. The response again contained empty text with eight zero token IDs, which remains a non-blocking accuracy observation rather than an accuracy pass.
   - The service was stopped cleanly after the request; port 10015 was released and all eight devices returned to 2 MiB idle usage. No broader CI, model, topology, accuracy, or throughput test was run.
+- Code conflict review artifact:
+  - `docs/internal/dcu-main-catchup-20260706-conflict-review.md` records the 10 actual textual conflict files and 25 reconstructed conflict hunks against resolved merge `51f025b2d5464a1c35eef12656546d7cc9c56bb1`.
+  - The artifact intentionally compares the auto-conflict state with the merge resolution only; the later runtime-only router-dtype fix `0d2e50ec1` remains documented in this ledger rather than being presented as a merge-conflict resolution.
