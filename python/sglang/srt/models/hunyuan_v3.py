@@ -230,14 +230,21 @@ class HYV3MoEFused(nn.Module):
         param.data.copy_(loaded_weight.to(torch.float32))
 
     def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-            and filter_moe_weight_param_global_expert(
-                name, x, self.experts.num_local_experts
-            )
-        ]
+        num_local_experts = self.experts.num_local_experts
+        result = []
+        for name, x in self.experts.named_parameters():
+            if name == "correction_bias":
+                continue
+            if filter_moe_weight_param_global_expert(name, x, num_local_experts):
+                result.append(x.data)
+        for name, x in self.experts.named_buffers():
+            if (
+                x.ndim > 0
+                and x.shape[0] == num_local_experts
+                and not getattr(x, "_sglang_require_global_experts", False)
+            ):
+                result.append(x)
+        return result
 
     def forward(
         self,
@@ -265,11 +272,11 @@ class HYV3MoEFused(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         shared_output = None
-        if hidden_states.shape[0] > 0:
-            router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
+        with get_global_expert_distribution_recorder().with_current_layer(
+            self.layer_id
+        ):
+            if hidden_states.shape[0] > 0:
+                router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -282,15 +289,15 @@ class HYV3MoEFused(nn.Module):
                         layer_id=self.layer_id,
                     ),
                 )
-            if self.shared_mlp is not None:
-                shared_output = self.shared_mlp(hidden_states)
-        else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+                if self.shared_mlp is not None:
+                    shared_output = self.shared_mlp(hidden_states)
+            else:
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -340,17 +347,17 @@ class HYV3MoEFused(nn.Module):
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
-            )        
-        if self.shared_mlp is not None:
-            shared_output = self.shared_mlp(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
             )
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
+            if self.shared_mlp is not None:
+                shared_output = self.shared_mlp(hidden_states)
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
@@ -397,10 +404,10 @@ class HYV3MoEFused(nn.Module):
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
-                )            
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
+                )
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
 
         current_stream.wait_stream(self.alt_stream)
         if get_moe_a2a_backend().is_deepep():
