@@ -369,12 +369,15 @@ class MiMoV2MoE(nn.Module):
                         layer_id=self.layer_id,
                     ),
                 )
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
         return final_hidden_states
 
