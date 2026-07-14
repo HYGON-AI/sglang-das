@@ -24,6 +24,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 fused_rope = fused_rope_inplace
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -78,7 +79,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -127,7 +127,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -1137,38 +1137,13 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
-                group_size=128,
-                scale_ue8m0=True,
-            )
-
-            lhs_fp8 = o_fp8.view(T, G, D)
-            lhs_scale = o_s.view(T, G, -1)
-
-            w = self.wo_a.weight
-            if tuple(w.shape) == (D, G * R):
-                rhs_fp8 = w.t().contiguous().view(G, R, D)
-            elif tuple(w.shape) == (G * R, D):
-                rhs_fp8 = w.contiguous().view(G, R, D)
-            else:
-                raise RuntimeError(
-                    f"unexpected wo_a.weight shape={tuple(w.shape)}, "
-                    f"expected {(D, G * R)} or {(G * R, D)}"
-                )
-
-            weight_scale = getattr(self.wo_a, "weight_scale", None)
-            if weight_scale is None:
-                weight_scale = self.wo_a.weight_scale_inv
-            rhs_scale = weight_scale.data.reshape(G, R).contiguous()
-
+            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
 
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (lhs_fp8, lhs_scale),
-                (rhs_fp8, rhs_scale),
+                (o_fp8, o_s),
+                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
             )
@@ -2284,7 +2259,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_flags().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2321,7 +2296,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        if get_flags().disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None

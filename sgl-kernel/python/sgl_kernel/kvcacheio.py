@@ -444,3 +444,17 @@ def dcu_align_evict_mask_to_page_size(
         num_draft_tokens,
         bs,
     )
+
+
+def copy_all_layer_kv_cache_cpu(
+    data_ptrs: torch.Tensor,
+    strides: torch.Tensor,
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+):
+    torch.ops.sgl_kernel.copy_all_layer_kv_cache_cpu(
+        data_ptrs,
+        strides,
+        tgt_loc,
+        src_loc,
+    )

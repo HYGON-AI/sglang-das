@@ -1389,3 +1389,41 @@ actual result in the checkpoint note.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260706-conflict-review.md` records the 10 actual textual conflict files and 25 reconstructed conflict hunks against resolved merge `51f025b2d5464a1c35eef12656546d7cc9c56bb1`.
   - The artifact intentionally compares the auto-conflict state with the merge resolution only; the later runtime-only router-dtype fix `0d2e50ec1` remains documented in this ledger rather than being presented as a merge-conflict resolution.
+
+### Official main catch-up 20260709 / `bd7e54d7379e`
+
+- Branch: `sync/official-main-catchup-20260709`.
+- Base: DCU `main@b654e63e9815446a27eaf883abf7bf9b9e5e24d8`, official previous checkpoint `9a6f8e599204aa37481f5f37a1b20938aee98d5c`.
+- Endpoint: official `main@bd7e54d7379e437cf5f027382d6ca214e046626b` (`[AMD] Fix AITER custom all-gather CUDA-graph capture crash under torch_memory_saver (#30557)`).
+- Scope: 90 immutable official commits (the planning estimate was 105), 2026-07-07 to 2026-07-09 by official commit date; 446 files changed. Git reported 11 textual conflict files and 20 conflict hunks, below the 50-file split threshold.
+- Textual conflicts and decisions:
+  - `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` (`DSA/indexer`, `manual merge`): accepted official DeepGEMM head padding in generic paged/ragged FP8 logits paths, while preserving the DCU BF16 index cache, LightOp MQA, and the validated DCU CP-ragged FP8 contract. DCU remains selected before generic HIP/CUDA behavior.
+  - `python/sglang/srt/layers/dp_attention.py` (`DP attention`, `manual merge`): added official runtime flags while retaining the `is_dcu` import used by the DCU communicator path.
+  - `python/sglang/srt/layers/moe/ep_moe/layer.py` (`MoE runner`, `theirs`): accepted official CuTeDSL ModelOpt and unquantized BF16 DeepGEMM/DeepEP low-latency deprecation routing; its explicit `not _is_hip` guard leaves the existing DCU runner selection unchanged.
+  - `python/sglang/srt/layers/moe/token_dispatcher/deepep.py` (`DeepEP`, `manual merge`): retained the DCU group-GEMM `quant_type` dispatch ABI, but moved the normal path to official `use_fp8`/`use_nvfp4` low-latency dispatch arguments and scale options.
+  - `python/sglang/srt/mem_cache/memory_pool.py` (`KV cache/VMM`, `manual merge`): adopted official `KvBufferDesc` and post-capture VMM backing as canonical, retained the DCU FA physical K/V layout ahead of generic layouts, and ported the DCU per-token copy stride to the new `_create_buffers()` entry point. PD buffer lengths now come from the official descriptors.
+  - `python/sglang/srt/model_executor/model_runner.py` (`model executor`, `theirs`): removed the stale local chunked-prefix backend list and used the official `server_args` definition, which already contains `dcu_mla`.
+  - `python/sglang/srt/models/bailing_moe.py` (`MoE streams`, `manual merge`): adopted official named stream-pool leasing while preserving stream creation when the DCU SBO path is enabled.
+  - `python/sglang/srt/models/deepseek_v4.py` (`DeepSeek-V4`, `manual merge`): retained the DCU rotary helper import and accepted official DSV4 WO-A group-major FP8 quantization/JIT operands. The validated `_is_dcu` MHC prewarm skip remains intact.
+  - `python/sglang/srt/speculative/draft_utils.py` (`speculative decoding`, `manual merge`): combined official CPU/AMX helpers with the retained `is_dcu` backend selection.
+  - `python/sglang/srt/speculative/triton_ops/cache_locs.py` (`speculative cache`, `manual merge`): kept DCU cache-location wrappers and environment switch before Triton fallback, while adding official CPU wrappers and dispatch.
+  - `sgl-kernel/python/sgl_kernel/kvcacheio.py` (`sgl-kernel cache I/O`, `manual merge`): retained all DCU cache-location wrappers and added official CPU all-layer KV-copy binding.
+- High-risk semantic audit:
+  - The endpoint fix is present exactly in `python/sglang/srt/distributed/parallel_state.py`: AITER custom all-gather uses `all_gather_unreg` during CUDA-graph capture when torch memory saver is active, while the registered path remains for normal capture.
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still exports `SGLANG_USE_AITER_AG=0`. This catch-up absorbs and records the official fix but does not remove the operational workaround without a dedicated DCU graph all-gather reproducer.
+  - Official template parser files moved from `srt/managers` to `srt/parser`. The retained DCU-only registered OpenAI test import was forward-ported to the canonical parser path; a repository scan found no other stale imports of the removed modules.
+  - `deepseek_v2.py` retains the 20260706 `_is_dcu and self.is_deepseek_v4` FP32 router-logit branch. The official FP32 fallback addition applies to non-DSV4 prefill-CP and does not displace that DCU Hash-MoE contract.
+  - `attention_registry`, DSV4 JIT/model code, ServerArgs/arg groups, memory cache, and AITER collectives were reviewed. Existing DCU exclusions remain explicit where generic HIP/AITER behavior is not validated.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on staged changed files: no output.
+  - `git diff --cached --check`: passed.
+  - `python3 -m py_compile` over 352 changed Python files under `python/sglang`, `test/registered`, and `sgl-kernel/python`: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841`: blocked because Ruff remains unavailable (`No module named ruff`); no dependency installation was attempted.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - Workspace import resolved `sglang` and `deepseek_v4.py` under `/home/proj_sglang_open/dcu-sglang/python`; `_is_dcu=True`.
+- Functional validation status:
+  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
+  - Accuracy, throughput, other models/topologies, broad CI, and AITER all-gather workaround removal remain owner-run/non-blocking.

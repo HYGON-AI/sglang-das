@@ -6,6 +6,7 @@ import triton.language as tl
 
 from sglang.srt.utils import (
     get_bool_env_var,
+    is_cpu,
     is_cuda,
     is_dcu,
     is_hip,
@@ -15,6 +16,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_dcu = is_dcu()
@@ -27,6 +29,9 @@ if _is_dcu:
         dcu_assign_extend_cache_locs,
         dcu_assign_req_to_token_pool,
     )
+
+if _is_cpu:
+    from sgl_kernel import assign_extend_cache_locs_cpu, assign_req_to_token_pool_cpu
 
 
 @triton.jit
@@ -86,6 +91,16 @@ def assign_req_to_token_pool_func(
         )
         return
 
+    if _is_cpu:
+        assign_req_to_token_pool_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+        return
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -432,6 +447,23 @@ def assign_extend_cache_locs_func(
             start_offset,
             end_offset,
             out_cache_loc,
+        )
+
+        return out_cache_loc
+
+    elif _is_cpu:
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+        assign_extend_cache_locs_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
         )
 
         return out_cache_loc

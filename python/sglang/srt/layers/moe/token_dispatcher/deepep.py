@@ -773,26 +773,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
-        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
-        if input_global_scale is not None:
-            use_nvfp4 = True
-        else:
-            backend = get_moe_runner_backend()
-            # BF16 dispatch is needed when:
-            #   - quant_config requests BF16 dispatch explicitly
-            #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
-            #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
-            #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
-            need_bf16_dispatch = (
-                bf16_dispatch
-                or backend.is_flashinfer_cutedsl()
-                or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
-                or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
-            )
-            if not need_bf16_dispatch:
-                use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -804,7 +785,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if use_fp8
+            if self.use_fp8
             else dict()
         )
 
@@ -819,7 +800,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
-                        quant_type = 2,
+                        quant_type=2,
                         fp8_round_scale=False,
                         async_finish=not self.return_recv_hook,
                         return_recv_hook=self.return_recv_hook,
@@ -833,7 +814,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
                         self.num_experts,
-                        quant_type = 0,
+                        quant_type=0,
                         fp8_round_scale=False,
                         async_finish=not self.return_recv_hook,
                         return_recv_hook=self.return_recv_hook,
@@ -858,11 +839,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 buffer.low_latency_dispatch(
                     hidden_states,
                     topk_ids,
-                    topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
-                    quant_type = 0,
-                    **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
+                    use_fp8=self.use_fp8,
+                    **(dict(topk_weights=topk_weights) if _is_npu else dict()),
+                    **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                     **(
                         dict(x_global_scale=input_global_scale)
                         if input_global_scale is not None
@@ -870,10 +851,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     ),
                     async_finish=not self.return_recv_hook,
                     return_recv_hook=self.return_recv_hook,
-                    round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                    and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                    use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                    and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                    **fp8_deepgemm_scale_opts,
                 )
             )
         return packed_recv_hidden, self.packed_recv_count, event, hook

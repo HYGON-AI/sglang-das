@@ -667,7 +667,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
-        from sglang.srt.managers.template_manager import TemplateManager
+        from sglang.srt.parser.template_manager import TemplateManager
         from sglang.srt.server_args import PortArgs, ServerArgs
 
         server_args = ServerArgs(
