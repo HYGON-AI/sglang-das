@@ -14,6 +14,7 @@
 
 """Helpers for HCU cookbook-style SGLang nightly tests."""
 
+import ast
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import requests
 
 from sglang.srt.utils import kill_process_tree
@@ -33,6 +35,7 @@ from sglang.test.hcu_utils import (
 )
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import popen_launch_server
+from sglang.utils import download_and_cache_file, read_jsonl
 
 
 HCU_COOKBOOK_API_KEY = "sk-123456"
@@ -976,3 +979,86 @@ def run_cookbook_accuracy_eval(
         f"num_threads={num_threads}, score={score}, latency={latency}"
     )
     return metrics
+
+
+GSM8K_TEST_URL = (
+    "https://raw.githubusercontent.com/openai/grade-school-math/"
+    "master/grade_school_math/data/test.jsonl"
+)
+INVALID_GSM8K_ANSWER = -9999999
+
+
+def _gsm8k_answer_value(answer: str) -> int:
+    numbers = re.findall(r"\d+", answer.replace(",", ""))
+    if not numbers:
+        return INVALID_GSM8K_ANSWER
+    try:
+        return int(ast.literal_eval(numbers[-1]))
+    except (SyntaxError, ValueError):
+        return INVALID_GSM8K_ANSWER
+
+
+def _gsm8k_example(lines: list[dict], index: int, include_answer: bool) -> str:
+    text = "Question: " + lines[index]["question"] + "\nAnswer:"
+    if include_answer:
+        text += " " + lines[index]["answer"]
+    return text
+
+
+def run_gsm8k_completion_benchmark(
+    base_url: str,
+    num_questions: int = 200,
+    num_shots: int = 5,
+    parallel: int = 64,
+) -> tuple[float, float, float]:
+    """Run the same few-shot completion GSM8K benchmark used by AMD CI."""
+    import sglang as sgl
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+
+    data_path = (
+        os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_DATA_PATH")
+        or os.environ.get("SGLANG_HCU_GSM8K_DATA_PATH")
+        or download_and_cache_file(GSM8K_TEST_URL)
+    )
+    lines = list(read_jsonl(data_path))
+    if num_shots + num_questions > len(lines):
+        raise AssertionError(
+            f"GSM8K requires {num_shots + num_questions} rows, got {len(lines)}"
+        )
+
+    few_shot_examples = "".join(
+        _gsm8k_example(lines, index, True) + "\n\n"
+        for index in range(num_shots)
+    )
+    questions = [
+        _gsm8k_example(lines, index, False) for index in range(num_questions)
+    ]
+    labels = [
+        _gsm8k_answer_value(lines[index]["answer"]) for index in range(num_questions)
+    ]
+    if any(label == INVALID_GSM8K_ANSWER for label in labels):
+        raise AssertionError("GSM8K contains an answer that cannot be parsed")
+
+    @sgl.function
+    def few_shot_gsm8k(s, question):
+        s += few_shot_examples + question
+        s += sgl.gen(
+            "answer",
+            max_tokens=512,
+            stop=["Question", "Assistant:", "<|separator|>"],
+        )
+
+    backend = RuntimeEndpoint(base_url, api_key=HCU_COOKBOOK_API_KEY)
+    sgl.set_default_backend(backend)
+    start = time.perf_counter()
+    states = few_shot_gsm8k.run_batch(
+        [{"question": question} for question in questions],
+        temperature=0,
+        num_threads=parallel,
+        progress_bar=True,
+    )
+    latency = time.perf_counter() - start
+    predictions = [_gsm8k_answer_value(state["answer"]) for state in states]
+    accuracy = float(np.mean(np.array(predictions) == np.array(labels)))
+    invalid = float(np.mean(np.array(predictions) == INVALID_GSM8K_ANSWER))
+    return accuracy, invalid, latency

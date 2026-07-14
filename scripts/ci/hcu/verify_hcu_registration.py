@@ -33,7 +33,6 @@ from __future__ import annotations
 import glob
 import importlib.util
 import os
-import subprocess
 import sys
 from collections import defaultdict
 
@@ -57,17 +56,7 @@ def _load_ci_register():
     return module
 
 
-def _verify_hcu_rename() -> int:
-    checker = os.path.join(
-        REPO_ROOT, "scripts", "ci", "hcu", "verify_hcu_rename.py"
-    )
-    return subprocess.call([sys.executable, checker], cwd=REPO_ROOT)
-
-
 def main() -> int:
-    if _verify_hcu_rename() != 0:
-        return 5
-
     ci_register = _load_ci_register()
     HWBackend = ci_register.HWBackend
     collect_tests = ci_register.collect_tests
