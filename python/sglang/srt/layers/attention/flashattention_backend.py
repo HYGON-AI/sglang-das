@@ -905,6 +905,8 @@ class FlashAttentionBackend(AttentionBackend):
                 if not forward_batch.mha_one_shot
                 else metadata.max_seq_len_k
             )
+            q_padded_num_tokens = q.shape[0]
+            q_num_tokens = q_padded_num_tokens
             if not _kv_layout_dcu_fa:
                 output = varlen_fwd_unified(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -926,8 +928,6 @@ class FlashAttentionBackend(AttentionBackend):
                     s_aux=kwargs.get('sinks', None)
                 )
             else:
-                q_padded_num_tokens = q.shape[0]
-                q_num_tokens = q_padded_num_tokens
                 if (
                     get_global_server_args().minimax_opt
                     and q_padded_num_tokens != 0
