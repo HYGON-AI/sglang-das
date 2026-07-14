@@ -244,7 +244,7 @@ MLA_ATTENTION_BACKENDS = [
     "triton",
     "flashmla",
     "cutlass_mla",
-    "dcu_mla",
+    "hcu_mla",
     "trtllm_mla",
     "tokenspeed_mla",
     "ascend",
@@ -255,13 +255,13 @@ MLA_ATTENTION_BACKENDS = [
 CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashinfer",
     "fa3",
-    "dcu_mla",
+    "hcu_mla",
     "fa4",
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
-    "dcu_mla",
+    "hcu_mla",
 ]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {

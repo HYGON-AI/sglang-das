@@ -18,9 +18,9 @@ Performance tests for 2-GPU that need large GPUs (H200 80GB) - MoE and Pipeline 
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(est_time=1100, suite="nightly-dcu-perf", nightly=True, disabled="DCU BW1100 2GPU perf candidate maps to AMD large-GPU MoE/PP/70B throughput tests; keep disabled until local Mixtral/Llama-70B assets and DCU throughput thresholds are defined.")
+register_hcu_ci(est_time=1100, suite="nightly-hcu-perf", nightly=True, disabled="HCU BW1100 2GPU perf candidate maps to AMD large-GPU MoE/PP/70B throughput tests; keep disabled until local Mixtral/Llama-70B assets and HCU throughput thresholds are defined.")
 
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,

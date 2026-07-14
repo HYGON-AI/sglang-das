@@ -19,17 +19,17 @@ from typing import Tuple, Optional
 import torch
 import triton
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu, is_dcu, round_up
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu, is_hcu, round_up
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-if _is_dcu:
+if _is_hcu:
     from lightop import op as op
 
 def moe_align_block_size(
@@ -103,7 +103,7 @@ def moe_align_block_size(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
-def dcu_moe_align_block_size(
+def hcu_moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,

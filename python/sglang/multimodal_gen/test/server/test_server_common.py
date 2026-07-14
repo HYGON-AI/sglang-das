@@ -50,6 +50,7 @@ from sglang.multimodal_gen.test.test_utils import (
     save_consistency_failure_artifact,
     wait_for_req_perf_record,
 )
+from sglang.srt.utils.common import is_hcu
 
 logger = init_logger(__name__)
 
@@ -71,9 +72,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         and server_args.ring_degree is not None
         and server_args.ring_degree > 1
     ):
+        hardware_platform = "HCU/ROCm" if is_hcu() else "AMD/ROCm"
         pytest.skip(
             f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
-            "requires Flash Attention which is not available on AMD/ROCm"
+            f"requires Flash Attention which is not available on {hardware_platform}"
         )
 
     default_port = get_dynamic_server_port()

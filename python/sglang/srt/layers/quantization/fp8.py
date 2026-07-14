@@ -84,7 +84,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -110,12 +110,12 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
-if (_use_aiter or _use_hip_int4) and not _is_dcu:
+if (_use_aiter or _use_hip_int4) and not _is_hcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -1433,13 +1433,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+        if _is_hcu and get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
-                build_dcu_w8a8_mega_moe_experts_weights,
-                get_dcu_mega_moe_runtime,
+                build_hcu_w8a8_mega_moe_experts_weights,
+                get_hcu_mega_moe_runtime,
             )
 
-            runtime = get_dcu_mega_moe_runtime()
+            runtime = get_hcu_mega_moe_runtime()
             if runtime == "megamoe" and (
                 self.block_quant
                 or self.is_fp4_expert
@@ -1453,11 +1453,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if not self.block_quant and not self.is_fp4_expert:
                 if not self.quant_config.is_checkpoint_fp8_serialized:
                     raise ValueError(
-                        "DCU W8A8 MegaMoE requires an FP8-serialized checkpoint "
+                        "HCU W8A8 MegaMoE requires an FP8-serialized checkpoint "
                         "with channelwise expert weight scales"
                     )
 
-                build_dcu_w8a8_mega_moe_experts_weights(layer)
+                build_hcu_w8a8_mega_moe_experts_weights(layer)
                 return
 
         if _is_hip and _use_hip_int4:

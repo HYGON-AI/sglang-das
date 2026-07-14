@@ -1,0 +1,8 @@
+# Allowed legacy image strings after HCU rename
+#
+# Only external image/model paths may remain here. Do not add code symbols,
+# suite names, environment variables, function names, file names, or docs titles.
+.github/workflows/lint-hcu.yml:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/nightly-test-hcu.yml:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/release-pr-hcu.yml:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/release-pypi-nightly-hcu.yml:harbor.sourcefind.cn:5443/dcu/admin/base/dev

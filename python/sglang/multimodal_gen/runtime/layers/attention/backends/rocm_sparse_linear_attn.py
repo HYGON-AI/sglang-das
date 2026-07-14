@@ -32,7 +32,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class RocmSparseLinearAttentionBackend(AttentionBackend):
-    """SLA backend for ROCm/DCU using flash_attn.sparse_attn_with_sla."""
+    """SLA backend for ROCm/HCU using flash_attn.sparse_attn_with_sla."""
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -56,7 +56,7 @@ class RocmSparseLinearAttentionBackend(AttentionBackend):
 
 
 class RocmSparseLinearAttentionImpl(AttentionImpl, nn.Module):
-    """ROCm/DCU SLA implementation backed by flash-attention-cutlass."""
+    """ROCm/HCU SLA implementation backed by flash-attention-cutlass."""
 
     def __init__(
         self,
