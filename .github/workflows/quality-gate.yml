@@ -21,6 +21,7 @@ env:
   RUFF_IMAGE: ghcr.io/astral-sh/ruff:0.12.1
   SEMGREP_IMAGE: semgrep/semgrep:1.125.0
   TRIVY_IMAGE: aquasec/trivy:0.63.0
+  HCU_TEXT_CHECK_IMAGE: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
 
 concurrency:
   group: quality-gate-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -192,7 +193,12 @@ jobs:
           CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
           mapfile -t files < <(printf '%s\n' "$CHANGED_FILES")
-          python3 scripts/ci/hcu/check_hcu_runtime_text.py -- "${files[@]}"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo:ro" \
+            -w /repo \
+            "${{ env.HCU_TEXT_CHECK_IMAGE }}" \
+            python3 scripts/ci/hcu/check_hcu_runtime_text.py -- "${files[@]}"
 
   secret-check:
     name: secret-check
