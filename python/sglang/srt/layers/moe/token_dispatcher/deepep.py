@@ -377,6 +377,8 @@ class _DeepEPDispatcherImplBase:
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+        self.set_deepep_dispatcher_dtype()
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
