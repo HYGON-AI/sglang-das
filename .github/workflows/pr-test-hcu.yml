@@ -420,7 +420,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         run: |
           cd "${HCU_CI_CHECKOUT_DIR}"
-          python3.9 scripts/ci/hcu/verify_hcu_registration.py || python3 scripts/ci/hcu/verify_hcu_registration.py
+          python3.9 scripts/ci/hcu/verify_hcu_registration.py
 
       - name: Setup HCU validation container
         if: github.event_name == 'workflow_dispatch'
