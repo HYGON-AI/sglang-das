@@ -1342,3 +1342,40 @@ actual result in the checkpoint note.
   - The single confirmation used the exact command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`. All four TP ranks completed weight loading without entering the incompatible generic MHC bucket prewarm, then captured decode graphs for every configured batch from 128 through 1 and reported service readiness.
   - `GET /health` returned HTTP 200. One short `POST /generate` returned HTTP 200 and completed eight tokens without a worker crash or MHC shape-contract exception. The test service was stopped cleanly afterward and port 10015 was released.
   - The response still contained empty text with eight zero token IDs. This remains a deferred, non-blocking accuracy observation and is not reported as an accuracy pass. The scoped startup/request blocker is resolved; no broader CI or model matrix was run.
+
+### Official main catch-up 20260706 / `9a6f8e599204`
+
+- Branch: `sync/official-main-catchup-20260706`.
+- Base: DCU `main@726ca92425c0cac65419686308b9ee2a9c915f80`, official previous checkpoint `88db9e033a11b2d366a8f9d037f027a46ccb9940`.
+- Endpoint: official `main@9a6f8e599204aa37481f5f37a1b20938aee98d5c` (`[AMD] Fix DeepSeek V4 MTP accuracy issue (#30333)`).
+- Scope: 94 immutable official commits (the planning estimate was 81), 2026-07-04 to 2026-07-06 by official commit date; 414 files changed. Git reported 10 textual conflict files, below the 50-file split threshold.
+- Textual conflicts and decisions (10 files, below the 50-file split threshold):
+  - `.github/workflows/pr-test-npu.yml` (`CI/NPU`, `theirs + line-ending normalization`): accepted the official single-node NPU job and finish dependency; normalized the official CRLF blob to the LF convention already used by DCU `main`, leaving only the 28-line semantic addition.
+  - `python/sglang/jit_kernel/csrc/deepseek_v4/topk_v2.cuh` (`DSV4 JIT top-k`, `theirs`): accepted the official runtime-topk rewrite and deleted legacy compile-time `SGL_TOPK` implementation. DCU/HIP continues to disable JIT top-k v2 and use the registered backend; the shared JIT header provides the ROCm `__grid_constant__` compatibility macro.
+  - `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` (`DSA/indexer`, `manual merge`): adopted official instance-scoped fusion selection and paged-MQA backend wrappers for CUDA/ROCm, while retaining DCU LightOp fused LayerNorm/RoPE, BF16/FP8 index-cache layouts, page-size-64 handling, and LightOp paged/ragged logits. DCU is selected before generic HIP/AITER dispatch.
+  - `python/sglang/srt/layers/moe/topk.py` (`MoE top-k`, `manual merge`): retained DCU LightOp grouped-top-k and postprocess paths, while accepting retirement of the removed AOT fused-gate fake registrations and the unused hard-coded expert-count debug writer.
+  - `python/sglang/srt/layers/quantization/__init__.py` (`quantization registry`, `manual merge`): retained both SlimQuant DCU registrations and added the official NPU `mxfp_w4a8` registration.
+  - `python/sglang/srt/layers/quantization/unquant.py` (`quantization/MoE`, `manual merge`): added the official type-only `ServerArgs` import and CuTeDSL BF16 GEMM branch, then retained the DCU dtype-alignment fallback before `F.linear`.
+  - `python/sglang/srt/models/deepseek_v2.py` (`DeepSeek/MoE`, `manual merge`): retained DCU DSA cache-dequant/attention helpers, added the official unquantized BF16 backend lookup, and accepted Hash-MoE `input_ids` forwarding for TBO sub-batches.
+  - `python/sglang/srt/models/deepseek_v4.py` (`DeepSeek-V4/MHC`, `theirs in conflict`): accepted the official `get_flags().enable_dp_lm_head` LM-head structure. The previously validated `_is_dcu` early return from generic load-time MHC prewarm remains intact, so DCU still specializes MHC lazily from real request shapes.
+  - `python/sglang/srt/server_args.py` (`ServerArgs/config resolution`, `port to new API`): used the official reordered field layout and declarative override pipeline, replayed compatible DCU fields, and ported DCU DSA page-size, `dcu_mla`, Mamba extra-buffer, LightOp/AITER W8A8, and `record_nolora_graph` semantics to the new view/override APIs.
+  - `test/registered/debug_utils/test_dumper.py` (`test registry`, `manual merge`): adopted the official `temp_set_env` import move and preserved the disabled DCU nightly registration alongside AMD/CUDA registration.
+- High-risk semantic audit:
+  - The endpoint's DeepSeek-V4 MTP fix is present exactly in `deepseek_v4_compress_state.py`: HIP C128 cold state now clears every request row instead of only the sentinel row; this intentionally includes DCU and fixes uninitialized cold-request state.
+  - Official ROCm batch-invariant RMSNorm fallback is retained for DCU. DSV4 sparse prefill remains forced off on HIP by the official hook; the pure-TP launcher already requests the same behavior.
+  - DSA paged-MQA backend selection is canonical for CUDA/generic ROCm, but DCU LightOp remains an explicit earlier branch and does not execute the new AITER wrapper. DSV4 top-k v2 remains disabled on HIP/DCU by the existing model defaults.
+  - `SGLANG_USE_AITER_AG=0` remains unchanged; this checkpoint does not remove or retest the custom all-gather graph workaround.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on staged changed files: no output.
+  - `git diff --cached --check`: passed after normalizing the official NPU workflow CRLF blob to the existing LF convention.
+  - `python3 -m py_compile` over 304 changed Python files under `python/sglang` and `test/registered`: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841`: blocked because Ruff remains unavailable (`No module named ruff`); no dependency installation was attempted.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files; retained the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - Workspace import resolved `sglang` and `deepseek_v4.py` under `/home/proj_sglang_open/dcu-sglang/python`; `_is_dcu=True`.
+- Functional validation status:
+  - The only in-scope runtime command remains `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
+  - The command was not started during this validation pass because all eight devices were already at 77-79% VRAM usage (about 116-117 GiB of 147 GiB each) from an external/other-container workload not visible in this process namespace. The launcher requests `--mem-fraction-static 0.8`, so starting it with only about 30 GiB free per device would be a guaranteed allocation failure rather than a meaningful checkpoint test.
+  - No external process was killed and no runtime fix attempt was consumed. The branch may retain its static merge commit, but must not advance `main` or receive a milestone tag until the pure-TP service gate is run on free devices.

@@ -8,12 +8,22 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.jit_kernel.dsa import (
+    aiter_paged_mqa_logits,
+    cutedsl_paged_mqa_logits,
+    deepgemm_paged_mqa_logits_native,
+    deepgemm_paged_mqa_logits_split,
+    pick_dsl_expand,
+)
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -34,7 +44,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -54,7 +64,6 @@ logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
-_use_dsa_indexer_fusion = _is_cuda and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -384,6 +393,11 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.use_dsa_indexer_fusion = (
+            _is_cuda
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and not is_neox_style
+        )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -413,7 +427,7 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        if _use_dsa_indexer_fusion:
+        if self.use_dsa_indexer_fusion:
             self.wk_weights_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim + self.n_heads,
@@ -451,6 +465,10 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_server_args().dsa_paged_mqa_logits_backend
+        )
 
     def _use_dcu_bf16_index_cache(self, forward_batch: ForwardBatch) -> bool:
         return _is_dcu and not getattr(
@@ -574,7 +592,7 @@ class Indexer(MultiPlatformOp):
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
         # index-K cache here matches the fused path that decode reads back.
-        return x if _use_dsa_indexer_fusion else rotate_activation(x)
+        return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         if (
@@ -636,7 +654,7 @@ class Indexer(MultiPlatformOp):
                     )
                 with torch.cuda.stream(self.alt_stream):
                     # TODO we should also put DeepGEMM half SM here?
-                    if _use_dsa_indexer_fusion:
+                    if self.use_dsa_indexer_fusion:
                         key, weights_raw = self._fused_k_weights(x)
                     else:
                         key, _ = self.wk(x)
@@ -657,7 +675,7 @@ class Indexer(MultiPlatformOp):
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
                 )
-                if _use_dsa_indexer_fusion:
+                if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
                     key, _ = self.wk(x)
@@ -938,8 +956,45 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        assert len(q.shape) == 3
+        # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
+        # hidden states; q_offset is the real (unpadded) q length.
+        q_offset = sum(metadata.get_dsa_extend_len_cpu())
 
-        if seqlens_32.dim() == 2:
+        B = metadata.get_seqlens_int32().shape[0]
+        next_n = q_offset // B if B > 0 else 0
+        use_cute_dsl = (
+            not _is_dcu
+            and self.paged_mqa_logits_backend.is_cutedsl()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        dsl_expand_factor, dsl_atom = 1, 1
+        if (
+            use_cute_dsl
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+        ):
+            dsl_expand_factor, dsl_atom = pick_dsl_expand(
+                next_n,
+                batch_size=B,
+                max_ctx=max_seq_len,
+                num_sms=self.sm_count,
+                kernel_atoms=(1, 2, 3, 4),
+                num_heads=self.n_heads,
+            )
+        ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        use_dg_native = (
+            not use_cute_dsl
+            and _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+            and ctx_2d is not None
+            and ctx_2d.shape == (B, next_n)
+        )
+
+        if use_dg_native:
+            seqlens_32_2d = ctx_2d
+        elif seqlens_32.dim() == 2:
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
@@ -977,44 +1032,15 @@ class Indexer(MultiPlatformOp):
             kv_cache_fp8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(
                 layer_id=layer_id
             )
-            assert len(q.shape) == 3
-            q_fp8 = q.unsqueeze(1)  # the next_n dim is 1 now
             assert len(kv_cache_fp8.shape) == 2
-            block_kv = 1 if _is_hip and not _is_dcu else 64
-            num_heads_kv = 1
-            head_dim_with_sf = 132
-            if _is_hip and not _is_dcu:
-                kv_cache_fp8 = kv_cache_fp8.view(
-                    -1, block_kv, num_heads_kv, head_dim_with_sf
-                )
-            else:
-                kv_cache_fp8 = kv_cache_fp8.view(
-                    kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-                )
-            if _is_hip and not _is_dcu:
-                from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+            block_kv = 1 if _is_hip and not _is_dcu else page_size
+            kv_cache_fp8 = kv_cache_fp8.view(-1, block_kv, 1, 132)
 
-                batch_size, next_n, heads, _ = q_fp8.shape
-                logits = torch.full(
-                    (batch_size * next_n, max_seq_len),
-                    float("-inf"),
-                    device=q_fp8.device,
-                    dtype=torch.float32,
-                )
-                deepgemm_fp8_paged_mqa_logits(
-                    q_fp8,
-                    kv_cache_fp8,
-                    weights,
-                    logits,
-                    seqlens_32,
-                    block_tables,
-                    max_seq_len,
-                    Preshuffle=_use_aiter_preshuffle,
-                    KVBlockSize=block_kv,
-                )
-            elif _is_dcu:
+            if _is_dcu:
+                # LightOp keeps the existing DCU ABI with an explicit next_n dim.
+                q_paged = q.unsqueeze(1)
                 logits = gemmopt.paged_mqa_logits(
-                    q_fp8[:q_offset],
+                    q_paged[:q_offset],
                     kv_cache_fp8,
                     weights[:q_offset],
                     seqlens_32,
@@ -1023,16 +1049,61 @@ class Indexer(MultiPlatformOp):
                     max_seq_len,
                     clean_logits=True,
                 )
-            else:
-                logits = deep_gemm.fp8_paged_mqa_logits(
-                    q_fp8[:q_offset],
+            elif self.paged_mqa_logits_backend.is_aiter():
+                logits = aiter_paged_mqa_logits(
+                    q,
                     kv_cache_fp8,
-                    weights[:q_offset],
+                    weights,
                     seqlens_32,
+                    block_tables,
+                    max_seq_len,
+                    preshuffle=_use_aiter_preshuffle,
+                    kv_block_size=block_kv,
+                )
+            elif use_cute_dsl:
+                logits = cutedsl_paged_mqa_logits(
+                    q,
+                    kv_cache_fp8,
+                    weights,
+                    metadata.get_seqlens_int32(),
                     block_tables,
                     schedule_metadata,
                     max_seq_len,
-                    clean_logits=False,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                    is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                    dsl_expand_factor=dsl_expand_factor,
+                    dsl_atom=dsl_atom,
+                    blocksize=blocksize,
+                    sm_count=self.sm_count,
+                    get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                )
+            elif use_dg_native:
+                logits = deepgemm_paged_mqa_logits_native(
+                    deep_gemm.fp8_paged_mqa_logits,
+                    q,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                )
+            else:
+                logits = deepgemm_paged_mqa_logits_split(
+                    deep_gemm.fp8_paged_mqa_logits,
+                    q,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
                 )
 
         # NOTE(dark): logits should be cleaned in topk_transform
@@ -1410,7 +1481,7 @@ class Indexer(MultiPlatformOp):
 
         # Write the same K representation the decode path reads back: fused
         # (no-Hadamard) when fusion is on, else the legacy Hadamard path.
-        if _use_dsa_indexer_fusion:
+        if self.use_dsa_indexer_fusion:
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -1943,12 +2014,12 @@ class Indexer(MultiPlatformOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
         # absent then; short-circuit before touching it.
-        weights_proj_lora = not _use_dsa_indexer_fusion and getattr(
+        weights_proj_lora = not self.use_dsa_indexer_fusion and getattr(
             self.weights_proj, "set_lora", False
         )
 
         if (
-            _use_dsa_indexer_fusion
+            self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ):
@@ -2072,7 +2143,7 @@ class Indexer(MultiPlatformOp):
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if not _use_dsa_indexer_fusion:
+            if not self.use_dsa_indexer_fusion:
                 if weights_proj_lora:
                     weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
                 else:
@@ -2089,7 +2160,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            if _use_dsa_indexer_fusion:
+            if self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
@@ -2170,7 +2241,7 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if in_piecewise_or_breakable_cuda_graph:
-                if _use_dsa_indexer_fusion:
+                if self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
                         weights_raw,
                         self.n_heads**-0.5,
@@ -2187,7 +2258,7 @@ class Indexer(MultiPlatformOp):
                         self.softmax_scale,
                         q_scale,
                     )
-            elif _use_dsa_indexer_fusion:
+            elif self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
@@ -2686,7 +2757,7 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if _use_dsa_indexer_fusion:
+    if indexer.use_dsa_indexer_fusion:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,

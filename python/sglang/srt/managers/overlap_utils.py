@@ -131,6 +131,7 @@ class RelayPayload:
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     @classmethod
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
@@ -140,6 +141,7 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
+            dsa_topk_indices=getattr(draft_input, "dsa_topk_indices", None),
         )
 
 
@@ -236,6 +238,15 @@ class FutureMap:
                 device=self.device,
             )
 
+        self.dsa_topk_indices_buf = None
+        if payload.dsa_topk_indices is not None:
+            seed0 = payload.dsa_topk_indices[0]
+            self.dsa_topk_indices_buf = torch.empty(
+                (self.req_pool_size, *seed0.shape),
+                dtype=payload.dsa_topk_indices.dtype,
+                device=self.device,
+            )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -275,6 +286,8 @@ class FutureMap:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
+        if self.dsa_topk_indices_buf is not None:
+            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -358,3 +371,10 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
+        if (
+            self.dsa_topk_indices_buf is not None
+            and payload.dsa_topk_indices is not None
+        ):
+            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
+                self.dsa_topk_indices_buf.dtype
+            )
