@@ -1444,7 +1444,7 @@ actual result in the checkpoint note.
 
 - Branch: `sync/official-main-catchup-20260710`.
 - Base: DCU `main@68d965671265f5d3859ba767cc3bd4e94cc03dce`, official previous checkpoint `bd7e54d7379e437cf5f027382d6ca214e046626b`.
-- Endpoint: official `main@e1d51be91f6be39e585756568a8f66b99ac2c512` (`[AMD] Optimize RMSNorm for gfx950 (#30690)`).
+- Endpoint: official `main@e1d51be91f6be39e585756568a8f66b99ac2c512` (`[Tiny] Fix a typo in cookbook (#30837)`).
 - Scope: 93 immutable official commits; 751 files changed, 34,706 insertions, 11,075 deletions, 65 detected renames, and 9 deletions. Git reported 22 textual conflict files and 37 conflict hunks, below the 50-file split threshold.
 - Textual conflicts and decisions:
   - `python/pyproject.toml` (`dependency`, `manual merge`): accepted official FlashInfer `0.6.14` and repaired the adjacent `smg`/`soundfile` dependency split without restoring CUDA-only DCU dependencies.
