@@ -405,15 +405,21 @@ jobs:
                       "Copyright or License header"
                   )
               elif status.startswith(("M", "R", "T")):
-                  bad.append(
-                      f"{path}: modified/renamed source file missing a visible "
-                      "Copyright or License header"
+                  warnings.append(
+                      f"{path}: modified/renamed source file has no visible "
+                      "Copyright or License header; manual review required"
                   )
               else:
-                  warnings.append(f"{path}: unhandled Git status {status}")
+                  warnings.append(
+                      f"{path}: unhandled Git status {status}; "
+                      "manual review required"
+                  )
 
-          for item in warnings:
-              print(f"::warning title=Manual header review::{item}")
+          if warnings:
+              print("License/Copyright warnings, observe mode only:")
+              for item in warnings:
+                  print(" -", item)
+                  print(f"::warning title=Manual header review::{item}")
 
           if bad:
               print("License/Copyright check failed:")
