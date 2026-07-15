@@ -482,11 +482,18 @@ Forward-port progress on 2026-07-15 CST:
 - Step 3 endpoint `80571de9491c` is committed as merge `d648b38c7f3d`. Its FSDP/HY3,
   attention, HCU-visible-compliance, and `_is_dcu` refactor audits are complete;
   static and pure-TP startup/health/request gates passed without a code retry.
-- Step 4 endpoint `cf5983854be1` has all 9 conflicts resolved. DCU HiCache was
+- Step 4 endpoint `cf5983854be1` is committed as merge `f76fbea9601d`. DCU HiCache was
   moved into the canonical host-pool module, old CUDA-graph behavior moved to
   the current base runner, and packed KV/MiniMax/MiMo behavior was adapted to
   current runtime APIs. Static and pure-TP gates passed without a runtime retry.
+- Step 5 endpoint `5ec8531b096f` is committed as merge `8a075ddc63af` after
+  resolving 9 conflicts. Mooncake heterogeneous-TP transfer, DeepSeek V3.2
+  fused RMS quantization, MiMo KME/RoPE/MTP/EPLB, DCU LightOp INT8 MoE, and
+  AITER W4A16 MoE_C were ported to current APIs. Static and pure-TP gates
+  passed after one static optional-LightOp capability fix; no runtime retry was
+  required.
 - The known empty-output/eight-zero-token result remains an explicitly
   non-blocking accuracy issue and is not reported as an accuracy pass.
-- Continue with exact endpoint `5ec8531b096f`, retaining a separate no-ff merge
-  and evidence record for it.
+- All five immutable endpoints are now present as exact no-ff second parents on
+  `forward-port/v0.5.12-dev-20260715`. The branch is ready for migration-owner
+  review and remains separate from `main` until explicitly approved.

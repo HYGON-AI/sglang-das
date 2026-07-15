@@ -1907,6 +1907,6 @@ actual result in the checkpoint note.
     known non-blocking NaN/accuracy observation rather than an accuracy pass;
   - no runtime retry was needed; port 10015 closed and all selected devices
     returned to VRAM/HCU 0%.
-- Status: resolved and validated; exact Step 5 merge commit pending.
+- Status: committed as merge `8a075ddc63af713025cc585fa8d37a84cc99e217`; validated.
 - Detailed conflict decisions and evidence:
   `docs/internal/dcu-main-forward-port-v0.5.12-dev-step5-conflict-review.md`.

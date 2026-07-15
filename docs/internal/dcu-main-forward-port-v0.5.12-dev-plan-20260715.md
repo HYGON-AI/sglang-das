@@ -100,7 +100,7 @@ rsync repositories between the two test machines.
 | 2 | `fde56844fca442108bf3d2c71cbdeacb4ddb8f08` | committed as `c7ffa6497a9e` | 32 textual conflicts; static gates passed; pure-TP passed after one focused optional-DeepGEMM import fix |
 | 3 | `80571de9491c8fd80e6822c9fa4efeb02ff67cce` | committed as `d648b38c7f3d` | 66 textual conflicts; static gates and pure-TP startup/health/request passed; known empty output remains non-blocking |
 | 4 | `cf5983854be1f19237ba28416b438f7b8965cfe6` | committed as `f76fbea9601d` | 9 textual conflicts; static gates and pure-TP startup/health/request passed without retry |
-| 5 | `5ec8531b096fa3297ab034dedc873aad215f2c35` | resolved and validated; merge commit pending | 9 textual conflicts; static gates and pure-TP passed after one static optional-LightOp capability fix |
+| 5 | `5ec8531b096fa3297ab034dedc873aad215f2c35` | committed as `8a075ddc63af` | 9 textual conflicts; static gates and pure-TP passed after one static optional-LightOp capability fix |
 
 Step 2 keeps the official-main file/API layout canonical. Its old C16/BF16 KV
 store moved from `mem_cache/utils.py` to `kernels/ops/kvcache/mla_buffer.py`;
