@@ -1502,3 +1502,36 @@ actual result in the checkpoint note.
   - The service was stopped cleanly after the request and port 10015 was released. No broader CI, model, topology, accuracy, or throughput test was run.
 - Integration decision:
   - Static and functional gates passed under the scoped policy. Fast-forward this validated branch to `main` and create annotated tag `dcu-main-sync-official-20260710`; do not push as part of this step.
+
+### Official main catch-up 20260712 / `82e7cdcff9aa`
+
+- Branch: `sync/official-main-catchup-20260712`.
+- Base: DCU `main@ef85596515098410395f504fb2928e3b28f3520b`, official previous checkpoint `e1d51be91f6be39e585756568a8f66b99ac2c512`.
+- Endpoint: official `main@82e7cdcff9aa5f49156c3ace73a826f30854ae91` (`[Misc] Remove a few dead code paths in DSA (#30973)`).
+- Scope: 34 immutable official commits; 203 files changed, 21,094 insertions, 1,611 deletions, one test-file rename, and no deletions. Git reported 2 textual conflict files, below the 50-file split threshold.
+- Textual conflicts and decisions:
+  - `python/sglang/srt/layers/attention/deepseek_v4_backend.py` (`DSV4 attention/spec graph`, `manual merge`): accepted official DSpark and compact ragged-verify metadata imports and lifecycle while retaining the DCU `is_dcu` and LightOp quant-cache environment dispatch. The existing DCU branch remains ahead of generic paths.
+  - `python/sglang/srt/layers/mhc.py` (`MHC/TileLang`, `port to new API`): adopted official lazy TileLang loading so model-registry discovery does not load native stubs, retained the DCU AITER TileLang MHC route and warmup state, and moved the ROCm `decouple_type_cast` bool-allocation patch into the first real TileLang load before JIT compilation.
+- High-risk semantic and move audit:
+  - Official DSV4 draft-extend, DSpark, and compact ragged-verify graph metadata are canonical. The retained DCU LightOp quant-cache route and HIP radix backend remain explicit and were not displaced by the new imports or graph-key logic.
+  - `MLATokenToKVPoolHost` moved from `memory_pool_host.py` to `mem_cache/pool_host/mla.py`. The moved class retains HIP JIT enablement, staged page-first write-back, layer-sharded transfer behavior, and all supported layouts; all active imports were updated to the new module.
+  - DSA fused metadata generation no longer uses the old environment toggle, but every fused path still requires `not _is_hip`, so DCU remains on the existing non-fused metadata route.
+  - The only rename is `test_gqa_preill_cp.py` to `test_gqa_prefill_cp.py`; there are no deleted runtime files to forward-port. Source scans found no stale references to the old test name or the previously removed attention/model Triton namespaces.
+  - Existing `get_attention_tp_size` references in the legacy DCU MLA backend and KV-cache mixin predate this range and are not touched by Step 1; the planned ModelRunner/ParallelState refactor checkpoint remains the canonical place to reconcile them rather than mixing an unrelated cleanup into this merge.
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still sets `SGLANG_USE_AITER_AG=0`, `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1`, and `SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE=1`; this checkpoint does not remove any workaround.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on staged changed files: no output.
+  - `git diff --cached --check`: passed.
+  - `python3 -m py_compile` over 192 changed Python files: passed.
+  - Ruff `E9,F401,F811,F821,F841`: blocked because neither a Ruff module nor binary is installed in the current host environment; no dependency installation was attempted.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files and the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - Workspace import resolved both `sglang` and `mhc.py` under `/home/proj_sglang_open/sglang-das/python`; `_is_dcu=True`. With the DCU AITER MHC environment switch disabled for the import-only check, real TileLang remained unloaded and absent from `sys.modules`.
+- Functional validation status:
+  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
+  - Check `hy-smi` on both shared-home environments before starting; use an idle environment only and do not rsync `/home`.
+  - Accuracy, throughput, alternate models/topologies, DSpark/ragged-verify runtime, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
+- Code conflict review artifact:
+  - Pending generation after the resolved merge commit; it must contain only the two actual conflict files and be committed before handoff or integration to `main`.
