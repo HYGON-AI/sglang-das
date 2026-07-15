@@ -73,7 +73,7 @@ def get_batch_sizes_to_capture(
         mul_base *= 2
         num_tokens_per_req = 1
 
-    if require_gathered_buffer(server_args):
+    if require_gathered_buffer(server_args) or server_args.minimax_opt:
         mul_base *= get_parallel().attn_tp_size
 
     if mul_base % get_parallel().attn_cp_size != 0:

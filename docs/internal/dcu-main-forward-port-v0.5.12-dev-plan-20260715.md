@@ -98,8 +98,8 @@ rsync repositories between the two test machines.
 |---|---|---|---|
 | 1 | `8736a794acee8253019704cf00a901fd7ffcefbe` | committed as `e7e06b77881d` | static gates passed; pure-TP startup, health, and request passed; known empty output remains non-blocking |
 | 2 | `fde56844fca442108bf3d2c71cbdeacb4ddb8f08` | committed as `c7ffa6497a9e` | 32 textual conflicts; static gates passed; pure-TP passed after one focused optional-DeepGEMM import fix |
-| 3 | `80571de9491c8fd80e6822c9fa4efeb02ff67cce` | resolved and validated; merge commit pending | 66 textual conflicts; static gates and pure-TP startup/health/request passed; known empty output remains non-blocking |
-| 4 | `cf5983854be1f19237ba28416b438f7b8965cfe6` | pending | not run |
+| 3 | `80571de9491c8fd80e6822c9fa4efeb02ff67cce` | committed as `d648b38c7f3d` | 66 textual conflicts; static gates and pure-TP startup/health/request passed; known empty output remains non-blocking |
+| 4 | `cf5983854be1f19237ba28416b438f7b8965cfe6` | resolved and validated; merge commit pending | 9 textual conflicts; static gates and pure-TP startup/health/request passed without retry |
 | 5 | `5ec8531b096fa3297ab034dedc873aad215f2c35` | pending | not run |
 
 Step 2 keeps the official-main file/API layout canonical. Its old C16/BF16 KV
@@ -118,3 +118,19 @@ compliance wording. Static gates and the pure-TP startup/health/request gate
 passed without a code retry. The complete 66-file conflict inventory and
 semantic audit are in
 `docs/internal/dcu-main-forward-port-v0.5.12-dev-step3-conflict-review.md`.
+
+Step 4 keeps the current host-cache, runtime-context, and CUDA-graph structure
+canonical. The old DCU MHA host pool moved from the obsolete monolithic module
+to `mem_cache/pool_host/mha.py`; all current callers pass the configured layout.
+The removed CUDA-graph file stays deleted and its MiniMax behavior moved to the
+current base runner. Packed paged-KV, MiniMax SP/Marlin, MiMo TP1, Mooncake,
+and quantization behavior are retained with the DCU layout explicitly guarded
+by `is_dcu()`.
+
+All Step 4 static gates passed: 28 changed Python files compiled, broad and
+targeted Ruff passed, seven high-risk modules imported, DCU registration found
+277 files, DSA passed 19 tests, and gfx938 HIP setup passed. Immediate preflight
+rejected occupied `zz-nmz26` and selected idle `zz-nmz22`; the exact pure-TP
+service loaded 46 shards, captured graphs `bs=128..1`, and returned HTTP 200
+for health and generate. The known empty eight-zero-token result remains
+non-blocking. Detailed evidence is in the Step 4 conflict review.

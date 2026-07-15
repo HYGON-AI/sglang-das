@@ -61,7 +61,9 @@ def build_kv_host_pool(
     override_kv_cache_dim: Optional[int] = None,
 ):
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
+        MLATokenToKVPoolHost
+        if use_mla
+        else get_mha_host_pool_cls(kv_pool, server_args.hicache_mem_layout)
     )
     kwargs = {}
     if override_kv_cache_dim is not None:

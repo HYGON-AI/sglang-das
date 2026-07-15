@@ -129,15 +129,25 @@ class W8A8Int8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-        if should_ignore_layer(
-            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-        ):
-            return UnquantizedLinearMethod()
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.quantization.fp8 import Fp8KVCacheMethod
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
         if isinstance(layer, LinearBase):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return W8A8Int8MoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            return Fp8KVCacheMethod(self)
         return None
 
     def is_layer_skipped(

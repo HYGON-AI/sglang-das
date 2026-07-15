@@ -1789,3 +1789,59 @@ actual result in the checkpoint note.
   - service stopped, port 10015 closed, and `zz-nmz22` returned to VRAM/HCU 0%.
 - Detailed file-by-file groups and evidence:
   `docs/internal/dcu-main-forward-port-v0.5.12-dev-step3-conflict-review.md`.
+
+### v0.5.12_dev forward-port Step 4 / `cf5983854be1`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 3 merge `d648b38c7f3dd314ca1a5e098144e554949b3a84`.
+- Old range: `80571de9491c8fd80e6822c9fa4efeb02ff67cce..cf5983854be1f19237ba28416b438f7b8965cfe6`.
+- Scope: 26 full-graph commits, 18 non-merge commits, 30 old-range files;
+  resolved code before documentation changes is 32 files with 3,308
+  insertions and 295 deletions.
+- Git reported exactly 9 textual conflict files:
+  - decode KV offload, FlashAttention, DeepEP MoE, HiRadix, the old host-pool
+    facade, Mooncake, the removed old CUDA-graph runner, MiniMax M2, and
+    ServerArgs;
+  - all were resolved against current APIs while retaining the old DCU feature
+    intent.
+- Refactor/move decisions:
+  - moved `MHATokenToKVPoolHostDCU` from the old monolithic host-pool file to
+    current `mem_cache/pool_host/mha.py`, including page-major K/V buffers,
+    kvcacheio direct/kernel transfers, and explicit unsupported-layout guards;
+  - passed `hicache_mem_layout` through decode offload, HiRadix, hybrid pool,
+    and draft KV-cache callers so the DCU implementation remains reachable;
+  - kept `model_executor/cuda_graph_runner.py` deleted and ported its MiniMax
+    gathered-buffer multiple to `runner/base_cuda_graph_runner.py`;
+  - retained the current Mooncake hybrid logical-anchor guard and generalized
+    recursive registration for tuple/list K/V buffers;
+  - adapted old MiniMax/MiMo accessor calls to `get_server_args()` and
+    `get_parallel()`.
+- `_is_dcu` audit:
+  - packed paged-KV can use `SGLANG_KV_LAYOUT_DCU_FA` only when `is_dcu()`;
+  - current `_is_hip` DeepEP and quantization paths were reviewed without
+    replacing dedicated DCU LightOp/cache behavior;
+  - no runtime `is_hcu()` predicate or removed API was introduced;
+  - `SGLANG_USE_AITER_AG=0` remains unchanged.
+- Static validation passed:
+  - zero unmerged entries and no precise markers;
+  - `git diff --check` passed after seven upstream trailing-space artifacts in
+    `transfer.cu` were removed;
+  - all 28 changed Python files compiled;
+  - broad Ruff `E9,F821` and targeted high-risk Ruff
+    `E9,F401,F811,F821,F841` passed;
+  - seven high-risk modules passed direct import smoke;
+  - DCU registration passed with 277 files and the existing CPU-utils warning;
+  - DSA alias/CLI/registry passed 19 tests;
+  - gfx938 HIP setup passed with package `sglang-kernel`, zero unsupported CUDA
+    calls, and 56 replaced launches.
+- Pure-TP validation:
+  - immediate preflight rejected `zz-nmz26`, where all devices were VRAM 93%,
+    and selected `zz-nmz22`, where all devices were VRAM/HCU 0%;
+  - the exact required script loaded 46 shards, captured graphs `bs=128..1`,
+    reached readiness, and returned HTTP 200 for `/health` and `/generate`;
+  - response text remained empty with eight zero output IDs, the known
+    non-blocking NaN/accuracy observation;
+  - no runtime fix or retry was needed; port 10015 closed and all selected
+    devices returned to VRAM 0%.
+- Detailed conflict decisions and evidence:
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step4-conflict-review.md`.

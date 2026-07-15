@@ -32,7 +32,6 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -107,7 +106,7 @@ def maybe_register_hicache_draft(
         allocator_type=server_args.hicache_storage_backend,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool, kw["layout"])(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:

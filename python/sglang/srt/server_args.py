@@ -1082,6 +1082,10 @@ class ServerArgs:
         "which can cause kernel autotuners to select wrong-sized variants "
         "at small batches.",
     ] = False
+    minimax_opt: A[
+        bool,
+        "Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
+    ] = False
     enable_p2p_check: A[
         bool,
         "Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
@@ -1570,6 +1574,23 @@ class ServerArgs:
         ),
     ] = "sgl-kernel"
     disable_flashinfer_autotune: A[bool, "Disable FlashInfer autotuning."] = False
+    pack_paged_kv_to_varlen: A[
+        Literal["auto", "on", "off"],
+        Arg(
+            help=(
+                "Control the optional packed paged-KV to varlen attention path. "
+                "'auto' uses shape/platform heuristics, 'on' keeps only "
+                "correctness guards, and 'off' disables the path."
+            ),
+            choices=["auto", "on", "off"],
+        ),
+    ] = "auto"
+    pack_paged_kv_to_varlen_min_kv_tokens: A[
+        int, "Minimum total KV tokens for the packed paged-KV auto policy."
+    ] = 16384
+    pack_paged_kv_to_varlen_min_q_tokens: A[
+        int, "Minimum query tokens for the packed paged-KV auto policy."
+    ] = 8192
     mamba_backend: A[
         str,
         Arg(
@@ -2232,6 +2253,7 @@ class ServerArgs:
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "layout_dcu",
             ],
         ),
     ] = "page_first"
@@ -4563,6 +4585,7 @@ class ServerArgs:
                 if (
                     expected_attn_tp_size is not None
                     and effective_attn_tp_size != expected_attn_tp_size
+                    and effective_attn_tp_size != 1
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "

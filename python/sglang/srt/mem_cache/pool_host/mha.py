@@ -35,9 +35,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_dcu, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -1230,12 +1231,261 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
 
 
-def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
+class MHATokenToKVPoolHostDCU(HostKVCache):
+    """DCU MHA/GQA host pool matching the page-major FA cache layout.
+
+    K is stored as ``[page, layer, kv_head, page_token, head_dim]`` while V
+    is stored as ``[page, layer, kv_head, head_dim, page_token]``. Keeping the
+    two buffers independent preserves the device layout and avoids a transpose
+    during HiCache/Mooncake offload.
+    """
+
+    device_pool: MHATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        if layout != "layout_dcu":
+            raise ValueError(
+                "MHATokenToKVPoolHostDCU requires hicache_mem_layout=layout_dcu, "
+                f"got {layout!r}"
+            )
+        if device_pool.layer_shard_enabled:
+            raise ValueError(
+                "layout_dcu HiCache does not support layer-sharded KV pools"
+            )
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+        k_by_layer = self.k_buffer.transpose(0, 1)
+        v_by_layer = self.v_buffer.transpose(0, 1)
+        self.k_data_refs = [k_by_layer[i] for i in range(self.layer_num)]
+        self.v_data_refs = [v_by_layer[i] for i in range(self.layer_num)]
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def get_size_per_token(self):
+        self.head_num = self.device_pool.head_num
+        self.head_dim = self.device_pool.head_dim
+        self.layer_num = self.device_pool.layer_num
+        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token() // 2
+
+    def init_kv_buffer(self):
+        k_shape = (
+            self.page_num,
+            self.layer_num,
+            self.head_num,
+            self.page_size,
+            self.head_dim,
+        )
+        v_shape = (
+            self.page_num,
+            self.layer_num,
+            self.head_num,
+            self.head_dim,
+            self.page_size,
+        )
+        self.token_stride_size = (
+            self.page_size * self.head_num * self.head_dim * self.dtype.itemsize
+        )
+        alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        kwargs = dict(
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        return alloc(k_shape, **kwargs), alloc(v_shape, **kwargs)
+
+    @property
+    def k_buffer(self):
+        return self.kv_buffer[0]
+
+    @property
+    def v_buffer(self):
+        return self.kv_buffer[1]
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            from sgl_kernel.kvcacheio import (
+                transfer_kv_per_layer_kernel_pf_lf_H2D_dcu,
+            )
+
+            transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
+                src_k=self.k_buffer,
+                dst_k=device_pool.k_buffer[layer_id],
+                src_v=self.v_buffer,
+                dst_v=device_pool.v_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                item_size=self.token_stride_size,
+                src_layout_dim=self.token_stride_size * self.layer_num,
+                page_size=self.page_size,
+                layer_id=layer_id,
+            )
+        elif io_backend == "direct":
+            from sgl_kernel.kvcacheio import transfer_kv_all_direct_pf_lf_H2D_dcu
+
+            transfer_kv_all_direct_pf_lf_H2D_dcu(
+                src_ptrs_k=self.k_buffer,
+                src_ptrs_v=self.v_buffer,
+                dst_ptrs_k=device_pool.k_buffer,
+                dst_ptrs_v=device_pool.v_buffer,
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                start_layer_id=layer_id,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported layout_dcu IO backend: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if io_backend == "kernel":
+            from sgl_kernel.kvcacheio import transfer_kv_all_kernel_lf_pf_D2H_dcu
+
+            transfer_kv_all_kernel_lf_pf_D2H_dcu(
+                src_k=device_pool.k_data_ptrs,
+                dst_k=self.k_buffer,
+                src_v=device_pool.v_data_ptrs,
+                dst_v=self.v_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.token_stride_size,
+                srt_layout_dim=self.token_stride_size * self.page_num,
+                dst_layout_dim=self.token_stride_size * self.layer_num,
+                page_size=self.page_size,
+                layer_num=self.layer_num,
+            )
+        elif io_backend == "direct":
+            from sgl_kernel.kvcacheio import transfer_kv_all_direct_lf_pf_D2H_dcu
+
+            transfer_kv_all_direct_lf_pf_D2H_dcu(
+                src_ptrs_k=device_pool.k_buffer,
+                src_ptrs_v=device_pool.v_buffer,
+                dst_ptrs_k=self.k_buffer,
+                dst_ptrs_v=self.v_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                start_layer_id=0,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported layout_dcu IO backend: {io_backend}")
+
+    def get_data_page(self, index, flat: bool = True):
+        page = int(index) // self.page_size
+        k_page = self.k_buffer[page : page + 1]
+        v_page = self.v_buffer[page : page + 1]
+        if flat:
+            return k_page.flatten(), v_page.flatten()
+        return k_page, v_page
+
+    def get_dummy_flat_data_page(self):
+        k_shape = (1, self.layer_num, self.head_num, self.page_size, self.head_dim)
+        v_shape = (1, self.layer_num, self.head_num, self.head_dim, self.page_size)
+        kwargs = dict(dtype=self.dtype, device=self.device, pin_memory=self.pin_memory)
+        return torch.zeros(k_shape, **kwargs).flatten(), torch.zeros(
+            v_shape, **kwargs
+        ).flatten()
+
+    def set_from_flat_data_page(self, index: int, data_page) -> None:
+        k_page, v_page = data_page
+        page = int(index) // self.page_size
+        self.k_buffer[page : page + 1].copy_(
+            k_page.reshape(
+                1, self.layer_num, self.head_num, self.page_size, self.head_dim
+            )
+        )
+        self.v_buffer[page : page + 1].copy_(
+            v_page.reshape(
+                1, self.layer_num, self.head_num, self.head_dim, self.page_size
+            )
+        )
+
+    def get_split_heads_page_buffer_meta(self, indices, split_factor: int):
+        raise NotImplementedError("layout_dcu does not support split-head metadata")
+
+    def get_page_buffer_meta(self, indices):
+        assert len(indices) % self.page_size == 0
+        k_base = self.k_buffer.data_ptr()
+        v_base = self.v_buffer.data_ptr()
+        ptrs = []
+        for token_index in indices.tolist()[:: self.page_size]:
+            offset = (
+                token_index
+                * self.layer_num
+                * self.head_num
+                * self.head_dim
+                * self.dtype.itemsize
+            )
+            ptrs.extend((k_base + offset, v_base + offset))
+        element_size = (
+            self.layer_num
+            * self.dtype.itemsize
+            * self.page_size
+            * self.head_num
+            * self.head_dim
+        )
+        return ptrs, [element_size] * len(ptrs)
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        page_stride = (
+            self.layer_num
+            * self.head_num
+            * self.page_size
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        return (
+            self.k_buffer.data_ptr() % page_size_bytes == 0
+            and self.v_buffer.data_ptr() % page_size_bytes == 0
+            and page_stride % page_size_bytes == 0
+        )
+
+
+def get_mha_host_pool_cls(
+    device_pool: MHATokenToKVPool, layout: str | None = None
+) -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
+
+    DCU's page-major FlashAttention layout owns a dedicated host pool. Other
+    layouts and generic HIP retain the official host-pool implementations.
 
     Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    if _is_dcu and layout == "layout_dcu":
+        return MHATokenToKVPoolHostDCU
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost

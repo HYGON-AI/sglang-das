@@ -739,7 +739,10 @@ class HiCacheController:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
-            if self.mem_pool_host.layout == "layer_first":
+            if (
+                self.mem_pool_host.layout == "layer_first"
+                or self.mem_pool_host.layout == "layout_dcu"
+            ):
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)

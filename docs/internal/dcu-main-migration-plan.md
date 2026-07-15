@@ -479,10 +479,14 @@ Forward-port progress on 2026-07-15 CST:
 - Step 2 endpoint `fde56844fca4` is committed as merge `c7ffa6497a9e` after
   resolving 32 conflicts and passing static plus pure-TP gates with one focused
   optional-DeepGEMM import fix.
-- Step 3 endpoint `80571de9491c` has all 66 conflicts resolved. Its FSDP/HY3,
+- Step 3 endpoint `80571de9491c` is committed as merge `d648b38c7f3d`. Its FSDP/HY3,
   attention, HCU-visible-compliance, and `_is_dcu` refactor audits are complete;
   static and pure-TP startup/health/request gates passed without a code retry.
+- Step 4 endpoint `cf5983854be1` has all 9 conflicts resolved. DCU HiCache was
+  moved into the canonical host-pool module, old CUDA-graph behavior moved to
+  the current base runner, and packed KV/MiniMax/MiMo behavior was adapted to
+  current runtime APIs. Static and pure-TP gates passed without a runtime retry.
 - The known empty-output/eight-zero-token result remains an explicitly
   non-blocking accuracy issue and is not reported as an accuracy pass.
-- Continue with exact endpoints `cf5983854be1` and `5ec8531b096f`, retaining a
-  separate no-ff merge and evidence record for each.
+- Continue with exact endpoint `5ec8531b096f`, retaining a separate no-ff merge
+  and evidence record for it.

@@ -55,7 +55,9 @@ class DecodeKVCacheOffloadManager:
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
+            self.decode_host_mem_pool = get_mha_host_pool_cls(
+                kv_cache, server_args.hicache_mem_layout
+            )(
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -335,10 +337,8 @@ class DecodeKVCacheOffloadManager:
         state = self.offloaded_state.get(req.rid)
         if state is None:
             prefill_len = len(req.origin_input_ids) // self.page_size * self.page_size
-            inc_len = 0
         else:
             prefill_len = state.prefill_len
-            inc_len = state.inc_len
         # Prefill-aligned slots are freed by _release_finished_req. Make
         # sure state exists so it can find prefill_len.
         if state is None:

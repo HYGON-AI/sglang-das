@@ -157,8 +157,7 @@ class MiMoV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -211,7 +210,6 @@ class MoEGate(nn.Module):
 
 
 class MiMoV2MoE(nn.Module):
-
     def __init__(
         self,
         config: MiMoV2Config,
@@ -976,7 +974,7 @@ class MiMoV2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
@@ -1078,9 +1076,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.model is not None
-        ), "get_input_embedding() is not available in encoder_only mode"
+        assert self.model is not None, (
+            "get_input_embedding() is not available in encoder_only mode"
+        )
         return self.model.get_input_embedding(input_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -1194,9 +1192,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        assert (
-            not self.config.encoder_only
-        ), "forward() should not be called in encoder_only mode"
+        assert not self.config.encoder_only, (
+            "forward() should not be called in encoder_only mode"
+        )
 
         if self._is_multimodal:
             hidden_states = general_mm_embed_routine(
@@ -1372,9 +1370,63 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                         self.config
                     )
-                    load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
-                    )
+                    attn_tp_size = get_parallel().attn_tp_size
+
+                    if attn_tp_size == 1 and expected_fused_tp_size is not None:
+                        fused_tp = expected_fused_tp_size
+                        layer_id = get_layer_id(name)
+                        is_swa = (
+                            layer_id is not None
+                            and hasattr(self.config, "hybrid_layer_pattern")
+                            and self.config.hybrid_layer_pattern[layer_id] == 1
+                        )
+                        if is_swa and hasattr(self.config, "swa_num_attention_heads"):
+                            total_q = (
+                                self.config.swa_num_attention_heads
+                                * self.config.swa_head_dim
+                            )
+                            total_k = (
+                                self.config.swa_num_key_value_heads
+                                * self.config.swa_head_dim
+                            )
+                            total_v = self.config.swa_num_key_value_heads * getattr(
+                                self.config, "swa_v_head_dim", self.config.swa_head_dim
+                            )
+                        else:
+                            total_q = (
+                                self.config.num_attention_heads * self.config.head_dim
+                            )
+                            total_k = (
+                                self.config.num_key_value_heads * self.config.head_dim
+                            )
+                            total_v = self.config.num_key_value_heads * getattr(
+                                self.config, "v_head_dim", self.config.head_dim
+                            )
+                        per_rank_q = total_q // fused_tp
+                        per_rank_k = total_k // fused_tp
+                        per_rank_v = total_v // fused_tp
+                        per_rank_total = per_rank_q + per_rank_k + per_rank_v
+
+                        chunks = loaded_weight.split([per_rank_total] * fused_tp, dim=0)
+                        q_parts = [ch[:per_rank_q] for ch in chunks]
+                        k_parts = [
+                            ch[per_rank_q : per_rank_q + per_rank_k] for ch in chunks
+                        ]
+                        v_parts = [
+                            ch[
+                                per_rank_q + per_rank_k : per_rank_q
+                                + per_rank_k
+                                + per_rank_v
+                            ]
+                            for ch in chunks
+                        ]
+
+                        reordered = torch.cat(q_parts + k_parts + v_parts, dim=0)
+                        default_weight_loader(param, reordered)
+                    else:
+                        load_mimo_v2_qkv_proj_weight(
+                            name, param, loaded_weight, expected_fused_tp_size
+                        )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1435,15 +1487,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "get_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "get_embed_and_head() is not available in encoder_only mode"
+        )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "set_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "set_embed_and_head() is not available in encoder_only mode"
+        )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
