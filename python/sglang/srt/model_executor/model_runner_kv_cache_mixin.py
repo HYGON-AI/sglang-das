@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -153,11 +167,11 @@ class ModelRunnerKVCacheMixin:
                 swa_layers_num = len(self.model_config.swa_attention_layer_ids)
 
                 full_per_token = self.model_config.get_num_kv_heads(
-                    get_attention_tp_size()
+                    get_parallel().attn_tp_size
                 ) * (self.model_config.head_dim + self.model_config.v_head_dim)
 
                 swa_per_token = self.model_config.get_swa_num_kv_heads(
-                    get_attention_tp_size()
+                    get_parallel().attn_tp_size
                 ) * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
 
                 cell_size = (
@@ -165,7 +179,7 @@ class ModelRunnerKVCacheMixin:
                 ) * kv_size
             else:
                 cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
                     * (self.model_config.head_dim + self.model_config.v_head_dim)
                     * num_layers
                     * kv_size
@@ -175,7 +189,7 @@ class ModelRunnerKVCacheMixin:
                 # kv_scale_buffer
                 scale_block_size = 16
 
-                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                n = self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
                 k = self.model_config.head_dim
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size

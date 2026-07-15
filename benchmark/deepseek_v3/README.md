@@ -150,7 +150,7 @@ Finally, I need to make sure that this is the correct answer. Yes, Paris is inde
 
 ### Example: Serving with two H20\*8 nodes
 
-For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`. Please **use the first node's IP** for both commands.
+For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `203.0.113.11`, and the second node's IP is `203.0.113.12`. Please **use the first node's IP** for both commands.
 
 If the command fails, try setting the `GLOO_SOCKET_IFNAME` parameter. For more information, see [Common Environment Variables](https://pytorch.org/docs/stable/distributed.html#common-environment-variables).
 
@@ -158,10 +158,10 @@ If the multi nodes support NVIDIA InfiniBand and encounter hanging issues during
 
 ```bash
 # node 1
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 0 --trust-remote-code
+python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 203.0.113.11:5000 --nnodes 2 --node-rank 0 --trust-remote-code
 
 # node 2
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 10.0.0.1:5000 --nnodes 2 --node-rank 1 --trust-remote-code
+python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 203.0.113.11:5000 --nnodes 2 --node-rank 1 --trust-remote-code
 ```
 
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
@@ -194,7 +194,7 @@ SGLANG_ENABLE_JIT_DEEPGEMM=false python3 -m sglang.launch_server --model-path=de
 
 ### Example: Serving with two H200\*8 nodes and docker
 
-There are two H200 nodes, each with 8 GPUs. The first node's IP is `192.168.114.10`, and the second node's IP is `192.168.114.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 192.168.114.10:20000`.
+There are two H200 nodes, each with 8 GPUs. The first node's IP is `203.0.113.10`, and the second node's IP is `203.0.113.11`. Configure the endpoint to expose it to another Docker container using `--host 0.0.0.0` and `--port 40000`, and set up communications with `--dist-init-addr 203.0.113.10:20000`.
 A single H200 with 8 devices can run DeepSeek V3, the dual H200 setup is just to demonstrate multi-node usage.
 
 ```bash
@@ -209,7 +209,7 @@ docker run --gpus all \
     --env "HF_TOKEN=$HF_TOKEN" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 40000
+    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 203.0.113.10:20000 --nnodes 2 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 40000
 ```
 
 ```bash
@@ -224,7 +224,7 @@ docker run --gpus all \
     --env "HF_TOKEN=$HF_TOKEN" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 192.168.114.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
+    python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --dist-init-addr 203.0.113.10:20000 --nnodes 2 --node-rank 1 --trust-remote-code --host 0.0.0.0 --port 40000
 ```
 
 To ensure functionality, we include a test from a client Docker container.
@@ -249,20 +249,20 @@ docker run --gpus all \
 
 To serve DeepSeek-V3 with A100 GPUs, we need to convert the [FP8 model checkpoints](https://huggingface.co/deepseek-ai/DeepSeek-V3) to BF16 with [script](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) mentioned [here](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) first.
 
-Since the BF16 model is over 1.3 TB, we need to prepare four A100 nodes, each with 8 80GB GPUs. Assume the first node's IP is `10.0.0.1`, and the converted model path is `/path/to/DeepSeek-V3-BF16`, we can have following commands to launch the server.
+Since the BF16 model is over 1.3 TB, we need to prepare four A100 nodes, each with 8 80GB GPUs. Assume the first node's IP is `203.0.113.11`, and the converted model path is `/path/to/DeepSeek-V3-BF16`, we can have following commands to launch the server.
 
 ```bash
 # node 1
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 30000
+python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 203.0.113.11:5000 --nnodes 4 --node-rank 0 --trust-remote-code --host 0.0.0.0 --port 30000
 
 # node 2
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 1 --trust-remote-code
+python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 203.0.113.11:5000 --nnodes 4 --node-rank 1 --trust-remote-code
 
 # node 3
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 2 --trust-remote-code
+python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 203.0.113.11:5000 --nnodes 4 --node-rank 2 --trust-remote-code
 
 # node 4
-python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 10.0.0.1:5000 --nnodes 4 --node-rank 3 --trust-remote-code
+python3 -m sglang.launch_server --model-path /path/to/DeepSeek-V3-BF16 --tp 32 --dist-init-addr 203.0.113.11:5000 --nnodes 4 --node-rank 3 --trust-remote-code
 ```
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
@@ -271,10 +271,10 @@ Then we can benchmark the accuracy and latency by accessing the first node's exp
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 10.0.0.1 --port 30000
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 203.0.113.11 --port 30000
 
 # bench latency
-python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
+python3 -m sglang.bench_one_batch_server --model None --base-url http://203.0.113.11:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
 
 

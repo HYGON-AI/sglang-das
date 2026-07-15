@@ -476,10 +476,13 @@ Forward-port rules:
 Forward-port progress on 2026-07-15 CST:
 
 - Step 1 endpoint `8736a794acee` is committed as merge `e7e06b77881d`.
-- Step 2 endpoint `fde56844fca4` has all 32 conflicts resolved, its DCU
-  refactor audit completed, and its static plus pure-TP startup/request gates
-  passed after one focused optional-DeepGEMM import fix.
+- Step 2 endpoint `fde56844fca4` is committed as merge `c7ffa6497a9e` after
+  resolving 32 conflicts and passing static plus pure-TP gates with one focused
+  optional-DeepGEMM import fix.
+- Step 3 endpoint `80571de9491c` has all 66 conflicts resolved. Its FSDP/HY3,
+  attention, HCU-visible-compliance, and `_is_dcu` refactor audits are complete;
+  static and pure-TP startup/health/request gates passed without a code retry.
 - The known empty-output/eight-zero-token result remains an explicitly
   non-blocking accuracy issue and is not reported as an accuracy pass.
-- Continue with exact endpoints `80571de9491c`, `cf5983854be1`, and
-  `5ec8531b096f`, retaining a separate no-ff merge and evidence record for each.
+- Continue with exact endpoints `cf5983854be1` and `5ec8531b096f`, retaining a
+  separate no-ff merge and evidence record for each.

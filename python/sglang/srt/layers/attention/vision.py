@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import dataclasses
@@ -83,7 +97,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.utils import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -420,7 +434,7 @@ class VisionFlash3Attention(nn.Module):
         **kwargs,
     ):
         if not (_is_cuda or _is_musa or _is_dcu):
-            raise Exception("VisionFlash3Attention is only available for cuda or musa or dcu")
+            raise Exception("VisionFlash3Attention is only available for CUDA, MUSA, or HCU")
         super().__init__()
         use_data_parallel = (
             kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
@@ -675,20 +689,16 @@ class VisionAiterAttention(nn.Module):
         **kwargs,
     ):
         if not _is_hip:
-            if _is_dcu:
-                raise Exception("aiter_attn is only available for DCU/DTK")
-            raise Exception("aiter_attn is only available for ROCm/HIP")
+            raise Exception("aiter_attn is only available for AMD or HCU")
         try:
             from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
         except ImportError as e:
             if _is_dcu:
                 raise ImportError(
-                    "aiter is DCU/DTK compatible kernel library. "
-                    "Please make sure aiter is installed on your DCU device."
+                    "Please make sure aiter is installed on your HCU device."
                 ) from e
             raise ImportError(
-                "aiter is ROCm/HIP specific kernel library. "
-                "Please make sure aiter is installed on your ROCm/HIP device."
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
             ) from e
 
         self.flash_attn_varlen_func = aiter_flash_attn_varlen_func

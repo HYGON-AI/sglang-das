@@ -69,6 +69,12 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
+def _should_use_streaming_state_dict_load(server_args: ServerArgs) -> bool:
+    sp_degree = getattr(server_args, "sp_degree", 1) or 1
+    ulysses_degree = getattr(server_args, "ulysses_degree", 1) or 1
+    return bool(sp_degree > 1 and ulysses_degree > 1)
+
+
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
@@ -179,6 +185,9 @@ class TransformerLoader(ComponentLoader):
             output_dtype=None,
             strict=False,
             weight_load_plan=weight_load_plan,
+            streaming_state_dict_load=_should_use_streaming_state_dict_load(
+                component_server_args
+            ),
         )
 
         # post-hooks (e.g., patch scales (nunchaku))

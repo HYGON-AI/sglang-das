@@ -1737,3 +1737,55 @@ actual result in the checkpoint note.
     HCU 0%.
 - Integration decision: scoped static and functional gates passed after one
   focused fix; commit this exact endpoint as the Step 2 no-ff checkpoint.
+
+### v0.5.12_dev forward-port Step 3 / `80571de9491c`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 2 merge `c7ffa6497a9e783e37a18556639ca7eb6138d292`.
+- Old range: `fde56844fca442108bf3d2c71cbdeacb4ddb8f08..80571de9491c8fd80e6822c9fa4efeb02ff67cce`.
+- Scope: 57 full-graph commits, 43 non-merge commits, 450 old-range files;
+  resolved staged result before documentation changes is 393 files with 8,366
+  insertions and 2,117 deletions.
+- Git reported exactly 66 conflict files:
+  - 12 current CI workflow definitions kept from current `main`;
+  - 11 old Sphinx/obsolete documentation paths kept deleted;
+  - 34 runtime/model conflicts resolved against current APIs, including FSDP
+    streaming, canonical DSA/speculative paths, HY3 precision/PD/EPLB, and
+    current disaggregation/communicator contracts;
+  - one FlashMLA kernel-Python conflict and eight test conflicts resolved to
+    current canonical coverage, with obsolete NSA/EAGLE/PP tests not revived.
+- Range-order/revert audit:
+  - temporary HY3 PP support and its conflict-resolution commit are followed
+    by explicit reverts before the endpoint; the final forward-port does not
+    restore that PP implementation;
+  - FSDP streaming is retained in the current `WeightLoadPlan`, preprocess,
+    and bitsandbytes full-load structure;
+  - HY3 retains the range's PD/EPLB, redundant-expert, and precision behavior
+    using current graph, stream, parallel, and expert-location APIs.
+- `_is_dcu` audit:
+  - five runtime Python files initially introduced a non-existent `is_hcu()`
+    predicate. They now use `is_dcu/_is_dcu`; HCU remains only the intended
+    user-visible compliance label;
+  - C++ causal-conv and MoE test helpers follow the same internal-DCU,
+    visible-HCU rule;
+  - canonical `dsa_*` ServerArgs fields are retained; DCU FP8 DSA resolves to
+    `flashmla_auto/flashmla_kv`, DCU non-FP8 to `sparse/sparse`, and generic HIP
+    remains `tilelang`;
+  - stale `get_attention_tp_size()` use was ported to
+    `get_parallel().attn_tp_size`;
+  - `SGLANG_USE_AITER_AG=0` remains unchanged.
+- Static validation passed: zero unmerged entries, no precise markers,
+  `git diff --check`, compilation of all 352 changed Python files, broad
+  changed-file Ruff `E9,F821`, targeted high-risk Ruff
+  `E9,F401,F811,F821,F841`, ten-module import smoke, 276-file DCU registration,
+  19 DSA alias tests, and gfx938 HIP setup-name generation.
+- Pure-TP validation:
+  - immediate preflight rejected occupied `zz-nmz26` (VRAM 57% on all eight
+    devices) and selected idle `zz-nmz22` (VRAM/HCU 0%);
+  - the exact required script loaded 46 shards, captured graphs `bs=128..1`,
+    reached readiness, and returned HTTP 200 for `/health` and `/generate`;
+  - response remained empty with eight zero output IDs, recorded as the known
+    non-blocking NaN/accuracy observation rather than an accuracy pass;
+  - service stopped, port 10015 closed, and `zz-nmz22` returned to VRAM/HCU 0%.
+- Detailed file-by-file groups and evidence:
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step3-conflict-review.md`.

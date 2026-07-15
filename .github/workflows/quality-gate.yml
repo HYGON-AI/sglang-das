@@ -153,6 +153,23 @@ jobs:
           print("Encoding check passed.")
           PY
 
+  hcu-runtime-text-check:
+    name: hcu-runtime-text-check
+    needs: changed-files
+    if: false
+    runs-on: [self-hosted, linux, x64, quality]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check HCU user-visible runtime text
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
+        run: |
+          python3 scripts/ci/dcu/check_hcu_runtime_text.py ${CHANGED_FILES}
+
   secret-check:
     name: secret-check
     runs-on: [self-hosted, Linux, X64, internal, quality]
@@ -331,7 +348,6 @@ jobs:
     if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
     timeout-minutes: 10
-    continue-on-error: true
 
     steps:
       - name: Checkout
@@ -351,12 +367,22 @@ jobs:
 
           echo "$PY_FILES" > ruff-files.txt
 
+          set +e
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             -v "$PWD:/repo:ro" \
             -w /repo \
             ${{ env.RUFF_IMAGE }} \
-            check --no-cache $(cat ruff-files.txt)
+            check --no-cache --select F401,F541,F821,F841 $(cat ruff-files.txt)
+          rc=$?
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Ruff lint findings::Ruff found lint issues in changed Python files. Observe mode only, not blocking merge."
+            exit 0
+          fi
+
+          echo "Ruff lint check passed."
 
   sast-check:
     name: sast-check

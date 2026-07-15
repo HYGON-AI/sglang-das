@@ -23,8 +23,6 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
-    get_pp_group,
-    get_pp_indices,
     get_tensor_model_parallel_world_size,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
@@ -38,13 +36,16 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -52,6 +53,7 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -60,15 +62,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.utils import (
-    enable_fused_set_kv_buffer,
-)
 from sglang.srt.runtime_context import get_stream
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, make_layers
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu
+from sglang.srt.utils.common import LazyValue
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_dcu = is_dcu()
@@ -176,7 +175,8 @@ class HYV3MoEFused(nn.Module):
 
         experts_cls = get_moe_impl_class(quant_config)
         self.experts = experts_cls(
-            num_experts=self.n_routed_experts,
+            num_experts=self.n_routed_experts
+            + get_global_server_args().ep_num_redundant_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
@@ -216,11 +216,20 @@ class HYV3MoEFused(nn.Module):
         else:
             self.shared_mlp = None
 
-
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight.to(torch.float32))
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
 
     def forward(
         self,
@@ -250,15 +259,21 @@ class HYV3MoEFused(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=(
-                    forward_batch.num_token_non_padded
-                    if forward_batch is not None
-                    else None
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=(
+                        forward_batch.num_token_non_padded
+                        if forward_batch is not None
+                        else None
+                    ),
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
             if self.shared_mlp is not None:
                 shared_output = self.shared_mlp(hidden_states)
         else:
@@ -308,7 +323,16 @@ class HYV3MoEFused(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-        topk_output = self.topk(hidden_states, router_logits)
+        with get_global_expert_distribution_recorder().with_current_layer(
+            self.layer_id
+        ):
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         if self.shared_mlp is not None:
             shared_output = self.shared_mlp(hidden_states)
             final_hidden_states = self.experts(
@@ -356,7 +380,16 @@ class HYV3MoEFused(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
-            topk_output = self.topk(hidden_states, router_logits)
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
@@ -483,15 +516,12 @@ class HYV3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        can_fuse_set_kv = (
-            self.head_dim == self.rotary_emb.rotary_dim
-            and enable_fused_set_kv_buffer(forward_batch)
-        )
+        used_fused_hunyuan_rotary_kv_store = False
         if (
             _is_dcu
             and _use_fused_hunyuan_rotary
             and self.use_qk_norm
-            and can_fuse_set_kv
+            and self.head_dim == self.rotary_emb.rotary_dim
         ):
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
@@ -525,13 +555,20 @@ class HYV3Attention(nn.Module):
                 v_scale=None,
                 epsilon=self.q_norm.variance_epsilon,
             )
+            used_fused_hunyuan_rotary_kv_store = True
         elif self.use_qk_norm:
             q = self.q_norm(q.reshape(-1, self.head_dim))
             q = q.view(-1, self.q_size)
             k = self.k_norm(k.reshape(-1, self.head_dim))
             k = k.view(-1, self.kv_size)
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not used_fused_hunyuan_rotary_kv_store,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -687,44 +724,29 @@ class HYV3Model(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
 
-        if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
-                prefix=f"{prefix}.embed_tokens",
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
+            prefix=f"{prefix}.embed_tokens",
+        )
 
         self.alt_stream = get_stream("alt") if is_cuda() else None
 
-        self.start_layer, self.end_layer = get_pp_indices(
-            config.num_hidden_layers,
-            self.pp_group.rank_in_group,
-            self.pp_group.world_size,
-        )
-        self.layers, self.start_layer, self.end_layer = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: (
+        self.layers = nn.ModuleList(
+            [
                 HYV3DecoderLayer(
                     config=config,
-                    layer_id=idx,
+                    layer_id=i,
                     quant_config=quant_config,
-                    prefix=prefix,
+                    prefix=f"{prefix}.layers.{i}",
                     alt_stream=self.alt_stream,
                 )
-            ),
-            prefix=f"{prefix}.layers",
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
+                for i in range(config.num_hidden_layers)
+            ]
         )
-        if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer(return_tuple=True)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     @torch.no_grad()
     def forward(
@@ -733,38 +755,18 @@ class HYV3Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
         else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
+            hidden_states = input_embeds
+        residual = None
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
-
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-
         if not forward_batch.forward_mode.is_idle():
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         return hidden_states
 
@@ -779,32 +781,29 @@ class HYV3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
 
         self.model = HYV3Model(config, quant_config, prefix=f"{prefix}.model")
-        if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.lm_head",
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.lm_head",
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
         if getattr(self.config, "tie_word_embeddings", False):
-            if not (self.pp_group.is_first_rank and self.pp_group.is_last_rank):
-                raise ValueError(
-                    "Pipeline parallelism for Hunyuan3 with tied word embeddings "
-                    "is not supported because embed_tokens and lm_head live on "
-                    "different pipeline stages."
-                )
             self.lm_head.weight = self.model.embed_tokens.weight
-        if self.pp_group.is_last_rank:
-            self.logits_processor = LogitsProcessor(config)
-        else:
-            self.logits_processor = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, HYV3MoEFused)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @torch.no_grad()
     def forward(
@@ -813,13 +812,8 @@ class HYV3ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-        )
-        if not self.pp_group.is_last_rank:
-            return hidden_states
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -852,7 +846,8 @@ class HYV3ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -865,12 +860,6 @@ class HYV3ForCausalLM(nn.Module):
                 continue
 
             if "rotary_emb.inv_freq" in name:
-                continue
-
-            layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
-            ):
                 continue
 
             if num_nextn_layers > 0 and name.startswith("model.layers."):
@@ -925,6 +914,16 @@ class HYV3ForCausalLM(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [HYV3ForCausalLM]

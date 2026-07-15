@@ -1240,7 +1240,14 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and is_hip():
+    if not user_set_prefill and not user_set_decode and is_dcu():
+        if kv_cache_dtype == "fp8_e4m3":
+            declared["dsa_prefill_backend"] = "flashmla_auto"
+            declared["dsa_decode_backend"] = "flashmla_kv"
+        else:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+            declared["dsa_decode_backend"] = "flashmla_sparse"
+    elif not user_set_prefill and not user_set_decode and is_hip():
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "fp8_e4m3":

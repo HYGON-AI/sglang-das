@@ -175,6 +175,45 @@ def hf_to_custom_state_dict(
     return custom_param_sd, reverse_param_names_mapping
 
 
+def iter_hf_to_custom_state_dict(
+    hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
+    param_names_mapping: Callable[[str], tuple[str, Any, Any]],
+    valid_target_names: set[str] | None = None,
+) -> Iterator[tuple[str, torch.Tensor, tuple[str, Any, Any]]]:
+    """Yield custom-formatted checkpoint tensors without building a full dict."""
+    to_merge_params = defaultdict(dict)  # type: ignore
+    if isinstance(hf_param_sd, dict):
+        hf_param_sd = hf_param_sd.items()  # type: ignore
+    for source_param_name, full_tensor in hf_param_sd:  # type: ignore
+        target_param_name, merge_index, num_params_to_merge = param_names_mapping(
+            source_param_name
+        )
+        if (
+            valid_target_names is not None
+            and target_param_name != source_param_name
+            and source_param_name in valid_target_names
+            and target_param_name not in valid_target_names
+        ):
+            target_param_name = source_param_name
+            merge_index = None
+            num_params_to_merge = None
+        if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
+            continue
+        reverse_entry = (source_param_name, merge_index, num_params_to_merge)
+        if merge_index is not None:
+            to_merge_params[target_param_name][merge_index] = full_tensor
+            if len(to_merge_params[target_param_name]) == num_params_to_merge:
+                sorted_tensors = [
+                    to_merge_params[target_param_name][i]
+                    for i in range(num_params_to_merge)
+                ]
+                full_tensor = torch.cat(sorted_tensors, dim=0)
+                del to_merge_params[target_param_name]
+            else:
+                continue
+        yield target_param_name, full_tensor, reverse_entry
+
+
 class skip_init_modules:
     def __enter__(self):
         # Save originals

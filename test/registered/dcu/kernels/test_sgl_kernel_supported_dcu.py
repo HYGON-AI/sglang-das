@@ -1,3 +1,17 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import subprocess
 import sys
@@ -34,6 +48,15 @@ KERNEL_TEST_SETS = {
 }
 
 
+def _sanitize_dcu_log_text(text: str) -> str:
+    return (
+        text.replace("AMD", "HCU")
+        .replace("amd", "hcu")
+        .replace("XGMI", "HSL")
+        .replace("xgmi", "hsl")
+    )
+
+
 class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
     def test_supported_kernel_whitelist(self):
         test_set = os.environ.get("SGLANG_DCU_KERNEL_TEST_SET", "nightly")
@@ -51,7 +74,8 @@ class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
         test_files = [str(kernel_root / name) for name in KERNEL_TEST_SETS[test_set]]
         missing = [name for name in test_files if not Path(name).exists()]
         if missing:
-            raise AssertionError(f"Missing sgl-kernel tests: {missing}")
+            missing_text = _sanitize_dcu_log_text(str(missing))
+            raise AssertionError(f"Missing sgl-kernel tests: {missing_text}")
 
         env = os.environ.copy()
         env["HF_HUB_OFFLINE"] = "1"
@@ -69,9 +93,9 @@ class TestBW1100SupportedSGLKernelDCU(unittest.TestCase):
 
         if result.returncode != 0:
             print("sgl-kernel stdout:")
-            print(result.stdout)
+            print(_sanitize_dcu_log_text(result.stdout))
             print("sgl-kernel stderr:")
-            print(result.stderr)
+            print(_sanitize_dcu_log_text(result.stderr))
         self.assertEqual(result.returncode, 0)
 
 

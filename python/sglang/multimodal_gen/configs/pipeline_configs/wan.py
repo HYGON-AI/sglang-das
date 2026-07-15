@@ -163,6 +163,9 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+        # Wan I2V must match the official full-frame VAE encode/decode path.
+        self.vae_config.use_parallel_encode = False
+        self.vae_config.use_parallel_decode = False
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -237,6 +240,9 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+        # Wan TI2V also feeds VAE latents into/out of the DiT like official Wan.
+        self.vae_config.use_parallel_encode = False
+        self.vae_config.use_parallel_decode = False
         self.dit_config.expand_timesteps = self.expand_timesteps
 
 
@@ -254,6 +260,10 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
     boundary_ratio: float | None = 0.875
 
     def __post_init__(self) -> None:
+        super().__post_init__()
+        # Match the official full-frame Wan VAE decode path for SP/Ulysses runs.
+        self.vae_config.use_parallel_encode = False
+        self.vae_config.use_parallel_decode = False
         self.dit_config.boundary_ratio = self.boundary_ratio
         self.dit_config.torch_compile_mode = "default"
 

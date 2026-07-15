@@ -224,13 +224,13 @@ spec:
                 medium: Memory
               name: dshm
             - hostPath:
-                path: /data/DeepSeek-V3.2-Exp
+                path: <MODEL_PATH>
               name: model
             - hostPath:
                 path: /dev/infiniband
               name: ib
             - hostPath:
-                path: /data/src/sglang
+                path: <SGLANG_REPO_PATH>
                 type: DirectoryOrCreate
               name: src
 
@@ -467,14 +467,14 @@ spec:
                 type: DirectoryOrCreate
               name: sgl-cache
             - hostPath:
-                path: /data/src/sglang
+                path: <SGLANG_REPO_PATH>
                 type: DirectoryOrCreate
               name: src
             - emptyDir:
                 medium: Memory
               name: dshm
             - hostPath:
-                path: /data/DeepSeek-V3.2-Exp
+                path: <MODEL_PATH>
               name: model
             - hostPath:
                 path: /dev/infiniband
@@ -541,7 +541,7 @@ deepseek-rbg-32exp-prefill-0                 1/1     Running   0          74m
 
 [root@ecs-cbm-x1-pd-cpu-001 main_doc]# kubectl  get svc |grep dee
 deepseek-rbg-32exp-decode             ClusterIP   None             <none>        <none>           97m
-deepseek-rbg-32exp-router-service     NodePort    172.16.242.169   <none>        8000:30800/TCP   22m
+deepseek-rbg-32exp-router-service     NodePort    <cluster-ip>   <none>        8000:30800/TCP   22m
 deepseek-rbg-32exp-prefill            ClusterIP   None             <none>        <none>           97m
 ```
 
@@ -550,7 +550,7 @@ At this point, select a nodePort:30800 to access:
 ```bash Command
 [root@ecs-001]# curl -X POST "http://{nodePort}:30800/v1/chat/completions" \
 >     -H "Content-Type: application/json" \
->     -H "Authorization: Bearer None" \
+>     -H "Authorization: Bearer <API_KEY>" \
 >     -d '{
 >        "rid":"ccccdd",
 >         "model": "dsv32",

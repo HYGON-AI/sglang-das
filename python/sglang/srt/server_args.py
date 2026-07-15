@@ -71,6 +71,7 @@ from sglang.srt.utils.common import (
     human_readable_int,
     is_cpu,
     is_cuda,
+    is_dcu_native_fp8_supported,
     is_flashinfer_available,
     is_hip,
     is_dcu,
@@ -224,6 +225,53 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "intel_xpu",
 ]
+
+DCU_ATTENTION_BACKEND_CHOICES = {
+    "fa3",
+    "dcu_mla",
+    "triton",
+    "dsa",
+    "nsa",
+    "dsv4",
+}
+
+DCU_GENERIC_ATTENTION_BACKEND_CHOICES = {
+    "fa3",
+    "dcu_mla",
+    "triton",
+}
+
+DCU_DSA_PREFILL_BACKEND_CHOICES = {
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+}
+
+DCU_DSA_DECODE_BACKEND_CHOICES = {
+    "flashmla_sparse",
+    "flashmla_kv",
+}
+
+DCU_GENERIC_KV_CACHE_DTYPE_CHOICES = {
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e5m2",
+}
+
+DCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES = {
+    *DCU_GENERIC_KV_CACHE_DTYPE_CHOICES,
+    "fp8_e4m3",
+}
+
+DCU_DSA_KV_CACHE_DTYPE_CHOICES = {
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e4m3",
+}
+
+DCU_DSV4_KV_CACHE_DTYPE_CHOICES = DCU_DSA_KV_CACHE_DTYPE_CHOICES
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
@@ -2915,6 +2963,7 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        self._validate_dcu_attention_backend_compatibility()
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
@@ -4782,7 +4831,9 @@ class ServerArgs:
             # MHA architecture
             from sglang.srt.arg_groups.overrides import resolved_view
 
-            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
+            if is_dcu():
+                return "fa3"
+            elif is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
                 resolved_view(self)
             ):
                 # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
@@ -4809,7 +4860,9 @@ class ServerArgs:
                 return "triton"
         else:
             # MLA architecture
-            if is_hopper_with_cuda_12_3():
+            if is_dcu():
+                return "dcu_mla"
+            elif is_hopper_with_cuda_12_3():
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
@@ -4937,6 +4990,132 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+    @staticmethod
+    def _get_dcu_arch_name() -> str:
+        import torch
+
+        try:
+            props = torch.cuda.get_device_properties(0)
+            return getattr(props, "gcnArchName", "") or "unknown"
+        except Exception as e:
+            logger.warning("DCU arch detection failed: %s", e)
+            return "unknown"
+
+    def _validate_dcu_generic_kv_cache_dtype(
+        self,
+        backend: str,
+        label: str,
+        arch_name: str,
+    ) -> None:
+        allowed_dtypes = (
+            DCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES
+            if is_dcu_native_fp8_supported()
+            else DCU_GENERIC_KV_CACHE_DTYPE_CHOICES
+        )
+        if self.kv_cache_dtype in allowed_dtypes:
+            return
+
+        if self.kv_cache_dtype == "fp8_e4m3":
+            raise ValueError(
+                f"DCU {label} '{backend}' does not support "
+                f"--kv-cache-dtype=fp8_e4m3 on {arch_name}. "
+                "fp8_e4m3 for fa3/dcu_mla/triton is only supported on gfx938. "
+                f"Please use one of {sorted(allowed_dtypes)} on this device, "
+                "or use --attention-backend dsa with FlashMLA DSA backends for "
+                "fp8_e4m3 KV cache."
+            )
+
+        raise ValueError(
+            f"DCU {label} '{backend}' supports --kv-cache-dtype in "
+            f"{sorted(allowed_dtypes)}, but got {self.kv_cache_dtype}."
+        )
+
+    def _validate_dcu_dsa_backend(
+        self,
+        attr: str,
+        label: str,
+        allowed_backends: set[str],
+    ) -> None:
+        backend = getattr(self, attr)
+        if backend is None:
+            return
+
+        if backend not in allowed_backends:
+            raise ValueError(
+                f"DCU --dsa-{label}-backend only supports "
+                f"{sorted(allowed_backends)}, but got {backend}. "
+                "Use --attention-backend dsa for DSA models; flashmla_kv, "
+                "flashmla_sparse, and prefill-only flashmla_auto are "
+                "DSA sub-backends, not "
+                "--attention-backend values."
+            )
+
+        if backend == "flashmla_kv" and self.kv_cache_dtype not in (
+            "auto",
+            "fp8_e4m3",
+        ):
+            raise ValueError(
+                f"DCU --dsa-{label}-backend=flashmla_kv requires "
+                f"--kv-cache-dtype=fp8_e4m3, but got {self.kv_cache_dtype}."
+            )
+
+    def _validate_dcu_dsv4_kv_cache_dtype(self) -> None:
+        if self.kv_cache_dtype in DCU_DSV4_KV_CACHE_DTYPE_CHOICES:
+            return
+
+        raise ValueError(
+            "DCU dsv4 attention backend supports --kv-cache-dtype in "
+            f"{sorted(DCU_DSV4_KV_CACHE_DTYPE_CHOICES)}, but got "
+            f"{self.kv_cache_dtype}."
+        )
+
+    def _validate_dcu_attention_backend_compatibility(self):
+        if not is_dcu():
+            return
+
+        arch_name = self._get_dcu_arch_name()
+        prefill_backend, decode_backend = self._resolved_attention_backends()
+        for label, backend in (
+            ("prefill attention backend", prefill_backend),
+            ("decode attention backend", decode_backend),
+        ):
+            if backend not in DCU_ATTENTION_BACKEND_CHOICES:
+                raise ValueError(
+                    f"DCU only supports attention backends "
+                    f"{sorted(DCU_ATTENTION_BACKEND_CHOICES)}, but got "
+                    f"{backend} for {label}. "
+                    "For FlashMLA DSA kernels, use --attention-backend dsa "
+                    "together with --dsa-prefill-backend/--dsa-decode-backend."
+                )
+
+            if backend in DCU_GENERIC_ATTENTION_BACKEND_CHOICES:
+                self._validate_dcu_generic_kv_cache_dtype(backend, label, arch_name)
+            elif backend == "dsv4":
+                self._validate_dcu_dsv4_kv_cache_dtype()
+
+        if "dsa" not in (prefill_backend, decode_backend) and not (
+            self.dsa_prefill_backend or self.dsa_decode_backend
+        ):
+            return
+
+        if self.kv_cache_dtype not in DCU_DSA_KV_CACHE_DTYPE_CHOICES:
+            raise ValueError(
+                "DCU DSA attention backend supports --kv-cache-dtype in "
+                f"{sorted(DCU_DSA_KV_CACHE_DTYPE_CHOICES)}, but got "
+                f"{self.kv_cache_dtype}."
+            )
+
+        self._validate_dcu_dsa_backend(
+            "dsa_prefill_backend",
+            "prefill",
+            DCU_DSA_PREFILL_BACKEND_CHOICES,
+        )
+        self._validate_dcu_dsa_backend(
+            "dsa_decode_backend",
+            "decode",
+            DCU_DSA_DECODE_BACKEND_CHOICES,
+        )
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
