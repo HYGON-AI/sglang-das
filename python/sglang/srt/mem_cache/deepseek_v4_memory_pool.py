@@ -11,7 +11,10 @@ from sglang.jit_kernel.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
-from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_masked,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -164,9 +167,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if self.is_bf16_attention_kv_cache:
-            return self.set_key_buffer_bf16(layer_id, loc, cache_k)
+            return self.set_key_buffer_bf16(layer_id, loc, cache_k, valid_mask)
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -180,6 +184,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         assert self.is_bf16_attention_kv_cache
         values = cache_k.to(torch.bfloat16).contiguous().view(-1, self.logical_kv_dim)
@@ -189,12 +194,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         if loc.numel() == 0:
             return
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id].view(-1, self.logical_kv_dim),
-            loc.long(),
-            values[..., : self.qk_nope_head_dim],
-            values[..., self.qk_nope_head_dim :],
-        )
+        kv_buffer = self.kv_buffer[layer_id].view(-1, self.logical_kv_dim)
+        loc = loc.long()
+        cache_k_nope = values[..., : self.qk_nope_head_dim]
+        cache_k_rope = values[..., self.qk_nope_head_dim :]
+        if valid_mask is None:
+            set_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_triton_masked(
+                kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                valid_mask.contiguous(),
+            )
 
     def set_key_buffer_lightop_fused(
         self,
@@ -984,8 +997,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
-        c4_state_pool_size = self.c4_state_pool_size
-        c128_state_pool_size = self.c128_state_pool_size
         total_L = len(self.compression_ratios)
         self.compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
@@ -1097,7 +1108,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if ONLINE_C128 or num_draft_tokens <= 1 or req_pool_indices.numel() == 0:
             return
 
-        bs = req_pool_indices.numel()
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
@@ -1292,10 +1302,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
-        return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
+        return compress_kv_pool.set_key_buffer_fused(
+            compress_layer_id, loc, cache_k, valid_mask
+        )
 
     def set_extra_key_buffer_lightop_fused(
         self,

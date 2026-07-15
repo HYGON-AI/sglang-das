@@ -1677,3 +1677,63 @@ actual result in the checkpoint note.
     non-blocking for the current startup/request gate.
 - Detailed decisions and validation evidence are recorded in
   `docs/internal/dcu-main-forward-port-v0.5.12-dev-step1-conflict-review.md`.
+
+### v0.5.12_dev forward-port Step 2 / `fde56844fca4`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 1 merge `e7e06b77881d243291fdc29fc815c2da6b28e75e`.
+- Old range: `8736a794acee8253019704cf00a901fd7ffcefbe..fde56844fca442108bf3d2c71cbdeacb4ddb8f08`.
+- Scope: 68 full-graph commits, 56 non-merge commits, 130 old-range files;
+  resolved code before documentation changes 127 files with 6,914 insertions
+  and 544 deletions.
+- Git reported exactly 32 textual conflict files. The complete file-by-file
+  resolution table is recorded in
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step2-conflict-review.md`.
+- Refactor/move decisions:
+  - kept deleted `docs_new/index.mdx` and
+    `python/sglang/srt/model_executor/cuda_graph_runner.py` absent;
+  - ported graph-token behavior to
+    `model_executor/runner/decode_cuda_graph_runner.py`;
+  - moved the C16 masked MLA store from old `mem_cache/utils.py` into canonical
+    `kernels/ops/kvcache/mla_buffer.py`, with a compatibility re-export;
+  - ported old HY3 PD/EP/fused normalization and rotary behavior into current
+    model, loader, stream, and capture APIs;
+  - migrated HY3 attention rank/size lookup from removed helpers to the current
+    attention tensor-parallel API; both HY3 modules pass direct import smoke;
+  - extended current multi-modal IPC caching with one source pool per TP
+    device and target-device synchronization;
+  - integrated DCU standalone/deep-gemm MegaMoE, graph tokens, PD behavior,
+    W8A8 builders, AITER ASM shuffle, LightOp TopK, and EP W4A16 into current
+    MoE/quant APIs.
+- `_is_dcu` audit:
+  - dedicated DCU LightOp, DSV4 BF16 cache, MegaMoE, AITER, W4A16, and
+    mem-cache paths stay ahead of generic `_is_hip` behavior;
+  - DeepSeek-V4 multi-stream is excluded for DCU BF16 attention KV cache, not
+    for the previously rejected fused-qnorm condition;
+  - BF16 attention KV uses its dedicated scatter regardless of the generic
+    fused-store setting and therefore cannot fall through to FP8 packing;
+  - the optional DeepGEMM `w4a16_marlin_weight` symbol is now a lazy import
+    behind `_is_dcu` and `SGLANG_USE_MARLIN_W4A16_MOE_OPT`;
+  - `SGLANG_USE_AITER_AG=0` remains present in the runtime script.
+- Static validation:
+  - no unmerged entries or precise markers; staged `git diff --check` passed;
+  - all 113 changed Python files compiled;
+  - targeted Ruff `E9,F401,F811,F821,F841` passed;
+  - DCU registration passed with 276 files and the existing CPU-utils warning;
+  - DSA alias/CLI/registry passed 19 tests;
+  - gfx938 HIP setup passed with package `sglang-kernel`, zero unsupported CUDA
+    calls, and 55 replaced kernel launches.
+- Functional validation:
+  - `zz-nmz26` was not used because all eight devices were at VRAM 93%; all
+    eight `zz-nmz22` devices were VRAM 0% / HCU 0% and were selected;
+  - the first attempt exposed the unconditional optional DeepGEMM import and
+    stopped before weight loading; one focused fix resolved it;
+  - confirmation loaded 46 shards, captured decode graphs `bs=128..1`, reached
+    readiness, returned HTTP 200 from `/health`, and returned HTTP 200 from one
+    short `/generate` without worker failure;
+  - response text remained empty with eight zero output IDs, the already
+    deferred non-blocking NaN/accuracy observation;
+  - service stopped, port 10015 closed, and `zz-nmz22` returned to VRAM 0% /
+    HCU 0%.
+- Integration decision: scoped static and functional gates passed after one
+  focused fix; commit this exact endpoint as the Step 2 no-ff checkpoint.

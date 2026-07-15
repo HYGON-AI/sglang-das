@@ -5604,6 +5604,26 @@ class ServerArgs:
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
         if a2a_backend == "megamoe":
+            if is_dcu():
+                dcu_runtime = envs.SGLANG_DCU_MEGA_MOE_RUNTIME.get().strip().lower()
+                if dcu_runtime not in {"deep_gemm", "megamoe"}:
+                    raise ValueError(
+                        "SGLANG_DCU_MEGA_MOE_RUNTIME must be 'deep_gemm' or "
+                        f"'megamoe', got {dcu_runtime!r}"
+                    )
+                if dcu_runtime == "deep_gemm":
+                    if self.cuda_graph_config.decode.backend != Backend.DISABLED:
+                        logger.warning(
+                            "CUDA graph is disabled for the DCU deep_gemm "
+                            "W8A8 MegaMoE runtime."
+                        )
+                    self.cuda_graph_config.decode.backend = Backend.DISABLED
+                    self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                else:
+                    logger.info(
+                        "DCU MegaMoE uses the standalone megamoe runtime; "
+                        "CUDA graph remains enabled."
+                    )
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(

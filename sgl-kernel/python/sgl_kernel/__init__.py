@@ -188,6 +188,8 @@ else:
         "gptq_gemm",
         "gptq_shuffle",
         "int8_scaled_mm",
+        "kimi_k2_moe_fused_gate",
+        "l2norm",
         "merge_state_v2",
         "moe_align_block_size",
         "moe_sum",

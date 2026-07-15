@@ -25,7 +25,13 @@ from sglang.srt.layers.quantization.marlin_utils import (
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_dcu,
+    is_hip,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from compressed_tensors.quantization import QuantizationArgs
@@ -47,14 +53,30 @@ __all__ = [
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_marlin_w4a16_moe = (
+    get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT") and _is_dcu
+)
 
 if _use_aiter:
     pass
 
 
 logger = logging.getLogger(__name__)
+
+
+def _convert_w4a16_marlin_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Load the optional DCU DeepGEMM reorder helper only when requested."""
+    try:
+        from deepgemm.m_group_gemm import w4a16_marlin_weight
+    except ImportError as exc:
+        raise RuntimeError(
+            "SGLANG_USE_MARLIN_W4A16_MOE_OPT requires a DeepGEMM build "
+            "that exports w4a16_marlin_weight"
+        ) from exc
+    return w4a16_marlin_weight(weight)
 
 
 class GPTQMarlinState(Enum):
@@ -517,11 +539,15 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
         w13 = layer.w13_weight_packed.data
         w13 = w13.transpose(1, 2).contiguous().view(torch.uint8)
+        if _use_marlin_w4a16_moe:
+            w13 = _convert_w4a16_marlin_weight(w13)
         layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
 
         # Convert w2 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
         w2 = layer.w2_weight_packed.data
         w2 = w2.transpose(1, 2).contiguous().view(torch.uint8)
+        if _use_marlin_w4a16_moe:
+            w2 = _convert_w4a16_marlin_weight(w2)
         layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
 
         # Convert w13 scales: [E, K//group_size, N] -> [E, N, K//group_size]

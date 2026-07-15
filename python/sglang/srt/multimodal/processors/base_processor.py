@@ -34,7 +34,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
+    MmItemMemoryPoolGroup,
 )
 
 _is_cpu = is_cpu()
@@ -283,10 +283,10 @@ class BaseMultimodalProcessor(ABC):
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
                 worker_num,
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+            self.cudaipc_mmfeature_pool = MmItemMemoryPoolGroup(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
+                tp_size=self.server_args.tp_size,
             )
 
     def compute_mrope_positions(self, input_ids, mm_items):
@@ -1232,22 +1232,14 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
-        sync_flag, available_slice, byte_offset = (
-            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
+        sync_flags, available_slices = (
+            self.cudaipc_mmfeature_pool.return_slices_with_flags(tensor)
         )
-        if isinstance(available_slice, torch.Tensor):
-            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
+        if isinstance(available_slices, dict):
             return CudaIpcTensorTransportProxy(
-                data=available_slice,
+                data=available_slices,
                 info_data=tensor,
-                sync_buffer_meta=sync_flag,
-                pool_ipc_handle=(
-                    self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if _IPC_POOL_HANDLE_CACHE
-                    else None
-                ),
-                pool_byte_offset=byte_offset,
-                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
+                sync_buffer_meta=sync_flags,
             )
         if self.keep_mm_feature_on_device:
             return tensor

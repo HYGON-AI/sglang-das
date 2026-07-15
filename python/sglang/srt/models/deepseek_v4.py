@@ -1110,6 +1110,7 @@ class MQALayer(MqaAttentionBase):
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
+            and not get_token_to_kv_pool().is_bf16_attention_kv_cache
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None

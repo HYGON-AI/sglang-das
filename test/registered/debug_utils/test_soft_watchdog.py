@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=120, suite="nightly-dcu", nightly=True)
+register_dcu_ci(est_time=120, suite="nightly-dcu-core-functional", nightly=True)
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=622, suite="base-c-test-cpu")

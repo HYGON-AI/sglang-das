@@ -838,7 +838,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
-        elif _is_dcu:
+        elif _is_dcu and envs.SGLANG_LIGHTOP_TOPK.get():
             from lightop import topk_transform_512 as lightop_topk_transform_512
             lightop_topk_transform_512(
                 logits,

@@ -56,6 +56,16 @@ register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 mp.set_start_method("spawn", force=True)
 
 
+def _dcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+        return {}
+    return {
+        "attention_backend": "fa3",
+        "page_size": 64,
+        "trust_remote_code": True,
+    }
+
+
 def verify_params_close(params1, params2, error_msg):
     """Verify if two parameter arrays are close enough."""
     try:
@@ -323,6 +333,7 @@ def init_process_sgl(
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
             cuda_graph_max_bs_decode=2,
+            **_dcu_engine_kwargs(),
         )
     else:
         if rank == 1:

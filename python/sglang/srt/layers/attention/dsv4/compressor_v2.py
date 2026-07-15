@@ -306,6 +306,26 @@ def _use_online_compress(compress_ratio: int) -> bool:
     return compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def _select_bf16_prefill_compress_writes(
+    plan: CompressorPrefillPlan,
+    out_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return static-shape (valid_mask, write_loc, positions) from plan_c."""
+    plan_c = plan.plan_c
+    assert plan_c.shape[-1] == 16, (
+        "BF16 compressed cache prefill expects CompressPlan layout, "
+        f"got {tuple(plan_c.shape)}"
+    )
+    plan_c_i32 = plan_c.contiguous().view(dtype=torch.int32).view(-1, 4)
+    seq_lens = plan_c_i32[:, 0].to(torch.int64)
+    ragged_ids = torch.bitwise_and(plan_c_i32[:, 1], 0xFFFF).to(torch.long)
+    compress_ratio = int(plan.compress_ratio)
+    valid = (seq_lens >= compress_ratio) & (seq_lens % compress_ratio == 0)
+    positions = torch.clamp(seq_lens - compress_ratio, min=0)
+    write_loc = out_loc.index_select(0, ragged_ids)
+    return valid, write_loc, positions
+
+
 def _extract_positions_from_plan(
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
     compress_ratio: int,
@@ -600,6 +620,7 @@ class CompressorBackendMixin:
         if kv_compressed.shape[0] == 0:
             return
 
+        valid_mask = None
         # For decode: zero out non-boundary tokens to prevent corrupting kvcache loc 0.
         if plan.is_decode:
             plan_raw = plan[1].view(torch.int32)
@@ -610,7 +631,16 @@ class CompressorBackendMixin:
             )
 
         # Step 2: norm + rope (Triton fallback for precision parity with V1)
-        positions = _extract_positions_from_plan(plan, compress_ratio)
+        if (
+            token_to_kv_pool.is_bf16_attention_kv_cache
+            and not is_indexer
+            and not plan.is_decode
+        ):
+            valid_mask, out_loc_to_store, positions = (
+                _select_bf16_prefill_compress_writes(plan, out_loc)
+            )
+        else:
+            positions = _extract_positions_from_plan(plan, compress_ratio)
         positions_safe = positions.clamp(min=0)
 
         fused_norm_rope_inplace_triton(
@@ -631,7 +661,7 @@ class CompressorBackendMixin:
         if plan.is_decode:
             kv_to_store = kv_compressed
             out_loc_to_store = out_loc
-        else:
+        elif valid_mask is None:
             kv_to_store = kv_compressed
             plan_raw = plan[1].view(torch.int32)
             ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
@@ -640,8 +670,18 @@ class CompressorBackendMixin:
         if kv_to_store.shape[0] == 0:
             return
 
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            # fused kernel: BF16 in -> FP8 quant + paged scatter in one launch
+        if token_to_kv_pool.is_bf16_attention_kv_cache and not is_indexer:
+            # The DSV4 BF16 attention cache has its own paged scatter path.  It
+            # must not fall through to the FP8 pack path when the generic fused
+            # store-cache optimization is disabled.
+            token_to_kv_pool.set_extra_key_buffer_fused(
+                layer_id=layer_id,
+                loc=out_loc_to_store,
+                cache_k=kv_to_store,
+                valid_mask=valid_mask,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+            # Fused kernel: BF16 in -> FP8 quant + paged scatter in one launch.
             if is_indexer:
                 token_to_kv_pool.set_index_k_fused(
                     layer_id=layer_id,
@@ -653,6 +693,7 @@ class CompressorBackendMixin:
                     layer_id=layer_id,
                     loc=out_loc_to_store,
                     cache_k=kv_to_store,
+                    valid_mask=valid_mask,
                 )
         else:
             if is_indexer:

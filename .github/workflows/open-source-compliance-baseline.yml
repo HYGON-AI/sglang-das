@@ -1,0 +1,479 @@
+name: open-source-compliance-baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      fail_on_hard_findings:
+        description: "Fail workflow when hard compliance findings exist"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: open-source-compliance-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CONFIG_FILE: .github/open-source-compliance.json
+  REPORT_DIR: open-source-compliance-report
+
+jobs:
+  compliance-baseline:
+    name: open-source-compliance-baseline
+    runs-on: [self-hosted, linux, x64, quality]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load compliance config
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config_file = Path(os.environ["CONFIG_FILE"])
+          if not config_file.exists():
+              raise SystemExit(f"Missing config file: {config_file}")
+
+          cfg = json.loads(config_file.read_text(encoding="utf-8"))
+
+          required = [
+              "project",
+              "upstream_repo",
+              "upstream_branch",
+              "target_branch",
+              "license",
+              "company",
+          ]
+
+          missing = [key for key in required if not cfg.get(key)]
+          if missing:
+              raise SystemExit(f"Missing required config keys: {', '.join(missing)}")
+
+          mapping = {
+              "PROJECT": cfg["project"],
+              "UPSTREAM_REPO": cfg["upstream_repo"],
+              "UPSTREAM_BRANCH": cfg["upstream_branch"],
+              "TARGET_BRANCH": cfg["target_branch"],
+              "LICENSE_ID": cfg["license"],
+              "COMPANY": cfg["company"],
+          }
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in mapping.items():
+                  env.write(f"{key}={value}\n")
+
+          print("Loaded compliance config:")
+          for key, value in mapping.items():
+              print(f"- {key}: {value}")
+          PY
+
+      - name: Prepare report directory
+        shell: bash
+        run: |
+          rm -rf "$REPORT_DIR"
+          mkdir -p "$REPORT_DIR"
+
+      - name: Fetch upstream and generate diff lists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          UPSTREAM_HEAD="$(git rev-parse FETCH_HEAD)"
+          TARGET_HEAD="$(git rev-parse HEAD)"
+
+          BASE="$(git merge-base HEAD FETCH_HEAD)"
+          if [ -z "$BASE" ]; then
+            echo "Cannot find merge-base between target and upstream." >&2
+            exit 1
+          fi
+
+          {
+            echo "project=$PROJECT"
+            echo "upstream_repo=$UPSTREAM_REPO"
+            echo "upstream_branch=$UPSTREAM_BRANCH"
+            echo "upstream_head=$UPSTREAM_HEAD"
+            echo "target_branch=$TARGET_BRANCH"
+            echo "target_head=$TARGET_HEAD"
+            echo "merge_base=$BASE"
+            echo "license=$LICENSE_ID"
+            echo "company=$COMPANY"
+            echo "run_url=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$REPORT_DIR/scan-metadata.txt"
+
+          git diff --name-status "$BASE"..HEAD > "$REPORT_DIR/changed-files.txt"
+          git diff --stat "$BASE"..HEAD > "$REPORT_DIR/changed-stat.txt"
+          git diff --name-only --diff-filter=A "$BASE"..HEAD > "$REPORT_DIR/added-files.txt"
+          git diff --name-only --diff-filter=M "$BASE"..HEAD > "$REPORT_DIR/modified-files.txt"
+          git diff --name-only --diff-filter=D "$BASE"..HEAD > "$REPORT_DIR/deleted-files.txt"
+          git diff --name-only --diff-filter=R "$BASE"..HEAD > "$REPORT_DIR/renamed-files.txt"
+          git diff --find-renames --no-ext-diff "$BASE"..HEAD > "$REPORT_DIR/full-diff.patch"
+
+          if git cat-file -e FETCH_HEAD:NOTICE 2>/dev/null; then
+            echo "true" > "$REPORT_DIR/upstream-notice-exists.txt"
+            git show FETCH_HEAD:NOTICE > "$REPORT_DIR/upstream-NOTICE.txt"
+          else
+            echo "false" > "$REPORT_DIR/upstream-notice-exists.txt"
+          fi
+
+          if git cat-file -e FETCH_HEAD:LICENSE 2>/dev/null; then
+            git show FETCH_HEAD:LICENSE > "$REPORT_DIR/upstream-LICENSE.txt"
+          fi
+
+      - name: Generate compliance reports
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          report_dir = Path(os.environ["REPORT_DIR"])
+          license_id = os.environ["LICENSE_ID"]
+          company = os.environ["COMPANY"]
+          project = os.environ["PROJECT"]
+          upstream_repo = os.environ["UPSTREAM_REPO"]
+          upstream_branch = os.environ["UPSTREAM_BRANCH"]
+          target_branch = os.environ["TARGET_BRANCH"]
+
+          hard = []
+          manual = []
+          warnings = []
+
+          def read_text(path: Path) -> str:
+              try:
+                  return path.read_text(encoding="utf-8", errors="replace")
+              except FileNotFoundError:
+                  return ""
+
+          def exists(path: str) -> bool:
+              return Path(path).exists()
+
+          def has_any(text: str, patterns) -> bool:
+              lower = text.lower()
+              return any(p.lower() in lower for p in patterns)
+
+          metadata = read_text(report_dir / "scan-metadata.txt")
+
+          # Parse changed files.
+          changed_rows = []
+          changed_files = []
+          added_files = set(read_text(report_dir / "added-files.txt").splitlines())
+          modified_files = set(read_text(report_dir / "modified-files.txt").splitlines())
+          deleted_files = set(read_text(report_dir / "deleted-files.txt").splitlines())
+
+          for line in read_text(report_dir / "changed-files.txt").splitlines():
+              if not line.strip():
+                  continue
+              parts = line.split("\t")
+              status = parts[0]
+              if status.startswith("R") or status.startswith("C"):
+                  old_path = parts[1] if len(parts) > 1 else ""
+                  new_path = parts[2] if len(parts) > 2 else old_path
+                  path = new_path
+              else:
+                  path = parts[1] if len(parts) > 1 else ""
+              if path:
+                  changed_rows.append((status, path))
+                  if status != "D":
+                      changed_files.append(path)
+
+          # Root files check.
+          root_lines = [
+              "# Root Files Check",
+              "",
+              f"- Project: {project}",
+              f"- Upstream: {upstream_repo} ({upstream_branch})",
+              f"- Target branch: {target_branch}",
+              f"- Expected license: {license_id}",
+              "",
+              "| Item | Result | Notes |",
+              "|---|---|---|",
+          ]
+
+          license_text = read_text(Path("LICENSE"))
+          if not exists("LICENSE"):
+              root_lines.append("| LICENSE | HARD | Missing root LICENSE file |")
+              hard.append("Missing root LICENSE file")
+          elif license_id.lower() == "apache-2.0" and not has_any(license_text, ["apache license", "version 2.0"]):
+              root_lines.append("| LICENSE | HARD | LICENSE exists but does not look like Apache-2.0 |")
+              hard.append("LICENSE exists but does not look like Apache-2.0")
+          else:
+              root_lines.append("| LICENSE | PASS | Root LICENSE exists and basic license text looks valid |")
+
+          readme_candidates = [Path("README.md"), Path("README")]
+          readme_path = next((p for p in readme_candidates if p.exists()), None)
+          readme_text = read_text(readme_path) if readme_path else ""
+
+          if not readme_path:
+              root_lines.append("| README | HARD | Missing README.md / README |")
+              hard.append("Missing README.md / README")
+          else:
+              notes = []
+              if not has_any(readme_text, ["license", "apache"]):
+                  notes.append("missing obvious license wording")
+                  manual.append("README needs manual review: license wording not found")
+              if not has_any(readme_text, ["attribution", "upstream", "based on", "sglang", "hygon"]):
+                  notes.append("missing obvious attribution wording")
+                  manual.append("README needs manual review: attribution wording not found")
+              if notes:
+                  root_lines.append(f"| README | WARN | {', '.join(notes)} |")
+              else:
+                  root_lines.append("| README | PASS | README contains basic license / attribution wording |")
+
+          upstream_notice_exists = read_text(report_dir / "upstream-notice-exists.txt").strip() == "true"
+          notice_exists = exists("NOTICE")
+
+          if upstream_notice_exists and not notice_exists:
+              root_lines.append("| NOTICE | HARD | Upstream has NOTICE, but target repository has no NOTICE |")
+              hard.append("Upstream NOTICE exists but target NOTICE is missing")
+          elif upstream_notice_exists and notice_exists:
+              root_lines.append("| NOTICE | MANUAL | Upstream NOTICE exists; manually confirm original NOTICE content is retained |")
+              manual.append("Manually confirm NOTICE retains upstream NOTICE content")
+          elif not upstream_notice_exists and notice_exists:
+              root_lines.append("| NOTICE | PASS | Upstream has no NOTICE; target NOTICE exists for attribution |")
+          else:
+              root_lines.append("| NOTICE | WARN | Upstream has no NOTICE; target also has no NOTICE. Recommend adding concise attribution NOTICE |")
+              warnings.append("Recommend adding NOTICE for attribution even if upstream has no NOTICE")
+
+          (report_dir / "root-files-check.md").write_text("\n".join(root_lines) + "\n", encoding="utf-8")
+
+          # Copyright/header check.
+          source_exts = {
+              ".py", ".c", ".cc", ".cpp", ".cu", ".h", ".hh", ".hpp",
+              ".rs", ".go", ".java", ".js", ".jsx", ".ts", ".tsx",
+              ".sh", ".bash", ".cmake",
+          }
+
+          skip_parts = {
+              ".git", ".github", "__pycache__", ".ruff_cache", ".mypy_cache",
+              ".pytest_cache", "node_modules", "dist", "build", "target",
+          }
+
+          header_patterns = [
+              "copyright",
+              "spdx",
+              "licensed under the apache license",
+              "apache license",
+              "modifications copyright",
+          ]
+
+          header_lines = [
+              "# Copyright / Header Check",
+              "",
+              "Scope: added and modified source files only.",
+              "",
+              "| Status | File | Result | Notes |",
+              "|---|---|---|---|",
+          ]
+
+          source_count = 0
+          for status, file_name in changed_rows:
+              path = Path(file_name)
+              if status == "D":
+                  continue
+              if path.suffix.lower() not in source_exts:
+                  continue
+              if set(path.parts) & skip_parts:
+                  continue
+              if not path.exists():
+                  continue
+
+              source_count += 1
+              text = read_text(path)
+              head = "\n".join(text.splitlines()[:120])
+              has_header = has_any(head, header_patterns)
+
+              if file_name in added_files and not has_header:
+                  header_lines.append(f"| {status} | `{file_name}` | HARD | Added source file has no obvious copyright / license header |")
+                  hard.append(f"Added source file has no obvious header: {file_name}")
+              elif file_name in modified_files and not has_header:
+                  header_lines.append(f"| {status} | `{file_name}` | MANUAL | Modified source file has no obvious header; confirm whether header / modification notice is needed |")
+                  manual.append(f"Modified source file needs header review: {file_name}")
+              elif company.lower() in head.lower() and not has_any(head, ["apache", "spdx"]):
+                  header_lines.append(f"| {status} | `{file_name}` | WARN | Company copyright exists but Apache/SPDX wording not obvious |")
+                  warnings.append(f"Company copyright without obvious Apache/SPDX wording: {file_name}")
+              else:
+                  header_lines.append(f"| {status} | `{file_name}` | PASS | Header keyword found |")
+
+          if source_count == 0:
+              header_lines.append("| - | - | PASS | No added or modified source files found |")
+
+          (report_dir / "copyright-header-check.md").write_text("\n".join(header_lines) + "\n", encoding="utf-8")
+
+          # Third-party / license risk check.
+          risk_patterns = [
+              ("AGPL risk", re.compile(r"\bAGPL\b|Affero General Public License", re.I)),
+              ("GPL risk", re.compile(r"\bGPL\b|General Public License", re.I)),
+              ("LGPL risk", re.compile(r"\bLGPL\b|Lesser General Public License", re.I)),
+              ("Copied/derived code hint", re.compile(r"copied from|derived from|modified from|based on|backport|backported", re.I)),
+              ("Vendor/third-party path", re.compile(r"(^|/)(vendor|third_party|third-party|3rdparty|external)(/|$)", re.I)),
+          ]
+
+          risk_lines = [
+              "# Third-party / License Risk Check",
+              "",
+              "| Type | File | Line | Snippet |",
+              "|---|---|---:|---|",
+          ]
+
+          risk_count = 0
+          for file_name in changed_files:
+              path = Path(file_name)
+              if not path.exists() or not path.is_file():
+                  continue
+
+              path_text = str(path).replace("\\", "/")
+              for risk_name, pattern in risk_patterns:
+                  if pattern.search(path_text):
+                      risk_count += 1
+                      risk_lines.append(f"| {risk_name} | `{file_name}` | 0 | path matched |")
+                      manual.append(f"Third-party/license path risk: {file_name}")
+
+              if path.suffix.lower() in {
+                  ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip",
+                  ".gz", ".tar", ".tgz", ".so", ".dll", ".exe", ".bin",
+                  ".onnx", ".pt", ".pth", ".safetensors", ".whl",
+              }:
+                  continue
+
+              text = read_text(path)
+              for i, line in enumerate(text.splitlines(), 1):
+                  for risk_name, pattern in risk_patterns:
+                      if pattern.search(line):
+                          risk_count += 1
+                          snippet = line.strip().replace("|", "\\|")
+                          if len(snippet) > 160:
+                              snippet = snippet[:157] + "..."
+                          risk_lines.append(f"| {risk_name} | `{file_name}` | {i} | `{snippet}` |")
+                          if "GPL" in risk_name or "AGPL" in risk_name or "LGPL" in risk_name:
+                              manual.append(f"Manual license review required: {risk_name} in {file_name}:{i}")
+                          else:
+                              manual.append(f"Manual third-party/source-origin review: {file_name}:{i}")
+
+          if risk_count == 0:
+              risk_lines.append("| - | - | - | No obvious third-party / license risk keywords found in changed files |")
+
+          (report_dir / "third-party-risk-check.md").write_text("\n".join(risk_lines) + "\n", encoding="utf-8")
+
+          # Summary.
+          changed_count = len(changed_rows)
+          added_count = len(added_files)
+          modified_count = len(modified_files)
+          deleted_count = len(deleted_files)
+
+          summary = [
+              "# Open Source Compliance Baseline Summary",
+              "",
+              "## Metadata",
+              "",
+              "```text",
+              metadata.strip(),
+              "```",
+              "",
+              "## Diff Scope",
+              "",
+              f"- Changed files: {changed_count}",
+              f"- Added files: {added_count}",
+              f"- Modified files: {modified_count}",
+              f"- Deleted files: {deleted_count}",
+              "",
+              "## Result",
+              "",
+              f"- Hard findings: {len(hard)}",
+              f"- Manual review items: {len(manual)}",
+              f"- Warnings: {len(warnings)}",
+              "",
+          ]
+
+          if hard:
+              summary.extend([
+                  "## Hard Findings",
+                  "",
+              ])
+              summary.extend([f"- {item}" for item in hard])
+              summary.append("")
+
+          if manual:
+              summary.extend([
+                  "## Manual Review Items",
+                  "",
+              ])
+              summary.extend([f"- {item}" for item in manual[:200]])
+              if len(manual) > 200:
+                  summary.append(f"- ... {len(manual) - 200} more items omitted in summary")
+              summary.append("")
+
+          if warnings:
+              summary.extend([
+                  "## Warnings",
+                  "",
+              ])
+              summary.extend([f"- {item}" for item in warnings])
+              summary.append("")
+
+          summary.extend([
+              "## Generated Reports",
+              "",
+              "- changed-files.txt",
+              "- changed-stat.txt",
+              "- added-files.txt",
+              "- modified-files.txt",
+              "- deleted-files.txt",
+              "- full-diff.patch",
+              "- root-files-check.md",
+              "- copyright-header-check.md",
+              "- third-party-risk-check.md",
+              "",
+              "## Manual Review Recommendation",
+              "",
+              "Review root LICENSE / NOTICE / README, added source headers, modified upstream source headers, third-party/vendor hints, and GPL/AGPL/LGPL keyword hits before marking the compliance stage as passed.",
+              "",
+          ])
+
+          (report_dir / "open-source-compliance-summary.md").write_text("\n".join(summary), encoding="utf-8")
+          (report_dir / "hard-findings.txt").write_text("\n".join(hard) + ("\n" if hard else ""), encoding="utf-8")
+          (report_dir / "manual-review-items.txt").write_text("\n".join(manual) + ("\n" if manual else ""), encoding="utf-8")
+
+          print("\n".join(summary))
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as step_summary:
+              step_summary.write("\n".join(summary))
+          PY
+
+      - name: Upload compliance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-source-compliance-report
+          path: open-source-compliance-report
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail on hard findings
+        if: ${{ github.event.inputs.fail_on_hard_findings == 'true' }}
+        shell: bash
+        run: |
+          if [ -s "$REPORT_DIR/hard-findings.txt" ]; then
+            echo "Hard compliance findings found:"
+            cat "$REPORT_DIR/hard-findings.txt"
+            exit 1
+          fi
+
+          echo "No hard compliance findings found."

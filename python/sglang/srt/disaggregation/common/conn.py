@@ -681,10 +681,112 @@ class CommonKVManager(BaseKVManager):
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
-        end_layer = start_layer + num_kv_layers
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        if end_layer is None:
+            end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
+        full_attention_layer_ids = getattr(
+            self.model_config, "full_attention_layer_ids", None
+        )
+
+        def is_mha_layer_type(layer_type) -> bool:
+            layer_type = str(layer_type)
+            return layer_type in ("attention", "full_attention", "sliding_attention")
+
+        if not full_attention_layer_ids:
+            hf_text_config = getattr(self.model_config, "hf_text_config", None)
+            layer_types = getattr(hf_text_config, "layer_types", None)
+            if layer_types is None:
+                layer_types = getattr(hf_text_config, "layers_block_type", None)
+            if layer_types is None:
+                hf_config = getattr(self.model_config, "hf_config", None)
+                layer_types = getattr(hf_config, "layer_types", None)
+                if layer_types is None:
+                    layer_types = getattr(hf_config, "layers_block_type", None)
+            if layer_types:
+                full_attention_layer_ids = [
+                    layer_id
+                    for layer_id, layer_type in enumerate(layer_types)
+                    if is_mha_layer_type(layer_type)
+                ]
+        main_total_layers = (
+            len(full_attention_layer_ids)
+            if full_attention_layer_ids
+            else getattr(self.model_config, "num_hidden_layers", None)
+        )
+        if (
+            num_kv_layers != dst_num_total_layers
+            and main_total_layers is not None
+            and len(dst_kv_ptrs) >= 2 * main_total_layers
+        ):
+            # Decode can append draft/MTP KV after the main model layout:
+            # [K_main..., V_main..., K_draft..., V_draft...].  Also, hybrid
+            # linear-attention models store only full-attention layers in the
+            # KV pool, so PP stage model-layer ids must be converted to compact
+            # full-attention KV indices before slicing the decode-side pointers.
+            if full_attention_layer_ids:
+                compact_start_layer = sum(
+                    1 for layer_id in full_attention_layer_ids if layer_id < start_layer
+                )
+                local_attention_layer_ids = [
+                    layer_id
+                    for layer_id in full_attention_layer_ids
+                    if start_layer <= layer_id < end_layer
+                ]
+                compact_end_layer = compact_start_layer + len(local_attention_layer_ids)
+                if len(local_attention_layer_ids) != num_kv_layers:
+                    compact_end_layer = compact_start_layer + num_kv_layers
+            else:
+                compact_start_layer = start_layer
+                compact_end_layer = compact_start_layer + num_kv_layers
+            if compact_end_layer <= main_total_layers:
+                dst_k_ptrs = dst_kv_ptrs[compact_start_layer:compact_end_layer]
+                dst_v_ptrs = dst_kv_ptrs[
+                    main_total_layers + compact_start_layer : main_total_layers
+                    + compact_end_layer
+                ]
+                layers_current_pp_stage = len(src_k_ptrs)
+                if not (
+                    len(src_k_ptrs)
+                    == len(src_v_ptrs)
+                    == len(dst_k_ptrs)
+                    == len(dst_v_ptrs)
+                    == layers_current_pp_stage
+                ):
+                    logger.error(
+                        "MHA PP ptr slicing mismatch in compact path: "
+                        "start_layer=%s, num_kv_layers=%s, end_layer=%s, "
+                        "dst_num_total_layers=%s, main_total_layers=%s, "
+                        "compact_start_layer=%s, compact_end_layer=%s, "
+                        "src_k=%s, src_v=%s, dst_k=%s, dst_v=%s, "
+                        "len_src_kv_ptrs=%s, len_dst_kv_ptrs=%s, "
+                        "full_attention_layer_ids_len=%s",
+                        start_layer,
+                        num_kv_layers,
+                        end_layer,
+                        dst_num_total_layers,
+                        main_total_layers,
+                        compact_start_layer,
+                        compact_end_layer,
+                        len(src_k_ptrs),
+                        len(src_v_ptrs),
+                        len(dst_k_ptrs),
+                        len(dst_v_ptrs),
+                        len(src_kv_ptrs),
+                        len(dst_kv_ptrs),
+                        len(full_attention_layer_ids)
+                        if full_attention_layer_ids is not None
+                        else None,
+                    )
+                return (
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                )
         if num_kv_layers == dst_num_total_layers:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
@@ -708,6 +810,35 @@ class CommonKVManager(BaseKVManager):
                 dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
             ]
         layers_current_pp_stage = len(src_k_ptrs)
+        if not (
+            len(src_k_ptrs)
+            == len(src_v_ptrs)
+            == len(dst_k_ptrs)
+            == len(dst_v_ptrs)
+            == layers_current_pp_stage
+        ):
+            logger.error(
+                "MHA PP ptr slicing mismatch: start_layer=%s, num_kv_layers=%s, "
+                "end_layer=%s, dst_num_total_layers=%s, main_total_layers=%s, "
+                "src_k=%s, src_v=%s, dst_k=%s, dst_v=%s, "
+                "len_src_kv_ptrs=%s, len_dst_kv_ptrs=%s, "
+                "full_attention_layer_ids_len=%s, is_draft_model=%s",
+                start_layer,
+                num_kv_layers,
+                end_layer,
+                dst_num_total_layers,
+                main_total_layers,
+                len(src_k_ptrs),
+                len(src_v_ptrs),
+                len(dst_k_ptrs),
+                len(dst_v_ptrs),
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
+                len(full_attention_layer_ids)
+                if full_attention_layer_ids is not None
+                else None,
+                getattr(self.model_config, "is_draft_model", None),
+            )
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(

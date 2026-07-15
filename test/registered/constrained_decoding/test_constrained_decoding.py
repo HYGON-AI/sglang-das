@@ -7,6 +7,7 @@ register_dcu_ci(
     est_time=179,
     suite="stage-b-test-1-gpu-small-dcu",
 )
+register_dcu_ci(est_time=179, suite="nightly-dcu-functional-long", nightly=True)
 
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin

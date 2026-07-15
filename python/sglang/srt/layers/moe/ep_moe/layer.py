@@ -84,6 +84,7 @@ from deepgemm import m_grouped_w4a8_gemm_nt_masked, m_grouped_w8a8_gemm_nt_maske
 from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_fp8_quant_ep, fuse_silu_and_mul, \
     fuse_silu_mul_fp8_quant
 from lightop import op as lightop_op
+from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -92,6 +93,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+_use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -505,6 +507,7 @@ class DeepEPMoE(FusedMoE):
         if self.deprecate_flag:
             return
 
+        self.use_w4a16_marlin = False
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
@@ -562,6 +565,14 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = True
+        elif _use_marlin_w4a16_moe and _is_dcu:
+            self.use_w4afp8 = False
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.use_w4a8_marlin = False
+            self.use_w8a8_marlin = False
+            self.use_bf16_marlin = False
+            self.use_w4a16_marlin = True
         else:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
@@ -706,6 +717,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_groupgemm_w8a8_fp8_masked(dispatch_output)
             elif self.use_bf16_marlin:
                 output = self.forward_groupgemm_bf16_masked(dispatch_output)
+            elif self.use_w4a16_marlin:
+                output = self.forward_groupgemm_w4a16_marlin_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
         elif _use_aiter:
@@ -1783,6 +1796,66 @@ class DeepEPMoE(FusedMoE):
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
         return hidden_states
+
+
+    def forward_groupgemm_w4a16_marlin_masked(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+        hidden_states, _, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+
+        num_groups, m, _ = hidden_states.size()
+        expected_m = min(m, expected_m)
+        w13_weight = self.w13_weight_packed
+        w13_scales = self.w13_weight_scale
+        w2_weight = self.w2_weight_packed
+        w2_scales = self.w2_weight_scale
+
+        n1 = w13_scales.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n1),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        grouped_gemm_w4a16_nt_masked_entry(
+            hidden_states,
+            w13_weight,
+            w13_scales,
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+
+        q_a2_all = torch.empty(
+            (num_groups, m, n1 // 2),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        fuse_silu_and_mul(
+            input=gateup_output,
+            output=q_a2_all,
+            mask_m=masked_m,
+            expect_m=expected_m,
+        )
+        del gateup_output
+
+        n2 = w2_scales.size(1)
+        down_output = torch.empty(
+            (num_groups, m, n2),
+            device=q_a2_all.device,
+            dtype=torch.bfloat16,
+        )
+        grouped_gemm_w4a16_nt_masked_entry(
+            q_a2_all,
+            w2_weight,
+            w2_scales,
+            down_output,
+            masked_m,
+            expected_m,
+        )
+        return down_output
 
 
 class NpuFuseEPMoE(DeepEPMoE):

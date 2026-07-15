@@ -472,3 +472,14 @@ Forward-port rules:
 - GitHub pushes use `zz-nmz22 / rye_sglang_0601` or
   `zz-nmz26 / rye_sglang_open`; never rely on the unavailable SSH key in
   `zz-nmz22 / rye_sglang_open`.
+
+Forward-port progress on 2026-07-15 CST:
+
+- Step 1 endpoint `8736a794acee` is committed as merge `e7e06b77881d`.
+- Step 2 endpoint `fde56844fca4` has all 32 conflicts resolved, its DCU
+  refactor audit completed, and its static plus pure-TP startup/request gates
+  passed after one focused optional-DeepGEMM import fix.
+- The known empty-output/eight-zero-token result remains an explicitly
+  non-blocking accuracy issue and is not reported as an accuracy pass.
+- Continue with exact endpoints `80571de9491c`, `cf5983854be1`, and
+  `5ec8531b096f`, retaining a separate no-ff merge and evidence record for each.

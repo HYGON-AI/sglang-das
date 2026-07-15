@@ -11,6 +11,7 @@ register_dcu_ci(
     est_time=195,
     suite="stage-b-test-1-gpu-small-dcu",
 )
+register_dcu_ci(est_time=195, suite="nightly-dcu-functional-long", nightly=True)
 
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
