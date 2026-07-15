@@ -186,6 +186,7 @@ class HcuCookbookModelConfig:
     tp_size: int
     server_args: list[str]
     env: dict[str, str] = field(default_factory=dict)
+    eval_kwargs: dict[str, object] = field(default_factory=dict)
     timeout: int = 3600
     dtype_or_quant: str = "bf16"
 
@@ -604,6 +605,10 @@ QWEN36_35B_A3B_2GPU = HcuCookbookModelConfig(
     timeout=3600,
     dtype_or_quant="bf16",
     env=QWEN36_35B_A3B_COOKBOOK_ENV,
+    eval_kwargs={
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
+    },
     server_args=_qwen36_35b_a3b_args(),
 )
 
@@ -1051,21 +1056,24 @@ def run_cookbook_accuracy_eval(
     os.environ["OPENAI_API_KEY"] = HCU_COOKBOOK_API_KEY
     with CookbookServer(config, base_url) as server:
         args = SimpleNamespace(
-            base_url=base_url,
-            model=server.model_path,
-            eval_name=eval_name,
-            api="chat",
-            num_examples=num_examples,
-            num_threads=num_threads,
-            num_shots=num_shots,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            top_p=1.0,
-            repeat=1,
-            gsm8k_data_path=gsm8k_data_path,
-            dataset_path=dataset_path,
-            response_answer_regex=None,
-            return_latency=False,
+            **{
+                "base_url": base_url,
+                "model": server.model_path,
+                "eval_name": eval_name,
+                "api": "chat",
+                "num_examples": num_examples,
+                "num_threads": num_threads,
+                "num_shots": num_shots,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "repeat": 1,
+                "gsm8k_data_path": gsm8k_data_path,
+                "dataset_path": dataset_path,
+                "response_answer_regex": None,
+                "return_latency": False,
+                **config.eval_kwargs,
+            }
         )
         metrics = run_eval(args)
 
