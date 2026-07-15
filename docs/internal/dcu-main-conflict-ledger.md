@@ -1530,9 +1530,12 @@ actual result in the checkpoint note.
   - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
   - Workspace import resolved both `sglang` and `mhc.py` under `/home/proj_sglang_open/sglang-das/python`; `_is_dcu=True`. With the DCU AITER MHC environment switch disabled for the import-only check, real TileLang remained unloaded and absent from `sys.modules`.
 - Functional validation status:
-  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
-  - Check `hy-smi` on both shared-home environments before starting; use an idle environment only and do not rsync `/home`.
+  - Blocked before startup by the shared runtime environment, so the only in-scope command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, `/health`, and the short `/generate` were not run.
+  - The current `nmz26` container resolved `sglang.__file__` to `/home/proj_sglang_open/sglang-das/python/sglang/__init__.py`, port 10015 was closed, and no local SGLang worker was running. However, `hy-smi` reported all eight devices occupied at 139,410-139,538 MiB of 147,440 MiB each. `hy-smi --showpids` exposed no KFD process inside this container, so the allocations belong outside the current container and were not touched.
+  - `nmz22` resolved to `10.16.1.22`, but the current container has no SSH authorization for it; the `zz-nmz22` and `zz-nmz26` aliases are not resolvable here. An idle second environment therefore could not be confirmed safely.
   - Accuracy, throughput, alternate models/topologies, DSpark/ragged-verify runtime, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260712-conflict-review.md` was generated from resolved merge `dde320d3772f023256aeb50b51470fefea5cdcf5`.
   - It reconstructs exactly the 2 actual textual conflict files and 2 conflict hunks; automatically merged files are intentionally excluded.
+- Integration decision:
+  - Keep `sync/official-main-catchup-20260712` locally with its completed merge, static validation, and review artifact. Do not advance `main`, create `dcu-main-sync-official-20260712`, or push until the pure-TP startup/request gate runs in a fully idle environment.
