@@ -414,17 +414,35 @@ class DeepseekV2MLP(nn.Module):
                 return x, None, None, None
             return x
 
+        use_fused_gate_up_rms_quant = (
+            _use_fused_rms_quant
+            and rms_weight is not None
+            and residual is not None
+        )
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
+            and not use_fused_gate_up_rms_quant
         ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
-        gate_up, _ = self.gate_up_proj(x)
+        if use_fused_gate_up_rms_quant:
+            gate_up_output = self.gate_up_proj(
+                x,
+                rms_weight=rms_weight,
+                residual=residual,
+                update_hd=update_hd,
+            )
+            gate_up, new_residual, i_q, i_s = gate_up_output[:4]
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            new_residual = residual
+            i_q = None
+            i_s = None
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -462,6 +480,8 @@ class DeepseekV2MLP(nn.Module):
                 (self.down_proj.weight, self.down_proj.weight_scale_inv),
                 down_output,
             )
+            if use_fused_gate_up_rms_quant:
+                return down_output, new_residual, i_q, i_s
             return down_output
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         if self.swiglu_limit is not None:
@@ -474,6 +494,8 @@ class DeepseekV2MLP(nn.Module):
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
+        if use_fused_gate_up_rms_quant:
+            return x, new_residual, i_q, i_s
         return x
 
 
@@ -923,7 +945,7 @@ class DeepseekV2MoE(nn.Module):
         # )
         i_q = None
         i_s = None
-        if _use_fused_rms_quant:
+        if _use_fused_rms_quant and rms_weight is not None and residual is not None:
             shared_output, new_resi, i_q, i_s = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator,
                 rms_weight = rms_weight,
@@ -953,7 +975,10 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            if _use_fused_rms_quant and i_q is not None and i_s is not None:
+                final_hidden_states = self.experts(hidden_states, topk_output, i_q=i_q, i_s=i_s)
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
             if not (_is_cuda or _is_musa) or isinstance(
                 self.experts.quant_method, KTEPWrapperMethod
             ):
@@ -1002,11 +1027,25 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
+        i_q = None
+        i_s = None
+        shared_output = None
+        shared_output_ready = False
         if hidden_states.shape[0] > 0:
-            if not defer_shared and not self._fuse_shared_experts_inside_sbo:
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator,
-                )
+            if not self._fuse_shared_experts_inside_sbo:
+                if _use_fused_rms_quant and rms_weight is not None and residual is not None:
+                    shared_output, new_resi, i_q, i_s = self._forward_shared_experts(
+                        hidden_states,
+                        gemm_output_zero_allocator,
+                        rms_weight=rms_weight,
+                        residual=residual,
+                    )
+                    shared_output_ready = True
+                elif not defer_shared:
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, gemm_output_zero_allocator,
+                    )
+                    shared_output_ready = True
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (
@@ -1078,6 +1117,7 @@ class DeepseekV2MoE(nn.Module):
             defer_shared
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
+            and not shared_output_ready
         ):
             shared_output = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator
@@ -3242,9 +3282,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
-        # 前三层dense，开融合时返回值为4个
+        # Fused RMS quant implementations may return extra quant metadata.
         if _use_fused_rms_quant and residual is not None and self.post_attention_layernorm.weight.data is not None and isinstance(self.mlp, DeepseekV2MLP):
-            hidden_states, _, _, _ = self.mlp(
+            mlp_output = self.mlp(
                 hidden_states,
                 forward_batch,
                 should_allreduce_fusion,
@@ -3253,6 +3293,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 rms_weight=self.post_attention_layernorm.weight.data,
                 residual=residual,
             )
+            hidden_states = mlp_output[0] if isinstance(mlp_output, (tuple, list)) else mlp_output
         else:  # 不管开不开融合，结果是一个就行
             hidden_states = self.mlp(
                 hidden_states,
