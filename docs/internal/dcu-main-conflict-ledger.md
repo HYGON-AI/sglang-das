@@ -1586,7 +1586,7 @@ actual result in the checkpoint note.
 - Branch: `sync/official-main-catchup-20260714`.
 - Base: DCU catch-up head `52bf6e27831a1547b1f8eb58be5bf6c1508dc296`, official previous checkpoint `f49cbbd67dea602f8616892d2a9882c8c30ae942`.
 - Endpoint: official `main@7e229e2a817de7d59e919db7ab3809ab4a22e754` (`support GLM-5.2 MTP index sharing with prefill CP (#30992)`).
-- Scope: 26 immutable official commits; 534 files changed, 9,446 insertions and 56,907 deletions. The large deletion count is dominated by the legacy Sphinx `docs/` removal after the Mintlify cutover. Git reported 9 textual conflict files and 11 conflict hunks, below the 50-file split threshold.
+- Scope: 26 immutable official commits; the official range changes 534 files with 9,446 insertions and 56,907 deletions, while the resolved merge changes 535 files with 9,515 insertions and 56,969 deletions because the ledger and semantic-audit fixes are included. The large deletion count is dominated by the legacy Sphinx `docs/` removal after the Mintlify cutover. Git reported 9 textual conflict files and 11 conflict hunks, below the 50-file split threshold.
 - `v0.5.15.post1` release marker:
   - Official annotated tag object `658e0a942ec771aeeef1b1adf4180764cacd79b2` peels to release-branch commit `0b3bb0cbe31873994c9f989fddfe2f87ca839fdd`; that commit is not an ancestor of official `main` and remains on `release/v0.5.15`.
   - The seven `v0.5.15..v0.5.15.post1` release commits map to main originals `7966f6be` (#30454), `ecb7fb398` (#30627), `24d59d8d` (#30858), `f49cbbd67` (#31001), `78dc58151` (#30839), and `7e229e2a8` (#30992), plus release-only revert `344bd82`; the revert only removes release-branch state and needs no main counterpart.
@@ -1621,4 +1621,5 @@ actual result in the checkpoint note.
   - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, after checking `hy-smi` on both `zz-nmz22` and `zz-nmz26` and selecting a completely idle environment.
   - Accuracy, throughput, alternate models/topologies, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
-  - Pending the resolved merge SHA. The review must reconstruct exactly the 9 actual textual conflict files and 11 conflict hunks from `/tmp/sglang-das-auto-conflict-20260714`; automatically merged files and later semantic-only fixes remain excluded.
+  - `docs/internal/dcu-main-catchup-20260714-conflict-review.md` was generated from resolved merge `310560cc3595f0739c3fb047c9b99425075e1685`.
+  - It reconstructs exactly the 9 actual textual conflict files and 11 conflict hunks; automatically merged files and semantic-only fixes are intentionally excluded.
