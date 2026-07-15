@@ -104,6 +104,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -131,8 +132,6 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_tp_group,
-    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -191,7 +190,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_server_args
+from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -687,7 +686,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
+                    "Initial expert_location_metadata:\n%s",
+                    format_expert_location_layout(
+                        get_global_expert_location_metadata()
+                    ),
                 )
 
             set_global_expert_distribution_recorder(
@@ -797,9 +799,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
         if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, get_global_server_args().torchao_config
-            )
+            apply_torchao_config_to_model(self.model, get_server_args().torchao_config)
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
@@ -1030,7 +1030,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts
+                enable=get_server_args().enable_return_routed_experts
                 or debug_moe_trace,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
@@ -1041,7 +1041,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        enable = get_global_server_args().enable_return_indexer_topk
+        enable = get_server_args().enable_return_indexer_topk
         # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
         # path); other backends would create a capturer but never feed it.
         if enable and self.device != "cuda":
@@ -1316,7 +1316,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
-        self.attention_tp_group = get_attention_tp_group()
+        self.attention_tp_group = get_parallel().attn_tp_group
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1733,8 +1733,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 # Load the missing weights from disk
                 self.update_weights_from_disk(
-                    get_global_server_args().model_path,
-                    get_global_server_args().load_format,
+                    get_server_args().model_path,
+                    get_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
 
@@ -2774,7 +2774,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Keep warmup aligned with scheduler MLP-sync padding.
         if require_mlp_sync(self.server_args):
-            attn_tp_size = get_attention_tp_size()
+            attn_tp_size = get_parallel().attn_tp_size
             if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
                 num_tokens = ceil_align(num_tokens, attn_tp_size)
                 batch_size = num_tokens // num_tokens_per_bs
@@ -3490,7 +3490,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.server_args.elastic_ep_backend is not None:
+        if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
         return output

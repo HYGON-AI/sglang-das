@@ -17,7 +17,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -49,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -568,7 +568,7 @@ class ModelRunnerKVCacheMixin:
         bundle = init_unified_mamba_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             page_size=self.page_size,
             start_layer=self.start_layer,
@@ -625,7 +625,7 @@ class ModelRunnerKVCacheMixin:
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
 
-        head_num = self.model_config.get_num_kv_heads(get_attention_tp_size())
+        head_num = self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
         head_dim = self.model_config.head_dim
         if self.is_hybrid_swa_compress:
             # Asymmetric head dims between full and SWA (NPU compress path):
@@ -634,7 +634,7 @@ class ModelRunnerKVCacheMixin:
             swa_head_num = max(
                 1,
                 self.model_config.hf_text_config.swa_num_key_value_heads
-                // get_attention_tp_size(),
+                // get_parallel().attn_tp_size,
             )
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
@@ -943,7 +943,7 @@ class ModelRunnerKVCacheMixin:
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
@@ -966,7 +966,7 @@ class ModelRunnerKVCacheMixin:
                         "swa_head_num": max(
                             1,
                             self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_attention_tp_size(),
+                            // get_parallel().attn_tp_size,
                         ),
                         "swa_head_dim": self.model_config.swa_head_dim,
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
@@ -979,7 +979,7 @@ class ModelRunnerKVCacheMixin:
                     dtype=self.kv_cache_dtype,
                     post_capture_active=self.post_capture_kv_active,
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
@@ -1018,7 +1018,7 @@ class ModelRunnerKVCacheMixin:
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
@@ -1028,16 +1028,31 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
-            )
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            (
+                dsa_cp_layer_shard_rank,
+                dsa_cp_layer_shard_size,
+            ) = get_glm_dsa_cp_layer_shard_info(self)
             pool_kwargs = {}
             if self.enable_hisparse:
+                PoolCls = HiSparseDSATokenToKVPool
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            elif dsa_cp_layer_shard_rank is not None:
+                # DSA cache layer split: shard KV/indexer layers across CP ranks.
+                from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                    LayerSplitDSATokenToKVPool,
+                )
+
+                PoolCls = LayerSplitDSATokenToKVPool
+                pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+                pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            else:
+                PoolCls = DSATokenToKVPool
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1089,7 +1104,7 @@ class ModelRunnerKVCacheMixin:
                         "swa_head_num": max(
                             1,
                             self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_attention_tp_size(),
+                            // get_parallel().attn_tp_size,
                         ),
                         "swa_head_dim": self.model_config.swa_head_dim,
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
@@ -1101,7 +1116,7 @@ class ModelRunnerKVCacheMixin:
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
@@ -1128,7 +1143,7 @@ class ModelRunnerKVCacheMixin:
                     dtype=self.kv_cache_dtype,
                     index_dtype=self.dtype,
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     idx_head_dim=sparse_cfg["sparse_index_dim"],
@@ -1152,7 +1167,7 @@ class ModelRunnerKVCacheMixin:
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
@@ -1187,7 +1202,7 @@ class ModelRunnerKVCacheMixin:
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
+                            get_parallel().attn_tp_size
                         ),
                         head_dim=self.model_config.head_dim,
                         v_head_dim=self.model_config.v_head_dim,
@@ -1212,7 +1227,7 @@ class ModelRunnerKVCacheMixin:
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
+                            get_parallel().attn_tp_size
                         ),
                         head_dim=self.model_config.head_dim,
                         v_head_dim=self.model_config.v_head_dim,
