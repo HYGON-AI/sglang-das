@@ -1623,10 +1623,12 @@ actual result in the checkpoint note.
   - `pip show sglang` identified the stale editable project location `/home/proj_sglang_open/dcu-sglang/python`, which no longer exists after the workspace move.
   - The one permitted focused environment fix, `python3 -m pip install --no-deps -e python`, failed while building the editable wheel: container Cargo `1.75.0` cannot parse `rust/sglang-grpc/Cargo.toml` because the package requires edition 2024. The installed editable location therefore remains unchanged.
   - Per the migration-owner workflow, no Cargo upgrade, `PYTHONPATH` bypass, or second startup attempt was made. Service readiness, `/health`, and `/generate` remain unvalidated for this step.
+  - Owner follow-up on 2026-07-15: after repairing the environment, the migration owner confirmed that the merged branch starts the target service normally and explicitly approved landing it on `main`.
+  - This owner result supersedes the earlier environment-only blocker for the catch-up integration gate; request accuracy and the previously deferred empty-output/NaN observation remain outside this startup confirmation.
   - Accuracy, throughput, alternate models/topologies, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260714-conflict-review.md` was generated from resolved merge `310560cc3595f0739c3fb047c9b99425075e1685`.
   - It reconstructs exactly the 9 actual textual conflict files and 11 conflict hunks; automatically merged files and semantic-only fixes are intentionally excluded.
 - Integration decision:
-  - Code merge and static validation are complete on `sync/official-main-catchup-20260714`, but the required functional gate is blocked by the stale editable install/Cargo toolchain.
-  - Keep local `main` at `71c4c42af24f7dda258df84b79995afa50db3af2` and do not create the `20260714`/post1-equivalent tag until the owner repairs or waives this environment gate.
+  - Code merge, static validation, and owner startup confirmation are complete on `sync/official-main-catchup-20260714`; fast-forward local `main` to this branch.
+  - Create annotated tag `v0.5.15.post1` on the resulting DCU `main` commit, explicitly recording official main-equivalent endpoint `7e229e2a817d`, then push `main` and the tag without rewriting remote history.
