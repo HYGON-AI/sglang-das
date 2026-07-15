@@ -1578,4 +1578,5 @@ actual result in the checkpoint note.
   - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
   - Accuracy, throughput, alternate models/topologies, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
-  - Pending generation from the resolved merge commit; it must contain only the eight actual conflict files and eight reconstructed hunks.
+  - `docs/internal/dcu-main-catchup-20260713-conflict-review.md` was generated from resolved merge `b111d8bc66a6ecd8c386fe9110fcf411f9e67650`.
+  - It reconstructs exactly the 8 actual textual conflict files and 8 conflict hunks; automatically merged files and the moved-symbol semantic fixes are intentionally excluded.
