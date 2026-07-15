@@ -1618,8 +1618,15 @@ actual result in the checkpoint note.
   - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
   - Workspace import resolved to `/home/proj_sglang_open/sglang-das/python/sglang/__init__.py`; `is_dcu()` returned `True`.
 - Functional validation status:
-  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, after checking `hy-smi` on both `zz-nmz22` and `zz-nmz26` and selecting a completely idle environment.
+  - Preflight `hy-smi` found all eight `zz-nmz22` devices at `VRAM 0% / HCU 0.0%`; all eight `zz-nmz26` devices were occupied at `VRAM 95%`, so only `zz-nmz22` was selected.
+  - The exact in-scope command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel` failed before model loading because `/usr/local/bin/sglang` could not import the package (`ModuleNotFoundError: No module named 'sglang'`).
+  - `pip show sglang` identified the stale editable project location `/home/proj_sglang_open/dcu-sglang/python`, which no longer exists after the workspace move.
+  - The one permitted focused environment fix, `python3 -m pip install --no-deps -e python`, failed while building the editable wheel: container Cargo `1.75.0` cannot parse `rust/sglang-grpc/Cargo.toml` because the package requires edition 2024. The installed editable location therefore remains unchanged.
+  - Per the migration-owner workflow, no Cargo upgrade, `PYTHONPATH` bypass, or second startup attempt was made. Service readiness, `/health`, and `/generate` remain unvalidated for this step.
   - Accuracy, throughput, alternate models/topologies, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260714-conflict-review.md` was generated from resolved merge `310560cc3595f0739c3fb047c9b99425075e1685`.
   - It reconstructs exactly the 9 actual textual conflict files and 11 conflict hunks; automatically merged files and semantic-only fixes are intentionally excluded.
+- Integration decision:
+  - Code merge and static validation are complete on `sync/official-main-catchup-20260714`, but the required functional gate is blocked by the stale editable install/Cargo toolchain.
+  - Keep local `main` at `71c4c42af24f7dda258df84b79995afa50db3af2` and do not create the `20260714`/post1-equivalent tag until the owner repairs or waives this environment gate.
