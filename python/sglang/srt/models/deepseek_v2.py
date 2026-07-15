@@ -226,10 +226,13 @@ _use_opt_cat_decode = get_bool_env_var("SGLANG_USE_OPT_CAT")
 _use_fused_mla_cat = get_bool_env_var("SGLANG_USE_FUSED_MLA_CAT")
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
-_rms_quant_path = get_int_env_var('SGLANG_USE_RMS_QUANT_PATH')
+_rms_quant_path = get_int_env_var("SGLANG_USE_RMS_QUANT_PATH")
 if _use_fused_rmsnorm_rope:
     from lightop import fused_rms_norm_rope_contiguous
-    fused_rms_norm_rope_contiguous = torch._dynamo.disable(fused_rms_norm_rope_contiguous)
+
+    fused_rms_norm_rope_contiguous = torch._dynamo.disable(
+        fused_rms_norm_rope_contiguous
+    )
     # 此处注册自定义算子反而导致多了很多triton kernel影响性能
     # def fused_rms_norm_rope_wrapper(
     #     positions: torch.Tensor,
@@ -350,6 +353,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
 # 暂时先放这
 def ds_bmm_wrapper(q: torch.Tensor, w: torch.Tensor, scale: float, dtype: torch.dtype):
     # # scale=1时去掉elementwise数乘
@@ -376,6 +380,7 @@ dtype_mapping = {
     torch.float16: "fp16",
     torch.bfloat16: "bf16",
 }
+
 
 def add_forward_absorb_core_attention_backend(backend_name):
     if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
@@ -434,14 +439,11 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
-            _is_hip
-            and not _is_dcu
-            and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
+            _is_hip and not _is_dcu and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -460,10 +462,14 @@ class DeepseekV2MLP(nn.Module):
                 return x, None, None, None
             return x
 
+        use_fused_gate_up_rms_quant = (
+            _use_fused_rms_quant and rms_weight is not None and residual is not None
+        )
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
             and self.swiglu_limit is None
             and not isinstance(x, tuple)
+            and not use_fused_gate_up_rms_quant
         ):
             from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
                 nvfp4_gemm_swiglu_nvfp4_quant,
@@ -489,13 +495,26 @@ class DeepseekV2MLP(nn.Module):
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
+            and not use_fused_gate_up_rms_quant
         ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
-        gate_up, _ = self.gate_up_proj(x)
+        if use_fused_gate_up_rms_quant:
+            gate_up_output = self.gate_up_proj(
+                x,
+                rms_weight=rms_weight,
+                residual=residual,
+                update_hd=update_hd,
+            )
+            gate_up, new_residual, i_q, i_s = gate_up_output[:4]
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            new_residual = residual
+            i_q = None
+            i_s = None
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -533,6 +552,8 @@ class DeepseekV2MLP(nn.Module):
                 (self.down_proj.weight, self.down_proj.weight_scale_inv),
                 down_output,
             )
+            if use_fused_gate_up_rms_quant:
+                return down_output, new_residual, i_q, i_s
             return down_output
 
         if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
@@ -585,6 +606,8 @@ class DeepseekV2MLP(nn.Module):
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        if use_fused_gate_up_rms_quant:
+            return x, new_residual, i_q, i_s
         return x
 
 
@@ -698,7 +721,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -928,13 +950,15 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = (
+                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -1076,8 +1100,8 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
-                    rms_weight = rms_weight,
-                    residual = residual,
+                    rms_weight=rms_weight,
+                    residual=residual,
                 )
             else:
                 return self.forward_normal(
@@ -1108,13 +1132,24 @@ class DeepseekV2MoE(nn.Module):
         residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
-        # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
+        # - no stream explosion: the routed path precedes the alt block unless
+        #   fused RMS/quant must produce the routed INT8 input first;
         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
         # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
         #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
         use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        i_q = None
+        i_s = None
+        shared_output = None
+        if _use_fused_rms_quant and rms_weight is not None and residual is not None:
+            shared_output, _new_residual, i_q, i_s = self._forward_shared_experts(
+                hidden_states,
+                gemm_output_zero_allocator,
+                rms_weight=rms_weight,
+                residual=residual,
+            )
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
@@ -1157,7 +1192,12 @@ class DeepseekV2MoE(nn.Module):
         elif use_flashinfer_trtllm_bypass:
             final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
         else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            if i_q is not None and i_s is not None:
+                final_hidden_states = self.experts(
+                    hidden_states, topk_output, i_q=i_q, i_s=i_s
+                )
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             not _is_cuda
             and not _is_musa
@@ -1167,17 +1207,8 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
-        with torch.cuda.stream(self.alt_stream):
-            if _use_fused_rms_quant and rms_weight is not None and residual is not None:
-                shared_output = self._forward_shared_experts(
-                    hidden_states,
-                    gemm_output_zero_allocator,
-                    rms_weight=rms_weight,
-                    residual=residual,
-                )
-                if isinstance(shared_output, tuple):
-                    shared_output = shared_output[0]
-            else:
+        if shared_output is None:
+            with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -1235,16 +1266,31 @@ class DeepseekV2MoE(nn.Module):
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
+        i_q = None
+        i_s = None
         shared_output = None
+        shared_output_ready = False
         if hidden_states.shape[0] > 0:
-            if (
-                not defer_shared
-                and not self._fuse_shared_experts_inside_sbo
-                and not skip_shared_experts
-            ):
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator,
-                )
+            if not self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
+                if (
+                    _use_fused_rms_quant
+                    and rms_weight is not None
+                    and residual is not None
+                ):
+                    shared_output, _new_residual, i_q, i_s = (
+                        self._forward_shared_experts(
+                            hidden_states,
+                            gemm_output_zero_allocator,
+                            rms_weight=rms_weight,
+                            residual=residual,
+                        )
+                    )
+                    shared_output_ready = True
+                elif not defer_shared:
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, gemm_output_zero_allocator
+                    )
+                    shared_output_ready = True
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (
@@ -1265,9 +1311,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if _use_lightop_moe_sum_mul_add:
-            final_hidden_states = self.experts(
-                hidden_states, topk_output, shared_output=shared_output
-            )
+            if i_q is not None and i_s is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    shared_output=shared_output,
+                    i_q=i_q,
+                    i_s=i_s,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states, topk_output, shared_output=shared_output
+                )
         else:
             if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
                 shared_output = None
@@ -1292,16 +1347,18 @@ class DeepseekV2MoE(nn.Module):
                     torch.cuda.current_stream().wait_stream(self.alt_stream)
                     post_combine_hook_handle.remove()
 
-                pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
-                    _pre_combine_hook
+                pre_combine_hook_handle = (
+                    self.experts.dispatcher.register_pre_combine_hook(_pre_combine_hook)
                 )
                 post_combine_hook_handle = (
-                    self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+                    self.experts.dispatcher.register_post_combine_hook(
+                        _post_combine_hook
+                    )
                 )
             final_hidden_states = self.experts(
-            hidden_states,
-            topk_output,
-        )
+                hidden_states,
+                topk_output,
+            )
         if (
             not _is_cuda
             and not _is_musa
@@ -1318,6 +1375,7 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
+            and not shared_output_ready
         ):
             shared_output = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator
@@ -1422,14 +1480,24 @@ class DeepseekV2MoE(nn.Module):
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         if _use_fused_rms_quant:
-                            shared_output, new_resi, i_q, i_s = self._forward_shared_experts(hidden_states, rms_weight=rms_weight, residual=residual)
+                            shared_output, new_resi, i_q, i_s = (
+                                self._forward_shared_experts(
+                                    hidden_states,
+                                    rms_weight=rms_weight,
+                                    residual=residual,
+                                )
+                            )
                         else:
                             shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
                 else:
                     if _use_fused_rms_quant:
-                        shared_output, new_resi, i_q, i_s = self._forward_shared_experts(hidden_states, rms_weight=rms_weight, residual=residual)
+                        shared_output, new_resi, i_q, i_s = (
+                            self._forward_shared_experts(
+                                hidden_states, rms_weight=rms_weight, residual=residual
+                            )
+                        )
                     else:
                         shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1646,9 +1714,9 @@ class DeepseekV2MoE(nn.Module):
             return self.shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator=gemm_output_zero_allocator,
-                rms_weight = rms_weight,
-                residual = residual,
-                update_hd = update_hd,
+                rms_weight=rms_weight,
+                residual=residual,
+                update_hd=update_hd,
             )
         else:
             if _use_fused_rms_quant and rms_weight is not None and residual is not None:
@@ -1769,7 +1837,6 @@ class DeepseekV2AttentionMLA(
     DeepseekMLARocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2106,20 +2173,20 @@ class DeepseekV2AttentionMLA(
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states[0]
         else:
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states, None, forward_batch, None
-        
+
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -2243,29 +2310,33 @@ class DeepseekV2AttentionMLA(
             if _use_fused_rms_quant and self.input_layernorm is not None:
                 # NOTE: suspected
                 if _rms_quant_path == 1:
-                # path 1
+                    # path 1
                     if forward_batch.residual_rms_per_quant_int8 is None:
                         qkv_latent, _ = self.fused_qkv_a_proj_with_mqa(
-                            hidden_states, 
+                            hidden_states,
                             rms_weight=self.input_layernorm.weight.data,
                             residual=None,
-                            update_hd=False)
+                            update_hd=False,
+                        )
                         forward_batch.residual_rms_per_quant_int8 = hidden_states
                     else:
                         qkv_latent, _ = self.fused_qkv_a_proj_with_mqa(
-                            hidden_states, 
+                            hidden_states,
                             rms_weight=self.input_layernorm.weight.data,
                             residual=forward_batch.residual_rms_per_quant_int8,
-                            update_hd=False)
+                            update_hd=False,
+                        )
                 else:
-                # path 2
-                    if forward_batch.residual_rms_per_quant_int8 is None: 
+                    # path 2
+                    if forward_batch.residual_rms_per_quant_int8 is None:
                         _normed = self.input_layernorm(hidden_states)
                         forward_batch.residual_rms_per_quant_int8 = hidden_states
                     else:
-                        _normed, _ = self.input_layernorm(hidden_states, forward_batch.residual_rms_per_quant_int8)
+                        _normed, _ = self.input_layernorm(
+                            hidden_states, forward_batch.residual_rms_per_quant_int8
+                        )
                     qkv_latent = self.fused_qkv_a_proj_with_mqa(_normed)[0]
-                
+
             else:
                 qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         return qkv_latent
@@ -2308,7 +2379,12 @@ class DeepseekV2AttentionMLA(
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode() and not _use_fused_rmsnorm_rope and not _use_fused_rms_quant:
+            if (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not _use_fused_rmsnorm_rope
+                and not _use_fused_rms_quant
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -2399,10 +2475,16 @@ class DeepseekV2AttentionMLA(
                 if not _use_fused_rmsnorm_rope:
                     k_nope = k_nope.unsqueeze(1)
                 if not _use_fused_rms_quant:
-                    q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                    q = self.q_b_proj(q)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 else:
-                    q = self.q_b_proj(q, rms_weight=self.q_a_layernorm.weight.data, residual=None,
-                                    update_hd=False)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                    q = self.q_b_proj(
+                        q,
+                        rms_weight=self.q_a_layernorm.weight.data,
+                        residual=None,
+                        update_hd=False,
+                    )[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or (
                         self.is_nextn and prev_topk_indices is None
@@ -2430,17 +2512,29 @@ class DeepseekV2AttentionMLA(
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
         if _use_fused_rmsnorm_rope:
-            k_nope_normed = torch.empty(k_nope.shape, dtype=k_nope.dtype, device=k_nope.device)
+            k_nope_normed = torch.empty(
+                k_nope.shape, dtype=k_nope.dtype, device=k_nope.device
+            )
             weight = self.kv_a_layernorm.weight
             variance_epsilon = self.kv_a_layernorm.variance_epsilon
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             kv_pool = get_token_to_kv_pool()
             # 暂不注册自定义算子，多很多kernel影响性能
-            fused_rms_norm_rope_contiguous(positions, q_pe, k_pe.squeeze(1), k_nope,
-                                          k_nope_normed, weight, cos_sin_cache,
-                                          forward_batch.out_cache_loc,
-                                          kv_pool.kv_buffer[self.layer_id - kv_pool.start_layer],
-                                          dtype_mapping.get(kv_pool.dtype),1.0,False,variance_epsilon)
+            fused_rms_norm_rope_contiguous(
+                positions,
+                q_pe,
+                k_pe.squeeze(1),
+                k_nope,
+                k_nope_normed,
+                weight,
+                cos_sin_cache,
+                forward_batch.out_cache_loc,
+                kv_pool.kv_buffer[self.layer_id - kv_pool.start_layer],
+                dtype_mapping.get(kv_pool.dtype),
+                1.0,
+                False,
+                variance_epsilon,
+            )
             k_nope = k_nope.unsqueeze(1)
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -2477,7 +2571,7 @@ class DeepseekV2AttentionMLA(
                 )
             else:
                 # q_nope_out = ds_bmm_wrapper(q_nope, self.w_kc, self.w_scale, torch.bfloat16)
-                 q_nope_out = torch.bmm(
+                q_nope_out = torch.bmm(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
@@ -2501,9 +2595,12 @@ class DeepseekV2AttentionMLA(
             #         q_t,
             #         w_vc_t
             #     )
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1).to(torch.bfloat16), self.w_kc.to(torch.bfloat16) * self.w_scale)
+            q_nope_out = torch.bmm(
+                q_nope.transpose(0, 1).to(torch.bfloat16),
+                self.w_kc.to(torch.bfloat16) * self.w_scale,
+            )
         q_nope_out = q_nope_out.transpose(0, 1)
-        
+
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
@@ -2577,9 +2674,7 @@ class DeepseekV2AttentionMLA(
                     q_pe,
                     k_nope,
                     k_pe,
-                    get_token_to_kv_pool().get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
+                    get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
                     forward_batch.out_cache_loc,
                     positions,
                     cos,
@@ -2590,23 +2685,31 @@ class DeepseekV2AttentionMLA(
                 )
 
                 save_kv_cache = False
-                attn_output = self.attn_mqa( 
+                attn_output = self.attn_mqa(
                     q,
                     k,
                     k_nope,
                     forward_batch,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
                 )
             elif _use_fused_mla_cat:
                 save_kv_cache = False
-                attn_output = self.attn_mqa( 
+                attn_output = self.attn_mqa(
                     q_nope_out,
                     k_nope,
                     k_nope,
                     forward_batch,
                     q_rope=q_pe,
                     k_rope=k_pe,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
                 )
             else:
                 if _use_opt_cat_decode and q_nope_out.shape[0] < 1024:
@@ -2619,7 +2722,11 @@ class DeepseekV2AttentionMLA(
                         k_nope,
                         forward_batch,
                         k_rope=k_pe,
-                        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
                     )
 
                 else:
@@ -2631,7 +2738,11 @@ class DeepseekV2AttentionMLA(
                         k,
                         k_nope,
                         forward_batch,
-                        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
                     )
 
             # Apply llama 4 scaling if provided
@@ -2644,7 +2755,11 @@ class DeepseekV2AttentionMLA(
                     k_nope,
                     forward_batch,
                     save_kv_cache=save_kv_cache,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
                 )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         if self.use_deep_gemm_bmm:
@@ -2854,9 +2969,7 @@ class DeepseekV2AttentionMLA(
         get_token_to_kv_pool().set_kv_buffer(
             self.attn_mqa, forward_batch.out_cache_loc, k_input, None
         )
-        key_cache_buf = get_token_to_kv_pool().get_key_buffer(
-            self.attn_mqa.layer_id
-        )
+        key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
         return (
@@ -2885,9 +2998,9 @@ class DeepseekV2AttentionMLA(
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(
-            self
-        ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
+            "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+        )
 
         q_input, k_input, v_input = (
             torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
@@ -3005,9 +3118,9 @@ class DeepseekV2AttentionMLA(
     def forward_absorb_fused_mla_rope_cpu_core(
         self, q_input, k_input, v_input, forward_batch, zero_allocator
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(
-            self
-        ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
+            "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+        )
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -3126,7 +3239,7 @@ class DeepseekV2AttentionMLA(
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        
+
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
         if has_extend_prefix:
             attn_output, lse = attn_output
@@ -3228,13 +3341,11 @@ class DeepseekV2AttentionMLA(
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert (
-            kv_indices is not None
-        ), "page_table_1_flattened should have been generated for FP8 MHA path"
-
-        kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(
-            self.attn_mha.layer_id
+        assert kv_indices is not None, (
+            "page_table_1_flattened should have been generated for FP8 MHA path"
         )
+
+        kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
 
         kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
 
@@ -3287,7 +3398,6 @@ class DeepseekV2AttentionMLA(
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -3462,7 +3572,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
                 quant_format=getattr(self, "_gfx95_quant_format", ""),
-            )        )
+            )
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -3482,9 +3593,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         # DCU fused RMS/quant must keep the norm for SBO sparse-MoE layers.
-        forward_batch.rms_quant_flag = not (
-            self.is_layer_sparse and _is_sbo_enabled
-        )
+        forward_batch.rms_quant_flag = not (self.is_layer_sparse and _is_sbo_enabled)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )

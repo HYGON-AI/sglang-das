@@ -80,9 +80,25 @@ from sglang.srt.runtime_context import get_forward, get_parallel, get_server_arg
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
+    is_dcu,
     is_non_idle_and_non_empty,
     make_layers,
 )
+
+_is_dcu = is_dcu()
+_use_lightop_rotary_embedding_fuse = False
+mimo_v2_split_rope_vscale_kv_store = None
+if _is_dcu:
+    try:
+        from lightop import mimo_v2_split_rope_vscale_kv_store
+    except ImportError:
+        pass
+
+    _use_lightop_rotary_embedding_fuse = (
+        mimo_v2_split_rope_vscale_kv_store is not None
+        and get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
+    )
 
 MiMoV2Config = None
 
@@ -119,6 +135,56 @@ def load_mimo_v2_qkv_proj_weight(
         )
 
     default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+
+
+def load_mimo_v2_qkv_proj_weight_v2(
+    name: str,
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    expected_fused_tp_size: Optional[int],
+    config: MiMoV2Config,
+):
+    attn_tp_size = get_parallel().attn_tp_size
+
+    if attn_tp_size == 1 and expected_fused_tp_size is not None:
+        fused_tp = expected_fused_tp_size
+        layer_id = get_layer_id(name)
+        is_swa = (
+            layer_id is not None
+            and hasattr(config, "hybrid_layer_pattern")
+            and config.hybrid_layer_pattern[layer_id] == 1
+        )
+        # MTP layer always uses SWA
+        is_mtp = "mtp_block" in name or "mtp.layers" in name
+        if is_swa or is_mtp:
+            total_q = config.swa_num_attention_heads * config.swa_head_dim
+            total_k = config.swa_num_key_value_heads * config.swa_head_dim
+            total_v = config.swa_num_key_value_heads * getattr(
+                config, "swa_v_head_dim", config.swa_head_dim
+            )
+        else:
+            total_q = config.num_attention_heads * config.head_dim
+            total_k = config.num_key_value_heads * config.head_dim
+            total_v = config.num_key_value_heads * getattr(
+                config, "v_head_dim", config.head_dim
+            )
+        per_rank_q = total_q // fused_tp
+        per_rank_k = total_k // fused_tp
+        per_rank_v = total_v // fused_tp
+        per_rank_total = per_rank_q + per_rank_k + per_rank_v
+
+        chunks = loaded_weight.split([per_rank_total] * fused_tp, dim=0)
+        q_parts = [ch[:per_rank_q] for ch in chunks]
+        k_parts = [ch[per_rank_q : per_rank_q + per_rank_k] for ch in chunks]
+        v_parts = [
+            ch[per_rank_q + per_rank_k : per_rank_q + per_rank_k + per_rank_v]
+            for ch in chunks
+        ]
+
+        reordered = torch.cat(q_parts + k_parts + v_parts, dim=0)
+        default_weight_loader(param, reordered)
+    else:
+        load_mimo_v2_qkv_proj_weight(name, param, loaded_weight, expected_fused_tp_size)
 
 
 class MiMoV2MLP(nn.Module):
@@ -353,12 +419,15 @@ class MiMoV2MoE(nn.Module):
                         layer_id=self.layer_id,
                     ),
                 )
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
         return final_hidden_states
 
@@ -530,6 +599,37 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
+        server_args = get_server_args()
+        if server_args.kv_cache_dtype == "fp8_e4m3":
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        elif server_args.kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_dtype = torch.float8_e5m2
+        elif server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
+        else:
+            self.kv_cache_dtype = torch.bfloat16
+        self.page_size = server_args.page_size
+        self.layer_id = layer_id
+
+    def _get_lightop_mha_kv_args(self, forward_batch: ForwardBatch):
+        pool = forward_batch.token_to_kv_pool
+        loc = forward_batch.out_cache_loc
+
+        if hasattr(pool, "layers_mapping"):
+            layer_id_pool, is_swa_layer = pool.layers_mapping[self.layer_id]
+            if is_swa_layer:
+                if pool.swa_loc is not None:
+                    loc = pool.swa_loc
+                else:
+                    if pool.full_to_swa_index_mapping is not None:
+                        loc = pool.translate_loc_from_full_to_swa(loc)
+                k_buffer, v_buffer = pool.swa_kv_pool.get_kv_buffer(layer_id_pool)
+            else:
+                k_buffer, v_buffer = pool.full_kv_pool.get_kv_buffer(layer_id_pool)
+        else:
+            logger.error("mimo v2 kv pool is not healthy: missing layers_mapping")
+            return None
+        return k_buffer, v_buffer, loc
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -579,14 +679,47 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
-        # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
-        # [t, h, d]
+        if _is_dcu and _use_lightop_rotary_embedding_fuse:
+            kv_args = self._get_lightop_mha_kv_args(forward_batch)
+            if kv_args is None:
+                return None
+            k_buffer, v_buffer, kv_cache_loc = kv_args
 
-        if self.v_scale is not None:
-            v = v * self.v_scale
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            if cos_sin_cache.device != qkv.device or cos_sin_cache.dtype != qkv.dtype:
+                cos_sin_cache = cos_sin_cache.to(
+                    qkv.device, dtype=qkv.dtype, non_blocking=True
+                )
+                self.rotary_emb.cos_sin_cache = cos_sin_cache
+
+            q, k, v = mimo_v2_split_rope_vscale_kv_store(
+                positions,
+                qkv,
+                self.q_size,
+                self.k_size,
+                self.v_size,
+                cos_sin_cache,
+                head_dim=self.head_dim,
+                v_head_dim=self.v_head_dim,
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                kv_cache_loc=kv_cache_loc,
+                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                value_scale=self.v_scale if self.v_scale is not None else 1.0,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=self.attn.k_scale,
+                v_cache_scale=self.attn.v_scale,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+
+            # [t, h, dr]
+            q, k = self.rotary_emb(positions, q, k)
+            # [t, h, d]
+
+            if self.v_scale is not None:
+                v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output
@@ -1370,63 +1503,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                         self.config
                     )
-                    attn_tp_size = get_parallel().attn_tp_size
-
-                    if attn_tp_size == 1 and expected_fused_tp_size is not None:
-                        fused_tp = expected_fused_tp_size
-                        layer_id = get_layer_id(name)
-                        is_swa = (
-                            layer_id is not None
-                            and hasattr(self.config, "hybrid_layer_pattern")
-                            and self.config.hybrid_layer_pattern[layer_id] == 1
-                        )
-                        if is_swa and hasattr(self.config, "swa_num_attention_heads"):
-                            total_q = (
-                                self.config.swa_num_attention_heads
-                                * self.config.swa_head_dim
-                            )
-                            total_k = (
-                                self.config.swa_num_key_value_heads
-                                * self.config.swa_head_dim
-                            )
-                            total_v = self.config.swa_num_key_value_heads * getattr(
-                                self.config, "swa_v_head_dim", self.config.swa_head_dim
-                            )
-                        else:
-                            total_q = (
-                                self.config.num_attention_heads * self.config.head_dim
-                            )
-                            total_k = (
-                                self.config.num_key_value_heads * self.config.head_dim
-                            )
-                            total_v = self.config.num_key_value_heads * getattr(
-                                self.config, "v_head_dim", self.config.head_dim
-                            )
-                        per_rank_q = total_q // fused_tp
-                        per_rank_k = total_k // fused_tp
-                        per_rank_v = total_v // fused_tp
-                        per_rank_total = per_rank_q + per_rank_k + per_rank_v
-
-                        chunks = loaded_weight.split([per_rank_total] * fused_tp, dim=0)
-                        q_parts = [ch[:per_rank_q] for ch in chunks]
-                        k_parts = [
-                            ch[per_rank_q : per_rank_q + per_rank_k] for ch in chunks
-                        ]
-                        v_parts = [
-                            ch[
-                                per_rank_q + per_rank_k : per_rank_q
-                                + per_rank_k
-                                + per_rank_v
-                            ]
-                            for ch in chunks
-                        ]
-
-                        reordered = torch.cat(q_parts + k_parts + v_parts, dim=0)
-                        default_weight_loader(param, reordered)
-                    else:
-                        load_mimo_v2_qkv_proj_weight(
-                            name, param, loaded_weight, expected_fused_tp_size
-                        )
+                    load_mimo_v2_qkv_proj_weight_v2(
+                        name, param, loaded_weight, expected_fused_tp_size, self.config
+                    )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

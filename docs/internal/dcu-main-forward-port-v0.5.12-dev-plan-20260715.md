@@ -99,8 +99,8 @@ rsync repositories between the two test machines.
 | 1 | `8736a794acee8253019704cf00a901fd7ffcefbe` | committed as `e7e06b77881d` | static gates passed; pure-TP startup, health, and request passed; known empty output remains non-blocking |
 | 2 | `fde56844fca442108bf3d2c71cbdeacb4ddb8f08` | committed as `c7ffa6497a9e` | 32 textual conflicts; static gates passed; pure-TP passed after one focused optional-DeepGEMM import fix |
 | 3 | `80571de9491c8fd80e6822c9fa4efeb02ff67cce` | committed as `d648b38c7f3d` | 66 textual conflicts; static gates and pure-TP startup/health/request passed; known empty output remains non-blocking |
-| 4 | `cf5983854be1f19237ba28416b438f7b8965cfe6` | resolved and validated; merge commit pending | 9 textual conflicts; static gates and pure-TP startup/health/request passed without retry |
-| 5 | `5ec8531b096fa3297ab034dedc873aad215f2c35` | pending | not run |
+| 4 | `cf5983854be1f19237ba28416b438f7b8965cfe6` | committed as `f76fbea9601d` | 9 textual conflicts; static gates and pure-TP startup/health/request passed without retry |
+| 5 | `5ec8531b096fa3297ab034dedc873aad215f2c35` | resolved and validated; merge commit pending | 9 textual conflicts; static gates and pure-TP passed after one static optional-LightOp capability fix |
 
 Step 2 keeps the official-main file/API layout canonical. Its old C16/BF16 KV
 store moved from `mem_cache/utils.py` to `kernels/ops/kvcache/mla_buffer.py`;
@@ -134,3 +134,26 @@ rejected occupied `zz-nmz26` and selected idle `zz-nmz22`; the exact pure-TP
 service loaded 46 shards, captured graphs `bs=128..1`, and returned HTTP 200
 for health and generate. The known empty eight-zero-token result remains
 non-blocking. Detailed evidence is in the Step 4 conflict review.
+
+Step 5 completes the immutable old range at `5ec8531b096f`. It keeps the
+current Mooncake chunk and SWA allocator structures canonical, adds the old
+heterogeneous attention-TP slice transfer without duplicate sends, and does
+not restore the superseded pool-level `free_swa` implementation. DeepSeek
+V3.2 fused gate/up RMS quantization and shared/routed expert activation scales
+are ported into current scoped communication and deferred-finalize APIs.
+
+MiMo retains the endpoint's TP1 fused-QKV/MTP-as-SWA loading, KME/RoPE, EPLB,
+and resume behavior using current runtime-context accessors. Static import
+smoke found that the container's installed LightOp lacks the newly requested
+fused RoPE/KV-store symbol; one capability-detection fix preserves the fused
+path when available and safely falls back otherwise.
+
+All Step 5 static gates passed: changed Python compilation, broad and targeted
+Ruff, eleven high-risk imports, 277-file DCU registration, 19 DSA tests, and
+gfx938 HIP setup with 56 replaced launches. Immediate preflight rejected
+occupied `zz-nmz26` (VRAM 93%) and selected idle `zz-nmz22`. The exact pure-TP
+service loaded 46 shards, captured graphs `bs=128..1`, and returned HTTP 200
+for health and generate. The known empty response with eight zero output IDs
+remains a non-blocking accuracy observation. Port 10015 was closed and the
+selected node returned to VRAM/HCU 0%. Detailed evidence is in the Step 5
+conflict review.

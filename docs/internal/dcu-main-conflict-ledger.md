@@ -1845,3 +1845,68 @@ actual result in the checkpoint note.
     devices returned to VRAM 0%.
 - Detailed conflict decisions and evidence:
   `docs/internal/dcu-main-forward-port-v0.5.12-dev-step4-conflict-review.md`.
+
+### v0.5.12_dev forward-port Step 5 / `5ec8531b096f`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 4 merge `f76fbea9601d31f7a45cd4b4c063de95c18455d3`.
+- Old range: `cf5983854be1f19237ba28416b438f7b8965cfe6..5ec8531b096fa3297ab034dedc873aad215f2c35`.
+- Scope: 22 full-graph commits, 13 non-merge commits, 17 old-range files;
+  resolved code before documentation changes is 16 files with 2,156
+  insertions and 615 deletions.
+- Git reported exactly 9 textual conflict files:
+  - Mooncake connection, FlashAttention, DeepEP MoE, MiniMax INT8 Marlin,
+    fused MoE, W8A8 INT8, SWA pool facade, DeepSeek V2/V3.2, and MiMo V2;
+  - all were resolved against current APIs while retaining the endpoint's DCU
+    transfer, LightOp/AITER, fused quantization, and model behavior.
+- Refactor and semantic decisions:
+  - Mooncake keeps current strict C128/SWA-ring validation, canonical transfer
+    chunks, MiniMax flat transfer, and recursive registration. Heterogeneous
+    attention TP transfers a dedicated SWA/DSA slice and skips the generic
+    sender to avoid duplicate writes;
+  - `swa_memory_pool.py` remains the pool facade. The old simplified
+    `free_swa` edit is superseded by current `mem_cache/allocator/swa.py`,
+    which already expands full pages, deduplicates, rejects already-free
+    pages, merges released pages, and clears stale mappings;
+  - DeepSeek V3.2 fused gate/up RMS quantization and routed/shared expert
+    activation scales were ported into current scoped communication and
+    deferred-finalization contracts; removed down-projection and all-reduce
+    parameters were not restored;
+  - DeepEP INT8 uses LightOp only under `_is_dcu`; generic platforms retain
+    the current DeepGEMM alias. The endpoint's AITER W4A16 MoE_C support is
+    retained on the current fused-MoE runner API;
+  - MiMo retains TP1 fused-QKV and MTP-as-SWA loading, KME/RoPE, EPLB, and
+    resume behavior using current runtime-context accessors;
+  - import smoke found that the installed LightOp lacks
+    `mimo_v2_split_rope_vscale_kv_store`. One focused capability guard keeps
+    the fused DCU path when available and falls back to the unfused path when
+    unavailable instead of failing module import;
+  - no runtime `is_hcu()` predicate was introduced, and the generic-HIP fused
+    clamp remains explicitly excluded from DCU's dedicated quantized path;
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still exports
+    `SGLANG_USE_AITER_AG=0`.
+- Static validation:
+  - no unmerged entries or precise conflict markers;
+  - staged `git diff --check` passed;
+  - all changed Python files compiled;
+  - broad Ruff `E9,F821` and targeted high-risk Ruff
+    `E9,F401,F811,F821,F841` passed;
+  - eleven high-risk modules imported after the one capability fix;
+  - DCU registration passed with 277 files and the existing CPU-utils warning;
+  - DSA alias/CLI/registry passed 19 tests;
+  - gfx938 HIP setup passed with package `sglang-kernel`, zero unsupported CUDA
+    calls, and 56 replaced kernel launches.
+- Pure-TP validation:
+  - immediate preflight rejected `zz-nmz26`, where all devices were VRAM 93%,
+    and selected `zz-nmz22`, where all devices were VRAM/HCU 0%;
+  - workspace import resolved to the current
+    `/home/proj_sglang_open/sglang-das/python` tree;
+  - the exact required script loaded 46 shards, captured graphs `bs=128..1`,
+    reached readiness, and returned HTTP 200 for `/health` and `/generate`;
+  - response text remained empty with eight zero output IDs, recorded as the
+    known non-blocking NaN/accuracy observation rather than an accuracy pass;
+  - no runtime retry was needed; port 10015 closed and all selected devices
+    returned to VRAM/HCU 0%.
+- Status: resolved and validated; exact Step 5 merge commit pending.
+- Detailed conflict decisions and evidence:
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step5-conflict-review.md`.

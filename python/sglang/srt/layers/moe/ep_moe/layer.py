@@ -101,14 +101,14 @@ if TYPE_CHECKING:
 from deepgemm import (
     m_grouped_w4a8_gemm_nt_masked,
     m_grouped_w8a8_gemm_nt_masked,
-    m_grouped_i8_gemm_nt_contiguous,
+    m_grouped_i8_gemm_nt_contiguous as _deepgemm_i8_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_contiguous,
 )
 from lightop import (
-    fuse_silu_mul_quant_ep,
     fuse_silu_mul_quant,
+    fuse_silu_mul_quant_ep,
     fuse_silu_mul_fp8_quant_ep,
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -120,6 +120,12 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_dcu = is_dcu()
 _is_fp8_fnuz = is_fp8_fnuz()
+if _is_dcu:
+    from lightop import (
+        m_grouped_w8a8_gemm_nt_contig_asm as m_grouped_i8_gemm_nt_contiguous,
+    )
+else:
+    m_grouped_i8_gemm_nt_contiguous = _deepgemm_i8_gemm_nt_contiguous
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
@@ -1255,13 +1261,23 @@ class DeepEPMoE(FusedMoE):
             return hidden_states.bfloat16()
 
         M, K = hidden_states.size()
-        N = self.w13_weight.size(1)
+        w13_shape = getattr(self, "_dsv4_w13_weight_shape", None)
+        if w13_shape is not None:
+            N = w13_shape[1]
+        else:
+            N = self.w13_weight.size(1)
+        w13_weight = getattr(self, "w13_weight_deepgemm", None)
+        w2_weight = getattr(self, "w2_weight_deepgemm", None)
+        if w13_weight is None:
+            w13_weight = self.w13_weight
+        if w2_weight is None:
+            w2_weight = self.w2_weight
         w13_weight_int8 = (
-            self.w13_weight,
+            w13_weight,
             (self.w13_weight_scale),
         )
         w2_weight_int8 = (
-            self.w2_weight,
+            w2_weight,
             (self.w2_weight_scale),
         )
 
@@ -1301,8 +1317,13 @@ class DeepEPMoE(FusedMoE):
             ),
         )
 
-        gateup_output = torch.zeros(
-            (all_tokens, N * 16),
+        gateup_output_factory = (
+            torch.empty
+            if all(count % 256 == 0 for count in num_recv_tokens_per_expert)
+            else torch.zeros
+        )
+        gateup_output = gateup_output_factory(
+            (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )

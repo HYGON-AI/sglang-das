@@ -42,7 +42,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
-    load_mimo_v2_qkv_proj_weight,
+    load_mimo_v2_qkv_proj_weight_v2,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
@@ -238,7 +238,6 @@ class MiMoV2ModelNextN(nn.Module):
 
 
 class MiMoV2MTP(MiMoV2ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -309,18 +308,18 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight(
+                    load_mimo_v2_qkv_proj_weight_v2(
                         name,
                         param,
                         loaded_weight,
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        config=self.config,
                     )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:
