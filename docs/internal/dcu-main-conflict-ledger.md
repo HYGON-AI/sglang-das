@@ -1632,3 +1632,48 @@ actual result in the checkpoint note.
 - Integration decision:
   - Code merge, static validation, and owner startup confirmation are complete on `sync/official-main-catchup-20260714`; fast-forward local `main` to this branch.
   - Create annotated tag `v0.5.15.post1` on the resulting DCU `main` commit, explicitly recording official main-equivalent endpoint `7e229e2a817d`, then push `main` and the tag without rewriting remote history.
+
+### v0.5.12_dev forward-port Step 1 / `8736a794acee`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Base: DCU `main@65f3bd9426e51df40987516acd075b646b858cf6`.
+- Old source: `/home/proj_dpsk-v4/sglang-das`, common base
+  `d4c6831a107ac03bae80e353d170af15557e4443`, endpoint
+  `8736a794acee8253019704cf00a901fd7ffcefbe`.
+- Scope: 41 full-graph commits, 30 non-merge commits, 54 old-range files. The
+  resolved staged tree changes 48 files with 6,800 insertions and 350 deletions.
+- Git reported 20 conflicts: 19 content conflicts plus modify/delete for the
+  obsolete `python/sglang/jit_kernel/deepseek_v4.py` wrapper. The wrapper,
+  legacy NSA implementation files, and legacy SWA pool file were not revived;
+  their required DCU behavior was ported to the current DSV4/DSA and
+  `mem_cache/allocator/swa.py` structures.
+- Preserved DCU semantics:
+  - DSV4 radix TopK early-exit/launch bounds and the existing VMFault guard.
+  - BF16 KV-cache layout, pool sizing, canonical store, compressor v1/v2, and
+    dtype-aware DSV4 backend behavior.
+  - DCU FlashMLA/DSA imports and cached dense Hadamard fallback.
+  - LightOp TopK without a duplicate generic EPLB remap.
+  - SWA stale-page mapping at its new allocator location.
+  - Explicit DCU versus generic ROCm diagnostics; current upstream APIs remain
+    canonical.
+- Static validation:
+  - no unmerged entries or precise conflict markers;
+  - staged `git diff --check` passed;
+  - all 35 changed Python files compiled;
+  - targeted Ruff `E9,F401,F811,F821` passed; seven broad `F841` observations
+    are unchanged from the current-main parent and are not Step 1 regressions;
+  - DCU registration passed with 221 registered files and the existing CPU
+    utils warning;
+  - DSA alias/CLI/registry and gfx938 HIP setup gates passed.
+- Functional validation:
+  - immediate preflight found all devices on both test nodes idle; `zz-nmz22`
+    was selected.
+  - the exact pure-TP script loaded 46 shards, captured decode graphs from
+    `bs=128` through `bs=1`, and reached service readiness;
+  - `/health` returned HTTP 200 and one short `/generate` returned HTTP 200
+    without worker failure;
+  - the response remained empty with eight zero output IDs. This is the known
+    deferred NaN/accuracy observation, is not an accuracy pass, and remains
+    non-blocking for the current startup/request gate.
+- Detailed decisions and validation evidence are recorded in
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step1-conflict-review.md`.

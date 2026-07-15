@@ -11,6 +11,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
+from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -96,6 +97,9 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.is_bf16_attention_kv_cache:
+            return self.logical_kv_dim * torch._utils._element_size(self.dtype)
+
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -104,8 +108,26 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         return dim_per_token
 
+    @property
+    def is_bf16_attention_kv_cache(self) -> bool:
+        return self.dtype == torch.bfloat16
+
+    @property
+    def logical_kv_dim(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
+        if self.is_bf16_attention_kv_cache:
+            self.kv_cache_total_dim = self.logical_kv_dim
+            self.bytes_per_page_padded = self.page_size * bytes_per_token
+            return torch.zeros(
+                num_pages,
+                self.page_size * self.logical_kv_dim,
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
@@ -129,6 +151,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        assert not self.is_bf16_attention_kv_cache
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -142,12 +165,35 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.is_bf16_attention_kv_cache:
+            return self.set_key_buffer_bf16(layer_id, loc, cache_k)
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
             indices=loc,
             page_size=self.page_size,
             type="flashmla",
+        )
+
+    def set_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        assert self.is_bf16_attention_kv_cache
+        values = cache_k.to(torch.bfloat16).contiguous().view(-1, self.logical_kv_dim)
+        assert loc.numel() == values.shape[0], (
+            "BF16 DSV4 KV locations must match cache rows: "
+            f"{loc.numel()=} rows={values.shape[0]}"
+        )
+        if loc.numel() == 0:
+            return
+        set_mla_kv_buffer_triton(
+            self.kv_buffer[layer_id].view(-1, self.logical_kv_dim),
+            loc.long(),
+            values[..., : self.qk_nope_head_dim],
+            values[..., self.qk_nope_head_dim :],
         )
 
     def set_key_buffer_lightop_fused(
@@ -157,6 +203,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         cache_k: torch.Tensor,
         eps: float = 1e-8,
     ) -> None:
+        assert not self.is_bf16_attention_kv_cache
         from lightop import op
 
         op.quantize_nope_fp8_rope_bf16_pack_store(
@@ -184,7 +231,6 @@ class DeepSeekV4SingleKVPool(KVCache):
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
     def __init__(
         self,
         size: int,
@@ -470,7 +516,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
@@ -673,6 +718,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # layer's transfer before attention reads it. No-op when HiCache is off.
         self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+
+    @property
+    def is_bf16_attention_kv_cache(self) -> bool:
+        return self._unified_kv or self.swa_kv_pool.is_bf16_attention_kv_cache
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
@@ -994,9 +1043,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1065,9 +1114,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
@@ -1201,6 +1250,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.is_bf16_attention_kv_cache:
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                fused_norm_rope_inplace_triton,
+            )
+
+            fused_norm_rope_inplace_triton(
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions=positions,
+            )
+            return self.swa_kv_pool.set_key_buffer_fused(
+                self._swa_local_layer_id(layer_id), swa_loc, kv
+            )
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

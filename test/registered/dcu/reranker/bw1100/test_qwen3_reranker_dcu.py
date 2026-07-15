@@ -25,7 +25,7 @@ def _default_reranker_args() -> list[str]:
     template = repo_root / "examples" / "chat_template" / "qwen3_reranker.jinja"
     if not template.exists():
         raise unittest.SkipTest(f"Qwen3 reranker chat template is missing: {template}")
-    return DCU_TEXT_SERVER_ARGS + ["--chat-template", str(template)]
+    return DCU_TEXT_SERVER_ARGS + ["--disable-cuda-graph", "--chat-template", str(template)]
 
 
 class TestBW1100Qwen3RerankerDCU(unittest.TestCase):

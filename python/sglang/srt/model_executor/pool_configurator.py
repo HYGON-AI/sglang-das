@@ -305,9 +305,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
@@ -532,6 +532,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.kv_cache_dtype = mr.kv_cache_dtype
         self.context_len = mr.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
@@ -616,7 +617,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self.kv_cache_dtype == torch.bfloat16:
+            kv_bytes = (
+                self.qk_nope_head_dim + self.qk_rope_head_dim
+            ) * torch._utils._element_size(self.kv_cache_dtype)
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
         indexer_bytes = (
@@ -743,9 +749,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -773,9 +779,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

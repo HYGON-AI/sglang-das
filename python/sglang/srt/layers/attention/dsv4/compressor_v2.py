@@ -504,7 +504,10 @@ class CompressorBackendMixin:
             use_fp4_indexer = (
                 compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
             )
-            bf16_store = False
+            bf16_store = (
+                token_to_kv_pool.is_bf16_attention_kv_cache
+                and not compressor.is_in_indexer
+            )
             if compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()

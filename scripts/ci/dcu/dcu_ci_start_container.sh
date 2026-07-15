@@ -15,6 +15,8 @@ set -euo pipefail
 #   DCU_DEVICE_FLAGS / DCU_CI_DEVICE_FLAGS    Additional `--device ...` flags.
 #   DCU_CI_VISIBLE_DEVICES                    Comma-separated DCU devices to expose.
 #   DCU_CACHE_HOST / DCU_CI_CACHE_HOST         Host-side cache directory mounted into /sgl-data.
+#   DCU_WHEEL_STAGING_ROOT                  Host-side PR wheel staging directory.
+#   DCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
 
 CUSTOM_IMAGE=""
 CONTAINER="${DCU_CI_CONTAINER:-${DCU_CI_CONTAINER_NAME:-ci_sglang}}"
@@ -85,6 +87,15 @@ else
   MODEL_VOLUME=""
 fi
 
+WHEEL_STAGING_HOST="${DCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}"
+WHEEL_STAGING_CONTAINER="${DCU_WHEEL_STAGING_CONTAINER_ROOT:-/dcu-wheel-staging}"
+if [[ -n "${WHEEL_STAGING_HOST}" ]]; then
+  mkdir -p "${WHEEL_STAGING_HOST}" || true
+  WHEEL_STAGING_VOLUME="-v ${WHEEL_STAGING_HOST}:${WHEEL_STAGING_CONTAINER}:ro"
+else
+  WHEEL_STAGING_VOLUME=""
+fi
+
 # Remove any leftover container from a previous run.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
@@ -98,6 +109,7 @@ docker run -dt --user root --privileged \
   -v /opt/hyhal:/opt/hyhal:ro \
   ${CACHE_VOLUME} \
   ${MODEL_VOLUME} \
+  ${WHEEL_STAGING_VOLUME} \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \

@@ -34,15 +34,20 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_dcu,
+    is_hip,
     is_npu,
     set_weight_attrs,
 )
 
 _is_dcu = is_dcu()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
 )
+if _is_dcu:
+    from lightop import op
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -188,7 +193,9 @@ class CompressorBackendMixin:
         )
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if token_to_kv_pool.is_bf16_attention_kv_cache or (
+            envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+        ):
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
                 loc=out_loc,

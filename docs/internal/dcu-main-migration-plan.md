@@ -444,3 +444,31 @@ python3 scripts/code_sync/dcu_main_migration.py checkpoints
 python3 scripts/code_sync/dcu_main_migration.py next
 python3 scripts/code_sync/dcu_main_migration.py tag-message C01 --validation passed
 ```
+
+## 11. Active Forward-Port Phase (2026-07-15 CST)
+
+Official catch-up through the `v0.5.15.post1` main-equivalent endpoint is
+complete on internal `main@65f3bd9426e5`. The active worktree is now
+`/home/proj_sglang_open/sglang-das`, and the remaining delivery-branch work is
+being integrated on `forward-port/v0.5.12-dev-20260715`.
+
+The immutable old source is `/home/proj_dpsk-v4/sglang-das` at
+`v0.5.12_dev@5ec8531b096f`, with common base `d4c6831a107a`. Its 214-commit
+full-graph range is split into five semantic checkpoints. The exact endpoints,
+inventory, risk areas, validation rules, and push-container restriction are in
+`docs/internal/dcu-main-forward-port-v0.5.12-dev-plan-20260715.md`.
+
+Forward-port rules:
+
+- Treat current official-main structure as canonical; port old DCU intent to
+  the new file/API location instead of reviving deleted modules.
+- Prefer `_is_dcu` before `_is_hip` whenever the old branch has a dedicated
+  LightOp, AITER, DeepEP, DSV4, FP8, cache-layout, or graph path.
+- Keep each exact old endpoint as a no-ff merge checkpoint with its own
+  conflict/refactor audit and pure-TP validation evidence.
+- Runtime scope is only the DeepSeek-V4 pure-TP script after an immediate
+  `hy-smi` availability check. Broad CI, other models, and other topologies are
+  owner-run.
+- GitHub pushes use `zz-nmz22 / rye_sglang_0601` or
+  `zz-nmz26 / rye_sglang_open`; never rely on the unavailable SSH key in
+  `zz-nmz22 / rye_sglang_open`.

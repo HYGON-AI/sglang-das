@@ -353,19 +353,28 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             mapping_indices = self._expand_to_full_pages(free_index)
 
-        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+        mapping = self.full_to_swa_index_mapping
+        swa_indices = mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
-        if swa_indices.numel() > 0:
-            unique_swa = torch.unique(swa_indices)
-            if len(self.swa_attn_allocator.release_pages) > 0:
-                self.swa_attn_allocator.merge_and_sort_free()
-            swa_pages = unique_swa // self.swa_attn_allocator.page_size
-            already_free = torch.isin(swa_pages, self.swa_attn_allocator.free_pages)
-            if already_free.any():
-                unique_swa = unique_swa[~already_free]
-            if unique_swa.numel() > 0:
-                self.swa_attn_allocator.free(unique_swa)
-        self.full_to_swa_index_mapping[mapping_indices] = 0
+        if swa_indices.numel() == 0:
+            mapping[mapping_indices] = 0
+            return
+
+        unique_swa = torch.unique(swa_indices)
+        page_size = self.swa_attn_allocator.page_size
+        freed_swa_pages = torch.unique(unique_swa // page_size)
+        if len(self.swa_attn_allocator.release_pages) > 0:
+            self.swa_attn_allocator.merge_and_sort_free()
+        already_free = torch.isin(
+            unique_swa // page_size, self.swa_attn_allocator.free_pages
+        )
+        unique_swa = unique_swa[~already_free]
+        if unique_swa.numel() > 0:
+            self.swa_attn_allocator.free(unique_swa)
+
+        all_swa_pages = mapping // page_size
+        stale = torch.isin(all_swa_pages, freed_swa_pages) & (mapping > 0)
+        mapping[stale] = 0
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
