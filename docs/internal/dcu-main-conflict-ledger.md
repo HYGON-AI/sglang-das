@@ -1534,4 +1534,5 @@ actual result in the checkpoint note.
   - Check `hy-smi` on both shared-home environments before starting; use an idle environment only and do not rsync `/home`.
   - Accuracy, throughput, alternate models/topologies, DSpark/ragged-verify runtime, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
-  - Pending generation after the resolved merge commit; it must contain only the two actual conflict files and be committed before handoff or integration to `main`.
+  - `docs/internal/dcu-main-catchup-20260712-conflict-review.md` was generated from resolved merge `dde320d3772f023256aeb50b51470fefea5cdcf5`.
+  - It reconstructs exactly the 2 actual textual conflict files and 2 conflict hunks; automatically merged files are intentionally excluded.
