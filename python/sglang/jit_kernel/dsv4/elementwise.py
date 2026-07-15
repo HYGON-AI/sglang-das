@@ -163,7 +163,7 @@ def fused_q_indexer_rope_hadamard_quant(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
     if _is_dcu:
-        from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+        from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
         # TVM-FFI matches this output as uint8 storage. Passing a torch FP8 tensor
         # directly makes DLPack report float8_e4m3fn and fails the C++ matcher.

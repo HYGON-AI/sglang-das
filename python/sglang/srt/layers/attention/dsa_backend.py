@@ -103,8 +103,8 @@ _is_hip = is_hip()
 _is_dcu = is_dcu()
 
 if _is_hip:
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 
 if _is_hip and not _is_dcu:

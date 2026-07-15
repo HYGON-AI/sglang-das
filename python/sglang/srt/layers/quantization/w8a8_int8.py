@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -22,8 +23,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-# from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -46,6 +45,9 @@ _is_dcu = is_dcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+
+if _is_dcu:
+    from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm

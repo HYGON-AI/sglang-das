@@ -1542,3 +1542,40 @@ actual result in the checkpoint note.
   - It reconstructs exactly the 2 actual textual conflict files and 2 conflict hunks; automatically merged files are intentionally excluded.
 - Integration decision:
   - Static and functional gates passed under the scoped policy. Fast-forward this validated branch to local `main` and create annotated tag `dcu-main-sync-official-20260712`; do not push as part of this step.
+
+### Official main catch-up 20260713 / `f49cbbd67dea`
+
+- Branch: `sync/official-main-catchup-20260713`.
+- Base: DCU `main@71c4c42af24f7dda258df84b79995afa50db3af2`, official previous checkpoint `82e7cdcff9aa5f49156c3ace73a826f30854ae91`.
+- Endpoint: official `main@f49cbbd67dea602f8616892d2a9882c8c30ae942` (`Fix GLM/DeepSeek NVFP4 + flashinfer_trtllm long-context "!!!!" collapse (NaN routing) (#31001)`).
+- Scope: 19 immutable official commits. The official range changes 370 files with 2,668 insertions and 1,573 deletions; the resolved merge changes 373 files with 2,693 insertions and 1,586 deletions because three DCU-only moved-symbol/documentation follow-ups were required. Git reported 8 textual conflict files and 8 conflict hunks, below the 50-file split threshold.
+- Textual conflicts and decisions:
+  - `python/sglang/srt/layers/attention/dsa/index_buf_accessor.py` (`DSA index cache`, `port to new API`): moved `is_fp8_fnuz` to the canonical `sglang.kernels` namespace while retaining DCU detection and the AITER preshuffle gate.
+  - `python/sglang/srt/layers/attention/dsa/tilelang_kernel.py` (`DSA TileLang`, `port to new API`): followed the official FP8 helper move and retained `_is_dcu` plus the existing DCU TileLang workaround and dispatch.
+  - `python/sglang/srt/layers/moe/ep_moe/layer.py` (`EP MoE`, `manual merge`): accepted the canonical FP8 helper import while retaining DCU quant-method type dispatch for LightOp, AITER, DeepGEMM, compressed tensors, Quark, and NPU paths.
+  - `python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py` (`Triton MoE`, `manual merge`): accepted official batch-invariant/padding imports and the new quantization namespace; the lmslim INT8 quantizer now overrides the canonical helper only under `_is_dcu`.
+  - `python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8.py` (`W8A8 INT8`, `manual merge`): uses the official INT8 kernel on generic platforms and retains the lmslim quantizer only for DCU.
+  - `python/sglang/srt/layers/quantization/w8a8_fp8.py` (`W8A8 FP8`, `manual merge`): accepted canonical FP8 kernel imports while retaining DCU runner selection through `get_moe_runner_backend()`.
+  - `python/sglang/srt/layers/quantization/w8a8_int8.py` (`W8A8 INT8`, `manual merge`): accepted the canonical INT8 kernel and retained the lmslim quantizer under `_is_dcu` together with the existing DCU LightOp/AITER runner branches.
+  - `python/sglang/srt/models/deepseek_v2.py` (`DeepSeek/DSV4`, `port to new API`): moved all retained DCU MLA FP8 helpers to `sglang.kernels.ops.quantization.fp8_kernel`; the endpoint's BF16 routing-bias fix for modelopt FP4 + FlashInfer TRT-LLM remains present.
+- High-risk semantic and move audit:
+  - Official moved the quantization kernels/configs into `python/sglang/kernels/ops/quantization` with 166 detected renames. Source scans found two automatically merged DCU references to the removed FP8 module in `jit_kernel/dsv4/elementwise.py` and `debug_flash_mla_adapter.py`; both were ported to the canonical namespace, and the benchmark README output path was updated. A follow-up source scan found no stale imports of the removed FP8/INT8/AWQ modules.
+  - The endpoint's NaN-routing correction is present in the merged `MoEGate`: modelopt FP4 with the FlashInfer TRT-LLM runner stores `e_score_correction_bias` as BF16. Existing DCU AITER/compressed-tensor/Quark BF16 routing-bias behavior remains intact.
+  - The official range adds no new `is_hip`/`is_dcu` dispatch changes. DCU LightOp, AITER, DeepGEMM, DeepEP, FP8 storage, and DSV4 graph paths therefore remain ahead of generic HIP behavior.
+  - The one deletion is an obsolete Ascend GLM example replaced by the new NPU reference/tutorial structure. The Waterfill test/module rename and quantization namespace moves have active imports updated.
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still keeps `SGLANG_USE_AITER_AG=0`; this checkpoint does not remove or waive that workaround.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on staged changed files: no unresolved markers.
+  - `git diff --cached --check`: passed.
+  - `python3 -m py_compile` over 163 changed Python files: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841`: blocked because neither the Ruff module nor binary is installed; no dependency installation was attempted.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files and the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - Import smoke covered all eight conflict modules plus the two moved DCU-only modules and resolved every file from `/home/proj_sglang_open/sglang-das/python`.
+- Functional validation status:
+  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, followed by `/health` and one short `/generate`.
+  - Accuracy, throughput, alternate models/topologies, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
+- Code conflict review artifact:
+  - Pending generation from the resolved merge commit; it must contain only the eight actual conflict files and eight reconstructed hunks.

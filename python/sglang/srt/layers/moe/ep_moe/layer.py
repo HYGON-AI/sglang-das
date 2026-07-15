@@ -10,6 +10,7 @@ from sglang.srt.layers.quantization.slimquant_w4a8_marlin import SlimQuantW4A8In
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -50,7 +51,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs

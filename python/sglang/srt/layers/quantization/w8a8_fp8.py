@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    is_fp8_fnuz,
+    per_token_group_quant_fp8,
+)
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -19,11 +24,6 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    is_fp8_fnuz,
-    per_token_group_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,

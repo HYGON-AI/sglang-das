@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 
 _DIM_NOPE = 448

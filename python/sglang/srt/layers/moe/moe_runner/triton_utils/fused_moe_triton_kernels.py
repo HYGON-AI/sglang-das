@@ -8,24 +8,24 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.quantization.int8_kernel import (
+from sglang.kernels.ops.quantization.int8_kernel import (
     per_token_group_quant_int8,
-    # per_token_quant_int8,
+    per_token_quant_int8,
     sglang_per_token_group_quant_int8,
 )
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_hip,
     is_sm90_supported,
 )
@@ -39,9 +39,13 @@ except:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _is_dcu:
+    from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 if _is_cuda:
     pass
