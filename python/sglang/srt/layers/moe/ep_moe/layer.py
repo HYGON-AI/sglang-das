@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
-from collections import defaultdict
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin import \
     SlimQuantCompressedTensorsMarlinConfig
@@ -10,7 +9,11 @@ from sglang.srt.layers.quantization.slimquant_w4a8_marlin import SlimQuantW4A8In
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.jit_kernel.activation import silu_and_mul
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    sglang_per_token_group_quant_fp8,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -20,20 +23,19 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     # should_use_flashinfer_trtllm_moe, # 找不到
 )
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     ep_gather,
     ep_scatter,
     ep_scatter_no_scale,
-    silu_and_mul_masked_post_quant_fwd,
     tma_align_input_scale,
-    per_token_quant_int8_triton_opt,
     build_m_indices_triton,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
-from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
+from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
+from sglang.srt.layers.moe.moe_runner.deep_gemm import copy_list_to_gpu_no_ce
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
@@ -77,12 +79,11 @@ if TYPE_CHECKING:
     )
 
 from deepgemm import m_grouped_w4a8_gemm_nt_masked, m_grouped_w8a8_gemm_nt_masked, m_grouped_i8_gemm_nt_contiguous, \
-    m_grouped_fp8_gemm_nt_masked, m_grouped_bf16_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous, \
+    m_grouped_bf16_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous, \
     m_grouped_bf16_gemm_nt_contiguous
 from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_fp8_quant_ep, fuse_silu_and_mul, \
     fuse_silu_mul_fp8_quant
 from lightop import op as lightop_op
-from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -456,8 +457,20 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        if _use_aiter or _is_npu:
+        is_humming = (
+            get_moe_runner_backend().is_humming()
+            or get_moe_runner_backend().is_auto()
+            and quant_config is not None
+            and quant_config.get_name() == "humming"
+        )
+        if is_humming:
+            self.deprecate_flag = True
+        elif _is_dcu and _use_aiter:
             self.deprecate_flag = False
+        elif _use_aiter:
+            self.deprecate_flag = True
+        elif _is_npu:
+            self.deprecate_flag = True
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config
         ):
@@ -972,7 +985,6 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
-        hidden_states_dtype = hidden_states.dtype
         input_tensor = [
             torch.empty(
                 (all_tokens, K),
@@ -1196,7 +1208,6 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
-        hidden_states_dtype = hidden_states.dtype
         input_tensor = [
             torch.empty(
                 (all_tokens, K),
@@ -1319,11 +1330,7 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
-        hidden_states_dtype = hidden_states.dtype
         scale_hidden_size = K // 128
-        counts_are_aligned = all(
-            count % 128 == 0 for count in num_recv_tokens_per_expert
-        )
 
         input_tensor = [
             torch.empty(
@@ -2004,7 +2011,6 @@ class MoriEPMoE(DeepEPMoE):
         self,
         dispatch_output: DispatchOutput,
     ):
-        scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
         is_quark_w4a4 = hasattr(self, "scheme") and isinstance(
             self.scheme, QuarkW4A4MXFp4MoE
@@ -2016,8 +2022,8 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_ids,
             dispatch_weights,
             dispatch_recv_token_num,
-            origin_topk_ids,
-            origin_topk_weights,
+            _origin_topk_ids,
+            _origin_topk_weights,
             output_dtype,
         ) = (
             dispatch_output.hidden_states,

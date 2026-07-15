@@ -14,6 +14,12 @@ import triton
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_triton,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from lightop import moe_gemm_marlin_w8a8_fp8, get_moe_cuda_marlin_config
@@ -34,12 +40,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils import direct_register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
-    invoke_fused_moe_kernel,
-    moe_sum_reduce_triton,
-    support_tensor_descriptor,
-)
 from .moe_align_block_size import moe_align_block_size
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput

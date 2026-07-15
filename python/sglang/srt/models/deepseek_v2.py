@@ -40,9 +40,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    create_per_token_group_quant_fp8_output_scale,
-)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -1055,9 +1052,12 @@ class DeepseekV2MoE(nn.Module):
         if not self._enable_a2a_moe:
             server_args = get_server_args()
             if self._can_dual_stream_graph(hidden_states, server_args):
+                fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
+                    fwd.fuse_mlp_allreduce,
+                    fwd.mlp_reduce_scatter,
                 )
             elif (
                 self.alt_stream is not None
@@ -4239,6 +4239,8 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 def dsv2_flashinfer_moe_dual_stream_graph(
     hidden_states: torch.Tensor,
     layer_id: int,
+    fuse_mlp_allreduce: bool,
+    mlp_reduce_scatter: bool,
 ) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
     assert forward_context is not None
@@ -4246,7 +4248,14 @@ def dsv2_flashinfer_moe_dual_stream_graph(
 
     moe_fusion = forward_context.moe_fusions[layer_id]
     assert moe_fusion is not None
-    with get_forward().scoped(flashinfer_trtllm_bypass=True):
+    # Custom-op execution happens outside the caller's Python scope under
+    # torch.compile. Carry graph-varying control state as scalar operands and
+    # republish it for the nested MoE/linear consumers.
+    with get_forward().scoped(
+        fuse_mlp_allreduce=fuse_mlp_allreduce,
+        mlp_reduce_scatter=mlp_reduce_scatter,
+        flashinfer_trtllm_bypass=True,
+    ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)
 
 

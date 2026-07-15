@@ -50,6 +50,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -59,6 +60,7 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 if not _is_npu:
     from sglang.jit_kernel.dsa import (
@@ -131,7 +133,6 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
@@ -351,6 +352,8 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
     # from sgl_kernel import hadamard_transform
     if not _is_dcu and _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_xpu:
+        from sgl_kernel import hadamard_transform
     elif not _is_dcu:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -427,7 +430,7 @@ class Indexer(MultiPlatformOp):
         elif _is_dcu:
             device_props = torch.cuda.get_device_properties(0)
             self.sm_count = device_props.multi_processor_count
-            pp_size = get_global_server_args().pp_size
+            pp_size = get_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -1407,7 +1410,7 @@ class Indexer(MultiPlatformOp):
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[:q_offset], weights[:q_offset]
+                        q[:q_offset], weights[:q_offset]
                     )
                     logits = deep_gemm.fp8_mqa_logits(
                         q_padded,
@@ -1490,7 +1493,7 @@ class Indexer(MultiPlatformOp):
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[start:end], weights[start:end]
+                        q[start:end], weights[start:end]
                     )
                     logits_chunk = deep_gemm.fp8_mqa_logits(
                         q_padded,

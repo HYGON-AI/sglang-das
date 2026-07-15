@@ -25,6 +25,9 @@ from sglang.jit_kernel.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
@@ -46,9 +49,6 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
-)
-from sglang.srt.layers.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -74,7 +74,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+from sglang.kernels.ops.attention.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -133,7 +133,11 @@ if not _is_hip:
 if _is_xpu:
     from sgl_kernel import hc_split_sinkhorn
 else:
-    from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
+    from sglang.kernels.ops.layernorm.mhc import (
+        hc_split_sinkhorn,
+        mhc_fused_post_pre,
+        npu_hc_pre,
+    )
 
 from sglang.srt.utils import (
     LazyValue,
@@ -495,7 +499,7 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-        from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
+        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
         self.rope_scaling = rope_scaling
@@ -847,7 +851,7 @@ class MQALayer(MqaAttentionBase):
                 else self.wkv(x_linear)[0]
             )
 
-            from sglang.srt.layers.fused_qk_norm_rope_store import (
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
@@ -961,7 +965,7 @@ class MQALayer(MqaAttentionBase):
                     False,
                 )
 
-            from sglang.srt.layers.fused_qk_norm_rope_store import (
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
 
@@ -1433,7 +1437,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # AITER MHC pre does not fuse the decoder-layer RMSNorm.
                 norm_fused = False
             else:
-                from sglang.srt.layers.mhc import mhc_pre
+                from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
                 norm_kwargs = {}
                 if norm is not None:
@@ -1527,17 +1531,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             if _is_dcu and _use_aiter_tilelang_mhc:
-                out = mhc_post_fwd(
-                    x, 
-                    residual,
-                    post, 
-                    comb, 
-                )
-                return out
+                return mhc_post_fwd(x, residual, post, comb)
             else:
-                from sglang.srt.layers.mhc import mhc_post
+                from sglang.kernels.ops.layernorm.mhc import mhc_post
+
                 return mhc_post(x, residual, post, comb)
-                # return mhc_post_torch(x, residual, post, comb)
 
         elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
             from aiter.ops.mhc import mhc_post
@@ -2135,7 +2133,7 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
-            from sglang.srt.layers.mhc_head import fused_hc_head
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
                 x.contiguous(),
@@ -2405,7 +2403,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
-            from sglang.srt.layers.deepseek_v4_rope import set_batched_rope
+            from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
             from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
 
             set_force_ck_w8a8(True)
@@ -2696,7 +2694,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.srt.layers.mhc import prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
 
         tic = time.perf_counter()
         prewarm_mhc_pre(

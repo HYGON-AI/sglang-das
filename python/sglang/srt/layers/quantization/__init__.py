@@ -4,19 +4,8 @@
 from __future__ import annotations
 
 import builtins
-import inspect
-from typing import TYPE_CHECKING, Dict, Optional, Type
+from typing import Dict, Type
 
-import torch
-
-
-# Define empty classes as placeholders when vllm is not available
-class DummyConfig:
-    def override_quantization_method(self, *args, **kwargs):
-        return None
-
-
-CompressedTensorsConfig = DummyConfig
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
@@ -35,6 +24,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
     GPTQMarlinConfig,
 )
+from sglang.srt.layers.quantization.humming import HummingConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -68,8 +58,6 @@ from sglang.srt.utils import (
 
 _is_mxfp_supported = mxfp_supported()
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -101,6 +89,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
     "slimquant_w4a8_marlin": SlimQuantW4A8Int8MarlinConfig,
     "slimquant_marlin": SlimQuantCompressedTensorsMarlinConfig,
+    "humming": HummingConfig,
     "mxfp_w4a8": Mxfp4W4A8Config,
 }
 if QuarkConfig is not None:

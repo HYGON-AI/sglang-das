@@ -1580,3 +1580,45 @@ actual result in the checkpoint note.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260713-conflict-review.md` was generated from resolved merge `b111d8bc66a6ecd8c386fe9110fcf411f9e67650`.
   - It reconstructs exactly the 8 actual textual conflict files and 8 conflict hunks; automatically merged files and the moved-symbol semantic fixes are intentionally excluded.
+
+### Official main catch-up 20260714 / `7e229e2a817d`
+
+- Branch: `sync/official-main-catchup-20260714`.
+- Base: DCU catch-up head `52bf6e27831a1547b1f8eb58be5bf6c1508dc296`, official previous checkpoint `f49cbbd67dea602f8616892d2a9882c8c30ae942`.
+- Endpoint: official `main@7e229e2a817de7d59e919db7ab3809ab4a22e754` (`support GLM-5.2 MTP index sharing with prefill CP (#30992)`).
+- Scope: 26 immutable official commits; 534 files changed, 9,446 insertions and 56,907 deletions. The large deletion count is dominated by the legacy Sphinx `docs/` removal after the Mintlify cutover. Git reported 9 textual conflict files and 11 conflict hunks, below the 50-file split threshold.
+- `v0.5.15.post1` release marker:
+  - Official annotated tag object `658e0a942ec771aeeef1b1adf4180764cacd79b2` peels to release-branch commit `0b3bb0cbe31873994c9f989fddfe2f87ca839fdd`; that commit is not an ancestor of official `main` and remains on `release/v0.5.15`.
+  - The seven `v0.5.15..v0.5.15.post1` release commits map to main originals `7966f6be` (#30454), `ecb7fb398` (#30627), `24d59d8d` (#30858), `f49cbbd67` (#31001), `78dc58151` (#30839), and `7e229e2a8` (#30992), plus release-only revert `344bd82`; the revert only removes release-branch state and needs no main counterpart.
+  - `7e229e2a817d` is therefore the earliest official-main commit containing the complete functional content of `v0.5.15.post1`. This integration is a main-equivalent marker, not a merge or copy of the off-main release tag.
+- Textual conflicts and decisions:
+  - `python/sglang/kernels/ops/moe/ep_moe_kernels.py` (`MoE/kernel namespace`, `port to new API`): completed the 96%-similar move from `srt/layers/moe/ep_moe/kernels.py`, retaining DCU INT8/FP8 scatter/gather and quant kernels while adding official `moe_permute`; normalized `Optional` and Triton `libdevice` imports at module scope.
+  - `python/sglang/srt/configs/model_config.py` (`model config/quantization`, `manual merge`): retained both DCU SlimQuant method names and official Humming registration.
+  - `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` (`DSA/indexer`, `manual merge`): added the official XPU Hadamard implementation without routing DCU away from its LightOp/optimized Hadamard branches. The semantic audit also removed a duplicate runtime-context import, used canonical `get_server_args()` for the DCU PP check, and corrected two non-DCU ragged fallbacks to use the function's `q` tensor instead of an undefined stale name.
+  - `python/sglang/srt/layers/linear.py` (`linear`, `manual merge`): retained the local RMS epsilon and accepted official `with_bias` state.
+  - `python/sglang/srt/layers/moe/ep_moe/layer.py` (`EP MoE`, `port to new API`): moved kernel and ROCm utility imports to `sglang.kernels`, accepted official Humming selection, and retained DCU AITER as the non-deprecated local path. The audit restored explicit imports for DCU DeepGEMM no-copy-engine transfer, activation, and FP8 group quant helpers after Ruff exposed stale undefined names.
+  - `python/sglang/srt/layers/quantization/__init__.py` (`quantization registry`, `manual merge`): retained both SlimQuant registrations and official Humming registration; removed the obsolete placeholder assignment that was immediately overwritten by the real compressed-tensors config.
+  - `python/sglang/srt/layers/quantization/fp8_utils.py` (`FP8`, `manual merge`): kept the DCU-only `deepgemm` import and removed a duplicate fake-op definition already supplied by the canonical kernel namespace.
+  - `python/sglang/srt/models/deepseek_v4.py` (`DeepSeek-V4/MHC`, `port to new API`): moved RoPE and generic MHC imports to `sglang.kernels` while retaining DCU AITER TileLang `mhc_pre_big_fuse` and `mhc_post_fwd` dispatch ahead of generic HIP.
+  - `python/sglang/srt/server_args.py` (`server args`, `manual merge`): retained SlimQuant/LightOp choices and added Humming choices. Removed dead GPT-OSS MXFP4 locals after the endpoint moved those overrides into `arg_groups/overrides.py`.
+- High-risk semantic and move audit:
+  - Official moved DeepSeek-V4 RoPE, fused Q/K operations, MHC/layernorm, EP-MoE, ROCm MoE utilities, router, sampling hash, and related kernels into `python/sglang/kernels`. Rename detection shows the DCU-bearing MHC file as `R100`, EP-MoE kernels as `R096`, fused MoE Triton kernels as `R098`, and ROCm MoE utilities as `R100`; their DCU/LightOp/AITER symbol counts are retained at the new paths.
+  - Source scans found no remaining imports of the removed `srt.layers.mhc`, `deepseek_v4_rope`, `moe.ep_moe.kernels`, or `moe.rocm_moe_utils` module paths. Auto-merge duplicates in `deepseek_v2.py`, `rotary_embedding/mrope.py`, and `schedule_batch.py` were removed.
+  - The official range introduces no new `_is_hip`/`is_hip()` or `_is_dcu`/`is_dcu()` dispatch changes. The staged current tree retains 1,372 DCU/high-risk keyword matches versus 822 in the official endpoint.
+  - The old semantic-reference path `/home/proj_dpsk-v4/dcu-sglang` is absent in the current shared `/home`, so a fresh three-repository scan is blocked. Decisions use the continuous DCU history already present in `sglang-das`, the prior conflict ledger, and the official endpoint; this limitation is not represented as a completed old-repository audit.
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still sets `SGLANG_USE_AITER_AG=0`; this catch-up does not remove or waive that workaround.
+- Automated validation before the merge commit:
+  - `git ls-files -u`: no output.
+  - Precise conflict-marker scan on staged changed files: no output.
+  - `git diff --cached --check`: passed.
+  - `python3 -m py_compile` over 228 changed Python files: passed.
+  - Targeted Ruff `E9,F401,F811,F821,F841` on all 9 conflict files plus 6 high-risk moved/automatically merged files: passed after the semantic fixes above. A broad all-changed-file Ruff run also reported unrelated official/pre-existing warnings outside this targeted gate; no bulk upstream style cleanup was mixed into the merge.
+  - `python3 scripts/ci/dcu/verify_dcu_registration.py`: passed with 212 DCU registered test files and the existing warning for `test/registered/cpu/utils.py`.
+  - `PYTHONPATH=python python3 test/manual/test_dsa_alias_cli_registry_env.py`: passed, 19 tests.
+  - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
+  - Workspace import resolved to `/home/proj_sglang_open/sglang-das/python/sglang/__init__.py`; `is_dcu()` returned `True`.
+- Functional validation status:
+  - Pending the only in-scope runtime command: `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, after checking `hy-smi` on both `zz-nmz22` and `zz-nmz26` and selecting a completely idle environment.
+  - Accuracy, throughput, alternate models/topologies, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
+- Code conflict review artifact:
+  - Pending the resolved merge SHA. The review must reconstruct exactly the 9 actual textual conflict files and 11 conflict hunks from `/tmp/sglang-das-auto-conflict-20260714`; automatically merged files and later semantic-only fixes remain excluded.
