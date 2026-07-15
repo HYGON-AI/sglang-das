@@ -1530,12 +1530,15 @@ actual result in the checkpoint note.
   - `(cd sgl-kernel && AMDGPU_TARGET=gfx938 python3 setup_hip.py --name)`: passed with package name `sglang-kernel`, zero unsupported CUDA calls, and 50 converted kernel launches.
   - Workspace import resolved both `sglang` and `mhc.py` under `/home/proj_sglang_open/sglang-das/python`; `_is_dcu=True`. With the DCU AITER MHC environment switch disabled for the import-only check, real TileLang remained unloaded and absent from `sys.modules`.
 - Functional validation status:
-  - Blocked before startup by the shared runtime environment, so the only in-scope command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel`, `/health`, and the short `/generate` were not run.
-  - The current `nmz26` container resolved `sglang.__file__` to `/home/proj_sglang_open/sglang-das/python/sglang/__init__.py`, port 10015 was closed, and no local SGLang worker was running. However, `hy-smi` reported all eight devices occupied at 139,410-139,538 MiB of 147,440 MiB each. `hy-smi --showpids` exposed no KFD process inside this container, so the allocations belong outside the current container and were not touched.
-  - `nmz22` resolved to `10.16.1.22`, but the current container has no SSH authorization for it; the `zz-nmz22` and `zz-nmz26` aliases are not resolvable here. An idle second environment therefore could not be confirmed safely.
+  - Before startup, `hy-smi` showed all eight `nmz26` devices at `VRAM 0% / HCU 0.0%` with 2 MiB used per device. Port 10015 was closed, and `sglang.__file__` resolved to `/home/proj_sglang_open/sglang-das/python/sglang/__init__.py`.
+  - The exact in-scope command `bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel` completed distributed initialization, loaded all 46 shards, initialized the DSV4 pools, and captured all configured decode graph buckets from batch size 128 through 1.
+  - The multimem all-gather probe reported `HIP error: invalid argument` and disabled that optional path on every rank; the documented fallback continued through graph capture and request handling without a worker exit.
+  - The service reported readiness on port 10015. `GET /health` returned HTTP 200; one short `POST /generate` returned HTTP 200 with `finish_reason=length` and completed eight tokens without a worker crash.
+  - The response remained empty with eight zero token IDs. This is the already deferred non-blocking accuracy/NaN observation and is not reported as an accuracy pass; no checkpoint code fix was made for it.
+  - The service was stopped cleanly after the request, port 10015 was released, and all eight devices returned to `VRAM 0% / HCU 0.0%`.
   - Accuracy, throughput, alternate models/topologies, DSpark/ragged-verify runtime, broad CI, and the deferred empty-output/NaN observation remain owner-run/non-blocking. A startup/request failure permits one focused fix and one confirmation only.
 - Code conflict review artifact:
   - `docs/internal/dcu-main-catchup-20260712-conflict-review.md` was generated from resolved merge `dde320d3772f023256aeb50b51470fefea5cdcf5`.
   - It reconstructs exactly the 2 actual textual conflict files and 2 conflict hunks; automatically merged files are intentionally excluded.
 - Integration decision:
-  - Keep `sync/official-main-catchup-20260712` locally with its completed merge, static validation, and review artifact. Do not advance `main`, create `dcu-main-sync-official-20260712`, or push until the pure-TP startup/request gate runs in a fully idle environment.
+  - Static and functional gates passed under the scoped policy. Fast-forward this validated branch to local `main` and create annotated tag `dcu-main-sync-official-20260712`; do not push as part of this step.
