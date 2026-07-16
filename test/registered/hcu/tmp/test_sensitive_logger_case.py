@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def test_hcu_runtime_text_gate_failure_message():
-    logger.warning("AMD GPU memory capacity detection failed.")
-    logger.error("AMD 1 hop XGMI detection failed.")
-    logger.critical("DCU runtime reported an AMD GPU topology error.")
+def test_sensitive_logger_messages():
+    logger.info("dcu runtime initialization started.")
+    logger.warning("AMD device memory check failed.")
+    logger.error("xgmi link validation failed.")

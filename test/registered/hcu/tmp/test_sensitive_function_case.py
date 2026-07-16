@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
+
+def inspect_dcu_runtime():
+    return True
 
 
-logger = logging.getLogger(__name__)
+def query_amd_device():
+    return True
 
 
-def test_hcu_runtime_text_gate_failure_message():
-    logger.warning("AMD GPU memory capacity detection failed.")
-    logger.error("AMD 1 hop XGMI detection failed.")
-    logger.critical("DCU runtime reported an AMD GPU topology error.")
+def validate_xgmi_link():
+    return True
+
+
+def test_sensitive_function_names():
+    assert inspect_dcu_runtime()
+    assert query_amd_device()
+    assert validate_xgmi_link()
