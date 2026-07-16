@@ -44,6 +44,7 @@ from sglang.srt.utils.common import (
     get_device_name,
     get_device_sm,
     get_nvidia_driver_version,
+    get_bool_env_var,
     get_quantization_config,
     has_fp8_weights_in_checkpoint,
     human_readable_int,
@@ -783,6 +784,9 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    # Custom all-reduce backend: auto | native | aiter | off.
+    # --disable-custom-all-reduce takes precedence and forces this to "off".
+    custom_all_reduce_backend: str = "auto"
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -4526,6 +4530,26 @@ class ServerArgs:
                     self.nnodes,
                 )
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
+        # Normalize custom_all_reduce_backend. --disable-custom-all-reduce wins.
+        if self.disable_custom_all_reduce:
+            if self.custom_all_reduce_backend != "off":
+                logger.info(
+                    "--disable-custom-all-reduce overrides "
+                    "--custom-all-reduce-backend=%s to 'off'.",
+                    self.custom_all_reduce_backend,
+                )
+            self.custom_all_reduce_backend = "off"
+        # Legacy env var promotion: SGLANG_USE_AITER_AR=1 on HIP -> aiter.
+        elif (
+            self.custom_all_reduce_backend == "auto"
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_AR", default="false")
+        ):
+            logger.info(
+                "Promoting custom_all_reduce_backend from 'auto' to 'aiter' "
+                "because SGLANG_USE_AITER_AR=1 is set on HIP."
+            )
+            self.custom_all_reduce_backend = "aiter"
         if self.debug_cuda_graph:
             if not is_cuda():
                 logger.warning(
@@ -6808,6 +6832,21 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--custom-all-reduce-backend",
+            type=str,
+            default=ServerArgs.custom_all_reduce_backend,
+            choices=["auto", "native", "aiter", "off"],
+            help=(
+                "Choose the custom all-reduce backend. "
+                "'auto' picks aiter on HIP/DCU when available otherwise the "
+                "native SGLang implementation; 'native' forces the SGLang "
+                "kernel; 'aiter' forces the Hygon/DCU aiter kernel and, when "
+                "AITER_AR_TRANSPORT=fabric, fails hard rather than silently "
+                "falling back; 'off' disables custom all-reduce entirely. "
+                "--disable-custom-all-reduce overrides this and forces 'off'."
+            ),
         )
         parser.add_argument(
             "--enable-mscclpp",
