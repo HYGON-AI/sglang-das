@@ -68,7 +68,7 @@ elif is_cpu():
 _use_causal_conv1d = get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D")
 if _is_dcu and _use_causal_conv1d:
     from causal_conv1d.causal_conv1d_interface import causal_conv1d_update as causal_conv1d_update_dcu
-    from causal_conv1d import causal_conv1d_fn_dcu
+    from causal_conv1d import causal_conv1d_fn_hcu
 
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
@@ -445,7 +445,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
             if _is_dcu and _use_causal_conv1d:
-                mixed_qkv = causal_conv1d_fn_dcu(
+                mixed_qkv = causal_conv1d_fn_hcu(
                     mixed_qkv,
                     layer.conv_weights,
                     layer.bias,
