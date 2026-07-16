@@ -1,3 +1,17 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import unittest
 
@@ -48,7 +62,7 @@ class TestBW1100Qwen25HalfBServerDCU(unittest.TestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=get_server_args("SGLANG_DCU_SERVER_ARGS", DCU_TEXT_SERVER_ARGS),
+            other_args=get_server_args("SGLANG_DCU_SERVER_ARGS", DCU_TEXT_SERVER_ARGS + ["--disable-cuda-graph"]),
             env={
                 "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
                 "SGLANG_USE_MODELSCOPE": os.environ.get("SGLANG_USE_MODELSCOPE", "1"),

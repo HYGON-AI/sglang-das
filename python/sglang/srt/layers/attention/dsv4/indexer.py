@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
@@ -838,7 +852,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
-        elif _is_dcu:
+        elif _is_dcu and envs.SGLANG_LIGHTOP_TOPK.get():
             from lightop import topk_transform_512 as lightop_topk_transform_512
             lightop_topk_transform_512(
                 logits,

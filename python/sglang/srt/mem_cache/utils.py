@@ -31,6 +31,9 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton_masked as set_mla_kv_buffer_triton_masked,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (

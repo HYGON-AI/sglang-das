@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -23,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import ExpertDistributionReq
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -100,8 +115,26 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
+                    # Expert-distribution dump performs a world-group collective.
+                    # Forward its control request before handling it locally so
+                    # downstream PP stages enter the same collective.
+                    preforward_expert_distribution_req = (
+                        not self.pp_group.is_last_rank
+                        and any(
+                            isinstance(req, ExpertDistributionReq) for req in recv_reqs
+                        )
+                    )
+                    if preforward_expert_distribution_req:
+                        self._pp_commit_comm_work(self.send_req_work)
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                if (
+                    not self.pp_group.is_last_rank
+                    and not preforward_expert_distribution_req
+                ):
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(

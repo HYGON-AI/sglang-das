@@ -1,3 +1,17 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from flash_attn import (
     flash_attn_varlen_func as flash_attn_varlen_func_interface,
     flash_attn_with_kvcache as flash_attn_with_kvcache_interface,
@@ -149,6 +163,17 @@ def vllm_flash_attn_with_kvcache(
             num_splits=num_splits,
         )
 
+def _apply_flash_attn_varlen_out(result, out, return_softmax_lse):
+    if out is None:
+        return result
+    if return_softmax_lse:
+        attn_out, lse, *rest = result
+        out.copy_(attn_out)
+        return (out, lse, *rest)
+    out.copy_(result)
+    return out
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -175,7 +200,7 @@ def flash_attn_varlen_func(
     return_softmax_lse=False,
     sinks=None,
     ver=3,
-
+    out=None,
 ):
     global _SERVER_ARGS, IS_SLIMQUANT_W4A8, IS_KVCACHE_FP8_E4M3
 
@@ -188,7 +213,7 @@ def flash_attn_varlen_func(
 
     if is_nmz_fp8(k.dtype) and not IS_SLIMQUANT_W4A8 and not IS_KVCACHE_FP8_E4M3:
         q_descale = torch.ones_like(k_descale)
-        return flash_attn_varlen_func_interface(
+        result = flash_attn_varlen_func_interface(
                 q=q,
                 k=k,
                 v=v,
@@ -204,8 +229,9 @@ def flash_attn_varlen_func(
                 return_attn_probs=return_softmax_lse,
                 softcap=softcap,
             )
+        return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
-    return flash_attn_varlen_func_interface(
+    result = flash_attn_varlen_func_interface(
         q=q,
         k=k,
         v=v,
@@ -218,6 +244,7 @@ def flash_attn_varlen_func(
         return_attn_probs=return_softmax_lse,
         softcap=softcap,
     )
+    return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
 def vllm_flash_attn_varlen_func(
     q,

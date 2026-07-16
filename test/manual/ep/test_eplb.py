@@ -163,7 +163,6 @@ class TestStaticEPLB(CustomTestCase):
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
-            engine = None
             time.sleep(5)
 
     def _assert_engine_generate_correct(self, engine: sgl.Engine):

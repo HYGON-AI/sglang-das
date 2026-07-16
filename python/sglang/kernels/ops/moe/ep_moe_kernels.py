@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 from typing import Optional, Tuple
 
@@ -993,6 +1007,53 @@ def _fwd_kernel_ep_scatter_1_use_groupgemm(
 
 
 @triton.jit
+def _fwd_kernel_ep_scatter_1_fused(
+    num_recv_tokens_per_expert,
+    expert_start_loc,
+    m_indices,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_EXPERT_NUM: tl.constexpr,
+    topk_ids_ptr,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+
+    offset_cumsum = tl.arange(0, BLOCK_EXPERT_NUM)
+    tokens_per_expert = tl.load(
+        num_recv_tokens_per_expert + offset_cumsum,
+        mask=offset_cumsum < num_experts,
+        other=0,
+    )
+    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
+    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
+
+    count = 0
+    for offset in range(0, numel, BLOCK):
+        offs = offset + tl.arange(0, BLOCK)
+        mask = offs < numel
+        val = tl.load(topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last")
+        count = count + tl.sum((val == cur_expert).to(tl.int32) & mask)
+
+    rng = tl.arange(0, BLOCK_EXPERT_NUM)
+    vals = tl.load(num_recv_tokens_per_expert + rng, mask=rng < num_experts, other=0)
+    start_pos = tl.sum(tl.where(rng < cur_expert, vals, 0))
+    my_padded = tl.load(num_recv_tokens_per_expert + cur_expert)
+    end_pos = start_pos + my_padded
+
+    m_indices_start_ptr = m_indices + start_pos
+    off_expert = tl.arange(0, BLOCK_E)
+    for start_m in tl.range(0, my_padded, BLOCK_E, num_stages=4):
+        offs = start_m + off_expert
+        mask = offs < end_pos
+        rel_pos = offs - start_pos
+        valid = rel_pos < count
+        result = tl.where(valid, cur_expert, -1)
+        tl.store(m_indices_start_ptr + offs, result, mask=mask)
+
+
+@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     expert_start_loc,
@@ -1318,6 +1379,25 @@ def count_expert_histogram_kernel(
 
 
 @triton.jit
+def count_expert_histogram_kernel_opt(
+    topk_ids_ptr,
+    counts_ptr,
+    numel,
+    E: tl.constexpr,
+    BLOCK: tl.constexpr = 1024,
+):
+    pid = tl.program_id(0)
+    stride = BLOCK * tl.num_programs(0)
+
+    for offset in range(0, numel, stride):
+        offs = pid * BLOCK + offset + tl.arange(0, BLOCK)
+        mask = offs < numel
+        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+        valid_mask = (expert_id >= 0) & (expert_id < E)
+        tl.atomic_add(counts_ptr + expert_id, 1, mask=valid_mask)
+
+
+@triton.jit
 def compute_slots_kernel(
     counts_ptr,
     slots_ptr,
@@ -1328,6 +1408,230 @@ def compute_slots_kernel(
         cnt = tl.load(counts_ptr + i)
         slot = (cnt + 255) // 256  # equivalent to ceil(cnt/256)
         tl.store(slots_ptr + i, slot)
+
+
+@triton.jit
+def fused_build_m_indices_kernel(
+    topk_ids_ptr,
+    num_recv_tokens_ptr,
+    m_indices_ptr,
+    numel,
+    E: tl.constexpr,
+    BLOCK: tl.constexpr = 1024,
+):
+    pid = tl.program_id(0)
+
+    if pid < E:
+        count = 0
+        for offset in range(0, numel, BLOCK):
+            offs = offset + tl.arange(0, BLOCK)
+            mask = offs < numel
+            val = tl.load(topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last")
+            count = count + tl.sum((val == pid).to(tl.int32) & mask)
+
+        rng = tl.arange(0, E)
+        vals = tl.load(num_recv_tokens_ptr + rng, mask=rng < E, other=0)
+        start_pos = tl.sum(tl.where(rng < pid, vals, 0))
+        my_padded = tl.load(num_recv_tokens_ptr + pid)
+        end_pos = start_pos + my_padded
+
+        for offset in range(start_pos, end_pos, BLOCK):
+            offs = offset + tl.arange(0, BLOCK)
+            mask = offs < end_pos
+            rel_pos = offs - start_pos
+            valid = rel_pos < count
+            result = tl.where(valid, pid, -1)
+            tl.store(m_indices_ptr + offs, result, mask=mask)
+
+
+def _build_m_indices_and_ep_scatter_use_groupgemm(
+    recv_x,
+    recv_x_scale,
+    recv_topk,
+    num_recv_tokens_per_expert_gpu,
+    output_tensor,
+    output_tensor_scale,
+    m_indices,
+    output_index,
+    local_num_expert,
+    scale_ue8m0=False,
+):
+    BLOCK = 1024
+    num_warps = 8
+    BLOCK_E = 256
+    scale_hidden_size = recv_x_scale.shape[-1]
+    if scale_ue8m0:
+        scale_hidden_size = ceil_div(scale_hidden_size, 4)
+
+    assert m_indices.shape[0] % BLOCK_E == 0
+    assert recv_x_scale.dtype == output_tensor_scale.dtype
+    assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
+
+    hidden_size = recv_x.shape[1]
+    expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
+
+    _fwd_kernel_ep_scatter_1_fused[(local_num_expert,)](
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        m_indices,
+        num_experts=local_num_expert,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(local_num_expert),
+        topk_ids_ptr=recv_topk,
+        numel=recv_topk.numel(),
+        BLOCK=BLOCK,
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
+        IS_FP8=True,
+    )
+
+
+def _build_m_indices_and_ep_scatter_not_use_groupgemm(
+    recv_x,
+    recv_x_scale,
+    recv_topk,
+    num_recv_tokens_per_expert_gpu,
+    output_tensor,
+    output_tensor_scale,
+    m_indices,
+    output_index,
+    local_num_expert,
+    scale_ue8m0=False,
+):
+    BLOCK = 1024
+    fused_build_m_indices_kernel[(local_num_expert,)](
+        recv_topk,
+        num_recv_tokens_per_expert_gpu,
+        m_indices,
+        recv_topk.numel(),
+        E=local_num_expert,
+        BLOCK=BLOCK,
+    )
+
+    num_warps = 8
+    hidden_size = recv_x.shape[1]
+    BLOCK_E = 128
+    BLOCK_D = 128
+    scale_hidden_size = hidden_size // BLOCK_D
+    if scale_ue8m0:
+        scale_hidden_size = ceil_div(scale_hidden_size, 4)
+
+    assert m_indices.shape[0] % BLOCK_E == 0
+    assert recv_x_scale.dtype == output_tensor_scale.dtype
+    assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
+
+    expert_start_loc = torch.zeros_like(num_recv_tokens_per_expert_gpu)
+    _fwd_kernel_ep_scatter_1[(local_num_expert,)](
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        m_indices,
+        num_experts=local_num_expert,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(local_num_expert),
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
+        IS_FP8=True,
+    )
+
+
+def build_m_indices_and_ep_scatter(
+    recv_x,
+    recv_x_scale,
+    recv_topk,
+    num_recv_tokens_per_expert_gpu,
+    output_tensor,
+    output_tensor_scale,
+    m_indices,
+    output_index,
+    local_num_expert,
+    scale_ue8m0=False,
+):
+    if use_groupgemm:
+        _build_m_indices_and_ep_scatter_use_groupgemm(
+            recv_x,
+            recv_x_scale,
+            recv_topk,
+            num_recv_tokens_per_expert_gpu,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+            local_num_expert,
+            scale_ue8m0,
+        )
+    else:
+        _build_m_indices_and_ep_scatter_not_use_groupgemm(
+            recv_x,
+            recv_x_scale,
+            recv_topk,
+            num_recv_tokens_per_expert_gpu,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+            local_num_expert,
+            scale_ue8m0,
+        )
 
 
 @triton.jit
@@ -1405,6 +1709,7 @@ def build_m_indices_triton(topk_ids, device, num_experts):
 @triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
+    input_token_num,
     input_tensor,
     input_tensor_stride0,
     input_tensor_stride1,
@@ -1446,18 +1751,23 @@ def _fwd_kernel_ep_gather(
                 source_token_index_int32 = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
-                source_token_index = source_token_index_int32.to(tl.int64)
+                if (source_token_index_int32 >= 0) & (
+                    source_token_index_int32 < input_token_num
+                ):
+                    source_token_index = source_token_index_int32.to(tl.int64)
 
-                acc_weight = tl.load(
-                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
-                )
-                tmp = tl.load(
-                    input_tensor
-                    + source_token_index * input_tensor_stride0
-                    + cur_block * BLOCK_D
-                    + off_d
-                )
-                accumulator += tmp.to(tl.float32) * acc_weight
+                    acc_weight = tl.load(
+                        recv_topk_weight
+                        + cur_token * recv_topk_weight_stride0
+                        + topk_index
+                    )
+                    tmp = tl.load(
+                        input_tensor
+                        + source_token_index * input_tensor_stride0
+                        + cur_block * BLOCK_D
+                        + off_d
+                    )
+                    accumulator += tmp.to(tl.float32) * acc_weight
 
         tl.store(
             output_tensor
@@ -1487,6 +1797,7 @@ def ep_gather(
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](
         num_tokens,
+        input_tensor.shape[0],
         input_tensor,
         input_tensor.stride(0),
         input_tensor.stride(1),

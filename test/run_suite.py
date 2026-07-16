@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import glob
 import importlib.util
@@ -242,11 +256,20 @@ NIGHTLY_SUITES = {
     HWBackend.DCU: [
         "nightly-dcu",
         "nightly-dcu-1-gpu",
+        "nightly-dcu-2-gpu",
         "nightly-dcu-4-gpu",
         "nightly-dcu-8-gpu",
         "nightly-dcu-accuracy",
         "nightly-dcu-perf",
         "nightly-dcu-vlm",
+        "nightly-dcu-core-functional",
+        "nightly-dcu-accuracy-text",
+        "nightly-dcu-perf-text",
+        "nightly-dcu-large-model-4gpu",
+        "nightly-dcu-large-model-8gpu",
+        "nightly-dcu-quant-opt",
+        "nightly-dcu-functional-long",
+        "nightly-dcu-api-models",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",

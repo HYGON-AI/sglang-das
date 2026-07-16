@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_dcu, is_hip, is_mps, is_musa, is_npu
 
 
 def is_cuda_v2():
@@ -225,10 +225,15 @@ class GPUEnv(BaseEnv):
 class HIPEnv(BaseEnv):
     """Environment checker for ROCm/HIP"""
 
-    def get_info(self):
-        cuda_info = {"ROCM available": torch.cuda.is_available()}
+    def __init__(self):
+        super().__init__()
+        self.is_dcu = is_dcu()
 
-        if cuda_info["ROCM available"]:
+    def get_info(self):
+        runtime_available = torch.cuda.is_available()
+        cuda_info = {"ROCM available": runtime_available}
+
+        if runtime_available:
             cuda_info.update(self.get_device_info())
             cuda_info.update(self._get_cuda_version_info())
 
@@ -290,9 +295,8 @@ class HIPEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "AMD Topology": "\n" + result.stdout if result.returncode == 0 else None
-            }
+            topology_name = "HCU Topology" if self.is_dcu else "AMD Topology"
+            return {topology_name: "\n" + result.stdout if result.returncode == 0 else None}
         except subprocess.SubprocessError:
             return {}
 

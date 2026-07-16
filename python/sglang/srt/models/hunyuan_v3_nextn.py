@@ -20,10 +20,10 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -33,6 +33,7 @@ from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
 from sglang.srt.runtime_context import get_stream
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class HYV3ModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
             prefix=f"{prefix}.embed_tokens",
         )
 
@@ -133,6 +135,7 @@ class HYV3ForCausalLMNextN(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix="lm_head",
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -171,12 +174,13 @@ class HYV3ForCausalLMNextN(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        moe_impl_class = get_moe_impl_class(self.quant_config)
+        expert_params_mapping = moe_impl_class.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -254,5 +258,14 @@ class HYV3ForCausalLMNextN(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 EntryClass = [HYV3ForCausalLMNextN]

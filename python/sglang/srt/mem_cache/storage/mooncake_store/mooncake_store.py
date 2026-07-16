@@ -27,7 +27,6 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
-
 logger = logging.getLogger(__name__)
 
 
@@ -300,6 +299,11 @@ class MooncakeBaseStore:
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
+        if isinstance(tensor, (tuple, list)):
+            for buffer in tensor:
+                self.register_buffer(buffer)
+            return
+
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
         ret_code = self.store.register_buffer(ptr, size)
@@ -311,7 +315,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -648,6 +651,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
             return
+        assert self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+            "layout_dcu",
+        ], (
+            "Mooncake storage supports page_first, page_first_direct, "
+            "page_head, page_first_kv_split, and layout_dcu host layouts"
+        )
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
                 super().register_buffer(buffer)

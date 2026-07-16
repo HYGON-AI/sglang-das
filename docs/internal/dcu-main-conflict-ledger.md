@@ -1632,3 +1632,281 @@ actual result in the checkpoint note.
 - Integration decision:
   - Code merge, static validation, and owner startup confirmation are complete on `sync/official-main-catchup-20260714`; fast-forward local `main` to this branch.
   - Create annotated tag `v0.5.15.post1` on the resulting DCU `main` commit, explicitly recording official main-equivalent endpoint `7e229e2a817d`, then push `main` and the tag without rewriting remote history.
+
+### v0.5.12_dev forward-port Step 1 / `8736a794acee`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Base: DCU `main@65f3bd9426e51df40987516acd075b646b858cf6`.
+- Old source: `/home/proj_dpsk-v4/sglang-das`, common base
+  `d4c6831a107ac03bae80e353d170af15557e4443`, endpoint
+  `8736a794acee8253019704cf00a901fd7ffcefbe`.
+- Scope: 41 full-graph commits, 30 non-merge commits, 54 old-range files. The
+  resolved staged tree changes 48 files with 6,800 insertions and 350 deletions.
+- Git reported 20 conflicts: 19 content conflicts plus modify/delete for the
+  obsolete `python/sglang/jit_kernel/deepseek_v4.py` wrapper. The wrapper,
+  legacy NSA implementation files, and legacy SWA pool file were not revived;
+  their required DCU behavior was ported to the current DSV4/DSA and
+  `mem_cache/allocator/swa.py` structures.
+- Preserved DCU semantics:
+  - DSV4 radix TopK early-exit/launch bounds and the existing VMFault guard.
+  - BF16 KV-cache layout, pool sizing, canonical store, compressor v1/v2, and
+    dtype-aware DSV4 backend behavior.
+  - DCU FlashMLA/DSA imports and cached dense Hadamard fallback.
+  - LightOp TopK without a duplicate generic EPLB remap.
+  - SWA stale-page mapping at its new allocator location.
+  - Explicit DCU versus generic ROCm diagnostics; current upstream APIs remain
+    canonical.
+- Static validation:
+  - no unmerged entries or precise conflict markers;
+  - staged `git diff --check` passed;
+  - all 35 changed Python files compiled;
+  - targeted Ruff `E9,F401,F811,F821` passed; seven broad `F841` observations
+    are unchanged from the current-main parent and are not Step 1 regressions;
+  - DCU registration passed with 221 registered files and the existing CPU
+    utils warning;
+  - DSA alias/CLI/registry and gfx938 HIP setup gates passed.
+- Functional validation:
+  - immediate preflight found all devices on both test nodes idle; `zz-nmz22`
+    was selected.
+  - the exact pure-TP script loaded 46 shards, captured decode graphs from
+    `bs=128` through `bs=1`, and reached service readiness;
+  - `/health` returned HTTP 200 and one short `/generate` returned HTTP 200
+    without worker failure;
+  - the response remained empty with eight zero output IDs. This is the known
+    deferred NaN/accuracy observation, is not an accuracy pass, and remains
+    non-blocking for the current startup/request gate.
+- Detailed decisions and validation evidence are recorded in
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step1-conflict-review.md`.
+
+### v0.5.12_dev forward-port Step 2 / `fde56844fca4`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 1 merge `e7e06b77881d243291fdc29fc815c2da6b28e75e`.
+- Old range: `8736a794acee8253019704cf00a901fd7ffcefbe..fde56844fca442108bf3d2c71cbdeacb4ddb8f08`.
+- Scope: 68 full-graph commits, 56 non-merge commits, 130 old-range files;
+  resolved code before documentation changes 127 files with 6,914 insertions
+  and 544 deletions.
+- Git reported exactly 32 textual conflict files. The complete file-by-file
+  resolution table is recorded in
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step2-conflict-review.md`.
+- Refactor/move decisions:
+  - kept deleted `docs_new/index.mdx` and
+    `python/sglang/srt/model_executor/cuda_graph_runner.py` absent;
+  - ported graph-token behavior to
+    `model_executor/runner/decode_cuda_graph_runner.py`;
+  - moved the C16 masked MLA store from old `mem_cache/utils.py` into canonical
+    `kernels/ops/kvcache/mla_buffer.py`, with a compatibility re-export;
+  - ported old HY3 PD/EP/fused normalization and rotary behavior into current
+    model, loader, stream, and capture APIs;
+  - migrated HY3 attention rank/size lookup from removed helpers to the current
+    attention tensor-parallel API; both HY3 modules pass direct import smoke;
+  - extended current multi-modal IPC caching with one source pool per TP
+    device and target-device synchronization;
+  - integrated DCU standalone/deep-gemm MegaMoE, graph tokens, PD behavior,
+    W8A8 builders, AITER ASM shuffle, LightOp TopK, and EP W4A16 into current
+    MoE/quant APIs.
+- `_is_dcu` audit:
+  - dedicated DCU LightOp, DSV4 BF16 cache, MegaMoE, AITER, W4A16, and
+    mem-cache paths stay ahead of generic `_is_hip` behavior;
+  - DeepSeek-V4 multi-stream is excluded for DCU BF16 attention KV cache, not
+    for the previously rejected fused-qnorm condition;
+  - BF16 attention KV uses its dedicated scatter regardless of the generic
+    fused-store setting and therefore cannot fall through to FP8 packing;
+  - the optional DeepGEMM `w4a16_marlin_weight` symbol is now a lazy import
+    behind `_is_dcu` and `SGLANG_USE_MARLIN_W4A16_MOE_OPT`;
+  - `SGLANG_USE_AITER_AG=0` remains present in the runtime script.
+- Static validation:
+  - no unmerged entries or precise markers; staged `git diff --check` passed;
+  - all 113 changed Python files compiled;
+  - targeted Ruff `E9,F401,F811,F821,F841` passed;
+  - DCU registration passed with 276 files and the existing CPU-utils warning;
+  - DSA alias/CLI/registry passed 19 tests;
+  - gfx938 HIP setup passed with package `sglang-kernel`, zero unsupported CUDA
+    calls, and 55 replaced kernel launches.
+- Functional validation:
+  - `zz-nmz26` was not used because all eight devices were at VRAM 93%; all
+    eight `zz-nmz22` devices were VRAM 0% / HCU 0% and were selected;
+  - the first attempt exposed the unconditional optional DeepGEMM import and
+    stopped before weight loading; one focused fix resolved it;
+  - confirmation loaded 46 shards, captured decode graphs `bs=128..1`, reached
+    readiness, returned HTTP 200 from `/health`, and returned HTTP 200 from one
+    short `/generate` without worker failure;
+  - response text remained empty with eight zero output IDs, the already
+    deferred non-blocking NaN/accuracy observation;
+  - service stopped, port 10015 closed, and `zz-nmz22` returned to VRAM 0% /
+    HCU 0%.
+- Integration decision: scoped static and functional gates passed after one
+  focused fix; commit this exact endpoint as the Step 2 no-ff checkpoint.
+
+### v0.5.12_dev forward-port Step 3 / `80571de9491c`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 2 merge `c7ffa6497a9e783e37a18556639ca7eb6138d292`.
+- Old range: `fde56844fca442108bf3d2c71cbdeacb4ddb8f08..80571de9491c8fd80e6822c9fa4efeb02ff67cce`.
+- Scope: 57 full-graph commits, 43 non-merge commits, 450 old-range files;
+  resolved staged result before documentation changes is 393 files with 8,366
+  insertions and 2,117 deletions.
+- Git reported exactly 66 conflict files:
+  - 12 current CI workflow definitions kept from current `main`;
+  - 11 old Sphinx/obsolete documentation paths kept deleted;
+  - 34 runtime/model conflicts resolved against current APIs, including FSDP
+    streaming, canonical DSA/speculative paths, HY3 precision/PD/EPLB, and
+    current disaggregation/communicator contracts;
+  - one FlashMLA kernel-Python conflict and eight test conflicts resolved to
+    current canonical coverage, with obsolete NSA/EAGLE/PP tests not revived.
+- Range-order/revert audit:
+  - temporary HY3 PP support and its conflict-resolution commit are followed
+    by explicit reverts before the endpoint; the final forward-port does not
+    restore that PP implementation;
+  - FSDP streaming is retained in the current `WeightLoadPlan`, preprocess,
+    and bitsandbytes full-load structure;
+  - HY3 retains the range's PD/EPLB, redundant-expert, and precision behavior
+    using current graph, stream, parallel, and expert-location APIs.
+- `_is_dcu` audit:
+  - five runtime Python files initially introduced a non-existent `is_hcu()`
+    predicate. They now use `is_dcu/_is_dcu`; HCU remains only the intended
+    user-visible compliance label;
+  - C++ causal-conv and MoE test helpers follow the same internal-DCU,
+    visible-HCU rule;
+  - canonical `dsa_*` ServerArgs fields are retained; DCU FP8 DSA resolves to
+    `flashmla_auto/flashmla_kv`, DCU non-FP8 to `sparse/sparse`, and generic HIP
+    remains `tilelang`;
+  - stale `get_attention_tp_size()` use was ported to
+    `get_parallel().attn_tp_size`;
+  - `SGLANG_USE_AITER_AG=0` remains unchanged.
+- Static validation passed: zero unmerged entries, no precise markers,
+  `git diff --check`, compilation of all 352 changed Python files, broad
+  changed-file Ruff `E9,F821`, targeted high-risk Ruff
+  `E9,F401,F811,F821,F841`, ten-module import smoke, 276-file DCU registration,
+  19 DSA alias tests, and gfx938 HIP setup-name generation.
+- Pure-TP validation:
+  - immediate preflight rejected occupied `zz-nmz26` (VRAM 57% on all eight
+    devices) and selected idle `zz-nmz22` (VRAM/HCU 0%);
+  - the exact required script loaded 46 shards, captured graphs `bs=128..1`,
+    reached readiness, and returned HTTP 200 for `/health` and `/generate`;
+  - response remained empty with eight zero output IDs, recorded as the known
+    non-blocking NaN/accuracy observation rather than an accuracy pass;
+  - service stopped, port 10015 closed, and `zz-nmz22` returned to VRAM/HCU 0%.
+- Detailed file-by-file groups and evidence:
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step3-conflict-review.md`.
+
+### v0.5.12_dev forward-port Step 4 / `cf5983854be1`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 3 merge `d648b38c7f3dd314ca1a5e098144e554949b3a84`.
+- Old range: `80571de9491c8fd80e6822c9fa4efeb02ff67cce..cf5983854be1f19237ba28416b438f7b8965cfe6`.
+- Scope: 26 full-graph commits, 18 non-merge commits, 30 old-range files;
+  resolved code before documentation changes is 32 files with 3,308
+  insertions and 295 deletions.
+- Git reported exactly 9 textual conflict files:
+  - decode KV offload, FlashAttention, DeepEP MoE, HiRadix, the old host-pool
+    facade, Mooncake, the removed old CUDA-graph runner, MiniMax M2, and
+    ServerArgs;
+  - all were resolved against current APIs while retaining the old DCU feature
+    intent.
+- Refactor/move decisions:
+  - moved `MHATokenToKVPoolHostDCU` from the old monolithic host-pool file to
+    current `mem_cache/pool_host/mha.py`, including page-major K/V buffers,
+    kvcacheio direct/kernel transfers, and explicit unsupported-layout guards;
+  - passed `hicache_mem_layout` through decode offload, HiRadix, hybrid pool,
+    and draft KV-cache callers so the DCU implementation remains reachable;
+  - kept `model_executor/cuda_graph_runner.py` deleted and ported its MiniMax
+    gathered-buffer multiple to `runner/base_cuda_graph_runner.py`;
+  - retained the current Mooncake hybrid logical-anchor guard and generalized
+    recursive registration for tuple/list K/V buffers;
+  - adapted old MiniMax/MiMo accessor calls to `get_server_args()` and
+    `get_parallel()`.
+- `_is_dcu` audit:
+  - packed paged-KV can use `SGLANG_KV_LAYOUT_DCU_FA` only when `is_dcu()`;
+  - current `_is_hip` DeepEP and quantization paths were reviewed without
+    replacing dedicated DCU LightOp/cache behavior;
+  - no runtime `is_hcu()` predicate or removed API was introduced;
+  - `SGLANG_USE_AITER_AG=0` remains unchanged.
+- Static validation passed:
+  - zero unmerged entries and no precise markers;
+  - `git diff --check` passed after seven upstream trailing-space artifacts in
+    `transfer.cu` were removed;
+  - all 28 changed Python files compiled;
+  - broad Ruff `E9,F821` and targeted high-risk Ruff
+    `E9,F401,F811,F821,F841` passed;
+  - seven high-risk modules passed direct import smoke;
+  - DCU registration passed with 277 files and the existing CPU-utils warning;
+  - DSA alias/CLI/registry passed 19 tests;
+  - gfx938 HIP setup passed with package `sglang-kernel`, zero unsupported CUDA
+    calls, and 56 replaced launches.
+- Pure-TP validation:
+  - immediate preflight rejected `zz-nmz26`, where all devices were VRAM 93%,
+    and selected `zz-nmz22`, where all devices were VRAM/HCU 0%;
+  - the exact required script loaded 46 shards, captured graphs `bs=128..1`,
+    reached readiness, and returned HTTP 200 for `/health` and `/generate`;
+  - response text remained empty with eight zero output IDs, the known
+    non-blocking NaN/accuracy observation;
+  - no runtime fix or retry was needed; port 10015 closed and all selected
+    devices returned to VRAM 0%.
+- Detailed conflict decisions and evidence:
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step4-conflict-review.md`.
+
+### v0.5.12_dev forward-port Step 5 / `5ec8531b096f`
+
+- Branch: `forward-port/v0.5.12-dev-20260715`.
+- Parent: Step 4 merge `f76fbea9601d31f7a45cd4b4c063de95c18455d3`.
+- Old range: `cf5983854be1f19237ba28416b438f7b8965cfe6..5ec8531b096fa3297ab034dedc873aad215f2c35`.
+- Scope: 22 full-graph commits, 13 non-merge commits, 17 old-range files;
+  resolved code before documentation changes is 16 files with 2,156
+  insertions and 615 deletions.
+- Git reported exactly 9 textual conflict files:
+  - Mooncake connection, FlashAttention, DeepEP MoE, MiniMax INT8 Marlin,
+    fused MoE, W8A8 INT8, SWA pool facade, DeepSeek V2/V3.2, and MiMo V2;
+  - all were resolved against current APIs while retaining the endpoint's DCU
+    transfer, LightOp/AITER, fused quantization, and model behavior.
+- Refactor and semantic decisions:
+  - Mooncake keeps current strict C128/SWA-ring validation, canonical transfer
+    chunks, MiniMax flat transfer, and recursive registration. Heterogeneous
+    attention TP transfers a dedicated SWA/DSA slice and skips the generic
+    sender to avoid duplicate writes;
+  - `swa_memory_pool.py` remains the pool facade. The old simplified
+    `free_swa` edit is superseded by current `mem_cache/allocator/swa.py`,
+    which already expands full pages, deduplicates, rejects already-free
+    pages, merges released pages, and clears stale mappings;
+  - DeepSeek V3.2 fused gate/up RMS quantization and routed/shared expert
+    activation scales were ported into current scoped communication and
+    deferred-finalization contracts; removed down-projection and all-reduce
+    parameters were not restored;
+  - DeepEP INT8 uses LightOp only under `_is_dcu`; generic platforms retain
+    the current DeepGEMM alias. The endpoint's AITER W4A16 MoE_C support is
+    retained on the current fused-MoE runner API;
+  - MiMo retains TP1 fused-QKV and MTP-as-SWA loading, KME/RoPE, EPLB, and
+    resume behavior using current runtime-context accessors;
+  - import smoke found that the installed LightOp lacks
+    `mimo_v2_split_rope_vscale_kv_store`. One focused capability guard keeps
+    the fused DCU path when available and falls back to the unfused path when
+    unavailable instead of failing module import;
+  - no runtime `is_hcu()` predicate was introduced, and the generic-HIP fused
+    clamp remains explicitly excluded from DCU's dedicated quantized path;
+  - `/home/scripts/sglang/run_dpsk-v4.sh` still exports
+    `SGLANG_USE_AITER_AG=0`.
+- Static validation:
+  - no unmerged entries or precise conflict markers;
+  - staged `git diff --check` passed;
+  - all changed Python files compiled;
+  - broad Ruff `E9,F821` and targeted high-risk Ruff
+    `E9,F401,F811,F821,F841` passed;
+  - eleven high-risk modules imported after the one capability fix;
+  - DCU registration passed with 277 files and the existing CPU-utils warning;
+  - DSA alias/CLI/registry passed 19 tests;
+  - gfx938 HIP setup passed with package `sglang-kernel`, zero unsupported CUDA
+    calls, and 56 replaced kernel launches.
+- Pure-TP validation:
+  - immediate preflight rejected `zz-nmz26`, where all devices were VRAM 93%,
+    and selected `zz-nmz22`, where all devices were VRAM/HCU 0%;
+  - workspace import resolved to the current
+    `/home/proj_sglang_open/sglang-das/python` tree;
+  - the exact required script loaded 46 shards, captured graphs `bs=128..1`,
+    reached readiness, and returned HTTP 200 for `/health` and `/generate`;
+  - response text remained empty with eight zero output IDs, recorded as the
+    known non-blocking NaN/accuracy observation rather than an accuracy pass;
+  - no runtime retry was needed; port 10015 closed and all selected devices
+    returned to VRAM/HCU 0%.
+- Status: committed as merge `8a075ddc63af713025cc585fa8d37a84cc99e217`; validated.
+- Detailed conflict decisions and evidence:
+  `docs/internal/dcu-main-forward-port-v0.5.12-dev-step5-conflict-review.md`.

@@ -70,7 +70,6 @@ from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
-from sglang.srt.utils import get_bool_env_var
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -215,6 +214,10 @@ def dequant_mxfp4(
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
+        if _is_dcu:
+            raise ImportError(
+                "The Quark package is required to use MX-FP4 models. Please install the Quark package."
+            ) from err
         raise ImportError(
             "The package `amd-quark` is required to use "
             "MX-FP4 models. Please install it with `pip install "
@@ -231,6 +234,10 @@ def quant_dequant_mxfp4(
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
+        if _is_dcu:
+            raise ImportError(
+                "The Quark package is required to use MX-FP4 models. Please install the Quark package."
+            ) from err
         raise ImportError(
             "The package `amd-quark` is required to use "
             "MX-FP4 models. Please install it with `pip install "

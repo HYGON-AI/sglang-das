@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -44,11 +58,11 @@ from sglang.srt.utils import (
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
+    is_dcu,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_musa,
-    is_dcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -171,6 +185,13 @@ if _is_cuda:
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
+        M = mat_a.shape[-2]
+        N = mat_b.shape[-1]
+        return mat_a.new_empty((M, N), dtype=out_dtype)
+
+    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
+    def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
@@ -546,9 +567,10 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_aiter():
         if not _use_aiter:
+            aiter_platform = "DCU devices" if _is_dcu else "AMD GPUs"
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
-                "but AITER is not available. AITER requires AMD GPUs with "
+                f"but AITER is not available. AITER requires {aiter_platform} with "
                 "SGLANG_USE_AITER=1 environment variable set."
             )
         return aiter_w8a8_block_fp8_linear

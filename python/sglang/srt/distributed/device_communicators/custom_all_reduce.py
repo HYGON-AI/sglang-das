@@ -25,11 +25,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
+    is_dcu,
     is_hip,
     is_musa,
     log_info_on_rank0,
 )
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_hip = is_hip()
 _is_musa = is_musa()
 
@@ -387,13 +389,16 @@ def dispatch_custom_allreduce(
     if _use_amd_deterministic_impl():
         return CustomAllreduce
 
-    if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+    if get_bool_env_var("SGLANG_USE_AITER_AR", default="false"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
+            if _is_dcu:
+                logger.info("[AR] Using AiterCustomAllreduce (HCU default)")
+            else:
+                logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             return partial(
                 AiterCustomAllreduce,

@@ -1,3 +1,17 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import shlex
@@ -7,7 +21,9 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_dcu_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.run_eval import run_eval_once
+from sglang.test.simple_eval_common import set_ulimit
+from sglang.test.simple_eval_mmlu import MMLUEval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -17,7 +33,7 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_dcu_ci(est_time=3600, suite="nightly-dcu-accuracy", nightly=True)
+register_dcu_ci(est_time=3600, suite="nightly-dcu-accuracy-text", nightly=True)
 
 DEFAULT_DCU_SERVER_ARGS = [
     "--attention-backend",
@@ -105,15 +121,26 @@ class TestBW1100MMLUEvalDCU(unittest.TestCase):
                 other_args=_get_server_args_env("SGLANG_DCU_MMLU_SERVER_ARGS"),
             )
 
+            set_ulimit()
+            os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+            base_url = f"{self.base_url}/v1"
+            dataset = (
+                self.dataset_path
+                or "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+            )
+            eval_obj = MMLUEval(dataset, self.num_examples, self.num_threads)
             args = SimpleNamespace(
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="mmlu",
                 num_examples=self.num_examples,
                 num_threads=self.num_threads,
-                dataset_path=self.dataset_path,
             )
-            metrics = run_eval(args)
+            result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+            metrics = result.metrics | {"score": result.score, "latency": latency}
+            total_completion_tokens = sum(sampler._completion_tokens)
+            if total_completion_tokens > 0 and latency > 0:
+                metrics["output_throughput"] = total_completion_tokens / latency
             metrics["score"] = round(metrics["score"], 4)
             write_results_to_json(self.model, metrics, "w")
             all_results.append((self.model, metrics["score"], 0.0, None))

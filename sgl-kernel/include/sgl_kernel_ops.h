@@ -154,6 +154,7 @@ void musa_fused_add_rms_norm(
     torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
+at::Tensor l2norm(at::Tensor& input, double eps);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -575,6 +576,53 @@ void dcu_alloc_decode_kernel(
     const at::Tensor free_page_ptr,   
     at::Tensor out_indices, 
     int64_t bs,          
+    int64_t page_size);
+
+void transfer_kv_all_kernel_lf_pf_D2H_dcu(
+    const at::Tensor& src_k,
+    at::Tensor dst_k,
+    const at::Tensor& src_v,
+    at::Tensor dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t srt_layout_dim,
+    int64_t dst_layout_dim,
+    int64_t page_size,
+    int64_t layer_num,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
+    const at::Tensor& src_k,
+    at::Tensor dst_k,
+    const at::Tensor& src_v,
+    at::Tensor dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t layer_id,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_direct_pf_lf_H2D_dcu(
+    const at::Tensor& src_ptrs_k,
+    const at::Tensor& src_ptrs_v,
+    std::vector<at::Tensor> dst_ptrs_k,
+    std::vector<at::Tensor> dst_ptrs_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t start_layer_id,
+    int64_t page_size);
+
+void transfer_kv_all_direct_lf_pf_D2H_dcu(
+    const std::vector<at::Tensor>& src_ptrs_k,
+    const std::vector<at::Tensor>& src_ptrs_v,
+    at::Tensor dst_ptrs_k,
+    at::Tensor dst_ptrs_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t start_layer_id,
     int64_t page_size);
 
 void transfer_kv_per_layer(

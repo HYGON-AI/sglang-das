@@ -33,7 +33,7 @@ cd sgl-kernel
 python setup_hip.py install
 
 1. 编译whl包并安装
-python setup.py bdist_wheel 
+python setup.py bdist_wheel
 cd dist
 pip install sglang*
 
@@ -56,6 +56,20 @@ pip install -e "python[all_hip]" --no-deps --no-build-isolation --no-index
 
 ## 验证
 - python -c "import sglang; print(sglang.\_\_version__)",
+
+## 手动无人值守大模型测试
+
+仓库提供独立 workflow `Manual DCU Unattended Model Test`（文件：`.github/workflows/dcu-manual-model-test.yml`），用于在 DCU runner 上手动启动长时间模型验证任务。它只支持 `workflow_dispatch`，不会在 `pull_request`、`push` 或 `schedule` 时自动触发，因此不属于 PR gate。
+
+使用方式：进入 GitHub Actions，选择 `Manual DCU Unattended Model Test`，点击 `Run workflow`。GitHub 页面上的分支下拉框决定默认测试 ref；也可以通过 `test_branch` 输入分支、tag、ref 或 SHA 覆盖。默认 suite 为 `nightly-dcu-accuracy`，可通过 `suite` 改成 `nightly-dcu`、`nightly-dcu-vlm`、`nightly-dcu-4-gpu` 等已注册 DCU suite。若只跑单个文件，填写 `include_file`，例如 `test/registered/dcu/accuracy/bw1100/test_gsm8k_eval_dcu.py`。
+
+常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 DCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 会传给 `SGLANG_DCU_GSM8K_MODEL`、`SGLANG_DCU_MMLU_MODEL` 和 `SGLANG_TEST_DEFAULT_MODEL_NAME`，可用于测试其它本地模型路径，例如 `/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct`。`run_suite.py` 尚无 `--model-name` 过滤参数，因此这里通过测试文件已支持的环境变量选择模型。
+
+快速验证其它模型时，可填写 `model_name`，并将 `eval_num_examples` 设为较小值（例如 `10`）；也可用 `include_file` 只跑 `test/registered/dcu/accuracy/bw1100/test_gsm8k_eval_dcu.py` 或 `test/registered/dcu/accuracy/bw1100/test_mmlu_eval_dcu.py`。如模型精度阈值不同，可通过 `gsm8k_threshold`、`mmlu_threshold` 临时覆盖。`mmlu_num_threads` 默认 128，这是在 DCU runner 上手动验证过的稳定配置。
+
+该 workflow 默认会在测试前从所选 ref 重新编译并安装 `sgl-kernel`（`rebuild_sgl_kernel: true`），避免 checkout 出来的 `sglang` 源码与镜像里预装的 `sgl-kernel` 扩展包接口不匹配。如果明确使用镜像内完全匹配的包，可手动关闭该选项。
+
+运行结束后，可在 workflow 日志中查看测试 ref、runner label、容器名、suite、include_file、model_name、timeout、分片配置和最终执行命令。job summary 会展示本次配置和结果；artifact `dcu-manual-model-test-<run_id>` 会上传 `summary.md`、最终命令和 `run.log`。
 
 ## PD 分离
 
@@ -90,7 +104,7 @@ mc_topo.config
 ```
 **DeepSeek-R1-Channel-INT8 模型示例**
 
-##### prefill 
+##### prefill
 ```bash
 python -m sglang.launch_server \
   --model-path DeepSeek-R1-Channel-INT8 \
@@ -105,10 +119,10 @@ python -m sglang.launch_server \
   --tp-size 2 \
   --pp-size 4 \
   --mem-fraction-static 0.9 \
-  --attention-backend dcu_mla 
+  --attention-backend dcu_mla
 ```
 
-##### decode  
+##### decode
 ```bash
 python -m sglang.launch_server \
   --model-path DeepSeek-R1-Channel-INT8  \
@@ -145,7 +159,7 @@ curl -X POST http://localhost:30002/v1/completions \
 #### low_latency （使用deepep）
 prefill部分同上面normal部分的prefill
 
-##### decode  
+##### decode
 ```bash
 # deep_ep
 #export ROCSHMEM_DISABLE_HDP_FLUSH=1 #xdp使用

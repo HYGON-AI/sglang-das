@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List
 
 import torch
@@ -59,6 +73,104 @@ def dcu_alloc_decode_kernel(
         free_page_ptr,
         out_indices,
         bs,
+        page_size,
+    )
+
+def transfer_kv_all_kernel_lf_pf_D2H_dcu(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    srt_layout_dim: int,
+    dst_layout_dim: int,
+    page_size: int,
+    layer_num: int,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_kernel_lf_pf_D2H_dcu.default(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        srt_layout_dim,
+        dst_layout_dim,
+        page_size,
+        layer_num,
+        num_warps_per_block,
+    )
+
+def transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    src_layout_dim: int,
+    page_size: int,
+    layer_id: int,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_kernel_pf_lf_H2D_dcu.default(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        src_layout_dim,
+        page_size,
+        layer_id,
+        num_warps_per_block,
+    )
+
+def transfer_kv_all_direct_pf_lf_H2D_dcu(
+    src_ptrs_k: torch.Tensor,
+    src_ptrs_v: torch.Tensor,
+    dst_ptrs_k: List[torch.Tensor],
+    dst_ptrs_v: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    start_layer_id: int,
+    page_size: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_direct_pf_lf_H2D_dcu.default(
+        src_ptrs_k,
+        src_ptrs_v,
+        dst_ptrs_k,
+        dst_ptrs_v,
+        src_indices,
+        dst_indices,
+        start_layer_id,
+        page_size,
+    )
+
+def transfer_kv_all_direct_lf_pf_D2H_dcu(
+    src_ptrs_k: List[torch.Tensor],
+    src_ptrs_v: List[torch.Tensor],
+    dst_ptrs_k: torch.Tensor,
+    dst_ptrs_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    start_layer_id: int,
+    page_size: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_direct_lf_pf_D2H_dcu.default(
+        src_ptrs_k,
+        src_ptrs_v,
+        dst_ptrs_k,
+        dst_ptrs_v,
+        src_indices,
+        dst_indices,
+        start_layer_id,
         page_size,
     )
 

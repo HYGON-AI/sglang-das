@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import enum
@@ -1567,7 +1581,9 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if self.token_to_kv_pool.is_bf16_attention_kv_cache or (
+            envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+        ):
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1624,7 +1640,7 @@ class DeepseekV4AttnBackend(
             cache_seqlens=None,
             tile_scheduler_metadata=flashmla_metadata,
             softmax_scale=self.softmax_scale,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=swa_k_cache.dtype != torch.bfloat16,
             indices=swa_page_indices,
             topk_length=swa_topk_lengths,
             attn_sink=attn_sink,
@@ -2023,7 +2039,7 @@ class DeepseekV4AttnBackend(
                         cache_seqlens=None,
                         tile_scheduler_metadata=flashmla_metadata,
                         softmax_scale=self.softmax_scale,
-                        is_fp8_kvcache=True,
+                        is_fp8_kvcache=swa_k_cache.dtype != torch.bfloat16,
                         indices=swa_page_indices,
                         topk_length=swa_topk_lengths,
                         attn_sink=attn_sink,

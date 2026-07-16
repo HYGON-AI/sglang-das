@@ -1,3 +1,17 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -23,8 +37,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -50,7 +63,7 @@ if _is_dcu:
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    from sgl_kernel import int8_scaled_mm  # noqa: F401 -- registers the custom op
 
     @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
     def _int8_scaled_mm_abstract(
@@ -115,15 +128,31 @@ class W8A8Int8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.quantization.fp8 import Fp8KVCacheMethod
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
-        if should_ignore_layer(
-            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-        ):
-            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedEmbeddingMethod()
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return W8A8Int8MoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return None
+            else:
+                return Fp8KVCacheMethod(self)
         return None
 
     def is_layer_skipped(
@@ -162,7 +191,6 @@ class W8A8Int8Config(QuantizationConfig):
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
 
@@ -266,8 +294,6 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        tp_size = get_parallel().tp_size
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(

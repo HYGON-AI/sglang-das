@@ -34,7 +34,9 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_dcu, is_gfx95_supported
+
+_is_dcu = is_dcu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -56,9 +58,16 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
-    print(
-        "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-    )
+    if _is_dcu:
+        print(
+            "aiter is DCU/DTK compatible kernel library. "
+            "Please make sure aiter is installed on your DCU device."
+        )
+    else:
+        print(
+            "aiter is ROCm/HIP specific kernel library. "
+            "Please make sure aiter is installed on your ROCm/HIP device."
+        )
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs.model_config import AttentionArch

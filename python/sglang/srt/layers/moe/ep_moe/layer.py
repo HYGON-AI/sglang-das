@@ -1,11 +1,31 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
-from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin import \
-    SlimQuantCompressedTensorsMarlinConfig
-from sglang.srt.layers.quantization.slimquant_w4a8_marlin import SlimQuantW4A8Int8MarlinConfig
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin import (
+    SlimQuantCompressedTensorsMarlinConfig,
+)
+from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+    SlimQuantW4A8Int8MarlinConfig,
+)
 import torch
 import torch.nn.functional as F
 
@@ -78,20 +98,38 @@ if TYPE_CHECKING:
         DispatchOutput,
     )
 
-from deepgemm import m_grouped_w4a8_gemm_nt_masked, m_grouped_w8a8_gemm_nt_masked, m_grouped_i8_gemm_nt_contiguous, \
-    m_grouped_bf16_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous, \
-    m_grouped_bf16_gemm_nt_contiguous
-from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_fp8_quant_ep, fuse_silu_and_mul, \
-    fuse_silu_mul_fp8_quant
+from deepgemm import (
+    m_grouped_w4a8_gemm_nt_masked,
+    m_grouped_w8a8_gemm_nt_masked,
+    m_grouped_i8_gemm_nt_contiguous as _deepgemm_i8_gemm_nt_contiguous,
+    m_grouped_bf16_gemm_nt_masked,
+    m_grouped_fp8_gemm_nt_contiguous,
+    m_grouped_bf16_gemm_nt_contiguous,
+)
+from lightop import (
+    fuse_silu_mul_quant,
+    fuse_silu_mul_quant_ep,
+    fuse_silu_mul_fp8_quant_ep,
+    fuse_silu_and_mul,
+    fuse_silu_mul_fp8_quant,
+)
 from lightop import op as lightop_op
+from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_dcu = is_dcu()
 _is_fp8_fnuz = is_fp8_fnuz()
+if _is_dcu:
+    from lightop import (
+        m_grouped_w8a8_gemm_nt_contig_asm as m_grouped_i8_gemm_nt_contiguous,
+    )
+else:
+    m_grouped_i8_gemm_nt_contiguous = _deepgemm_i8_gemm_nt_contiguous
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+_use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -173,12 +211,8 @@ def _build_m_indices_with_optional_lightop(
         block_size,
         counts_are_aligned,
     ):
-        m_indices = torch.empty(
-            (total_elements,), device=device, dtype=torch.int32
-        )
-        lightop_op.ep_build_m_indices(
-            topk_ids, m_indices, num_experts, block_size
-        )
+        m_indices = torch.full((total_elements,), -1, device=device, dtype=torch.int32)
+        lightop_op.ep_build_m_indices(topk_ids, m_indices, num_experts, block_size)
         return m_indices
 
     return build_m_indices_triton(topk_ids, device, num_experts)
@@ -256,10 +290,12 @@ def _ep_scatter_with_optional_lightop(
         counts_are_aligned=counts_are_aligned,
         scale_ue8m0=scale_ue8m0,
     ):
-        output_index = torch.empty(
-            recv_topk.shape, device=recv_topk.device, dtype=torch.int32
+        output_index = torch.full(
+            recv_topk.shape, -1, device=recv_topk.device, dtype=torch.int32
         )
-        m_indices = torch.empty((all_tokens,), device=recv_x.device, dtype=torch.int32)
+        m_indices = torch.full(
+            (all_tokens,), -1, device=recv_x.device, dtype=torch.int32
+        )
         lightop_op.ep_scatter(
             recv_x,
             recv_x_scale,
@@ -304,11 +340,13 @@ def _ep_scatter_with_optional_lightop(
 
 # ------ custom op for lightop
 def m_grouped_w4a8_gemm_nt_masked_wrapper(
-    a0: torch.Tensor, a1: torch.Tensor,
-    b0: torch.Tensor, b1: torch.Tensor,
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
     d: torch.Tensor,
     masked_m: torch.Tensor,
-    expected_m_per_group: int
+    expected_m_per_group: int,
 ) -> torch.Tensor:
     return m_grouped_w4a8_gemm_nt_masked(
         (a0, a1),
@@ -320,21 +358,25 @@ def m_grouped_w4a8_gemm_nt_masked_wrapper(
 
 
 def m_grouped_w4a8_gemm_nt_masked_fake(
-    a0: torch.Tensor, a1: torch.Tensor,
-    b0: torch.Tensor, b1: torch.Tensor,
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
     d: torch.Tensor,
     masked_m: torch.Tensor,
-    expected_m_per_group: int
+    expected_m_per_group: int,
 ) -> torch.Tensor:
     return d
 
 
 def m_grouped_w8a8_gemm_nt_masked_wrapper(
-    a0: torch.Tensor, a1: torch.Tensor,
-    b0: torch.Tensor, b1: torch.Tensor,
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
     d: torch.Tensor,
     masked_m: torch.Tensor,
-    expected_m_per_group: int
+    expected_m_per_group: int,
 ) -> torch.Tensor:
     return m_grouped_w8a8_gemm_nt_masked(
         (a0, a1),
@@ -342,31 +384,33 @@ def m_grouped_w8a8_gemm_nt_masked_wrapper(
         d,
         masked_m,
         expected_m_per_group,
-        config={"MODE": 1000, }
+        config={
+            "MODE": 1000,
+        },
     )
 
 
 def m_grouped_w8a8_gemm_nt_masked_fake(
-    a0: torch.Tensor, a1: torch.Tensor,
-    b0: torch.Tensor, b1: torch.Tensor,
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
     d: torch.Tensor,
     masked_m: torch.Tensor,
-    expected_m_per_group: int
+    expected_m_per_group: int,
 ) -> torch.Tensor:
     return d
+
 
 def fuse_silu_mul_quant_ep_wrapper(
     input: torch.Tensor,
     tokens_per_expert: Optional[torch.Tensor] = None,
     num_local_tokens_tensor: Optional[torch.Tensor] = None,
     topk: int = 1,
-    expect_m: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
+    expect_m: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
     return fuse_silu_mul_quant_ep(
-        input,
-        tokens_per_expert,
-        num_local_tokens_tensor,
-        topk,
-        expect_m
+        input, tokens_per_expert, num_local_tokens_tensor, topk, expect_m
     )
 
 
@@ -375,13 +419,12 @@ def fuse_silu_mul_quant_ep_fake(
     tokens_per_expert: Optional[torch.Tensor] = None,
     num_local_tokens_tensor: Optional[torch.Tensor] = None,
     topk: int = 1,
-    expect_m: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
+    expect_m: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
     E, T, H = input.shape
     d = H // 2
     output = torch.empty(E, T, d, dtype=torch.int8, device=input.device)
-    scales = torch.empty((E, T, 1),
-                         device=input.device,
-                         dtype=torch.float32)
+    scales = torch.empty((E, T, 1), device=input.device, dtype=torch.float32)
     return output, scales
 
 
@@ -389,20 +432,21 @@ direct_register_custom_op(
     op_name="m_grouped_w4a8_gemm_nt_masked",
     op_func=m_grouped_w4a8_gemm_nt_masked_wrapper,
     mutates_args=[],
-    fake_impl=m_grouped_w4a8_gemm_nt_masked_fake
+    fake_impl=m_grouped_w4a8_gemm_nt_masked_fake,
 )
 direct_register_custom_op(
     op_name="m_grouped_w8a8_gemm_nt_masked",
     op_func=m_grouped_w8a8_gemm_nt_masked_wrapper,
     mutates_args=[],
-    fake_impl=m_grouped_w8a8_gemm_nt_masked_fake
+    fake_impl=m_grouped_w8a8_gemm_nt_masked_fake,
 )
 direct_register_custom_op(
     op_name="fuse_silu_mul_quant_ep",
     op_func=fuse_silu_mul_quant_ep_wrapper,
     mutates_args=[],
-    fake_impl=fuse_silu_mul_quant_ep_fake
+    fake_impl=fuse_silu_mul_quant_ep_fake,
 )
+
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
@@ -495,9 +539,9 @@ class DeepEPMoE(FusedMoE):
             and not _is_npu
             and not _is_hip
         ):
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), "Unquantized DeepEP low-latency MoE requires DeepGEMM BF16"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                "Unquantized DeepEP low-latency MoE requires DeepGEMM BF16"
+            )
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
@@ -505,6 +549,7 @@ class DeepEPMoE(FusedMoE):
         if self.deprecate_flag:
             return
 
+        self.use_w4a16_marlin = False
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
@@ -562,6 +607,14 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = True
+        elif _use_marlin_w4a16_moe and _is_dcu:
+            self.use_w4afp8 = False
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.use_w4a8_marlin = False
+            self.use_w8a8_marlin = False
+            self.use_bf16_marlin = False
+            self.use_w4a16_marlin = True
         else:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
@@ -611,9 +664,9 @@ class DeepEPMoE(FusedMoE):
         i_s: Optional[torch.Tensor] = None,
     ):
         if is_in_tc_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for piecewise cuda graph"
+            )
             return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
@@ -684,9 +737,7 @@ class DeepEPMoE(FusedMoE):
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
             else:
-                raise ValueError(
-                    f"Dispatch output is not supported"
-                )
+                raise ValueError(f"Dispatch output is not supported")
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if self.quant_config is None:
                 output = self.forward_unquantized_deepep_ll(dispatch_output)
@@ -706,6 +757,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_groupgemm_w8a8_fp8_masked(dispatch_output)
             elif self.use_bf16_marlin:
                 output = self.forward_groupgemm_bf16_masked(dispatch_output)
+            elif self.use_w4a16_marlin:
+                output = self.forward_groupgemm_w4a16_marlin_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
         elif _use_aiter:
@@ -808,13 +861,18 @@ class DeepEPMoE(FusedMoE):
         if w2_bias is not None:
             output = output + w2_bias.unsqueeze(1)
         return output.masked_fill(~valid_mask, 0)
+
     def forward_deepgemm_w4a8_marlin_contiguous(
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
     ):
-        hidden_states, hidden_states_scale, topk_idx, topk_weights, num_recv_tokens_per_expert = (
-            dispatch_output
-        )
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_idx,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
         # hidden_states_int8, hidden_states_scale = hidden_states_int8
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
@@ -822,11 +880,14 @@ class DeepEPMoE(FusedMoE):
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
-        rank_expert_offset = get_moe_expert_parallel_rank() * (self.num_experts // get_moe_expert_parallel_world_size())
+        rank_expert_offset = get_moe_expert_parallel_rank() * (
+            self.num_experts // get_moe_expert_parallel_world_size()
+        )
         topk_idx = torch.where(
             topk_idx == -1,
             self.num_experts - 1 if rank_expert_offset == 0 else 0,
-            topk_idx + rank_expert_offset)
+            topk_idx + rank_expert_offset,
+        )
         expert_output = self.quant_method.apply_ep(
             x=hidden_states,
             w1=self.w13_weight,
@@ -1093,7 +1154,9 @@ class DeepEPMoE(FusedMoE):
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
 
-        input_tensor = torch.empty((all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype)
+        input_tensor = torch.empty(
+            (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
+        )
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -1144,7 +1207,9 @@ class DeepEPMoE(FusedMoE):
             gateup_output,
             m_indices,
         )
-        q_a2_all = torch.empty((all_tokens, N // 2), device=hidden_states.device, dtype=torch.bfloat16)
+        q_a2_all = torch.empty(
+            (all_tokens, N // 2), device=hidden_states.device, dtype=torch.bfloat16
+        )
         fuse_silu_and_mul(input=gateup_output, output=q_a2_all)
         del gateup_output
 
@@ -1196,32 +1261,38 @@ class DeepEPMoE(FusedMoE):
             return hidden_states.bfloat16()
 
         M, K = hidden_states.size()
-        N = self.w13_weight.size(1)
+        w13_shape = getattr(self, "_dsv4_w13_weight_shape", None)
+        if w13_shape is not None:
+            N = w13_shape[1]
+        else:
+            N = self.w13_weight.size(1)
+        w13_weight = getattr(self, "w13_weight_deepgemm", None)
+        w2_weight = getattr(self, "w2_weight_deepgemm", None)
+        if w13_weight is None:
+            w13_weight = self.w13_weight
+        if w2_weight is None:
+            w2_weight = self.w2_weight
         w13_weight_int8 = (
-            self.w13_weight,
+            w13_weight,
             (self.w13_weight_scale),
         )
         w2_weight_int8 = (
-            self.w2_weight,
+            w2_weight,
             (self.w2_weight_scale),
         )
 
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
-        input_tensor = [
-            torch.empty(
-                (all_tokens, K),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            ),
-            (
-                torch.empty(
-                    (all_tokens, hidden_states_scale.shape[-1]),
-                    device=hidden_states.device,
-                    dtype=torch.float32,
-                )
-            ),
-        ]
+        a_int8 = torch.empty(
+            (all_tokens, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        a_scale = torch.empty(
+            (all_tokens, hidden_states_scale.shape[-1]),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -1238,27 +1309,31 @@ class DeepEPMoE(FusedMoE):
             hidden_states_scale,
             topk_ids,
             num_recv_tokens_per_expert_gpu,
-            input_tensor[0],
-            input_tensor[1],
+            a_int8,
+            a_scale,
             all_tokens,
             counts_are_aligned=all(
                 count % 256 == 0 for count in num_recv_tokens_per_expert
             ),
         )
 
-        gateup_output = torch.zeros(
-            (all_tokens, N * 16),
+        gateup_output_factory = (
+            torch.empty
+            if all(count % 256 == 0 for count in num_recv_tokens_per_expert)
+            else torch.zeros
+        )
+        gateup_output = gateup_output_factory(
+            (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
 
         m_grouped_i8_gemm_nt_contiguous(
-            input_tensor,
+            (a_int8, a_scale),
             w13_weight_int8,
             gateup_output,
             m_indices,
         )
-        del input_tensor
 
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
@@ -1276,7 +1351,7 @@ class DeepEPMoE(FusedMoE):
             m_indices,
         )
 
-        gather_out = torch.empty(
+        gather_out = torch.zeros(
             hidden_states_shape,
             device=hidden_states_device,
             dtype=torch.bfloat16,
@@ -1490,29 +1565,39 @@ class DeepEPMoE(FusedMoE):
         w2_scales = self.w2_weight_scale
 
         n1 = w13_scales.size(1)
-        gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
+        gateup_output = torch.empty(
+            (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
+        )
 
         # ---- first GEMM ----
         torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
-            hidden_states, hidden_states_scale,
-            w13_weight, w13_scales,
+            hidden_states,
+            hidden_states_scale,
+            w13_weight,
+            w13_scales,
             gateup_output,
             masked_m,
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(gateup_output, masked_m)
+        q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+            gateup_output, masked_m
+        )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
 
         # ---- second GEMM ----
         n2 = w2_scales.size(1)
-        down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
+        down_output = torch.empty(
+            (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
+        )
 
         torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
-            q_a2_all, q_a2_scale,
-            w2_weight, w2_scales,
+            q_a2_all,
+            q_a2_scale,
+            w2_weight,
+            w2_scales,
             down_output,
             masked_m,
             expected_m,
@@ -1525,7 +1610,9 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DeepEPLLDispatchOutput,
     ):
 
-        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = dispatch_output
+        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
+            dispatch_output
+        )
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
         # base shapes
@@ -1542,29 +1629,39 @@ class DeepEPMoE(FusedMoE):
         w2_scales = self.w2_weight_scale
 
         n1 = w13_scales.size(1)
-        gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
+        gateup_output = torch.empty(
+            (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
+        )
 
         # ---- first GEMM ----
         torch.ops.sglang.m_grouped_w8a8_gemm_nt_masked(
-            hidden_states, hidden_states_scale,
-            w13_weight, w13_scales,
+            hidden_states,
+            hidden_states_scale,
+            w13_weight,
+            w13_scales,
             gateup_output,
             masked_m,
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(gateup_output, masked_m)
+        q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+            gateup_output, masked_m
+        )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
 
         # ---- second GEMM ----
         n2 = w2_scales.size(1)
-        down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
+        down_output = torch.empty(
+            (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
+        )
 
         torch.ops.sglang.m_grouped_w8a8_gemm_nt_masked(
-            q_a2_all, q_a2_scale,
-            w2_weight, w2_scales,
+            q_a2_all,
+            q_a2_scale,
+            w2_weight,
+            w2_scales,
             down_output,
             masked_m,
             expected_m,
@@ -1577,11 +1674,15 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DeepEPLLDispatchOutput,
     ):
 
-        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = dispatch_output
+        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
+            dispatch_output
+        )
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
             self.runner, "down_gemm_overlap_args", None
         )
-        meta_overlap_args: Optional[dict] = getattr(self.runner, "meta_overlap_args", None)
+        meta_overlap_args: Optional[dict] = getattr(
+            self.runner, "meta_overlap_args", None
+        )
         assert self.moe_runner_config.activation == "silu"
         # base shapes
         num_groups, m, k = hidden_states.size()
@@ -1600,9 +1701,12 @@ class DeepEPMoE(FusedMoE):
         w2_scales = self.w2_weight_scale
 
         n1 = w13_scales.size(1)
-        gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
+        gateup_output = torch.empty(
+            (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
+        )
 
         from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+
         m_grouped_fp8_gemm_nt_masked_ll(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
@@ -1611,16 +1715,18 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(input=gateup_output,
-                                                          fp8type=0,
-                                                          tokens_per_expert=masked_m)
+        q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
+            input=gateup_output, fp8type=0, tokens_per_expert=masked_m
+        )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
 
         # ---- second GEMM ----
         n2 = w2_scales.size(1)
-        down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
+        down_output = torch.empty(
+            (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
+        )
 
         enable_overlap = down_gemm_overlap_args is not None
 
@@ -1648,7 +1754,9 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DeepEPLLDispatchOutput,
     ):
 
-        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = dispatch_output
+        hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
+            dispatch_output
+        )
         assert self.moe_runner_config.activation == "silu"
         # base shapes
         num_groups, m, k = hidden_states.size()
@@ -1659,7 +1767,9 @@ class DeepEPMoE(FusedMoE):
         w2_weight = self.w2_weight
 
         n1 = w13_weight.size(1)
-        gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
+        gateup_output = torch.empty(
+            (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
+        )
         # ---- first GEMM ----
         m_grouped_bf16_gemm_nt_masked(
             hidden_states,
@@ -1669,14 +1779,18 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all = torch.empty((num_groups, m, n1 // 2), device=hidden_states.device, dtype=torch.bfloat16)
+        q_a2_all = torch.empty(
+            (num_groups, m, n1 // 2), device=hidden_states.device, dtype=torch.bfloat16
+        )
         fuse_silu_and_mul(input=gateup_output, output=q_a2_all)
         # The first-stage BF16 activation is no longer needed after SiLU*mul.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
         # ---- second GEMM ----
         n2 = w2_weight.size(1)
-        down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
+        down_output = torch.empty(
+            (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
+        )
 
         m_grouped_bf16_gemm_nt_masked(
             q_a2_all,
@@ -1784,6 +1898,65 @@ class DeepEPMoE(FusedMoE):
 
         return hidden_states
 
+    def forward_groupgemm_w4a16_marlin_masked(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+        hidden_states, _, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+
+        num_groups, m, _ = hidden_states.size()
+        expected_m = min(m, expected_m)
+        w13_weight = self.w13_weight_packed
+        w13_scales = self.w13_weight_scale
+        w2_weight = self.w2_weight_packed
+        w2_scales = self.w2_weight_scale
+
+        n1 = w13_scales.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n1),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        grouped_gemm_w4a16_nt_masked_entry(
+            hidden_states,
+            w13_weight,
+            w13_scales,
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+
+        q_a2_all = torch.empty(
+            (num_groups, m, n1 // 2),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        fuse_silu_and_mul(
+            input=gateup_output,
+            output=q_a2_all,
+            mask_m=masked_m,
+            expect_m=expected_m,
+        )
+        del gateup_output
+
+        n2 = w2_scales.size(1)
+        down_output = torch.empty(
+            (num_groups, m, n2),
+            device=q_a2_all.device,
+            dtype=torch.bfloat16,
+        )
+        grouped_gemm_w4a16_nt_masked_entry(
+            q_a2_all,
+            w2_weight,
+            w2_scales,
+            down_output,
+            masked_m,
+            expected_m,
+        )
+        return down_output
+
 
 class NpuFuseEPMoE(DeepEPMoE):
     def __init__(
@@ -1869,13 +2042,13 @@ class NpuFuseEPMoE(DeepEPMoE):
             2,
             original_shape[dim] // (2 * chunk_size),
             chunk_size,
-            *original_shape[dim + 1:],
+            *original_shape[dim + 1 :],
         )
 
         weight = weight.view(new_shape)
         weight = weight.transpose(dim, dim + 1).contiguous()
 
-        return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1:])
+        return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
     def release_weight_cache(self, weight: torch.Tensor):
         # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)

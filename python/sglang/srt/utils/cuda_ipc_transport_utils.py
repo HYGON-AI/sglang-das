@@ -1,9 +1,23 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import fcntl
 import logging
 import threading
 import time
 from multiprocessing import shared_memory
-from typing import Any, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -102,19 +116,23 @@ class MmItemMemoryChunk:
     def end(self):
         return self.area[1]
 
-    def try_to_recycle(self) -> bool:
-        try:
-            tp_num = get_server_args().tp_size
-        except Exception:
-            logger.info(
-                "server_args has not been published yet, skip this turn's recycle"
-            )
-            return False
+    def try_to_recycle(self, recycle_count: Optional[int] = None) -> bool:
+        if recycle_count is None:
+            try:
+                recycle_count = get_server_args().tp_size
+            except Exception:
+                logger.info(
+                    "server_args has not been published yet, skip this turn's recycle"
+                )
+                return False
 
         val = float(self.sync_flag.buffer_wrapper.item())
-        logger.debug(f"[try_to_recycle] area={self.area}, flag={val}, tp_size={tp_num}")
+        logger.debug(
+            f"[try_to_recycle] area={self.area}, flag={val}, "
+            f"recycle_count={recycle_count}"
+        )
 
-        if val == float(tp_num):
+        if val == float(recycle_count):
             self.sync_flag.buffer_wrapper *= 0.0
             return True
 
@@ -122,10 +140,23 @@ class MmItemMemoryChunk:
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval, base_gpu_id):
-        self.memory_pool = torch.empty(
-            memory_size, dtype=torch.int8, device=f"cuda:{base_gpu_id}"
-        ).contiguous()
+    def __init__(
+        self,
+        memory_size,
+        recycle_interval,
+        base_gpu_id=None,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+        recycle_count: Optional[int] = None,
+    ):
+        if device is None:
+            device = "cuda" if base_gpu_id is None else f"cuda:{base_gpu_id}"
+        self.device = torch.device(device)
+        self.recycle_count = recycle_count
+        with torch.cuda.device(self.device):
+            self.memory_pool = torch.empty(
+                memory_size, dtype=torch.int8, device=self.device
+            ).contiguous()
         storage = self.memory_pool.untyped_storage()
         self._pool_ipc_handle = storage._share_cuda_()
         self._pool_device_index = self.memory_pool.device.index
@@ -225,16 +256,34 @@ class MmItemMemoryPool:
         return None
 
     def return_a_slice_tensor_with_flag(self, src_tensor: torch.Tensor):
+        sync_flag, slice_tensor, chunk = self.return_a_slice_tensor_with_flag_and_chunk(
+            src_tensor
+        )
+        return (
+            sync_flag,
+            slice_tensor,
+            chunk.start if chunk is not None else None,
+        )
+
+    def return_a_slice_tensor_with_flag_and_chunk(self, src_tensor: torch.Tensor):
         with self._lock:
             available_chunk = self.get_available_chunk(src_tensor)
             if available_chunk is not None:
                 return (
                     available_chunk.sync_flag.meta_data,
                     self.memory_pool[available_chunk.start : available_chunk.end],
-                    available_chunk.start,
+                    available_chunk,
                 )
         self._warn_pool_full_once(src_tensor)
         return None, None, None
+
+    def recycle_unconsumed_chunk(self, chunk: MmItemMemoryChunk):
+        chunk.sync_flag.buffer_wrapper *= 0.0
+        with self._lock:
+            if chunk in self.occupied_chunks:
+                self.occupied_chunks.remove(chunk)
+            self.available_chunks.append(chunk)
+            self.merge_chunks()
 
     def _warn_pool_full_once(self, src_tensor: torch.Tensor):
         if self._pool_full_warned:
@@ -256,7 +305,7 @@ class MmItemMemoryPool:
 
         new_occupied_chunks = []
         for chunk in self.occupied_chunks:
-            if chunk.try_to_recycle():
+            if chunk.try_to_recycle(self.recycle_count):
                 self.available_chunks.append(chunk)
             else:
                 new_occupied_chunks.append(chunk)
@@ -283,6 +332,58 @@ class MmItemMemoryPool:
         self.available_chunks = merged_chunks
 
 
+class MmItemMemoryPoolGroup:
+    """One CUDA IPC source pool per TP rank/device."""
+
+    def __init__(self, memory_size, recycle_interval, tp_size: Optional[int] = None):
+        if tp_size is None:
+            try:
+                tp_size = get_server_args().tp_size
+            except Exception:
+                tp_size = torch.cuda.device_count()
+        if tp_size > torch.cuda.device_count():
+            raise RuntimeError(
+                f"tp_size={tp_size} exceeds cuda device count={torch.cuda.device_count()}"
+            )
+        self.pools = {
+            device_idx: MmItemMemoryPool(
+                memory_size,
+                recycle_interval,
+                device=torch.device(f"cuda:{device_idx}"),
+                recycle_count=1,
+            )
+            for device_idx in range(tp_size)
+        }
+
+    def return_slices_with_flags(self, src_tensor: torch.Tensor):
+        allocated = []
+        sync_flags: Dict[int, dict] = {}
+        slice_tensors: Dict[int, torch.Tensor] = {}
+        src_bytes = src_tensor.view(torch.int8).view(-1)
+
+        for device_idx, pool in self.pools.items():
+            sync_flag, slice_tensor, chunk = (
+                pool.return_a_slice_tensor_with_flag_and_chunk(src_tensor)
+            )
+            if not isinstance(slice_tensor, torch.Tensor):
+                for allocated_pool, allocated_chunk in allocated:
+                    allocated_pool.recycle_unconsumed_chunk(allocated_chunk)
+                return None, None
+            try:
+                slice_tensor.copy_(src_bytes)
+                torch.cuda.synchronize(slice_tensor.device)
+            except Exception:
+                pool.recycle_unconsumed_chunk(chunk)
+                for allocated_pool, allocated_chunk in allocated:
+                    allocated_pool.recycle_unconsumed_chunk(allocated_chunk)
+                raise
+            allocated.append((pool, chunk))
+            sync_flags[device_idx] = sync_flag
+            slice_tensors[device_idx] = slice_tensor
+
+        return sync_flags, slice_tensors
+
+
 class CudaIpcTensorTransportProxy:
     """
     A torch.tensor's proxy used to do inter-process data-sharing
@@ -294,7 +395,7 @@ class CudaIpcTensorTransportProxy:
 
     def __init__(
         self,
-        data: torch.Tensor,
+        data: Union[torch.Tensor, Dict[int, torch.Tensor]],
         info_data: torch.Tensor,
         sync_buffer_meta,
         pool_ipc_handle=None,
@@ -302,14 +403,33 @@ class CudaIpcTensorTransportProxy:
         pool_device_index: int = 0,
     ):
 
-        if (not isinstance(data, torch.Tensor)) or (
+        if (not isinstance(data, (torch.Tensor, dict))) or (
             not isinstance(info_data, torch.Tensor)
         ):
             raise TypeError(
-                f"Input 'data' must be a torch.Tensor, but got {type(data)}"
+                "Input 'data' must be a torch.Tensor or dict[int, torch.Tensor], "
+                f"but got {type(data)}"
             )
 
-        if pool_ipc_handle is not None:
+        if isinstance(data, dict):
+            ipc_extra_by_device = {}
+            for device_idx, tensor in data.items():
+                state = self.get_proxy_state(tensor, info_data)
+                if state["ipc_extra"] is None:
+                    self.proxy_state = {
+                        "ipc_extra": None,
+                        "ipc_extra_by_device": None,
+                        "tensor_data": info_data,
+                    }
+                    break
+                ipc_extra_by_device[device_idx] = state["ipc_extra"]
+            else:
+                self.proxy_state = {
+                    "ipc_extra": None,
+                    "ipc_extra_by_device": ipc_extra_by_device,
+                    "tensor_data": None,
+                }
+        elif pool_ipc_handle is not None:
             self.proxy_state = {
                 "ipc_extra": {
                     "pool_handle": pool_ipc_handle,
@@ -333,12 +453,15 @@ class CudaIpcTensorTransportProxy:
 
     @property
     def get_sync_flag(self):
+        return self.get_sync_flag_from_meta(self.sync_data_meta)
+
+    def get_sync_flag_from_meta(self, sync_data_meta):
         if not self.sync_buffer:
-            shm_name = self.sync_data_meta["handle"]
+            shm_name = sync_data_meta["handle"]
             self.sync_buffer = shared_memory.SharedMemory(name=shm_name)
 
-        shape = self.sync_data_meta["shape"]
-        dtype = self.sync_data_meta["dtype"]
+        shape = sync_data_meta["shape"]
+        dtype = sync_data_meta["dtype"]
         return np.ndarray(shape, dtype=dtype, buffer=self.sync_buffer.buf)
 
     def close_shm(self):
@@ -410,6 +533,7 @@ class CudaIpcTensorTransportProxy:
         rebuild_device: torch.device,
         recons_shape,
         recons_dtype,
+        sync_data_meta=None,
     ):
         with torch.cuda.device(rebuild_device):
             reconstructed_tensor = torch.empty(
@@ -421,7 +545,9 @@ class CudaIpcTensorTransportProxy:
             # write the shm_sync_buffer with a file lock
             with open(SHM_LOCK_FILE, "w+") as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
-                sync_flag = self.get_sync_flag
+                sync_flag = self.get_sync_flag_from_meta(
+                    sync_data_meta or self.sync_data_meta
+                )
                 sync_flag += 1
                 fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -437,8 +563,24 @@ class CudaIpcTensorTransportProxy:
         ):
             return self.reconstruct_tensor
 
-        if self.proxy_state["ipc_extra"]:
-            ipc_extra = self.proxy_state["ipc_extra"]
+        ipc_extra_by_device = self.proxy_state.get("ipc_extra_by_device")
+        if ipc_extra_by_device:
+            ipc_extra = ipc_extra_by_device.get(rebuild_device_idx)
+            if ipc_extra is None:
+                ipc_extra = ipc_extra_by_device.get(str(rebuild_device_idx))
+            if ipc_extra is None:
+                raise RuntimeError(
+                    f"Cannot find CUDA IPC source pool for device {rebuild_device_idx}"
+                )
+            sync_data_meta = self.sync_data_meta.get(
+                rebuild_device_idx,
+                self.sync_data_meta.get(str(rebuild_device_idx)),
+            )
+        else:
+            ipc_extra = self.proxy_state.get("ipc_extra")
+            sync_data_meta = self.sync_data_meta
+
+        if ipc_extra:
             recons_shape = ipc_extra["recons_shape"]
             recons_dtype = ipc_extra["recons_dtype"]
 
@@ -501,9 +643,13 @@ class CudaIpcTensorTransportProxy:
                     raise
 
             reconstructed_tensor = self._copy_slice_tensor_to_target(
-                slice_tensor, rebuild_device, recons_shape, recons_dtype
+                slice_tensor,
+                rebuild_device,
+                recons_shape,
+                recons_dtype,
+                sync_data_meta,
             )
-        elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
+        elif isinstance(self.proxy_state.get("tensor_data"), torch.Tensor):
             reconstructed_tensor = self.proxy_state["tensor_data"].to(
                 rebuild_device, non_blocking=True
             )

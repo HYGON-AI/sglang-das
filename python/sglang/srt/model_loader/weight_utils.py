@@ -256,6 +256,9 @@ def get_quant_config(
     if hf_quant_config is None:
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+    # kimi_k26 等多模态模型可能把 compression_config 放在 text_config 里
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = getattr(hf_text_config, "compression_config", None)
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
@@ -1003,7 +1006,14 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # Use the local device sglang already assigned to this worker instead of the
+    # global rank: on node>0 (e.g. TP8.PP2 / TP16 across 2 nodes) the global rank
+    # is 8..15 but each node only has 8 cards (0..7), so `cuda:{rank}` yields an
+    # "invalid device ordinal" and multi-node loading crashes. current_device() is
+    # numerically transparent (device only decides which physical card holds the
+    # tensor; file reading / sharding / broadcast are driven by the process group)
+    # and reduces to the same value on single node. Matches vLLM PR #34070.
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
@@ -1030,8 +1040,9 @@ def fastsafetensors_weights_iterator(
                 for k in keys:
                     t = fb.get_tensor(k)
                     yield k, t
+                    del t
             finally:
-                pass
+                fb.close()
         finally:
             loader.close()
 
