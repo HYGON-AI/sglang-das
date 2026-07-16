@@ -48,8 +48,10 @@ is complete.
 
 Target branches:
 
-- `v0.5.12_dev`: stable delivery branch. It continues to receive current business fixes.
-- `main`: internal trunk after the C01-C19 bootstrap lands. Official catch-up and future architecture work target this branch first.
+- `v0.5.12_dev`: historical delivery source after its required changes were forward-ported; keep it for audit or emergency-only maintenance.
+- `main`: internal trunk for periodic exact-endpoint official sync and post-release forward-ports.
+- `v0.5.15.post1_dev`: active DCU debugging, optimization, stabilization, and release branch.
+- `forward-port/v0.5.12-dev-20260715`: completed five-step integration evidence; keep it until the landing is reviewed and archived.
 - `sync/official-main-bootstrap`: completed C01-C19 bootstrap integration branch; keep it as historical evidence.
 - `sync/official-main-Cxx-*`: historical short-lived branch for each bootstrap checkpoint or checkpoint group.
 - `sync/official-main-catchup-YYYYMMDD`: temporary branch for post-bootstrap official `main` catch-up until internal `main` reaches the current upstream head.
@@ -57,11 +59,12 @@ Target branches:
 
 Rules:
 
-- Do not freeze `v0.5.12_dev` during bootstrap.
-- Do not merge official checkpoints directly into `v0.5.12_dev`.
-- Delay broad `v0.5.12_dev` forward-porting until internal `main` catches up to current official `main` and the daily-sync lane is active.
+- Target active release development at `v0.5.15.post1_dev`.
+- Integrate official checkpoints only through short-lived branches created from `main`; never merge official main wholesale into the release branch.
+- Backport only release-required, dependency-complete main fixes through dedicated review branches.
+- After release, forward-port every required release-branch patch back to current `main` and record semantic equivalents instead of duplicating them.
 - Keep official catch-up/daily-sync work separate from DCU feature or bugfix PRs.
-- Do not rewrite public branch history and do not force-push `v0.5.12_dev` or `main`.
+- Do not rewrite public branch history or move published tags; never force-push `main` or `v0.5.15.post1_dev`.
 - Enable `git rerere` in the migration workspace to reuse repeated conflict resolutions.
 
 ## 3. Official Checkpoint Merge List
@@ -409,16 +412,17 @@ Validation:
 
 ## 8. Parallel Development Rules
 
-- Current delivery and emergency fixes may continue on `v0.5.12_dev` until retirement.
-- New architecture, new models, upstream adaptation, and official sync work target `main`.
+- Debugging, optimization, stabilization, and release fixes target `v0.5.15.post1_dev`.
+- Official sync, upstream adaptation, and future trunk architecture target `main`.
+- Backport a main fix into the release branch only when the active release requires it.
+- After release, forward-port release patches to current `main` in small dependency-related groups.
 - PR labels should include one of:
-  - `target: v0.5.12_dev`
+  - `target: v0.5.15.post1_dev`
   - `target: main`
   - `needs-forward-port`
   - `needs-backport`
   - `dcu-main-only`
-- Do not run broad `v0.5.12_dev` forward-port batches until internal `main` has caught up to current official `main` and entered daily sync.
-- After daily sync is active, forward-port still-relevant `v0.5.12_dev` commits in small, reviewable batches until `v0.5.12_dev` can be retired.
+  - `release: v0.5.15.post1`
 - Do not mix official catch-up/daily-sync merges and DCU feature work in one PR.
 - High-risk changes in attention, MoE, DeepEP, or sgl-kernel require main migration owner review.
 
@@ -432,7 +436,7 @@ Migration is complete when:
 - MoE, DeepEP, and DeepSeek V4 are at least covered in nightly with known issue tracking.
 - No unowned high-risk conflict remains in the conflict ledger.
 - Milestone tags exist for C01-C19.
-- Required `v0.5.12_dev` changes have been forward-ported after official catch-up, new development is main-first, and `v0.5.12_dev` is retired or in emergency-only maintenance.
+- Required `v0.5.12_dev` changes are on `main`, the active release branch is eventually forward-ported, and old delivery branches are retired or emergency-only.
 
 ## 10. Local Helper
 
@@ -445,12 +449,13 @@ python3 scripts/code_sync/dcu_main_migration.py next
 python3 scripts/code_sync/dcu_main_migration.py tag-message C01 --validation passed
 ```
 
-## 11. Active Forward-Port Phase (2026-07-15 CST)
+## 11. Completed v0.5.12_dev Forward-Port Phase (2026-07-15 CST)
 
 Official catch-up through the `v0.5.15.post1` main-equivalent endpoint is
-complete on internal `main@65f3bd9426e5`. The active worktree is now
-`/home/proj_sglang_open/sglang-das`, and the remaining delivery-branch work is
-being integrated on `forward-port/v0.5.12-dev-20260715`.
+complete at internal `main@65f3bd9426e5`. All required delivery-branch work
+was integrated on `forward-port/v0.5.12-dev-20260715` and landed on `main`
+through merge `98828d29049179e69d1be31a0163a9546497b9fd`.
+The active worktree remains `/home/proj_sglang_open/sglang-das`.
 
 The immutable old source is `/home/proj_dpsk-v4/sglang-das` at
 `v0.5.12_dev@5ec8531b096f`, with common base `d4c6831a107a`. Its 214-commit
@@ -495,5 +500,17 @@ Forward-port progress on 2026-07-15 CST:
 - The known empty-output/eight-zero-token result remains an explicitly
   non-blocking accuracy issue and is not reported as an accuracy pass.
 - All five immutable endpoints are now present as exact no-ff second parents on
-  `forward-port/v0.5.12-dev-20260715`. The branch is ready for migration-owner
-  review and remains separate from `main` until explicitly approved.
+  `forward-port/v0.5.12-dev-20260715`; the complete branch was owner-validated
+  for service startup and merged to `main` as `98828d290491`.
+
+## 12. Active v0.5.15.post1_dev Release Phase (2026-07-16 CST)
+
+Active debugging, optimization, stabilization, and release work moves to
+`v0.5.15.post1_dev`, cut from the post-forward-port `main`. Periodic official
+sync continues independently on `main`; only explicitly required main fixes
+are selectively backported into the release branch. After release, every
+required release patch is forward-ported back to current `main`.
+
+The detailed branch roles, validation limits, patch tracking, tag immutability,
+release gates, and post-release forward-port workflow are maintained in
+`docs/internal/dcu-v0.5.15-post1-dev-plan.md`.

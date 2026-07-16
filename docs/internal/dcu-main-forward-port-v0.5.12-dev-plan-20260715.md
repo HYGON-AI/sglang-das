@@ -157,3 +157,24 @@ for health and generate. The known empty response with eight zero output IDs
 remains a non-blocking accuracy observation. Port 10015 was closed and the
 selected node returned to VRAM/HCU 0%. Detailed evidence is in the Step 5
 conflict review.
+
+## 6. Main landing and release-branch handoff
+
+- Owner validation confirmed that the complete forward-port branch starts the
+  target DeepSeek-V4 service normally.
+- `forward-port/v0.5.12-dev-20260715@f9665d122868` was merged with `--no-ff`
+  into `main` as `98828d29049179e69d1be31a0163a9546497b9fd`.
+- The merge preserves all five exact old endpoints as second-parent ancestry;
+  the completed integration branch remains historical review evidence.
+- The existing public annotated tag `v0.5.15.post1` remains at
+  `65f3bd9426e51df40987516acd075b646b858cf6`. It records the official
+  main-equivalent release point and is not rewritten to the later forward-port
+  landing.
+- Active debugging, optimization, stabilization, and release work moves to
+  `v0.5.15.post1_dev`, cut from post-landing `main`.
+- Official sync continues on `main`. After the release, every required
+  `v0.5.15.post1_dev` patch is forward-ported to current `main`; semantic
+  equivalents are recorded and skipped rather than duplicated.
+
+The active workflow is maintained in
+`docs/internal/dcu-v0.5.15-post1-dev-plan.md`.
