@@ -76,6 +76,7 @@ class MMMUVLMEval(Eval):
         seed: int = 42,
         response_answer_regex: str = None,
         dataset_path: Optional[str] = None,
+        direct_answer_prompt: bool = False,
     ):
         """Create MMMU VLM eval (Math subset, 100 fixed samples by default)."""
         self.num_examples = num_examples
@@ -84,6 +85,7 @@ class MMMUVLMEval(Eval):
         self.dataset_path = dataset_path or os.environ.get(
             "SGLANG_HCU_MMMU_DATASET_PATH"
         )
+        self.direct_answer_prompt = direct_answer_prompt
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)
         # For example, "<\|begin_of_box\|>foo<\|end_of_box\|>" could be used to extract "foo" as the answer from the response text
@@ -186,13 +188,21 @@ class MMMUVLMEval(Eval):
                 letters = [chr(ord("A") + i) for i in range(len(options))]
                 for letter, opt in zip(letters, options):
                     prompt_text += f"{letter}. {opt}\n"
-                prompt_text += (
-                    "\nAnswer the following multiple-choice question. "
-                    "The last line of your response should be of the "
-                    "following format: 'Answer: $LETTER' (without quotes) "
-                    "where LETTER is one of the options. "
-                    "Think step by step before answering."
-                )
+                if self.direct_answer_prompt:
+                    prompt_text += (
+                        "\nAnswer the following multiple-choice question. "
+                        "Respond with only the option letter in the format "
+                        "'Answer: $LETTER' (without quotes), where LETTER is "
+                        "one of the options."
+                    )
+                else:
+                    prompt_text += (
+                        "\nAnswer the following multiple-choice question. "
+                        "The last line of your response should be of the "
+                        "following format: 'Answer: $LETTER' (without quotes) "
+                        "where LETTER is one of the options. "
+                        "Think step by step before answering."
+                    )
             else:
                 prompt_text += "\nAnswer: "
 

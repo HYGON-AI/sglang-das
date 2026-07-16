@@ -31,7 +31,7 @@ register_hcu_ci(
 )
 
 
-COOKBOOK_MMLU_MIN_SCORE = {"Qwen3-32B": 0.80}
+COOKBOOK_MMLU_MIN_SCORE = {"Qwen3-32B": 0.83}
 
 
 class TestCookbookTextMMLUEvalHCU(unittest.TestCase):

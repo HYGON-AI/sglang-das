@@ -22,7 +22,10 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.run_eval import run_eval_once
-from sglang.test.simple_eval_common import set_ulimit
+from sglang.test.simple_eval_common import (
+    QUERY_TEMPLATE_MULTICHOICE_NO_COT,
+    set_ulimit,
+)
 from sglang.test.simple_eval_mmlu import MMLUEval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -96,9 +99,9 @@ class TestBW1100MMLUEvalHCU(unittest.TestCase):
         cls.model = _get_model_env(
             "SGLANG_HCU_MMLU_MODEL", DEFAULT_HCU_MMLU_MODEL
         )
-        cls.threshold = _get_float_env("SGLANG_HCU_MMLU_THRESHOLD", 0.68)
+        cls.threshold = _get_float_env("SGLANG_HCU_MMLU_THRESHOLD", 0.72)
         cls.num_examples = _get_int_env_with_fallback(
-            "SGLANG_HCU_MMLU_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 50
+            "SGLANG_HCU_MMLU_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 100
         )
         cls.num_threads = _get_int_env("SGLANG_HCU_MMLU_NUM_THREADS", 256)
         cls.dataset_path = _get_dataset_path_env(
@@ -125,7 +128,10 @@ class TestBW1100MMLUEvalHCU(unittest.TestCase):
             os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
             base_url = f"{self.base_url}/v1"
             eval_obj = MMLUEval(
-                self.dataset_path, self.num_examples, self.num_threads
+                self.dataset_path,
+                self.num_examples,
+                self.num_threads,
+                query_template=QUERY_TEMPLATE_MULTICHOICE_NO_COT,
             )
             args = SimpleNamespace(
                 base_url=self.base_url,
@@ -133,6 +139,7 @@ class TestBW1100MMLUEvalHCU(unittest.TestCase):
                 eval_name="mmlu",
                 num_examples=self.num_examples,
                 num_threads=self.num_threads,
+                max_tokens=64,
             )
             result, latency, sampler = run_eval_once(args, base_url, eval_obj)
             metrics = result.metrics | {"score": result.score, "latency": latency}

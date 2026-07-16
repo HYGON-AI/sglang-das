@@ -32,8 +32,8 @@ register_hcu_ci(
 
 
 COOKBOOK_MMMU_MIN_SCORE = {
-    "Qwen3-VL-4B-Instruct": 0.25,
-    "Qwen3-VL-32B-Instruct": 0.23,
+    "Qwen3-VL-4B-Instruct": 0.40,
+    "Qwen3-VL-32B-Instruct": 0.43,
 }
 
 

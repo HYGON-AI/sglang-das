@@ -21,7 +21,7 @@ register_hcu_ci(
     nightly=True,
 )
 
-DEFAULT_ACCURACY_THRESHOLD = 0.80
+DEFAULT_ACCURACY_THRESHOLD = 0.92
 
 
 class TestKimiK26EvalHCU(unittest.TestCase):
@@ -34,7 +34,7 @@ class TestKimiK26EvalHCU(unittest.TestCase):
         )
         parallel = int(
             os.environ.get(
-                "SGLANG_HCU_KIMI_K26_GSM8K_PARALLEL", str(num_questions)
+                "SGLANG_HCU_KIMI_K26_GSM8K_PARALLEL", "256"
             )
         )
         threshold = float(

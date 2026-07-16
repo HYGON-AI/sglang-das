@@ -159,10 +159,9 @@ class HCULocalParquetMMMUEval(MMMUVLMEval):
                     prompt_text += f"{letter}. {opt}\n"
                 prompt_text += (
                     "\nAnswer the following multiple-choice question. "
-                    "The last line of your response should be of the "
-                    "following format: 'Answer: $LETTER' (without quotes) "
-                    "where LETTER is one of the options. "
-                    "Think step by step before answering."
+                    "Respond with only the option letter in the format "
+                    "'Answer: $LETTER' (without quotes), where LETTER is one "
+                    "of the options."
                 )
             else:
                 prompt_text += "\nAnswer: "
@@ -270,7 +269,7 @@ class TestBW1100MMMUEvalHCU(unittest.TestCase):
         cls.latency_threshold = _get_float_env("SGLANG_HCU_MMMU_LATENCY_THRESHOLD", 1e9)
         cls.num_examples = _get_int_env("SGLANG_HCU_MMMU_NUM_EXAMPLES", 100)
         cls.num_threads = _get_int_env("SGLANG_HCU_MMMU_NUM_THREADS", 4)
-        cls.max_tokens = _get_int_env("SGLANG_HCU_MMMU_MAX_TOKENS", 30)
+        cls.max_tokens = _get_int_env("SGLANG_HCU_MMMU_MAX_TOKENS", 64)
         cls.dataset_path = _get_dataset_path_env("SGLANG_HCU_MMMU_DATASET_PATH")
         cls.base_url = DEFAULT_URL_FOR_TEST
 

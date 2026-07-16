@@ -252,6 +252,17 @@ C) {C}
 D) {D}
 """.strip()
 
+QUERY_TEMPLATE_MULTICHOICE_NO_COT = """
+Answer the following multiple choice question. Respond with only the final answer in the format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD.
+
+{Question}
+
+A) {A}
+B) {B}
+C) {C}
+D) {D}
+""".strip()
+
 ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
 
@@ -331,8 +342,8 @@ HTML_JINJA = """
 """
 
 
-def format_multichoice_question(row):
-    return QUERY_TEMPLATE_MULTICHOICE.format(**row)
+def format_multichoice_question(row, query_template: str = QUERY_TEMPLATE_MULTICHOICE):
+    return query_template.format(**row)
 
 
 def check_equality(sampler: SamplerBase, expr1: str, expr2: str):

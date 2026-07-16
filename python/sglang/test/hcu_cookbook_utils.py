@@ -1180,6 +1180,7 @@ def run_cookbook_accuracy_eval(
                 "gsm8k_data_path": gsm8k_data_path,
                 "dataset_path": dataset_path,
                 "response_answer_regex": None,
+                "direct_answer_prompt": eval_name == "mmmu",
                 "return_latency": False,
                 **config.eval_kwargs,
             }

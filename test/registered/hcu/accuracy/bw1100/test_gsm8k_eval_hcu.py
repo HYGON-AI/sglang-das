@@ -95,9 +95,9 @@ class TestBW1100GSM8KEvalHCU(unittest.TestCase):
         cls.model = _get_model_env(
             "SGLANG_HCU_GSM8K_MODEL", DEFAULT_HCU_GSM8K_MODEL
         )
-        cls.threshold = _get_float_env("SGLANG_HCU_GSM8K_THRESHOLD", 0.65)
+        cls.threshold = _get_float_env("SGLANG_HCU_GSM8K_THRESHOLD", 0.88)
         cls.num_examples = _get_int_env_with_fallback(
-            "SGLANG_HCU_GSM8K_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 10
+            "SGLANG_HCU_GSM8K_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 100
         )
         cls.num_threads = _get_int_env("SGLANG_HCU_GSM8K_NUM_THREADS", 128)
         cls.num_shots = _get_int_env("SGLANG_HCU_GSM8K_NUM_SHOTS", 5)
@@ -125,9 +125,11 @@ class TestBW1100GSM8KEvalHCU(unittest.TestCase):
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="gsm8k",
+                api="completion",
                 num_examples=self.num_examples,
                 num_threads=self.num_threads,
                 num_shots=self.num_shots,
+                max_tokens=512,
                 gsm8k_data_path=self.data_path,
             )
             metrics = run_eval(args)
