@@ -15,9 +15,6 @@
 from typing import Iterable, Optional, Tuple
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
@@ -28,6 +25,10 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -40,18 +41,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.eplb.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -69,14 +64,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import LazyValue
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, make_layers
+from sglang.srt.utils.common import LazyValue
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
+from transformers import PretrainedConfig
 
 _is_dcu = is_dcu()
 _use_fused_hunyuan_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
@@ -180,9 +176,9 @@ class HYV3MoEFused(nn.Module):
         #     quant_config=quant_config,
         #     prefix=f"{prefix}.experts",
         # )
-        
-        experts_cls = get_moe_impl_class(quant_config)        
-        self.experts = experts_cls(        
+
+        experts_cls = get_moe_impl_class(quant_config)
+        self.experts = experts_cls(
             num_experts=self.n_routed_experts
             + get_global_server_args().ep_num_redundant_experts,
             top_k=top_k,
@@ -853,7 +849,7 @@ class HYV3ForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             self.logits_processor = LogitsProcessor(config)
         else:
-            self.logits_processor = PPMissingLayer()        
+            self.logits_processor = PPMissingLayer()
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
@@ -861,9 +857,10 @@ class HYV3ForCausalLM(nn.Module):
                 if isinstance(layer.mlp, HYV3MoEFused)
             }
         )
+
     @property
     def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value        
+        return self._routed_experts_weights_of_layer.value
 
     @torch.no_grad()
     def forward(
