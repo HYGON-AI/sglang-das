@@ -20,7 +20,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,9 +35,24 @@ from sglang.test.hcu_utils import (
 )
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import popen_launch_server
-from sglang.utils import download_and_cache_file, read_jsonl
+from sglang.utils import read_jsonl
 
 HCU_COOKBOOK_API_KEY = "sk-123456"
+DEFAULT_HCU_GSM8K_DATA_PATH = (
+    "/public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl"
+)
+DEFAULT_HCU_MMLU_DATASET_PATH = (
+    "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
+)
+
+
+def _require_local_data_path(path: str, dataset_name: str) -> str:
+    if not Path(path).exists():
+        raise AssertionError(
+            f"Local {dataset_name} data path does not exist: {path}. "
+            "Mount the HCU dataset directory or set the corresponding data path env."
+        )
+    return path
 
 QWEN3_COOKBOOK_ENV = {
     "SGLANG_ENABLE_SPEC_V2": "1",
@@ -721,14 +736,6 @@ GLM51_CHANNEL_INT8_8GPU = HcuCookbookModelConfig(
     server_args=_glm51_args("w8a8_int8"),
 )
 
-# GLM-5-Channel-INT8-w8a8 is not installed on the HCU CI runner.  Reuse the
-# available GLM-5.1 Channel INT8 checkpoint as its smoke/accuracy substitute.
-GLM5_CHANNEL_INT8_SUBSTITUTE_8GPU = replace(
-    GLM51_CHANNEL_INT8_8GPU,
-    name="GLM-5-Channel-INT8-w8a8 (GLM-5.1 substitute)",
-    env_name="SGLANG_HCU_GLM5_CHANNEL_INT8_MODEL",
-)
-
 DEEPSEEK_V32_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
     name="DeepSeek-V3.2-Channel-FP8",
     env_name="SGLANG_HCU_DEEPSEEK_V32_CHANNEL_FP8_MODEL",
@@ -743,7 +750,7 @@ DEEPSEEK_V32_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
 DEEPSEEK_V32_CHANNEL_INT8_8GPU = HcuCookbookModelConfig(
     name="DeepSeek-V3.2-Channel-INT8",
     env_name="SGLANG_HCU_DEEPSEEK_V32_CHANNEL_INT8_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/deepseek-v3.2/vllm-w8a8-models/DeepSeek-V3.2-Channel-INT8",
+    default_path="/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/DeepSeek-V3.2-Channel-INT8",
     tp_size=8,
     timeout=7200,
     dtype_or_quant="w8a8_int8",
@@ -809,7 +816,7 @@ QWEN3_VL_4B_INSTRUCT = HcuCookbookModelConfig(
 GLM41V_9B_THINKING = HcuCookbookModelConfig(
     name="GLM-4.1V-9B-Thinking",
     env_name="SGLANG_HCU_GLM41V_9B_THINKING_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/glm4/GLM-4.1V-9B-Thinking",
+    default_path="/public/opendas/DL_DATA/llm-models/GLM-4.1V-9B-Thinking",
     tp_size=1,
     timeout=3600,
     dtype_or_quant="bf16",
@@ -844,8 +851,8 @@ QWEN3_4GPU_PERF_MODELS = [QWEN3_30B_A3B_4GPU, QWEN3_32B_4GPU]
 QWEN3_4GPU_QUANT_MODELS = [QWEN3_30B_A3B_W8A8_4GPU]
 QWEN36_2GPU_MODELS = [QWEN36_27B_2GPU, QWEN36_35B_A3B_2GPU]
 QWEN35_4GPU_MODELS = [QWEN35_397B_A17B_CHANNEL_FP8_4GPU]
-GLM5_8GPU_MODELS = [GLM5_CHANNEL_INT8_SUBSTITUTE_8GPU]
 GLM51_8GPU_MODELS = [GLM51_CHANNEL_FP8_8GPU]
+GLM51_8GPU_INT8_MODELS = [GLM51_CHANNEL_INT8_8GPU]
 GLM51_8GPU_PERF_MODELS = [GLM51_CHANNEL_FP8_8GPU]
 DEEPSEEK_V32_8GPU_MODELS = [
     DEEPSEEK_V32_CHANNEL_FP8_8GPU,
@@ -1140,6 +1147,9 @@ def run_cookbook_accuracy_eval(
         dataset_path = os.environ.get(
             "SGLANG_HCU_COOKBOOK_MMLU_DATASET_PATH"
         ) or os.environ.get("SGLANG_HCU_MMLU_DATASET_PATH")
+        dataset_path = _require_local_data_path(
+            dataset_path or DEFAULT_HCU_MMLU_DATASET_PATH, "MMLU"
+        )
     elif eval_name == "mmmu":
         dataset_path = os.environ.get(
             "SGLANG_HCU_COOKBOOK_MMMU_DATASET_PATH"
@@ -1148,6 +1158,9 @@ def run_cookbook_accuracy_eval(
         gsm8k_data_path = os.environ.get(
             "SGLANG_HCU_COOKBOOK_GSM8K_DATA_PATH"
         ) or os.environ.get("SGLANG_HCU_GSM8K_DATA_PATH")
+        gsm8k_data_path = _require_local_data_path(
+            gsm8k_data_path or DEFAULT_HCU_GSM8K_DATA_PATH, "GSM8K"
+        )
 
     os.environ["OPENAI_API_KEY"] = HCU_COOKBOOK_API_KEY
     with CookbookServer(config, base_url) as server:
@@ -1189,10 +1202,6 @@ def run_cookbook_accuracy_eval(
     return metrics
 
 
-GSM8K_TEST_URL = (
-    "https://raw.githubusercontent.com/openai/grade-school-math/"
-    "master/grade_school_math/data/test.jsonl"
-)
 INVALID_GSM8K_ANSWER = -9999999
 
 
@@ -1226,8 +1235,9 @@ def run_gsm8k_completion_benchmark(
     data_path = (
         os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_DATA_PATH")
         or os.environ.get("SGLANG_HCU_GSM8K_DATA_PATH")
-        or download_and_cache_file(GSM8K_TEST_URL)
+        or DEFAULT_HCU_GSM8K_DATA_PATH
     )
+    data_path = _require_local_data_path(data_path, "GSM8K")
     lines = list(read_jsonl(data_path))
     if num_shots + num_questions > len(lines):
         raise AssertionError(

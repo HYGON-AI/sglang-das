@@ -30,8 +30,13 @@ from sglang.test.test_utils import (
 register_hcu_ci(est_time=900, suite="nightly-hcu-api-models", nightly=True)
 
 DEFAULT_QWEN3_4B_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-4B"
-DEFAULT_QWEN3_LORA_1 = "nissenj/Qwen3-4B-lora-v2"
-DEFAULT_QWEN3_LORA_2 = "TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0"
+DEFAULT_QWEN3_LORA_1 = (
+    "/public/opendas/DL_DATA/llm-models/lora/nissenj/Qwen3-4B-lora-v2"
+)
+DEFAULT_QWEN3_LORA_2 = (
+    "/public/opendas/DL_DATA/llm-models/lora/TanXS/"
+    "Qwen3-4B-LoRA-ZH-WebNovelty-v0.0"
+)
 
 
 def _default_lora_args() -> list[str]:

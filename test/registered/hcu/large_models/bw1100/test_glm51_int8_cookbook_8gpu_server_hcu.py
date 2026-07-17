@@ -16,7 +16,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_cookbook_utils import (
-    GLM5_8GPU_MODELS,
+    GLM51_8GPU_INT8_MODELS,
     CookbookServer,
     selected_configs,
 )
@@ -29,12 +29,10 @@ register_hcu_ci(
 )
 
 
-class TestGlm5Cookbook8GpuServerHCU(unittest.TestCase):
-    def test_glm5_cookbook_8gpu_chat(self):
-        # GLM5_8GPU_MODELS intentionally contains the available GLM-5.1
-        # Channel INT8 checkpoint as the GLM-5 Channel INT8 substitute.
+class TestGlm51Int8Cookbook8GpuServerHCU(unittest.TestCase):
+    def test_glm51_int8_cookbook_8gpu_chat(self):
         configs = selected_configs(
-            GLM5_8GPU_MODELS, "SGLANG_HCU_GLM5_8GPU_MODEL_FILTER"
+            GLM51_8GPU_INT8_MODELS, "SGLANG_HCU_GLM51_INT8_8GPU_MODEL_FILTER"
         )
         for config in configs:
             with self.subTest(model=config.name):

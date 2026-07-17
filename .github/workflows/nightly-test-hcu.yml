@@ -583,6 +583,7 @@ jobs:
             timeout_per_file: 4200
             timeout_minutes: 180
             include_files: ""
+            extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
           - name: accuracy-text-1
             group: nightly-hcu-accuracy-text
             suite: nightly-hcu-accuracy-text
@@ -592,6 +593,7 @@ jobs:
             timeout_per_file: 4200
             timeout_minutes: 180
             include_files: ""
+            extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
           - name: vlm
             group: nightly-hcu-vlm
             suite: nightly-hcu-vlm
@@ -809,6 +811,8 @@ jobs:
       HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
       HCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.HCU_CI_VISIBLE_DEVICES || '' }}
       HCU_MODEL_EXTRA_HOST_PATHS: ${{ matrix.extra_model_paths || '' }}
+      SGLANG_HCU_GSM8K_DATA_PATH: /public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl
+      SGLANG_HCU_MMLU_DATASET_PATH: /public/opendas/DL_DATA/llm-models/datasets/mmlu
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_CI_USE_INSTALLED_WHEELS: "1"
       HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp

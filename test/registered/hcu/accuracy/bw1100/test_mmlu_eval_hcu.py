@@ -25,7 +25,6 @@ from sglang.test.run_eval import run_eval_once
 from sglang.test.simple_eval_common import set_ulimit
 from sglang.test.simple_eval_mmlu import MMLUEval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_evaluation_test_results,
@@ -35,6 +34,12 @@ from sglang.test.test_utils import (
 
 register_hcu_ci(est_time=3600, suite="nightly-hcu-accuracy-text", nightly=True)
 
+DEFAULT_HCU_MMLU_MODEL = (
+    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+)
+DEFAULT_HCU_MMLU_DATASET_PATH = (
+    "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
+)
 DEFAULT_HCU_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
@@ -46,9 +51,6 @@ DEFAULT_HCU_SERVER_ARGS = [
     "warning",
     "--trust-remote-code",
 ]
-
-DEFAULT_HCU_MMLU_DATASET_PATH = ""
-
 
 def _get_int_env(name: str, default: int) -> int:
     value = os.environ.get(name)
@@ -74,14 +76,8 @@ def _get_model_env(name: str, default: str) -> str:
     return model
 
 
-def _get_optional_dataset_path_env(name: str) -> str | None:
-    value = os.environ.get(name)
-    if not value:
-        if DEFAULT_HCU_MMLU_DATASET_PATH and os.path.exists(
-            DEFAULT_HCU_MMLU_DATASET_PATH
-        ):
-            return DEFAULT_HCU_MMLU_DATASET_PATH
-        return None
+def _get_dataset_path_env(name: str, default: str) -> str:
+    value = os.environ.get(name, default)
     if not os.path.exists(value):
         raise AssertionError(f"{name} points to a missing path: {value}")
     return value
@@ -97,13 +93,17 @@ def _get_server_args_env(name: str) -> list[str]:
 class TestBW1100MMLUEvalHCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = _get_model_env("SGLANG_HCU_MMLU_MODEL", DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = _get_model_env(
+            "SGLANG_HCU_MMLU_MODEL", DEFAULT_HCU_MMLU_MODEL
+        )
         cls.threshold = _get_float_env("SGLANG_HCU_MMLU_THRESHOLD", 0.68)
         cls.num_examples = _get_int_env_with_fallback(
             "SGLANG_HCU_MMLU_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 50
         )
         cls.num_threads = _get_int_env("SGLANG_HCU_MMLU_NUM_THREADS", 256)
-        cls.dataset_path = _get_optional_dataset_path_env("SGLANG_HCU_MMLU_DATASET_PATH")
+        cls.dataset_path = _get_dataset_path_env(
+            "SGLANG_HCU_MMLU_DATASET_PATH", DEFAULT_HCU_MMLU_DATASET_PATH
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_mmlu(self):
@@ -124,11 +124,9 @@ class TestBW1100MMLUEvalHCU(unittest.TestCase):
             set_ulimit()
             os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
             base_url = f"{self.base_url}/v1"
-            dataset = (
-                self.dataset_path
-                or "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+            eval_obj = MMLUEval(
+                self.dataset_path, self.num_examples, self.num_threads
             )
-            eval_obj = MMLUEval(dataset, self.num_examples, self.num_threads)
             args = SimpleNamespace(
                 base_url=self.base_url,
                 model=self.model,

@@ -23,7 +23,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_evaluation_test_results,
@@ -33,6 +32,12 @@ from sglang.test.test_utils import (
 
 register_hcu_ci(est_time=3600, suite="nightly-hcu-accuracy-text", nightly=True)
 
+DEFAULT_HCU_GSM8K_MODEL = (
+    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+)
+DEFAULT_HCU_GSM8K_DATA_PATH = (
+    "/public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl"
+)
 DEFAULT_HCU_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
@@ -70,10 +75,8 @@ def _get_model_env(name: str, default: str) -> str:
     return model
 
 
-def _get_optional_path_env(name: str) -> str | None:
-    value = os.environ.get(name)
-    if not value:
-        return None
+def _get_data_path_env(name: str, default: str) -> str:
+    value = os.environ.get(name, default)
     if not os.path.exists(value):
         raise AssertionError(f"{name} points to a missing path: {value}")
     return value
@@ -89,14 +92,18 @@ def _get_server_args_env(name: str) -> list[str]:
 class TestBW1100GSM8KEvalHCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = _get_model_env("SGLANG_HCU_GSM8K_MODEL", DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = _get_model_env(
+            "SGLANG_HCU_GSM8K_MODEL", DEFAULT_HCU_GSM8K_MODEL
+        )
         cls.threshold = _get_float_env("SGLANG_HCU_GSM8K_THRESHOLD", 0.65)
         cls.num_examples = _get_int_env_with_fallback(
             "SGLANG_HCU_GSM8K_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 10
         )
         cls.num_threads = _get_int_env("SGLANG_HCU_GSM8K_NUM_THREADS", 128)
         cls.num_shots = _get_int_env("SGLANG_HCU_GSM8K_NUM_SHOTS", 5)
-        cls.data_path = _get_optional_path_env("SGLANG_HCU_GSM8K_DATA_PATH")
+        cls.data_path = _get_data_path_env(
+            "SGLANG_HCU_GSM8K_DATA_PATH", DEFAULT_HCU_GSM8K_DATA_PATH
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_gsm8k(self):

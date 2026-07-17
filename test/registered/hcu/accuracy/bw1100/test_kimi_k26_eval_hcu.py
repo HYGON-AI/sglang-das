@@ -9,7 +9,10 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.hcu_cookbook_utils import KIMI_K26_8GPU
+from sglang.test.hcu_cookbook_utils import (
+    DEFAULT_HCU_GSM8K_DATA_PATH,
+    KIMI_K26_8GPU,
+)
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
 register_hcu_ci(
@@ -43,7 +46,10 @@ class TestKimiK26EvalHCU(unittest.TestCase):
         data_path = (
             os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_DATA_PATH")
             or os.environ.get("SGLANG_HCU_GSM8K_DATA_PATH")
+            or DEFAULT_HCU_GSM8K_DATA_PATH
         )
+        if not os.path.isfile(data_path):
+            raise AssertionError(f"Local GSM8K data path does not exist: {data_path}")
         model_path = KIMI_K26_8GPU.resolve_model_path()
 
         process = popen_launch_server(
