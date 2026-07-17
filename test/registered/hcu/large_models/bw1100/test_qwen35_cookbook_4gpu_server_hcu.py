@@ -16,7 +16,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_cookbook_utils import (
-    GLM51_8GPU_MODELS,
+    QWEN35_4GPU_MODELS,
     CookbookServer,
     selected_configs,
 )
@@ -24,15 +24,15 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 register_hcu_ci(
     est_time=7200,
-    suite="nightly-hcu-large-model-8gpu",
+    suite="nightly-hcu-large-model-4gpu",
     nightly=True,
 )
 
 
-class TestGlm51Cookbook8GpuServerHCU(unittest.TestCase):
-    def test_glm51_cookbook_8gpu_chat(self):
+class TestQwen35Cookbook4GpuServerHCU(unittest.TestCase):
+    def test_qwen35_cookbook_4gpu_chat(self):
         configs = selected_configs(
-            GLM51_8GPU_MODELS, "SGLANG_HCU_GLM51_8GPU_MODEL_FILTER"
+            QWEN35_4GPU_MODELS, "SGLANG_HCU_QWEN35_4GPU_MODEL_FILTER"
         )
         for config in configs:
             with self.subTest(model=config.name):
