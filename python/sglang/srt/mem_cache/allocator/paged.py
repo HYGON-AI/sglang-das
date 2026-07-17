@@ -252,13 +252,19 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
         if self.sglang_kvalloc_kernel:
+            # The external HIP kernel's ABI declares last_loc_ptr as int32_t*,
+            # while SWA translation returns an int64 mapping tensor. Passing
+            # that tensor through directly makes request 1 read the high half
+            # of request 0's location. Preserve the kernel ABI at this boundary;
+            # this is a no-op for the regular int32 req_to_token path.
+            last_loc_i32 = last_loc.to(dtype=torch.int32, copy=False)
             dcu_alloc_decode_kernel(
-                seq_lens_ptr = seq_lens,
-                last_loc_ptr = last_loc,
-                free_page_ptr = self.free_pages,
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                seq_lens_ptr=seq_lens,
+                last_loc_ptr=last_loc_i32,
+                free_page_ptr=self.free_pages,
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
         else:
             alloc_decode_kernel[(bs,)](
