@@ -1,4 +1,4 @@
-name: HYGON PR Gate
+name: Quality Gate(test)
 
 on:
   pull_request:
@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   gate:
-    name: HYGON PR Gate
+    name: PR Checks
     uses: HYGON-AI/open-source-governance/.github/workflows/pr-quality-gate.yml@955da79f4888280f0eba01406e772b1500021c37
     permissions:
       contents: read
