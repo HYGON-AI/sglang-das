@@ -174,25 +174,56 @@ jobs:
           print("Encoding check passed.")
           PY
 
-  hcu-runtime-text-check:
-    name: hcu-runtime-text-check
+  check-sensitive-diff-text:
+    name: check-sensitive-diff-text
     needs: changed-files
-    if: ${{ false }}
+    if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
+    timeout-minutes: 5
 
     steps:
       - name: Checkout target commit
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Check HCU user-visible runtime text
+      - name: Resolve diff revisions
+        id: revisions
         shell: bash
-        env:
-          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
-          mapfile -t files < <(printf '%s\n' "$CHANGED_FILES")
-          python3 scripts/ci/hcu/check_hcu_runtime_text.py -- "${files[@]}"
+          set -euo pipefail
+
+          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            DIFF_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            if [ -z "$BASE_SHA" ] || echo "$BASE_SHA" | grep -Eq '^0+$'; then
+              if git rev-parse "$HEAD_SHA^" >/dev/null 2>&1; then
+                DIFF_BASE="$HEAD_SHA^"
+              else
+                DIFF_BASE="$(git hash-object -t tree /dev/null)"
+              fi
+            else
+              DIFF_BASE="$BASE_SHA"
+            fi
+          fi
+
+          echo "base=$DIFF_BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check sensitive fields in added diff content
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 scripts/ci/hcu/check_sensitive_diff_text.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --base "${{ steps.revisions.outputs.base }}" \
+            --head "${{ steps.revisions.outputs.head }}"
 
   secret-check:
     name: secret-check
@@ -698,6 +729,7 @@ jobs:
     needs:
       - changed-files
       - encoding-check
+      - check-sensitive-diff-text
       - secret-check
       - symlink-check
       - large-file-check
@@ -709,6 +741,7 @@ jobs:
       HAS_FILES: ${{ needs.changed-files.outputs.has_files }}
       CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
       ENCODING_RESULT: ${{ needs.encoding-check.result }}
+      SENSITIVE_DIFF_TEXT_RESULT: ${{ needs.check-sensitive-diff-text.result }}
       SECRET_RESULT: ${{ needs.secret-check.result }}
       SYMLINK_RESULT: ${{ needs.symlink-check.result }}
       LARGE_FILE_RESULT: ${{ needs.large-file-check.result }}
@@ -746,10 +779,12 @@ jobs:
 
           if [ "$HAS_FILES" = "true" ]; then
             require_success "encoding-check" "$ENCODING_RESULT"
+            require_success "check-sensitive-diff-text" "$SENSITIVE_DIFF_TEXT_RESULT"
             require_success "symlink-check" "$SYMLINK_RESULT"
             require_success "large-file-check" "$LARGE_FILE_RESULT"
           elif [ "$HAS_FILES" = "false" ]; then
             require_skipped "encoding-check" "$ENCODING_RESULT"
+            require_skipped "check-sensitive-diff-text" "$SENSITIVE_DIFF_TEXT_RESULT"
             require_skipped "symlink-check" "$SYMLINK_RESULT"
             require_skipped "large-file-check" "$LARGE_FILE_RESULT"
           else
