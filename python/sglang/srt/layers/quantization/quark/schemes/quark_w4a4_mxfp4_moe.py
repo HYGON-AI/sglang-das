@@ -71,6 +71,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
+                if _is_hcu:
+                    raise NotImplementedError(
+                        "Online MXFP4 quantization for MoE layers requires an HCU "
+                        "device with FP4 hardware support."
+                    )
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE layers requires an AMD ROCm "
                     "device with FP4 hardware support (gfx95x, e.g. MI355x)."
@@ -192,6 +197,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_id: int,
         ):
             if dynamic_mxfp4_quant is None:
+                if _is_hcu:
+                    raise NotImplementedError(
+                        "Online MXFP4 quantization for MoE is not supported on HCU devices."
+                    )
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE is only supported on AMD GPUs."
                 )

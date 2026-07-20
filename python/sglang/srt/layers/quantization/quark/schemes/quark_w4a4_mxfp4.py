@@ -172,6 +172,11 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
+                if _is_hcu:
+                    raise NotImplementedError(
+                        "Online MXFP4 quantization requires an HCU device with "
+                        "FP4 hardware support."
+                    )
                 raise NotImplementedError(
                     "Online MXFP4 quantization requires an AMD ROCm device with "
                     "FP4 hardware support (gfx95x, e.g. MI355x)."

@@ -2102,9 +2102,14 @@ def _dllm_attention_backend(view: Any) -> dict:
         return {}
     if is_hip():
         if view.attention_backend not in ["triton", "aiter"]:
-            logger.warning(
-                "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
-            )
+            if is_hcu():
+                logger.warning(
+                    "Attention backend is set to triton for diffusion LLM inference on HCU devices"
+                )
+            else:
+                logger.warning(
+                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                )
             return {"attention_backend": "triton"}
     elif is_npu():
         if view.attention_backend != "ascend":

@@ -55,6 +55,7 @@ from sglang.multimodal_gen.test.test_utils import (
     validate_openai_video,
     validate_video_file,
 )
+from sglang.srt.utils import is_hcu
 
 logger = init_logger(__name__)
 
@@ -544,14 +545,24 @@ class PerformanceValidator:
                 expected, amd_tolerance, min_abs_tolerance_ms
             )
             if actual > upper_bound:
-                logger.warning(
-                    f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
-                    f"  Actual:   {actual:.4f}ms\n"
-                    f"  Expected: {expected:.4f}ms\n"
-                    f"  AMD Limit: {upper_bound:.4f}ms "
-                    f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
-                    f"  Original tolerance was: {tolerance:.1%}"
-                )
+                if is_hcu():
+                    logger.warning(
+                        f"[HCU PERF WARNING] Validation would fail for '{name}'.\n"
+                        f"  Actual:   {actual:.4f}ms\n"
+                        f"  Expected: {expected:.4f}ms\n"
+                        f"  HCU Limit: {upper_bound:.4f}ms "
+                        f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
+                        f"  Original tolerance was: {tolerance:.1%}"
+                    )
+                else:
+                    logger.warning(
+                        f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
+                        f"  Actual:   {actual:.4f}ms\n"
+                        f"  Expected: {expected:.4f}ms\n"
+                        f"  AMD Limit: {upper_bound:.4f}ms "
+                        f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
+                        f"  Original tolerance was: {tolerance:.1%}"
+                    )
         else:
             upper_bound = calculate_upper_bound(
                 expected, tolerance, min_abs_tolerance_ms
@@ -972,13 +983,22 @@ def get_generate_fn(
                 return (video_id, b"")
 
             if is_amd:
-                logger.warning(
-                    f"[AMD TIMEOUT WARNING] {case_id}: video job {video_id} did not complete "
-                    f"within {timeout}s timeout. This may indicate performance issues on AMD."
-                )
-                pytest.skip(
-                    f"{case_id}: video job timed out on AMD after {timeout}s - skipping"
-                )
+                if is_hcu():
+                    logger.warning(
+                        f"[HCU TIMEOUT WARNING] {case_id}: video job {video_id} did not complete "
+                        f"within {timeout}s timeout. This may indicate performance issues on HCU."
+                    )
+                    pytest.skip(
+                        f"{case_id}: video job timed out on HCU after {timeout}s - skipping"
+                    )
+                else:
+                    logger.warning(
+                        f"[AMD TIMEOUT WARNING] {case_id}: video job {video_id} did not complete "
+                        f"within {timeout}s timeout. This may indicate performance issues on AMD."
+                    )
+                    pytest.skip(
+                        f"{case_id}: video job timed out on AMD after {timeout}s - skipping"
+                    )
 
             pytest.fail(f"{case_id}: video job {video_id} did not complete in time")
 

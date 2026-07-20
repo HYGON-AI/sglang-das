@@ -611,6 +611,10 @@ def get_amdgpu_memory_capacity():
         return min(memory_values)
 
     except FileNotFoundError:
+        if is_hcu():
+            raise RuntimeError(
+                "rocminfo not found. Ensure HCU ROCm-compatible drivers are installed and accessible."
+            )
         raise RuntimeError(
             "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
         )

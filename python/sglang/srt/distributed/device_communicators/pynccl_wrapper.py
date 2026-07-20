@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.distributed import ReduceOp
 
+from sglang.srt.utils import is_hcu
+
 logger = logging.getLogger(__name__)
 
 
@@ -358,17 +360,30 @@ class NCCLLibrary:
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:
-            logger.error(
-                "Failed to load NCCL library from %s . "
-                "It is expected if you are not running on NVIDIA/AMD/MTHREADS GPUs. "
-                "Otherwise, the nccl library might not exist, be corrupted "
-                "or it does not support the current platform %s. "
-                "If you already have the library, please set the "
-                "environment variable SGLANG_NCCL_SO_PATH"
-                " to point to the correct nccl library path.",
-                so_file,
-                platform.platform(),
-            )
+            if is_hcu():
+                logger.error(
+                    "Failed to load NCCL library from %s . "
+                    "It is expected if you are not running on NVIDIA/HCU/MTHREADS GPUs. "
+                    "Otherwise, the nccl library might not exist, be corrupted "
+                    "or it does not support the current platform %s. "
+                    "If you already have the library, please set the "
+                    "environment variable SGLANG_NCCL_SO_PATH"
+                    " to point to the correct nccl library path.",
+                    so_file,
+                    platform.platform(),
+                )
+            else:
+                logger.error(
+                    "Failed to load NCCL library from %s . "
+                    "It is expected if you are not running on NVIDIA/AMD/MTHREADS GPUs. "
+                    "Otherwise, the nccl library might not exist, be corrupted "
+                    "or it does not support the current platform %s. "
+                    "If you already have the library, please set the "
+                    "environment variable SGLANG_NCCL_SO_PATH"
+                    " to point to the correct nccl library path.",
+                    so_file,
+                    platform.platform(),
+                )
             raise e
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
