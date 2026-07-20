@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from contextlib import nullcontext
@@ -316,7 +317,10 @@ class DeepEPBuffer:
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
+        supports_use_fabric = (
+            "use_fabric" in inspect.signature(Buffer.__init__).parameters
+        )
+        if not is_cu12 and use_mnnvl_fabric and supports_use_fabric:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
