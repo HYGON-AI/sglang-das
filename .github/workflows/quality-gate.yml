@@ -1,16 +1,6 @@
-name: quality-gate
+name: Legacy Quality Gate
 
 on:
-  pull_request:
-    branches:
-      - main
-      - master
-      - v0.5.12_dev
-  push:
-    branches:
-      - main
-      - master
-      - v0.5.12_dev
   workflow_dispatch:
 
 permissions:
