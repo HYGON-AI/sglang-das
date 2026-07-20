@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 logger = logging.getLogger(__name__)
-FIX_I_STEP_PROTOCOL_VERSION = 2
-FIX_I_STEP_BUILD_ID = 2026071602
+DP_DECODE_STEP_PROTOCOL_VERSION = 2
+DP_DECODE_STEP_BUILD_ID = 2026071602
 
 
 
@@ -40,7 +40,7 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
 
-    # Fix I fields appended after the original six MLPSync values:
+    # Extra StepInfo fields after the original six MLPSync values:
     # [protocol, build_id, epoch, transfer, prealloc, retracted, running, paused,
     #  pd_elapsed_ms, pd_over_budget]
     scheduler_step_info: Optional[list[int]] = None
@@ -66,7 +66,7 @@ class MLPSyncBatchInfo:
         if self.scheduler_step_info is not None:
             if len(self.scheduler_step_info) != 10:
                 raise RuntimeError(
-                    "Fix I StepInfo must contain exactly 10 scheduler fields"
+                    "DP Decode StepInfo must contain exactly 10 scheduler fields"
                 )
             values.extend(self.scheduler_step_info)
         return torch.tensor(values, device=device, dtype=dtype)
@@ -91,13 +91,12 @@ class MLPSyncBatchInfo:
         actual_world = torch.distributed.get_world_size(group=group)
         if actual_world != expected_world:
             raise RuntimeError(
-                "Fix I scheduler group size mismatch: "
+                "DP Decode scheduler group size mismatch: "
                 f"actual={actual_world} expected={expected_world}"
             )
 
         if self.scheduler_step_info is not None and device == "cpu":
-            # Fix I uses list all_gather for compatibility with customized
-            # ROCm/DCU Gloo builds where _allgather_base may be unavailable.
+            # Use list all_gather for ROCm/DCU Gloo builds where _allgather_base may be unavailable.
             gathered = [
                 torch.empty_like(local_info_tensor)
                 for _ in range(actual_world)
@@ -134,30 +133,30 @@ class MLPSyncBatchInfo:
             builds = step_all[:, 1]
             epochs = step_all[:, 2]
             if (
-                int(versions.min().item()) != FIX_I_STEP_PROTOCOL_VERSION
-                or int(versions.max().item()) != FIX_I_STEP_PROTOCOL_VERSION
+                int(versions.min().item()) != DP_DECODE_STEP_PROTOCOL_VERSION
+                or int(versions.max().item()) != DP_DECODE_STEP_PROTOCOL_VERSION
             ):
                 raise RuntimeError(
-                    "Fix I StepInfo protocol mismatch across ranks: "
+                    "DP Decode StepInfo protocol mismatch across ranks: "
                     f"{versions.tolist()}"
                 )
             if (
-                int(builds.min().item()) != FIX_I_STEP_BUILD_ID
-                or int(builds.max().item()) != FIX_I_STEP_BUILD_ID
+                int(builds.min().item()) != DP_DECODE_STEP_BUILD_ID
+                or int(builds.max().item()) != DP_DECODE_STEP_BUILD_ID
             ):
                 raise RuntimeError(
-                    "Fix I StepInfo build mismatch across ranks: "
+                    "DP Decode StepInfo build mismatch across ranks: "
                     f"{builds.tolist()}"
                 )
             if int(epochs.min().item()) != int(epochs.max().item()):
                 raise RuntimeError(
-                    "Fix I scheduler epoch mismatch across ranks: "
+                    "DP Decode scheduler epoch mismatch across ranks: "
                     f"{epochs.tolist()}"
                 )
             paused = step_all[:, 7]
             if int(paused.min().item()) != int(paused.max().item()):
                 raise RuntimeError(
-                    "Fix I paused-state mismatch across ranks: "
+                    "DP Decode paused-state mismatch across ranks: "
                     f"{paused.tolist()}"
                 )
 
@@ -295,7 +294,7 @@ def prepare_mlp_sync_batch_raw(
 
     tbo_preparer = TboDPAttentionPreparer()
     if sync_group_override is not None:
-        # Fix I: scheduler metadata always uses its dedicated CPU communicator.
+        # Scheduler metadata always uses its dedicated CPU communicator.
         group = sync_group_override
         device = "cpu"
     elif len(offload_tags) == 0 and (
@@ -325,7 +324,7 @@ def prepare_mlp_sync_batch_raw(
 
     if scheduler_step_info is not None and skip_all_gather:
         raise RuntimeError(
-            "Fix I is incompatible with SGLANG_SCHEDULER_SKIP_ALL_GATHER"
+            "PD Decode DP sync is incompatible with SGLANG_SCHEDULER_SKIP_ALL_GATHER"
         )
 
     if not skip_all_gather:
@@ -357,8 +356,8 @@ def prepare_mlp_sync_batch_raw(
 
 class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
-        # Fix I: PD Decode folds scheduler epoch, queue observability and the
-        # original six MLPSync fields into one fixed-shape all-gather.
+        # Fold scheduler epoch, queue stats and the original six MLPSync fields
+        # into one fixed-shape all-gather for PD Decode.
         is_disagg_decode = (
             self.server_args.disaggregation_mode == "decode"
             and self.server_args.enable_dp_attention
@@ -372,7 +371,7 @@ class SchedulerDPAttnMixin:
             )
             if sync_group_override is None:
                 raise RuntimeError(
-                    "Fix I dedicated dp_scheduler_cpu_group is not initialized"
+                    "dedicated dp_scheduler_cpu_group is not initialized"
                 )
             epoch = int(getattr(self, "_dp_scheduler_epoch", 0))
             transfer_n = len(self.disagg_decode_transfer_queue.queue)
@@ -389,8 +388,8 @@ class SchedulerDPAttnMixin:
                 bool(getattr(self, "_dp_scheduler_pd_over_budget", False))
             )
             scheduler_step_info = [
-                FIX_I_STEP_PROTOCOL_VERSION,
-                FIX_I_STEP_BUILD_ID,
+                DP_DECODE_STEP_PROTOCOL_VERSION,
+                DP_DECODE_STEP_BUILD_ID,
                 epoch,
                 transfer_n,
                 prealloc_n,

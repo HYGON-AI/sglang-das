@@ -2431,7 +2431,7 @@ class MooncakeKVSender(CommonKVSender):
 
 class MooncakeKVReceiver(CommonKVReceiver):
     def _safe_send_multipart(self, sock, parts):
-        """DP hang fix C: swallow ZMQ send timeout so decode scheduler can join MLPSync."""
+        """Swallow ZMQ send timeout so the decode scheduler can keep joining MLPSync."""
         import zmq
 
         try:
