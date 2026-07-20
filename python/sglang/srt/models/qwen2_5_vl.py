@@ -459,7 +459,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                 .to(device=x.device, dtype=torch.int32),
             ]
         )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
@@ -540,8 +539,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                 .to(device=x.device, dtype=torch.int32),
             ]
         )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
-
         return self.cuda_graph_runner.run(
             x=x,
             position_embeddings=position_embeddings,

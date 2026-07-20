@@ -2014,9 +2014,11 @@ class DeepseekV2AttentionMLA(
             )
         else:
             if _use_fused_rms_quant and self.input_layernorm is not None:
-                # NOTE: suspected
                 if _rms_quant_path == 1:
-                # path 1
+                    # The fused rms-quant path updates `hidden_states` in-place
+                    # when `update_hd=True`. For the first layer there is no
+                    # residual baseline yet, so keep `hidden_states` intact and
+                    # save it as the baseline for following layers.
                     if forward_batch.residual_rms_per_quant_int8 is None:
                         qkv_latent, _ = self.fused_qkv_a_proj_with_mqa(
                             hidden_states, 
@@ -2025,13 +2027,16 @@ class DeepseekV2AttentionMLA(
                             update_hd=False)
                         forward_batch.residual_rms_per_quant_int8 = hidden_states
                     else:
+                        # Match the unfused PATH=0 semantics: RMSNorm should be
+                        # computed from the updated residual state, and the
+                        # shared residual tensor must be advanced in-place for
+                        # later attention/NSA users.
                         qkv_latent, _ = self.fused_qkv_a_proj_with_mqa(
                             hidden_states, 
                             rms_weight=self.input_layernorm.weight.data,
                             residual=forward_batch.residual_rms_per_quant_int8,
-                            update_hd=False)
+                            update_hd=True)
                 else:
-                # path 2
                     if forward_batch.residual_rms_per_quant_int8 is None: 
                         _normed = self.input_layernorm(hidden_states)
                         forward_batch.residual_rms_per_quant_int8 = hidden_states
