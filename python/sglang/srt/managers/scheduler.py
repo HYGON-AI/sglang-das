@@ -1201,6 +1201,76 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        # Fix I single-clock: dedicated scheduler group.
+        #
+        # This communicator is used only by the epoch-tagged StepInfo/MLPSync
+        # all-gather.  Do not mix recv-control or model-forward collectives into
+        # it.  A process-group timeout is a replica-fatal error; no plain-barrier
+        # fallback is allowed.
+        self.dp_scheduler_cpu_group = None
+        self._dp_scheduler_epoch = 0
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.enable_dp_attention
+        ):
+            if not self.require_mlp_sync:
+                raise RuntimeError(
+                    "Fix I requires require_mlp_sync=True on PD Decode"
+                )
+            if self.pp_size != 1:
+                raise RuntimeError(
+                    "Fix I currently supports PD Decode with pp_size=1 only"
+                )
+            if self.attn_tp_size != 1 or self.attn_cp_size != 1:
+                raise RuntimeError(
+                    "Fix I currently supports attn_tp_size=1 and "
+                    "attn_cp_size=1 only"
+                )
+            if not self.server_args.enable_dp_attention_local_control_broadcast:
+                raise RuntimeError(
+                    "Fix I requires --enable-dp-attention-local-control-broadcast "
+                    "to keep recv control off the full tp_cpu_group"
+                )
+
+            tp_ranks = list(self.tp_group.ranks)
+            expected_world = (
+                self.server_args.dp_size
+                * self.attn_tp_size
+                * self.attn_cp_size
+            )
+            default_world = torch.distributed.get_world_size()
+            if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
+                raise RuntimeError(
+                    "Fix I strict topology check failed: "
+                    f"tp_ranks={len(tp_ranks)} expected={expected_world} "
+                    f"default_world={default_world}. "
+                    "Use this experimental patch only on the validated PP1 "
+                    "DP-attention Decode topology."
+                )
+            expected_ranks = list(range(default_world))
+            if tp_ranks != expected_ranks:
+                raise RuntimeError(
+                    "Fix I requires tp_group.ranks to be the ordered full "
+                    f"default world: actual={tp_ranks} expected={expected_ranks}"
+                )
+
+            from datetime import timedelta
+
+            # Dedicated scheduler-group timeout for PD Decode DP sync.
+            timeout_s = 60.0
+            self.dp_scheduler_cpu_group = torch.distributed.new_group(
+                ranks=tp_ranks,
+                backend="gloo",
+                timeout=timedelta(seconds=timeout_s),
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "PD Decode single-clock enabled: dedicated Gloo scheduler "
+                    "group, world=%s timeout=%.1fs",
+                    len(tp_ranks),
+                    timeout_s,
+                )
+
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
         # Default to the target model_config so the MetadataBuffers branches
