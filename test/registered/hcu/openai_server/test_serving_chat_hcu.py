@@ -52,6 +52,7 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            default_chat_template_kwargs=None,
         )
         # Mock hf_config for _use_dpsk_v32_encoding check
         mock_hf_config = Mock()
@@ -94,6 +95,7 @@ class _MockTemplateManager:
         self.chat_template_name: Optional[str] = "llama-3"
         self.jinja_template_content_format: Optional[str] = None
         self.completion_template_name: Optional[str] = None
+        self.reasoning_config = None
 
 
 class ServingChatTestCase(unittest.TestCase):

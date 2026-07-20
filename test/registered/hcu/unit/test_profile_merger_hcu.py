@@ -27,7 +27,7 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.test.ci.ci_register import register_hcu_ci
 register_hcu_ci(est_time=8, suite="stage-b-test-1-gpu-small-hcu")
@@ -216,18 +216,14 @@ class TestProfileMerger(unittest.TestCase):
 class TestProfileMergerIntegration(unittest.TestCase):
 
     def test_data_structures_merge_profiles(self):
-        # Test ProfileReqInput
-        req_input = ProfileReqInput()
-        self.assertFalse(req_input.merge_profiles)
-
-        req_input = ProfileReqInput(merge_profiles=True)
-        self.assertTrue(req_input.merge_profiles)
-
-        # Test ProfileReq
-        req = ProfileReq(type=ProfileReqType.START_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE)
+        self.assertEqual(req.req_type, ProfileReqType.START_PROFILE)
         self.assertFalse(req.merge_profiles)
 
-        req = ProfileReq(type=ProfileReqType.START_PROFILE, merge_profiles=True)
+        req = ProfileReq(
+            req_type=ProfileReqType.START_PROFILE,
+            merge_profiles=True,
+        )
         self.assertTrue(req.merge_profiles)
 
     def test_integration_parameters(self):
@@ -239,12 +235,14 @@ class TestProfileMergerIntegration(unittest.TestCase):
         )
 
         sig = inspect.signature(TokenizerControlMixin.start_profile)
-        self.assertIn("merge_profiles", sig.parameters)
+        self.assertIn("req", sig.parameters)
 
-        # Test SchedulerProfilerMixin
-        from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+        # ProfileReq fields are forwarded to the scheduler profiler manager.
+        from sglang.srt.managers.scheduler_components.profiler_manager import (
+            SchedulerProfilerManager,
+        )
 
-        sig = inspect.signature(SchedulerProfilerMixin.init_profile)
+        sig = inspect.signature(SchedulerProfilerManager._init_profile)
         self.assertIn("merge_profiles", sig.parameters)
 
         # Test CLI profiler

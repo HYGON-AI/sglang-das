@@ -791,6 +791,9 @@ class TestHiCacheArgs(unittest.TestCase):
             self.assertEqual(args.decode_attention_backend, expected_decode_backend)
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
+        expected_kernel_layout = (
+            "layer_first" if server_args_module.is_hip() else "page_first"
+        )
         cases = [
             {
                 "name": "default_kernel_page_first",
@@ -798,7 +801,7 @@ class TestHiCacheArgs(unittest.TestCase):
                     "enable_hierarchical_cache": True,
                 },
                 "expected_io_backend": "kernel",
-                "expected_mem_layout": "page_first",
+                "expected_mem_layout": expected_kernel_layout,
             },
             {
                 "name": "kernel_with_page_first_direct",
@@ -841,7 +844,7 @@ class TestHiCacheArgs(unittest.TestCase):
                     "decode_attention_backend": "fa3",
                 },
                 "expected_io_backend": "kernel",
-                "expected_mem_layout": "page_first",
+                "expected_mem_layout": expected_kernel_layout,
                 "expected_decode_backend": "fa3",
             },
         ]
@@ -868,7 +871,10 @@ class TestHiCacheArgs(unittest.TestCase):
         args._handle_hicache()
 
         self.assertEqual(args.hicache_io_backend, "kernel")
-        self.assertEqual(args.hicache_mem_layout, "page_first")
+        self.assertEqual(
+            args.hicache_mem_layout,
+            "layer_first" if server_args_module.is_hip() else "page_first",
+        )
         self.assertIsNone(args.decode_attention_backend)
 
 
@@ -977,6 +983,13 @@ class TestAdaptiveSpecArgs(CustomTestCase):
 
 
 class TestWaterfillArgs(CustomTestCase):
+    @staticmethod
+    def _run_a2a_handler(server_args):
+        # The dummy model skips normal initialization; reproduce the config
+        # state established before this handler in a real server startup.
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args._handle_a2a_moe()
+
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -985,7 +998,7 @@ class TestWaterfillArgs(CustomTestCase):
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
-        server_args._handle_a2a_moe()
+        self._run_a2a_handler(server_args)
 
         from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -1001,7 +1014,7 @@ class TestWaterfillArgs(CustomTestCase):
             enable_waterfill=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
-        server_args._handle_a2a_moe()
+        self._run_a2a_handler(server_args)
 
         from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -1017,7 +1030,7 @@ class TestWaterfillArgs(CustomTestCase):
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
-        server_args._handle_a2a_moe()
+        self._run_a2a_handler(server_args)
 
         from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -1033,7 +1046,7 @@ class TestWaterfillArgs(CustomTestCase):
             deepep_mode="low_latency",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
-        server_args._handle_a2a_moe()
+        self._run_a2a_handler(server_args)
 
         self.assertEqual(server_args.deepep_mode, "low_latency")
         self.assertFalse(server_args.disable_cuda_graph)
