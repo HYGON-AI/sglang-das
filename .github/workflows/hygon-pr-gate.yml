@@ -16,6 +16,6 @@ concurrency:
 jobs:
   gate:
     name: HYGON PR Gate
-    uses: HYGON-AI/open-source-governance/.github/workflows/pr-quality-gate.yml@055043c78beafad4f1315b9d3ad21cbf3748a54e
+    uses: HYGON-AI/open-source-governance/.github/workflows/pr-quality-gate.yml@955da79f4888280f0eba01406e772b1500021c37
     permissions:
       contents: read
