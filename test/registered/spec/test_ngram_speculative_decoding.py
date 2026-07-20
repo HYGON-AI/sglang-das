@@ -16,7 +16,7 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_NGRAM,
@@ -28,12 +28,12 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=230, suite="stage-b-test-1-gpu-large")
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: ngram speculative decoding path needs BW1100 validation before enabling.",
+    disabled="HCU CSV CI placeholder: ngram speculative decoding path needs BW1100 validation before enabling.",
 )
 
 GSM_DATASET_PATH = None

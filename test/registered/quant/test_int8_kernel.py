@@ -25,15 +25,15 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
-    register_dcu_ci,
+    register_hcu_ci,
 )
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=30,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: INT8 kernel path needs BW1100 numeric validation before enabling.",
+    disabled="HCU CSV CI placeholder: INT8 kernel path needs BW1100 numeric validation before enabling.",
 )
 
 from sglang.test.test_utils import CustomTestCase

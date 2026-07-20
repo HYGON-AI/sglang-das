@@ -28,7 +28,7 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -40,10 +40,10 @@ register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=258, suite="stage-b-test-1-gpu-small-amd")
 
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: tool_choice model matrix is not fully local; Llama/Qwen have local candidates but Mistral/LFM models are remote/missing, so file-level PR gate cannot be enabled yet.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: tool_choice model matrix is not fully local; Llama/Qwen have local candidates but Mistral/LFM models are remote/missing, so file-level PR gate cannot be enabled yet.",
 )
 
 class TestToolChoiceLlama32(CustomTestCase):

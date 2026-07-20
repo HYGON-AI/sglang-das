@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-    register_dcu_ci,
+    register_hcu_ci,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_dcu_ci(est_time=40, suite="nightly-dcu-core-functional", nightly=True)
+register_hcu_ci(est_time=40, suite="nightly-hcu-core-functional", nightly=True)
 register_cuda_ci(est_time=40, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=40, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=225, suite="base-c-test-cpu")

@@ -2,8 +2,19 @@ name: Release HCU Nightly Wheels
 
 permissions:
   contents: read
+  pull-requests: read
 
 on:
+  push:
+    branches:
+      - v0.5.15.post1_dev
+    paths:
+      - 'python/**'
+      - 'sgl-kernel/**'
+      - 'sgl-model-gateway/**'
+      - 'requirements_hcu.txt'
+      - '.github/workflows/release-pypi-nightly-hcu.yml'
+
   workflow_call:
     inputs:
       ref:
@@ -47,10 +58,11 @@ jobs:
     timeout-minutes: 180
 
     container:
-      image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+      image: harbor.sourcefind.cn:5443/hcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
+        -v /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang:/home/github/sgl_whl_temp/HYGON-AI_hcu-sglang
         --shm-size=80G
         --cap-add=SYS_PTRACE
         --security-opt seccomp=unconfined
@@ -88,7 +100,8 @@ jobs:
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
+          yum install -y perl-IPC-Cmd perl-Time-Piece
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" ciupload
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -174,7 +187,7 @@ jobs:
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
           cd sgl-model-gateway && cargo build --release
-          cd bindings/python && maturin build --release --skip-auditwheel
+          cd bindings/python && maturin build --release --skip-auditwheel --features vendored-openssl
           echo "=== sgl-model-gateway wheel ==="
           ls -lh target/wheels/*.whl
 
@@ -188,7 +201,7 @@ jobs:
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
+          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-6)"
           echo "Local version: ${LOCAL_VER}"
           mkdir -p output
           for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
@@ -198,10 +211,4 @@ jobs:
           echo "=== Repaired wheels ==="
           ls -lh output/
           CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: hcu-wheels-py${{ matrix.python-version }}
-          path: output/*.whl
-          if-no-files-found: warn
+          rm -rf /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang/* || true

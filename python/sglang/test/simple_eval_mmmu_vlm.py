@@ -82,7 +82,7 @@ class MMMUVLMEval(Eval):
         self.num_threads = num_threads
         self.seed = seed
         self.dataset_path = dataset_path or os.environ.get(
-            "SGLANG_DCU_MMMU_DATASET_PATH"
+            "SGLANG_HCU_MMMU_DATASET_PATH"
         )
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)

@@ -30,14 +30,14 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
-    register_dcu_ci,
+    register_hcu_ci,
 )
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=261,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     disabled=(
-        "DCU Full Enabled run 26941698027 failed; keep disabled until "
+        "HCU Full Enabled run 26941698027 failed; keep disabled until "
         "BW1100 failure is fixed or revalidated."
     ),
 )

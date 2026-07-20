@@ -14,7 +14,7 @@
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
@@ -22,12 +22,12 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=350, suite="stage-c-test-4-gpu-h100")
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=300,
-    suite="nightly-dcu-4-gpu",
+    suite="nightly-hcu-4-gpu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: 4-GPU Qwen3-Next model path needs local model mapping before enabling.",
+    disabled="HCU CSV CI placeholder: 4-GPU Qwen3-Next model path needs local model mapping before enabling.",
 )
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"

@@ -30,13 +30,13 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-    register_dcu_ci,
+    register_hcu_ci,
 )
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
-register_dcu_ci(est_time=8, suite="nightly-dcu-1-gpu", nightly=True)
+register_hcu_ci(est_time=8, suite="nightly-hcu-1-gpu", nightly=True)
 
 
 class TestSLRUAccuracy(unittest.TestCase):

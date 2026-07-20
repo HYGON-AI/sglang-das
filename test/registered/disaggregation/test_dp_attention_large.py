@@ -19,7 +19,7 @@ import requests
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -41,11 +41,11 @@ register_cuda_ci(est_time=350, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=120,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU multi-device/VLM path needs local model mapping and dedicated real-device validation.",
+    disabled="HCU multi-device/VLM path needs local model mapping and dedicated real-device validation.",
 )
 
 @unittest.skipIf(

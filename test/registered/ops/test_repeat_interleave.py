@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy as cpu_numpy_impl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
 # Ops - Repeat Interleave tests (1-GPU)
 
@@ -30,7 +30,7 @@ register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
 
 
-register_dcu_ci(est_time=75, suite="stage-b-test-1-gpu-small-dcu")
+register_hcu_ci(est_time=75, suite="stage-b-test-1-gpu-small-hcu")
 
 def torch_ref_impl(grid_thw: torch.Tensor) -> torch.Tensor:
     """

@@ -18,12 +18,12 @@ python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_p
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.test_utils import CustomTestCase, run_mmlu_test, run_mulit_request_test
 
 register_cuda_ci(est_time=312, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=312, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(est_time=312, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_hcu_ci(est_time=312, suite="stage-b-test-1-gpu-small-hcu", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestChunkedPrefill(CustomTestCase):

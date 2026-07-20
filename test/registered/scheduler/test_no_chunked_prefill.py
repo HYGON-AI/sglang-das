@@ -14,7 +14,7 @@
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -24,8 +24,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=108, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=108, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(est_time=108, suite="stage-b-test-1-gpu-small-dcu")
-register_dcu_ci(est_time=108, suite="nightly-dcu-functional-long", nightly=True)
+register_hcu_ci(est_time=108, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=108, suite="nightly-hcu-functional-long", nightly=True)
 
 
 class TestNoChunkedPrefill(CustomTestCase):
