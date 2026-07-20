@@ -85,7 +85,7 @@ from sglang.srt.utils import (
     dispose_tensor,
     get_bool_env_var,
     get_int_env_var,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_npu,
 )
@@ -118,9 +118,9 @@ from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
-if _is_dcu:
+if _is_hcu:
     from lightop import (
         m_grouped_w8a8_gemm_nt_contig_asm as m_grouped_i8_gemm_nt_contiguous,
     )
@@ -134,7 +134,7 @@ _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", 
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
 
-if _use_aiter and not _is_dcu:
+if _use_aiter and not _is_hcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 elif _is_npu:
@@ -509,7 +509,7 @@ class DeepEPMoE(FusedMoE):
         )
         if is_humming:
             self.deprecate_flag = True
-        elif _is_dcu and _use_aiter:
+        elif _is_hcu and _use_aiter:
             self.deprecate_flag = False
         elif _use_aiter:
             self.deprecate_flag = True
@@ -591,7 +591,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = True
             self.use_bf16_marlin = False
-        elif _use_fp8_w8a8_moe and _is_dcu:
+        elif _use_fp8_w8a8_moe and _is_hcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = True
             self.use_block_quant = False
@@ -599,7 +599,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
-        elif _use_marlin_w16a16_moe and _is_dcu:
+        elif _use_marlin_w16a16_moe and _is_hcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
@@ -607,7 +607,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = True
-        elif _use_marlin_w4a16_moe and _is_dcu:
+        elif _use_marlin_w4a16_moe and _is_hcu:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False

@@ -81,15 +81,15 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_dcu,
+    is_hcu,
     is_non_idle_and_non_empty,
     make_layers,
 )
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_lightop_rotary_embedding_fuse = False
 mimo_v2_split_rope_vscale_kv_store = None
-if _is_dcu:
+if _is_hcu:
     try:
         from lightop import mimo_v2_split_rope_vscale_kv_store
     except ImportError:
@@ -680,7 +680,7 @@ class MiMoV2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if _is_dcu and _use_lightop_rotary_embedding_fuse:
+        if _is_hcu and _use_lightop_rotary_embedding_fuse:
             kv_args = self._get_lightop_mha_kv_args(forward_batch)
             if kv_args is None:
                 return None

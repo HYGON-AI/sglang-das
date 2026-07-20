@@ -42,7 +42,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
-    is_dcu
+    is_hcu
 )
 
 _is_cuda = is_cuda()
@@ -54,7 +54,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _flashinfer_layernorm_available = False
 
 if _is_cuda or _is_xpu or _is_musa:
@@ -111,9 +111,9 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
-if _is_dcu:
+if _is_hcu:
     from lightop import op 
-    from lightop import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm_dcu
+    from lightop import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm_hcu
 
 if _is_hip:
     try:
@@ -811,8 +811,8 @@ class GemmaRMSNorm(MultiPlatformOp):
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                if _is_dcu:
-                    out, residual_out=gemma_fused_add_rmsnorm_dcu(
+                if _is_hcu:
+                    out, residual_out=gemma_fused_add_rmsnorm_hcu(
                         x, residual, self.weight.data, self.variance_epsilon
                     )
                     return out, residual_out

@@ -34,9 +34,9 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_dcu, is_gfx95_supported
+from sglang.srt.utils import is_hcu, is_gfx95_supported
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -58,10 +58,10 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
-    if _is_dcu:
+    if _is_hcu:
         print(
-            "aiter is DCU/DTK compatible kernel library. "
-            "Please make sure aiter is installed on your DCU device."
+            "aiter is HCU/DTK compatible kernel library. "
+            "Please make sure aiter is installed on your HCU device."
         )
     else:
         print(

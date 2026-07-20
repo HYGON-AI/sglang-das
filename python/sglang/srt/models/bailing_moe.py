@@ -91,7 +91,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -99,14 +99,14 @@ from sglang.srt.utils import (
 LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 _use_fused_bailing_silu_mul_fp8_quant = get_bool_env_var("SGLANG_USE_FUSED_BAILING_SILU_MUL_FP8_QUANT")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _use_fused_bailing_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_BAILING_RMS_QUANT")
 _use_fused_bailing_moe_sum_add = get_bool_env_var("SGLANG_USE_FUSED_BAILING_MOE_SUM_ADD", "true")
 
-if _is_dcu:
+if _is_hcu:
     from lightop import rms_rotary_embedding_fuse_with_kv_store
 
 
@@ -187,7 +187,7 @@ class BailingMoEGate(nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
 
-        if _is_dcu and self.params_dtype == torch.float32:
+        if _is_hcu and self.params_dtype == torch.float32:
             self.weight = nn.Parameter(
                 torch.empty(
                     (config.num_experts, config.hidden_size),
@@ -824,7 +824,7 @@ class BailingMoEAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
-        if self.use_qk_norm and _is_dcu and _use_fused_bailing_rms_rotary:
+        if self.use_qk_norm and _is_hcu and _use_fused_bailing_rms_rotary:
             # Fused RMSNorm + RoPE + kv_store path through custom op.
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if (cos_sin_cache.device != q.device
@@ -1003,13 +1003,13 @@ class BailingMoEBlock(nn.Module):
 
         # Keep this fusion path minimal: only first 4 dense layers.
         dense_rms_quant_fusion = (
-            _is_dcu
+            _is_hcu
             and _use_fused_bailing_rms_quant
             and (not self.is_layer_sparse)
             and (not is_dp_attention_enabled() or get_server_args().ep_size > 1)
         )
         sparse_rms_quant_fusion = (
-            _is_dcu
+            _is_hcu
             and _use_fused_bailing_rms_quant
             and self.is_layer_sparse
             and (not is_dp_attention_enabled() or get_server_args().ep_size > 1)

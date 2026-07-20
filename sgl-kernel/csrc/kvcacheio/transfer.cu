@@ -78,7 +78,7 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 }
 
 __device__ __forceinline__ void
-transfer_item_warp_dcu(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes,int64_t total_threads) {
+transfer_item_warp_hcu(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes,int64_t total_threads) {
   const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
   uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
   const int total_chunks = item_size_bytes / sizeof(uint64_t);
@@ -98,7 +98,7 @@ transfer_item_warp_dcu(int32_t lane_id, const void* src_addr, void* dst_addr, in
 }
 
 template <typename T>
-__device__ __forceinline__ T* get_global_offset_lf_tbl_dcu(
+__device__ __forceinline__ T* get_global_offset_lf_tbl_hcu(
     T* /*unused*/,
     const uintptr_t* __restrict__ layer_base_tbl,
     int64_t layer_id,
@@ -110,7 +110,7 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl_dcu(
 }
 
 template <typename T>
-__device__ __forceinline__ T* get_global_offset_pf_dcu(
+__device__ __forceinline__ T* get_global_offset_pf_hcu(
     T* base,
     const uintptr_t* __restrict__ /*unused*/,
     int64_t layer_id,
@@ -122,7 +122,7 @@ __device__ __forceinline__ T* get_global_offset_pf_dcu(
 }
 
 template <typename T>
-__device__ __forceinline__ T* get_global_offset_lf_dcu(
+__device__ __forceinline__ T* get_global_offset_lf_hcu(
     T* base,
     const uintptr_t* __restrict__ /*unused*/,
     int64_t layer_id,
@@ -354,7 +354,7 @@ __global__ void transfer_kernel_impl(
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn>
-__global__ void transfer_kernel_impl_dcu(
+__global__ void transfer_kernel_impl_hcu(
     const void* __restrict__ src_k,
     void* __restrict__ dst_k,
     const void* __restrict__ src_v,
@@ -384,13 +384,13 @@ __global__ void transfer_kernel_impl_dcu(
           static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, s_page_id, item_size_bytes);
       char* dst_ptr = DstOffsetFn(
           static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, d_page_id, item_size_bytes);
-      transfer_item_warp_dcu(lane_id, src_ptr, dst_ptr, item_size_bytes,total_threads);
+      transfer_item_warp_hcu(lane_id, src_ptr, dst_ptr, item_size_bytes,total_threads);
 
       const char* src_v_ptr = SrcOffsetFn(
           static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, s_page_id, item_size_bytes);
       char* dst_v_ptr = DstOffsetFn(
           static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, d_page_id, item_size_bytes);
-      transfer_item_warp_dcu(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes,total_threads);
+      transfer_item_warp_hcu(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes,total_threads);
   }
 }
 
@@ -492,7 +492,7 @@ void transfer_kv_launcher(
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn>
-void transfer_kv_launcher_dcu(
+void transfer_kv_launcher_hcu(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
     const at::Tensor& src_v,
@@ -541,7 +541,7 @@ void transfer_kv_launcher_dcu(
   const uintptr_t* dst_v_tbl_ptr = !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
 
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
-  transfer_kernel_impl_dcu<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+  transfer_kernel_impl_hcu<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
       src_k_ptr,
       dst_k_ptr,
       src_v_ptr,
@@ -1204,7 +1204,7 @@ void transfer_kv_all_layer_direct_lf_pf(
   transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size);
 }
 
-void transfer_kv_all_direct_pf_lf_H2D_dcu(
+void transfer_kv_all_direct_pf_lf_H2D_hcu(
     const at::Tensor& src_ptrs_k,
     const at::Tensor& src_ptrs_v,
     std::vector<at::Tensor> dst_ptrs_k,
@@ -1232,7 +1232,7 @@ void transfer_kv_all_direct_pf_lf_H2D_dcu(
     }
   }
 
-void transfer_kv_all_kernel_lf_pf_D2H_dcu(
+void transfer_kv_all_kernel_lf_pf_D2H_hcu(
     const at::Tensor& src_k,
     at::Tensor dst_k,
     const at::Tensor& src_v,
@@ -1248,7 +1248,7 @@ void transfer_kv_all_kernel_lf_pf_D2H_dcu(
 
     TORCH_CHECK(layer_num == src_k.size(0), "Number of layers in source k tensor does not match num_layers");
     at::Tensor empty;
-    transfer_kv_launcher_dcu<get_global_offset_lf_tbl_dcu<const char>, get_global_offset_pf_dcu<char>>(
+    transfer_kv_launcher_hcu<get_global_offset_lf_tbl_hcu<const char>, get_global_offset_pf_hcu<char>>(
       empty,
       dst_k,
       empty,
@@ -1268,7 +1268,7 @@ void transfer_kv_all_kernel_lf_pf_D2H_dcu(
       num_warps_per_block);
 }
 
-void transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
+void transfer_kv_per_layer_kernel_pf_lf_H2D_hcu(
     const at::Tensor& src_k,
     at::Tensor dst_k,
     const at::Tensor& src_v,
@@ -1282,7 +1282,7 @@ void transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
     int64_t num_warps_per_block){
 
     at::Tensor empty;
-    transfer_kv_launcher_dcu<get_global_offset_pf_dcu<const char>, get_global_offset_lf_dcu<char>>(
+    transfer_kv_launcher_hcu<get_global_offset_pf_hcu<const char>, get_global_offset_lf_hcu<char>>(
       src_k,
       dst_k,
       src_v,
@@ -1302,7 +1302,7 @@ void transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
       num_warps_per_block);
 }
 
-void transfer_kv_all_direct_lf_pf_D2H_dcu(
+void transfer_kv_all_direct_lf_pf_D2H_hcu(
     const std::vector<at::Tensor>& src_ptrs_k,
     const std::vector<at::Tensor>& src_ptrs_v,
     at::Tensor dst_ptrs_k,
@@ -1514,7 +1514,7 @@ __global__ void launch_create_extend_after_decode_spec_info_int64_kernel(
     new_verified_id_ptr[pid] = verified_id_ptr[verified_idx];
 }
 
-void dcu_alloc_decode_kernel(
+void hcu_alloc_decode_kernel(
   const at::Tensor seq_lens_ptr,   
   const at::Tensor last_loc_ptr,    
   const at::Tensor free_page_ptr,   
@@ -1534,7 +1534,7 @@ void dcu_alloc_decode_kernel(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void dcu_create_extend_after_decode_spec_info(
+void hcu_create_extend_after_decode_spec_info(
     const at::Tensor verified_id,
     const at::Tensor seq_lens,
     const at::Tensor accept_lens,
@@ -1577,7 +1577,7 @@ void dcu_create_extend_after_decode_spec_info(
     }
 };
 
-void dcu_alloc_extend_kernel(
+void hcu_alloc_extend_kernel(
     const at::Tensor pre_lens_ptr,
     const at::Tensor seq_lens_ptr,
     const at::Tensor last_loc_ptr,
@@ -1634,7 +1634,7 @@ __global__ void launch_assign_req_to_token_pool(
 }
 
 
-void dcu_assign_req_to_token_pool(
+void hcu_assign_req_to_token_pool(
     const at::Tensor req_pool_indices_ptr,
     at::Tensor req_to_token_ptr,
     const at::Tensor allocate_lens_ptr,
@@ -1678,7 +1678,7 @@ __global__ void get_last_loc_kernel(
     }
 }
 
-at::Tensor dcu_get_last_loc(
+at::Tensor hcu_get_last_loc(
     const at::Tensor req_to_token,     
     const at::Tensor req_pool_indices,  
     const at::Tensor prefix_lens) {
@@ -1759,7 +1759,7 @@ __global__ void launch_assign_extend_cache_locs_kernel(
     }
 }
 
-void dcu_assign_extend_cache_locs(
+void hcu_assign_extend_cache_locs(
     const at::Tensor req_pool_indices,
     const at::Tensor req_to_token,
     const at::Tensor start_offset,
@@ -1791,7 +1791,7 @@ void dcu_assign_extend_cache_locs(
 
 
 template<int PAGED_SIZE>
-__global__ void dcu_create_flashmla_kv_indices_kernel(
+__global__ void hcu_create_flashmla_kv_indices_kernel(
     const int32_t* __restrict__ req_to_token,
     const int32_t* __restrict__ req_pool_indices,
     const int32_t* __restrict__ page_kernel_lens,
@@ -1829,7 +1829,7 @@ __global__ void dcu_create_flashmla_kv_indices_kernel(
     }
 }
 
-void dcu_create_flashmla_kv_indices(
+void hcu_create_flashmla_kv_indices(
     const at::Tensor& req_to_token,
     const at::Tensor& req_pool_indices,
     const at::Tensor& page_kernel_lens,
@@ -1855,7 +1855,7 @@ void dcu_create_flashmla_kv_indices(
         kv_start_idx_ptr = kv_start_idx.value().data_ptr<int32_t>();
     }
     if (PAGED_SIZE == 64) {
-        dcu_create_flashmla_kv_indices_kernel<64><<<grid, block, 0, stream>>>(
+        hcu_create_flashmla_kv_indices_kernel<64><<<grid, block, 0, stream>>>(
             req_to_token.data_ptr<int32_t>(),
             req_pool_indices.data_ptr<int32_t>(),
             page_kernel_lens.data_ptr<int32_t>(),
@@ -1898,7 +1898,7 @@ __global__ void launch_create_chunked_prefix_cache_kv_indices(
 }
 
 
-void dcu_create_chunked_prefix_cache_kv_indices(
+void hcu_create_chunked_prefix_cache_kv_indices(
     at::Tensor req_to_token_ptr,
     const at::Tensor req_pool_indices_ptr,
     const at::Tensor chunk_starts_ptr,
@@ -1948,7 +1948,7 @@ __global__ void launch_align_evict_mask_to_page_size(
 }
 
 
-void dcu_align_evict_mask_to_page_size(
+void hcu_align_evict_mask_to_page_size(
     const at::Tensor seq_lens_ptr,
     at::Tensor evict_mask_ptr,
     int64_t page_size,

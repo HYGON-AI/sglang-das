@@ -33,12 +33,12 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
-_is_dcu = is_dcu()
-if _is_dcu:
+_is_hcu = is_hcu()
+if _is_hcu:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-    from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
+    from sgl_kernel.flash_mla import hcu_create_flashmla_kv_indices
 else:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
@@ -150,8 +150,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 dtype=torch.int32,
                 device=forward_batch.seq_lens.device,
             )
-            if _is_dcu and use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+            if _is_hcu and use_sglang_create_flashmla_kv_indices_triton:
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr=self.req_to_token,
                     req_pool_indices_ptr=forward_batch.req_pool_indices,
                     page_kernel_lens_ptr=forward_batch.seq_lens,
@@ -194,8 +194,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-            if _is_dcu and use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+            if _is_hcu and use_sglang_create_flashmla_kv_indices_triton:
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr=self.req_to_token,
                     req_pool_indices_ptr=forward_batch.req_pool_indices,
                     page_kernel_lens_ptr=seq_lens,

@@ -38,7 +38,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_sm100_supported,
@@ -52,12 +52,12 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_dcu:
+if _is_hcu:
     from lightop import op
 
 if _is_cuda or _is_musa:
@@ -2207,7 +2207,7 @@ Returns:
 Raises:
     AssertionError: If input is not 2D or if static scale's numel != 1
 """
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
 
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""

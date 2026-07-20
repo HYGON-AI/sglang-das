@@ -46,8 +46,8 @@ def _q8kv8_cuda_flags() -> list[str]:
     return [
         "-O3",
         "-DNDEBUG",
-        "-DCUTE_USE_PACKED_TUPLE=1",
-        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+        "-HCUTE_USE_PACKED_TUPLE=1",
+        "-HCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         "--use_fast_math",
     ]
 

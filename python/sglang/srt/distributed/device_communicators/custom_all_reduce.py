@@ -25,13 +25,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     log_info_on_rank0,
 )
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_musa = is_musa()
 
@@ -395,7 +395,7 @@ def dispatch_custom_allreduce(
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            if _is_dcu:
+            if _is_hcu:
                 logger.info("[AR] Using AiterCustomAllreduce (HCU default)")
             else:
                 logger.info("[AR] Using AiterCustomAllreduce (AMD default)")

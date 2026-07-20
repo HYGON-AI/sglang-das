@@ -22,7 +22,7 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_dcu, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -77,7 +77,7 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
@@ -86,7 +86,7 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
-@torch.compile(dynamic=True, disable=_is_npu or _is_dcu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_hcu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -96,7 +96,7 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
-@torch.compile(dynamic=True, disable=_is_npu or _is_dcu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_hcu)
 def _gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
@@ -417,7 +417,7 @@ class FutureMap:
                 draft_input.topk_index,
                 bonus_tokens,
                 hidden_states,
-            ) = (_gather_spec_extras if _is_dcu else gather_spec_extras)(
+            ) = (_gather_spec_extras if _is_hcu else gather_spec_extras)(
                 indices,
                 self.topk_p_buf,
                 self.topk_index_buf,

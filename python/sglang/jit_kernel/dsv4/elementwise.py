@@ -8,12 +8,12 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_dcu, is_hip, is_xpu
+from sglang.srt.utils import is_hcu, is_hip, is_xpu
 
 from .utils import make_name
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_xpu = is_xpu()
 
 
@@ -164,7 +164,7 @@ def fused_q_indexer_rope_hadamard_quant(
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    if _is_dcu:
+    if _is_hcu:
         from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
         # TVM-FFI matches this output as uint8 storage. Passing a torch FP8 tensor

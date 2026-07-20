@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only helper for the DCU main migration.
+"""Read-only helper for the HCU main migration.
 
 This script intentionally does not create branches, merge commits, tags, or
 pushes. It reports migration state and prints templates that humans can use
@@ -35,7 +35,7 @@ class Checkpoint:
 
     @property
     def tag_name(self) -> str:
-        return f"dcu-main-bootstrap-{self.cid}-official-{self.cutoff_utc.replace('-', '')}"
+        return f"hcu-main-bootstrap-{self.cid}-official-{self.cutoff_utc.replace('-', '')}"
 
 
 CHECKPOINTS = [
@@ -125,50 +125,50 @@ def changed_files(repo: Path, rev_range: str, extra_env: dict[str, str] | None =
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    dcu_repo = args.repo
+    hcu_repo = args.repo
     official_repo = args.official_repo
     official_head = git(official_repo, "rev-parse", "HEAD")
-    dcu_head = git(dcu_repo, "rev-parse", "HEAD")
+    hcu_head = git(hcu_repo, "rev-parse", "HEAD")
     merge_base = git(
-        dcu_repo,
+        hcu_repo,
         "merge-base",
         "HEAD",
         official_head,
         extra_env=alternate_env(official_repo),
     )
-    dcu_count = git(dcu_repo, "rev-list", "--count", f"{BASE_SHA}..HEAD")
+    hcu_count = git(hcu_repo, "rev-list", "--count", f"{BASE_SHA}..HEAD")
     official_count = git(official_repo, "rev-list", "--count", f"{BASE_SHA}..HEAD")
-    dcu_files = changed_files(dcu_repo, f"{BASE_SHA}..HEAD", extra_env=alternate_env(official_repo))
+    hcu_files = changed_files(hcu_repo, f"{BASE_SHA}..HEAD", extra_env=alternate_env(official_repo))
     official_files = changed_files(official_repo, f"{BASE_SHA}..HEAD")
-    overlap = dcu_files & official_files
+    overlap = hcu_files & official_files
 
-    print(f"DCU repo: {dcu_repo}")
+    print(f"HCU repo: {hcu_repo}")
     print(f"Official repo: {official_repo}")
-    print(f"Current branch: {git(dcu_repo, 'branch', '--show-current')}")
-    print(f"DCU HEAD: {dcu_head[:12]}")
+    print(f"Current branch: {git(hcu_repo, 'branch', '--show-current')}")
+    print(f"HCU HEAD: {hcu_head[:12]}")
     print(f"Official HEAD: {official_head[:12]}")
     print(f"Merge base: {merge_base[:12]}")
-    print(f"DCU commits after base: {dcu_count}")
+    print(f"HCU commits after base: {hcu_count}")
     print(f"Official commits after base: {official_count}")
     print(f"Overlapping changed files: {len(overlap)}")
-    print(f"Local main exists: {'yes' if branch_exists(dcu_repo, 'main') else 'no'}")
+    print(f"Local main exists: {'yes' if branch_exists(hcu_repo, 'main') else 'no'}")
     print(
         "Bootstrap branch exists: "
-        f"{'yes' if branch_exists(dcu_repo, 'sync/official-main-bootstrap') else 'no'}"
+        f"{'yes' if branch_exists(hcu_repo, 'sync/official-main-bootstrap') else 'no'}"
     )
-    rerere = git(dcu_repo, "config", "--get", "rerere.enabled", check=False) or "unset"
+    rerere = git(hcu_repo, "config", "--get", "rerere.enabled", check=False) or "unset"
     print(f"rerere.enabled: {rerere}")
 
 
 def cmd_checkpoints(args: argparse.Namespace) -> None:
-    dcu_repo = args.repo
+    hcu_repo = args.repo
     print("| ID | Cutoff UTC | Checkpoint | Delta | Risk | Tag | Notes |")
     print("|---|---:|---|---:|---|---|---|")
     for checkpoint in CHECKPOINTS:
         if checkpoint.cid == "C00":
             state = "base"
         else:
-            state = "done" if tag_exists(dcu_repo, checkpoint.tag_name) else "pending"
+            state = "done" if tag_exists(hcu_repo, checkpoint.tag_name) else "pending"
         print(
             f"| {checkpoint.cid} | {checkpoint.cutoff_utc} | `{checkpoint.short_sha}` | "
             f"{checkpoint.delta_commits} | {checkpoint.risk} | {state} | {checkpoint.notes} |"
@@ -176,11 +176,11 @@ def cmd_checkpoints(args: argparse.Namespace) -> None:
 
 
 def cmd_next(args: argparse.Namespace) -> None:
-    dcu_repo = args.repo
+    hcu_repo = args.repo
     for checkpoint in CHECKPOINTS:
         if checkpoint.cid == "C00":
             continue
-        if not tag_exists(dcu_repo, checkpoint.tag_name):
+        if not tag_exists(hcu_repo, checkpoint.tag_name):
             print(f"Next checkpoint: {checkpoint.cid}")
             print(f"Official SHA: {checkpoint.short_sha}")
             print(f"Cutoff UTC: {checkpoint.cutoff_utc}")
@@ -194,13 +194,13 @@ def cmd_next(args: argparse.Namespace) -> None:
 
 def cmd_tag_message(args: argparse.Namespace) -> None:
     checkpoint = checkpoint_by_id(args.checkpoint)
-    dcu_sha = git(args.repo, "rev-parse", "HEAD")
+    hcu_sha = git(args.repo, "rev-parse", "HEAD")
     official_sha = git(args.official_repo, "rev-parse", checkpoint.sha)
     print(f"Tag: {checkpoint.tag_name}")
     print()
     print(f"Official checkpoint: {official_sha}")
-    print("DCU base branch: v0.5.12_dev")
-    print(f"DCU main sha: {dcu_sha}")
+    print("HCU base branch: v0.5.12_dev")
+    print(f"HCU main sha: {hcu_sha}")
     print(f"Validation: {args.validation}")
     print("Known issues:")
     if args.known_issue:
@@ -212,19 +212,19 @@ def cmd_tag_message(args: argparse.Namespace) -> None:
 
 def cmd_validation(args: argparse.Namespace) -> None:
     print("Phase 0:")
-    print("  python3 scripts/ci/dcu/verify_dcu_registration.py")
+    print("  python3 scripts/ci/hcu/verify_hcu_registration.py")
     print()
     print("Phase 1:")
-    print("  # Fill in internal DCU CI dry-run command")
-    print("  python3 scripts/ci/dcu/verify_dcu_registration.py")
+    print("  # Fill in internal HCU CI dry-run command")
+    print("  python3 scripts/ci/hcu/verify_hcu_registration.py")
     print()
     print("Phase 2:")
-    print("  # Fill in DCU stage-b small model smoke command")
+    print("  # Fill in HCU stage-b small model smoke command")
     print("  # Fill in Qwen2.5 dense, VLM, embedding, reranker smoke commands")
-    print("  # Fill in sgl-kernel DCU smoke whitelist command")
+    print("  # Fill in sgl-kernel HCU smoke whitelist command")
     print()
     print("Phase 3:")
-    print("  # Fill in Qwen3 MoE, DeepEP, DeepSeek V4, nightly-dcu commands")
+    print("  # Fill in Qwen3 MoE, DeepEP, DeepSeek V4, nightly-hcu commands")
     print()
     print("Phase 4:")
     print("  # Fill in daily sync smoke gate and weekly nightly commands")
@@ -232,7 +232,7 @@ def cmd_validation(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", type=Path, default=repo_root(), help="Path to dcu-sglang repo")
+    parser.add_argument("--repo", type=Path, default=repo_root(), help="Path to hcu-sglang repo")
     parser.add_argument(
         "--official-repo",
         type=Path,

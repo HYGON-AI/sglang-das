@@ -84,7 +84,7 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-HCUTLASS_ENABLE_GDC_FOR_SM100=1",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,

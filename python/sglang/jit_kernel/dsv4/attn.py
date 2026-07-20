@@ -11,11 +11,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
 from .utils import make_name
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 
 @cache_once
@@ -62,7 +62,7 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    if is_hip_runtime() and not _is_dcu:
+    if is_hip_runtime() and not _is_hcu:
         from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)

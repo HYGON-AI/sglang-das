@@ -116,7 +116,7 @@ struct _dtype_trait<bf16_t> {
 #endif
 
 #ifdef USE_ROCM
-// fp16_t and bf16_t alias the HIP native types on DCU, so define their
+// fp16_t and bf16_t alias the HIP native types on HCU, so define their
 // traits only once through the native types below.
 template <>
 struct _dtype_trait<__half> {

@@ -9,11 +9,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
 from .utils import make_name
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 
 @cache_once
@@ -118,7 +118,7 @@ def hash_topk(
     scoring_func: str = "sqrtsoftplus",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert scoring_func == "sqrtsoftplus"
-    if is_hip_runtime() and not _is_dcu:
+    if is_hip_runtime() and not _is_hcu:
         from sglang.jit_kernel.triton.hash_topk import hash_topk_triton
 
         return hash_topk_triton(
