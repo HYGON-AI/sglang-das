@@ -33,7 +33,7 @@ register_hcu_ci(
 
 COOKBOOK_GSM8K_MIN_SCORE = {
     "Qwen3-32B": 0.90,
-    "Qwen3-30B-A3B": 0.88,
+    "Qwen3-30B-A3B": 0.93,
     "Qwen3.6-35B-A3B": 0.93,
 }
 

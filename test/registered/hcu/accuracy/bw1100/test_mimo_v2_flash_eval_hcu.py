@@ -17,7 +17,7 @@ register_hcu_ci(
     nightly=True,
 )
 
-DEFAULT_ACCURACY_THRESHOLD = 0.75
+DEFAULT_ACCURACY_THRESHOLD = 0.80
 
 
 class TestMiMoV2FlashEvalHCU(unittest.TestCase):
