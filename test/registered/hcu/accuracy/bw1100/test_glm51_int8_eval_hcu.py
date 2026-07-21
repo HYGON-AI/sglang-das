@@ -4,6 +4,7 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
 from sglang.test.hcu_cookbook_utils import (
     GLM51_CHANNEL_INT8_8GPU,
     CookbookServer,
@@ -49,6 +50,16 @@ class TestGlm51Int8EvalHCU(unittest.TestCase):
             "HCU GLM-5.1 Channel INT8 GSM8K: "
             f"accuracy={accuracy:.3f}, invalid={invalid:.3f}, "
             f"latency={latency:.1f}s, threshold={threshold:.3f}"
+        )
+        write_hcu_accuracy_result(
+            model_key="glm51_channel_int8",
+            model="GLM-5.1-Channel-INT8",
+            score=accuracy,
+            threshold=threshold,
+            num_examples=num_questions,
+            invalid_rate=invalid,
+            latency_seconds=latency,
+            source_test=__file__,
         )
         self.assertGreaterEqual(accuracy, threshold)
 

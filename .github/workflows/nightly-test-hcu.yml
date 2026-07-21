@@ -869,6 +869,7 @@ jobs:
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
       - name: Run nightly HCU suite
+        id: run_suite
         if: steps.filter.outputs.should_run == 'true'
         env:
           INCLUDE_FILES: ${{ matrix.include_files }}
@@ -901,8 +902,58 @@ jobs:
 
           echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }} nightly=${{ matrix.nightly }}"
           echo "HCU_CI_INSTALL_WHEEL_URLS=${HCU_CI_INSTALL_WHEEL_URLS}"
-          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
+          exec_args=(
+            -w /sglang-checkout/test
+            --container-name "${HCU_CI_CONTAINER_NAME}"
+          )
+          if [[ "${{ matrix.group }}" == "nightly-hcu-accuracy-text" ]]; then
+            exec_args+=(
+              -e SGLANG_HCU_ACCURACY_RESULT_DIR=/sglang-checkout/test-results/hcu-accuracy
+            )
+          fi
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" "${exec_args[@]}" -- \
             "${cmd[@]}"
+
+      - name: Record HCU accuracy partition status
+        if: >-
+          always() &&
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-text'
+        env:
+          PARTITION_OUTCOME: ${{ steps.run_suite.outcome }}
+        run: |
+          set -euo pipefail
+          result_dir="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-nightly-${{ matrix.name }}/test-results/hcu-accuracy"
+          mkdir -p "${result_dir}"
+          python3 - "${result_dir}/partition-status.json" "${{ matrix.name }}" "${PARTITION_OUTCOME}" <<'PY'
+          import json
+          import sys
+
+          output_path, partition, outcome = sys.argv[1:]
+          with open(output_path, "w", encoding="utf-8") as output_file:
+              json.dump(
+                  {
+                      "schema_version": 1,
+                      "partition": partition,
+                      "outcome": outcome,
+                  },
+                  output_file,
+                  sort_keys=True,
+              )
+              output_file.write("\n")
+          PY
+
+      - name: Upload HCU accuracy results
+        if: >-
+          always() &&
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-text'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcu-accuracy-${{ matrix.name }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hcu-sglang-${{ github.run_id }}-nightly-${{ matrix.name }}/test-results/hcu-accuracy
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Cleanup HCU container
         if: always() && steps.filter.outputs.should_run == 'true'
@@ -940,3 +991,59 @@ jobs:
           done
 
           echo "All HCU nightly jobs completed successfully or were intentionally skipped."
+
+  notify-hcu-accuracy-feishu:
+    name: Notify HCU accuracy to Feishu
+    needs:
+      - validate-config
+      - probe-hcu-wheels
+      - nightly-hcu
+      - nightly-hcu-finish
+    if: >-
+      always() &&
+      github.ref_name == '0713-hcu-sglang-test' &&
+      needs.validate-config.result == 'success' &&
+      (needs.validate-config.outputs.job_filter == 'all' ||
+       needs.validate-config.outputs.job_filter == 'nightly-hcu-accuracy-text')
+    runs-on: ${{ needs.validate-config.outputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
+    environment: hcu-ci-notify
+    steps:
+      - name: Checkout notification source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: hcu-notify-source
+
+      - name: Prepare HCU accuracy artifact directory
+        run: mkdir -p "${{ runner.temp }}/hcu-accuracy-${{ github.run_id }}"
+
+      - name: Download HCU accuracy artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hcu-accuracy-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/hcu-accuracy-${{ github.run_id }}
+          merge-multiple: false
+
+      - name: Send signed Feishu accuracy card
+        env:
+          FEISHU_HCU_CI_WEBHOOK: ${{ secrets.FEISHU_HCU_CI_WEBHOOK }}
+          FEISHU_HCU_CI_SIGNING_SECRET: ${{ secrets.FEISHU_HCU_CI_SIGNING_SECRET }}
+          HCU_ACCURACY_RESULTS_DIR: ${{ runner.temp }}/hcu-accuracy-${{ github.run_id }}
+          HCU_ACCURACY_BRANCH: ${{ github.ref_name }}
+          HCU_ACCURACY_TARGET_REF: ${{ needs.validate-config.outputs.target_ref }}
+          HCU_ACCURACY_COMMIT_SHA: ${{ needs.probe-hcu-wheels.outputs.full_sha }}
+          HCU_ACCURACY_IMAGE: ${{ needs.validate-config.outputs.image }}
+          HCU_ACCURACY_WORKFLOW_RESULT: ${{ needs.nightly-hcu.result }}
+          HCU_ACCURACY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3.12 || command -v python3.10 || command -v python3.9 || command -v python3.8 || command -v python3)"
+          "${python_bin}" hcu-notify-source/scripts/ci/hcu/hcu_ci_notify_feishu.py \
+            --results-dir "${HCU_ACCURACY_RESULTS_DIR}" \
+            --branch "${HCU_ACCURACY_BRANCH}" \
+            --target-ref "${HCU_ACCURACY_TARGET_REF}" \
+            --commit-sha "${HCU_ACCURACY_COMMIT_SHA}" \
+            --image "${HCU_ACCURACY_IMAGE}" \
+            --workflow-result "${HCU_ACCURACY_WORKFLOW_RESULT}" \
+            --run-url "${HCU_ACCURACY_RUN_URL}"

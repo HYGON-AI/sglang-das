@@ -4,9 +4,10 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
 from sglang.test.hcu_cookbook_utils import (
-    CookbookServer,
     DEEPSEEK_V32_CHANNEL_FP8_8GPU,
+    CookbookServer,
     run_gsm8k_completion_benchmark,
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
@@ -49,6 +50,16 @@ class TestDeepSeekV32EvalHCU(unittest.TestCase):
             "HCU DeepSeek-V3.2 GSM8K: "
             f"accuracy={accuracy:.3f}, invalid={invalid:.3f}, "
             f"latency={latency:.1f}s, threshold={threshold:.3f}"
+        )
+        write_hcu_accuracy_result(
+            model_key="deepseek_v32_channel_fp8",
+            model="DeepSeek-V3.2-Channel-FP8",
+            score=accuracy,
+            threshold=threshold,
+            num_examples=num_questions,
+            invalid_rate=invalid,
+            latency_seconds=latency,
+            source_test=__file__,
         )
         self.assertGreaterEqual(accuracy, threshold)
 

@@ -9,6 +9,7 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
 from sglang.test.hcu_cookbook_utils import (
     DEFAULT_HCU_GSM8K_DATA_PATH,
     KIMI_K26_8GPU,
@@ -29,14 +30,8 @@ class TestKimiK26EvalHCU(unittest.TestCase):
         num_questions = int(
             os.environ.get("SGLANG_HCU_KIMI_K26_GSM8K_NUM_QUESTIONS", "1319")
         )
-        num_shots = int(
-            os.environ.get("SGLANG_HCU_KIMI_K26_GSM8K_NUM_SHOTS", "8")
-        )
-        parallel = int(
-            os.environ.get(
-                "SGLANG_HCU_KIMI_K26_GSM8K_PARALLEL", "256"
-            )
-        )
+        num_shots = int(os.environ.get("SGLANG_HCU_KIMI_K26_GSM8K_NUM_SHOTS", "8"))
+        parallel = int(os.environ.get("SGLANG_HCU_KIMI_K26_GSM8K_PARALLEL", "256"))
         threshold = float(
             os.environ.get(
                 "SGLANG_HCU_KIMI_K26_GSM8K_THRESHOLD",
@@ -86,6 +81,16 @@ class TestKimiK26EvalHCU(unittest.TestCase):
             "HCU Kimi-K2.6 GSM8K: "
             f"accuracy={accuracy:.3f}, invalid={invalid:.3f}, "
             f"latency={latency:.1f}s, threshold={threshold:.3f}"
+        )
+        write_hcu_accuracy_result(
+            model_key="kimi_k26",
+            model="Kimi-K2.6",
+            score=accuracy,
+            threshold=threshold,
+            num_examples=num_questions,
+            invalid_rate=invalid,
+            latency_seconds=latency,
+            source_test=__file__,
         )
         self.assertGreaterEqual(accuracy, threshold)
 

@@ -41,9 +41,7 @@ HCU_COOKBOOK_API_KEY = "sk-123456"
 DEFAULT_HCU_GSM8K_DATA_PATH = (
     "/public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl"
 )
-DEFAULT_HCU_MMLU_DATASET_PATH = (
-    "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
-)
+DEFAULT_HCU_MMLU_DATASET_PATH = "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
 
 
 def _require_local_data_path(path: str, dataset_name: str) -> str:
@@ -53,6 +51,7 @@ def _require_local_data_path(path: str, dataset_name: str) -> str:
             "Mount the HCU dataset directory or set the corresponding data path env."
         )
     return path
+
 
 QWEN3_COOKBOOK_ENV = {
     "SGLANG_ENABLE_SPEC_V2": "1",
@@ -916,13 +915,21 @@ def _get_threshold(
     return defaults.get(config.name)
 
 
+def get_cookbook_threshold(
+    config: HcuCookbookModelConfig, defaults: dict[str, float], env_prefix: str
+) -> float | None:
+    """Return the effective threshold after applying per-model env overrides."""
+
+    return _get_threshold(config, defaults, env_prefix)
+
+
 def assert_cookbook_min_score(
     config: HcuCookbookModelConfig,
     metrics: dict,
     defaults: dict[str, float],
     env_prefix: str,
 ) -> None:
-    threshold = _get_threshold(config, defaults, env_prefix)
+    threshold = get_cookbook_threshold(config, defaults, env_prefix)
     if threshold is None:
         return
     score = float(metrics["score"])

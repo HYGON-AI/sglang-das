@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -92,9 +93,7 @@ def _get_server_args_env(name: str) -> list[str]:
 class TestBW1100GSM8KEvalHCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = _get_model_env(
-            "SGLANG_HCU_GSM8K_MODEL", DEFAULT_HCU_GSM8K_MODEL
-        )
+        cls.model = _get_model_env("SGLANG_HCU_GSM8K_MODEL", DEFAULT_HCU_GSM8K_MODEL)
         cls.threshold = _get_float_env("SGLANG_HCU_GSM8K_THRESHOLD", 0.88)
         cls.num_examples = _get_int_env_with_fallback(
             "SGLANG_HCU_GSM8K_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 100
@@ -134,6 +133,16 @@ class TestBW1100GSM8KEvalHCU(unittest.TestCase):
             )
             metrics = run_eval(args)
             metrics["score"] = round(metrics["score"], 4)
+            write_hcu_accuracy_result(
+                model_key="qwen25_7b_instruct",
+                model="Qwen2.5-7B-Instruct",
+                score=metrics["score"],
+                threshold=self.threshold,
+                num_examples=self.num_examples,
+                invalid_rate=metrics.get("invalid"),
+                latency_seconds=metrics.get("latency"),
+                source_test=__file__,
+            )
             write_results_to_json(self.model, metrics, "w")
             all_results.append((self.model, metrics["score"], 0.0, None))
         except Exception as exc:
