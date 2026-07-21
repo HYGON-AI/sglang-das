@@ -119,15 +119,15 @@ struct DLDataTypeTrait<bf16_t> {
 // fp16_t and bf16_t alias the HIP native types on DCU, so define their
 // traits only once through the native types below.
 template <>
-struct _dtype_trait<__half> {
+struct DLDataTypeTrait<__half> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct _dtype_trait<__hip_bfloat16> {
+struct DLDataTypeTrait<__hip_bfloat16> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
 template <>
-struct _dtype_trait<__hip_fp8_e4m3> {
+struct DLDataTypeTrait<__hip_fp8_e4m3> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 #endif

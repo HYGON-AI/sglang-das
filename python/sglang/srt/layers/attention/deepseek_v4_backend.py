@@ -69,7 +69,7 @@ from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_lightop,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool

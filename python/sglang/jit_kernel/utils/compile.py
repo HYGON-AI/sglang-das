@@ -166,7 +166,15 @@ def _find_hipcc() -> str:
 
 def _patch_tvm_ffi_load_inline_for_hip() -> None:
     """Teach CUDA-only tvm_ffi.cpp.load_inline builds to use hipcc on ROCm."""
-    load_inline_mod = importlib.import_module("tvm_ffi.cpp.load_inline")
+    try:
+        load_inline_mod = importlib.import_module("tvm_ffi.cpp.load_inline")
+    except ModuleNotFoundError as exc:
+        if exc.name != "tvm_ffi.cpp.load_inline":
+            raise
+        # Newer tvm_ffi merged load_inline into tvm_ffi.cpp.extension and supports
+        # the HIP backend natively (auto-detected), so this CUDA-only shim is neither
+        # importable nor needed. Skip patching and let tvm_ffi drive hipcc itself.
+        return
     if getattr(load_inline_mod, "_sglang_hipcc_patched", False):
         return
 

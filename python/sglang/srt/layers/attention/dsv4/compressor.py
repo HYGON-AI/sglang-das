@@ -33,7 +33,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_lightop,
 )
 from sglang.srt.layers.layernorm import RMSNorm

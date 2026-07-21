@@ -1968,3 +1968,30 @@ actual result in the checkpoint note.
   `zz-nmz22` container was not started implicitly.
 - Detailed file-by-file decisions and evidence:
   `docs/internal/dcu-main-daily-20260721-conflict-review.md`.
+
+### Official main daily 20260721 — post-merge fixed patch review
+
+- Base merge: `d328f8371812c26320ee1409c8ef2f98ee0773cd`.
+- Review scope: six uncommitted runtime/import fixes applied after the daily
+  merge. No new upstream commit was merged and no v0.5.15.post1_dev work was
+  mixed into this review.
+- Retained DCU-compatible fixes:
+  - renamed DCU `USE_ROCM` JIT dtype specializations from `_dtype_trait` to the
+    official `DLDataTypeTrait` interface;
+  - skipped the legacy HIP tvm-ffi monkey-patch only when
+    `tvm_ffi.cpp.load_inline` itself is absent, which matches the installed
+    package's `tvm_ffi.cpp.extension` layout;
+  - moved the two DSV4 LightOp imports to the canonical kernels namespace;
+  - restored the official `init_cublas` helper required by current attention
+    backend setup;
+  - repaired a submitted no-op NPU comment into the historical two-value
+    `FusedMoEMode` compatibility enum required by the retained local
+    `ep_moe/layer.py` post-load path.
+- Evidence: `git diff --check`, changed-Python compilation, direct imports of
+  `FusedMoEMode`, DSV4 LightOp, `init_cublas`, `DeepEPMoE`, and the installed
+  new tvm-ffi entrypoint all passed.
+- Runtime status: not run by this review. A fresh `hy-smi` idle preflight is
+  required before the single pure-TP service test. The patch is deliberately
+  uncommitted, not merged to `main`, and not pushed pending user review.
+- Detailed review:
+  `docs/internal/dcu-main-daily-20260721-fixed-patch-review.md`.

@@ -4751,3 +4751,13 @@ class W8a8GetCacheJSON:
                 configs_dict[configs_key]=sub_value
 
         return configs_dict
+
+
+def init_cublas():
+    """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+    dtype = torch.float16
+    device = "cuda"
+    a = torch.ones((16, 16), dtype=dtype, device=device)
+    b = torch.ones((16, 16), dtype=dtype, device=device)
+    c = a @ b
+    return c
