@@ -388,11 +388,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 aiter_can_use_preshuffle_paged_mqa,
             )
 
-            if (
-                is_hip()
-                and not is_dcu()
-                and not aiter_can_use_preshuffle_paged_mqa()
-            ):
+            if is_hip() and not is_dcu() and not aiter_can_use_preshuffle_paged_mqa():
                 # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
                 # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                 # not set, or SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
