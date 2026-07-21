@@ -3,14 +3,10 @@ name: quality-gate
 on:
   pull_request:
     branches:
-      - main
-      - master
-      - v0.5.15.post1_dev
+      - hcu/v0.5.15.post1-port
   push:
     branches:
-      - main
-      - master
-      - v0.5.15.post1_dev
+      - hcu/v0.5.15.post1-port
   workflow_dispatch:
 
 permissions:
@@ -178,52 +174,7 @@ jobs:
     name: check-sensitive-diff-text
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
-    runs-on: [self-hosted, Linux, X64, internal, quality]
-    timeout-minutes: 5
-
-    steps:
-      - name: Checkout target commit
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Resolve diff revisions
-        id: revisions
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
-
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            DIFF_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-          else
-            BASE_SHA="${{ github.event.before }}"
-            if [ -z "$BASE_SHA" ] || echo "$BASE_SHA" | grep -Eq '^0+$'; then
-              if git rev-parse "$HEAD_SHA^" >/dev/null 2>&1; then
-                DIFF_BASE="$HEAD_SHA^"
-              else
-                DIFF_BASE="$(git hash-object -t tree /dev/null)"
-              fi
-            else
-              DIFF_BASE="$BASE_SHA"
-            fi
-          fi
-
-          echo "base=$DIFF_BASE" >> "$GITHUB_OUTPUT"
-          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Check sensitive fields in added diff content
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 scripts/ci/hcu/check_sensitive_diff_text.py \
-            --repo "$GITHUB_WORKSPACE" \
-            --base "${{ steps.revisions.outputs.base }}" \
-            --head "${{ steps.revisions.outputs.head }}"
+    uses: HYGON-AI/open-source-governance/.github/workflows/sensitive-diff-check.yml@abbd542cd30f58bc93f9c8b401604f20a378d909
 
   secret-check:
     name: secret-check
