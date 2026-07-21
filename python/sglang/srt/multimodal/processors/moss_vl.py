@@ -30,15 +30,11 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
-    SGL_USE_CUDA_IPC,
-)
-from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -565,39 +561,14 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if SGL_USE_CUDA_IPC:
+            if self.use_cuda_ipc:
                 for item in mm_items:
-                    if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_slices_with_flags(
-                                item.feature
-                            )
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+                    if isinstance(item.precomputed_embeddings, torch.Tensor):
+                        item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                            item.precomputed_embeddings
                         )
-                        if isinstance(available_slice, dict):
-                            item.feature = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.feature,
-                                sync_buffer_meta=sync_flag,
-                            )
-                        elif not self.server_args.keep_mm_feature_on_device:
-                            item.feature = item.feature.cpu()
-                    elif (
-                        isinstance(item.precomputed_embeddings, torch.Tensor)
-                        and item.precomputed_embeddings.is_cuda
-                    ):
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_slices_with_flags(
-                                item.precomputed_embeddings
-                            )
-                        )
-                        if isinstance(available_slice, dict):
-                            item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.precomputed_embeddings,
-                                sync_buffer_meta=sync_flag,
-                            )
-                        elif not self.server_args.keep_mm_feature_on_device:
-                            item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),

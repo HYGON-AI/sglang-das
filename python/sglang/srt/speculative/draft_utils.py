@@ -14,6 +14,8 @@
 
 import logging
 
+logger = logging.getLogger(__name__)
+
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -24,8 +26,6 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class DraftBackendFactory:
@@ -400,11 +400,9 @@ class DraftBackendFactory:
         return AscendAttnBackend(self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
+        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
-        return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False)
+        return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_dcumla_prefill_backend(self):
         logger.warning(

@@ -98,7 +98,7 @@ if _is_dcu:
     import lightop
     from lightop import gemmopt
     from lightop import op
-    from sglang.srt.layers.attention.dsa.triton_kernel import (
+    from sglang.kernels.ops.attention.dsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
         hadamard_transform_optimized,
     )
@@ -1858,7 +1858,7 @@ class Indexer(MultiPlatformOp):
             "piecewise/breakable CUDA graph"
         )
         if not _is_npu:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
@@ -2057,9 +2057,9 @@ class Indexer(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         act_quant = None
         if _is_hip and not _is_dcu:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu and not _is_dcu:
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
@@ -2748,7 +2748,8 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            return topk_indices[0]
+            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+            return topk_indices[0].squeeze(1)
 
     def do_npu_cp_balance_indexer(
         self,
@@ -2825,7 +2826,7 @@ def pcg_dsa_indexer_prefill_split(
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
     assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch

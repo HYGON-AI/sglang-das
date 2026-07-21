@@ -1910,3 +1910,61 @@ actual result in the checkpoint note.
 - Status: committed as merge `8a075ddc63af713025cc585fa8d37a84cc99e217`; validated.
 - Detailed conflict decisions and evidence:
   `docs/internal/dcu-main-forward-port-v0.5.12-dev-step5-conflict-review.md`.
+
+### Official main daily 20260721 / `d6ef68881e26`
+
+- Branch: `sync/official-main-daily-20260721`.
+- DCU parent: `ccb9a976e9c3b7556fd6abbca0e4e251c187b678`.
+- Common official base: `7e229e2a817de7d59e919db7ab3809ab4a22e754`.
+- Official endpoint: `d6ef68881e263812d4901f632786015005c4d050`
+  (`[NPU] Adapt MiMo-V2.5-W8A8 (#29131)`, 2026-07-21).
+- Scope: 314 official commits and 1,350 official changed paths; resolved staged
+  tree has 1,348 paths with 131,551 insertions and 25,672 deletions.
+- Git reported exactly 48 textual conflict files. They cover DSV4/DSA and
+  FlashAttention, quantization/MoE, memory-pool and model-runner refactors,
+  ServerArgs/speculative code, disaggregation/IPC, two removed qserve sources,
+  documentation/configuration, and tests.
+- High-risk resolution decisions:
+  - allocation DCU behavior moved from `mem_cache/common.py` to
+    `mem_cache/allocation.py`;
+  - model KV sizing moved from the deleted `model_runner_kv_cache_mixin.py` to
+    `pool_configurator.py`;
+  - DCU pull/push custom-allreduce behavior moved into the new unified JIT
+    custom-allreduce sources, with obsolete headers kept deleted;
+  - DSV4 sparse prefill uses the official workspace/live-sequence structure
+    and has one implementation; `_is_dcu` selects Hygon `flash_mla` while the
+    generic path uses `sgl_kernel.flash_mla`;
+  - FlashAttention retains official CP-v2 materialization and separates KV
+    cache write scales from FA kernel descales, while preserving DCU cache-write
+    and custom-kernel behavior;
+  - DeepSeek V2's conflict-spliced qkv functions were repaired; DeepSeek V4
+    retains DCU weight-scale fallback and avoids incompatible post-load FP8
+    scale setup;
+  - CUDA IPC retains per-device DCU pools and applies official consumer-count
+    acknowledgement exactly once to every consumed source pool;
+  - official MXFP8, elastic-EP, and experimental SGL-Marlin ServerArgs handlers
+    are present together with existing DCU handlers;
+  - qserve sources and the old model-runner KV mixin remain deleted, with no
+    stale references.
+- `_is_dcu` refactor audit searched current, official, and old DCU trees for
+  platform predicates and DCU backend symbols. Dedicated DCU LightOp, AITER,
+  DeepEP, FlashMLA, FP8/cache-layout, and graph paths remain ahead of generic
+  HIP where behavior differs. `SGLANG_USE_AITER_AG=0` remains unchanged.
+- Static validation:
+  - zero unmerged entries and no precise conflict markers;
+  - staged `git diff --check` passed after normalizing one upstream CRLF file;
+  - all changed Python files compiled;
+  - isolated pyflakes found and the merge fixed missing Triton/logger/Qwen
+    imports plus a duplicate DSV4 sparse-prefill definition; remaining reports
+    were triaged as official conditional-import or CLI-annotation patterns;
+  - DCU registration passed with 277 files;
+  - DSA alias/CLI/registry validation passed;
+  - gfx938 HIP setup-name validation passed with package `sglang-kernel`, zero
+    unsupported CUDA calls, and 56 replaced launches.
+- Grouped high-risk import smoke terminated during GPU extension/plugin loading
+  without a Python traceback; it is not counted as a passed import gate.
+- Pure-TP validation: blocked before launch. `zz-nmz26` had VRAM 95% on all
+  eight devices and HCU 25.0%--98.6%; no model command was run. The stopped
+  `zz-nmz22` container was not started implicitly.
+- Detailed file-by-file decisions and evidence:
+  `docs/internal/dcu-main-daily-20260721-conflict-review.md`.

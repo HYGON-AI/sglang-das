@@ -22,7 +22,7 @@ import torch
 
 from sglang.srt.environ import envs
 
-from sglang.srt.utils import is_dcu, is_hip
+from sglang.srt.utils import is_dcu, is_hip, is_xpu
 
 _is_dcu = is_dcu()
 
@@ -138,6 +138,7 @@ class PagedIndexerMetadata:
     def __post_init__(self):
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
             or _is_dcu
         ):

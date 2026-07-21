@@ -24,8 +24,30 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_dcu, is_hip, is_xpu
 
 from .utils import make_name
+
+_is_dcu = is_dcu()
+_is_xpu = is_xpu()
+if _is_xpu:
+    from sgl_kernel import compress_norm_rope_store as compress_norm_rope_store_xpu
+    from sgl_kernel import (
+        flash_compress4_decode,
+        flash_compress4_prefill,
+        flash_compress128_decode,
+        flash_compress128_prefill,
+        plan_compress_decode,
+        plan_compress_decode_legacy,
+        plan_compress_prefill,
+        plan_compress_prefill_legacy,
+    )
+
+    _XPU_COMPRESS_FNS = {
+        4: (flash_compress4_decode, flash_compress4_prefill),
+        128: (flash_compress128_decode, flash_compress128_prefill),
+    }
+
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -80,9 +102,11 @@ def _jit_compress_module(
 
 
 @cache_once
-def _jit_compress_128_online_module(head_dim: int) -> Module:
+def _jit_compress_128_online_module(
+    head_dim: int, dtype_buffer: torch.dtype = torch.float32
+) -> Module:
     assert head_dim == 512
-    args = make_cpp_args(head_dim, is_arch_support_pdl())
+    args = make_cpp_args(head_dim, dtype_buffer, is_arch_support_pdl())
     kernel_class = f"FlashCompress128OnlineKernel<{args}>"
     return load_jit(
         make_name(f"compress_128_online_v2"),
@@ -145,24 +169,43 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
-        ) -> CompressorDecodePlan:
-        module = _jit_compress_plan_module()
-        plan_d = torch.empty(
-            (req_pool_indices.shape[0], 16),
-            dtype=torch.uint8,
-            device=req_pool_indices.device,
-        )
-        module.plan_decode_out(
+    ) -> CompressorDecodePlan:
+        if _is_dcu:
+            module = _jit_compress_plan_module()
+            plan_d = torch.empty(
+                (req_pool_indices.shape[0], 16),
+                dtype=torch.uint8,
+                device=req_pool_indices.device,
+            )
+            module.plan_decode_out(
+                req_pool_indices,
+                req_to_token,
+                full_to_state,
+                seq_lens,
+                plan_d,
+                int(compress_ratio),
+                int(swa_page_size),
+                int(ring_size),
+            )
+            return CompressorDecodePlan(compress_ratio, plan_d)
+
+        if _is_xpu:
+            fn = plan_compress_decode
+        else:
+            module = _jit_compress_plan_module()
+            fn = module.plan_decode
+        plan_d = fn(
             req_pool_indices,
             req_to_token,
             full_to_state,
             seq_lens,
-            plan_d,
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
         )
-        return CompressorDecodePlan(compress_ratio, plan_d)
+        return CompressorDecodePlan(
+            compress_ratio, torch.from_dlpack(plan_d) if not _is_xpu else plan_d
+        )
 
     @staticmethod
     def generate_legacy(
@@ -170,8 +213,13 @@ class CompressorDecodePlan(NamedTuple):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
-        module = _jit_compress_plan_module()
-        plan_d = module.plan_decode_legacy(req_pool_indices, seq_lens, compress_ratio)
+        if _is_xpu:
+            fn = plan_compress_decode_legacy
+        else:
+            module = _jit_compress_plan_module()
+            fn = module.plan_decode_legacy
+
+        plan_d = fn(req_pool_indices, seq_lens, compress_ratio)
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
     @staticmethod
@@ -227,25 +275,60 @@ class CompressorPrefillPlan(NamedTuple):
         num_q_tokens: int,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
-        is_gpu_input = seq_lens.device.type == "cuda"
+        is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
             0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
-        device = req_pool_indices.device
-        plan_c = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
-        plan_w = torch.empty((num_q_tokens, 8), dtype=torch.uint8, device=device)
-        module = _jit_compress_plan_module()
-        plan_lens = module.plan_prefill_out(
+        if int(num_q_tokens) == 0 and is_hip():
+            device = req_to_token.device
+            return CompressorPrefillPlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=device),
+                torch.empty((0, 8), dtype=torch.uint8, device=device),
+                pin_buffer,
+            )
+
+        if _is_dcu:
+            device = req_pool_indices.device
+            plan_c = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
+            plan_w = torch.empty((num_q_tokens, 8), dtype=torch.uint8, device=device)
+            module = _jit_compress_plan_module()
+            plan_lens = module.plan_prefill_out(
+                req_pool_indices,
+                req_to_token,
+                full_to_state,
+                seq_lens,
+                extend_lens,
+                pin_buffer,
+                plan_c,
+                plan_w,
+                int(num_q_tokens),
+                int(compress_ratio),
+                int(swa_page_size),
+                int(ring_size),
+                bool(use_cuda_graph),
+            )
+            return CompressorPrefillPlan(
+                compress_ratio,
+                plan_c[: int(plan_lens[0])],
+                plan_w[: int(plan_lens[1])],
+                pin_buffer,
+            )
+
+        if _is_xpu:
+            fn = plan_compress_prefill
+        else:
+            module = _jit_compress_plan_module()
+            fn = module.plan_prefill
+        plan_c, plan_w = fn(
             req_pool_indices,
             req_to_token,
             full_to_state,
             seq_lens,
             extend_lens,
             pin_buffer,
-            plan_c,
-            plan_w,
             int(num_q_tokens),
             int(compress_ratio),
             int(swa_page_size),
@@ -254,8 +337,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            plan_c[: int(plan_lens[0])],
-            plan_w[: int(plan_lens[1])],
+            torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
+            torch.from_dlpack(plan_w) if not _is_xpu else plan_w,
             pin_buffer,
         )
 
@@ -274,8 +357,13 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=True,
         )
-        module = _jit_compress_plan_module()
-        plan_c, plan_w = module.plan_prefill_legacy(
+        if _is_xpu:
+            fn = plan_compress_prefill_legacy
+        else:
+            module = _jit_compress_plan_module()
+            fn = module.plan_prefill_legacy
+
+        plan_c, plan_w = fn(
             req_pool_indices,
             seq_lens,
             extend_lens,
@@ -286,8 +374,8 @@ class CompressorPrefillPlan(NamedTuple):
         )
         return CompressorPrefillPlan(
             compress_ratio,
-            torch.from_dlpack(plan_c),
-            torch.from_dlpack(plan_w),
+            torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
+            torch.from_dlpack(plan_w) if not _is_xpu else plan_w,
             pin_buffer,
         )
 
@@ -354,13 +442,21 @@ def compress_forward(
     assert plan.compress_ratio == compress_ratio
     if is_online:
         assert compress_ratio == 128 and head_dim == 512
-        module = _jit_compress_128_online_module(512)
+        module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
     else:
-        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
-        module = _jit_compress_module(
-            head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
-        )
-    fn = module.decode if plan.is_decode else module.prefill
+        if _is_xpu:
+            decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
+        else:
+            dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+            module = _jit_compress_module(
+                head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
+            )
+
+    if _is_xpu:
+        fn = decode_fn if plan.is_decode else prefill_fn
+    else:
+        fn = module.decode if plan.is_decode else module.prefill
+
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
@@ -381,18 +477,33 @@ def compress_norm_rope_store(
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
-    )
-    fn = module.forward_fp4 if use_fp4 else module.forward
-    fn(
-        kv,
-        plan[1],
-        norm_weight,
-        norm_eps,
-        freq_cis,
-        out_loc,
-        kvcache,
-        plan.is_decode,
-        plan.compress_ratio,
-    )
+    if _is_xpu:
+        compress_norm_rope_store_xpu(
+            kv,
+            plan[1],
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            plan.is_decode,
+            plan.compress_ratio,
+            page_size,
+            use_fp4,
+        )
+    else:
+        module = _jit_compress_norm_rope_module(
+            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+        )
+        fn = module.forward_fp4 if use_fp4 else module.forward
+        fn(
+            kv,
+            plan[1],
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+            plan.is_decode,
+            plan.compress_ratio,
+        )

@@ -17,7 +17,7 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
 

@@ -286,3 +286,6 @@ artifacts/
 *.hip
 *_hip.*
 .humanize/
+
+# Internal, non-published docs
+internal-docs/

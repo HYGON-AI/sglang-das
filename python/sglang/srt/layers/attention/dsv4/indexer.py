@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     is_dcu,
     is_gfx95_supported,
     is_hip,
+    is_xpu,
 )
 from sglang.srt.utils.common import is_gfx942_supported, is_sm120_supported
 
@@ -112,14 +113,14 @@ def fp8_paged_mqa_logits_torch(
 
     kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
     kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
-    kv_values = kv_values_fp8.to(torch.float32)
+    kv_values = kv_values_fp8.to(torch.bfloat16)
     kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
 
     kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
     kv_scales = kv_scales_raw.view(dtype=torch.float32)
     kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
 
-    q_float = q_fp8[:, 0].to(torch.float32)
+    q_float = q_fp8[:, 0].to(torch.bfloat16)
     scores = torch.bmm(kv_values, q_float.transpose(1, 2))
     scores = F.relu(scores)
     scores = scores * weight.unsqueeze(1)
@@ -199,6 +200,25 @@ def fp8_paged_mqa_logits_torch_sm120(
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
 
+    _QUERY_CHUNK = 1024
+    if batch_size > _QUERY_CHUNK:
+        return torch.cat(
+            [
+                fp8_paged_mqa_logits_torch_sm120(
+                    q_fp8[start : start + _QUERY_CHUNK],
+                    kvcache_fp8,
+                    weight[start : start + _QUERY_CHUNK],
+                    seq_lens[start : start + _QUERY_CHUNK],
+                    page_table[start : start + _QUERY_CHUNK],
+                    deep_gemm_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+                for start in range(0, batch_size, _QUERY_CHUNK)
+            ],
+            dim=0,
+        )
+
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
     assert (
         block_size == 64
@@ -224,13 +244,13 @@ def fp8_paged_mqa_logits_torch_sm120(
     kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
     kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
 
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
+    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
     kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
 
     kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
     kv_scale = kv_scale.view(batch_size, max_padded_seq)
 
-    q = q_fp8[:, 0].to(torch.float32)
+    q = q_fp8[:, 0].to(torch.bfloat16)
 
     score = torch.bmm(kv_value, q.transpose(1, 2))
 
@@ -711,7 +731,7 @@ class C4IndexerBackendMixin:
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
         elif (
@@ -724,6 +744,12 @@ class C4IndexerBackendMixin:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
+        elif is_xpu():
+            from sgl_kernel import fp8_paged_mqa_logits_triton
+
+            # TODO: switch from triton to SYCL when OOM is resolved
+
+            fn = fp8_paged_mqa_logits_triton
         else:
             dg_paged_mqa_chunk_size = getattr(
                 envs, "SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE", None
