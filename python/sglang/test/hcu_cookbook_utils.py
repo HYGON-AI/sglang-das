@@ -34,7 +34,6 @@ from sglang.test.hcu_utils import (
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import popen_launch_server
 
-
 HCU_COOKBOOK_API_KEY = "sk-123456"
 
 QWEN3_COOKBOOK_ENV = {
@@ -43,6 +42,37 @@ QWEN3_COOKBOOK_ENV = {
     "SGLANG_USE_LIGHTOP": "1",
     "SGLANG_USE_CAUSAL_CONV1D": "1",
     "SGLANG_USE_AITER_LINEAR_ATTN": "1",
+}
+
+QWEN36_27B_COOKBOOK_ENV = dict(QWEN3_COOKBOOK_ENV)
+
+QWEN36_35B_A3B_COOKBOOK_ENV = {
+    **QWEN3_COOKBOOK_ENV,
+    "SGLANG_USE_CUDA_IPC_TRANSPORT": "1",
+    "SGLANG_USE_MARLIN_W16A16_MOE": "1",
+}
+
+QWEN35_397B_A17B_COOKBOOK_ENV = {
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "HSA_ENABLE_COREDUMP": "1",
+    "USE_HCU_CUSTOM_ALLREDUCE": "1",
+    "ALLREDUCE_STREAM_WITH_COMPUTE": "1",
+    "HIP_KERNEL_EVENT_SYSTENFENCE": "1",
+    "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD": "0",
+    "GLIBC_TUNABLES": "glibc.rtld.optional_static_tls=0x40000",
+    "HIP_KERNEL_BATCH_CEILING": "100",
+    "GPU_FORCE_BLIT_COPY_SIZE": "16",
+    "HSA_KERNARG_POOL_SIZE": "8388608",
+    "ROC_AQL_QUEUE_SIZE": "131072",
+    "SGLANG_USE_LIGHTOP": "1",
+    "SGLANG_USE_FP8_W8A8_MOE": "1",
+    "SGLANG_USE_FUSED_TOPK_SOFTMAX": "1",
+    "SGLANG_USE_CAUSAL_CONV1D": "1",
+    "SGLANG_USE_FUSED_RMS_ROTARY": "1",
+    "SGLANG_KV_LAYOUT_HCU_FA": "1",
+    "SGLANG_USE_AITER_LINEAR_ATTN": "1",
+    "SGLANG_USE_MODELSCOPE": "1",
+    "GPU_MAX_HW_QUEUES": "4",
 }
 
 GLM51_COOKBOOK_ENV = {
@@ -175,6 +205,7 @@ class HcuCookbookModelConfig:
     tp_size: int
     server_args: list[str]
     env: dict[str, str] = field(default_factory=dict)
+    eval_kwargs: dict[str, object] = field(default_factory=dict)
     timeout: int = 3600
     dtype_or_quant: str = "bf16"
 
@@ -214,6 +245,127 @@ def _qwen3_next_args(tp_size: int) -> list[str]:
         "--max-running-requests",
         "4",
         "--disable-custom-all-reduce",
+    ]
+
+
+def _qwen36_27b_args() -> list[str]:
+    return [
+        "--attention-backend",
+        "fa3",
+        "--mm-attention-backend",
+        "fa3",
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--tp-size",
+        "2",
+        "--pp-size",
+        "1",
+        "--page-size",
+        "64",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--reasoning-parser",
+        "qwen3",
+        "--trust-remote-code",
+        "--log-level",
+        "warning",
+        "--log-level-http",
+        "warning",
+    ]
+
+
+def _qwen36_35b_a3b_args() -> list[str]:
+    return [
+        "--attention-backend",
+        "fa3",
+        "--mm-attention-backend",
+        "fa3",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--cuda-graph-backend-prefill",
+        "tc_piecewise",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--tp-size",
+        "2",
+        "--pp-size",
+        "1",
+        "--page-size",
+        "64",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--trust-remote-code",
+        "--chunked-prefill-size",
+        "-1",
+        "--log-level",
+        "warning",
+        "--log-level-http",
+        "warning",
+    ]
+
+
+def _qwen35_397b_a17b_channel_fp8_args() -> list[str]:
+    return [
+        "--numa-node",
+        "0",
+        "0",
+        "0",
+        "0",
+        "1",
+        "1",
+        "1",
+        "1",
+        "--trust-remote-code",
+        "--tp-size",
+        "4",
+        "--pp-size",
+        "1",
+        "--dtype",
+        "bfloat16",
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        "64",
+        "--watchdog-timeout",
+        "36000",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--cuda-graph-backend-prefill",
+        "tc_piecewise",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--mem-fraction-static",
+        "0.8",
+        "--disable-radix-cache",
+        "--chunked-prefill-size",
+        "-1",
+        "--skip-server-warmup",
+        "--cuda-graph-max-bs",
+        "50",
+        "--log-level",
+        "warning",
+        "--log-level-http",
+        "warning",
     ]
 
 
@@ -259,6 +411,7 @@ def _glm51_args(quantization: str) -> list[str]:
         "--log-level-http",
         "warning",
     ]
+
 
 def _deepseek_v32_args(quantization: str) -> list[str]:
     return [
@@ -505,6 +658,45 @@ QWEN3_30B_A3B_W8A8_4GPU = HcuCookbookModelConfig(
     server_args=_common_text_args(4),
 )
 
+QWEN36_27B_2GPU = HcuCookbookModelConfig(
+    name="Qwen3.6-27B",
+    env_name="SGLANG_HCU_QWEN36_27B_MODEL",
+    default_path="/public/opendas/DL_DATA/llm-models/qwen3.6/Qwen3.6-27B",
+    tp_size=2,
+    timeout=3600,
+    dtype_or_quant="bf16",
+    env=QWEN36_27B_COOKBOOK_ENV,
+    server_args=_qwen36_27b_args(),
+)
+
+QWEN36_35B_A3B_2GPU = HcuCookbookModelConfig(
+    name="Qwen3.6-35B-A3B",
+    env_name="SGLANG_HCU_QWEN36_35B_A3B_MODEL",
+    default_path="/public/opendas/DL_DATA/llm-models/qwen3.6/Qwen3.6-35B-A3B",
+    tp_size=2,
+    timeout=3600,
+    dtype_or_quant="bf16",
+    env=QWEN36_35B_A3B_COOKBOOK_ENV,
+    eval_kwargs={
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
+    },
+    server_args=_qwen36_35b_a3b_args(),
+)
+
+QWEN35_397B_A17B_CHANNEL_FP8_4GPU = HcuCookbookModelConfig(
+    name="Qwen3.5-397B-A17B-Channel-FP8",
+    env_name="SGLANG_HCU_QWEN35_397B_A17B_CHANNEL_FP8_MODEL",
+    default_path=(
+        "/public/opendas/DL_DATA/llm-models/qwen3.5/Qwen3.5-397B-A17B-Channel-FP8"
+    ),
+    tp_size=4,
+    timeout=7200,
+    dtype_or_quant="w8a8_fp8",
+    env=QWEN35_397B_A17B_COOKBOOK_ENV,
+    server_args=_qwen35_397b_a17b_channel_fp8_args(),
+)
+
 GLM51_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
     name="GLM-5.1-Channel-FP8",
     env_name="SGLANG_HCU_GLM51_CHANNEL_FP8_MODEL",
@@ -640,6 +832,8 @@ QWEN25_VL_72B_W8A8 = HcuCookbookModelConfig(
 QWEN3_4GPU_MODELS = [QWEN3_NEXT_80B_4GPU, QWEN3_30B_A3B_4GPU, QWEN3_32B_4GPU]
 QWEN3_4GPU_PERF_MODELS = [QWEN3_30B_A3B_4GPU, QWEN3_32B_4GPU]
 QWEN3_4GPU_QUANT_MODELS = [QWEN3_30B_A3B_W8A8_4GPU]
+QWEN36_2GPU_MODELS = [QWEN36_27B_2GPU, QWEN36_35B_A3B_2GPU]
+QWEN35_4GPU_MODELS = [QWEN35_397B_A17B_CHANNEL_FP8_4GPU]
 GLM51_8GPU_MODELS = [GLM51_CHANNEL_FP8_8GPU, GLM51_CHANNEL_INT8_8GPU]
 GLM51_8GPU_PERF_MODELS = [GLM51_CHANNEL_FP8_8GPU]
 DEEPSEEK_V32_8GPU_MODELS = [
@@ -660,7 +854,11 @@ VLM_COOKBOOK_MODELS = [
     QWEN25_VL_72B_W8A8,
 ]
 VLM_COOKBOOK_QUANT_MODELS = [QWEN25_VL_72B_W8A8]
-COOKBOOK_GSM8K_EVAL_MODELS = [QWEN3_32B_4GPU, QWEN3_30B_A3B_4GPU]
+COOKBOOK_GSM8K_EVAL_MODELS = [
+    QWEN3_32B_4GPU,
+    QWEN3_30B_A3B_4GPU,
+    QWEN36_35B_A3B_2GPU,
+]
 COOKBOOK_MMLU_EVAL_MODELS = [QWEN3_32B_4GPU]
 COOKBOOK_MMMU_EVAL_MODELS = [QWEN3_VL_4B_INSTRUCT, QWEN3_VL_32B_INSTRUCT]
 
@@ -832,7 +1030,9 @@ class CookbookServer:
         message = payload.get("choices", [{}])[0].get("message", {})
         content = message.get("content") or message.get("reasoning_content") or ""
         if not content.strip():
-            raise AssertionError(f"VLM chat completion returned empty content: {payload}")
+            raise AssertionError(
+                f"VLM chat completion returned empty content: {payload}"
+            )
         return content
 
 
@@ -926,20 +1126,17 @@ def run_cookbook_accuracy_eval(
     dataset_path = None
     gsm8k_data_path = None
     if eval_name == "mmlu":
-        dataset_path = (
-            os.environ.get("SGLANG_HCU_COOKBOOK_MMLU_DATASET_PATH")
-            or os.environ.get("SGLANG_HCU_MMLU_DATASET_PATH")
-        )
+        dataset_path = os.environ.get(
+            "SGLANG_HCU_COOKBOOK_MMLU_DATASET_PATH"
+        ) or os.environ.get("SGLANG_HCU_MMLU_DATASET_PATH")
     elif eval_name == "mmmu":
-        dataset_path = (
-            os.environ.get("SGLANG_HCU_COOKBOOK_MMMU_DATASET_PATH")
-            or os.environ.get("SGLANG_HCU_MMMU_DATASET_PATH")
-        )
+        dataset_path = os.environ.get(
+            "SGLANG_HCU_COOKBOOK_MMMU_DATASET_PATH"
+        ) or os.environ.get("SGLANG_HCU_MMMU_DATASET_PATH")
     elif eval_name == "gsm8k":
-        gsm8k_data_path = (
-            os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_DATA_PATH")
-            or os.environ.get("SGLANG_HCU_GSM8K_DATA_PATH")
-        )
+        gsm8k_data_path = os.environ.get(
+            "SGLANG_HCU_COOKBOOK_GSM8K_DATA_PATH"
+        ) or os.environ.get("SGLANG_HCU_GSM8K_DATA_PATH")
 
     os.environ["OPENAI_API_KEY"] = HCU_COOKBOOK_API_KEY
     with CookbookServer(config, base_url) as server:
@@ -959,6 +1156,7 @@ def run_cookbook_accuracy_eval(
             dataset_path=dataset_path,
             response_answer_regex=None,
             return_latency=False,
+            **config.eval_kwargs,
         )
         metrics = run_eval(args)
 

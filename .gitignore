@@ -281,6 +281,7 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 *.ply
 *.npz
 artifacts/
+test-results/
 .claude/scheduled_tasks.lock
 # hip_kernel
 *.hip

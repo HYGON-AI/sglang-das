@@ -62,6 +62,12 @@
 - License: MIT License
 - Usage: simple evaluation helpers include Simple Evals-attributed implementations.
 
+## OpenAI HumanEval
+
+- Source: https://github.com/openai/human-eval
+- License: MIT License
+- Usage: the restricted HCU HumanEval correctness judge adapts HumanEval's execution guard and per-sample correctness-check structure.
+
 ## OmniServe / QServe
 
 - Source: https://github.com/mit-han-lab/omniserve

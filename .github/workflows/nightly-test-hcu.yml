@@ -35,6 +35,7 @@ on:
           - nightly-hcu-1gpu
           - nightly-hcu-accuracy
           - nightly-hcu-accuracy-text
+          - nightly-hcu-accuracy-reasoning-code
           - nightly-hcu-vlm
           - nightly-hcu-perf-text
           - nightly-hcu-large-model-4gpu
@@ -594,6 +595,54 @@ jobs:
             timeout_minutes: 180
             include_files: ""
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
+          - name: reasoning-code-qwen3-32b
+            group: nightly-hcu-accuracy-reasoning-code
+            suite: nightly-hcu-accuracy-reasoning-code
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 14400
+            timeout_minutes: 300
+            include_files: registered/hcu/accuracy/bw1100/test_reasoning_code_qwen3_32b_hcu.py
+            reasoning_model_key: qwen3_32b
+            visible_devices: "0,1,2,3,4,5,6,7"
+            extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
+          - name: reasoning-code-qwen3-30b-a3b
+            group: nightly-hcu-accuracy-reasoning-code
+            suite: nightly-hcu-accuracy-reasoning-code
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 14400
+            timeout_minutes: 300
+            include_files: registered/hcu/accuracy/bw1100/test_reasoning_code_qwen3_30b_a3b_hcu.py
+            reasoning_model_key: qwen3_30b_a3b
+            visible_devices: "0,1,2,3,4,5,6,7"
+            extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
+          - name: reasoning-code-qwen36-35b-a3b
+            group: nightly-hcu-accuracy-reasoning-code
+            suite: nightly-hcu-accuracy-reasoning-code
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 14400
+            timeout_minutes: 300
+            include_files: registered/hcu/accuracy/bw1100/test_reasoning_code_qwen36_35b_a3b_hcu.py
+            reasoning_model_key: qwen36_35b_a3b
+            visible_devices: "0,1"
+            extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
+          - name: reasoning-code-qwen35-397b
+            group: nightly-hcu-accuracy-reasoning-code
+            suite: nightly-hcu-accuracy-reasoning-code
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 14400
+            timeout_minutes: 300
+            include_files: registered/hcu/accuracy/bw1100/test_reasoning_code_qwen35_397b_hcu.py
+            reasoning_model_key: qwen35_397b
+            visible_devices: "0,1,2,3,4,5,6,7"
+            extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data"
           - name: vlm
             group: nightly-hcu-vlm
             suite: nightly-hcu-vlm
@@ -813,6 +862,8 @@ jobs:
       HCU_MODEL_EXTRA_HOST_PATHS: ${{ matrix.extra_model_paths || '' }}
       SGLANG_HCU_GSM8K_DATA_PATH: /public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl
       SGLANG_HCU_MMLU_DATASET_PATH: /public/opendas/DL_DATA/llm-models/datasets/mmlu
+      SGLANG_HCU_MATH500_DATA_PATH: /public/opendas/DL_DATA/opencompass_data/math/test_prm800k_500.jsonl
+      SGLANG_HCU_HUMANEVAL_DATA_PATH: /public/opendas/DL_DATA/opencompass_data/humaneval/human-eval-v2-20210705.jsonl
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_CI_USE_INSTALLED_WHEELS: "1"
       HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
@@ -868,6 +919,13 @@ jobs:
         if: steps.filter.outputs.should_run == 'true'
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
 
+      - name: Install reasoning/code evaluation dependencies
+        if: >-
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-reasoning-code'
+        run: >-
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_reasoning_code_deps.sh"
+
       - name: Run nightly HCU suite
         if: steps.filter.outputs.should_run == 'true'
         env:
@@ -903,6 +961,27 @@ jobs:
           echo "HCU_CI_INSTALL_WHEEL_URLS=${HCU_CI_INSTALL_WHEEL_URLS}"
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
             "${cmd[@]}"
+
+      - name: Judge HumanEval in a restricted container
+        if: >-
+          always() &&
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-reasoning-code'
+        run: >-
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_judge_humaneval.sh"
+          "${{ matrix.reasoning_model_key }}"
+
+      - name: Upload reasoning/code results
+        if: >-
+          always() &&
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-reasoning-code'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcu-reasoning-code-${{ matrix.reasoning_model_key }}-${{ github.run_id }}
+          path: ${{ env.HCU_CI_CHECKOUT_DIR }}/test-results/hcu-reasoning-code/${{ matrix.reasoning_model_key }}
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Cleanup HCU container
         if: always() && steps.filter.outputs.should_run == 'true'
