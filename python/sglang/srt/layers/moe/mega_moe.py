@@ -25,6 +25,7 @@ import torch
 from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -56,6 +57,7 @@ _MEGA_MOE_DCU_BACKEND_LL = "ll"
 _MEGA_MOE_DCU_BACKEND_NORMAL = "normal"
 _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
 _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD = 496
+_MEGA_MOE_DCU_K3_TAIL_REDUCE_ENV = "K3_USE_ASM_TAIL_REDUCE"
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +113,18 @@ def _get_dcu_normal_ll_token_threshold() -> int:
 def _select_dcu_megamoe_backend(selector_tokens: int) -> str:
     if selector_tokens < 0:
         raise ValueError("MegaMoE backend selector token count must be non-negative")
+    if is_dsa_enable_prefill_cp():
+        # CP prefill uses the rank-barrier + local-reduce path. The standalone
+        # DCU LL/tail-reduce path can VMFault under sustained CP traffic.
+        os.environ.setdefault(_MEGA_MOE_DCU_K3_TAIL_REDUCE_ENV, "0")
     if _is_pd_prefill_instance():
         return _MEGA_MOE_DCU_BACKEND_NORMAL
 
     mode = os.environ.get(_MEGA_MOE_DCU_BACKEND_ENV, _MEGA_MOE_DCU_BACKEND_AUTO)
     mode = mode.strip().lower()
     if mode == _MEGA_MOE_DCU_BACKEND_AUTO:
+        if is_dsa_enable_prefill_cp():
+            return _MEGA_MOE_DCU_BACKEND_NORMAL
         return (
             _MEGA_MOE_DCU_BACKEND_LL
             if selector_tokens <= _get_dcu_normal_ll_token_threshold()
@@ -281,7 +289,7 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -299,7 +307,7 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
         return not _IS_DCU or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
-    if global_num_tokens:
+    if global_num_tokens and not is_dsa_enable_prefill_cp():
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
@@ -308,9 +316,9 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"] = None,
+    forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -345,9 +353,9 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
@@ -385,7 +393,14 @@ def _run_mega_routed(
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
     global_num_tokens = get_dp_global_num_tokens()
-    dispatch_num_tokens = max(global_num_tokens) if global_num_tokens else num_tokens
+    # CP has already split the padded prefill batch across attention ranks at
+    # this point.  Using the DP-global token count here would size and select
+    # the MegaMoE dispatch as if every CP rank still owned the full batch.
+    dispatch_num_tokens = (
+        max(global_num_tokens)
+        if global_num_tokens and not is_dsa_enable_prefill_cp()
+        else num_tokens
+    )
     assert dispatch_num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
@@ -510,7 +525,7 @@ def _run_deep_gemm_dcu_w8a8_mega_moe(
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     buf,
     num_tokens: int,
     hidden_size: int,
@@ -549,7 +564,7 @@ def _run_standalone_dcu_w8a8_mega_moe(
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     buf,
     num_tokens: int,
     hidden_size: int,
@@ -636,7 +651,6 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(sf).copy_(result)
 
 
-
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
@@ -680,7 +694,9 @@ def build_mega_moe_experts_weights(experts) -> None:
         # the deep-ep path consumes the non-transposed interleaved scale and a
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights((w13, w13_sf))
+        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+            (w13, w13_sf)
+        )
         w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
         w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 

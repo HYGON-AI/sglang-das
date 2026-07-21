@@ -183,7 +183,14 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    # With a single DP replica and no residual attention-TP/MLP-TP gather,
+    # every CP rank receives the same work through the CP control broadcast.
+    # The scheduler metadata all-gather is therefore redundant and can hang
+    # on DCU CPU process groups during the idle loop.  Reuse the established
+    # skip path, which records each rank's local token count as required by CP.
+    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or (
+        dp_size == 1 and attn_tp_size == 1 and not require_mlp_tp_gather
+    )
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
