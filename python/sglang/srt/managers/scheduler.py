@@ -1201,12 +1201,9 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        # Fix I single-clock: dedicated scheduler group.
-        #
-        # This communicator is used only by the epoch-tagged StepInfo/MLPSync
-        # all-gather.  Do not mix recv-control or model-forward collectives into
-        # it.  A process-group timeout is a replica-fatal error; no plain-barrier
-        # fallback is allowed.
+        # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
+        # Do not mix recv-control or model-forward collectives into it.
+        # A process-group timeout is replica-fatal; no plain-barrier fallback.
         self.dp_scheduler_cpu_group = None
         self._dp_scheduler_epoch = 0
         if (
@@ -1215,20 +1212,21 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError(
-                    "Fix I requires require_mlp_sync=True on PD Decode"
+                    "PD Decode DP sync requires require_mlp_sync=True"
                 )
             if self.pp_size != 1:
                 raise RuntimeError(
-                    "Fix I currently supports PD Decode with pp_size=1 only"
+                    "PD Decode DP sync currently supports pp_size=1 only"
                 )
             if self.attn_tp_size != 1 or self.attn_cp_size != 1:
                 raise RuntimeError(
-                    "Fix I currently supports attn_tp_size=1 and "
+                    "PD Decode DP sync currently supports attn_tp_size=1 and "
                     "attn_cp_size=1 only"
                 )
             if not self.server_args.enable_dp_attention_local_control_broadcast:
                 raise RuntimeError(
-                    "Fix I requires --enable-dp-attention-local-control-broadcast "
+                    "PD Decode DP sync requires "
+                    "--enable-dp-attention-local-control-broadcast "
                     "to keep recv control off the full tp_cpu_group"
                 )
 
@@ -1241,17 +1239,17 @@ class Scheduler(
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
                 raise RuntimeError(
-                    "Fix I strict topology check failed: "
+                    "PD Decode DP sync topology check failed: "
                     f"tp_ranks={len(tp_ranks)} expected={expected_world} "
                     f"default_world={default_world}. "
-                    "Use this experimental patch only on the validated PP1 "
-                    "DP-attention Decode topology."
+                    "Supported only on PP1 DP-attention Decode topology."
                 )
             expected_ranks = list(range(default_world))
             if tp_ranks != expected_ranks:
                 raise RuntimeError(
-                    "Fix I requires tp_group.ranks to be the ordered full "
-                    f"default world: actual={tp_ranks} expected={expected_ranks}"
+                    "PD Decode DP sync requires tp_group.ranks to be the ordered "
+                    f"full default world: actual={tp_ranks} "
+                    f"expected={expected_ranks}"
                 )
 
             from datetime import timedelta

@@ -654,17 +654,14 @@ class DecodePreallocQueue:
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
         if not self.queue:
-            # Fix H: no mid-path DP tick (single tick at end of process_decode_queue)
             return
 
         if all(decode_req.waiting_for_input for decode_req in self.queue):
-            # Fix H: no mid-path DP tick
             return
 
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
-        # Fix H: no mid-path DP tick after handshake poll
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1531,7 +1528,6 @@ class DecodeTransferQueue:
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
-            # Fix H: no mid-path DP tick (single tick at end of process_decode_queue)
             return []
 
         if self.enable_staging:
@@ -1540,7 +1536,6 @@ class DecodeTransferQueue:
             polls = poll_and_all_reduce(
                 [dr.kv_receiver for dr in self.queue], self.gloo_group
             )
-        # Fix H: no mid-path DP tick after transfer poll; local completion follows
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -1628,10 +1623,8 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
-            # Fix I: the following MLPSync call is the only cross-DP
-            # scheduler rendezvous for this epoch.
             if self._engine_paused:
-                # DP hang fix: paused ranks must still join MLPSync allgather
+                # Paused ranks must still join MLPSync so DP peers do not hang.
                 if getattr(self, "require_mlp_sync", False):
                     self.maybe_prepare_mlp_sync_batch(None)
                 continue
@@ -1661,10 +1654,8 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
-            # Fix I: the following MLPSync call is the only cross-DP
-            # scheduler rendezvous for this epoch.
             if self._engine_paused:
-                # DP hang fix: paused ranks must still join MLPSync allgather
+                # Paused ranks must still join MLPSync so DP peers do not hang.
                 if getattr(self, "require_mlp_sync", False):
                     self.maybe_prepare_mlp_sync_batch(None)
                 continue
@@ -1813,13 +1804,7 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        """Fix I: local PD progress only; no cross-DP collective here.
-
-        Existing request-level IO timeouts remain in force.  If a local call
-        never returns, peers time out on the dedicated StepInfo process group
-        and the Decode replica fails fast.  This function records elapsed time
-        for StepInfo observability but does not add another rendezvous.
-        """
+        """Advance local PD queues; cross-DP sync happens later in MLPSync."""
         pd_t0 = time.monotonic()
         try:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:

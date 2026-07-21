@@ -451,7 +451,7 @@ class CommonKVManager(BaseKVManager):
         socket = zmq.Context().socket(zmq.PUSH)
         if is_ipv6:
             socket.setsockopt(zmq.IPV6, 1)
-        # DP hang fix C: manager-side PUSH must not block forever either
+        # Avoid blocking the scheduler forever on a stalled PUSH.
         socket.setsockopt(zmq.SNDTIMEO, 5000)
         socket.setsockopt(zmq.SNDHWM, 1000)
         socket.connect(endpoint)
@@ -1159,7 +1159,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                # DP hang fix: do not block scheduler forever on PUSH
+                # Avoid blocking the scheduler forever on a stalled PUSH.
                 sock.setsockopt(zmq.SNDTIMEO, 5000)
                 sock.setsockopt(zmq.SNDHWM, 1000)
                 sock.connect(endpoint)
