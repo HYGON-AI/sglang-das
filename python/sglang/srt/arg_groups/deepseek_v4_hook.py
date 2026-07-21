@@ -74,7 +74,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"got {server_args.cp_strategy}"
         )
 
+    # The unified CP flags may have been mirrored to the generic legacy alias
+    # before the model-specific dsv4 attention backend was resolved.  DSV4
+    # uses the DSA runtime alias, so keep the two mutually-exclusive legacy
+    # flags normalized here as well.
     server_args.enable_dsa_prefill_context_parallel = True
+    server_args.enable_prefill_context_parallel = False
     server_args.dsa_prefill_cp_mode = "round-robin-split"
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1

@@ -1903,7 +1903,12 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1:
+    # Context parallelism still uses the DP-attention scheduler control path
+    # to keep all attention-CP ranks on the same batch, even when there is only
+    # one data-parallel replica.  Model hooks enable it before this generic
+    # default runs; do not overwrite that decision or CP ranks can enter MLP
+    # collectives with different local scheduler states.
+    if view.dp_size == 1 and not view.enable_prefill_cp:
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 

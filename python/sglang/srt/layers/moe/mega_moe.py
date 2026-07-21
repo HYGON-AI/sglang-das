@@ -57,6 +57,7 @@ _MEGA_MOE_DCU_BACKEND_LL = "ll"
 _MEGA_MOE_DCU_BACKEND_NORMAL = "normal"
 _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
 _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD = 496
+_MEGA_MOE_DCU_K3_TAIL_REDUCE_ENV = "K3_USE_ASM_TAIL_REDUCE"
 
 logger = logging.getLogger(__name__)
 
@@ -112,12 +113,18 @@ def _get_dcu_normal_ll_token_threshold() -> int:
 def _select_dcu_megamoe_backend(selector_tokens: int) -> str:
     if selector_tokens < 0:
         raise ValueError("MegaMoE backend selector token count must be non-negative")
+    if is_dsa_enable_prefill_cp():
+        # CP prefill uses the rank-barrier + local-reduce path. The standalone
+        # DCU LL/tail-reduce path can VMFault under sustained CP traffic.
+        os.environ.setdefault(_MEGA_MOE_DCU_K3_TAIL_REDUCE_ENV, "0")
     if _is_pd_prefill_instance():
         return _MEGA_MOE_DCU_BACKEND_NORMAL
 
     mode = os.environ.get(_MEGA_MOE_DCU_BACKEND_ENV, _MEGA_MOE_DCU_BACKEND_AUTO)
     mode = mode.strip().lower()
     if mode == _MEGA_MOE_DCU_BACKEND_AUTO:
+        if is_dsa_enable_prefill_cp():
+            return _MEGA_MOE_DCU_BACKEND_NORMAL
         return (
             _MEGA_MOE_DCU_BACKEND_LL
             if selector_tokens <= _get_dcu_normal_ll_token_threshold()
@@ -386,7 +393,14 @@ def _run_mega_routed(
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
     global_num_tokens = get_dp_global_num_tokens()
-    dispatch_num_tokens = max(global_num_tokens) if global_num_tokens else num_tokens
+    # CP has already split the padded prefill batch across attention ranks at
+    # this point.  Using the DP-global token count here would size and select
+    # the MegaMoE dispatch as if every CP rank still owned the full batch.
+    dispatch_num_tokens = (
+        max(global_num_tokens)
+        if global_num_tokens and not is_dsa_enable_prefill_cp()
+        else num_tokens
+    )
     assert dispatch_num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="

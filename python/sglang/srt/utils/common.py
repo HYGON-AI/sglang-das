@@ -3497,7 +3497,12 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if server_args.dp_size == 1:
+            assert server_args.enable_prefill_cp, (
+                "dp_size must be greater than 1 unless DP-attention control "
+                "broadcast is used by context parallelism"
+            )
+            return False
         if (
             server_args.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
@@ -3540,7 +3545,12 @@ def require_attn_tp_gather(server_args: ServerArgs):
 
     if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
         if server_args.enable_dp_attention:
-            return server_args.dp_size < server_args.tp_size
+            # Rank layout is (DP, CP, attention-TP).  A gather is required
+            # only when the residual attention-TP dimension is larger than 1.
+            return (
+                server_args.dp_size * server_args.attn_cp_size
+                < server_args.tp_size
+            )
         else:
             return True
     else:
