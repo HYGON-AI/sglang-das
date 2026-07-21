@@ -174,7 +174,7 @@ jobs:
     name: check-sensitive-diff-text
     needs: changed-files
     if: needs.changed-files.outputs.has_files == 'true'
-    uses: HYGON-AI/open-source-governance/.github/workflows/sensitive-diff-check.yml@abbd542cd30f58bc93f9c8b401604f20a378d909
+    uses: HYGON-AI/open-source-governance/.github/workflows/sensitive-diff-check.yml@main
 
   secret-check:
     name: secret-check
