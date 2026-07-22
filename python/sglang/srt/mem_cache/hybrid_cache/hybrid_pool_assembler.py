@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
     MambaPoolHost,
     MHATokenToKVPoolHost,
+    MHATokenToKVPoolHostDCU,
     MLATokenToKVPoolHost,
     NSAIndexerPoolHost,
     PoolEntry,
@@ -51,7 +52,14 @@ def build_kv_host_pool(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
 ):
-    kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
+    # HostDCU only supports layout_dcu; keep ordinary Host for other layouts
+    # so non-DCU / non-Qwen3.5 HiCache paths are unchanged.
+    if use_mla:
+        kv_host_pool_cls = MLATokenToKVPoolHost
+    elif server_args.hicache_mem_layout == "layout_dcu":
+        kv_host_pool_cls = MHATokenToKVPoolHostDCU
+    else:
+        kv_host_pool_cls = MHATokenToKVPoolHost
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -515,12 +523,17 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
+    # MambaPoolHost only supports page_first/page_first_direct/layer_first.
+    # layout_dcu is KV-only (MHATokenToKVPoolHostDCU); fall back for mamba state.
+    mamba_layout = server_args.hicache_mem_layout
+    if mamba_layout == "layout_dcu":
+        mamba_layout = "page_first"
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
         server_args.hicache_size,
         allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
+        layout=mamba_layout,
     )
     entries = [
         build_pool_entry(

@@ -1018,6 +1018,7 @@ class Scheduler(
         )
         from sglang.srt.mem_cache.memory_pool_host import (
             MHATokenToKVPoolHost,
+            MHATokenToKVPoolHostDCU,
             MLATokenToKVPoolHost,
         )
 
@@ -1028,14 +1029,21 @@ class Scheduler(
         # Create host pool for draft with the same slot count as the target host pool,
         # so that host indices stay 1-to-1 between target and draft KV caches.
         primary = self.tree_cache.cache_controller.mem_pool_host
+        layout = self.server_args.hicache_mem_layout
         kw = dict(
             host_to_device_ratio=primary.size / pool.size,
             host_size=0,
             page_size=self.page_size,
-            layout=self.server_args.hicache_mem_layout,
+            layout=layout,
         )
         if isinstance(pool, MHATokenToKVPool):
-            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+            # layout_dcu requires DCU host pool (same as hybrid_pool_assembler)
+            cls = (
+                MHATokenToKVPoolHostDCU
+                if layout == "layout_dcu"
+                else MHATokenToKVPoolHost
+            )
+            draft_host_pool = cls(pool, **kw)
         elif isinstance(pool, MLATokenToKVPool):
             draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
         else:
