@@ -586,8 +586,8 @@ class LayerCommunicator:
                         hidden_states, residual
                     )
             else:
-                enable_dp_attention = get_global_server_args().enable_dp_attention
-                moe_a2a_backend = get_global_server_args().moe_a2a_backend
+                enable_dp_attention = get_server_args().enable_dp_attention
+                moe_a2a_backend = get_server_args().moe_a2a_backend
                 if residual is None:
                     residual = hidden_states
 
@@ -637,7 +637,7 @@ class LayerCommunicator:
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
                         )
-                    elif _use_fused_bailing_rms_quant and (enable_dp_attention is None or moe_a2a_backend is None) and get_global_server_args().ep_size == 1 and get_global_server_args().dp_size == 1: 
+                    elif _use_fused_bailing_rms_quant and (enable_dp_attention is None or moe_a2a_backend is None) and get_server_args().ep_size == 1 and get_server_args().dp_size == 1:
                         out_fp8, out_bs = rms_norm_per_token_fp8_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -702,7 +702,7 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
                         )
-                    elif _use_fused_bailing_rms_quant and get_global_server_args().ep_size == 1 and get_global_server_args().dp_size == 1:
+                    elif _use_fused_bailing_rms_quant and get_server_args().ep_size == 1 and get_server_args().dp_size == 1:
                         out_fp8, out_bs = rms_norm_per_token_fp8_quant(
                             hidden_states,
                             self.input_layernorm.weight,
