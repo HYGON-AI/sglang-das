@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Collect HCU GSM8K artifacts and send one signed Feishu card."""
+"""Collect shared HCU GSM8K results and send one signed Feishu card."""
 
 from __future__ import annotations
 
@@ -65,12 +65,33 @@ class AccuracyResult:
         return self.score >= self.threshold
 
 
+@dataclass(frozen=True)
+class PartitionStatus:
+    partition: str
+    outcome: str
+    run_id: int
+    run_attempt: int
+    target_ref: str
+    commit_sha: str
+    image_ref: str
+    image_id: str
+    runner_name: str
+
+
 @dataclass
 class CollectedResults:
     results: Dict[str, AccuracyResult] = field(default_factory=dict)
-    partition_outcomes: Dict[str, str] = field(default_factory=dict)
+    partition_statuses: Dict[str, PartitionStatus] = field(default_factory=dict)
     duplicate_models: Set[str] = field(default_factory=set)
+    duplicate_partitions: Set[str] = field(default_factory=set)
     diagnostics: List[str] = field(default_factory=list)
+
+    @property
+    def partition_outcomes(self) -> Dict[str, str]:
+        return {
+            partition: status.outcome
+            for partition, status in self.partition_statuses.items()
+        }
 
     @property
     def missing_models(self) -> Set[str]:
@@ -82,7 +103,7 @@ class CollectedResults:
 
     @property
     def missing_partitions(self) -> Set[str]:
-        return EXPECTED_PARTITIONS - set(self.partition_outcomes)
+        return EXPECTED_PARTITIONS - set(self.partition_statuses)
 
     @property
     def failed_partitions(self) -> Dict[str, str]:
@@ -148,7 +169,13 @@ def _load_accuracy_result(payload: dict, path: Path) -> AccuracyResult:
     )
 
 
-def _load_partition_status(payload: dict, path: Path) -> Tuple[str, str]:
+def _load_partition_status(
+    payload: dict,
+    path: Path,
+    *,
+    expected_run_id: Optional[int],
+    expected_run_attempt: Optional[int],
+) -> PartitionStatus:
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"{path}: unsupported partition schema_version")
     partition = str(payload["partition"])
@@ -157,30 +184,85 @@ def _load_partition_status(payload: dict, path: Path) -> Tuple[str, str]:
         raise ValueError(f"{path}: unexpected partition={partition!r}")
     if outcome not in {"success", "failure", "cancelled", "skipped"}:
         raise ValueError(f"{path}: unexpected outcome={outcome!r}")
-    return partition, outcome
+    run_id = int(payload["run_id"])
+    run_attempt = int(payload["run_attempt"])
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ValueError(
+            f"{path}: run_id={run_id} does not match expected {expected_run_id}"
+        )
+    if expected_run_attempt is not None and run_attempt != expected_run_attempt:
+        raise ValueError(
+            f"{path}: run_attempt={run_attempt} does not match expected "
+            f"{expected_run_attempt}"
+        )
+
+    required_strings = {}
+    for key in (
+        "target_ref",
+        "commit_sha",
+        "image_ref",
+        "image_id",
+        "runner_name",
+    ):
+        value = payload[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{path}: {key} must be a non-empty string")
+        required_strings[key] = value
+
+    return PartitionStatus(
+        partition=partition,
+        outcome=outcome,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        target_ref=required_strings["target_ref"],
+        commit_sha=required_strings["commit_sha"],
+        image_ref=required_strings["image_ref"],
+        image_id=required_strings["image_id"],
+        runner_name=required_strings["runner_name"],
+    )
 
 
-def collect_results(results_dir: Path) -> CollectedResults:
+def collect_results(
+    results_dir: Path,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_run_attempt: Optional[int] = None,
+) -> CollectedResults:
     collected = CollectedResults()
     if not results_dir.is_dir():
-        collected.diagnostics.append(f"artifact directory is missing: {results_dir}")
+        collected.diagnostics.append(
+            f"shared result directory is missing: {results_dir}"
+        )
         return collected
 
     for path in sorted(results_dir.rglob("*.json")):
+        relative_path = path.relative_to(results_dir)
+        if any(part.startswith(".") for part in relative_path.parts):
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError(f"{path}: top-level JSON value must be an object")
 
             if path.name == "partition-status.json":
-                partition, outcome = _load_partition_status(payload, path)
-                if partition in collected.partition_outcomes:
+                status = _load_partition_status(
+                    payload,
+                    path,
+                    expected_run_id=expected_run_id,
+                    expected_run_attempt=expected_run_attempt,
+                )
+                partition = status.partition
+                if (
+                    partition in collected.partition_statuses
+                    or partition in collected.duplicate_partitions
+                ):
+                    collected.duplicate_partitions.add(partition)
                     collected.diagnostics.append(
                         f"duplicate partition status for {partition}"
                     )
-                    collected.partition_outcomes.pop(partition, None)
+                    collected.partition_statuses.pop(partition, None)
                 else:
-                    collected.partition_outcomes[partition] = outcome
+                    collected.partition_statuses[partition] = status
                 continue
 
             result = _load_accuracy_result(payload, path)
@@ -198,6 +280,16 @@ def collect_results(results_dir: Path) -> CollectedResults:
         collected.diagnostics.append(f"missing partition status for {partition}")
     for partition, outcome in sorted(collected.failed_partitions.items()):
         collected.diagnostics.append(f"partition {partition} outcome={outcome}")
+
+    for field_name in ("target_ref", "commit_sha", "image_ref", "image_id"):
+        values = {
+            getattr(status, field_name)
+            for status in collected.partition_statuses.values()
+        }
+        if len(values) > 1:
+            collected.diagnostics.append(
+                f"partition metadata mismatch for {field_name}: {sorted(values)}"
+            )
     return collected
 
 
@@ -246,6 +338,14 @@ def build_card(
     passed_count = sum(result.passed for result in collected.results.values())
     regression_count = len(collected.regressions)
     missing_count = len(collected.missing_models)
+    image_ids = sorted(
+        {
+            status.image_id
+            for status in collected.partition_statuses.values()
+            if status.image_id
+        }
+    )
+    resolved_image = ", ".join(image_ids) if image_ids else "unknown"
 
     overview = (
         f"**结果**：{status}（通过 {passed_count} / 回归 {regression_count} / "
@@ -255,6 +355,7 @@ def build_card(
         f"**测试 ref**：{_single_line(target_ref)}\n"
         f"**提交**：{_single_line(commit_sha[:12] or 'unknown')}\n"
         f"**镜像**：{_single_line(image)}\n"
+        f"**镜像 ID**：{_single_line(resolved_image)}\n"
         f"**矩阵状态**：{_single_line(workflow_result)}"
     )
 
@@ -410,13 +511,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image", required=True)
     parser.add_argument("--workflow-result", required=True)
     parser.add_argument("--run-url", required=True)
+    parser.add_argument("--run-id", required=True, type=int)
+    parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    collected = collect_results(args.results_dir)
+    collected = collect_results(
+        args.results_dir,
+        expected_run_id=args.run_id,
+        expected_run_attempt=args.run_attempt,
+    )
     card = build_card(
         collected,
         branch=args.branch,

@@ -33,16 +33,19 @@ set -euo pipefail
 #   HCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
 #   HCU_MODEL_EXTRA_HOST_PATHS              Colon-separated host model roots to mount read-only
 #                                           at the same path inside the container.
+#   HCU_CI_NETWORK_MODE                     Docker network mode: host (default) or bridge.
 
 CUSTOM_IMAGE=""
 CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
+NETWORK_MODE="${HCU_CI_NETWORK_MODE:-host}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --custom-image|--image) CUSTOM_IMAGE="$2"; shift 2;;
     --container-name) CONTAINER="$2"; shift 2;;
+    --network-mode) NETWORK_MODE="$2"; shift 2;;
     -h|--help)
-      echo "Usage: $0 [--custom-image IMAGE|--image IMAGE] [--container-name NAME]"
+      echo "Usage: $0 [--custom-image IMAGE|--image IMAGE] [--container-name NAME] [--network-mode host|bridge]"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -59,7 +62,16 @@ else
   exit 1
 fi
 
+case "${NETWORK_MODE}" in
+  host|bridge) ;;
+  *)
+    echo "Error: unsupported HCU_CI_NETWORK_MODE=${NETWORK_MODE@Q}; expected host or bridge." >&2
+    exit 1
+    ;;
+esac
+
 echo "Using HCU image: ${IMAGE}"
+echo "Using HCU Docker network mode: ${NETWORK_MODE}"
 
 # Pull only if not already present locally, unless explicitly skipped.
 if [[ -z "${HCU_CI_SKIP_PULL:-}" ]] && ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
@@ -132,7 +144,7 @@ docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
 echo "Launching container: ${CONTAINER}"
 docker run -dt --user root --privileged \
-  --network=host \
+  --network="${NETWORK_MODE}" \
   --ipc=host \
   ${DEVICE_FLAGS} \
   --ulimit nofile=65536:65536 \

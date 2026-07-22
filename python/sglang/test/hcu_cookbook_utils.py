@@ -27,14 +27,13 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.hcu_server_guard import HcuServerGuard
 from sglang.test.hcu_utils import (
     RED_DOT_IMAGE_DATA_URL,
     get_model_path,
     openai_base_url,
 )
 from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import popen_launch_server
 from sglang.utils import read_jsonl
 
 HCU_COOKBOOK_API_KEY = "sk-123456"
@@ -971,35 +970,17 @@ def assert_server_info_ready(base_url: str, api_key: str) -> dict:
     return payload
 
 
-class CookbookServer:
+class CookbookServer(HcuServerGuard):
     def __init__(self, config: HcuCookbookModelConfig, base_url: str):
         self.config = config
-        self.base_url = base_url
-        self.model_path = config.resolve_model_path()
-        self.process = None
-
-    def __enter__(self):
-        try:
-            self.process = popen_launch_server(
-                self.model_path,
-                self.base_url,
-                timeout=self.config.timeout,
-                api_key=HCU_COOKBOOK_API_KEY,
-                other_args=list(self.config.server_args),
-                env=self.config.merged_env(),
-            )
-            assert_server_info_ready(self.base_url, HCU_COOKBOOK_API_KEY)
-        except Exception:
-            if self.process is not None:
-                kill_process_tree(self.process.pid)
-                self.process = None
-            raise
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.process is not None:
-            kill_process_tree(self.process.pid)
-            self.process = None
+        super().__init__(
+            config.resolve_model_path(),
+            base_url,
+            timeout=config.timeout,
+            api_key=HCU_COOKBOOK_API_KEY,
+            other_args=list(config.server_args),
+            env=config.merged_env(),
+        )
 
     def assert_chat_non_empty(self) -> str:
         response = requests.post(

@@ -577,6 +577,7 @@ jobs:
           - name: accuracy-text-0
             group: nightly-hcu-accuracy-text
             suite: nightly-hcu-accuracy-text
+            network_mode: bridge
             nightly: "true"
             part: 0
             parts: 2
@@ -587,6 +588,7 @@ jobs:
           - name: accuracy-text-1
             group: nightly-hcu-accuracy-text
             suite: nightly-hcu-accuracy-text
+            network_mode: bridge
             nightly: "true"
             part: 1
             parts: 2
@@ -810,6 +812,7 @@ jobs:
       HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
       HCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_CI_NETWORK_MODE: ${{ matrix.network_mode || 'host' }}
       HCU_MODEL_EXTRA_HOST_PATHS: ${{ matrix.extra_model_paths || '' }}
       SGLANG_HCU_GSM8K_DATA_PATH: /public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl
       SGLANG_HCU_MMLU_DATASET_PATH: /public/opendas/DL_DATA/llm-models/datasets/mmlu
@@ -817,6 +820,7 @@ jobs:
       HCU_CI_USE_INSTALLED_WHEELS: "1"
       HCU_WHEEL_STAGING_ROOT: /home/github/sgl_whl_temp
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
+      HCU_ACCURACY_SHARED_ROOT: /ci_public/sglang-das/hcu-accuracy
     steps:
       - name: Check job filter
         id: filter
@@ -914,50 +918,50 @@ jobs:
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" "${exec_args[@]}" -- \
             "${cmd[@]}"
 
-      - name: Record HCU accuracy partition status
+      - name: Capture HCU runtime image ID
+        if: >-
+          always() &&
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-text'
+        run: |
+          set -euo pipefail
+          image_id="$(docker inspect --format '{{.Image}}' "${HCU_CI_CONTAINER_NAME}" 2>/dev/null || true)"
+          if [[ -z "${image_id}" ]]; then
+            image_id="$(docker image inspect --format '{{.Id}}' "${HCU_CI_IMAGE}" 2>/dev/null || true)"
+          fi
+          echo "HCU_CI_RUNTIME_IMAGE_ID=${image_id:-unknown}" >> "${GITHUB_ENV}"
+          echo "Resolved HCU runtime image ID: ${image_id:-unknown}"
+
+      - name: Cleanup HCU container
+        if: always() && steps.filter.outputs.should_run == 'true'
+        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
+
+      - name: Publish HCU accuracy results to shared storage
         if: >-
           always() &&
           steps.filter.outputs.should_run == 'true' &&
           matrix.group == 'nightly-hcu-accuracy-text'
         env:
           PARTITION_OUTCOME: ${{ steps.run_suite.outcome }}
+          HCU_ACCURACY_COMMIT_SHA: ${{ needs.probe-hcu-wheels.outputs.full_sha }}
+          HCU_ACCURACY_TARGET_REF: ${{ needs.validate-config.outputs.target_ref }}
         run: |
           set -euo pipefail
           result_dir="${RUNNER_TEMP}/hcu-sglang-${GITHUB_RUN_ID}-nightly-${{ matrix.name }}/test-results/hcu-accuracy"
-          mkdir -p "${result_dir}"
-          python3 - "${result_dir}/partition-status.json" "${{ matrix.name }}" "${PARTITION_OUTCOME}" <<'PY'
-          import json
-          import sys
-
-          output_path, partition, outcome = sys.argv[1:]
-          with open(output_path, "w", encoding="utf-8") as output_file:
-              json.dump(
-                  {
-                      "schema_version": 1,
-                      "partition": partition,
-                      "outcome": outcome,
-                  },
-                  output_file,
-                  sort_keys=True,
-              )
-              output_file.write("\n")
-          PY
-
-      - name: Upload HCU accuracy results
-        if: >-
-          always() &&
-          steps.filter.outputs.should_run == 'true' &&
-          matrix.group == 'nightly-hcu-accuracy-text'
-        uses: actions/upload-artifact@v4
-        with:
-          name: hcu-accuracy-${{ matrix.name }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/hcu-sglang-${{ github.run_id }}-nightly-${{ matrix.name }}/test-results/hcu-accuracy
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Cleanup HCU container
-        if: always() && steps.filter.outputs.should_run == 'true'
-        run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
+          python_bin="$(command -v python3.12 || command -v python3.10 || command -v python3.9 || command -v python3.8 || command -v python3)"
+          "${python_bin}" "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_publish_accuracy.py" \
+            --local-results-dir "${result_dir}" \
+            --shared-root "${HCU_ACCURACY_SHARED_ROOT}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --partition "${{ matrix.name }}" \
+            --outcome "${PARTITION_OUTCOME}" \
+            --target-ref "${HCU_ACCURACY_TARGET_REF}" \
+            --commit-sha "${HCU_ACCURACY_COMMIT_SHA}" \
+            --image-ref "${HCU_CI_IMAGE}" \
+            --image-id "${HCU_CI_RUNTIME_IMAGE_ID:-unknown}" \
+            --runner-name "${RUNNER_NAME}" \
+            --retention-days 14
 
   nightly-hcu-finish:
     name: Nightly HCU finish
@@ -1009,27 +1013,32 @@ jobs:
     environment: hcu-ci-notify
     steps:
       - name: Checkout notification source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: hcu-notify-source
-
-      - name: Prepare HCU accuracy artifact directory
-        run: mkdir -p "${{ runner.temp }}/hcu-accuracy-${{ github.run_id }}"
-
-      - name: Download HCU accuracy artifacts
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: hcu-accuracy-*-${{ github.run_id }}
-          path: ${{ runner.temp }}/hcu-accuracy-${{ github.run_id }}
-          merge-multiple: false
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          checkout_dir="${RUNNER_TEMP}/hcu-notify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "${checkout_dir}"
+          mkdir -p "${checkout_dir}"
+          echo "HCU_NOTIFY_SOURCE_DIR=${checkout_dir}" >> "${GITHUB_ENV}"
+          git init "${checkout_dir}"
+          cd "${checkout_dir}"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git \
+            -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
+            -c http.https://github.com.proxy= \
+            -c http.proxy= \
+            -c https.proxy= \
+            fetch --no-tags --depth=1 origin "${CHECKOUT_REF}"
+          git checkout --force FETCH_HEAD
 
       - name: Send signed Feishu accuracy card
         env:
           FEISHU_HCU_CI_WEBHOOK: ${{ secrets.FEISHU_HCU_CI_WEBHOOK }}
           FEISHU_HCU_CI_SIGNING_SECRET: ${{ secrets.FEISHU_HCU_CI_SIGNING_SECRET }}
-          HCU_ACCURACY_RESULTS_DIR: ${{ runner.temp }}/hcu-accuracy-${{ github.run_id }}
+          HCU_ACCURACY_RESULTS_DIR: /ci_public/sglang-das/hcu-accuracy/run-${{ github.run_id }}/attempt-${{ github.run_attempt }}
           HCU_ACCURACY_BRANCH: ${{ github.ref_name }}
           HCU_ACCURACY_TARGET_REF: ${{ needs.validate-config.outputs.target_ref }}
           HCU_ACCURACY_COMMIT_SHA: ${{ needs.probe-hcu-wheels.outputs.full_sha }}
@@ -1039,11 +1048,13 @@ jobs:
         run: |
           set -euo pipefail
           python_bin="$(command -v python3.12 || command -v python3.10 || command -v python3.9 || command -v python3.8 || command -v python3)"
-          "${python_bin}" hcu-notify-source/scripts/ci/hcu/hcu_ci_notify_feishu.py \
+          "${python_bin}" "${HCU_NOTIFY_SOURCE_DIR}/scripts/ci/hcu/hcu_ci_notify_feishu.py" \
             --results-dir "${HCU_ACCURACY_RESULTS_DIR}" \
             --branch "${HCU_ACCURACY_BRANCH}" \
             --target-ref "${HCU_ACCURACY_TARGET_REF}" \
             --commit-sha "${HCU_ACCURACY_COMMIT_SHA}" \
             --image "${HCU_ACCURACY_IMAGE}" \
             --workflow-result "${HCU_ACCURACY_WORKFLOW_RESULT}" \
-            --run-url "${HCU_ACCURACY_RUN_URL}"
+            --run-url "${HCU_ACCURACY_RUN_URL}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}"

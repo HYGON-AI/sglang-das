@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
@@ -14,7 +13,8 @@ from sglang.test.hcu_cookbook_utils import (
     DEFAULT_HCU_GSM8K_DATA_PATH,
     KIMI_K26_8GPU,
 )
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
+from sglang.test.hcu_server_guard import HcuServerGuard
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 register_hcu_ci(
     est_time=4200,
@@ -47,14 +47,13 @@ class TestKimiK26EvalHCU(unittest.TestCase):
             raise AssertionError(f"Local GSM8K data path does not exist: {data_path}")
         model_path = KIMI_K26_8GPU.resolve_model_path()
 
-        process = popen_launch_server(
+        with HcuServerGuard(
             model_path,
             DEFAULT_URL_FOR_TEST,
             timeout=KIMI_K26_8GPU.timeout,
             other_args=list(KIMI_K26_8GPU.server_args),
             env=KIMI_K26_8GPU.merged_env(),
-        )
-        try:
+        ):
             response = requests.get(
                 DEFAULT_URL_FOR_TEST.rstrip("/") + "/flush_cache", timeout=60
             )
@@ -71,8 +70,6 @@ class TestKimiK26EvalHCU(unittest.TestCase):
                 port=int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[-1]),
             )
             metrics = run_eval_few_shot_gsm8k(args)
-        finally:
-            kill_process_tree(process.pid)
 
         accuracy = float(metrics["accuracy"])
         invalid = float(metrics["invalid"])

@@ -1,8 +1,10 @@
 import importlib.util
 import json
 import os
+import stat
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -27,6 +29,13 @@ accuracy_report = _load_module(
     "hcu_accuracy_report",
     REPO_ROOT / "python" / "sglang" / "test" / "hcu_accuracy_report.py",
 )
+publisher = _load_module(
+    "hcu_ci_publish_accuracy",
+    REPO_ROOT / "scripts" / "ci" / "hcu" / "hcu_ci_publish_accuracy.py",
+)
+
+TEST_RUN_ID = 12345
+TEST_RUN_ATTEMPT = 2
 
 
 def _result_payload(
@@ -56,10 +65,29 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _write_partition_status(path: Path, partition: str, outcome: str) -> None:
+def _write_partition_status(
+    path: Path,
+    partition: str,
+    outcome: str,
+    *,
+    run_id: int = TEST_RUN_ID,
+    run_attempt: int = TEST_RUN_ATTEMPT,
+) -> None:
     _write_json(
         path / "partition-status.json",
-        {"schema_version": 1, "partition": partition, "outcome": outcome},
+        {
+            "schema_version": 1,
+            "partition": partition,
+            "outcome": outcome,
+            "run_id": run_id,
+            "run_attempt": run_attempt,
+            "target_ref": "0713-hcu-sglang-test",
+            "commit_sha": "a" * 40,
+            "image_ref": "example/sglang:latest",
+            "image_id": "sha256:" + "b" * 64,
+            "runner_name": "nmz4-ci-pr",
+            "result_files": [],
+        },
     )
 
 
@@ -207,6 +235,133 @@ class ResultCollectionTest(unittest.TestCase):
                 run_url="https://github.com/HYGON-AI/sglang-das/actions/runs/3",
             )
             self.assertEqual(card["header"]["template"], "orange")
+
+    def test_wrong_run_metadata_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_partition_status(
+                root / "partition-0",
+                "accuracy-text-0",
+                "success",
+                run_id=TEST_RUN_ID - 1,
+            )
+            collected = notify.collect_results(
+                root,
+                expected_run_id=TEST_RUN_ID,
+                expected_run_attempt=TEST_RUN_ATTEMPT,
+            )
+            self.assertIn("accuracy-text-0", collected.missing_partitions)
+            self.assertTrue(
+                any("does not match expected" in item for item in collected.diagnostics)
+            )
+
+    def test_duplicate_partition_never_becomes_valid_again(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for index in range(3):
+                _write_partition_status(
+                    root / f"partition-{index}",
+                    "accuracy-text-0",
+                    "success",
+                )
+            collected = notify.collect_results(root)
+            self.assertIn("accuracy-text-0", collected.duplicate_partitions)
+            self.assertIn("accuracy-text-0", collected.missing_partitions)
+
+    def test_hidden_staging_directory_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            key, model = notify.EXPECTED_MODELS[0]
+            _write_json(
+                root / ".accuracy-text-0.tmp" / f"{key}.json",
+                _result_payload(key, model),
+            )
+            collected = notify.collect_results(root)
+            self.assertNotIn(key, collected.results)
+
+
+class SharedResultPublisherTest(unittest.TestCase):
+    def test_publishes_partition_atomically_with_group_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            local_results = root / "local"
+            shared_root = root / "shared"
+            key, model = notify.EXPECTED_MODELS[0]
+            _write_json(
+                local_results / f"{key}.json",
+                _result_payload(key, model),
+            )
+
+            published = publisher.publish_partition(
+                local_results_dir=local_results,
+                shared_root=shared_root,
+                run_id=TEST_RUN_ID,
+                run_attempt=TEST_RUN_ATTEMPT,
+                partition="accuracy-text-0",
+                outcome="success",
+                target_ref="0713-hcu-sglang-test",
+                commit_sha="a" * 40,
+                image_ref="example/sglang:latest",
+                image_id="sha256:" + "b" * 64,
+                runner_name="nmz4-ci-pr",
+            )
+
+            status_payload = json.loads(
+                (published / "partition-status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(status_payload["run_id"], TEST_RUN_ID)
+            self.assertEqual(status_payload["run_attempt"], TEST_RUN_ATTEMPT)
+            self.assertEqual(status_payload["result_files"], [f"{key}.json"])
+            self.assertEqual(stat.S_IMODE(published.stat().st_mode), 0o2775)
+            self.assertEqual(
+                stat.S_IMODE((published / f"{key}.json").stat().st_mode), 0o664
+            )
+            self.assertFalse(
+                any(path.name.startswith(".") for path in published.parent.iterdir())
+            )
+
+    def test_existing_partition_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            kwargs = {
+                "local_results_dir": root / "local",
+                "shared_root": root / "shared",
+                "run_id": TEST_RUN_ID,
+                "run_attempt": TEST_RUN_ATTEMPT,
+                "partition": "accuracy-text-0",
+                "outcome": "failure",
+                "target_ref": "0713-hcu-sglang-test",
+                "commit_sha": "a" * 40,
+                "image_ref": "example/sglang:latest",
+                "image_id": "sha256:" + "b" * 64,
+                "runner_name": "nmz4-ci-pr",
+            }
+            publisher.publish_partition(**kwargs)
+            with self.assertRaises(FileExistsError):
+                publisher.publish_partition(**kwargs)
+
+    def test_prunes_only_expired_run_directories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_root = Path(tmpdir)
+            expired = shared_root / "run-1"
+            current = shared_root / f"run-{TEST_RUN_ID}"
+            unrelated = shared_root / "model-cache"
+            for path in (expired, current, unrelated):
+                path.mkdir()
+            old_time = time.time() - 20 * 86400
+            os.utime(expired, (old_time, old_time))
+            os.utime(unrelated, (old_time, old_time))
+
+            removed = publisher.prune_expired_runs(
+                shared_root,
+                retention_days=14,
+                current_run_id=TEST_RUN_ID,
+                now=time.time(),
+            )
+            self.assertEqual(removed, [expired])
+            self.assertFalse(expired.exists())
+            self.assertTrue(current.exists())
+            self.assertTrue(unrelated.exists())
 
 
 class FeishuSendTest(unittest.TestCase):
