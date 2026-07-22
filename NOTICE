@@ -1,10 +1,10 @@
-dcu-sglang
+hcu-sglang
 
 This product includes software developed by the SGLang project
 (https://github.com/sgl-project/sglang), licensed under the Apache License,
 Version 2.0.
 
 This product includes modifications and original contributions by Hygon
-Information Technology Co., Ltd. for DCU platform support.
+Information Technology Co., Ltd. for HCU platform support.
 
 See LICENSE and THIRD_PARTY_NOTICES.md for license and attribution details.

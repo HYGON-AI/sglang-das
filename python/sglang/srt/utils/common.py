@@ -171,12 +171,8 @@ def is_hcu() -> bool:
         return False
 
 
-def is_dcu() -> bool:
-    return is_hcu()
-
-
 @lru_cache(maxsize=1)
-def is_dcu_native_fp8_supported() -> bool:
+def is_hcu_native_fp8_supported() -> bool:
     if not is_hcu():
         return False
     try:

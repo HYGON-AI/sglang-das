@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequan
 from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
-    is_dcu,
+    is_hcu,
     set_weight_attrs,
 )
 
@@ -32,9 +32,9 @@ __all__ = ["QuarkW8A8FP8MoE"]
 
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter and not _is_dcu:
+if _use_aiter and not _is_hcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight

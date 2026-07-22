@@ -93,20 +93,20 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_dcu,
+    is_hcu,
     log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_dpskv4_lightop_rmsnorm = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM")
 _use_fused_qnorm_rope_kv_rope_quant = get_bool_env_var(
     "SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT"
 )
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 
-if _is_dcu:
+if _is_hcu:
     from lightop import op
 
     if _use_aiter_tilelang_mhc:
@@ -249,7 +249,7 @@ class MQALayer(nn.Module):
 
         self.register_buffer("cos_sin_cache_fused", None, persistent=False)
         self.cos_sin_cache_fused: Optional[torch.Tensor]
-        if _is_dcu and _use_fused_qnorm_rope_kv_rope_quant:
+        if _is_hcu and _use_fused_qnorm_rope_kv_rope_quant:
             freqs_real = torch.view_as_real(self.freqs_cis)  # [max_pos, 32, 2]
             cos_sin_cache = torch.cat(
                 [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
@@ -395,7 +395,7 @@ class MQALayer(nn.Module):
         # fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         # return q_out
 
-        if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+        if _is_hcu and _use_dpskv4_lightop_rmsnorm:
             op.rms_norm_no_weight(None, q, None, self.eps)
         else:
             q = rms_normalize_triton(q, self.eps)
@@ -543,7 +543,7 @@ class MQALayer(nn.Module):
 
         _cp_enabled = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _bf16_kv_cache = forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
-        _use_lightop_qnorm_rope = _use_fused_qnorm_rope_kv_rope_quant and _is_dcu
+        _use_lightop_qnorm_rope = _use_fused_qnorm_rope_kv_rope_quant and _is_hcu
         if _use_lightop_qnorm_rope:
             cos_sin_cache_fused = self.cos_sin_cache_fused
             assert cos_sin_cache_fused is not None
@@ -589,7 +589,7 @@ class MQALayer(nn.Module):
                 if self.use_jit_norm:
                     q = rmsnorm_self(q, self.eps)
                 else:
-                    if _is_dcu and _use_dpskv4_lightop_rmsnorm:
+                    if _is_hcu and _use_dpskv4_lightop_rmsnorm:
                         op.rms_norm_no_weight(None, q, None, self.eps)
                     else:
                         q = rms_normalize_triton(q, self.eps)
@@ -686,7 +686,7 @@ class MQALayer(nn.Module):
         _fused_cache_insert_path = (
             _use_fused_qnorm_rope_kv_rope_quant
             and not _cp_enabled
-            and _is_dcu
+            and _is_hcu
             and not enable_multi_stream
             and not forward_batch.token_to_kv_pool.is_bf16_attention_kv_cache
         )
@@ -854,7 +854,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            if _is_dcu and _use_aiter_tilelang_mhc:
+            if _is_hcu and _use_aiter_tilelang_mhc:
                 post, comb, y = mhc_pre_big_fuse(
                     residual=x,
                     fn=hc_fn,
@@ -937,7 +937,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            if _is_dcu and _use_aiter_tilelang_mhc:
+            if _is_hcu and _use_aiter_tilelang_mhc:
                 out = mhc_post_fwd(
                     x,
                     residual,

@@ -16,8 +16,8 @@
 
 This is intentionally written for debuggability and numerical comparison rather
 than peak throughput. It supports both SGLang paged KV layouts:
-  * SGLANG_KV_LAYOUT_DCU_FA=0: k/v are [num_blocks, page_size, Hkv, D]
-  * vLLM/DCU FA layout:        k is [num_blocks, Hkv, page_size, D],
+  * SGLANG_KV_LAYOUT_HCU_FA=0: k/v are [num_blocks, page_size, Hkv, D]
+  * vLLM/HCU FA layout:        k is [num_blocks, Hkv, page_size, D],
                                v is [num_blocks, Hkv, D, page_size]
 """
 
@@ -213,7 +213,7 @@ def triton_vllm_flash_attn_varlen_func(
 
     total_q, h_q, d = q.shape
     if k.shape[1] == v.shape[1] and k.shape[2] == v.shape[3]:
-        # vLLM/DCU FA layout: k=[B,H,P,D], v=[B,H,Dv,P].
+        # vLLM/HCU FA layout: k=[B,H,P,D], v=[B,H,Dv,P].
         h_kv = k.shape[1]
         page_size = k.shape[2]
         d_v = v.shape[2]
@@ -230,7 +230,7 @@ def triton_vllm_flash_attn_varlen_func(
             v.stride(2),
         )
     elif k.shape[1] == v.shape[1] and k.shape[2] == v.shape[2]:
-        # SGLANG_KV_LAYOUT_DCU_FA=0 layout: k/v=[B,P,H,D].
+        # SGLANG_KV_LAYOUT_HCU_FA=0 layout: k/v=[B,P,H,D].
         page_size = k.shape[1]
         h_kv = k.shape[2]
         d_v = v.shape[-1]

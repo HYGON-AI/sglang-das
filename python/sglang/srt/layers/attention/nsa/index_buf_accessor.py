@@ -20,10 +20,10 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import get_bool_env_var, is_hip, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_hcu
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
@@ -446,14 +446,14 @@ def _set_k_and_s_triton(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
 
-    if _is_hip and not _is_dcu:
+    if _is_hip and not _is_hcu:
         assert buf_numel_per_page == 1 * (128 + 4)
     else:
         assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
-    if _is_hip and not _is_dcu:
+    if _is_hip and not _is_hcu:
         assert page_size == 1
     else:
         assert page_size == 64

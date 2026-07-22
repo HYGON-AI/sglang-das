@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
-    MHATokenToKVPoolHostDCU,
+    MHATokenToKVPoolHostHCU,
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
@@ -30,7 +30,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 logger = logging.getLogger(__name__)
 
 
@@ -60,8 +60,8 @@ class DecodeKVCacheOffloadManager:
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
-            if _kv_layout_dcu_fa:
-                self.decode_host_mem_pool = MHATokenToKVPoolHostDCU(
+            if _kv_layout_hcu_fa:
+                self.decode_host_mem_pool = MHATokenToKVPoolHostHCU(
                     kv_cache,
                     server_args.hicache_ratio,
                     server_args.hicache_size,

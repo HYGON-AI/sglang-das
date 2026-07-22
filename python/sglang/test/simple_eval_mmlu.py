@@ -34,6 +34,7 @@ from sglang.test.simple_eval_common import (
     HTML_JINJA,
     Eval,
     EvalResult,
+    QUERY_TEMPLATE_MULTICHOICE,
     SamplerBase,
     SingleEvalResult,
     format_multichoice_question,
@@ -101,7 +102,13 @@ subject2category = {
 
 
 class MMLUEval(Eval):
-    def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
+    def __init__(
+        self,
+        filename: str,
+        num_examples: Optional[int],
+        num_threads: int,
+        query_template: str | None = None,
+    ):
         if os.path.isdir(filename):
             examples = self._load_local_hf_mmlu(filename)
         elif "://" in filename:
@@ -114,6 +121,7 @@ class MMLUEval(Eval):
             examples = random.Random(0).sample(examples, num_examples)
         self.examples = examples
         self.num_threads = num_threads
+        self.query_template = query_template
 
     @staticmethod
     def _load_local_hf_mmlu(dataset_path: str) -> list[dict]:
@@ -164,7 +172,13 @@ class MMLUEval(Eval):
         def fn(row: dict):
             prompt_messages = [
                 sampler._pack_message(
-                    content=format_multichoice_question(row), role="user"
+                    content=format_multichoice_question(
+                        row,
+                        self.query_template
+                        if self.query_template is not None
+                        else QUERY_TEMPLATE_MULTICHOICE,
+                    ),
+                    role="user",
                 )
             ]
             response_text = sampler(prompt_messages)
