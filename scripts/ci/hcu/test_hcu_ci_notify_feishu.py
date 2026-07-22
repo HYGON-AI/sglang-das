@@ -166,6 +166,11 @@ class ResultCollectionTest(unittest.TestCase):
             )
             self.assertEqual(card["header"]["template"], "green")
             self.assertIn("全部通过", card["header"]["title"]["content"])
+            self.assertNotIn("0713", card["header"]["title"]["content"])
+            self.assertIn(
+                f"{len(notify.EXPECTED_MODELS)} 个 GSM8K",
+                card["elements"][0]["text"]["content"],
+            )
 
     def test_empty_artifact_directory_builds_orange_missing_card(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -179,9 +184,7 @@ class ResultCollectionTest(unittest.TestCase):
                 workflow_result="failure",
                 run_url="https://github.com/HYGON-AI/sglang-das/actions/runs/4",
             )
-            self.assertEqual(
-                len(collected.missing_models), len(notify.EXPECTED_MODELS)
-            )
+            self.assertEqual(len(collected.missing_models), len(notify.EXPECTED_MODELS))
             self.assertEqual(card["header"]["template"], "orange")
 
     def test_regression_is_red_even_with_missing_results(self):

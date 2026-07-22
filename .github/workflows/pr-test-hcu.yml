@@ -18,7 +18,7 @@ on:
       - ".github/workflows/pr-gate.yml"
       - ".github/workflows/release-pr-hcu.yml"
       - ".github/workflows/hcu-full-enabled.yml"
-      - ".github/workflows/release-pypi-nightky-hcu.yml"
+      - ".github/workflows/release-pypi-nightly-hcu.yml"
       - "scripts/ci/hcu/**"
       - "python/pyproject*.toml"
       - "python/sglang/**"
@@ -181,7 +181,7 @@ jobs:
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
           echo "${changed_files}"
 
-          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightky-hcu)\.yml|scripts/ci/hcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_hcu\.txt$)'
+          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_hcu\.txt$)'
 
           if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"

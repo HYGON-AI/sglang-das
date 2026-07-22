@@ -320,7 +320,11 @@ def _overall_status(
     )
     if has_infra_issue:
         return "orange", "结果不完整", "存在基础设施或范围外测例异常"
-    return "green", "全部通过", "10 个 GSM8K 基线全部达到阈值"
+    return (
+        "green",
+        "全部通过",
+        f"{len(EXPECTED_MODELS)} 个 GSM8K 基线全部达到阈值",
+    )
 
 
 def build_card(
@@ -425,7 +429,7 @@ def build_card(
             "template": color,
             "title": {
                 "tag": "plain_text",
-                "content": f"[HCU CI] 0713 高阈值精度 - {status}",
+                "content": f"[HCU CI] 高阈值精度 - {status}",
             },
         },
         "elements": elements,
