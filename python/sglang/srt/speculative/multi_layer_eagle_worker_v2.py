@@ -41,7 +41,10 @@ from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_e
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids_triton
+from sglang.srt.speculative.multi_layer_eagle_utils import (
+    assign_hidden_states_pool_triton,
+    rotate_input_ids_triton,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -98,12 +101,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
-            "multi-layer EAGLE requires speculative_num_draft_tokens == "
-            "speculative_num_steps + 1, "
-            f"got {self.speculative_num_draft_tokens} and "
-            f"{self.speculative_num_steps}"
-        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -155,11 +152,23 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         self.init_lm_head()
 
+        # KV cache reversion buffer; sized to mirror req_to_token (indexed by
+        # req_pool_idx).
+        self.req_to_hidden_states_pool = torch.empty(
+            (
+                self.req_to_token_pool.req_to_token.shape[0],
+                self.speculative_num_steps - 1,
+                self.model_config.hidden_size,
+            ),
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
+
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[
-                i
-            ].server_args.disable_cuda_graph = backup_disable_cuda_graph
+            self.draft_runner_list[i].server_args.disable_cuda_graph = (
+                backup_disable_cuda_graph
+            )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -196,9 +205,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_extend_attn_backend_list.append(
                 draft_backend_factory.create_draft_extend_backend()
             )
-            self.draft_runner_list[
-                step
-            ].attn_backend = self.draft_extend_attn_backend_list[-1]
+            self.draft_runner_list[step].attn_backend = (
+                self.draft_extend_attn_backend_list[-1]
+            )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -430,6 +439,17 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
         next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
 
+        # Update req_to_hidden_states_pool for KV Cache reversion
+        if forward_batch.extend_seq_lens is not None:
+            assign_hidden_states_pool_triton(
+                target_hidden_states,
+                forward_batch.req_pool_indices,
+                self.req_to_hidden_states_pool,
+                self.speculative_num_steps - 1,
+                forward_batch.batch_size,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+            )
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -458,11 +478,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
-        # `accept_lens` includes the bonus token.  Store both forms on the
-        # shared spec input so graph replay and padding use identical metadata.
-        forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
-        forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
-
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -476,7 +491,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.reset_cuda_graph_buffers(forward_batch, batch_result)
         else:
             logger.warning_once(
-                "can't use cuda graph for draft extend! may have correctness issue!"
+                f"can't use cuda graph for draft extend! may have correctness issue!"
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
@@ -497,19 +512,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_p,
                     draft_logits_output.topk_index,
                 )
-                ret_topk_p = ret_topk_p.clone()
-                ret_topk_index = ret_topk_index.clone()
-                if step < self.speculative_num_steps - 1:
-                    shared = self.cuda_graph_runner_for_draft_extend
-                    rotate_input_ids_triton(
-                        shared.buffers.input_ids[
-                            : forward_batch.batch_size * shared.num_tokens_per_bs
-                        ],
-                        shared.buffers.extend_start_loc[: forward_batch.batch_size],
-                        shared.buffers.extend_seq_lens[: forward_batch.batch_size],
-                        ret_topk_index,
-                        shared.buffers.select_index[: forward_batch.batch_size],
-                    )
             else:
                 forward_batch.req_to_token_pool = self.draft_runner_list[
                     step
@@ -541,6 +543,32 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     )
             ret_topk_p_list.append(ret_topk_p)
             ret_topk_index_list.append(ret_topk_index)
+
+        # Update req_to_hidden_states_pool for KV Cache reversion
+        if (
+            forward_batch.extend_seq_lens is not None
+            and self.cuda_graph_runner_for_draft_extend is not None
+        ):
+            if can_cuda_graph:
+                last_runner = self.cuda_graph_runner_for_draft_extend.get_last_runner()
+                hidden_states = last_runner.buffers.hidden_states
+                req_pool_indices = last_runner.buffers.req_pool_indices
+                extend_seq_lens = last_runner.buffers.extend_seq_lens
+                extend_start_loc = last_runner.buffers.extend_start_loc
+            else:
+                hidden_states = draft_logits_output.logits_output.hidden_states
+                req_pool_indices = forward_batch.req_pool_indices
+                extend_seq_lens = forward_batch.extend_seq_lens
+                extend_start_loc = forward_batch.extend_start_loc
+            assign_hidden_states_pool_triton(
+                hidden_states,
+                req_pool_indices,
+                self.req_to_hidden_states_pool,
+                self.speculative_num_steps - 1,
+                forward_batch.batch_size,
+                extend_seq_lens,
+                extend_start_loc,
+            )
 
         # Reorganize the spec info for the next batch
         # draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[

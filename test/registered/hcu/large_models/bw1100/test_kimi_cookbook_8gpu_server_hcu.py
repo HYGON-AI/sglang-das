@@ -17,7 +17,7 @@ import unittest
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_cookbook_utils import (
     CookbookServer,
-    KIMI_MIMO_8GPU_MODELS,
+    KIMI_8GPU_MODELS,
     selected_configs,
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
@@ -29,10 +29,10 @@ register_hcu_ci(
 )
 
 
-class TestKimiMimoCookbook8GpuServerHCU(unittest.TestCase):
-    def test_kimi_mimo_cookbook_8gpu_chat(self):
+class TestKimiCookbook8GpuServerHCU(unittest.TestCase):
+    def test_kimi_cookbook_8gpu_chat(self):
         configs = selected_configs(
-            KIMI_MIMO_8GPU_MODELS, "SGLANG_HCU_KIMI_MIMO_8GPU_MODEL_FILTER"
+            KIMI_8GPU_MODELS, "SGLANG_HCU_KIMI_8GPU_MODEL_FILTER"
         )
         for config in configs:
             with self.subTest(model=config.name):

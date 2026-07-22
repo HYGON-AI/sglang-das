@@ -152,7 +152,7 @@ class ResultCollectionTest(unittest.TestCase):
             root = Path(tmpdir)
             _write_complete_results(root)
             collected = notify.collect_results(root)
-            self.assertEqual(len(collected.results), 10)
+            self.assertEqual(len(collected.results), len(notify.EXPECTED_MODELS))
             self.assertFalse(collected.missing_models)
             self.assertFalse(collected.diagnostics)
             card = notify.build_card(
@@ -179,7 +179,9 @@ class ResultCollectionTest(unittest.TestCase):
                 workflow_result="failure",
                 run_url="https://github.com/HYGON-AI/sglang-das/actions/runs/4",
             )
-            self.assertEqual(len(collected.missing_models), 10)
+            self.assertEqual(
+                len(collected.missing_models), len(notify.EXPECTED_MODELS)
+            )
             self.assertEqual(card["header"]["template"], "orange")
 
     def test_regression_is_red_even_with_missing_results(self):

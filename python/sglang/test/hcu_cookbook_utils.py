@@ -210,16 +210,6 @@ KIMI_K26_COOKBOOK_ENV = {
     "ALLREDUCE_STREAM_WITH_COMPUTE": "1",
 }
 
-MIMO_V2_FLASH_COOKBOOK_ENV = {
-    "SGLANG_USE_LIGHTOP": "1",
-    "SGLANG_KV_LAYOUT_HCU_FA": "0",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ROCM_USE_AITER_MOE": "0",
-    "SGLANG_USE_AITER_FP8_ASM_MOE": "1",
-    "SGLANG_USE_TRITON_EXTEND_FROM_AITER": "1",
-    "SGLANG_USE_MODELSCOPE": "1",
-}
-
 VLM_COOKBOOK_ENV = {
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_USE_LIGHTOP": "1",
@@ -579,46 +569,6 @@ def _kimi_k26_args() -> list[str]:
     ]
 
 
-def _mimo_v2_flash_args() -> list[str]:
-    return [
-        "--pp-size",
-        "1",
-        "--dp-size",
-        "2",
-        "--tp-size",
-        "8",
-        "--page-size",
-        "64",
-        "--trust-remote-code",
-        "--mem-fraction-static",
-        "0.85",
-        "--max-running-requests",
-        "128",
-        "--tool-call-parser",
-        "mimo",
-        "--disable-radix-cache",
-        "--context-length",
-        "262144",
-        "--attention-backend",
-        "triton",
-        "--chunked-prefill-size",
-        "-1",
-        "--enable-dp-attention",
-        "--speculative-algorithm",
-        "EAGLE",
-        "--speculative-num-steps",
-        "3",
-        "--speculative-eagle-topk",
-        "1",
-        "--speculative-num-draft-tokens",
-        "4",
-        "--log-level",
-        "warning",
-        "--log-level-http",
-        "warning",
-    ]
-
-
 def _vlm_args(tp_size: int, quantization: str | None = None) -> list[str]:
     args = [
         "--attention-backend",
@@ -801,17 +751,6 @@ KIMI_K26_8GPU = HcuCookbookModelConfig(
     server_args=_kimi_k26_args(),
 )
 
-MIMO_V2_FLASH_8GPU = HcuCookbookModelConfig(
-    name="MiMo-V2-Flash",
-    env_name="SGLANG_HCU_MIMO_V2_FLASH_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/Xiaomi/MiMo-V2-Flash",
-    tp_size=8,
-    timeout=7200,
-    dtype_or_quant="bf16",
-    env=MIMO_V2_FLASH_COOKBOOK_ENV,
-    server_args=_mimo_v2_flash_args(),
-)
-
 QWEN3_VL_4B_INSTRUCT = HcuCookbookModelConfig(
     name="Qwen3-VL-4B-Instruct",
     env_name="SGLANG_HCU_QWEN3_VL_4B_INSTRUCT_MODEL",
@@ -873,8 +812,8 @@ DEEPSEEK_V32_8GPU_QUANT_MODELS = [DEEPSEEK_V32_CHANNEL_INT8_8GPU]
 MINIMAX_M25_8GPU_MODELS = [MINIMAX_M25_FP8_8GPU]
 MINIMAX_M25_8GPU_PERF_MODELS = [MINIMAX_M25_FP8_8GPU]
 MINIMAX_M25_8GPU_QUANT_MODELS = [MINIMAX_M25_W8A8_8GPU]
-KIMI_MIMO_8GPU_MODELS = [KIMI_K26_8GPU, MIMO_V2_FLASH_8GPU]
-KIMI_MIMO_8GPU_PERF_MODELS = [KIMI_K26_8GPU, MIMO_V2_FLASH_8GPU]
+KIMI_8GPU_MODELS = [KIMI_K26_8GPU]
+KIMI_8GPU_PERF_MODELS = [KIMI_K26_8GPU]
 VLM_COOKBOOK_MODELS = [
     QWEN3_VL_4B_INSTRUCT,
     GLM41V_9B_THINKING,

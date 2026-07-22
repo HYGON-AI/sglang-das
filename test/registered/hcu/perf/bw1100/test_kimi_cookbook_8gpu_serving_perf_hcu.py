@@ -19,7 +19,7 @@ from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_cookbook_utils import (
     assert_cookbook_min_output_throughput,
     CookbookServer,
-    KIMI_MIMO_8GPU_PERF_MODELS,
+    KIMI_8GPU_PERF_MODELS,
     run_random_serving_perf,
     selected_configs,
 )
@@ -33,14 +33,13 @@ register_hcu_ci(
 )
 
 
-COOKBOOK_KIMI_MIMO_8GPU_MIN_OUTPUT_TPS = {
+COOKBOOK_KIMI_8GPU_MIN_OUTPUT_TPS = {
     "Kimi-K2.6": 15.0,
-    "MiMo-V2-Flash": 150.0,
 }
 
 
-class TestKimiMimoCookbook8GpuServingPerfHCU(unittest.TestCase):
-    def test_kimi_mimo_random_serving_perf(self):
+class TestKimiCookbook8GpuServingPerfHCU(unittest.TestCase):
+    def test_kimi_random_serving_perf(self):
         output_dir = os.environ.get(
             "SGLANG_HCU_PERF_OUTPUT_DIR", "performance_profiles_hcu_text"
         )
@@ -48,8 +47,8 @@ class TestKimiMimoCookbook8GpuServingPerfHCU(unittest.TestCase):
         input_len = get_int_env("SGLANG_HCU_PERF_INPUT_LEN", 2048)
         output_len = get_int_env("SGLANG_HCU_PERF_OUTPUT_LEN", 256)
         configs = selected_configs(
-            KIMI_MIMO_8GPU_PERF_MODELS,
-            "SGLANG_HCU_KIMI_MIMO_8GPU_PERF_MODEL_FILTER",
+            KIMI_8GPU_PERF_MODELS,
+            "SGLANG_HCU_KIMI_8GPU_PERF_MODEL_FILTER",
         )
 
         for config in configs:
@@ -69,8 +68,8 @@ class TestKimiMimoCookbook8GpuServingPerfHCU(unittest.TestCase):
                 assert_cookbook_min_output_throughput(
                     config,
                     result,
-                    COOKBOOK_KIMI_MIMO_8GPU_MIN_OUTPUT_TPS,
-                    "SGLANG_HCU_KIMI_MIMO_8GPU_MIN_OUTPUT_TPS",
+                    COOKBOOK_KIMI_8GPU_MIN_OUTPUT_TPS,
+                    "SGLANG_HCU_KIMI_8GPU_MIN_OUTPUT_TPS",
                 )
 
 

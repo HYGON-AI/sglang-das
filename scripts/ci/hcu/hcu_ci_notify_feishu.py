@@ -40,7 +40,6 @@ EXPECTED_MODELS = (
     ("deepseek_v32_channel_fp8", "DeepSeek-V3.2-Channel-FP8"),
     ("glm51_channel_int8", "GLM-5.1-Channel-INT8"),
     ("kimi_k26", "Kimi-K2.6"),
-    ("mimo_v2_flash", "MiMo-V2-Flash"),
     ("minimax_m25", "MiniMax-M2.5"),
     ("qwen35_397b_channel_fp8", "Qwen3.5-397B-A17B-Channel-FP8"),
 )
