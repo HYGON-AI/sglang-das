@@ -40,6 +40,7 @@ from sglang.jit_kernel.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
     v4_rope_inplace_npu,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -88,7 +89,6 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.kernels.ops.attention.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -175,6 +175,7 @@ _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 
 if _is_hcu:
     from lightop import op
+
     if _use_aiter_tilelang_mhc:
         from aiter.ops.tilelang import mhc_post_fwd, mhc_pre_big_fuse
 
@@ -635,9 +636,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         self.use_fused_qk_norm_rope = (
-            _is_hip
-            and not _is_hcu
-            and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+            _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
         # KV cache write is always fused into the K kernel
@@ -1778,12 +1777,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
         if _use_cp:
-            if get_moe_a2a_backend().is_none():
+            moe_a2a_backend = get_moe_a2a_backend()
+            if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert get_moe_a2a_backend().is_deepep(), (
-                    "CP requires DeepEP (moe_a2a_backend == deepep). "
-                    "Only DeepEP is tested with CP's per-rank token split."
+                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
+                    "CP requires DeepEP or megaMoE "
+                    "(moe_a2a_backend == deepep or megamoe). "
+                    f"Got {moe_a2a_backend.value}."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
@@ -2088,12 +2089,16 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = _is_hcu or _is_cuda or (
-            _is_hip
-            and not _is_hcu
-            and (
-                envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
-                or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+        use_stream_pool = (
+            _is_hcu
+            or _is_cuda
+            or (
+                _is_hip
+                and not _is_hcu
+                and (
+                    envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                    or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                )
             )
         )
         num_alt_streams = 5 if (_is_cuda or _is_hcu) else 2
@@ -3035,8 +3040,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     fused_weight = torch.cat(
                                         [bucket["q"], bucket["kv"]], dim=0
                                     )
-                                    param_name = maybe_remap_compressed_tensors_scale_name(
-                                        param_name
+                                    param_name = (
+                                        maybe_remap_compressed_tensors_scale_name(
+                                            param_name
+                                        )
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)

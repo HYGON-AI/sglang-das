@@ -388,11 +388,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 aiter_can_use_preshuffle_paged_mqa,
             )
 
-            if (
-                is_hip()
-                and not is_hcu()
-                and not aiter_can_use_preshuffle_paged_mqa()
-            ):
+            if is_hip() and not is_hcu() and not aiter_can_use_preshuffle_paged_mqa():
                 # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
                 # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                 # not set, or SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
@@ -1903,7 +1899,12 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1:
+    # Context parallelism still uses the DP-attention scheduler control path
+    # to keep all attention-CP ranks on the same batch, even when there is only
+    # one data-parallel replica.  Model hooks enable it before this generic
+    # default runs; do not overwrite that decision or CP ranks can enter MLP
+    # collectives with different local scheduler states.
+    if view.dp_size == 1 and not view.enable_prefill_cp:
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 
