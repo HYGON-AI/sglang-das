@@ -1032,7 +1032,18 @@ class DeepEPMoE(FusedMoE):
         )
         del input_tensor
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(gateup_output, fp8type=0)
+        swiglu_limit = self.moe_runner_config.swiglu_limit
+        if swiglu_limit is None:
+            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
+                gateup_output,
+                fp8type=0,
+            )
+        else:
+            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
+                gateup_output,
+                fp8type=0,
+                limit=swiglu_limit,
+            )
         del gateup_output
 
         down_output = torch.empty(
@@ -1618,9 +1629,21 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(input=gateup_output,
-                                                          fp8type=0,
-                                                          tokens_per_expert=masked_m)
+        swiglu_limit = self.moe_runner_config.swiglu_limit
+        if swiglu_limit is None:
+            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
+                input=gateup_output,
+                fp8type=0,
+                tokens_per_expert=masked_m,
+            )
+        else:
+            q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
+                input=gateup_output,
+                fp8type=0,
+                tokens_per_expert=masked_m,
+                limit=swiglu_limit,
+            )
+            
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
