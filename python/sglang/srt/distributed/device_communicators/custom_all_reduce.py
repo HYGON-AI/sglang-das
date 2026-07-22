@@ -399,14 +399,14 @@ def dispatch_custom_allreduce(backend: str = "auto"):
             enable_reg = False
         if _is_hcu:
             logger.info(
-                "[AR] Using AiterCustomAllreduce (DCU/DTK, transport=%s, "
+                "[AR] Using AiterCustomAllreduce (HCU, transport=%s, "
                 "enable_register_for_capturing=%s)",
                 transport,
                 enable_reg,
             )
         else:
             logger.info(
-                "[AR] Using AiterCustomAllreduce (ROCm/HIP, transport=%s, "
+                "[AR] Using AiterCustomAllreduce (AMD, transport=%s, "
                 "enable_register_for_capturing=%s)",
                 transport,
                 enable_reg,
