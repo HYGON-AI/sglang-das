@@ -1901,7 +1901,7 @@ class MLATokenToKVPool(KVCache):
                     cache_k_rope_fp8,
                 )
         else:
-            if _is_dcu:
+            if _is_hcu:
                 from lightop import op
                 if self.dtype == torch.float8_e5m2:
                     fp8_dtype_str = "fp8_e5m2"
