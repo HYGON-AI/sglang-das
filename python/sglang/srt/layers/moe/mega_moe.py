@@ -62,6 +62,32 @@ _MEGA_MOE_DCU_K3_TAIL_REDUCE_ENV = "K3_USE_ASM_TAIL_REDUCE"
 logger = logging.getLogger(__name__)
 
 
+def _disable_dcu_megamoe_asm_tail_reduce_default() -> None:
+    """Disable the standalone-DCU MegaMoE ASM tail-reduce path by default.
+
+    The LL backend's ASM tail-reduce path VMFaults on DCU
+    (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION) during decode CUDA-graph
+    capture -- e.g. DeepSeek-V4 MTP verify graphs abort at small batch sizes.
+    Its setup (megamoe.opt.prepare_opt_3stage) reads K3_USE_ASM_TAIL_REDUCE
+    exactly once, when the symmetric buffer is first built during capture, so
+    the flag must already be disabled by then; the setdefault at
+    backend-selection time (used by the CP-prefill mitigation) runs after buffer
+    creation and is too late for decode. Apply it here instead: this module is
+    imported at model load, well before the first MegaMoE dispatch. Only reads
+    SGLANG_DCU_MEGA_MOE_RUNTIME (set before process start), never server args, so
+    it is safe at import time. An explicit K3_USE_ASM_TAIL_REDUCE still wins.
+    """
+    if not _IS_DCU:
+        return
+    runtime = envs.SGLANG_DCU_MEGA_MOE_RUNTIME.get()
+    if runtime is None or runtime.strip().lower() != _DCU_MEGA_MOE_RUNTIME_MEGAMOE:
+        return
+    os.environ.setdefault(_MEGA_MOE_DCU_K3_TAIL_REDUCE_ENV, "0")
+
+
+_disable_dcu_megamoe_asm_tail_reduce_default()
+
+
 def get_dcu_mega_moe_runtime() -> str:
     runtime = envs.SGLANG_DCU_MEGA_MOE_RUNTIME.get().strip().lower()
     if runtime not in _DCU_MEGA_MOE_RUNTIMES:
