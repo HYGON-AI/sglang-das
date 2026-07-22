@@ -4,9 +4,22 @@
 
 - Source: https://github.com/sgl-project/sglang
 - Upstream version: v0.5.12
+- Fixed source commit: `25f2e430acb914c793307a5139b9b2a2055a2547`
 - License: Apache License, Version 2.0
 - Original copyright: Copyright 2023-2024 SGLang Team
 - Hygon modifications: HCU platform adaptations, build scripts, dependency adjustments, performance optimizations, and documentation updates.
+
+### Registered local files derived from SGLang v0.5.12
+
+| Local path | Upstream path at fixed commit | HYGON modification |
+| --- | --- | --- |
+| `sgl-kernel/setup_hip.py` | `sgl-kernel/setup_rocm.py` | Adapted the ROCm extension build configuration for the HCU build and local kernel set. |
+| `test/registered/embedding/test_embedding_models.py` | `test/registered/prefill_only/test_embedding_models.py` | Added HCU CI registration, local model mapping, and HCU test parameters. |
+| `test/registered/embedding/test_encoder_embedding_models.py` | `test/manual/prefill_only/test_encoder_embedding_models.py` | Registered the upstream test in the HCU CI layout and added HCU execution metadata. |
+| `test/registered/hcu/openai_server/test_protocol_hcu.py` | `test/registered/unit/entrypoints/openai/test_protocol.py` | Added an HCU-specific registered test variant and adjusted the supported protocol cases. |
+| `test/registered/lora/test_lora_backend.py` | `test/manual/lora/test_lora_backend.py` | Registered the upstream LoRA backend test for HCU CI and added HCU execution metadata. |
+| `test/registered/models/test_reward_models.py` | `test/registered/prefill_only/test_reward_models.py` | Added HCU CI registration and HCU model-test metadata. |
+| `test/registered/openai_server/basic/test_protocol.py` | `test/registered/unit/entrypoints/openai/test_protocol.py` | Moved the upstream test into the registered server suite and added HCU CI registration. |
 
 ## vLLM
 

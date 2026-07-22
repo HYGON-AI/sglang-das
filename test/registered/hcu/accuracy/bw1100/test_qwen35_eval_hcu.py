@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 """HCU Qwen3.5 397B Channel FP8 GSM8K evaluation on four BW1100 cards."""
 
 import os

@@ -1,5 +1,9 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_o.py
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from typing import Optional

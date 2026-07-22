@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 The SwissAI Initiative

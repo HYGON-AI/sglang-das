@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Adapted from qwen2_moe.py
 
 # Copyright 2023-2024 SGLang Team

@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 

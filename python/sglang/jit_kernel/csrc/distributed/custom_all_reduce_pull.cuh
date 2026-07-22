@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 // Partially migrated from AOT kernel:
 // https://github.com/sgl-project/sglang/blob/v0.5.9/sgl-kernel/csrc/allreduce/custom_all_reduce.cu
 // Which was originally adapted from:

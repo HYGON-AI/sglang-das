@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 """HCU DeepSeek-V3.2 GSM8K completion evaluation on eight BW1100 cards."""
 
 import os
