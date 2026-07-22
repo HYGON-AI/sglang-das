@@ -1686,8 +1686,12 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts,
             routed_scaling_factor,
         )
-        # LightOp already returns DCU expert IDs in its runtime layout. Applying
-        # the generic EPLB remap here a second time breaks MiMo routing.
+        if (expert_location_dispatch_info is not None) or (
+            num_token_non_padded is not None
+        ):
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
         return topk_weights, topk_ids
     else:
         num_experts = gating_output.shape[1]

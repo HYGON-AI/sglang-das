@@ -364,6 +364,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # DeepSeek-V4 only needs the SWA tail during PD prefill/decode transfer.
+    # Set to false to restore the legacy admission cap based on the SWA pool.
+    SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

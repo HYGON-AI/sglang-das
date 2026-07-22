@@ -2,6 +2,8 @@
 
 Plan date: 2026-07-16 CST
 
+Last workflow update: 2026-07-22 CST
+
 ## 1. Baseline and branch roles
 
 The official-main catch-up and the complete `v0.5.12_dev` forward-port are now
@@ -73,12 +75,17 @@ For each release-branch patch, Codex scope remains intentionally bounded:
    `E9,F401,F811,F821,F841`, precise marker scan, and `git diff --check`.
 3. Run DCU registration, DSA alias/CLI/registry, and gfx938 HIP metadata gates
    when applicable.
-4. Immediately before model validation, check both `zz-nmz22` and `zz-nmz26`
-   with `hy-smi`; never launch on a node with VRAM or HCU activity.
+4. Immediately before model validation, check every candidate below with
+   `hy-smi`; never launch on a node with VRAM or HCU activity:
+   - `zz-nmz22 / rye_sglang_0716`
+   - `zz-nmz26 / rye_sglang_0716`
+   - `zz-nmz20 / rye_sglang_0716`
+   - `zz-sglang2 / rye_sglang_0720`
 5. Run only:
 
    ```bash
-   bash /home/scripts/sglang/run_dpsk-v4.sh 10015 /home/model/DeepSeek-V4-Flash-FP8-Channel
+   cd /home/scripts/sglang
+   bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-FP8-Channel
    ```
 
 6. Gate on service readiness, `/health` HTTP 200, and one short `/generate`

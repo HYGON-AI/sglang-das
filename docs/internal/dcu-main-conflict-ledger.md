@@ -1910,3 +1910,57 @@ actual result in the checkpoint note.
 - Status: committed as merge `8a075ddc63af713025cc585fa8d37a84cc99e217`; validated.
 - Detailed conflict decisions and evidence:
   `docs/internal/dcu-main-forward-port-v0.5.12-dev-step5-conflict-review.md`.
+
+### v0.5.12_dev daily forward-port / `023409568bfb` (2026-07-22)
+
+- Branch: `forward-port/v0.5.12-dev-daily-20260722`.
+- Target parent: `bd8c84eb4f05a88c94e37daf7f21fe5a08376fa9`
+  on `v0.5.15.post1_dev`.
+- Old range:
+  `5ec8531b096fa3297ab034dedc873aad215f2c35..023409568bfb83982fbb173ac742baf12dc7dcc3`.
+- Scope: 29 full-graph commits, 20 non-merge commits, and 23 resolved
+  code/workflow files before documentation (820 insertions, 966 deletions).
+- Git reported exactly 11 textual conflict files: common PD connection,
+  decode, prefill, custom all-reduce, parallel state, environment registry,
+  LightOp TopK, current DP-attention Adapter, DeepSeek V2/V4, HY3, and
+  ServerArgs.
+- Major retained behavior:
+  - HY3 PP and latest EPLB fix on current `make_layers`, stream-registry, and
+    local-stage loading APIs;
+  - causal-conv `causal_conv1d_fn_hcu` interface adaptation;
+  - AITER `auto/native/aiter/off` backend and Fabric/IPC transport controls;
+  - DSV4 full-token-pool PD prefill admission;
+  - Qwen2.5-VL FA3 sequence offsets and DeepSeek RMS residual advancement;
+  - PD Decode DP anti-hang StepInfo protocol ported from the removed Mixin to
+    the current Adapter with a corrected 7+10 field layout;
+  - LTX-2 batching/TP/non-contiguous-output fixes and pinned quality gate.
+- Refactor decisions:
+  - paused decode uses `dp_attn_adapter.maybe_prepare_mlp_sync_batch`, not the
+    removed scheduler Mixin API;
+  - HY3 lazy expert enumeration is restricted to the local PP stage so
+    `PPMissingLayer` placeholders are never treated as decoder layers;
+  - the obsolete `SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS` merge artifact
+    was omitted because current `disaggregation_decode_extra_slots` already
+    implements that behavior;
+  - old hand-written ServerArgs CLI definitions were not restored into the
+    current Annotated argument system.
+- `_is_dcu` audit: corrected old `_is_hcu` runtime use to `_is_dcu`, retained
+  current CUDA custom-AR V2 capability checks, kept dedicated DCU LightOp and
+  causal-conv behavior, and left `SGLANG_USE_AITER_AG=0` unchanged.
+- Static gates passed: zero unmerged entries, no precise markers,
+  `git diff --cached --check`, compilation of all 22 changed Python files,
+  focused high-risk imports, causal-conv HCU symbol check, ServerArgs parser
+  check, DP StepInfo layout assertion, 277-file DCU registration, and 19 DSA
+  alias tests. Ruff was unavailable in `rye_sglang_0716` and is not claimed.
+- Pure-TP gate:
+  - rejected occupied `zz-nmz22`, `zz-nmz26`, and `zz-nmz20` environments;
+  - selected idle `zz-sglang2 / rye_sglang_0720`;
+  - the required `/module/DeepSeek-V4-Flash-FP8-Channel` command loaded 46
+    shards, captured graphs `bs=128..1`, and initialized AITER IPC custom AR
+    on all eight ranks with `disabled=False`;
+  - `/health` and `/generate` returned HTTP 200, and generation returned eight
+    non-empty tokens;
+  - no retry/fix was needed; port 10015 closed and the selected node returned
+    to VRAM/HCU 0%.
+- Detailed evidence:
+  `docs/internal/dcu-v0.5.15-post1-dev-forward-port-20260722-conflict-review.md`.

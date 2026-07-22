@@ -2521,6 +2521,28 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
+    def _safe_send_multipart(self, sock, parts):
+        """Swallow ZMQ send timeout so the decode scheduler can keep joining MLPSync."""
+        import zmq
+
+        try:
+            zmq.Socket.send_multipart(sock, parts)
+            return True
+        except zmq.Again:
+            logger.error(
+                "ZMQ PUSH SNDTIMEO in MooncakeKVReceiver; mark room=%s failed so DP sync can proceed",
+                getattr(self, "bootstrap_room", None),
+            )
+            try:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "ZMQ PUSH send timeout (SNDTIMEO)",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            except Exception as e:
+                logger.error("failed to record ZMQ timeout failure: %s", e)
+            return False
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -2567,7 +2589,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
-                sock.send_multipart(
+                self._safe_send_multipart(sock,
                     [
                         "None".encode("ascii"),
                         self.kv_mgr.local_ip.encode("ascii"),
@@ -2615,7 +2637,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
 
             with lock:
-                sock.send_multipart(
+                self._safe_send_multipart(sock,
                     [
                         str(self.bootstrap_room).encode("ascii"),
                         self.kv_mgr.local_ip.encode("ascii"),

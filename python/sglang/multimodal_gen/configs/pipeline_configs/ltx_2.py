@@ -205,6 +205,10 @@ class LTX2PipelineConfig(PipelineConfig):
             auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
         )
 
+    def supports_dynamic_batching(self) -> bool:
+        """Allow text-only LTX batching; scheduler image_path gate rejects images."""
+        return True
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         """Return unpacked latent shape [B, C, F, H, W]."""
         height = batch.height // self.vae_scale_factor

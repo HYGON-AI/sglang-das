@@ -678,7 +678,9 @@ class CommonKVManager(BaseKVManager):
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
             sock.setsockopt(zmq.RECONNECT_IVL, -1)
-            sock.setsockopt(zmq.SNDTIMEO, 30000)
+            # Do not let a stalled PD peer block the scheduler forever.
+            sock.setsockopt(zmq.SNDTIMEO, 5000)
+            sock.setsockopt(zmq.SNDHWM, 1000)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
@@ -1561,6 +1563,9 @@ class CommonKVReceiver(BaseKVReceiver):
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
+                # Avoid blocking the scheduler forever on a stalled PUSH.
+                sock.setsockopt(zmq.SNDTIMEO, 5000)
+                sock.setsockopt(zmq.SNDHWM, 1000)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()

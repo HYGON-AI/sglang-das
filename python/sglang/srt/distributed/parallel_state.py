@@ -250,6 +250,8 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    # Selected custom all-reduce backend: auto | native | aiter | off.
+    custom_all_reduce_backend: str
     use_torch_symm_mem_all_reduce: (
         bool  # a hint of whether to use TorchSymmMemAllReduce
     )
@@ -278,6 +280,7 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
+        custom_all_reduce_backend: str = "auto",
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -354,6 +357,7 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.custom_all_reduce_backend = custom_all_reduce_backend
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -406,23 +410,61 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
-        if use_custom_allreduce and self.world_size > 1:
+        ca_backend = self.custom_all_reduce_backend
+        aiter_transport_env = os.getenv("AITER_AR_TRANSPORT", "ipc").lower()
+        if use_custom_allreduce and self.world_size > 1 and ca_backend != "off":
             # Initialize a custom fast all-reduce implementation.
             try:
                 CAClass = dispatch_custom_allreduce(
                     group=self.cpu_group,
                     device=self.device,
+                    backend=ca_backend,
                 )
-                self.ca_comm = CAClass(
-                    group=self.cpu_group,
-                    device=self.device,
-                )
+                if CAClass is not None:
+                    self.ca_comm = CAClass(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
             except Exception as e:
-                logger.warning(
-                    f"Setup Custom allreduce failed with {e}. To silence this "
-                    "warning, specify --disable-custom-all-reduce explicitly."
+                strict_fabric = (
+                    ca_backend == "aiter" and aiter_transport_env == "fabric"
                 )
-            if is_hip() and use_quick_custom_allreduce:
+                if strict_fabric:
+                    logger.error(
+                        "[AR] Strict Fabric init failed on TP group ranks=%s: %s",
+                        self.ranks,
+                        e,
+                    )
+                    raise
+                logger.warning(
+                    f"Setup Custom allreduce failed with {e} "
+                    f"(backend={ca_backend}, transport={aiter_transport_env}). "
+                    "Falling back to RCCL/PyNccl. To silence this warning, "
+                    "specify --disable-custom-all-reduce explicitly."
+                )
+                self.ca_comm = None
+
+            # doc §6.4 item 6: aiter+fabric silently landing on disabled=True
+            # is treated as a strict-Fabric failure.
+            if (
+                self.ca_comm is not None
+                and ca_backend == "aiter"
+                and aiter_transport_env == "fabric"
+                and getattr(self.ca_comm, "disabled", False)
+            ):
+                raise RuntimeError(
+                    f"[AR] Strict Fabric requested but aiter CA is disabled "
+                    f"(ranks={self.ranks}). AITER_AR_TRANSPORT=fabric must not "
+                    "silently degrade to RCCL."
+                )
+
+            # doc §6.5: QuickAllReduce is IPC-only. When aiter is going to run
+            # over Fabric/auto, don't let QR construct alongside it.
+            suppress_qr = (
+                ca_backend in ("aiter", "auto")
+                and aiter_transport_env in ("fabric", "auto")
+            )
+            if is_hip() and use_quick_custom_allreduce and not suppress_qr:
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
                     # when rocm >= gfx942. Quick reduce is designed as a
@@ -434,8 +476,47 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+
+            # doc §6.4 item 6 / §7.5: canonical startup log — must be greppable
+            # per-rank so operators can prove Fabric was actually selected.
+            requested_transport = (
+                aiter_transport_env if ca_backend in ("aiter", "auto") else "n/a"
+            )
+            selected_transport = (
+                getattr(self.ca_comm, "transport", "n/a")
+                if self.ca_comm is not None
+                else "n/a"
+            )
+            disabled = (
+                True
+                if self.ca_comm is None
+                else bool(getattr(self.ca_comm, "disabled", True))
+            )
+            logger.info(
+                "[AR] custom_all_reduce_backend=%s requested_transport=%s "
+                "selected_transport=%s disabled=%s tp_ranks=%s world_size=%s",
+                ca_backend,
+                requested_transport,
+                selected_transport,
+                disabled,
+                self.ranks,
+                self.world_size,
+            )
+            if (
+                ca_backend == "aiter"
+                and requested_transport == "fabric"
+                and selected_transport != "fabric"
+            ):
+                logger.error(
+                    "[AR] Requested transport=fabric but selected=%s. "
+                    "This should not happen under strict-Fabric semantics.",
+                    selected_transport,
+                )
         elif self.world_size > 1 and is_hip():
-            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
+            logger.info(
+                "[AR] All-reduce call path: NCCL (custom AR disabled, backend=%s)",
+                ca_backend,
+            )
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -1675,6 +1756,7 @@ def init_world_group(
         use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
+        custom_all_reduce_backend="off",
     )
 
 
@@ -1689,6 +1771,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    custom_all_reduce_backend: Optional[str] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1696,6 +1779,8 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if custom_all_reduce_backend is None:
+        custom_all_reduce_backend = _CUSTOM_ALL_REDUCE_BACKEND
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1714,6 +1799,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        custom_all_reduce_backend=custom_all_reduce_backend,
     )
 
 
@@ -1846,11 +1932,21 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_CUSTOM_ALL_REDUCE_BACKEND: str = "auto"
 
 
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def set_custom_all_reduce_backend(backend: str) -> None:
+    global _CUSTOM_ALL_REDUCE_BACKEND
+    _CUSTOM_ALL_REDUCE_BACKEND = backend
+
+
+def get_custom_all_reduce_backend() -> str:
+    return _CUSTOM_ALL_REDUCE_BACKEND
 
 
 def set_mscclpp_all_reduce(enable: bool):
@@ -2240,6 +2336,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
+            custom_all_reduce_backend="off",
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -2299,6 +2396,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_ep",
             recovered_rank=recovered_rank,
+            custom_all_reduce_backend="off",
         )
 
     global _MOE_TP
@@ -2327,6 +2425,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
             recovered_rank=recovered_rank,
+            custom_all_reduce_backend="off",
         )
 
     # Build the pipeline model-parallel groups.
@@ -2347,6 +2446,7 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
+        custom_all_reduce_backend="off",
     )
 
 

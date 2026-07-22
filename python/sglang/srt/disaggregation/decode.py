@@ -279,7 +279,6 @@ class DecodeRequest:
     def priority(self) -> Optional[int]:
         return self.req.priority
 
-
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -1950,6 +1949,9 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                # Paused ranks must still join MLPSync so DP peers do not hang.
+                if getattr(self, "require_mlp_sync", False):
+                    self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(None)
                 continue
             self.process_decode_queue()
 
@@ -1986,6 +1988,9 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                # Paused ranks must still join MLPSync so DP peers do not hang.
+                if getattr(self, "require_mlp_sync", False):
+                    self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(None)
                 continue
             self.process_decode_queue()
 
@@ -2141,35 +2146,50 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        if self.enable_decode_hicache:
-            self.tree_cache.check_hicache_events()
+        """Advance local PD queues; cross-DP sync happens later in MLPSync."""
+        pd_t0 = time.monotonic()
+        try:
+            if self.enable_decode_hicache:
+                self.tree_cache.check_hicache_events()
 
-        if self.server_args.disaggregation_decode_enable_offload_kvcache:
-            self.decode_offload_manager.check_offload_progress()
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                self.decode_offload_manager.check_offload_progress()
 
-        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+            # Try to resume retracted requests if there is enough space.
+            resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+            self.waiting_queue.extend(resumed_reqs)
+            if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+                return
 
-        if not hasattr(self, "polling_count"):
-            self.polling_count = 0
-            self.polling_interval = (
-                self.server_args.disaggregation_decode_polling_interval
-            )
+            if not hasattr(self, "polling_count"):
+                self.polling_count = 0
+                self.polling_interval = (
+                    self.server_args.disaggregation_decode_polling_interval
+                )
 
-        self.polling_count = (self.polling_count + 1) % self.polling_interval
+            self.polling_count = (self.polling_count + 1) % self.polling_interval
 
-        if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
-            if self.enable_hisparse:
-                for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            if self.polling_count % self.polling_interval == 0:
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+                self.disagg_decode_transfer_queue.extend(req_conns)
+                transferred_reqs = (
+                    self.disagg_decode_transfer_queue.pop_transferred()
+                )
+                if self.enable_hisparse:
+                    for req in transferred_reqs:
+                        self.hisparse_coordinator.admit_request_direct(req)
+                    self.waiting_queue.extend(transferred_reqs)
+                else:
+                    self.waiting_queue.extend(transferred_reqs)
+        finally:
+            elapsed_ms = (time.monotonic() - pd_t0) * 1000.0
+            self._dp_scheduler_last_pd_ms = elapsed_ms
+            # Soft PD budget for StepInfo observability only (no fail-fast).
+            budget_ms = 5000.0
+            self._dp_scheduler_pd_over_budget = elapsed_ms > budget_ms
+            if self._dp_scheduler_pd_over_budget:
+                logger.warning(
+                    "PD Decode local progress exceeded budget: %.1fms > %.1fms",
+                    elapsed_ms,
+                    budget_ms,
+                )
