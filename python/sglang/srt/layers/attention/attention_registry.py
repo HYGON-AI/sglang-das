@@ -156,11 +156,11 @@ def create_flashmla_backend(runner):
 
     return FlashMLABackend(runner)
 
-@register_attention_backend("dcu_mla")
-def create_dcu_mla_backend(runner):
-    from sglang.srt.layers.attention.dcu_mla_backend import DCUMLABackend
+@register_attention_backend("hcu_mla")
+def create_hcu_mla_backend(runner):
+    from sglang.srt.layers.attention.hcu_mla_backend import HCUMLABackend
 
-    return DCUMLABackend(runner)
+    return HCUMLABackend(runner)
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):

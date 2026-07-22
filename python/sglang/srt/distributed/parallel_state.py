@@ -52,7 +52,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda_alike,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -66,7 +66,7 @@ _use_fused_reshape_to_float = get_bool_env_var("SGLANG_USE_FUSED_RESHAPE_TO_FLOA
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 use_quick_custom_allreduce = get_bool_env_var(
@@ -1047,7 +1047,7 @@ class GroupCoordinator:
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
 
-        if _is_dcu and _use_fused_reshape_to_float:
+        if _is_hcu and _use_fused_reshape_to_float:
             from lightop import op
 
             vocab_size = (

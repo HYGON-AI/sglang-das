@@ -322,7 +322,7 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
-    SGLANG_KV_LAYOUT_DCU_FA = EnvBool(True)
+    SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -350,7 +350,7 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
 
-    # DCU Lightop
+    # HCU Lightop
     SGLANG_USE_LIGHTOP = EnvBool(False)
 
     # MPS (Apple Silicon)
@@ -386,7 +386,7 @@ class Envs:
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
-    # DCU
+    # HCU
     SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = EnvBool(False)
     SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = EnvBool(False)
@@ -652,7 +652,7 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
-    SGLANG_DCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
+    SGLANG_HCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.

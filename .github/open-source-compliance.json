@@ -1,5 +1,5 @@
 {
-  "project": "dcu-sglang",
+  "project": "hcu-sglang",
   "upstream_repo": "https://github.com/sgl-project/sglang.git",
   "upstream_branch": "v0.5.12",
   "target_branch": "v0.5.12_dev",

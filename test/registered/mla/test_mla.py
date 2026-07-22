@@ -15,7 +15,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 # MLA attention test with MGSM evaluation
 register_cuda_ci(est_time=194, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(est_time=1100, suite="stage-b-test-1-gpu-large-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_hcu_ci(est_time=1100, suite="stage-b-test-1-gpu-large-hcu", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestMLA(CustomTestCase, MGSMEnMixin):

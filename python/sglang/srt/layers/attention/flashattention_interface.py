@@ -19,12 +19,12 @@ from flash_attn import (
     vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
 )
 from typing import Optional, Union
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import get_bool_env_var
 _use_triton_vllm_fa = get_bool_env_var("SGLANG_USE_TRITON_VLLM_FA")
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
-if _is_dcu and _use_triton_vllm_fa:
+if _is_hcu and _use_triton_vllm_fa:
     from sglang.srt.layers.attention.triton_vllm_flash_attn import (
         triton_vllm_flash_attn_varlen_func,
         triton_vllm_flash_attn_with_kvcache,
@@ -38,7 +38,7 @@ IS_KVCACHE_FP8_E4M3 = None
 
 
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
-    if is_dcu():
+    if is_hcu():
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
         if "gfx938" in gcn_arch and (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2):
@@ -131,7 +131,7 @@ def vllm_flash_attn_with_kvcache(
     sinks=None,
     ver=3,
 ):
-    if _is_dcu and _use_triton_vllm_fa:
+    if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
@@ -263,7 +263,7 @@ def vllm_flash_attn_varlen_func(
     k_descale,
     v_descale,
 ):
-    if _is_dcu and _use_triton_vllm_fa:
+    if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_varlen_func(
             q=q,
             k=k,

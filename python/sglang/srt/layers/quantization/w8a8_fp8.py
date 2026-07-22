@@ -45,7 +45,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import get_bool_env_var, is_dcu, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hcu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 
 try:
@@ -303,24 +303,24 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+        if _is_hcu and get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
-                build_dcu_w8a8_mega_moe_experts_weights,
-                get_dcu_mega_moe_runtime,
+                build_hcu_w8a8_mega_moe_experts_weights,
+                get_hcu_mega_moe_runtime,
             )
 
             if (
-                get_dcu_mega_moe_runtime() == "megamoe"
+                get_hcu_mega_moe_runtime() == "megamoe"
                 and not self.quant_config.is_checkpoint_fp8_serialized
             ):
                 raise ValueError(
                     "standalone megamoe requires an FP8-serialized "
                     "channelwise W8A8 checkpoint"
                 )
-            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
-        if _is_dcu and _use_fp8_w8a8_moe:
+        if _is_hcu and _use_fp8_w8a8_moe:
             w1 = layer.w13_weight
             w2 = layer.w2_weight
             w1_shape = w1.shape
@@ -411,7 +411,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
 
-        if moe_runner_backend.is_aiter() and _is_dcu:
+        if moe_runner_backend.is_aiter() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
         elif moe_runner_backend.is_triton():
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
@@ -444,7 +444,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        if _is_dcu and self.runner.runner_backend.is_aiter():
+        if _is_hcu and self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 get_aiter_w8a8_fp8_quant_info,
             )
@@ -457,7 +457,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 )
             return combine_input
 
-        if _is_dcu and _use_fp8_w8a8_moe:
+        if _is_hcu and _use_fp8_w8a8_moe:
             if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
                 layer.w2_weight, "_w8a8_fp8_packed", False
             ):
@@ -470,7 +470,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                     _, tk = topk_weights.shape
                     assert (
                         tk == 1
-                    ), "DCU marlin path: apply_router_weight_on_input requires topk=1"
+                    ), "HCU marlin path: apply_router_weight_on_input requires topk=1"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                     # Router-weighted input no longer matches precomputed rms-quant activations.

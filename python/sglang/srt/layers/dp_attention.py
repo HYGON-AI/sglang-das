@@ -43,7 +43,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -61,7 +61,7 @@ _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
@@ -104,7 +104,7 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA or _is_dcu:
+        if _USE_ROCM700A_WA or _is_hcu:
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN

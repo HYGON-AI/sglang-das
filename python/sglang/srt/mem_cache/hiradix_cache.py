@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
-    MHATokenToKVPoolHostDCU,
+    MHATokenToKVPoolHostHCU,
     MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import (
@@ -64,7 +64,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
-_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 class HiRadixCache(RadixCache):
 
@@ -75,8 +75,8 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            if _kv_layout_dcu_fa:
-                self.token_to_kv_pool_host = MHATokenToKVPoolHostDCU(
+            if _kv_layout_hcu_fa:
+                self.token_to_kv_pool_host = MHATokenToKVPoolHostHCU(
                     self.kv_cache,
                     server_args.hicache_ratio,
                     server_args.hicache_size,

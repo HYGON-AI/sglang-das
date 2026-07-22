@@ -32,7 +32,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -48,7 +48,7 @@ class AiterQuantType(str, Enum):
     PER_1X32 = "per_1x32"
 
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 
 @dataclass
@@ -520,10 +520,10 @@ class AiterRunnerCore(MoeRunnerCore):
         assert hooks is None, "AITER MoE does not support LoRA hooks."
 
         if quant_info.use_int8_w8a8 or quant_info.use_fp8_w8a8:
-            if _is_dcu:
+            if _is_hcu:
                 return _run_aiter_w8a8(runner_input, quant_info, self.config)
             raise RuntimeError(
-                "AITER W8A8 MoE is only supported on DCU. "
+                "AITER W8A8 MoE is only supported on HCU. "
                 "Use the native AITER path for other quantization modes."
             )
 

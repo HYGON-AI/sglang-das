@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-register_dcu_ci(
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+register_hcu_ci(
     est_time=400,
-    suite="nightly-dcu-2-gpu",
+    suite="nightly-hcu-2-gpu",
     nightly=True,
 )
 
@@ -69,8 +69,8 @@ register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 mp.set_start_method("spawn", force=True)
 
 
-def _dcu_engine_kwargs():
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _hcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_HCU") != "1":
         return {}
     return {
         "attention_backend": "fa3",
@@ -79,8 +79,8 @@ def _dcu_engine_kwargs():
     }
 
 
-def _dcu_server_args():
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _hcu_server_args():
+    if os.environ.get("SGLANG_IS_IN_CI_HCU") != "1":
         return ()
     return (
         "--attention-backend",
@@ -358,7 +358,7 @@ def init_process_sgl(
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
             cuda_graph_max_bs=2,
-            **_dcu_engine_kwargs(),
+            **_hcu_engine_kwargs(),
         )
     else:
         if rank == 1:
@@ -380,7 +380,7 @@ def init_process_sgl(
                 "--cuda-graph-max-bs",
                 2,
             )
-            + _dcu_server_args(),
+            + _hcu_server_args(),
         )
     torch.cuda.synchronize()
 

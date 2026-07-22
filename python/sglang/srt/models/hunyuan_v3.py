@@ -68,16 +68,16 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, make_layers
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, make_layers
 from sglang.srt.utils.common import LazyValue
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from torch import nn
 from transformers import PretrainedConfig
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_fused_hunyuan_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 
-if _is_dcu:
+if _is_hcu:
     from lightop import rms_rotary_embedding_fuse_with_kv_store
 
 
@@ -529,7 +529,7 @@ class HYV3Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         used_fused_hunyuan_rotary_kv_store = False
         if (
-            _is_dcu
+            _is_hcu
             and _use_fused_hunyuan_rotary
             and self.use_qk_norm
             and self.head_dim == self.rotary_emb.rotary_dim

@@ -179,6 +179,7 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
             dataset_path=getattr(args, "dataset_path", None),
+            direct_answer_prompt=getattr(args, "direct_answer_prompt", False),
         )
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval

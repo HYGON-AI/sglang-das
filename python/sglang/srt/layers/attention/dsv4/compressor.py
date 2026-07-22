@@ -41,10 +41,10 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils import get_bool_env_var, is_dcu
-_is_dcu = is_dcu()
+from sglang.srt.utils import get_bool_env_var, is_hcu
+_is_hcu = is_hcu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
-if _is_dcu:
+if _is_hcu:
     from lightop import op
 
 if TYPE_CHECKING:
@@ -164,7 +164,7 @@ class CompressorBackendMixin:
             )
         else:
             if (
-                _is_dcu
+                _is_hcu
                 and _use_dpskv4_lightop_quant_k_cache
                 and hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store")
             ):
@@ -174,7 +174,7 @@ class CompressorBackendMixin:
                     cache_k=new_compressed_kv.bfloat16(),
                 )
                 return
-            if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
+            if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
                 pack = quant_to_nope_fp8_rope_bf16_pack_lightop(new_compressed_kv.bfloat16(), 1e-8)
             else:
                 pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())

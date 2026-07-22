@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEn
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 
 
-def test_rocm_platform_maps_sla_to_dcu_flash_attn_backend():
+def test_rocm_platform_maps_sla_to_hcu_flash_attn_backend():
     backend_cls = RocmPlatform.get_attn_backend_cls_str(
         AttentionBackendEnum.SLA_ATTN,
         head_size=128,
