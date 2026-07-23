@@ -49,6 +49,11 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         "bfloat16",
         "fp8_e4m3",
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
+    if server_args.kv_cache_dtype == "bfloat16":
+        envs.SGLANG_OPT_USE_COMPRESSOR_V2.set(False)
+        logger.info(
+            "Disable DSV4 compressor_v2 for bfloat16 KV cache; using BF16 direct-store compressor path."
+        )
 
     if server_args.speculative_algorithm is not None:
         assert (
@@ -63,10 +68,15 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
 
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-        server_args.swa_full_tokens_ratio = 0.1
-        logger.info(
-            f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
-        )
+        if server_args.enable_nsa_prefill_context_parallel:
+            logger.info(
+                f"Keep swa_full_tokens_ratio at {server_args.swa_full_tokens_ratio} for {model_arch} with NSA prefill CP."
+            )
+        else:
+            server_args.swa_full_tokens_ratio = 0.1
+            logger.info(
+                f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
+            )
 
     # if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
     #     # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized

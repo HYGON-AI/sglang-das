@@ -24,9 +24,7 @@ namespace {
 
 constexpr uint32_t kTopK = 512;
 constexpr uint32_t kTopKBlockSize = 512;
-// Dynamic SMEM for double buffer: need 2 * kTopK elements = 2 * 512 * 4 = 4KB
-// Total SMEM budget for HIP is 64KB, so we use 4KB for dynamic SMEM
-constexpr uint32_t kSMEM = 2 * kTopK * sizeof(uint32_t);  // 4KB (bytes) - double buffer for topk512
+constexpr uint32_t kSMEM = 14 * 1024 * sizeof(uint32_t);  // 56KB (bytes)
 
 struct TopK512Params {
   const float* __restrict__ scores;
@@ -354,9 +352,7 @@ struct TopK512Kernel {
         .page_table_stride = P.unwrap(),
         .page_bits = page_bits,
     };
-    // constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
-    constexpr auto kSMEM_ = kSMEM;  // align up a little
-    // setup_kernel_smem_once<kernel, kSMEM_>();
+    constexpr auto kSMEM_ = kSMEM;
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
   }
 };

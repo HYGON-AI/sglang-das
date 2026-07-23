@@ -1115,6 +1115,20 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
 
+        # mHC target models (e.g. DSV4-Flash) must emit pre-hc-head hidden states
+        # (width = hc_hidden_size) so the EAGLE draft/NextN model can consume them.
+        # The verify graph freezes its hidden-output width at capture time, so the
+        # flag must be set here — a runtime flag on the replayed batch is ignored.
+        # Only the target-verify graph needs it; draft workers produce pre-hc-head
+        # hidden unconditionally in their NextN forward.
+        if (
+            self.capture_forward_mode.is_target_verify()
+            and not self.model_runner.is_draft_worker
+            and getattr(self.model_runner.model_config, "hc_hidden_size", None)
+            is not None
+        ):
+            forward_batch.return_hidden_states_before_norm = True
+
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:

@@ -719,6 +719,9 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_mtp_topk_indices",  # forward-level flag, inherited by both child batches
+            # mHC target models (e.g. DSV4-Flash) need pre-hc-head hidden states;
+            # this forward-level flag must survive the TBO split for target-verify.
+            "return_hidden_states_before_norm",
         ]:
             output_dict[key] = getattr(batch, key)
 
@@ -781,7 +784,8 @@ class TboForwardBatchPreparer:
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
-                return_hidden_states_before_norm=False,
+                # return_hidden_states_before_norm is inherited from the parent
+                # batch in the key-copy loop above (needed by mHC target-verify).
             )
         )
 

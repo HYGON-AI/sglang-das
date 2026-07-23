@@ -1,4 +1,4 @@
-      
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
@@ -14,6 +14,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import set_weight_attrs, direct_register_custom_op
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -125,7 +126,7 @@ direct_register_custom_op(
     fake_impl=fused_experts_impl_int8_marlin_fake,
 )
 
-    
+
 
 def get_w8a8_int8_marlin_weights(
          weight,
@@ -140,22 +141,27 @@ def get_w8a8_int8_marlin_weights(
 
     return weight
 
-def w8a8_nt_kpack2_marlin_weight(w8a8_w, # [size_n, size_k// 2 ]
-                                k_tile=16,
-                                n_tile=16, ):
-    assert w8a8_w.dtype == torch.int8, "w8a8_w 必须是 int8 类型"
-    size_n, size_k = w8a8_w.shape
-    assert size_n % k_tile == 0 and size_k % n_tile == 0, "k_tile / n_tile 必须能整除对应维度"
+def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
+    """Get shuffle_unique and disaggregation mode for deepgemm INT8 GEMM.
 
-    q = w8a8_w.reshape((size_n // n_tile,  n_tile, size_k // k_tile, k_tile))
-    q = q.permute((0, 2, 1, 3)).contiguous()
-    q = q.reshape((size_n // k_tile, size_k * k_tile))
-    return q
+    Returns (shuffle_unique, mode):
+        shuffle_unique=1, mode="ifb"       — combined prefill+decode (default)
+        shuffle_unique=0, mode="prefill"   — pd separation prefill node
+        shuffle_unique=0, mode="decode"    — pd separation decode node
+    """
+    try:
+        args = get_global_server_args()
+        mode = args.disaggregation_mode
+        if mode in ("prefill", "decode"):
+            return 0, mode
+    except Exception:
+        pass
+    return 1, "ifb"
 
 def weight8bit_nt_kpack2_marlin1(weight, # [size_n, size_k// 2 ]
                                 k_tile=16,
                                 k_tile1=4,
-                                n_tile=16, 
+                                n_tile=16,
                                 n_tile1=16):
     assert weight.element_size() == 1, "weight 必须是 8 bit 类型"
     if weight.dim() == 2:
@@ -217,11 +223,11 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 "For INT8 Fused MoE layers, we require channelwise, "
                 "dynamic per token quantization. Found static input scales.")
 
-        
+
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
-        
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.int8
@@ -277,50 +283,48 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         )
 
         if self.use_deepep:
+            from deepgemm import marlin_i8_masked_weight, marlin_i8_contiguous_weight
+
+            shuffle_unique, mode = _get_deepgemm_shuffle_unique()
+
+            # shuffle_unique=1 (IFB): unified 6D format, same pack for prefill+decode
+            # shuffle_unique=0 (PD separation): contiguous for prefill, masked for decode
+            if shuffle_unique == 1 or mode == "prefill":
+                pack_fn = marlin_i8_contiguous_weight
+            else:
+                pack_fn = marlin_i8_masked_weight
+
             layer._dsv4_w13_weight_shape = tuple(layer.w13_weight.shape)
             layer._dsv4_w2_weight_shape = tuple(layer.w2_weight.shape)
-            w13_marlin_list = []
-            for ii in range(layer.w13_weight.shape[0]):
-                w13_marlin_list.append(
-                    w8a8_nt_kpack2_marlin_weight(layer.w13_weight[ii])
-                )
-            w13_lightop = torch.stack(w13_marlin_list, dim=0)
-            layer.w13_weight = Parameter(w13_lightop, requires_grad=False)
+
+            w13_weight = layer.w13_weight.contiguous()
+            w13_packed = pack_fn(w13_weight, shuffle_unique=shuffle_unique)
+            layer.w13_weight = Parameter(w13_packed, requires_grad=False)
             layer.register_buffer(
                 "w13_weight_deepgemm", layer.w13_weight.data, persistent=False
             )
-            del w13_marlin_list, w13_lightop
+            del w13_packed
             torch.cuda.empty_cache()
 
-            w2_marlin_list = []
-            for ii in range(layer.w2_weight.shape[0]):
-                w2_marlin_list.append(
-                    w8a8_nt_kpack2_marlin_weight(layer.w2_weight[ii])
-                )
-            w2_lightop = torch.stack(w2_marlin_list, dim=0)
-            layer.w2_weight = Parameter(w2_lightop, requires_grad=False)
+            w2_weight = layer.w2_weight.contiguous()
+            w2_packed = pack_fn(w2_weight, shuffle_unique=shuffle_unique)
+            layer.w2_weight = Parameter(w2_packed, requires_grad=False)
             layer.register_buffer(
                 "w2_weight_deepgemm", layer.w2_weight.data, persistent=False
             )
-            del w2_marlin_list, w2_lightop
+            del w2_packed
             torch.cuda.empty_cache()
             return
 
         w1_marlin_list = []
         for ii in range(layer.w13_weight.shape[0]):
-            if not self.use_deepep:
-                w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
-            else:
-                w1_marlin_in = weight8bit_nt_kpack2_marlin(layer.w13_weight[ii])
+            w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
             w1_marlin_list.append(w1_marlin_in)
         w1_marlin = torch.stack(w1_marlin_list, dim=0)
 
         w2_marlin_list = []
         for ii in range(layer.w2_weight.shape[0]):
-            if not self.use_deepep:
-                w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
-            else:
-                w2_marlin_in = weight8bit_nt_kpack2_marlin(layer.w2_weight[ii])
+            w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
             w2_marlin_list.append(w2_marlin_in)
         w2_marlin = torch.stack(w2_marlin_list, dim=0)
 
@@ -399,7 +403,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     #         use_nn_moe=False,
     #         shared_output=shared_output,
     #         routed_scaling_factor=routed_scaling_factor)
-    
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -447,7 +451,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         )
 
         return StandardCombineInput(hidden_states=output)
-    
+
     def apply_with_shared_output(
         self,
         layer: torch.nn.Module,

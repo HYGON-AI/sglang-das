@@ -3,7 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
 from typing import Any, Dict, Optional, Tuple, Union
-
+import os
 import torch
 import torch.distributed
 
@@ -17,6 +17,11 @@ from .parallel_state import (
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    if os.environ.get("FORCE_TORCH_AR") == "1":
+        # Bypass aiter custom AR / sglang inplace wrapper: use native
+        # torch.distributed.all_reduce (NCCL, in-place).
+        torch.distributed.all_reduce(input_, group=get_tp_group().device_group)
+        return input_
     return get_tp_group().all_reduce(input_)
 
 

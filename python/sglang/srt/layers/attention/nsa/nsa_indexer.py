@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
+from scipy.linalg import hadamard
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
@@ -83,6 +86,32 @@ else:
 _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
 if _is_hcu and _use_fast_hadamard_transform:
     from fast_hadamard_transform import hadamard_transform
+
+_HADAMARD_CACHE = {}
+
+def _get_hadamard_matrix(dim, device=None, dtype=torch.float32):
+    key = (dim, str(device), str(dtype))
+    if key not in _HADAMARD_CACHE:
+        dim_padded = 2 ** math.ceil(math.log2(dim))
+        h_matrix = hadamard(dim_padded, dtype=float)
+        _HADAMARD_CACHE[key] = torch.tensor(h_matrix, dtype=dtype, device=device)
+    return _HADAMARD_CACHE[key]
+
+
+def _hadamard_transform_torch(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    x_shape = x.shape
+    dim = x.shape[-1]
+    dim_padded = 2 ** math.ceil(math.log2(dim))
+
+    h_matrix = _get_hadamard_matrix(dim, x.device, x.dtype)
+    x = x.reshape(-1, dim)
+    if dim != dim_padded:
+        x = F.pad(x, (0, dim_padded - dim))
+
+    out = F.linear(x, h_matrix)
+    if scale != 1.0:
+        out = out * scale
+    return out[..., :dim].reshape(*x_shape)
 
 if _is_cuda:
     try:
@@ -209,7 +238,7 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
     if _is_hcu and _use_fast_hadamard_transform:
         return hadamard_transform(x, scale=scale)
     elif _is_hcu:
-        return hadamard_transform_optimized(x, scale=scale)
+        return _hadamard_transform_torch(x, scale=scale)
     else:
         return hadamard_transform(x, scale=scale)
 

@@ -680,6 +680,7 @@ class Envs:
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    SGLANG_DSV4_USE_BF16_SPARSE_ATTN = EnvBool(False)
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)

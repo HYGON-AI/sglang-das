@@ -1319,7 +1319,7 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
-           
+
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
@@ -2864,6 +2864,21 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if (
+                self.chunked_req is not None
+                and len(self.waiting_queue) == 0
+                and len(self.running_batch.reqs) == 0
+                and adder.is_hybrid_swa
+                and adder.rem_swa_tokens <= self.page_size
+            ):
+                error_msg = (
+                    "Hybrid SWA chunked prefill cannot make progress: the only "
+                    f"remaining chunked request still needs {self.chunked_req.extend_input_len} "
+                    f"tokens, but rem_swa={adder.rem_swa_tokens} <= page_size={self.page_size}. "
+                    "Increase --swa-full-tokens-ratio or reduce --chunked-prefill-size."
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
             return None
 
         can_run_set = set(can_run_list)
