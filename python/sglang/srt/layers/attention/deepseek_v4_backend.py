@@ -1263,7 +1263,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 4, 128],
         forward_batch: ForwardBatch,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        core_attn_metadata: DSV4AttnMetadataRadix,
+        core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
         if nsa_use_prefill_cp(forward_batch):

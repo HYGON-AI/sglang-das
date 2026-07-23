@@ -34,6 +34,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     # should_use_flashinfer_trtllm_moe, # 找不到
 )
+from sglang.srt.layers.moe.moe_runner.deep_gemm import copy_list_to_gpu_no_ce
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -92,6 +93,10 @@ from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 
 _is_hip = is_hip()
+if _is_hip:
+    from sgl_kernel import silu_and_mul
+    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+
 _is_npu = is_npu()
 _is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
