@@ -6883,7 +6883,9 @@ class ServerArgs:
             action="store_true",
             help="With DP-attention, send control messages to every DP group leader "
             "and broadcast within attn_tp_group instead of the full tp_group. "
-            "Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
+            "Eliminates a costly all-ranks gloo sync on every scheduler iteration. "
+            "Preferred: set SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST=1 "
+            "(PD+DP does not require this flag).",
         )
         parser.add_argument(
             "--enable-dp-lm-head",

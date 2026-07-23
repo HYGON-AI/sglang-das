@@ -1223,12 +1223,6 @@ class Scheduler(
                     "PD Decode DP sync currently supports attn_tp_size=1 and "
                     "attn_cp_size=1 only"
                 )
-            if not self.server_args.enable_dp_attention_local_control_broadcast:
-                raise RuntimeError(
-                    "PD Decode DP sync requires "
-                    "--enable-dp-attention-local-control-broadcast "
-                    "to keep recv control off the full tp_cpu_group"
-                )
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
@@ -1795,12 +1789,15 @@ class Scheduler(
                     src=self.attn_cp_group.ranks[0],
                 )
 
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            # When local control broadcast is enabled (env preferred; CLI kept
+            # for compatibility), each DP group leader already receives control
+            # messages from the DP controller, so we broadcast within
+            # attn_tp_group + attn_cp_group instead of the full tp_group.
+            # This avoids an expensive all-ranks gloo sync.
+            _local_ctrl = (
+                envs.SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST.get()
+                or self.server_args.enable_dp_attention_local_control_broadcast
+            )
             if _local_ctrl:
                 if self.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(

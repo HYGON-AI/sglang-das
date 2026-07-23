@@ -275,6 +275,11 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
+    # Optional: with DP-attention, send control messages to every DP group
+    # leader and broadcast within attn_tp/cp group instead of full tp_group.
+    # Prefer this over --enable-dp-attention-local-control-broadcast so PD+DP
+    # workloads are not forced to flip a global CLI flag.
+    SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
