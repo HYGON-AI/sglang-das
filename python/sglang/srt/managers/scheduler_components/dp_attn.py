@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -31,6 +32,10 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+logger = logging.getLogger(__name__)
+
+DP_DECODE_STEP_PROTOCOL_VERSION = 2
+DP_DECODE_STEP_BUILD_ID = 2026071602
 
 
 @dataclass
@@ -46,6 +51,8 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     can_run_breakable_cuda_graph: bool
+    scheduler_step_info: Optional[list[int]] = None
+    gathered_scheduler_step_info: Optional[torch.Tensor] = None
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -56,56 +63,112 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-                int(self.can_run_breakable_cuda_graph),
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            self.num_tokens,
+            self.num_tokens_for_logprob,
+            int(self.can_cuda_graph),
+            int(self.is_extend_in_batch),
+            int(self.local_can_run_tbo),
+            self.local_forward_mode,
+            int(self.can_run_breakable_cuda_graph),
+        ]
+        if self.scheduler_step_info is not None:
+            if len(self.scheduler_step_info) != 10:
+                raise RuntimeError(
+                    "DP Decode StepInfo must contain exactly 10 scheduler fields"
+                )
+            values.extend(self.scheduler_step_info)
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_breakable_cuda_graph
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            0,  # num_tokens
+            0,  # num_tokens_for_logprob
+            1,  # can_cuda_graph
+            0,  # is_extend_in_batch
+            1,  # local_can_run_tbo
+            ForwardMode.IDLE.value,  # local_forward_mode
+            0,  # can_run_breakable_cuda_graph
+        ]
+        if self.scheduler_step_info is not None:
+            values.extend(self.scheduler_step_info)
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
-        global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
-            dtype=torch.int64,
-            device=device,
+        width = int(local_info_tensor.numel())
+        expected_world = self.dp_size * self.tp_size * self.cp_size
+        actual_world = torch.distributed.get_world_size(group=group)
+        if actual_world != expected_world:
+            raise RuntimeError(
+                "DP Decode scheduler group size mismatch: "
+                f"actual={actual_world} expected={expected_world}"
+            )
+
+        if self.scheduler_step_info is not None and device == "cpu":
+            # Some ROCm/DCU Gloo builds do not implement _allgather_base.
+            gathered = [
+                torch.empty_like(local_info_tensor) for _ in range(actual_world)
+            ]
+            torch.distributed.all_gather(gathered, local_info_tensor, group=group)
+            global_info_flat = torch.stack(gathered, dim=0)
+        else:
+            global_info_flat = torch.empty(
+                (actual_world, width), dtype=torch.int64, device=device
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_info_flat.flatten(), local_info_tensor, group=group
+            )
+        global_info_tensor = global_info_flat.view(
+            self.dp_size,
+            self.tp_size * self.cp_size,
+            width,
         )
 
-        torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
-            group=group,
-        )
+        if self.scheduler_step_info is not None:
+            step_all = global_info_flat[:, 7:].cpu()
+            versions, builds, epochs = step_all[:, 0], step_all[:, 1], step_all[:, 2]
+            if (
+                int(versions.min().item()) != DP_DECODE_STEP_PROTOCOL_VERSION
+                or int(versions.max().item()) != DP_DECODE_STEP_PROTOCOL_VERSION
+            ):
+                raise RuntimeError(
+                    "DP Decode StepInfo protocol mismatch across ranks: "
+                    f"{versions.tolist()}"
+                )
+            if (
+                int(builds.min().item()) != DP_DECODE_STEP_BUILD_ID
+                or int(builds.max().item()) != DP_DECODE_STEP_BUILD_ID
+            ):
+                raise RuntimeError(
+                    "DP Decode StepInfo build mismatch across ranks: "
+                    f"{builds.tolist()}"
+                )
+            if int(epochs.min().item()) != int(epochs.max().item()):
+                raise RuntimeError(
+                    "DP Decode scheduler epoch mismatch across ranks: "
+                    f"{epochs.tolist()}"
+                )
+            paused = step_all[:, 7]
+            if int(paused.min().item()) != int(paused.max().item()):
+                raise RuntimeError(
+                    "DP Decode paused-state mismatch across ranks: "
+                    f"{paused.tolist()}"
+                )
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
-        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+        tp_info = global_info_tensor.view(expected_world, width)
+        inactive = tp_active_ranks == 0
+        fallback = self._get_fallback_tensor(device=device)
+        if width == 7:
+            tp_info[inactive] = fallback
+        else:
+            # Keep scheduler epoch/diagnostics intact on inactive model ranks.
+            tp_info[inactive, :7] = fallback[:7]
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
@@ -116,6 +179,34 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+
+        if self.scheduler_step_info is not None:
+            step_tp0 = tp0_info[:, 7:].cpu()
+            self.gathered_scheduler_step_info = step_tp0
+            epoch = int(step_tp0[0, 2].item())
+            over_budget = int(step_tp0[:, 9].max().item())
+            if torch.distributed.get_rank(group=group) == 0 and (
+                over_budget or epoch % 1024 == 0
+            ):
+
+                def _minmax(col: int) -> tuple[int, int]:
+                    return (
+                        int(step_tp0[:, col].min().item()),
+                        int(step_tp0[:, col].max().item()),
+                    )
+
+                logger.info(
+                    "DP Decode StepInfo epoch=%s transfer=%s prealloc=%s "
+                    "retracted=%s running=%s paused=%s pd_ms=%s over_budget=%s",
+                    epoch,
+                    _minmax(3),
+                    _minmax(4),
+                    _minmax(5),
+                    _minmax(6),
+                    _minmax(7),
+                    _minmax(8),
+                    _minmax(9),
+                )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -156,6 +247,8 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    scheduler_step_info: Optional[list[int]] = None,
+    sync_group_override: Optional[torch.distributed.ProcessGroup] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -210,7 +303,10 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
+    if sync_group_override is not None:
+        group = sync_group_override
+        device = "cpu"
+    elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
@@ -233,7 +329,13 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
+        scheduler_step_info=scheduler_step_info,
     )
+
+    if scheduler_step_info is not None and skip_all_gather:
+        raise RuntimeError(
+            "PD Decode DP sync is incompatible with SGLANG_SCHEDULER_SKIP_ALL_GATHER"
+        )
 
     if not skip_all_gather:
         mlp_sync_info.all_gather(device=device, group=group)
@@ -283,9 +385,19 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    get_pd_decode_step_context: Callable[
+        [], Optional[tuple[torch.distributed.ProcessGroup, int, list[int]]]
+    ]
+    set_dp_scheduler_epoch: Callable[[int], None]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
-        return prepare_mlp_sync_batch_raw(
+        step_context = self.get_pd_decode_step_context()
+        if step_context is None:
+            sync_group, epoch, scheduler_step_info = None, None, None
+        else:
+            sync_group, epoch, scheduler_step_info = step_context
+
+        result = prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.ps.attn_tp_size,
@@ -296,7 +408,12 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            scheduler_step_info=scheduler_step_info,
+            sync_group_override=sync_group,
         )
+        if epoch is not None:
+            self.set_dp_scheduler_epoch(epoch + 1)
+        return result
 
     def maybe_prepare_mlp_sync_batch(
         self,

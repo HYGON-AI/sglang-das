@@ -176,7 +176,11 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    DP_DECODE_STEP_BUILD_ID,
+    DP_DECODE_STEP_PROTOCOL_VERSION,
+    SchedulerDPAttnAdapter,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -1120,6 +1124,74 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
+        # Do not mix recv-control or model-forward collectives into it.
+        # A process-group timeout is replica-fatal; no plain-barrier fallback.
+        self.dp_scheduler_cpu_group = None
+        self._dp_scheduler_epoch = 0
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.enable_dp_attention
+        ):
+            if not self.require_mlp_sync:
+                raise RuntimeError(
+                    "PD Decode DP sync requires require_mlp_sync=True"
+                )
+            if self.pp_size != 1:
+                raise RuntimeError(
+                    "PD Decode DP sync currently supports pp_size=1 only"
+                )
+            if self.attn_tp_size != 1 or self.attn_cp_size != 1:
+                raise RuntimeError(
+                    "PD Decode DP sync currently supports attn_tp_size=1 and "
+                    "attn_cp_size=1 only"
+                )
+            if not self.server_args.enable_dp_attention_local_control_broadcast:
+                raise RuntimeError(
+                    "PD Decode DP sync requires "
+                    "--enable-dp-attention-local-control-broadcast "
+                    "to keep recv control off the full tp_cpu_group"
+                )
+
+            tp_ranks = list(self.tp_group.ranks)
+            expected_world = (
+                self.server_args.dp_size
+                * self.attn_tp_size
+                * self.attn_cp_size
+            )
+            default_world = torch.distributed.get_world_size()
+            if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
+                raise RuntimeError(
+                    "PD Decode DP sync topology check failed: "
+                    f"tp_ranks={len(tp_ranks)} expected={expected_world} "
+                    f"default_world={default_world}. "
+                    "Supported only on PP1 DP-attention Decode topology."
+                )
+            expected_ranks = list(range(default_world))
+            if tp_ranks != expected_ranks:
+                raise RuntimeError(
+                    "PD Decode DP sync requires tp_group.ranks to be the ordered "
+                    f"full default world: actual={tp_ranks} "
+                    f"expected={expected_ranks}"
+                )
+
+            from datetime import timedelta
+
+            # Dedicated scheduler-group timeout for PD Decode DP sync.
+            timeout_s = 60.0
+            self.dp_scheduler_cpu_group = torch.distributed.new_group(
+                ranks=tp_ranks,
+                backend="gloo",
+                timeout=timedelta(seconds=timeout_s),
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "PD Decode single-clock enabled: dedicated Gloo scheduler "
+                    "group, world=%s timeout=%.1fs",
+                    len(tp_ranks),
+                    timeout_s,
+                )
+
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
@@ -1796,6 +1868,38 @@ class Scheduler(
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
 
+    def get_pd_decode_step_context(self):
+        """Build the epoch-tagged scheduler state for the PD Decode DP sync."""
+        if not (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.enable_dp_attention
+        ):
+            return None
+
+        sync_group = self.dp_scheduler_cpu_group
+        if sync_group is None:
+            raise RuntimeError("dedicated dp_scheduler_cpu_group is not initialized")
+
+        epoch = int(self._dp_scheduler_epoch)
+        prealloc_queue = self.disagg_decode_prealloc_queue
+        running_batch = getattr(self, "running_batch", None)
+        scheduler_step_info = [
+            DP_DECODE_STEP_PROTOCOL_VERSION,
+            DP_DECODE_STEP_BUILD_ID,
+            epoch,
+            len(self.disagg_decode_transfer_queue.queue),
+            len(getattr(prealloc_queue, "queue", []) or []),
+            len(prealloc_queue.retracted_queue),
+            len(getattr(running_batch, "reqs", []) or []),
+            int(bool(getattr(self, "_engine_paused", False))),
+            int(round(float(getattr(self, "_dp_scheduler_last_pd_ms", 0.0)))),
+            int(bool(getattr(self, "_dp_scheduler_pd_over_budget", False))),
+        ]
+        return sync_group, epoch, scheduler_step_info
+
+    def set_dp_scheduler_epoch(self, epoch: int) -> None:
+        self._dp_scheduler_epoch = epoch
+
     def init_dp_attn_adapter(self) -> None:
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             tp_group=self.tp_group,
@@ -1809,6 +1913,8 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_pd_decode_step_context=self.get_pd_decode_step_context,
+            set_dp_scheduler_epoch=self.set_dp_scheduler_epoch,
         )
 
     def init_pool_stats_observer(self) -> None:

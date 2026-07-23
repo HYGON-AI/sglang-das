@@ -4,6 +4,7 @@
 
 import ctypes
 import logging
+import os
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -23,7 +24,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
     is_hcu,
     is_hip,
@@ -344,29 +344,114 @@ class CustomAllreduce:
 def dispatch_custom_allreduce(
     group: ProcessGroup,
     device: torch.device,
+    backend: str = "auto",
 ):
-    """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
+    """Return the CustomAllreduce class (or partial) to use, per backend.
 
-    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
-    Otherwise use AiterCustomAllreduce if available.
+    Backends (see doc §5 / §6.4):
+        - ``off``    : return ``None``; caller must not construct CA.
+        - ``native`` : force SGLang's own CA (or JIT V2 on CUDA), ignoring aiter.
+        - ``aiter``  : force aiter CA on HIP/HCU. Raises on non-HIP or when the
+                       aiter package cannot be imported. The caller is
+                       responsible for re-raising vs. falling back based on
+                       ``AITER_AR_TRANSPORT`` (strict-Fabric semantics live in
+                       the ``GroupCoordinator`` construction site).
+        - ``auto``   : HIP + aiter importable → aiter (with the same transport
+                       rules); otherwise → native.
 
     On CUDA, the JIT-compiled v2 implementation is used by default.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
     Note: ServerArgs._handle_environment_variables forces this env to "0" when
     nnodes > 1 since custom AR is intra-node only.
+
+    Under aiter, ``enable_register_for_capturing`` is driven by transport
+    (doc §4.3): under ``fabric``/``auto`` it must be ``False`` because aiter
+    Fabric cannot register arbitrary graph allocations; under ``ipc`` we
+    preserve the historical memory-saver-driven behaviour.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-        from .custom_all_reduce_v2 import (
-            CustomAllReduceV2,
-            can_use_custom_all_reduce_v2,
+    backend = (backend or "auto").lower()
+    if backend not in ("auto", "native", "aiter", "off"):
+        logger.warning(
+            "[AR] Unknown custom_all_reduce_backend=%r, coercing to 'auto'.",
+            backend,
+        )
+        backend = "auto"
+
+    if backend == "off":
+        return None
+
+    def _native():
+        if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+            from .custom_all_reduce_v2 import (
+                CustomAllReduceV2,
+                can_use_custom_all_reduce_v2,
+            )
+
+            if can_use_custom_all_reduce_v2(group=group, device=device):
+                logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+                return CustomAllReduceV2
+        return CustomAllreduce
+
+    def _aiter_partial():
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            CustomAllreduce as AiterCustomAllreduce,
         )
 
-        if can_use_custom_all_reduce_v2(group=group, device=device):
-            logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
-            return CustomAllReduceV2
+        transport = os.environ.get("AITER_AR_TRANSPORT", "ipc").lower()
+        if transport == "ipc":
+            enable_reg = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        elif transport in ("fabric", "auto"):
+            # doc §4.3: Fabric cannot register arbitrary graph allocations;
+            # auto may resolve to Fabric, so also force copy-in mode.
+            enable_reg = False
+        else:
+            logger.warning(
+                "[AR] Unknown AITER_AR_TRANSPORT=%r; treating as copy-in.",
+                transport,
+            )
+            enable_reg = False
+        if _is_hcu:
+            logger.info(
+                "[AR] Using AiterCustomAllreduce (HCU/DTK, transport=%s, "
+                "enable_register_for_capturing=%s)",
+                transport,
+                enable_reg,
+            )
+        else:
+            logger.info(
+                "[AR] Using AiterCustomAllreduce (ROCm/HIP, transport=%s, "
+                "enable_register_for_capturing=%s)",
+                transport,
+                enable_reg,
+            )
+        return partial(
+            AiterCustomAllreduce,
+            enable_register_for_capturing=enable_reg,
+        )
 
+    if backend == "native":
+        return _native()
+
+    if backend == "aiter":
+        if not _is_hip:
+            raise RuntimeError(
+                "custom_all_reduce_backend=aiter requires HIP/ROCm; "
+                "current platform does not support aiter CA."
+            )
+        # aiter has no deterministic_all_reduce path; refuse rather than
+        # silently degrade correctness.
+        if _use_amd_deterministic_impl():
+            raise RuntimeError(
+                "custom_all_reduce_backend=aiter is incompatible with "
+                "deterministic inference (SGLANG_USE_1STAGE_ALLREDUCE / "
+                "SGLANG_ENABLE_DETERMINISTIC_INFERENCE). Use 'native' or "
+                "disable deterministic inference."
+            )
+        return _aiter_partial()
+
+    # backend == "auto"
     if _is_cuda or _is_musa:
-        return CustomAllreduce
+        return _native()
 
     assert _is_hip
 
@@ -385,35 +470,19 @@ def dispatch_custom_allreduce(
         logger.debug("[AR] All-reduce: default")
 
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
-    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
+    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method).
     if _use_amd_deterministic_impl():
         return CustomAllreduce
 
-    if get_bool_env_var("SGLANG_USE_AITER_AR", default="false"):
-        try:
-            from aiter.dist.device_communicators.custom_all_reduce import (
-                CustomAllreduce as AiterCustomAllreduce,
-            )
-
-            if _is_hcu:
-                logger.info("[AR] Using AiterCustomAllreduce (HCU default)")
-            else:
-                logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
-            tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-            return partial(
-                AiterCustomAllreduce,
-                # Workaround to use uncached input buffer, try again to revert it after umd fix(>=26.04.02)
-                enable_register_for_capturing=tms_cudagraph,
-            )
-        except ImportError as e:
-            logger.warning(
-                "[AR] Aiter custom all-reduce not available; "
-                "falling back to sglang CustomAllreduce. Details: %s",
-                e,
-            )
-            return CustomAllreduce
-
-    return CustomAllreduce
+    try:
+        return _aiter_partial()
+    except ImportError as e:
+        logger.warning(
+            "[AR] Aiter custom all-reduce not available; "
+            "falling back to sglang CustomAllreduce. Details: %s",
+            e,
+        )
+        return CustomAllreduce
 
 
 def _use_amd_deterministic_impl() -> bool:

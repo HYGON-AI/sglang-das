@@ -72,8 +72,10 @@ elif is_cpu():
 
 _use_causal_conv1d = get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D")
 if _is_hcu and _use_causal_conv1d:
-    from causal_conv1d.causal_conv1d_interface import causal_conv1d_update as causal_conv1d_update_hcu
     from causal_conv1d import causal_conv1d_fn_hcu
+    from causal_conv1d.causal_conv1d_interface import (
+        causal_conv1d_update as causal_conv1d_update_hcu,
+    )
 
 def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     """Use FlashInfer for the narrow SM100 GDN prefill domain we validated."""
