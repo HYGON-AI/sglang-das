@@ -65,7 +65,7 @@ from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
@@ -79,7 +79,7 @@ from sglang.srt.utils import (
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
-if is_cuda() and not is_dcu():
+if is_cuda() and not is_hcu():
     import deep_gemm
 
 if TYPE_CHECKING:
@@ -106,14 +106,14 @@ def _all_gather_dsa_trtllm_fp8_kv(
 
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
     try:
         from aiter import (  # noqa: F401
             flash_attn_varlen_func,
@@ -161,7 +161,7 @@ class DSAFlashMLAMetadata:
             )
 
     def copy_(self, other: "DSAFlashMLAMetadata"):
-        if _is_dcu:
+        if _is_hcu:
             flashmla_metadata = other.flashmla_metadata
             if hasattr(flashmla_metadata, "flashmla_metadata"):
                 flashmla_metadata = flashmla_metadata.flashmla_metadata
@@ -1020,7 +1020,7 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and not _is_dcu and (
+        if is_cuda() and not _is_hcu and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -2348,7 +2348,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        if _is_dcu:
+        if _is_hcu:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
@@ -2361,7 +2361,7 @@ class DeepseekSparseAttnBackend(
         required_padding = 128 if self.device_sm_major >= 10 else 64
         need_padding = num_heads % required_padding != 0
 
-        if _is_dcu:
+        if _is_hcu:
             q_input = q_all
         elif need_padding:
             assert required_padding % num_heads == 0, (
@@ -2387,7 +2387,7 @@ class DeepseekSparseAttnBackend(
         )
 
         # Trim output back to original num_heads if we padded
-        if (not _is_dcu) and need_padding:
+        if (not _is_hcu) and need_padding:
             o = o[:, :num_heads, :]
 
         return o
@@ -2527,7 +2527,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        if _is_dcu:
+        if _is_hcu:
             from flash_mla.flash_mla_interface import flash_mla_with_kvcache
         else:
             from sgl_kernel.flash_mla import flash_mla_with_kvcache
@@ -3052,7 +3052,7 @@ class DeepseekSparseAttnBackend(
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.dsa_kv_cache_store_fp8:
                 if (
-                    ( is_blackwell() or _is_dcu )
+                    ( is_blackwell() or _is_hcu )
                     and forward_batch is not None
                     and forward_batch.forward_mode == ForwardMode.EXTEND
                 ):
@@ -3108,7 +3108,7 @@ class DeepseekSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        if _is_dcu:
+        if _is_hcu:
             from flash_mla.flash_mla_interface import get_mla_metadata
         else:
             from sgl_kernel.flash_mla import get_mla_metadata

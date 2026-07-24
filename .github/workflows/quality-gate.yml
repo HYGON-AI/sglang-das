@@ -192,7 +192,7 @@ jobs:
           CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
         run: |
           mapfile -t files < <(printf '%s\n' "$CHANGED_FILES")
-          python3 scripts/ci/dcu/check_hcu_runtime_text.py -- "${files[@]}"
+          python3 scripts/ci/hcu/check_hcu_runtime_text.py -- "${files[@]}"
 
   secret-check:
     name: secret-check

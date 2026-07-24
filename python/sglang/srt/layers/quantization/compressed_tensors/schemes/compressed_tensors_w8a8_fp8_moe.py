@@ -42,7 +42,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_dcu, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
@@ -69,7 +69,7 @@ if _use_aiter_fp8_w8a8_moe:
         MoeSolutionType,
         MoeQuantType,
             )
-if _use_aiter and not _is_dcu:
+if _use_aiter and not _is_hcu:
     from aiter.ops.shuffle import shuffle_weight
 
 
@@ -387,17 +387,17 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+        if _is_hcu and get_moe_a2a_backend().is_megamoe():
             if self.weight_quant.strategy != QuantizationStrategy.CHANNEL:
                 raise RuntimeError(
-                    "DCU W8A8 MegaMoE requires channelwise FP8 expert weights "
+                    "HCU W8A8 MegaMoE requires channelwise FP8 expert weights "
                     "with dynamic per-token activation scales"
                 )
             from sglang.srt.layers.moe.mega_moe import (
-                build_dcu_w8a8_mega_moe_experts_weights,
+                build_hcu_w8a8_mega_moe_experts_weights,
             )
 
-            build_dcu_w8a8_mega_moe_experts_weights(layer)
+            build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
@@ -413,11 +413,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_deepgemm_moe and _is_dcu:
+        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_deepgemm_moe and _is_hcu:
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
 
         elif (
-            _is_dcu
+            _is_hcu
             and not _use_fp8_w8a8_moe
             and _use_aiter_fp8_w8a8_moe
             and _use_shuffle
@@ -429,7 +429,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_weight.copy_(w2_weight)
             del w2_weight
 
-        elif (_use_fp8_w8a8_moe and _is_dcu
+        elif (_use_fp8_w8a8_moe and _is_hcu
             and not getattr(layer, "_w8a8_fp8_packed", False)):
             w1 = layer.w13_weight
             w2 = layer.w2_weight
@@ -557,7 +557,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         moe_runner_config = self.moe_runner_config
 
         if (
-            _is_dcu
+            _is_hcu
             and self.runner.runner_backend.is_aiter()
             and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
         ):
@@ -630,7 +630,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     block_shape=self.weight_block_size,
                 )
             return self.runner.run(dispatch_output, quant_info)
-        elif _is_dcu and _use_fp8_w8a8_moe:
+        elif _is_hcu and _use_fp8_w8a8_moe:
             if (getattr(layer.w13_weight, "_w8a8_fp8_packed", False)
                 or getattr(layer.w2_weight, "_w8a8_fp8_packed", False)):
                 topk_weights, topk_ids, _ = topk_output
@@ -638,7 +638,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 if moe_runner_config.apply_router_weight_on_input:
                     assert topk_weights.dim() == 2, "`topk_weights` should be (num_tokens, topk)"
                     _, tk = topk_weights.shape
-                    assert tk == 1, "DCU marlin path: apply_router_weight_on_input requires topk=1"
+                    assert tk == 1, "HCU marlin path: apply_router_weight_on_input requires topk=1"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                     # Router-weighted input no longer matches precomputed rms-quant activations.
@@ -666,7 +666,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
                 return StandardCombineInput(hidden_states=output)
-        elif  _is_dcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe:
+        elif  _is_hcu and not _use_fp8_w8a8_moe and _use_aiter_fp8_w8a8_moe:
             if isinstance(layer.w13_weight,tuple):
                 w1=layer.w13_weight[0]
                 w2=layer.w2_weight[0]
@@ -677,7 +677,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             if moe_runner_config.apply_router_weight_on_input:
                 assert topk_weights.dim() == 2, "`topk_weights` should be (num_tokens, topk)"
                 _, tk = topk_weights.shape
-                assert tk == 1, "DCU marlin path: apply_router_weight_on_input requires topk=1"
+                assert tk == 1, "HCU marlin path: apply_router_weight_on_input requires topk=1"
                 x = x * topk_weights.to(x.dtype)
                 topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
                 # Router-weighted input no longer matches precomputed rms-quant activations.

@@ -19,7 +19,7 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
@@ -29,14 +29,14 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local bge-reranker-base mapping added, but HFRunner/SRTRunner cross-encoder comparison hung before DCU allocation on BW1100.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: local bge-reranker-base mapping added, but HFRunner/SRTRunner cross-encoder comparison hung before HCU allocation on BW1100.",
 )
 
-if os.environ.get("SGLANG_IS_IN_CI_DCU"):
+if os.environ.get("SGLANG_IS_IN_CI_HCU"):
     MODELS = [
         (
             os.environ.get(

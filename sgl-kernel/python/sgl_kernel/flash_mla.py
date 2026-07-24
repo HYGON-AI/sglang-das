@@ -14,7 +14,7 @@ _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
 
-def dcu_create_flashmla_kv_indices(
+def hcu_create_flashmla_kv_indices(
         req_to_token_ptr,
         req_pool_indices_ptr,
         page_kernel_lens_ptr,
@@ -24,7 +24,7 @@ def dcu_create_flashmla_kv_indices(
         kv_indices_ptr_stride,
         PAGED_SIZE = 64,
 ):
-    torch.ops.sgl_kernel.dcu_create_flashmla_kv_indices(req_to_token_ptr,
+    torch.ops.sgl_kernel.hcu_create_flashmla_kv_indices(req_to_token_ptr,
         req_pool_indices_ptr,
         page_kernel_lens_ptr,
         kv_start_idx,

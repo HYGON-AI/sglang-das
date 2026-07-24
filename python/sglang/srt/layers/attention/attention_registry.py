@@ -27,12 +27,12 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import get_device_capability, is_dcu, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hcu, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +158,7 @@ def create_dsv4_backend(runner):
         )
 
         return DeepseekV4AscendAttnBackend(runner)
-    elif _is_hip and not _is_dcu:
+    elif _is_hip and not _is_hcu:
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DeepseekV4HipRadixBackend,
         )
@@ -206,11 +206,11 @@ def create_flashmla_backend(runner):
 
     return FlashMLABackend(runner)
 
-@register_attention_backend("dcu_mla")
-def create_dcu_mla_backend(runner):
-    from sglang.srt.layers.attention.dcu_mla_backend import DCUMLABackend
+@register_attention_backend("hcu_mla")
+def create_hcu_mla_backend(runner):
+    from sglang.srt.layers.attention.hcu_mla_backend import HCUMLABackend
 
-    return DCUMLABackend(runner)
+    return HCUMLABackend(runner)
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):

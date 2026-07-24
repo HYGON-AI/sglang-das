@@ -15,13 +15,13 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, get_device_count
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=120,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: Mamba2 mixer path needs BW1100 backend validation before enabling.",
+    disabled="HCU CSV CI placeholder: Mamba2 mixer path needs BW1100 backend validation before enabling.",
 )
 
 

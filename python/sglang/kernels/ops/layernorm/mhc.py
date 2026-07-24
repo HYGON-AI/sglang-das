@@ -30,7 +30,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils import get_bool_env_var, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +169,9 @@ pass_configs = {
 # Set once mhc_pre() has compiled every n_splits bucket at startup.
 _mhc_pre_warmed = False
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
-if _is_dcu and _use_aiter_tilelang_mhc:
+if _is_hcu and _use_aiter_tilelang_mhc:
     from aiter.ops.tilelang import pre_big_fuse_tilelang
 
 FP8 = "float8_e4m3"
@@ -1097,7 +1097,7 @@ def mhc_pre(
             gemm_last_dim = hc_mult3
             big_fuse_n_splits = n_splits
 
-    if _is_dcu and _use_aiter_tilelang_mhc:
+    if _is_hcu and _use_aiter_tilelang_mhc:
        pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,

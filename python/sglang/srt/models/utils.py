@@ -35,7 +35,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_dcu, is_hip
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hcu, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
 
@@ -296,7 +296,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         and not is_prefill_context_parallel_enabled()
     )
     dcp_kv_mask = getattr(forward_batch, "dcp_kv_mask", None)
-    if _is_dcu:
+    if _is_hcu:
         return cuda_enabled
     return cuda_enabled or (
         _is_hip

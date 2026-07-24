@@ -49,19 +49,19 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_npu,
     set_weight_attrs,
 )
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
 )
-if _is_dcu:
+if _is_hcu:
     from lightop import op
 
 
@@ -219,7 +219,7 @@ class CompressorBackendMixin:
             )
         else:
             if (
-                _is_dcu
+                _is_hcu
                 and _use_dpskv4_lightop_quant_k_cache
                 and hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store")
             ):
@@ -229,7 +229,7 @@ class CompressorBackendMixin:
                     cache_k=new_compressed_kv.bfloat16(),
                 )
                 return
-            if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
+            if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
                 pack = quant_to_nope_fp8_rope_bf16_pack_lightop(
                     new_compressed_kv.bfloat16(), 1e-8
                 )

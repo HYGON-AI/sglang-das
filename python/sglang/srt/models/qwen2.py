@@ -52,11 +52,11 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_dcu, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_hcu, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-_is_dcu = is_dcu()
-if _is_dcu:
+_is_hcu = is_hcu()
+if _is_hcu:
     from lightop import split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant
 
 _use_fused_rms_rotary = get_bool_env_var(
@@ -208,7 +208,7 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         num_tokens = qkv.shape[0]
-        if _is_dcu and _use_fused_rms_rotary:
+        if _is_hcu and _use_fused_rms_rotary:
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             if (cos_sin_cache.device != qkv.device
                     or cos_sin_cache.dtype != qkv.dtype):

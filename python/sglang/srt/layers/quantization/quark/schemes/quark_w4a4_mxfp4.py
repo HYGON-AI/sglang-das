@@ -7,12 +7,12 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
-from sglang.srt.utils import is_dcu, is_hip
+from sglang.srt.utils import is_hcu, is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
-if _is_hip and not _is_dcu:
+_is_hcu = is_hcu()
+if _is_hip and not _is_hcu:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
@@ -172,6 +172,11 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
+                if _is_hcu:
+                    raise NotImplementedError(
+                        "Online MXFP4 quantization requires an HCU/ROCm device with "
+                        "FP4 hardware support (gfx95x, e.g. MI355x)."
+                    )
                 raise NotImplementedError(
                     "Online MXFP4 quantization requires an AMD ROCm device with "
                     "FP4 hardware support (gfx95x, e.g. MI355x)."

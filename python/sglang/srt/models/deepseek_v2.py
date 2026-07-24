@@ -207,7 +207,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     get_int_env_var,
-    is_dcu,
+    is_hcu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -220,7 +220,7 @@ if _use_aiter:
 from sglang.srt.layers.attention.lightop_concat import concat_decode_opt
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_sbo_enabled = is_sbo_enabled()
 _use_lightop_moe_sum_mul_add = get_bool_env_var("SGLANG_USE_LIGHTOP_MOE_SUM_MUL_ADD")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
@@ -448,7 +448,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
-            _is_hip and not _is_dcu and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
+            _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -709,8 +709,8 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif _is_dcu and self.is_deepseek_v4:
-                # DCU Hash-MoE JIT requires FP32 router logits.
+            elif _is_hcu and self.is_deepseek_v4:
+                # HCU Hash-MoE JIT requires FP32 router logits.
                 from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
@@ -1367,7 +1367,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _is_musa
-            and not _is_dcu
+            and not _is_hcu
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
@@ -2568,7 +2568,7 @@ class DeepseekV2AttentionMLA(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
-        elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_dcu:
+        elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_hcu:
             # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
@@ -3585,7 +3585,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
-        # DCU fused RMS/quant must keep the norm for SBO sparse-MoE layers.
+        # HCU fused RMS/quant must keep the norm for SBO sparse-MoE layers.
         forward_batch.rms_quant_flag = not (self.is_layer_sparse and _is_sbo_enabled)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -4158,7 +4158,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
             and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
         ):
-            hip_platform = "DCU/DTK-platform" if _is_dcu else "ROCm/HIP-platform"
+            hip_platform = "HCU/DTK-platform" if _is_hcu else "ROCm/HIP-platform"
             disable_reason = (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 f"or {hip_platform} with capability >= gfx942(MI30x) can use shared experts fusion optimization."
@@ -4167,7 +4167,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         elif get_parallel().moe_ep_size > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            hip_platform = "DCU/DTK-platform" if _is_dcu else "ROCm/HIP-platform"
+            hip_platform = "HCU/DTK-platform" if _is_hcu else "ROCm/HIP-platform"
             disable_reason = (
                 f"Only Deepseek V3/R1 on {hip_platform} with capability >= gfx942(MI30x) "
                 "can use shared experts fusion optimization under expert parallelism."

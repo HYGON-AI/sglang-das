@@ -247,7 +247,7 @@ def hadamard_transform_optimized(
     x: torch.Tensor,
     scale: float = 1.0,
 ) -> torch.Tensor:
-    """DCU fallback using a cached dense Hadamard transform."""
+    """HCU fallback using a cached dense Hadamard transform."""
     x_shape = x.shape
     dim = x.shape[-1]
     dim_padded = 2 ** math.ceil(math.log2(dim))

@@ -84,7 +84,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     add_prefix,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
@@ -94,7 +94,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _use_fused_qwen_bailing_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 if _is_cuda:
     from sglang.jit_kernel.fused_qknorm_rope import (
@@ -102,7 +102,7 @@ if _is_cuda:
         fused_qk_norm_rope,
     )
 
-if _is_dcu:
+if _is_hcu:
     from lightop import rms_rotary_embedding_fuse_with_kv_store
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
@@ -637,7 +637,7 @@ class Qwen3MoeAttention(nn.Module):
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            if _is_dcu and _use_fused_qwen_bailing_rotary:
+            if _is_hcu and _use_fused_qwen_bailing_rotary:
                 # Fused RMSNorm + RoPE + kv_store path through custom op.
                 cos_sin_cache = self.rotary_emb.cos_sin_cache
                 if (cos_sin_cache.device != q.device

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST,
@@ -36,12 +36,12 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=520, suite="stage-c-test-8-gpu-h20")
 
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=520,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: W4A8 DeepSeek-V3 quant path needs BW1100 large-model validation before enabling.",
+    disabled="HCU CSV CI placeholder: W4A8 DeepSeek-V3 quant path needs BW1100 large-model validation before enabling.",
 )
 
 class TestDeepseekV3W4afp8(CustomTestCase):

@@ -66,9 +66,9 @@ if TYPE_CHECKING:
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
 )
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_aiter_w16a16_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
@@ -433,7 +433,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
-        if (_is_dcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe
+        if (_is_hcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe
             and not self.use_deepep
             and not getattr(layer, "use_nn_moe", False)
             and not getattr(layer, "_marlin_w16a16_moe_packed", False)):
@@ -703,7 +703,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            if not _is_dcu and self._aiter_runner is not None:
+            if not _is_hcu and self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
                 )
@@ -714,7 +714,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
-            elif _is_dcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe:
+            elif _is_hcu and _use_marlin_w16a16_moe and not _use_aiter_w16a16_moe:
                     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe_w16a16
                     K = x.size(1)
 
@@ -756,7 +756,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                             inplace=True,
                         )
                         return StandardCombineInput(hidden_states=output)
-            elif _is_dcu and _use_aiter_w16a16_moe and not _use_marlin_w16a16_moe:
+            elif _is_hcu and _use_aiter_w16a16_moe and not _use_marlin_w16a16_moe:
                 w1 = layer.w13_weight[0] if isinstance(layer.w13_weight, tuple) else layer.w13_weight
                 w2 = layer.w2_weight[0] if isinstance(layer.w2_weight, tuple) else layer.w2_weight
                 topk_weights, topk_ids, _ = topk_output
@@ -767,7 +767,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     _, tk = topk_weights.shape
                     assert (
                         tk == 1
-                    ), "DCU AITER W16A16 path: apply_router_weight_on_input requires topk=1"
+                    ), "HCU AITER W16A16 path: apply_router_weight_on_input requires topk=1"
                     x = x * topk_weights.to(x.dtype)
                     topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
 

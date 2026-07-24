@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   update-pr-body:
-    runs-on: ${{ vars.DCU_CI_RUNNER_LABEL || 'dcu-ci-pr-2' }}
+    runs-on: ${{ vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-pr-2' }}
     steps:
       - name: Update CI states block in PR body
         uses: actions/github-script@v8

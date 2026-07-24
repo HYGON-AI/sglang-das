@@ -561,7 +561,7 @@ class CudaIpcTensorTransportProxy:
     ):
         """Mark this IPC feature as consumed exactly once per source pool.
 
-        The DCU pool group owns one source slice per TP device.  Normal TP
+        The HCU pool group owns one source slice per TP device.  Normal TP
         reconstruction acknowledges only the selected device slice.  Encoder-DP
         and cache-hit paths pass ``consumer_count > 1`` without a selected slice;
         in that case every per-device source slice is acknowledged once.

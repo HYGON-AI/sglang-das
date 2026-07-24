@@ -21,7 +21,7 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     is_blackwell,
     is_cpu,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -73,7 +73,7 @@ class DraftBackendFactory:
             "fa3": self._create_fa3_decode_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_decode_backend,
             "flashmla": self._create_flashmla_decode_backend,
-            "dcu_mla": self._create_dcumla_decode_backend,
+            "hcu_mla": self._create_hcumla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "cutedsl_mla": self._create_cutedsl_mla_decode_backend,
@@ -100,7 +100,7 @@ class DraftBackendFactory:
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
             "flashmla": self._create_flashmla_prefill_backend,
-            "dcu_mla": self._create_dcumla_prefill_backend,
+            "hcu_mla": self._create_hcumla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
@@ -233,12 +233,12 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
     
-    def _create_dcumla_decode_backend(self):
-        from sglang.srt.layers.attention.dcu_mla_backend import (
-            DCUMLAMultiStepDraftBackend,
+    def _create_hcumla_decode_backend(self):
+        from sglang.srt.layers.attention.hcu_mla_backend import (
+            HCUMLAMultiStepDraftBackend,
         )
 
-        return DCUMLAMultiStepDraftBackend(
+        return HCUMLAMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
@@ -304,7 +304,7 @@ class DraftBackendFactory:
             return DeepseekV4AscendMultiStepDraftBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
-        elif is_hip() and not is_dcu():
+        elif is_hip() and not is_hcu():
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4MultiStepBackend,
             )
@@ -404,7 +404,7 @@ class DraftBackendFactory:
 
         return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
 
-    def _create_dcumla_prefill_backend(self):
+    def _create_hcumla_prefill_backend(self):
         logger.warning(
             "flashmla prefill backend is not yet supported for draft extend."
         )
@@ -419,7 +419,7 @@ class DraftBackendFactory:
             )
 
             return ATTENTION_BACKENDS["dsv4"](self.draft_model_runner)
-        elif is_hip() and not is_dcu():
+        elif is_hip() and not is_hcu():
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4HipRadixBackend,
             )

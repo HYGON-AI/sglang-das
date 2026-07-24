@@ -21,14 +21,14 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-    register_dcu_ci,
+    register_hcu_ci,
 )
 from sglang.test.test_utils import run_doctests
 
-# DCU BW1100 validated on 10.16.1.66/dxl-sglang: EVS unit/doctest path passed three runs.
-register_dcu_ci(
+# HCU BW1100 validated on 10.16.1.66/dxl-sglang: EVS unit/doctest path passed three runs.
+register_hcu_ci(
     est_time=20,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
 )
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")

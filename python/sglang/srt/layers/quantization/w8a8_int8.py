@@ -42,7 +42,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -54,12 +54,12 @@ if TYPE_CHECKING:
 from lmslim import quant_ops
 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
-if _is_dcu:
+if _is_hcu:
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 if _is_cuda:
@@ -347,7 +347,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_dcu and self.runner.runner_backend.is_lightop():
+        if _is_hcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,
             )
@@ -374,9 +374,9 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
 
-        if moe_runner_backend.is_aiter() and _is_dcu:
+        if moe_runner_backend.is_aiter() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
-        elif moe_runner_backend.is_lightop() and _is_dcu:
+        elif moe_runner_backend.is_lightop() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.LIGHTOP, moe_runner_config)
         elif moe_runner_backend.is_triton():
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
@@ -439,13 +439,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
         quant_info = self.get_triton_quant_info(layer)
 
-        if _is_dcu and self.runner.runner_backend.is_aiter():
+        if _is_hcu and self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 get_aiter_w8a8_int8_quant_info,
             )
 
             quant_info = get_aiter_w8a8_int8_quant_info(layer)
-        elif _is_dcu and self.runner.runner_backend.is_lightop():
+        elif _is_hcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import get_lightop_quant_info
 
             quant_info = get_lightop_quant_info(layer)

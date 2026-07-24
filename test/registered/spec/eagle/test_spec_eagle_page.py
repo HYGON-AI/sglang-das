@@ -7,7 +7,7 @@ live in test_spec_eagle_topk.py. Runs on the cheap (5090) runner.
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecFeatureKit,
@@ -16,11 +16,11 @@ from sglang.test.kits.spec_server_kits import (
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
-register_dcu_ci(
+register_hcu_ci(
     est_time=540,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: EAGLE page-size variants need BW1100 validation before enabling.",
+    disabled="HCU CSV CI placeholder: EAGLE page-size variants need BW1100 validation before enabling.",
 )
 
 

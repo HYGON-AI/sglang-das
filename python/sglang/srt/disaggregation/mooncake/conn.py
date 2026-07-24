@@ -81,7 +81,7 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
-_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 
 # decode
@@ -747,7 +747,7 @@ class MooncakeKVManager(CommonKVManager):
 
         NOTE:
         - Non-FA layout: expand per token slot within each page.
-        - _kv_layout_dcu_fa layout: transfer one contiguous head slice per page.
+        - _kv_layout_hcu_fa layout: transfer one contiguous head slice per page.
         """
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
@@ -777,7 +777,7 @@ class MooncakeKVManager(CommonKVManager):
         src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
 
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             # FA: bytes of one head slice in one whole page
             bytes_per_head_to_send = dst_kv_item_len // dst_heads_per_rank
         else:
@@ -839,7 +839,7 @@ class MooncakeKVManager(CommonKVManager):
             return -1
 
         # Calculate offsets / transfer sizes
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             # FA layout: contiguous head slice on one whole page
             src_head_slice_offset = src_head_start_offset * bytes_per_head_to_send
             dst_head_slice_offset = dst_head_start_offset * bytes_per_head_to_send
@@ -853,7 +853,7 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         if not same_kv_item_len:
-            if _kv_layout_dcu_fa:
+            if _kv_layout_hcu_fa:
                 bytes_per_head_v = dst_v_item_len // dst_heads_per_rank
                 src_head_slice_offset_v = src_head_start_offset * bytes_per_head_v
                 dst_head_slice_offset_v = dst_head_start_offset * bytes_per_head_v
@@ -867,7 +867,7 @@ class MooncakeKVManager(CommonKVManager):
                 heads_bytes_per_token_v = num_heads_to_send * bytes_per_head_slice_v
 
         # Sanity check
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             if heads_bytes_to_send > dst_kv_item_len:
                 logger.error(
                     f"[{mooncake_session_id}] FA slice size ({heads_bytes_to_send}) exceeds "
@@ -885,7 +885,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
         decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
 
-        if not _kv_layout_dcu_fa:
+        if not _kv_layout_hcu_fa:
             tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
             bytes_per_token_on_prefill = src_kv_item_len // page_size
             bytes_per_token_on_decode = dst_kv_item_len // page_size
@@ -913,7 +913,7 @@ class MooncakeKVManager(CommonKVManager):
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
 
-            if _kv_layout_dcu_fa:
+            if _kv_layout_hcu_fa:
                 # One transfer per page
                 src_slice_addrs = src_page_base_addrs + src_head_slice_offset
                 dst_slice_addrs = dst_page_base_addrs + dst_head_slice_offset
@@ -942,7 +942,7 @@ class MooncakeKVManager(CommonKVManager):
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_v_item_len
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_v_item_len
 
-            if _kv_layout_dcu_fa:
+            if _kv_layout_hcu_fa:
                 src_slice_addrs = src_page_base_addrs + src_head_slice_offset_v
                 dst_slice_addrs = dst_page_base_addrs + dst_head_slice_offset_v
 
@@ -1195,7 +1195,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
         decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
 
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             tokens_per_page = None
         else:
             tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
@@ -1232,7 +1232,7 @@ class MooncakeKVManager(CommonKVManager):
                 dst_layer_ptr + decode_page_indices * dst_item_len_layer
             )
 
-            if _kv_layout_dcu_fa:
+            if _kv_layout_hcu_fa:
                 src_slice_addrs = src_page_base_addrs + src_head_byte_offset * page_size
                 dst_slice_addrs = dst_page_base_addrs + dst_head_byte_offset * page_size
                 transfer_bytes = transfer_bytes_per_token * page_size

@@ -26,7 +26,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -39,10 +39,10 @@ register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
-# DCU BW1100 validated on 10.16.1.66/dxl-sglang: local Qwen3-0.6B passed three runs.
-register_dcu_ci(
+# HCU BW1100 validated on 10.16.1.66/dxl-sglang: local Qwen3-0.6B passed three runs.
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
 )
 
 class TestEnableThinking(CustomTestCase):

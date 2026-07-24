@@ -33,12 +33,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
-_is_dcu = is_dcu()
-if _is_dcu:
+_is_hcu = is_hcu()
+if _is_hcu:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-    from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
+    from sgl_kernel.flash_mla import hcu_create_flashmla_kv_indices
 else:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
@@ -188,8 +188,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if _is_dcu and use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+            if _is_hcu and use_sglang_create_flashmla_kv_indices_triton:
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr=self.req_to_token,
                     req_pool_indices_ptr=forward_batch.req_pool_indices,
                     page_kernel_lens_ptr=forward_batch.seq_lens,
@@ -226,8 +226,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + self.num_draft_tokens, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if _is_dcu and use_sglang_create_flashmla_kv_indices_triton:
-                dcu_create_flashmla_kv_indices(
+            if _is_hcu and use_sglang_create_flashmla_kv_indices_triton:
+                hcu_create_flashmla_kv_indices(
                     req_to_token_ptr=self.req_to_token,
                     req_pool_indices_ptr=forward_batch.req_pool_indices,
                     page_kernel_lens_ptr=seq_lens,

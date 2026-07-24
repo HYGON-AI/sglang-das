@@ -38,13 +38,13 @@ import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=240,
-    suite="nightly-dcu-2-gpu",
+    suite="nightly-hcu-2-gpu",
     nightly=True,
-    disabled="DCU nightly disabled: remote weight loading OOMs or times out on BW1100; pending fix.",
+    disabled="HCU nightly disabled: remote weight loading OOMs or times out on BW1100; pending fix.",
 )
 
 from sglang.test.test_utils import (
@@ -64,8 +64,8 @@ register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
 
 
-def _dcu_engine_kwargs():
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _hcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_HCU") != "1":
         return {}
     return {
         "attention_backend": "fa3",
@@ -74,8 +74,8 @@ def _dcu_engine_kwargs():
     }
 
 
-def _dcu_server_args():
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _hcu_server_args():
+    if os.environ.get("SGLANG_IS_IN_CI_HCU") != "1":
         return ()
     return (
         "--attention-backend",
@@ -174,7 +174,7 @@ def init_process_seed(
             str(tp_size),
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
         )
-        + _dcu_server_args(),
+        + _hcu_server_args(),
     )
     torch.cuda.synchronize()
 
@@ -241,7 +241,7 @@ def init_process_dst(
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
             remote_instance_weight_loader_start_seed_via_transfer_engine=False,
-            **_dcu_engine_kwargs(),
+            **_hcu_engine_kwargs(),
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -275,7 +275,7 @@ def init_process_dst(
                 "--engine-info-bootstrap-port",
                 str(6789 + rank),
             )
-            + _dcu_server_args(),
+            + _hcu_server_args(),
         )
     torch.cuda.synchronize()
 

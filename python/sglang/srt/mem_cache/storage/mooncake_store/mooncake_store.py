@@ -659,10 +659,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first_direct",
             "page_head",
             "page_first_kv_split",
-            "layout_dcu",
+            "layout_hcu",
         ], (
             "Mooncake storage supports page_first, page_first_direct, "
-            "page_head, page_first_kv_split, and layout_dcu host layouts"
+            "page_head, page_first_kv_split, and layout_hcu host layouts"
         )
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):

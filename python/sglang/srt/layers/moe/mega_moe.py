@@ -28,7 +28,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -39,39 +39,39 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
-_MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT: Optional[Any] = None
-_MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = False
-_IS_DCU = is_dcu()
+_MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT: Optional[Any] = None
+_MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = False
+_IS_HCU = is_hcu()
 
-_DCU_MEGA_MOE_RUNTIME_DEEP_GEMM = "deep_gemm"
-_DCU_MEGA_MOE_RUNTIME_MEGAMOE = "megamoe"
-_DCU_MEGA_MOE_RUNTIMES = {
-    _DCU_MEGA_MOE_RUNTIME_DEEP_GEMM,
-    _DCU_MEGA_MOE_RUNTIME_MEGAMOE,
+_HCU_MEGA_MOE_RUNTIME_DEEP_GEMM = "deep_gemm"
+_HCU_MEGA_MOE_RUNTIME_MEGAMOE = "megamoe"
+_HCU_MEGA_MOE_RUNTIMES = {
+    _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM,
+    _HCU_MEGA_MOE_RUNTIME_MEGAMOE,
 }
 
-_MEGA_MOE_DCU_BACKEND_ENV = "MEGAMOE_DCU_BACKEND"
-_MEGA_MOE_DCU_BACKEND_AUTO = "auto"
-_MEGA_MOE_DCU_BACKEND_LL = "ll"
-_MEGA_MOE_DCU_BACKEND_NORMAL = "normal"
-_MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
-_MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD = 496
+_MEGA_MOE_HCU_BACKEND_ENV = "MEGAMOE_HCU_BACKEND"
+_MEGA_MOE_HCU_BACKEND_AUTO = "auto"
+_MEGA_MOE_HCU_BACKEND_LL = "ll"
+_MEGA_MOE_HCU_BACKEND_NORMAL = "normal"
+_MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD"
+_MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD = 496
 
 logger = logging.getLogger(__name__)
 
 
-def get_dcu_mega_moe_runtime() -> str:
-    runtime = envs.SGLANG_DCU_MEGA_MOE_RUNTIME.get().strip().lower()
-    if runtime not in _DCU_MEGA_MOE_RUNTIMES:
+def get_hcu_mega_moe_runtime() -> str:
+    runtime = envs.SGLANG_HCU_MEGA_MOE_RUNTIME.get().strip().lower()
+    if runtime not in _HCU_MEGA_MOE_RUNTIMES:
         raise ValueError(
-            "SGLANG_DCU_MEGA_MOE_RUNTIME must be one of "
-            f"{sorted(_DCU_MEGA_MOE_RUNTIMES)}, got {runtime!r}"
+            "SGLANG_HCU_MEGA_MOE_RUNTIME must be one of "
+            f"{sorted(_HCU_MEGA_MOE_RUNTIMES)}, got {runtime!r}"
         )
     return runtime
 
 
 def _is_standalone_megamoe_runtime() -> bool:
-    return _IS_DCU and get_dcu_mega_moe_runtime() == _DCU_MEGA_MOE_RUNTIME_MEGAMOE
+    return _IS_HCU and get_hcu_mega_moe_runtime() == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
 
 
 def _is_pd_prefill_instance() -> bool:
@@ -83,83 +83,83 @@ def _is_pd_prefill_instance() -> bool:
         return False
 
 
-def _get_dcu_normal_ll_token_threshold() -> int:
-    value = os.environ.get(_MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV)
+def _get_hcu_normal_ll_token_threshold() -> int:
+    value = os.environ.get(_MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV)
     if value is None:
-        return _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD
+        return _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD
     try:
         threshold = int(value)
     except ValueError:
         logger.warning(
             "Invalid %s=%s, fallback to %s",
-            _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV,
+            _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV,
             value,
-            _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD,
+            _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD,
         )
-        return _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD
+        return _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD
     if threshold < 0:
         logger.warning(
             "Invalid %s=%s, fallback to %s",
-            _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD_ENV,
+            _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV,
             value,
-            _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD,
+            _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD,
         )
-        return _MEGA_MOE_DCU_NORMAL_LL_TOKEN_THRESHOLD
+        return _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD
     return threshold
 
 
-def _select_dcu_megamoe_backend(selector_tokens: int) -> str:
+def _select_hcu_megamoe_backend(selector_tokens: int) -> str:
     if selector_tokens < 0:
         raise ValueError("MegaMoE backend selector token count must be non-negative")
     if _is_pd_prefill_instance():
-        return _MEGA_MOE_DCU_BACKEND_NORMAL
+        return _MEGA_MOE_HCU_BACKEND_NORMAL
 
-    mode = os.environ.get(_MEGA_MOE_DCU_BACKEND_ENV, _MEGA_MOE_DCU_BACKEND_AUTO)
+    mode = os.environ.get(_MEGA_MOE_HCU_BACKEND_ENV, _MEGA_MOE_HCU_BACKEND_AUTO)
     mode = mode.strip().lower()
-    if mode == _MEGA_MOE_DCU_BACKEND_AUTO:
+    if mode == _MEGA_MOE_HCU_BACKEND_AUTO:
         return (
-            _MEGA_MOE_DCU_BACKEND_LL
-            if selector_tokens <= _get_dcu_normal_ll_token_threshold()
-            else _MEGA_MOE_DCU_BACKEND_NORMAL
+            _MEGA_MOE_HCU_BACKEND_LL
+            if selector_tokens <= _get_hcu_normal_ll_token_threshold()
+            else _MEGA_MOE_HCU_BACKEND_NORMAL
         )
-    if mode in {_MEGA_MOE_DCU_BACKEND_LL, _MEGA_MOE_DCU_BACKEND_NORMAL}:
+    if mode in {_MEGA_MOE_HCU_BACKEND_LL, _MEGA_MOE_HCU_BACKEND_NORMAL}:
         return mode
     raise ValueError(
-        f"{_MEGA_MOE_DCU_BACKEND_ENV} must be one of "
-        f"{[_MEGA_MOE_DCU_BACKEND_AUTO, _MEGA_MOE_DCU_BACKEND_LL, _MEGA_MOE_DCU_BACKEND_NORMAL]}, "
+        f"{_MEGA_MOE_HCU_BACKEND_ENV} must be one of "
+        f"{[_MEGA_MOE_HCU_BACKEND_AUTO, _MEGA_MOE_HCU_BACKEND_LL, _MEGA_MOE_HCU_BACKEND_NORMAL]}, "
         f"got {mode!r}"
     )
 
 
-def _get_dcu_cuda_graph_max_tokens_per_rank(
+def _get_hcu_cuda_graph_max_tokens_per_rank(
     num_max_tokens_per_rank: int,
     selector_tokens: int,
 ) -> int:
     graph_tokens = max(
-        _get_dcu_normal_ll_token_threshold(),
+        _get_hcu_normal_ll_token_threshold(),
         int(selector_tokens),
         1,
     )
     if graph_tokens > num_max_tokens_per_rank:
         raise ValueError(
-            "Standalone DCU MegaMoE CUDA graph requires "
+            "Standalone HCU MegaMoE CUDA graph requires "
             "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to be at "
             f"least {graph_tokens}, got {num_max_tokens_per_rank}"
         )
     return graph_tokens
 
 
-def _get_dcu_w8a8_pre_dispatch_quant():
-    global _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT
-    global _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT_CHECKED
+def _get_hcu_w8a8_pre_dispatch_quant():
+    global _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
+    global _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED
 
-    if _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT_CHECKED:
-        return _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT
+    if _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED:
+        return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
 
     try:
         from lightop import op as lightop_op
 
-        _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT = getattr(
+        _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT = getattr(
             lightop_op, "per_token_quant_fp8", None
         )
     except Exception as exc:
@@ -168,9 +168,9 @@ def _get_dcu_w8a8_pre_dispatch_quant():
             "to megamoe.cast_to_fp8_channelwise: %s",
             exc,
         )
-        _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT = None
-    _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = True
-    return _MEGA_MOE_DCU_W8A8_PRE_DISPATCH_QUANT
+        _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT = None
+    _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = True
+    return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
 
 
 def _prepare_standalone_megamoe_inputs(
@@ -180,7 +180,7 @@ def _prepare_standalone_megamoe_inputs(
     buf,
     num_tokens: int,
 ) -> None:
-    quant = _get_dcu_w8a8_pre_dispatch_quant()
+    quant = _get_hcu_w8a8_pre_dispatch_quant()
     if quant is not None:
         quant_input = (
             hidden_states
@@ -238,16 +238,16 @@ def _get_mega_moe_symm_buffer(
     runtime: str,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
 ) -> SymmBuffer:
-    if _IS_DCU and runtime == _DCU_MEGA_MOE_RUNTIME_MEGAMOE:
+    if _IS_HCU and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
         import megamoe
 
-        package_key = _DCU_MEGA_MOE_RUNTIME_MEGAMOE
+        package_key = _HCU_MEGA_MOE_RUNTIME_MEGAMOE
         factory = megamoe.get_symm_buffer_for_mega_moe
     else:
         import deep_gemm
 
         _apply_mega_moe_dg_env()
-        package_key = _DCU_MEGA_MOE_RUNTIME_DEEP_GEMM
+        package_key = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM
         factory = deep_gemm.get_symm_buffer_for_mega_moe
         cuda_graph_max_tokens_per_rank = None
 
@@ -286,17 +286,17 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if _IS_DCU:
-        runtime = get_dcu_mega_moe_runtime()
-        built_runtime = getattr(moe.experts, "_mega_moe_dcu_runtime", None)
+    if _IS_HCU:
+        runtime = get_hcu_mega_moe_runtime()
+        built_runtime = getattr(moe.experts, "_mega_moe_hcu_runtime", None)
         if built_runtime != runtime:
             raise RuntimeError(
-                "DCU MegaMoE runtime changed after expert weights were built: "
+                "HCU MegaMoE runtime changed after expert weights were built: "
                 f"built={built_runtime!r}, current={runtime!r}. Restart the "
-                "server after changing SGLANG_DCU_MEGA_MOE_RUNTIME."
+                "server after changing SGLANG_HCU_MEGA_MOE_RUNTIME."
             )
     if get_is_capture_mode():
-        return not _IS_DCU or _is_standalone_megamoe_runtime()
+        return not _IS_HCU or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens:
@@ -393,14 +393,14 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
-    runtime = get_dcu_mega_moe_runtime() if _IS_DCU else _DCU_MEGA_MOE_RUNTIME_DEEP_GEMM
+    runtime = get_hcu_mega_moe_runtime() if _IS_HCU else _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM
     cuda_graph_max_tokens_per_rank = (
-        _get_dcu_cuda_graph_max_tokens_per_rank(
+        _get_hcu_cuda_graph_max_tokens_per_rank(
             num_max_tokens_per_rank,
             dispatch_num_tokens,
         )
-        if _IS_DCU
-        and runtime == _DCU_MEGA_MOE_RUNTIME_MEGAMOE
+        if _IS_HCU
+        and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
         and get_is_capture_mode()
         else None
     )
@@ -415,9 +415,9 @@ def _run_mega_routed(
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
     )
 
-    if _IS_DCU:
-        if runtime == _DCU_MEGA_MOE_RUNTIME_MEGAMOE:
-            y = _run_standalone_dcu_w8a8_mega_moe(
+    if _IS_HCU:
+        if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+            y = _run_standalone_hcu_w8a8_mega_moe(
                 hidden_states=hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
@@ -428,7 +428,7 @@ def _run_mega_routed(
                 dispatch_num_tokens=dispatch_num_tokens,
             )
         else:
-            y = _run_deep_gemm_dcu_w8a8_mega_moe(
+            y = _run_deep_gemm_hcu_w8a8_mega_moe(
                 hidden_states=hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
@@ -505,7 +505,7 @@ def _run_mega_routed(
     return y
 
 
-def _run_deep_gemm_dcu_w8a8_mega_moe(
+def _run_deep_gemm_hcu_w8a8_mega_moe(
     *,
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
@@ -544,7 +544,7 @@ def _run_deep_gemm_dcu_w8a8_mega_moe(
     return y
 
 
-def _run_standalone_dcu_w8a8_mega_moe(
+def _run_standalone_hcu_w8a8_mega_moe(
     *,
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
@@ -582,7 +582,7 @@ def _run_standalone_dcu_w8a8_mega_moe(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    api_kwargs = {"megamoe_backend": _select_dcu_megamoe_backend(dispatch_num_tokens)}
+    api_kwargs = {"megamoe_backend": _select_hcu_megamoe_backend(dispatch_num_tokens)}
     if is_graph_capture:
         api_kwargs["graph"] = True
     else:
@@ -701,7 +701,7 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts._mega_moe_weights_built = True
 
 
-def _dcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tensor:
+def _hcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tensor:
     num_experts = int(experts.w13_weight.shape[0])
     for name in names:
         scale_param = getattr(experts, name, None)
@@ -713,19 +713,19 @@ def _dcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tenso
         if scale.dim() == 2 and scale.shape == (num_experts, rows):
             return scale.to(torch.float32).contiguous()
     raise ValueError(
-        "DCU W8A8 MegaMoE requires channelwise FP32 scales shaped "
+        "HCU W8A8 MegaMoE requires channelwise FP32 scales shaped "
         f"[expert,row] for {label}; checked {', '.join(names)}"
     )
 
 
-def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
-    runtime = get_dcu_mega_moe_runtime()
+def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
+    runtime = get_hcu_mega_moe_runtime()
 
     if getattr(experts, "_mega_moe_weights_built", False):
-        built_runtime = getattr(experts, "_mega_moe_dcu_runtime", None)
+        built_runtime = getattr(experts, "_mega_moe_hcu_runtime", None)
         if built_runtime != runtime:
             raise RuntimeError(
-                "DCU MegaMoE expert weights were already built for "
+                "HCU MegaMoE expert weights were already built for "
                 f"{built_runtime!r}, cannot reuse them with {runtime!r}"
             )
         return
@@ -733,32 +733,32 @@ def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
     w13 = experts.w13_weight.data
     w2 = experts.w2_weight.data
     if w13.dim() != 3 or w2.dim() != 3 or w13.shape[0] != w2.shape[0]:
-        raise ValueError("DCU W8A8 MegaMoE expects grouped 3D expert weights")
+        raise ValueError("HCU W8A8 MegaMoE expects grouped 3D expert weights")
     if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
-        raise ValueError("DCU W8A8 MegaMoE expects torch.float8_e4m3fn expert weights")
+        raise ValueError("HCU W8A8 MegaMoE expects torch.float8_e4m3fn expert weights")
 
     num_experts, l1_rows, hidden = w13.shape
     _, l2_rows, intermediate = w2.shape
     if l1_rows != 2 * intermediate or l2_rows != hidden:
-        raise ValueError("DCU W8A8 MegaMoE expects w13=[E,2I,H] and w2=[E,H,I]")
+        raise ValueError("HCU W8A8 MegaMoE expects w13=[E,2I,H] and w2=[E,H,I]")
 
-    w13_scale = _dcu_channelwise_scale(
+    w13_scale = _hcu_channelwise_scale(
         experts,
         ("w13_weight_scale", "w13_weight_scale1"),
         l1_rows,
         "w13",
     )
-    w2_scale = _dcu_channelwise_scale(
+    w2_scale = _hcu_channelwise_scale(
         experts,
         ("w2_weight_scale", "w2_weight_scale1"),
         l2_rows,
         "w2",
     )
 
-    if runtime == _DCU_MEGA_MOE_RUNTIME_DEEP_GEMM:
+    if runtime == _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM:
         if l1_rows % 16 != 0 or hidden % 16 != 0 or intermediate % 16 != 0:
             raise ValueError(
-                "deep_gemm DCU W8A8 MegaMoE requires rows and K divisible by 16"
+                "deep_gemm HCU W8A8 MegaMoE requires rows and K divisible by 16"
             )
         import deep_gemm
 
@@ -770,7 +770,7 @@ def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
             deep_gemm.weight8bit_nt_kpack2_marlin(w2.contiguous()),
             w2_scale,
         )
-        experts._mega_moe_dcu_weight_layout = "marlin_kpack2"
+        experts._mega_moe_hcu_weight_layout = "marlin_kpack2"
     else:
         if (num_experts, hidden, intermediate) != (32, 4096, 2048):
             raise ValueError(
@@ -800,7 +800,7 @@ def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
                     w2_scale,
                 )
             }
-            experts._mega_moe_dcu_weight_layout = "normal"
+            experts._mega_moe_hcu_weight_layout = "normal"
         else:
             experts.mega_l1_weights = {
                 "unified": (
@@ -814,8 +814,8 @@ def build_dcu_w8a8_mega_moe_experts_weights(experts) -> None:
                     w2_scale,
                 )
             }
-            experts._mega_moe_dcu_weight_layout = "unified"
+            experts._mega_moe_hcu_weight_layout = "unified"
 
-    experts._mega_moe_dcu_runtime = runtime
-    experts._mega_moe_dcu_w8a8_weights = True
+    experts._mega_moe_hcu_runtime = runtime
+    experts._mega_moe_hcu_w8a8_weights = True
     experts._mega_moe_weights_built = True

@@ -18,10 +18,10 @@ from typing import Optional
 
 import torch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
-_kv_layout_dcu_fa = is_dcu() and get_bool_env_var(
-    "SGLANG_KV_LAYOUT_DCU_FA", default="true"
+_kv_layout_hcu_fa = is_hcu() and get_bool_env_var(
+    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
 )
 _max_batch_size_by_kv_heads = {1: 128, 2: 4}
 
@@ -51,7 +51,7 @@ def can_pack_paged_kv_to_varlen(
     total_kv_tokens = int(seq_lens_cpu.sum().item())
 
     correctness_ok = (
-        _kv_layout_dcu_fa
+        _kv_layout_hcu_fa
         and not forward_batch.mha_return_lse
         and layer.logit_cap == 0.0
         and window_size == (-1, -1)

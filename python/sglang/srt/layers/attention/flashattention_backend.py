@@ -50,7 +50,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
-from sglang.srt.utils import get_compiler_backend, is_dcu
+from sglang.srt.utils import get_compiler_backend, is_hcu
 from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
@@ -71,8 +71,8 @@ from sglang.srt.layers.attention.flashattention_interface import (
 from flash_attn import varlen_fwd_unified
 from sglang.srt.utils import get_bool_env_var
 
-_is_dcu = is_dcu()
-if _is_dcu:
+_is_hcu = is_hcu()
+if _is_hcu:
     from sglang.srt.layers.attention.flashattention_interface import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
@@ -80,13 +80,13 @@ if _is_dcu:
 
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
-_kv_layout_dcu_fa = _is_dcu and get_bool_env_var(
-    "SGLANG_KV_LAYOUT_DCU_FA", default="true"
+_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
+    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
 )
 
 
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
-    if is_dcu():
+    if is_hcu():
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
         if "gfx938" in gcn_arch and (
@@ -1234,7 +1234,7 @@ class FlashAttentionBackend(AttentionBackend):
                             self.attn_cp_size,
                             swa_loc=swa_loc,
                         )
-                elif not (_is_dcu and _use_fused_bailing_rms_rotary):
+                elif not (_is_hcu and _use_fused_bailing_rms_rotary):
                     kv_k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     kv_v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
                     self.token_to_kv_pool.set_kv_buffer(
@@ -1461,7 +1461,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             q_padded_num_tokens = q.shape[0]
             q_num_tokens = q_padded_num_tokens
-            if not _kv_layout_dcu_fa:
+            if not _kv_layout_hcu_fa:
                 output = varlen_fwd_unified(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=key_cache,
@@ -1802,7 +1802,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 kv_k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                 kv_v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                if _is_dcu:
+                if _is_hcu:
                     if k_rope is None:
                         if (
                             not self.use_mla or not _use_fused_rmsnorm_rope
@@ -1986,10 +1986,10 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_q = metadata.cu_seqlens_q
                 max_seqlen_q = metadata.max_seq_len_q
-                if _is_dcu:
+                if _is_hcu:
                     max_seqlen_k = metadata.max_seq_len_k
                     cu_seqlens_k = metadata.cu_seqlens_k
-                    if not _kv_layout_dcu_fa:
+                    if not _kv_layout_hcu_fa:
                         key_cache = key_cache.view(
                             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
                         )
@@ -2013,7 +2013,7 @@ class FlashAttentionBackend(AttentionBackend):
                     q_reshaped = q.contiguous().view(
                         -1, layer.tp_q_head_num, layer.head_dim
                     )
-                    if not _kv_layout_dcu_fa:
+                    if not _kv_layout_hcu_fa:
                         result = varlen_fwd_unified(
                             q=q_reshaped,
                             k=key_cache,
@@ -2819,7 +2819,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.topk <= 1:
                     # When topk = 1, we use the normal decode metadata
                     metadata = self.decode_cuda_graph_metadata[bs]
-                    if _is_dcu:
+                    if _is_hcu:
                         max_len = self._host_max_seq_len(seq_lens_cpu, seq_lens)
                         metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
                         max_seq_pages = (
@@ -2935,7 +2935,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                if _is_dcu:
+                if _is_hcu:
                     max_len = self._host_max_seq_len(seq_lens_cpu, seq_lens)
                     max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                     metadata.max_seq_len_k = max_len

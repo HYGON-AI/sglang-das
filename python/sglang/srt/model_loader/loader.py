@@ -845,7 +845,7 @@ class DefaultModelLoader(BaseModelLoader):
         # process_weights_after_loading allocates repacked/quantized tensors into
         # (and fragments) that space -- recovers ~10GB/rank of serving headroom.
         # Mirrors the torch.npu.empty_cache() sglang already does for NPU in the
-        # loop below; extended to CUDA/HIP (DCU), which upstream omitted.
+        # loop below; extended to CUDA/HIP (HCU), which upstream omitted.
         #
         # Gated to fst only: it is the sole loader that leaves reserved >> allocated
         # (other loaders stage weights on CPU, reserved ~= allocated), so this is a

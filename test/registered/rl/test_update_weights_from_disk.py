@@ -23,13 +23,13 @@ import requests
 
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=210,
-    suite="nightly-dcu-1-gpu",
+    suite="nightly-hcu-1-gpu",
     nightly=True,
-    disabled="DCU nightly disabled: cache flush fails on BW1100; pending fix.",
+    disabled="HCU nightly disabled: cache flush fails on BW1100; pending fix.",
 )
 
 from sglang.test.test_utils import (
@@ -49,8 +49,8 @@ register_cuda_ci(
 )
 
 
-def _dcu_engine_kwargs():
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _hcu_engine_kwargs():
+    if os.environ.get("SGLANG_IS_IN_CI_HCU") != "1":
         return {}
     return {
         "attention_backend": "fa3",
@@ -59,8 +59,8 @@ def _dcu_engine_kwargs():
     }
 
 
-def _dcu_server_args():
-    if os.environ.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _hcu_server_args():
+    if os.environ.get("SGLANG_IS_IN_CI_HCU") != "1":
         return ()
     return (
         "--attention-backend",
@@ -78,7 +78,7 @@ class TestEngineUpdateWeightsFromDisk(CustomTestCase):
     def setUp(self):
         self.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         # Initialize the engine in offline (direct) mode.
-        self.engine = sgl.Engine(model_path=self.model, **_dcu_engine_kwargs())
+        self.engine = sgl.Engine(model_path=self.model, **_hcu_engine_kwargs())
 
     def tearDown(self):
         self.engine.shutdown()
@@ -135,7 +135,7 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=_dcu_server_args(),
+            other_args=_hcu_server_args(),
         )
 
     @classmethod

@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
-    is_dcu,
+    is_hcu,
     is_hip,
     set_weight_attrs,
 )
@@ -32,13 +32,13 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
-if _is_hip and not _is_dcu:
+if _is_hip and not _is_hcu:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None
@@ -71,6 +71,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
+                if _is_hcu:
+                    raise NotImplementedError(
+                        "Online MXFP4 quantization for MoE layers requires an HCU/ROCm "
+                        "device with FP4 hardware support (gfx95x, e.g. MI355x)."
+                    )
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE layers requires an AMD ROCm "
                     "device with FP4 hardware support (gfx95x, e.g. MI355x)."
@@ -192,6 +197,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_id: int,
         ):
             if dynamic_mxfp4_quant is None:
+                if _is_hcu:
+                    raise NotImplementedError(
+                        "Online MXFP4 quantization for MoE is only supported on HCU devices."
+                    )
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE is only supported on AMD GPUs."
                 )

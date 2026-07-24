@@ -28,11 +28,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelList,
     UsageInfo,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
 register_cuda_ci(est_time=3, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-dcu", disabled='DCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_hcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-hcu", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
 class TestModelCard(unittest.TestCase):

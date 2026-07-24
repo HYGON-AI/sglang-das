@@ -1,8 +1,8 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
-register_dcu_ci(
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+register_hcu_ci(
     est_time=106,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: generation model matrix includes gated/remote models; needs a BW1100 local-model matrix before enabling.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: generation model matrix includes gated/remote models; needs a BW1100 local-model matrix before enabling.",
 )
 
 

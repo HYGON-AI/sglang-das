@@ -928,13 +928,13 @@ def _has_cli_option(args: list[object], names: set[str]) -> bool:
     )
 
 
-def _with_dcu_ci_server_defaults(args: list[str], env: dict) -> list[str]:
-    if env.get("SGLANG_IS_IN_CI_DCU") != "1":
+def _with_hcu_ci_server_defaults(args: list[str], env: dict) -> list[str]:
+    if env.get("SGLANG_IS_IN_CI_HCU") != "1":
         return args
 
     defaults = shlex.split(
         env.get(
-            "SGLANG_TEST_DCU_DEFAULT_SERVER_ARGS",
+            "SGLANG_TEST_HCU_DEFAULT_SERVER_ARGS",
             "--attention-backend fa3 --page-size 64 --trust-remote-code",
         )
     )
@@ -1038,7 +1038,7 @@ def popen_launch_server(
     # Build server command
     _, host, port = base_url.split(":")
     host = host[2:]
-    other_args = _with_dcu_ci_server_defaults(other_args, env)
+    other_args = _with_hcu_ci_server_defaults(other_args, env)
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:

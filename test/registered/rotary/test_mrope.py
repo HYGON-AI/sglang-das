@@ -34,16 +34,16 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
 register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
-# DCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical DCU coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU Stage-B deferred: local Qwen2/Qwen2.5 VL configs load offline, but Qwen2VLTextConfig/Qwen2_5_VLTextConfig lack rope_theta and all 32 MRoPE parameterized cases fail on BW1100.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU Stage-B deferred: local Qwen2/Qwen2.5 VL configs load offline, but Qwen2VLTextConfig/Qwen2_5_VLTextConfig lack rope_theta and all 32 MRoPE parameterized cases fail on BW1100.",
 )
 
 _is_cuda = is_cuda()
@@ -88,14 +88,14 @@ class MRoPETestInfo(NamedTuple):
 
 TRANSFORMERS_BASE_VERSION = Version(TRANSFORMERS_VERSION).base_version
 
-if os.environ.get("SGLANG_IS_IN_CI_DCU"):
-    _dcu_mrope_models = os.environ.get(
-        "SGLANG_TEST_DCU_MROPE_MODELS",
+if os.environ.get("SGLANG_IS_IN_CI_HCU"):
+    _hcu_mrope_models = os.environ.get(
+        "SGLANG_TEST_HCU_MROPE_MODELS",
         "Qwen/Qwen2-VL-2B-Instruct,Qwen/Qwen2.5-VL-3B-Instruct",
     )
     MODELS_TO_TEST = [
         MRoPETestInfo(model_name=model.strip())
-        for model in _dcu_mrope_models.split(",")
+        for model in _hcu_mrope_models.split(",")
         if model.strip()
     ]
 else:

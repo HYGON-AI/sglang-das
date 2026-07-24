@@ -19,15 +19,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
-register_dcu_ci(
+register_hcu_ci(
     est_time=1,
-    suite="nightly-dcu-1-gpu",
+    suite="nightly-hcu-1-gpu",
     nightly=True,
-    disabled="DCU nightly deferred: current BW1100 CI image lacks torchaudio; mm_process_config audio processor subtest imports torchaudio.functional.",
+    disabled="HCU nightly deferred: current BW1100 CI image lacks torchaudio; mm_process_config audio processor subtest imports torchaudio.functional.",
 )
 
 

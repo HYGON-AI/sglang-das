@@ -81,8 +81,8 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
-    is_dcu,
-    is_dcu_native_fp8_supported,
+    is_hcu,
+    is_hcu_native_fp8_supported,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -94,7 +94,7 @@ if TYPE_CHECKING:
     
 from sglang.srt.utils import get_bool_env_var
 
-_kv_layout_dcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_DCU_FA", default="true")
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 def conv_window_dedup_enabled(
     is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
@@ -1963,7 +1963,7 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             kv_buffers = [*self.k_buffer, *self.v_buffer]
             kv_strides = [
                 self.head_num
@@ -2003,7 +2003,7 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                if _kv_layout_dcu_fa:
+                if _kv_layout_hcu_fa:
                     page_num = (self.size + self.page_size) // self.page_size
                     self.k_buffer = [
                         torch.zeros(
@@ -2197,7 +2197,7 @@ class MHATokenToKVPool(KVCache):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                if _kv_layout_dcu_fa:
+                if _kv_layout_hcu_fa:
                     page_idxs = chunk_indices // 64
                     offsets = chunk_indices % 64
                     k_chunk = self.k_buffer[layer_id][page_idxs, :, offsets, :]
@@ -2229,7 +2229,7 @@ class MHATokenToKVPool(KVCache):
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
                 k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                if _kv_layout_dcu_fa:
+                if _kv_layout_hcu_fa:
                     page_idxs = chunk_indices // 64
                     offsets = chunk_indices % 64
                     self.k_buffer[layer_id][page_idxs, :, offsets, :] = k_chunk
@@ -2333,7 +2333,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if _kv_layout_dcu_fa:
+        if _kv_layout_hcu_fa:
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
             page_idxs = loc // self.page_size
@@ -4039,7 +4039,7 @@ class MLATokenToKVPool(KVCache):
     ) -> None:
         if (
             _is_hip
-            and not _is_dcu
+            and not _is_hcu
             and self.use_dsa
             and self.dtype == fp8_dtype
         ):
@@ -4053,7 +4053,7 @@ class MLATokenToKVPool(KVCache):
                 fp8_dtype,
             )
         elif self.dsa_kv_cache_store_fp8:
-            if _is_dcu:
+            if _is_hcu:
                 from lightop import op
 
                 op.fused_quantize_and_store_mla_kv_cache(
@@ -4357,18 +4357,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
-        if _is_dcu:
+        if _is_hcu:
             self.use_fp8_index_k_cache = dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
-            ) and is_dcu_native_fp8_supported()
+            ) and is_hcu_native_fp8_supported()
         else:
             self.use_fp8_index_k_cache = True
         self.index_k_buffer_dtype = (
-            torch.bfloat16 if _is_dcu and not self.use_fp8_index_k_cache else self.dtype
+            torch.bfloat16 if _is_hcu and not self.use_fp8_index_k_cache else self.dtype
         )
 
-        if _is_hip and not _is_dcu:
+        if _is_hip and not _is_hcu:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert (
                     self.page_size % 16 == 0

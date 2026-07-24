@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 import torch
 
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, set_weight_attrs
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class MoeWNA16Config(QuantizationConfig):
         if self.linear_quant_method == "gptq":
             self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(full_config)
         elif self.linear_quant_method == "awq":
-            if not _is_dcu:
+            if not _is_hcu:
                 capability_tuple = get_device_capability()
                 device_capability = (
                     -1

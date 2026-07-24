@@ -22,7 +22,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu
 from sglang.srt.layers.quantization.compressed_tensors import quant_ops as ops
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
@@ -31,8 +31,8 @@ __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 from lmslim import quant_ops 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
-if _is_dcu:
+_is_hcu = is_hcu()
+if _is_hcu:
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 if _is_cuda:

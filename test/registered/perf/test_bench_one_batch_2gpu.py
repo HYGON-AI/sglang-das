@@ -14,13 +14,13 @@
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=120,
-    suite="nightly-dcu-perf",
+    suite="nightly-hcu-perf",
     nightly=True,
-    disabled="DCU BW1100 2GPU perf validation with current wheel stayed silent for more than 8 minutes during MoE bench_one_batch cold start; keep disabled until perf cold-start behavior and pass thresholds are baselined.",
+    disabled="HCU BW1100 2GPU perf validation with current wheel stayed silent for more than 8 minutes during MoE bench_one_batch cold start; keep disabled until perf cold-start behavior and pass thresholds are baselined.",
 )
 
 from sglang.test.test_utils import (

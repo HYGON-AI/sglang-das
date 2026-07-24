@@ -45,7 +45,7 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
@@ -390,7 +390,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 
             if (
                 is_hip()
-                and not is_dcu()
+                and not is_hcu()
                 and not aiter_can_use_preshuffle_paged_mqa()
             ):
                 # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
@@ -1292,7 +1292,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and is_dcu():
+    if not user_set_prefill and not user_set_decode and is_hcu():
         if kv_cache_dtype == "fp8_e4m3":
             declared["dsa_prefill_backend"] = "flashmla_auto"
             declared["dsa_decode_backend"] = "flashmla_kv"
@@ -1702,11 +1702,11 @@ def _mla_backend_page_constraints(view: Any) -> dict:
     if (
         view.attention_backend == "flashmla"
         or view.decode_attention_backend == "flashmla"
-        or view.attention_backend == "dcu_mla"
-        or view.decode_attention_backend == "dcu_mla"
+        or view.attention_backend == "hcu_mla"
+        or view.decode_attention_backend == "hcu_mla"
     ):
         logger.warning(
-            "FlashMLA/DCU MLA only supports a page_size of 64, change page_size to 64."
+            "FlashMLA/HCU MLA only supports a page_size of 64, change page_size to 64."
         )
         page_size = 64
     if (
@@ -2153,6 +2153,11 @@ def _dllm_attention_backend(view: Any) -> dict:
         return {}
     if is_hip():
         if view.attention_backend not in ["triton", "aiter"]:
+            if is_hcu():
+                logger.warning(
+                    "Attention backend is set to triton for diffusion LLM inference on HCU devices"
+                )
+                return {"attention_backend": "triton"}
             logger.warning(
                 "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
             )

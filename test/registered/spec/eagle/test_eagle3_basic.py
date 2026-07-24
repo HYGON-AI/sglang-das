@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
@@ -29,10 +29,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=50, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small")
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-dcu",
-    disabled="DCU RL/speculative path needs local model mapping and quick validation before enabling.",
+    suite="stage-b-test-1-gpu-small-hcu",
+    disabled="HCU RL/speculative path needs local model mapping and quick validation before enabling.",
 )
 
 _is_hip = is_hip()

@@ -18,11 +18,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.test.ci.ci_register import register_cpu_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
-# DCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
-register_dcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-dcu")
+# HCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
+register_hcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-hcu")
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,

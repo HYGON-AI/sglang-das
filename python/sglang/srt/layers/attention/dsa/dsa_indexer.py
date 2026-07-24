@@ -46,7 +46,7 @@ from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -93,8 +93,8 @@ if _use_aiter and not _use_aiter_preshuffle:
         "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
-_is_dcu = is_dcu()
-if _is_dcu:
+_is_hcu = is_hcu()
+if _is_hcu:
     import lightop
     from lightop import gemmopt
     from lightop import op
@@ -347,14 +347,14 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor:
-    # DSV4 compressor kernels may return a non-bf16 staging dtype on DCU.
+    # DSV4 compressor kernels may return a non-bf16 staging dtype on HCU.
     # The older working dpskv4 branch intentionally allowed this path.
     # from sgl_kernel import hadamard_transform
-    if not _is_dcu and _is_hip:
+    if not _is_hcu and _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
-    elif not _is_dcu:
+    elif not _is_hcu:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
@@ -364,9 +364,9 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
 
     scale = hidden_size**-0.5 if apply_scale else 1.0
 
-    if _is_dcu and _use_fast_hadamard_transform:
+    if _is_hcu and _use_fast_hadamard_transform:
         return hadamard_transform(x, scale=scale)
-    elif _is_dcu:
+    elif _is_hcu:
         return hadamard_transform_optimized(x, scale=scale)
     else:
         return hadamard_transform(x, scale=scale)
@@ -427,7 +427,7 @@ class Indexer(MultiPlatformOp):
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
-        elif _is_dcu:
+        elif _is_hcu:
             device_props = torch.cuda.get_device_properties(0)
             self.sm_count = device_props.multi_processor_count
             pp_size = get_server_args().pp_size
@@ -496,8 +496,8 @@ class Indexer(MultiPlatformOp):
             get_server_args().dsa_paged_mqa_logits_backend
         )
 
-    def _use_dcu_bf16_index_cache(self, forward_batch: ForwardBatch) -> bool:
-        return _is_dcu and not getattr(
+    def _use_hcu_bf16_index_cache(self, forward_batch: ForwardBatch) -> bool:
+        return _is_hcu and not getattr(
             get_token_to_kv_pool(), "use_fp8_index_k_cache", True
         )
 
@@ -588,7 +588,7 @@ class Indexer(MultiPlatformOp):
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
-        if _is_dcu:
+        if _is_hcu:
             return fused_get_logits_head_gate_triton(
                 weights=weights,
                 q_scale=q_scale,
@@ -639,7 +639,7 @@ class Indexer(MultiPlatformOp):
         apply_hadamard_scale: bool = True,
     ):
         weights_raw = None
-        if _is_dcu:
+        if _is_hcu:
             query, _ = self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
 
@@ -722,14 +722,14 @@ class Indexer(MultiPlatformOp):
             self.alt_stream.wait_stream(current_stream)
             query = (
                 rotate_activation(query, apply_scale=apply_hadamard_scale)
-                if _is_dcu
+                if _is_hcu
                 else self._maybe_rotate(query)
             )
 
             with torch.cuda.stream(self.alt_stream):
                 key = (
                     rotate_activation(key, apply_scale=apply_hadamard_scale)
-                    if _is_dcu
+                    if _is_hcu
                     else self._maybe_rotate(key)
                 )
             current_stream.wait_stream(self.alt_stream)
@@ -740,14 +740,14 @@ class Indexer(MultiPlatformOp):
         ):
             key = (
                 rotate_activation(key, apply_scale=apply_hadamard_scale)
-                if _is_dcu
+                if _is_hcu
                 else self._maybe_rotate(key)
             )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             query = (
                 rotate_activation(query, apply_scale=apply_hadamard_scale)
-                if _is_dcu
+                if _is_hcu
                 else self._maybe_rotate(query)
             )
 
@@ -761,7 +761,7 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
-            if _is_dcu:
+            if _is_hcu:
                 query = rotate_activation(query, apply_scale=apply_hadamard_scale)
                 key = rotate_activation(key, apply_scale=apply_hadamard_scale)
             else:
@@ -1008,7 +1008,7 @@ class Indexer(MultiPlatformOp):
 
         page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
-        if _is_hip and not _is_dcu:
+        if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
                 assert (
                     page_size % 16 == 0
@@ -1020,7 +1020,7 @@ class Indexer(MultiPlatformOp):
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
-        if _is_hip and not _is_dcu and not _use_aiter_preshuffle:
+        if _is_hip and not _is_hcu and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -1047,7 +1047,7 @@ class Indexer(MultiPlatformOp):
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
-            not _is_dcu
+            not _is_hcu
             and self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
@@ -1087,7 +1087,7 @@ class Indexer(MultiPlatformOp):
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
-        elif _is_dcu:
+        elif _is_hcu:
             schedule_metadata = None
 
         assert len(weights.shape) == 3
@@ -1096,7 +1096,7 @@ class Indexer(MultiPlatformOp):
         # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
-        if self._use_dcu_bf16_index_cache(forward_batch):
+        if self._use_hcu_bf16_index_cache(forward_batch):
             kv_cache = get_token_to_kv_pool().get_index_k_buffer(layer_id=layer_id)
             # BF16 decode follows the vLLM ROCm pattern:
             # keep the indexer K cache in paged BF16 layout and pass it directly
@@ -1117,11 +1117,11 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id
             )
             assert len(kv_cache_fp8.shape) == 2
-            block_kv = 1 if _is_hip and not _is_dcu else page_size
+            block_kv = 1 if _is_hip and not _is_hcu else page_size
             kv_cache_fp8 = kv_cache_fp8.view(-1, block_kv, 1, 132)
 
-            if _is_dcu:
-                # LightOp keeps the existing DCU ABI with an explicit next_n dim.
+            if _is_hcu:
+                # LightOp keeps the existing HCU ABI with an explicit next_n dim.
                 q_paged = q.unsqueeze(1)
                 logits = gemmopt.paged_mqa_logits(
                     q_paged[:q_offset],
@@ -1274,7 +1274,7 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = get_token_to_kv_pool().page_size
-        if _is_hip and not _is_dcu:
+        if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
                 assert (
                     page_size % 16 == 0
@@ -1293,7 +1293,7 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
-        if _is_hip and not _use_aiter_preshuffle and not _is_dcu:
+        if _is_hip and not _use_aiter_preshuffle and not _is_hcu:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -1321,7 +1321,7 @@ class Indexer(MultiPlatformOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        use_bf16_index_cache = self._use_dcu_bf16_index_cache(forward_batch)
+        use_bf16_index_cache = self._use_hcu_bf16_index_cache(forward_batch)
         if use_bf16_index_cache:
             # Ragged BF16 cannot consume the paged cache buffer directly.
             # Gather each request's valid pages into one continuous K tensor first,
@@ -1382,7 +1382,7 @@ class Indexer(MultiPlatformOp):
                         None,
                         True,
                     )
-                elif _is_hip and not _is_dcu:
+                elif _is_hip and not _is_hcu:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1393,7 +1393,7 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q[:q_offset], kv, scale, weights[:q_offset], ks, ke, clean_logits=False
                     )
-                elif _is_dcu:
+                elif _is_hcu:
                     kv, scale = kv_fp8
                     logits = op.mqa_logits(
                         q[:q_offset],
@@ -1467,7 +1467,7 @@ class Indexer(MultiPlatformOp):
                         None,
                         True,
                     )
-                elif _is_hip and not _is_dcu:
+                elif _is_hip and not _is_hcu:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1481,7 +1481,7 @@ class Indexer(MultiPlatformOp):
                         ke[start:end],
                         clean_logits=False,
                     )
-                elif _is_dcu:
+                elif _is_hcu:
                     kv, scale = kv_fp8
                     logits_chunk = lightop.mqa_logits(
                         q[start:end],
@@ -1644,7 +1644,7 @@ class Indexer(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        use_bf16_index_cache = self._use_dcu_bf16_index_cache(forward_batch)
+        use_bf16_index_cache = self._use_hcu_bf16_index_cache(forward_batch)
         k_fp8_list = []
         k_scale_list = []
         k_bf16_list = []
@@ -1736,7 +1736,7 @@ class Indexer(MultiPlatformOp):
                         .squeeze(-1)
                     )
                     kv_fp8 = (k_fp8, k_scale)
-                    if _is_dcu:
+                    if _is_hcu:
                         logits = deep_gemm.fp8_mqa_logits(
                             q,
                             kv_fp8,
@@ -1811,7 +1811,7 @@ class Indexer(MultiPlatformOp):
                         None,
                         True,
                     )
-                elif _is_dcu:
+                elif _is_hcu:
                     logits = lightop.mqa_logits(
                         q,
                         k_fp8,
@@ -1997,8 +1997,8 @@ class Indexer(MultiPlatformOp):
             )
             return
 
-        if _is_dcu:
-            if self._use_dcu_bf16_index_cache(forward_batch):
+        if _is_hcu:
+            if self._use_hcu_bf16_index_cache(forward_batch):
                 get_token_to_kv_pool().set_index_k_buffer(
                     layer_id=layer_id,
                     loc=forward_batch.out_cache_loc,
@@ -2056,9 +2056,9 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         act_quant = None
-        if _is_hip and not _is_dcu:
+        if _is_hip and not _is_hcu:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
-        elif not _is_npu and not _is_dcu:
+        elif not _is_npu and not _is_hcu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -2090,7 +2090,7 @@ class Indexer(MultiPlatformOp):
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
-        if not _is_dcu and not in_piecewise_or_breakable_cuda_graph:
+        if not _is_hcu and not in_piecewise_or_breakable_cuda_graph:
             skip_logits_computation = self._should_skip_logits_computation(
                 forward_batch
             )
@@ -2165,7 +2165,7 @@ class Indexer(MultiPlatformOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
-        elif _is_dcu:
+        elif _is_hcu:
             decode_dual_stream = (
                 enable_dual_stream
                 and forward_batch.forward_mode.is_decode_or_idle()
@@ -2174,7 +2174,7 @@ class Indexer(MultiPlatformOp):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
 
-            use_bf16_index_cache = self._use_dcu_bf16_index_cache(forward_batch)
+            use_bf16_index_cache = self._use_hcu_bf16_index_cache(forward_batch)
             if use_bf16_index_cache:
                 q_index, key, _ = self._get_q_k_bf16(
                     q_lora,

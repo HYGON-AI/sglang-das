@@ -26,7 +26,7 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
-def is_dcu() -> bool:
+def is_hcu() -> bool:
     if not is_hip():
         return False
     try:
@@ -38,8 +38,8 @@ def is_dcu() -> bool:
 
 
 _is_hip = is_hip()
-_is_dcu = is_dcu()
-_hip_skip_reason = "Skip for HCU device" if _is_dcu else "Skip for AMD GPU"
+_is_hcu = is_hcu()
+_hip_skip_reason = "Skip for HCU device" if _is_hcu else "Skip for AMD GPU"
 
 
 def ceil_div(a, b):

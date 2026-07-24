@@ -17,16 +17,16 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_amd_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_hcu_ci
 
 # register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=300,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: disaggregation PP path needs BW1100 multi-device validation before enabling.",
+    disabled="HCU CSV CI placeholder: disaggregation PP path needs BW1100 multi-device validation before enabling.",
 )
 
 from sglang.test.few_shot_gsm8k import run_eval

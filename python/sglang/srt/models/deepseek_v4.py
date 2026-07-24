@@ -162,7 +162,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_dcu,
+    is_hcu,
     is_gfx95_supported,
     is_gfx942_supported,
     log_info_on_rank0,
@@ -171,14 +171,14 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_dpskv4_lightop_rmsnorm = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM")
 _use_fused_qnorm_rope_kv_rope_quant = get_bool_env_var(
     "SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT"
 )
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 
-if _is_dcu:
+if _is_hcu:
     from lightop import op
     if _use_aiter_tilelang_mhc:
         from aiter.ops.tilelang import mhc_post_fwd, mhc_pre_big_fuse
@@ -234,14 +234,14 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
     # tensor layout assumptions, so keep it disabled when either dependency is off.
     return (
-        not _is_dcu
+        not _is_hcu
         and envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
     )
 
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_dcu
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
@@ -540,7 +540,7 @@ class MqaAttentionBase(nn.Module):
                 ), "FP8 quant_config must create weight_scale or weight_scale_inv"
                 self.wo_a.weight_scale_inv = self.wo_a.weight_scale
             self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _is_dcu
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _is_hcu
             )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -613,12 +613,12 @@ class MQALayer(MqaAttentionBase):
 
         self.register_buffer("cos_sin_cache_fused", None, persistent=False)
         self.cos_sin_cache_fused: Optional[torch.Tensor]
-        if _is_dcu and _use_fused_qnorm_rope_kv_rope_quant:
+        if _is_hcu and _use_fused_qnorm_rope_kv_rope_quant:
             freqs_real = torch.view_as_real(self.freqs_cis)
             self.cos_sin_cache_fused = torch.cat(
                 [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
             ).contiguous()
-        elif _is_hip and not _is_dcu:
+        elif _is_hip and not _is_hcu:
             cos_cache = (
                 self.freqs_cis.real.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
             )
@@ -676,7 +676,7 @@ class MQALayer(MqaAttentionBase):
 
         self.use_fused_qk_norm_rope = (
             _is_hip
-            and not _is_dcu
+            and not _is_hcu
             and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
@@ -703,7 +703,7 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if not _is_dcu:
+        if not _is_hcu:
             if q_out is None:
                 q_out = torch.empty_like(q)
             # Official fused warp-per-(token, head) RMSNorm + RoPE path.
@@ -1294,7 +1294,7 @@ class MQALayer(MqaAttentionBase):
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
-            if _is_dcu:
+            if _is_hcu:
                 import deepgemm as deep_gemm
             else:
                 import deep_gemm
@@ -1491,7 +1491,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            if _is_dcu and _use_aiter_tilelang_mhc:
+            if _is_hcu and _use_aiter_tilelang_mhc:
                 post, comb, y = mhc_pre_big_fuse(
                     residual=x,
                     fn=hc_fn,
@@ -1546,7 +1546,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post.squeeze(-1), comb, False
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            if _is_dcu:
+            if _is_hcu:
                 import deepgemm as deep_gemm
             else:
                 from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
@@ -1559,7 +1559,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             mix_hc = hc_fn.size(0)
             d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
             s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            if _is_dcu:
+            if _is_hcu:
                 deep_gemm.tf32_hc_prenorm_gemm(
                     x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
                 )
@@ -1609,7 +1609,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            if _is_dcu and _use_aiter_tilelang_mhc:
+            if _is_hcu and _use_aiter_tilelang_mhc:
                 return mhc_post_fwd(x, residual, post, comb)
             else:
                 from sglang.kernels.ops.layernorm.mhc import mhc_post
@@ -2152,15 +2152,15 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = _is_dcu or _is_cuda or (
+        use_stream_pool = _is_hcu or _is_cuda or (
             _is_hip
-            and not _is_dcu
+            and not _is_hcu
             and (
                 envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
         )
-        num_alt_streams = 5 if (_is_cuda or _is_dcu) else 2
+        num_alt_streams = 5 if (_is_cuda or _is_hcu) else 2
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
@@ -2671,7 +2671,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM and not _is_dcu:
+        if _FP8_WO_A_GEMM and not _is_hcu:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
@@ -2762,11 +2762,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         path; the barrier keeps ranks from proceeding while a peer is still
         compiling. The early returns below must stay rank-uniform.
         """
-        if _is_dcu:
-            # DCU AITER TileLang MHC kernels are specialized lazily from real
+        if _is_hcu:
+            # HCU AITER TileLang MHC kernels are specialized lazily from real
             # request shapes. The generic bucket prewarm reuses that kernel
             # across synthetic n_splits shapes and can violate its cached input
-            # contract. Preserve the pre-20260703 DCU behavior here.
+            # contract. Preserve the pre-20260703 HCU behavior here.
             return
         if self._mhc_prewarmed_at_load:
             return

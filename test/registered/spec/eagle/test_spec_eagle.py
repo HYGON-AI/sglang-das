@@ -7,7 +7,7 @@ silently alter what this exercises.
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
@@ -19,11 +19,11 @@ from sglang.test.kits.spec_server_kits import (
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
-register_dcu_ci(
+register_hcu_ci(
     est_time=480,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     nightly=False,
-    disabled="DCU CSV CI placeholder: EAGLE speculative decoding needs BW1100 draft/target model mapping before enabling.",
+    disabled="HCU CSV CI placeholder: EAGLE speculative decoding needs BW1100 draft/target model mapping before enabling.",
 )
 
 _KITS = (

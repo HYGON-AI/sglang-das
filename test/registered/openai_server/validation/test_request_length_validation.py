@@ -18,9 +18,9 @@ import openai
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(est_time=90, suite="stage-b-test-1-gpu-small-dcu")
+register_hcu_ci(est_time=90, suite="stage-b-test-1-gpu-small-hcu")
 
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

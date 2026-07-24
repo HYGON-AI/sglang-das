@@ -55,13 +55,13 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_npu,
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
-from sgl_kernel.kvcacheio import dcu_create_chunked_prefix_cache_kv_indices
+from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 def _elastic_should_preserve_local_token_counts(
     *,
@@ -541,7 +541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
-    # dcu only
+    # hcu only
     residual_rms_per_quant_int8: Optional[torch.Tensor] = None
     rms_quant_flag: bool = False
 
@@ -857,7 +857,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 extend_prefix_lens_tensor = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32
                 )
-                if _is_dcu:
+                if _is_hcu:
                     extend_seq_lens_tensor = extend_seq_lens_tensor.pin_memory()
                     extend_prefix_lens_tensor = extend_prefix_lens_tensor.pin_memory()
                 ret.extend_seq_lens = extend_seq_lens_tensor.to(
@@ -1187,7 +1187,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             chunk_kv_indices = torch.empty(
                 num_chunk_tokens, dtype=torch.int32, device=device
             )
-            dcu_create_chunked_prefix_cache_kv_indices(
+            hcu_create_chunked_prefix_cache_kv_indices(
                     req_to_token = self.req_to_token_pool.req_to_token,
                     req_pool_indices = self.req_pool_indices,
                     chunk_starts = chunk_starts,
@@ -1198,7 +1198,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     bs = self.batch_size,
                 )
             # if self.use_sglang_create_chunked_prefix_cache_kv_indices:
-            #     dcu_create_chunked_prefix_cache_kv_indices(
+            #     hcu_create_chunked_prefix_cache_kv_indices(
             #         req_to_token = self.req_to_token_pool.req_to_token,
             #         req_pool_indices = self.req_pool_indices,
             #         chunk_starts = chunk_starts,
@@ -1729,7 +1729,7 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-if (is_cuda() or is_hip()) and not _is_dcu:
+if (is_cuda() or is_hip()) and not _is_hcu:
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda

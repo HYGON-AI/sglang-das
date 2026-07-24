@@ -35,10 +35,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_dcu, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -1231,8 +1231,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
 
 
-class MHATokenToKVPoolHostDCU(HostKVCache):
-    """DCU MHA/GQA host pool matching the page-major FA cache layout.
+class MHATokenToKVPoolHostHCU(HostKVCache):
+    """HCU MHA/GQA host pool matching the page-major FA cache layout.
 
     K is stored as ``[page, layer, kv_head, page_token, head_dim]`` while V
     is stored as ``[page, layer, kv_head, head_dim, page_token]``. Keeping the
@@ -1253,14 +1253,14 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
-        if layout != "layout_dcu":
+        if layout != "layout_hcu":
             raise ValueError(
-                "MHATokenToKVPoolHostDCU requires hicache_mem_layout=layout_dcu, "
+                "MHATokenToKVPoolHostHCU requires hicache_mem_layout=layout_hcu, "
                 f"got {layout!r}"
             )
         if device_pool.layer_shard_enabled:
             raise ValueError(
-                "layout_dcu HiCache does not support layer-sharded KV pools"
+                "layout_hcu HiCache does not support layer-sharded KV pools"
             )
         super().__init__(
             device_pool,
@@ -1336,10 +1336,10 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
     ):
         if io_backend == "kernel":
             from sgl_kernel.kvcacheio import (
-                transfer_kv_per_layer_kernel_pf_lf_H2D_dcu,
+                transfer_kv_per_layer_kernel_pf_lf_H2D_hcu,
             )
 
-            transfer_kv_per_layer_kernel_pf_lf_H2D_dcu(
+            transfer_kv_per_layer_kernel_pf_lf_H2D_hcu(
                 src_k=self.k_buffer,
                 dst_k=device_pool.k_buffer[layer_id],
                 src_v=self.v_buffer,
@@ -1352,9 +1352,9 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
                 layer_id=layer_id,
             )
         elif io_backend == "direct":
-            from sgl_kernel.kvcacheio import transfer_kv_all_direct_pf_lf_H2D_dcu
+            from sgl_kernel.kvcacheio import transfer_kv_all_direct_pf_lf_H2D_hcu
 
-            transfer_kv_all_direct_pf_lf_H2D_dcu(
+            transfer_kv_all_direct_pf_lf_H2D_hcu(
                 src_ptrs_k=self.k_buffer,
                 src_ptrs_v=self.v_buffer,
                 dst_ptrs_k=device_pool.k_buffer,
@@ -1365,15 +1365,15 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
                 page_size=self.page_size,
             )
         else:
-            raise ValueError(f"Unsupported layout_dcu IO backend: {io_backend}")
+            raise ValueError(f"Unsupported layout_hcu IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if io_backend == "kernel":
-            from sgl_kernel.kvcacheio import transfer_kv_all_kernel_lf_pf_D2H_dcu
+            from sgl_kernel.kvcacheio import transfer_kv_all_kernel_lf_pf_D2H_hcu
 
-            transfer_kv_all_kernel_lf_pf_D2H_dcu(
+            transfer_kv_all_kernel_lf_pf_D2H_hcu(
                 src_k=device_pool.k_data_ptrs,
                 dst_k=self.k_buffer,
                 src_v=device_pool.v_data_ptrs,
@@ -1387,9 +1387,9 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
                 layer_num=self.layer_num,
             )
         elif io_backend == "direct":
-            from sgl_kernel.kvcacheio import transfer_kv_all_direct_lf_pf_D2H_dcu
+            from sgl_kernel.kvcacheio import transfer_kv_all_direct_lf_pf_D2H_hcu
 
-            transfer_kv_all_direct_lf_pf_D2H_dcu(
+            transfer_kv_all_direct_lf_pf_D2H_hcu(
                 src_ptrs_k=device_pool.k_buffer,
                 src_ptrs_v=device_pool.v_buffer,
                 dst_ptrs_k=self.k_buffer,
@@ -1400,7 +1400,7 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
                 page_size=self.page_size,
             )
         else:
-            raise ValueError(f"Unsupported layout_dcu IO backend: {io_backend}")
+            raise ValueError(f"Unsupported layout_hcu IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True):
         page = int(index) // self.page_size
@@ -1433,7 +1433,7 @@ class MHATokenToKVPoolHostDCU(HostKVCache):
         )
 
     def get_split_heads_page_buffer_meta(self, indices, split_factor: int):
-        raise NotImplementedError("layout_dcu does not support split-head metadata")
+        raise NotImplementedError("layout_hcu does not support split-head metadata")
 
     def get_page_buffer_meta(self, indices):
         assert len(indices) % self.page_size == 0
@@ -1478,14 +1478,14 @@ def get_mha_host_pool_cls(
 ) -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
-    DCU's page-major FlashAttention layout owns a dedicated host pool. Other
+    HCU's page-major FlashAttention layout owns a dedicated host pool. Other
     layouts and generic HIP retain the official host-pool implementations.
 
     Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
-    if _is_dcu and layout == "layout_dcu":
-        return MHATokenToKVPoolHostDCU
+    if _is_hcu and layout == "layout_hcu":
+        return MHATokenToKVPoolHostHCU
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost

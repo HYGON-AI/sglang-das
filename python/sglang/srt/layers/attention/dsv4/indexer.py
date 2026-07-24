@@ -49,7 +49,7 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_gfx95_supported,
     is_hip,
     is_xpu,
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8_DTYPE).max
@@ -458,7 +458,7 @@ class C4IndexerBackendMixin:
 
         # q = c4_indexer.compute_q(q_lora, positions=positions)
 
-        # if _is_dcu and _use_lightop_group_fp8_quant:
+        # if _is_hcu and _use_lightop_group_fp8_quant:
         #     from lightop import op as ops
         #     def act_quant_group_lightop(
         #         x: torch.Tensor,
@@ -878,7 +878,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
-        elif _is_dcu and envs.SGLANG_LIGHTOP_TOPK.get():
+        elif _is_hcu and envs.SGLANG_LIGHTOP_TOPK.get():
             from lightop import topk_transform_512 as lightop_topk_transform_512
             lightop_topk_transform_512(
                 logits,

@@ -93,12 +93,12 @@ from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_xpu,
 )
 from sglang.srt.utils.common import is_sm120_supported
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
     "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
 )
@@ -175,7 +175,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if _is_sm120 or _is_xpu:
         return None
-    if _is_dcu:
+    if _is_hcu:
         import flash_mla
     else:
         import sgl_kernel.flash_mla as flash_mla
@@ -1634,7 +1634,7 @@ class DeepseekV4AttnBackend(
                 cache_k=swa_k,
             )
         else:
-            if _is_dcu and _use_dpskv4_lightop_quant_k_cache:
+            if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
                 from lightop import op
 
                 if hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store"):
@@ -1939,7 +1939,7 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            if not _is_dcu:
+            if not _is_hcu:
                 if q.ndim == 3:
                     q = q.unsqueeze(1)
                 if swa_page_indices.ndim == 2:
@@ -2081,7 +2081,7 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        if _is_dcu:
+        if _is_hcu:
             try:
                 from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
             except ImportError:

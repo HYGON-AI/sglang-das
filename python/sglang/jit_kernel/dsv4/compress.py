@@ -24,11 +24,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_dcu, is_hip, is_xpu
+from sglang.srt.utils import is_hcu, is_hip, is_xpu
 
 from .utils import make_name
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_xpu = is_xpu()
 if _is_xpu:
     from sgl_kernel import compress_norm_rope_store as compress_norm_rope_store_xpu
@@ -170,7 +170,7 @@ class CompressorDecodePlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
     ) -> CompressorDecodePlan:
-        if _is_dcu:
+        if _is_hcu:
             module = _jit_compress_plan_module()
             plan_d = torch.empty(
                 (req_pool_indices.shape[0], 16),
@@ -290,7 +290,7 @@ class CompressorPrefillPlan(NamedTuple):
                 pin_buffer,
             )
 
-        if _is_dcu:
+        if _is_hcu:
             device = req_pool_indices.device
             plan_c = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
             plan_w = torch.empty((num_q_tokens, 8), dtype=torch.uint8, device=device)

@@ -31,7 +31,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -43,12 +43,12 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
-if _is_dcu:
+if _is_hcu:
     from sgl_kernel.kvcacheio import (
-        dcu_assign_req_to_token_pool,
-        dcu_get_last_loc,
+        hcu_assign_req_to_token_pool,
+        hcu_get_last_loc,
     )
 
 if _is_cpu:
@@ -118,7 +118,7 @@ def get_last_loc(
     attn_backend = get_server_args().attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
-    if _is_hip and not _is_dcu and uses_triton_dispatch:
+    if _is_hip and not _is_hcu and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +
@@ -137,8 +137,8 @@ def get_last_loc(
     else:
         impl = get_last_loc_torch
 
-    if _is_dcu and get_bool_env_var("SGLANG_GET_LAST_LOC", default="true"):
-        impl = dcu_get_last_loc
+    if _is_hcu and get_bool_env_var("SGLANG_GET_LAST_LOC", default="true"):
+        impl = hcu_get_last_loc
     return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
 
 
@@ -647,10 +647,10 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_dcu and get_bool_env_var(
+    if _is_hcu and get_bool_env_var(
         "SGLANG_ASSIGN_REQ_TO_TOKEN_POOL", default="true"
     ):
-        dcu_assign_req_to_token_pool(
+        hcu_assign_req_to_token_pool(
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
             allocate_lens=start_offset,

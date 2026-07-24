@@ -17,14 +17,14 @@ from types import SimpleNamespace
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=300,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: disaggregation DP attention path needs BW1100 multi-device validation before enabling.",
+    disabled="HCU CSV CI placeholder: disaggregation DP attention path needs BW1100 multi-device validation before enabling.",
 )
 
 from sglang.test.run_eval import run_eval

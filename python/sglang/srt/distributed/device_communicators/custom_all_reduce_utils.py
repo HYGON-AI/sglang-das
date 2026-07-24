@@ -22,12 +22,12 @@ from typing_extensions import ParamSpec
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
-from sglang.srt.utils import is_cuda, is_dcu, is_hip, is_musa
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_musa = is_musa()
 
@@ -366,9 +366,9 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                         if link_type["hops"] != 1 or link_type["type"] != 2:
                             return False
                     except AmdSmiException as error:
-                        if _is_dcu:
+                        if _is_hcu:
                             logger.error(
-                                "DCU/DTK 1 hop XGMI detection failed.",
+                                "HCU 1 hop HSL detection failed.",
                                 exc_info=error,
                             )
                         else:

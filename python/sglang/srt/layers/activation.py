@@ -41,7 +41,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_dcu,
+    is_hcu,
     is_npu,
     is_xpu,
     set_weight_attrs,
@@ -55,9 +55,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _use_aiter = (
-    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_dcu
+    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
 )
 
 if _is_cuda:
@@ -106,7 +106,7 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if _is_dcu:
+        if _is_hcu:
             from lightop import fuse_silu_and_mul
             fuse_silu_and_mul(x, out)
         else:

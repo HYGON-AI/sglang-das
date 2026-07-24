@@ -25,8 +25,8 @@ GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
-from sglang.srt.utils import get_bool_env_var, is_dcu
-_is_dcu = is_dcu()
+from sglang.srt.utils import get_bool_env_var, is_hcu
+_is_hcu = is_hcu()
 _use_prefill_aiter_linear_attn = get_bool_env_var("SGLANG_USE_AITER_LINEAR_ATTN")
 
 @triton.autotune(

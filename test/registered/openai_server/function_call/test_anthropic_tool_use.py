@@ -30,11 +30,11 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-register_dcu_ci(
+register_hcu_ci(
     est_time=140,
-    suite="stage-b-test-1-gpu-small-dcu",
+    suite="stage-b-test-1-gpu-small-hcu",
     disabled=(
         "BW1100 Llama3.2 local server starts with fa3, but Anthropic "
         "tool_choice/tool_use requests return 500/error events; 2/10 pass."

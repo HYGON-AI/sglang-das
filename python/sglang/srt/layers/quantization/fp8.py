@@ -90,7 +90,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_dcu,
+    is_hcu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -115,7 +115,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
@@ -123,7 +123,7 @@ _is_gfx95_supported = is_gfx95_supported()
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-_is_shuffle_moe_mxfp4 = is_gfx95_supported() and not _is_dcu
+_is_shuffle_moe_mxfp4 = is_gfx95_supported() and not _is_hcu
 
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -134,7 +134,7 @@ def _require_fp4_dtype():
     return fp4_dtype
 
 
-if (_use_aiter or _use_hip_int4) and not _is_dcu:
+if (_use_aiter or _use_hip_int4) and not _is_hcu:
     from aiter.ops.shuffle import (
         shuffle_scale,
         shuffle_weight,
@@ -1326,7 +1326,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
-        if _use_aiter and self.is_fp4_expert and not _is_dcu:
+        if _use_aiter and self.is_fp4_expert and not _is_hcu:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
@@ -1898,13 +1898,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if _is_dcu and get_moe_a2a_backend().is_megamoe():
+        if _is_hcu and get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
-                build_dcu_w8a8_mega_moe_experts_weights,
-                get_dcu_mega_moe_runtime,
+                build_hcu_w8a8_mega_moe_experts_weights,
+                get_hcu_mega_moe_runtime,
             )
 
-            runtime = get_dcu_mega_moe_runtime()
+            runtime = get_hcu_mega_moe_runtime()
             if runtime == "megamoe" and (
                 self.block_quant
                 or self.is_fp4_expert
@@ -1918,10 +1918,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if not self.block_quant and not self.is_fp4_expert:
                 if not self.quant_config.is_checkpoint_fp8_serialized:
                     raise ValueError(
-                        "DCU W8A8 MegaMoE requires an FP8-serialized checkpoint "
+                        "HCU W8A8 MegaMoE requires an FP8-serialized checkpoint "
                         "with channelwise expert weight scales"
                     )
-                build_dcu_w8a8_mega_moe_experts_weights(layer)
+                build_hcu_w8a8_mega_moe_experts_weights(layer)
                 return
 
         if _is_hip and _use_hip_int4:
@@ -2469,9 +2469,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         no_combine: bool = False,
     ) -> Optional[AiterMoeQuantInfo]:
-        # DCU keeps its validated native/ASM AITER dispatch path. The official
+        # HCU keeps its validated native/ASM AITER dispatch path. The official
         # runner-core quant-info path below is for generic ROCm.
-        if _is_dcu or not (_use_aiter or _use_hip_int4):
+        if _is_hcu or not (_use_aiter or _use_hip_int4):
             return None
         assert not no_combine, f"{no_combine=} is not supported."
 

@@ -766,7 +766,7 @@ class HiCacheController:
         elif self.io_backend == "direct":
             if (
                 self.mem_pool_host.layout == "layer_first"
-                or self.mem_pool_host.layout == "layout_dcu"
+                or self.mem_pool_host.layout == "layout_hcu"
             ):
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()

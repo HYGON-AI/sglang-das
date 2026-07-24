@@ -608,7 +608,7 @@ def fused_marlin_moe_w16a16(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import hcu_moe_align_block_size
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -637,7 +637,7 @@ def fused_marlin_moe_w16a16(
     if global_num_experts == -1:
         global_num_experts = E
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(topk_ids, block_size_m, global_num_experts)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = hcu_moe_align_block_size(topk_ids, block_size_m, global_num_experts)
 
     # TODO: tune this further for specific models
     intermediate_cache2 = torch.empty(

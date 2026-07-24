@@ -6,9 +6,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_dcu
+from sglang.srt.utils import is_hcu
 
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -119,7 +119,7 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
-            if _is_dcu:
+            if _is_hcu:
                 from lightop import (
                     fast_topk_transform_fused,
                     fast_topk_transform_ragged_fused,

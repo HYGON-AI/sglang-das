@@ -57,7 +57,7 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_int_env_var,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_gfx95_supported,
     is_gfx942_supported,
     is_xpu,
@@ -65,7 +65,7 @@ from sglang.srt.utils import (
 )
 
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
@@ -127,7 +127,7 @@ class ForwardMetadata:
 class TritonAttnBackend(AttentionBackend):
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
-    needs_cpu_seq_lens: bool = _is_dcu
+    needs_cpu_seq_lens: bool = _is_hcu
 
     def __init__(
         self,

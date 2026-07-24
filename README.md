@@ -98,6 +98,6 @@ We learned the design and reused code from the following projects: [Guidance](ht
 
 This repository is based on [SGLang](https://github.com/sgl-project/sglang), version `v0.5.12`, licensed under the Apache License, Version 2.0.
 
-DCU adaptations, modifications, and original contributions by Hygon Information Technology Co., Ltd. are licensed under the Apache License, Version 2.0.
+HCU adaptations, modifications, and original contributions by Hygon Information Technology Co., Ltd. are licensed under the Apache License, Version 2.0.
 
 Original copyright notices and license terms from the upstream SGLang project are retained. See `LICENSE` and `THIRD_PARTY_NOTICES.md` for details.

@@ -1,0 +1,9 @@
+# Approved DCU-to-HCU rename exceptions.
+# Format: repository path:line:approved literal
+.github/workflows/lint-hcu.yml:14:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/nightly-test-dcu.yml:294:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/release-pr-hcu.yml:41:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/release-pypi-nightly-dcu.yml:61:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/release-pypi-nightly-hcu.yml:50:harbor.sourcefind.cn:5443/dcu/admin/base/dev
+.github/workflows/release-pypi-nightly-dcu.yml:65:/home/github/sgl_whl_temp/HYGON-AI_dcu-sglang
+.github/workflows/release-pypi-nightly-dcu.yml:214:/home/github/sgl_whl_temp/HYGON-AI_dcu-sglang

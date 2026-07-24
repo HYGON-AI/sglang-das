@@ -35,7 +35,7 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
-from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kernel
+from sgl_kernel.kvcacheio import hcu_alloc_decode_kernel, hcu_alloc_extend_kernel
 
 _is_hip = is_hip()
 
@@ -199,7 +199,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
         if self.sglang_kvalloc_kernel:
-            dcu_alloc_extend_kernel(
+            hcu_alloc_extend_kernel(
                 pre_lens_ptr = prefix_lens.to(torch.int64),
                 seq_lens_ptr = seq_lens.to(torch.int64),
                 last_loc_ptr = last_loc.to(torch.int64),
@@ -252,7 +252,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
         if self.sglang_kvalloc_kernel:
-            dcu_alloc_decode_kernel(
+            hcu_alloc_decode_kernel(
                 seq_lens_ptr = seq_lens,
                 last_loc_ptr = last_loc,
                 free_page_ptr = self.free_pages,

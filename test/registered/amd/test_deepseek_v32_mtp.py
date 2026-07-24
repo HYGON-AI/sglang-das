@@ -18,14 +18,14 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_hcu_ci
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=900,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: DeepSeek-V3.2 MTP path needs BW1100 8-GPU validation before enabling.",
+    disabled="HCU CSV CI placeholder: DeepSeek-V3.2 MTP path needs BW1100 8-GPU validation before enabling.",
 )
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k

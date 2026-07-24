@@ -19,14 +19,14 @@ import requests
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_dcu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
 
-# DCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_dcu_ci(
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
     est_time=300,
-    suite="nightly-dcu",
+    suite="nightly-hcu",
     nightly=True,
-    disabled="DCU CSV CI placeholder: DP attention path needs BW1100 multi-device validation before enabling.",
+    disabled="HCU CSV CI placeholder: DP attention path needs BW1100 multi-device validation before enabling.",
 )
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin

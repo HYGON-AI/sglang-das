@@ -1502,9 +1502,9 @@ def fused_moe_fp8_w8a8(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    # from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import dcu_moe_align_block_size
+    # from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import hcu_moe_align_block_size
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-        dcu_moe_align_block_size,
+        hcu_moe_align_block_size,
     )
 
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -1549,7 +1549,7 @@ def fused_moe_fp8_w8a8(
         if global_num_experts == -1:
             global_num_experts = E
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = dcu_moe_align_block_size(
+        sorted_token_ids, expert_ids, num_tokens_post_padded = hcu_moe_align_block_size(
             topk_ids, block_size_m, global_num_experts
         )
 

@@ -8,7 +8,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -19,15 +19,15 @@ from sglang.srt.utils import (
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
-if _is_dcu:
+if _is_hcu:
     from sgl_kernel.kvcacheio import (
-        dcu_assign_extend_cache_locs,
-        dcu_assign_req_to_token_pool,
+        hcu_assign_extend_cache_locs,
+        hcu_assign_req_to_token_pool,
     )
 
 if _is_cpu:
@@ -379,14 +379,14 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if _is_dcu:
+    if _is_hcu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,
             device=device,
         )
         if get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"):
-            dcu_assign_extend_cache_locs(
+            hcu_assign_extend_cache_locs(
                 req_pool_indices,
                 req_to_token,
                 start_offset,

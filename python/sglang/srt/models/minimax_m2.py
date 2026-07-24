@@ -101,7 +101,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_cuda,
-    is_dcu,
+    is_hcu,
     is_non_idle_and_non_empty,
     is_npu,
     make_layers,
@@ -113,14 +113,14 @@ logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
-_is_dcu = is_dcu()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
-if _is_dcu:
+if _is_hcu:
     from lightop.rmsnorm import fused_rms_norm_contiguous
 
 if _is_npu:
@@ -504,7 +504,7 @@ class MiniMaxM2QKRMSNorm:
 
     def forward_opt(self, q: torch.Tensor, k: torch.Tensor):
         q, k = q.contiguous(), k.contiguous()
-        if _is_dcu:
+        if _is_hcu:
             q = fused_rms_norm_contiguous(
                 torch.empty_like(q), q, self._q_norm.weight, self._eps
             )
