@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
+import importlib.util
 import os
+import subprocess
+import sys
 import traceback
 
 # imported by other files, do not remove
@@ -80,7 +83,43 @@ def cpu_platform_plugin() -> str | None:
     return "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform"
 
 
+_HCUSMI_DEVICE_COUNT_PREFIX = "HCUSMI_DEVICE_COUNT="
+
+
+def _probe_hcusmi_device_count() -> int:
+    probe = f"""
+import hcusmi
+
+hcusmi.hcusmi_init()
+try:
+    print("{_HCUSMI_DEVICE_COUNT_PREFIX}" + str(
+        len(hcusmi.hcusmi_get_processor_handles())
+    ))
+finally:
+    hcusmi.hcusmi_shut_down()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_HCUSMI_DEVICE_COUNT_PREFIX):
+            return int(line.removeprefix(_HCUSMI_DEVICE_COUNT_PREFIX))
+    raise RuntimeError("hcusmi probe did not report a device count")
+
+
 def rocm_platform_plugin() -> str | None:
+    try:
+        if importlib.util.find_spec("hcusmi") is not None:
+            if _probe_hcusmi_device_count() > 0:
+                logger.info("ROCm platform is available via hcusmi")
+                return "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform"
+    except Exception as e:
+        logger.debug("hcusmi platform detection failed: %s", e)
+
     is_rocm = False
 
     try:
