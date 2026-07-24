@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
-import importlib
+import importlib.util
 import subprocess
 import sys
 import traceback
@@ -112,35 +112,32 @@ finally:
 
 
 def rocm_platform_plugin() -> str | None:
-    if importlib.util.find_spec("hcusmi") is not None:
-        try:
-            if _probe_hcusmi_device_count() > 0:
-                logger.info("ROCm-compatible platform is available via hcusmi")
-                return "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform"
-        except Exception as e:
-            logger.warning(
-                "hcusmi platform probe failed; falling back to amdsmi: %s", e
-            )
-
-    initialized = False
     try:
-        amdsmi = importlib.import_module("amdsmi")
-        amdsmi.amdsmi_init()
-        initialized = True
-        if len(amdsmi.amdsmi_get_processor_handles()) > 0:
-            logger.info("ROCm-compatible platform is available via amdsmi")
-            return "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform"
+        if importlib.util.find_spec("hcusmi") is not None:
+            if _probe_hcusmi_device_count() > 0:
+                logger.info("ROCm platform is available via hcusmi")
+                return "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform"
     except Exception as e:
-        logger.debug("amdsmi platform detection failed: %s", e)
-    finally:
-        if initialized:
-            try:
-                amdsmi.amdsmi_shut_down()
-            except Exception as e:
-                logger.debug("amdsmi shutdown failed: %s", e)
+        logger.debug("hcusmi platform detection failed: %s", e)
 
-    logger.debug("ROCm-compatible platform is unavailable")
-    return None
+    is_rocm = False
+
+    try:
+        import amdsmi
+
+        amdsmi.amdsmi_init()
+        try:
+            if len(amdsmi.amdsmi_get_processor_handles()) > 0:
+                is_rocm = True
+                logger.debug("ROCm platform is available")
+        finally:
+            amdsmi.amdsmi_shut_down()
+    except Exception as e:
+        logger.debug("ROCm platform is unavailable: %s", e)
+
+    return (
+        "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
+    )
 
 
 def npu_platform_plugin() -> str | None:

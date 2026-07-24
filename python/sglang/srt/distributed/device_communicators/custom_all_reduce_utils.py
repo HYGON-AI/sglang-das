@@ -6,7 +6,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce_utils.py
 
 import ctypes
-import importlib
 import json
 import logging
 import os
@@ -46,26 +45,17 @@ if _is_musa:
     except ImportError as e:
         logger.warning("Failed to import pymtml with %r", e)
 
-_smi_backend_name: Optional[str] = None
-_smi_exception = Exception
-_smi_init: Optional[Callable[[], None]] = None
-_smi_shut_down: Optional[Callable[[], None]] = None
-_smi_get_processor_handles: Optional[Callable] = None
-_smi_topo_get_link_type: Optional[Callable] = None
-
 if _is_hip and not _is_hcu:
     try:
-        _smi_module = importlib.import_module("amdsmi")
-        _smi_backend_name = "amdsmi"
-        _smi_exception = getattr(_smi_module, "AmdSmiException")
-        _smi_init = getattr(_smi_module, "amdsmi_init")
-        _smi_shut_down = getattr(_smi_module, "amdsmi_shut_down")
-        _smi_get_processor_handles = getattr(
-            _smi_module, "amdsmi_get_processor_handles"
+        from amdsmi import (
+            AmdSmiException,
+            amdsmi_get_processor_handles,
+            amdsmi_init,
+            amdsmi_shut_down,
+            amdsmi_topo_get_link_type,
         )
-        _smi_topo_get_link_type = getattr(_smi_module, "amdsmi_topo_get_link_type")
-    except Exception as e:
-        logger.warning("Failed to load amdsmi with %r", e)
+    except ImportError as e:
+        logger.warning("Failed to import amdsmi with %r", e)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -350,14 +340,11 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
             return fn(*args, **kwargs)
 
         if _is_hip:
-            if _smi_init is None or _smi_shut_down is None:
-                return fn(*args, **kwargs)
-
             try:
-                _smi_init()
+                amdsmi_init()
                 return fn(*args, **kwargs)
             finally:
-                _smi_shut_down()
+                amdsmi_shut_down()
         else:
             pynvml.nvmlInit()
             try:
@@ -374,29 +361,26 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         return False
 
     if _is_hip:
-        if _smi_get_processor_handles is None or _smi_topo_get_link_type is None:
-            logger.warning("GPU topology is unavailable because no SMI backend loaded")
-            return False
-
         """
         query if the set of gpus are fully connected by xgmi (1 hop)
         """
-        handles = [_smi_get_processor_handles()[i] for i in physical_device_ids]
+        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
                     try:
-                        link_type = _smi_topo_get_link_type(handle, peer_handle)
+                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
                         # type is 2 for XGMI
                         if link_type["hops"] != 1 or link_type["type"] != 2:
                             return False
-                    except _smi_exception as error:
-                        logger.error(
-                            "%s 1-hop %s detection failed.",
-                            _smi_backend_name,
-                            "HSL" if _is_hcu else "XGMI",
-                            exc_info=error,
-                        )
+                    except AmdSmiException as error:
+                        if _is_hcu:
+                            logger.error("HCU 1 hop HSL detection failed.")
+                        else:
+                            logger.error(
+                                "AMD 1 hop XGMI detection failed.",
+                                exc_info=error,
+                            )
                         return False
         return True
     else:
