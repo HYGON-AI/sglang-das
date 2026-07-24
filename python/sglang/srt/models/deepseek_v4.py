@@ -2628,6 +2628,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
+        scale_suffix: str = "weight_scale_inv",
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -2661,9 +2662,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
                     elif rest == "e_proj.scale":
-                        rest = "e_proj.weight_scale_inv"
+                        rest = f"e_proj.{scale_suffix}"
                     elif rest == "h_proj.scale":
-                        rest = "h_proj.weight_scale_inv"
+                        rest = f"h_proj.{scale_suffix}"
                 name = f"model.layers.{num_hidden_layers}." + rest
 
         if name.startswith("layers."):
@@ -2674,7 +2675,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
         if "self_attn" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
+            name = name.removesuffix(".scale") + f".{scale_suffix}"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -2682,7 +2683,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
+            name = name.removesuffix(".scale") + f".{scale_suffix}"
 
         return name
 
@@ -2751,6 +2752,28 @@ class DeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
+        # The checkpoint always stores FP8 scales as ``.scale``. Depending on
+        # the quantization scheme, the materialized parameter is either the
+        # legacy block-FP8 ``weight_scale_inv`` or per-output-channel
+        # compressed-tensors ``weight_scale``. Select the target name from the
+        # model instance so both checkpoint layouts load without changing the
+        # block-FP8 path.
+        scale_suffix = (
+            "weight_scale"
+            if any(
+                key.endswith(
+                    (
+                        ".wo_b.weight_scale",
+                        ".wkv.weight_scale",
+                        ".wqkv_a.weight_scale",
+                        ".wq_a.weight_scale",
+                    )
+                )
+                for key in params_dict
+            )
+            else "weight_scale_inv"
+        )
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2855,6 +2878,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        scale_suffix=scale_suffix,
                     )
 
                     layer_id = get_layer_id(name)

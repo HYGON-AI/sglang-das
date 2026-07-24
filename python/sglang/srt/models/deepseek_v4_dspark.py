@@ -768,6 +768,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
+        # DSpark draft weights use the same checkpoint-side ``.scale`` name as
+        # the target. Match the parameter layout created by the active quant
+        # method: per-channel FP8 exposes ``weight_scale`` while block FP8 uses
+        # ``weight_scale_inv``.
+        self._dspark_scale_suffix = (
+            "weight_scale"
+            if any(key.endswith(".weight_scale") for key in params_dict)
+            else "weight_scale_inv"
+        )
+
         weights = list(weights)
         if any(name.endswith(".wo_a.scale") for name, _ in weights):
             weights = list(_dequant_fp8_wo_a(weights))
@@ -885,7 +895,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        mapped_rest = mapped_rest.replace(
+            ".scale",
+            "." + getattr(self, "_dspark_scale_suffix", "weight_scale_inv"),
+        )
         return f"stages.{stage_id}.{mapped_rest}"
 
 

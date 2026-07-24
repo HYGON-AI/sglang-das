@@ -274,8 +274,17 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
+    # HCU uses the HIP PyTorch runtime, so ServerArgs.device is not prefixed
+    # with ``cuda``. Keep all other platforms rejected until they add a tested
+    # backend, but allow the HCU implementation to reach its static-verify
+    # compatibility path.
     if not server_args.device.startswith("cuda"):
-        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+        from sglang.srt.utils.common import is_hcu
+
+        if not is_hcu():
+            raise ValueError(
+                "DSpark speculative decoding only supports CUDA or HCU device."
+            )
 
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:

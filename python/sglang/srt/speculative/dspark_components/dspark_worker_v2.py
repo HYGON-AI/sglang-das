@@ -314,7 +314,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        with self._draft_context():
+        # Draft graph capture is inference-only.  Keep autograd disabled during
+        # both warmup and capture: some HCU/AITER MoE outputs are views of leaf
+        # tensors, so the shared-expert in-place accumulation is otherwise
+        # rejected by PyTorch even though no backward pass can occur here.
+        with self._draft_context(), torch.inference_mode():
             if capture_decode_cuda_graph:
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:

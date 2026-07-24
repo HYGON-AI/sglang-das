@@ -300,6 +300,11 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
         return True
     if weight.dtype != torch.float8_e4m3fn:
         return False
+    # Per-channel compressed-tensors FP8 has ``weight_scale`` instead of the
+    # 128x128 block-grid ``weight_scale_inv`` required by the stacked fused
+    # path. Let CommitKvProj route it to the per-linear quant-method path.
+    if not hasattr(linear, "weight_scale_inv"):
+        return False
     block = 128
     out_dim, in_dim = weight.shape
     expected_scale_shape = (
