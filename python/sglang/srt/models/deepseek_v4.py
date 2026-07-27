@@ -116,6 +116,22 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
+_fused_qnorm_rope_cos_sin_cache: dict[tuple, torch.Tensor] = {}
+
+def _get_fused_qnorm_rope_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
+    key = (
+        freqs_cis.device.type,
+        freqs_cis.device.index,
+        freqs_cis.data_ptr(),
+    )
+    cache = _fused_qnorm_rope_cos_sin_cache.get(key)
+    if cache is None:
+        freqs_real = torch.view_as_real(freqs_cis)  # [max_pos, 32, 2]
+        cache = torch.cat(
+            [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
+        ).contiguous()  # [max_pos, 64], first 32 cos, last 32 sin
+        _fused_qnorm_rope_cos_sin_cache[key] = cache
+    return cache
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -250,11 +266,9 @@ class MQALayer(nn.Module):
         self.register_buffer("cos_sin_cache_fused", None, persistent=False)
         self.cos_sin_cache_fused: Optional[torch.Tensor]
         if _is_hcu and _use_fused_qnorm_rope_kv_rope_quant:
-            freqs_real = torch.view_as_real(self.freqs_cis)  # [max_pos, 32, 2]
-            cos_sin_cache = torch.cat(
-                [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
-            ).contiguous()  # [max_pos, 64], first 32 cos, last 32 sin
-            self.cos_sin_cache_fused = cos_sin_cache
+            self.cos_sin_cache_fused = _get_fused_qnorm_rope_cos_sin_cache(
+                self.freqs_cis
+            )
 
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
             self.alt_streams = alt_streams[:3]
@@ -1200,21 +1214,32 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,
                 )
-
+        if not self.pp_group.is_last_rank:
+            # Flatten 3D mHC tensor for PP IPC.
+            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+        need_pre_hc_head = getattr(forward_batch, "return_hidden_states_before_norm", False)
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch):
+            pre_hc_head = None
+            if need_pre_hc_head:
+                pre_hc_head = cp_all_gather_rerange_output(
+                    hidden_states.flatten(1),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            hidden_states = self.hc_head(
+                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            )
+            hidden_states = self.norm(hidden_states)
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-
-        if not self.pp_group.is_last_rank:
-            # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
-
-        pre_hc_head = hidden_states.flatten(1)
+            return hidden_states, pre_hc_head
+        pre_hc_head = hidden_states.flatten(1) if need_pre_hc_head else None
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base

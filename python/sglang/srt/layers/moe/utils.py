@@ -520,3 +520,23 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
+    """Get shuffle_unique and disaggregation mode for deepgemm INT8 GEMM.
+
+    Returns (shuffle_unique, mode):
+        shuffle_unique=1, mode="ifb"       — combined prefill+decode (default)
+        shuffle_unique=0, mode="prefill"   — pd separation prefill node
+        shuffle_unique=0, mode="decode"    — pd separation decode node
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        args = get_global_server_args()
+        mode = args.disaggregation_mode
+        if mode in ("prefill", "decode"):
+            return 0, mode
+    except Exception:
+        pass
+    return 1, "ifb"
