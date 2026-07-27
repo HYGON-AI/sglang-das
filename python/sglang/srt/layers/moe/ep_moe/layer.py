@@ -34,6 +34,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     # should_use_flashinfer_trtllm_moe, # 找不到
 )
+from sglang.srt.layers.moe.utils import _get_deepgemm_shuffle_unique
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -81,11 +82,16 @@ if TYPE_CHECKING:
         DispatchOutput,
     )
 
-from deepgemm import m_grouped_w4a8_gemm_nt_masked, m_grouped_w8a8_gemm_nt_masked, \
+from deepgemm import m_grouped_w4a8_gemm_nt_masked, m_grouped_i8_gemm_nt_masked, \
+    m_grouped_i8_gemm_nt_contiguous, \
     m_grouped_fp8_gemm_nt_masked, m_grouped_bf16_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous, \
     m_grouped_bf16_gemm_nt_contiguous
+<<<<<<< HEAD
 from lightop.gemm_ops import m_grouped_w8a8_gemm_nt_contig_asm as m_grouped_i8_gemm_nt_contiguous
 from lightop.activation import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_fp8_quant_ep, fuse_silu_and_mul, \
+=======
+from lightop import fuse_silu_mul_quant_ep, fuse_silu_mul_quant, fuse_silu_mul_fp8_quant_ep, fuse_silu_and_mul, \
+>>>>>>> 01848b8fd (support dpsk-v4-int8)
     fuse_silu_mul_fp8_quant
 from lightop import moe as lightop_op
 from lightop.quant import per_token_quant_int8
@@ -338,24 +344,25 @@ def m_grouped_w4a8_gemm_nt_masked_fake(
     return d
 
 
-def m_grouped_w8a8_gemm_nt_masked_wrapper(
+def m_grouped_i8_gemm_nt_masked_wrapper(
     a0: torch.Tensor, a1: torch.Tensor,
     b0: torch.Tensor, b1: torch.Tensor,
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m_per_group: int
 ) -> torch.Tensor:
-    return m_grouped_w8a8_gemm_nt_masked(
+    shuffle_unique, _mode = _get_deepgemm_shuffle_unique()
+    return m_grouped_i8_gemm_nt_masked(
         (a0, a1),
         (b0, b1),
         d,
         masked_m,
         expected_m_per_group,
-        config={"MODE": 1000, }
+        shuffle_unique=shuffle_unique,
     )
 
 
-def m_grouped_w8a8_gemm_nt_masked_fake(
+def m_grouped_i8_gemm_nt_masked_fake(
     a0: torch.Tensor, a1: torch.Tensor,
     b0: torch.Tensor, b1: torch.Tensor,
     d: torch.Tensor,
@@ -401,16 +408,17 @@ direct_register_custom_op(
     fake_impl=m_grouped_w4a8_gemm_nt_masked_fake
 )
 direct_register_custom_op(
-    op_name="m_grouped_w8a8_gemm_nt_masked",
-    op_func=m_grouped_w8a8_gemm_nt_masked_wrapper,
+    op_name="m_grouped_i8_gemm_nt_masked",
+    op_func=m_grouped_i8_gemm_nt_masked_wrapper,
     mutates_args=[],
-    fake_impl=m_grouped_w8a8_gemm_nt_masked_fake
+    fake_impl=m_grouped_i8_gemm_nt_masked_fake
 )
+
 direct_register_custom_op(
     op_name="fuse_silu_mul_quant_ep",
     op_func=fuse_silu_mul_quant_ep_wrapper,
     mutates_args=[],
-    fake_impl=fuse_silu_mul_quant_ep_fake
+    fake_impl=fuse_silu_mul_quant_ep_fake,
 )
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -1266,12 +1274,13 @@ class DeepEPMoE(FusedMoE):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-
+        shuffle_unique, _mode = _get_deepgemm_shuffle_unique()
         m_grouped_i8_gemm_nt_contiguous(
             (a_int8, a_scale),
             w13_weight_int8,
             gateup_output,
             m_indices,
+            shuffle_unique=shuffle_unique,
         )
 
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
@@ -1288,6 +1297,7 @@ class DeepEPMoE(FusedMoE):
             w2_weight_int8,
             down_output,
             m_indices,
+            shuffle_unique=shuffle_unique,
         )
 
         gather_out = torch.zeros(
@@ -1563,7 +1573,7 @@ class DeepEPMoE(FusedMoE):
         gateup_output = torch.empty((num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16)
 
         # ---- first GEMM ----
-        torch.ops.sglang.m_grouped_w8a8_gemm_nt_masked(
+        torch.ops.sglang.m_grouped_i8_gemm_nt_masked(
             hidden_states, hidden_states_scale,
             w13_weight, w13_scales,
             gateup_output,
@@ -1580,7 +1590,7 @@ class DeepEPMoE(FusedMoE):
         n2 = w2_scales.size(1)
         down_output = torch.empty((num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16)
 
-        torch.ops.sglang.m_grouped_w8a8_gemm_nt_masked(
+        torch.ops.sglang.m_grouped_i8_gemm_nt_masked(
             q_a2_all, q_a2_scale,
             w2_weight, w2_scales,
             down_output,
