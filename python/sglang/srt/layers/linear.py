@@ -1676,6 +1676,7 @@ class RowParallelLinear(LinearBase):
         forward_batch=None,
         use_fused_silu_mul_quant: Optional[bool] = False,
         use_fused_silu_mul_fp8_quant: Optional[bool] = False,
+        output_tensor=None,
     ):
         if self.input_is_parallel:
             input_parallel = input_
@@ -1727,7 +1728,20 @@ class RowParallelLinear(LinearBase):
                     sm.tag(output_parallel)
         else:
             with symm_ctx:
-                output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+                if output_tensor is None:
+                    output_parallel = self.quant_method.apply(
+                        self, input_parallel, bias=bias_
+                    )
+                else:
+                    apply_into = getattr(self.quant_method, "apply_into", None)
+                    if apply_into is None:
+                        raise RuntimeError(
+                            f"{type(self.quant_method).__name__} cannot write into "
+                            "caller-owned linear output"
+                        )
+                    output_parallel = apply_into(
+                        self, input_parallel, output_tensor, bias=bias_
+                    )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
