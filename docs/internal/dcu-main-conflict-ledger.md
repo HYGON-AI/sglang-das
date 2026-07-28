@@ -1995,3 +1995,129 @@ actual result in the checkpoint note.
   uncommitted, not merged to `main`, and not pushed pending user review.
 - Detailed review:
   `docs/internal/dcu-main-daily-20260721-fixed-patch-review.md`.
+
+
+### Official main daily 20260728 — in progress
+
+- Working branch: `sync/official-main-daily-20260728`; base `main` is
+  `49764eb373a`.  Official endpoint is
+  `edc0e5489f2ff8b42eb0d48fbcf7137d1931d4d2`.
+- The no-commit upstream merge has 32 resolved textual conflict files.  The
+  resolution keeps the official `jit_kernel` to `kernels` migration and ports
+  HCU behavior to the resulting owners, including DSV4 attention, MoE/quant,
+  cache allocation/configuration, server arguments, custom all-reduce, and
+  FlashAttention paths.  New platform predicates consistently use `_is_hcu`;
+  no runtime `_is_dcu` predicate remains in the HCU paths.
+- Static evidence before service validation: no unmerged entries, no precise
+  conflict markers, staged `git diff --check`, compilation of all 1,010 changed
+  Python files, DSA alias/CLI registry test (19 passed), HCU registration
+  validation (274 registered files), and `setup_hip.py --name` (zero unsupported
+  CUDA calls, 56 replaced launches).  Ruff was unavailable in the container.
+- Pure-TP attempt on the only idle node, `zz-sglang2` / `rye_sglang_0720`,
+  reached DeepSeek-V4 construction but stopped at the shared-expert FP8 setup:
+  `CompressedTensorsConfig.weight_block_size` is absent.  The generic
+  block-size assertion was therefore bypassed only for compressed-tensors.
+- The subsequent retry exposed that `_DeepseekV4ConfigAlias` intentionally has
+  no `quantization_config`.  `deepseek_v2.py` now queries that optional field
+  with `getattr` and, for the alias case, identifies compressed-tensors from
+  the instantiated layer quant-method module.  This preserves the ordinary
+  FP8 block-size equality assertion and is awaiting one user-run pure-TP retry;
+  it has compiled and passed staged whitespace validation.
+- Separate non-blocking migration audit observation: optional `mimo_v2_nextn`
+  import warns that its old `load_mimo_v2_qkv_proj_weight_v2` helper is absent
+  after the official model refactor.  It does not participate in this
+  DeepSeek-V4 startup path, but must be audited before finalizing this daily
+  sync.
+- Follow-up pure-TP startup on `zz-nmz26` reached checkpoint loading and found
+  a second removed compatibility path: compressed-tensors supplies
+  `wq_a/wkv.*weight_scale_inv`, whereas the fused `wqkv_a` layer owns
+  `.*weight_scale`.  The official refactor had removed the old scale-name
+  resolver, so the fused loader raised a `KeyError` for the `_inv` target.
+  `deepseek_v4.py` restores a parameter-existence based resolver only for these
+  scale aliases, applies it after WQA/WKV fusion, accepts both scale spellings,
+  and retains the pre-remap cache key.  It also guards `Exception.add_note` for
+  the Python 3.10 containers; this prevents masking a future loader error.
+  The changed file compiled and staged whitespace validation passed.  No second
+  model launch was issued automatically; pure-TP retry is pending user result.
+- A 2026-07-28 12:38 user retry then completed all 46 weight shards and
+  memory-pool initialization, confirming the compressed-tensors fixes.  CUDA
+  Graph setup exposed a separate namespace-conflict omission: official and the
+  pre-merge branch retain `ServerArgs.minimax_opt`, and 14 consumers still use
+  it, but the merged namespaced `ServerArgs` definition had dropped the field.
+  The field is restored under `NS("parallel")` with its original `False`
+  default; direct `ServerArgs` construction passed.
+- After a clean `hy-smi` preflight (all eight devices at VRAM 0%, HCU 0%), one
+  agent-run pure-TP attempt at 12:51 passed weight loading and memory-pool setup
+  and entered decode graph capture.  Capture then failed at
+  `dsv4/metadata.py:124` because the merge retained an `_is_hcu` condition but
+  dropped its `is_hcu` import and module-level initialization.  Those two lines
+  are restored from the pre-merge HCU implementation on the official metadata
+  structure.  The adjacent `copy_()` audit also restored the validated
+  `is_hip() and not _is_hcu` guard so HCU does not enter the generic HIP
+  metadata assignment path.  The file compiles and direct import reports
+  `_is_hcu=True`.
+- A later user retry reached compressed-tensors FP8 GEMM during graph capture
+  but failed in `torch._scaled_mm` because hipBLASLt found no valid solution.
+  `fp8_utils.py` now restores the validated HCU DeepGEMM path after the
+  official quantization flow, avoiding `torch._scaled_mm` for these DSV4
+  channel-wise shapes.
+- The bounded automatic pure-TP debug sequence on `zz-nmz26` /
+  `rye_sglang_0716` used an idle `hy-smi` preflight before every launch and
+  stopped after five failed launches as requested:
+  1. Graph capture passed the hipBLASLt site, then failed importing
+     `aiter.ops.triton.fusions.fused_clamp_act_mul`.  The generic HIP fused
+     clamp path is now excluded on `_is_hcu`.  The same audit restored the
+     DSV4 HCU FP32 Hash-MoE router and the HCU exclusion from generic routed
+     scaling.
+  2. Graph capture reached Hash-MoE and failed because the new
+     `kernels/ops/attention/dsv4/moe.py` used `_is_hcu` without defining it.
+     Its `is_hcu` import and module-level predicate are restored.
+  3. Graph capture reached the DSV4 indexer, where AITER's paged-MQA kernel
+     asserted that only gfx942/gfx950 are supported.  The pre-merge
+     architecture capability predicate is restored; gfx938 no longer enters
+     that AITER implementation, and the HCU LightOp fallback remains available.
+  4. The resulting Torch fallback received `seq_lens` shaped `[batch, 1]`
+     and failed its one-dimensional assertion.  The validated compatibility
+     squeeze from the pre-merge HCU implementation is restored.
+  5. Graph capture then progressed through that assertion but the Torch paged-
+     MQA fallback attempted an additional 8 GiB allocation and failed with HIP
+     OOM (136.09 GiB already allocated, 5.52 GiB free).
+- Runtime status: not passed.  The five-attempt limit has been reached, so no
+  further patch or launch was made.  The next review should decide whether
+  `_is_hcu` must select LightOp before
+  `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH`; do not treat the Torch OOM as a request
+  to reduce the established test topology.  After shutdown, all eight devices
+  report VRAM 0% and HCU 0%.
+- Follow-up graph-memory audit proved that the 80%+ steady-state allocation is
+  the configured `--mem-fraction-static 0.8` KV-pool target, not new model
+  weight growth: the current and 2026-07-22 successful logs both report
+  `bytes_per_full_token=7705.45` and about 46.5--46.8 GiB of model weights.
+  The older run captured decode graphs through bs=128 with only 0.67 GiB of
+  extra memory.
+- The direct graph OOM regression was a merge-resolution loss in
+  `server_args.py`: the pre-merge HCU guard from `cba9e72cc0` (renamed by
+  `b781224d4d`) was overwritten, enabling the generic Torch paged-MQA fallback
+  on HCU.  At bs=128 it materialized an 8 GiB FP32 scores tensor.  The
+  `not is_hcu()` guard and its missing import are restored.  As a defensive
+  second layer, `dsv4/indexer.py` now selects HCU LightOp before the Torch
+  fallback.  Both files compile and staged whitespace validation passes.
+- Open-graph retest status: not launched.  The mandatory `hy-smi` preflight
+  found HCU 0 at VRAM 3% (all other cards VRAM 0%; all HCU utilization 0%),
+  so validation stopped without terminating the unknown owner.  A fresh
+  all-zero preflight is required before retrying the pure-TP command.
+- 2026-07-28 MHC graph/runtime follow-up on `zz-nmz22` / `rye_sglang_0716`:
+  - `mhc_pre_big_fuse` first rejected the split dimension (`expected 1, got
+    32`) and then the padded GEMM last dimension (`expected 24, got 32`).
+    The HCU path now passes `big_fuse_n_splits` and compacts the valid
+    `[..., :hc_mult3]` prefix before calling AITER, preserving the HCU AITER
+    implementation while respecting its fixed physical layout contract.
+  - Static evidence after the fix: `mhc.py` compiled and staged
+    `git diff --check` passed. Decode CUDA graph capture completed all 20
+    shapes (bs=128 through bs=1), with about 0.64 GB additional graph memory
+    and about 24.6 GB available afterward.
+  - Functional smoke: `/health` returned HTTP 200 and `/generate` returned
+    HTTP 200. The request produced an empty text/all-zero token IDs; this is
+    retained as a non-blocking precision observation per the current user
+    workflow and does not block the daily merge.
+  - No temporary trace probes were added. The staged branch remains suitable
+    for commit; precision investigation is explicitly deferred.

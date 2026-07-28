@@ -28,12 +28,11 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
-import logging
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -54,16 +53,13 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
-    is_cuda,
     is_hcu,
+    is_cuda,
     is_hip,
     is_npu,
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
-from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -79,8 +75,8 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
-_is_hip = is_hip()
 _is_hcu = is_hcu()
+
 
 def _elastic_should_preserve_local_token_counts(
     *,
@@ -224,6 +220,34 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+# Predicate for whether a forward's sequence is sharded across the attn-TP group
+# (vs. replicated on every rank). Injected at init; unset defaults to sharded.
+_attn_tp_sequence_sharded_predicate: Optional[Callable[[int], bool]] = None
+
+
+def register_attn_tp_sequence_sharded_predicate(
+    predicate: Callable[[int], bool],
+) -> None:
+    """Register the predicate for whether a forward is sharded across attn-TP."""
+    global _attn_tp_sequence_sharded_predicate
+    _attn_tp_sequence_sharded_predicate = predicate
+
+
+def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's slice of the sequence.
+
+    A replicated (non-sharded) forward puts the whole sequence on every rank, so
+    the slice is the full range with no offset; localizing it as a shard would
+    drop real tokens on non-zero ranks.
+    """
+    predicate = _attn_tp_sequence_sharded_predicate
+    if predicate is not None and not predicate(num_tokens_per_dp):
+        return num_tokens_per_dp, 0
+    parallel = get_parallel()
+    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -233,15 +257,27 @@ def compute_local_num_token_non_padded(
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
-    attn_tp_rank = get_parallel().attn_tp_rank
-    attn_tp_size = get_parallel().attn_tp_size
-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
     return torch.clamp(
-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        global_num_token_non_padded - rank_offset,
         0,
         tokens_per_rank,
     )
+
+
+def compute_local_num_token_non_padded_cpu(
+    global_num_token_non_padded: int,
+    num_tokens_per_dp: int,
+) -> int:
+    """Int-scalar twin of ``compute_local_num_token_non_padded``.
+
+    Replay-time hooks hold the global count as a host int
+    (``num_token_non_padded_cpu``) and write the localized result into a
+    device buffer; keeping the math on ints lets them use ``Tensor.fill_``
+    instead of staging a CPU tensor through a host-to-device copy per replay.
+    """
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
+    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
 @dataclass
@@ -474,10 +510,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Position information
     positions: torch.Tensor = None
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
-    reuse_mtp_topk_indices: Optional[bool] = False
-
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
@@ -492,6 +524,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     original_global_num_tokens_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
+    _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -540,10 +573,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
-
-    # hcu only
-    residual_rms_per_quant_int8: Optional[torch.Tensor] = None
-    rms_quant_flag: bool = False
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
@@ -778,12 +807,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.pin_memory().to(device, non_blocking=True)
+                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).pin_memory().to(
+            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
                 device, non_blocking=True
             )
         ret.num_token_non_padded_cpu = num_tokens
@@ -813,12 +842,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
-            ).pin_memory().to(device, non_blocking=True)
+            ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
-            ).pin_memory().to(device, non_blocking=True)
+            ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -851,21 +880,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                extend_seq_lens_tensor = torch.tensor(
+                ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32
-                )
-                extend_prefix_lens_tensor = torch.tensor(
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32
-                )
-                if _is_hcu:
-                    extend_seq_lens_tensor = extend_seq_lens_tensor.pin_memory()
-                    extend_prefix_lens_tensor = extend_prefix_lens_tensor.pin_memory()
-                ret.extend_seq_lens = extend_seq_lens_tensor.to(
-                    device, non_blocking=True
-                )
-                ret.extend_prefix_lens = extend_prefix_lens_tensor.to(
-                    device, non_blocking=True
-                )
+                ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
             else:
@@ -1163,63 +1183,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.mrope_positions = torch.cat(
             [pos for pos in mrope_positions_list],
             dim=1,
-        ).pin_memory().to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
-
-    def get_max_chunk_capacity(self):
-        # Maximum number of tokens in each chunk
-        # TODO: Should be changed to a better value, maybe passed through server args
-        return 128 * 1024
-
-    def set_prefix_chunk_idx(self, idx: int):
-        self.prefix_chunk_idx = idx
-
-    def set_attn_attend_prefix_cache(self, attn_attend_prefix_cache: bool):
-        self.attn_attend_prefix_cache = attn_attend_prefix_cache
-
-    def prepare_chunked_kv_indices(self, device: torch.device):
-        self.prefix_chunk_kv_indices = []
-        for idx in range(self.num_prefix_chunks):
-            chunk_starts = self.prefix_chunk_starts[idx]
-            chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
-            chunk_cu_seq_lens = self.prefix_chunk_cu_seq_lens[idx]
-            num_chunk_tokens = self.prefix_chunk_num_tokens[idx]
-
-            chunk_kv_indices = torch.empty(
-                num_chunk_tokens, dtype=torch.int32, device=device
-            )
-            hcu_create_chunked_prefix_cache_kv_indices(
-                    req_to_token = self.req_to_token_pool.req_to_token,
-                    req_pool_indices = self.req_pool_indices,
-                    chunk_starts = chunk_starts,
-                    chunk_seq_lens = chunk_seq_lens,
-                    chunk_cu_seq_lens = chunk_cu_seq_lens,
-                    chunk_kv_indices = chunk_kv_indices,
-                    col_num = self.req_to_token_pool.req_to_token.shape[1],
-                    bs = self.batch_size,
-                )
-            # if self.use_sglang_create_chunked_prefix_cache_kv_indices:
-            #     hcu_create_chunked_prefix_cache_kv_indices(
-            #         req_to_token = self.req_to_token_pool.req_to_token,
-            #         req_pool_indices = self.req_pool_indices,
-            #         chunk_starts = chunk_starts,
-            #         chunk_seq_lens = chunk_seq_lens,
-            #         chunk_cu_seq_lens = chunk_cu_seq_lens,
-            #         chunk_kv_indices = chunk_kv_indices,
-            #         col_num = self.req_to_token_pool.req_to_token.shape[1],
-            #         bs = self.batch_size,
-            #     )
-            # else:
-            #     # logger.info("SGLANG_CREATE_CHUNKED_PREFIX_CACHE_KV_INDICES=0")
-            #     create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
-            #         self.req_to_token_pool.req_to_token,
-            #         self.req_pool_indices,
-            #         chunk_starts,
-            #         chunk_seq_lens,
-            #         chunk_cu_seq_lens,
-            #         chunk_kv_indices,
-            #         self.req_to_token_pool.req_to_token.shape[1],
-            #     )
-            self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
@@ -1250,6 +1214,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
@@ -1441,6 +1406,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
+        self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
@@ -1536,16 +1502,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
-
-        if not input_scattered and not model_runner.server_args.minimax_opt:
+        if not input_scattered:
             return
-
-        if model_runner.server_args.minimax_opt and not self.forward_mode.is_extend():
-            return
-
-        if input_scattered:
-            assert self.forward_mode.is_extend()
-
+        assert self.forward_mode.is_extend()
         tokens = self.input_ids.shape[0]
         rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
@@ -1557,6 +1516,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self._original_batch_size is not None:
             self.batch_size = self._original_batch_size
         bs = self.batch_size
+
+        # MLP-sync padding appended dummy rows after the real ones; slice the
+        # per-request tensors back so post-forward consumers (seeded sampling,
+        # ngram token-table updates) never see the padding. The draft-decode
+        # branch below does the same for speculative batches.
+        if self.spec_info is None and self._original_num_tokens is not None:
+            self.positions = self.positions[: self._original_num_tokens]
+            self.seq_lens = self.seq_lens[:bs]
+            self.req_pool_indices = self.req_pool_indices[:bs]
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
@@ -1730,7 +1700,7 @@ def _clamp_position_native(seq_lens):
 
 
 if (is_cuda() or is_hip()) and not _is_hcu:
-    from sglang.jit_kernel.clamp_position import clamp_position_cuda
+    from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:

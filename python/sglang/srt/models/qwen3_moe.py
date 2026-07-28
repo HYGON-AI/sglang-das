@@ -97,7 +97,7 @@ _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_qknorm_rope import (
+    from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )

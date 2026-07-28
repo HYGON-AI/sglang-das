@@ -5,31 +5,11 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
-
-# try:
-#     from sgl_kernel.flash_attn import flash_attn_varlen_func
-
-#     from sglang.jit_kernel.flash_attention_v4 import (
-#         flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-#     )
-
-#     def flash_attn_func(*args, ver: int = 3, **kwargs):
-#         if ver == 4:
-#             return flash_attn_varlen_func_fa4(*args, **kwargs)
-#         return flash_attn_varlen_func(*args, **kwargs)
-
-# except ImportError as e:
-#     raise e
-
-from flash_attn import flash_attn_func as flash_attn_func_interface
-from sglang.srt.layers.attention.flashattention_interface import flash_attn_varlen_func
-
-flash_attn_func = flash_attn_varlen_func
 
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -400,9 +380,6 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        assert query.ndim == 4, f"Expected fixed length fa ndim == 4, but got {query.ndim}"
-        if attn_metadata is None:
-            attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is not None:
             if attn_metadata.max_seqlen_q is None:
                 attn_metadata.max_seqlen_q = query.shape[1]
@@ -418,14 +395,19 @@ class FlashAttentionImpl(AttentionImpl):
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
         # - fa_ver == 4: call custom ops with FIXED return schema
         if fa_ver == 3:
-            flash_attn_op = flash_attn_func_interface
+            flash_attn_op = flash_attn_varlen_func
             output = flash_attn_op(
                 q=query,
                 k=key,
                 v=value,
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
-                return_attn_probs=return_softmax_lse,
+                return_softmax_lse=return_softmax_lse,
+                ver=fa_ver,
             )
             return output
 

@@ -1,17 +1,3 @@
-# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
-#
-# Hygon modifications to this file are licensed under the Apache License,
-# Version 2.0 (the "License"); you may not use these modifications except
-# in compliance with the License. You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Memory pool configurators for profiling and sizing KV cache pools.
 
 Each model architecture has its own configurator that computes pool sizes
@@ -47,12 +33,10 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
-    is_hcu,
-    is_hcu_native_fp8_supported,
     is_float4_e2m1fn_x2,
     spec_decode_alloc_len_per_request,
 )
@@ -87,7 +71,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
-_is_hcu = is_hcu()
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -148,6 +131,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        has_kv_on_another_pp_stage = (
+            self._cell_size == 0
+            and mambaish is not None
+            and bool(mambaish.full_attention_layer_ids)
+            and kvc.ps.pp_size > 1
+        )
+        self._zero_kv_max_tokens = (
+            torch.iinfo(torch.int64).max
+            if has_kv_on_another_pp_stage
+            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+        )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -202,8 +196,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
+            )
+
             cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
+                    server_args=kvc.server_args,
+                )
                 * effective_num_layers
                 * kv_size
             )
@@ -237,8 +239,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     element_size = torch._utils._element_size(
                         DSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
+                indexer_ratio = 1
+                if kvc.server_args.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    indexer_ratio = parse_hisparse_config(
+                        kvc.server_args
+                    ).host_to_device_ratio
+                cell_size += int(
+                    indexer_size_per_token
+                    * effective_num_layers
+                    * element_size
+                    * indexer_ratio
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -300,7 +312,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
-            elif kvc.server_args.kv_cache_dtype == "mxfp8":
+            elif get_model().kv_cache_dtype == "mxfp8":
                 scale_block_size = 32
                 n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
@@ -312,7 +324,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        max_total_num_tokens = (
+            available_bytes // self._cell_size
+            if self._cell_size
+            else self._zero_kv_max_tokens
+        )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
@@ -338,9 +354,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert self._swa_layers_num > 0, (
-            "Hybrid SWA model must have at least one SWA layer"
-        )
+        assert (
+            self._swa_layers_num > 0
+        ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -360,7 +376,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        if kvc.server_args.kv_cache_dtype == "mxfp8":
+        if get_model().kv_cache_dtype == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)
@@ -609,7 +625,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
-        self.kv_cache_dtype = kvc.kv_cache_dtype
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
@@ -696,12 +711,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        if self.kv_cache_dtype == torch.bfloat16:
-            kv_bytes = (
-                self.qk_nope_head_dim + self.qk_rope_head_dim
-            ) * torch._utils._element_size(self.kv_cache_dtype)
-        else:
-            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
         indexer_bytes = (
@@ -828,9 +838,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert page_size % 128 == 0, (
-            "page_size must be multiple of 128 for compressed attention"
-        )
+        assert (
+            page_size % 128 == 0
+        ), "page_size must be multiple of 128 for compressed attention"
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -858,9 +868,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert page_size % 128 == 0, (
-            "page_size must be multiple of 128 for compressed attention"
-        )
+        assert (
+            page_size % 128 == 0
+        ), "page_size must be multiple of 128 for compressed attention"
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

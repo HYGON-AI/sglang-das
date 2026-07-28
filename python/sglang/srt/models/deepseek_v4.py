@@ -1,24 +1,10 @@
-# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
-#
-# Hygon modifications to this file are licensed under the Apache License,
-# Version 2.0 (the "License"); you may not use these modifications except
-# in compliance with the License. You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import concurrent.futures
 import functools
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -37,14 +23,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
+from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
-)
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -74,6 +60,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
+from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -99,7 +86,6 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.kernels.ops.attention.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -150,6 +136,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_hip,
     _is_npu,
     _is_xpu,
+    _is_hcu,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 
@@ -162,29 +149,17 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_hcu,
     is_gfx95_supported,
     is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-_is_hcu = is_hcu()
-_use_dpskv4_lightop_rmsnorm = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM")
-_use_fused_qnorm_rope_kv_rope_quant = get_bool_env_var(
-    "SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT"
-)
-_use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
-
-if _is_hcu:
-    from lightop import op
-    if _use_aiter_tilelang_mhc:
-        from aiter.ops.tilelang import mhc_post_fwd, mhc_pre_big_fuse
-
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
-# torch_npu.npu_rms_norm directly (imports elsewhere are not visible here).
+# torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
 if _is_npu:
     import torch_npu
 
@@ -231,17 +206,18 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
-    # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
-    # tensor layout assumptions, so keep it disabled when either dependency is off.
+    # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
+    # not read that flag and dispatches independently for both small and large
+    # token batches, so the standalone pre flag must not veto the fused opt-in.
     return (
         not _is_hcu
         and envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
     )
 
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
@@ -482,9 +458,7 @@ class MqaAttentionBase(nn.Module):
         self.fuse_wqa_wkv = fuse
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self._attn_sink_local: Optional[torch.Tensor] = (
-            self.attn_sink if self.attn_tp_size == 1 else None
-        )
+        self._attn_sink_local: Optional[torch.Tensor] = None
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -519,8 +493,6 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
-        if fp8 and quant_config is not None:
-            quant_config.ignore = [i for i in quant_config.ignore if "wo_a" not in i]
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -534,13 +506,11 @@ class MqaAttentionBase(nn.Module):
         if fp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
-            if not hasattr(self.wo_a, "weight_scale_inv"):
-                assert hasattr(
-                    self.wo_a, "weight_scale"
-                ), "FP8 quant_config must create weight_scale or weight_scale_inv"
-                self.wo_a.weight_scale_inv = self.wo_a.weight_scale
+            assert hasattr(
+                self.wo_a, "weight_scale_inv"
+            ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _is_hcu
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -578,6 +548,51 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+    def _local_attn_sink(self) -> torch.Tensor:
+        if self.attn_tp_size == 1:
+            return self.attn_sink
+        if self._attn_sink_local is None:
+            rank = self.attn_tp_rank
+            num_heads = self.n_local_heads
+            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            sink = self.attn_sink.new_zeros(padded_num_heads)
+            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            self._attn_sink_local = sink
+        return self._attn_sink_local
+
+    @contextmanager
+    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        ctx = get_cp_decode_attn_tp_ctx()
+        attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
+        with ctx.maybe_use_decode_attn_tp(
+            forward_batch,
+            [self.wq_b, self.wo_a, self.wo_b],
+            radix_attn=attn,
+        ):
+            if ctx.use_decode_attn_tp:
+                orig = (
+                    self.n_local_heads,
+                    self.n_local_groups,
+                    self.attn_tp_rank,
+                    self.attn_tp_size,
+                )
+                decode_tp_size = ctx.decode_tp_size
+                self.n_local_heads = self.n_heads // decode_tp_size
+                self.n_local_groups = self.n_groups // decode_tp_size
+                self.attn_tp_rank = ctx.decode_tp_rank
+                self.attn_tp_size = decode_tp_size
+                try:
+                    yield
+                finally:
+                    (
+                        self.n_local_heads,
+                        self.n_local_groups,
+                        self.attn_tp_rank,
+                        self.attn_tp_size,
+                    ) = orig
+            else:
+                yield
+
 
 class MQALayer(MqaAttentionBase):
     def __init__(
@@ -596,8 +611,6 @@ class MQALayer(MqaAttentionBase):
             prefix,
             compress_ratio=compress_ratio_override,
         )
-        self.tp_rank = self.attn_tp_rank
-        self.tp_size = self.attn_tp_size
 
         if self.rope_scaling:
             self.rope_scaling["rope_type"] = "deepseek_yarn"
@@ -611,14 +624,7 @@ class MQALayer(MqaAttentionBase):
             device=get_server_args().device,
         )
 
-        self.register_buffer("cos_sin_cache_fused", None, persistent=False)
-        self.cos_sin_cache_fused: Optional[torch.Tensor]
-        if _is_hcu and _use_fused_qnorm_rope_kv_rope_quant:
-            freqs_real = torch.view_as_real(self.freqs_cis)
-            self.cos_sin_cache_fused = torch.cat(
-                [freqs_real[..., 0], freqs_real[..., 1]], dim=-1
-            ).contiguous()
-        elif _is_hip and not _is_hcu:
+        if _is_hip:
             cos_cache = (
                 self.freqs_cis.real.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
             )
@@ -675,9 +681,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         self.use_fused_qk_norm_rope = (
-            _is_hip
-            and not _is_hcu
-            and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
         # KV cache write is always fused into the K kernel
@@ -703,29 +707,11 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if not _is_hcu:
-            if q_out is None:
-                q_out = torch.empty_like(q)
-            # Official fused warp-per-(token, head) RMSNorm + RoPE path.
-            fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-            return q_out
-
-        if _use_dpskv4_lightop_rmsnorm:
-            op.rms_norm_no_weight(None, q, None, self.eps)
-        else:
-            q = F.rms_norm(q, (self.head_dim,), eps=self.eps)
-        if positions is not None:
-            fused_rope_inplace(
-                q[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
-        else:
-            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
-        if q_out is not None:
-            q_out.copy_(q)
-        return q
+        if q_out is None:
+            q_out = torch.empty_like(q)
+        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        return q_out
 
     def _compute_kv_to_cache(
         self,
@@ -740,6 +726,15 @@ class MQALayer(MqaAttentionBase):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
+        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+            # Quantize the nope payload from bf16-rounded values (the fused
+            # kernel quantizes from fp32 registers; the bf16 rounding moves
+            # values across fp8 bins relative to bf16-sourced consumers).
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            attn_backend.store_cache(
+                layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
+            )
+            return
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
@@ -1164,11 +1159,10 @@ class MQALayer(MqaAttentionBase):
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
-            and not get_token_to_kv_pool().is_bf16_attention_kv_cache
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.tp_size > 1:
+        if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
@@ -1184,15 +1178,7 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-            if self._attn_sink_local is None:
-                # Build once on the first forward (post weight load); a per-call
-                # rebuild would replay a fill+copy per layer in the decode graph.
-                rank = self.tp_rank
-                sink = self.attn_sink.new_zeros(padded_num_heads)
-                sink[: self.n_local_heads] = self.attn_sink[
-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
-                ]
-                self._attn_sink_local = sink
+        attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -1259,7 +1245,7 @@ class MQALayer(MqaAttentionBase):
                     o,
                     self.attn_mqa.layer_id,
                     self.compress_ratio,
-                    self._attn_sink_local,
+                    attn_sink,
                     save_kv_cache,
                 )
             else:
@@ -1270,7 +1256,7 @@ class MQALayer(MqaAttentionBase):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=self._attn_sink_local,
+                    attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
@@ -1294,10 +1280,7 @@ class MQALayer(MqaAttentionBase):
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
-            if _is_hcu:
-                import deepgemm as deep_gemm
-            else:
-                import deep_gemm
+            import deep_gemm
 
             from sglang.srt.layers import deep_gemm_wrapper
 
@@ -1318,7 +1301,6 @@ class MQALayer(MqaAttentionBase):
                 o_s = o_s.view(T, G, -1)
                 recipe = (1, 128, 128)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (o_fp8, o_s),
@@ -1332,7 +1314,7 @@ class MQALayer(MqaAttentionBase):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
+        if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
         return o
@@ -1437,8 +1419,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def refresh_mhc_norm_weight_cache(self):
-        if not self.use_fused_mhc_post_pre:
-            return
         # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
         self._input_layernorm_weight_bf16 = (
             self.input_layernorm.weight.data.bfloat16().contiguous()
@@ -1456,7 +1436,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm: Optional[nn.Module] = None,
         forward_batch: Optional[ForwardBatch] = None,
     ):
-        """Return MHC-pre outputs and whether the optional RMSNorm was fused."""
+        """If *norm* is given and the TileLang path is active, the returned
+        hidden_states are already post-norm (the norm is fused into the kernel)."""
 
         @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
@@ -1491,43 +1472,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            if _is_hcu and _use_aiter_tilelang_mhc:
-                post, comb, y = mhc_pre_big_fuse(
-                    residual=x,
-                    fn=hc_fn,
-                    mhc_scale=hc_scale,
-                    mhc_base=hc_base,
-                    rms_eps=self.rms_norm_eps,
-                    mhc_pre_eps=self.hc_eps,
-                    mhc_sinkhorn_eps=self.hc_eps,
-                    mhc_post_mult_value=2.0,
-                    sinkhorn_repeat=self.hc_sinkhorn_iters,
-                    n_splits=16,
-                )
-                # AITER MHC pre does not fuse the decoder-layer RMSNorm.
-                norm_fused = False
-            else:
-                from sglang.kernels.ops.layernorm.mhc import mhc_pre
+            from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
-                norm_kwargs = {}
-                if norm is not None:
-                    norm_kwargs["norm_weight"] = norm.weight.data
-                    norm_kwargs["norm_eps"] = norm.variance_epsilon
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
 
-                post, comb, y = mhc_pre(
-                    residual=x,
-                    fn=hc_fn,
-                    hc_scale=hc_scale,
-                    hc_base=hc_base,
-                    rms_eps=self.rms_norm_eps,
-                    hc_pre_eps=self.hc_eps,
-                    hc_sinkhorn_eps=self.hc_eps,
-                    hc_post_mult_value=_MHC_POST_MULT_VALUE,
-                    sinkhorn_repeat=self.hc_sinkhorn_iters,
-                    **norm_kwargs,
-                )
-                norm_fused = norm is not None
-            return y, post.squeeze(-1), comb, norm_fused
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
+            )
+            return y, post.squeeze(-1), comb, norm is not None
 
         if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
             from aiter.ops.mhc import mhc_pre
@@ -1546,12 +1510,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post.squeeze(-1), comb, False
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            if _is_hcu:
-                import deepgemm as deep_gemm
-            else:
-                from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
-                    tf32_hc_prenorm_gemm,
-                )
+            from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+                tf32_hc_prenorm_gemm,
+            )
 
             x_flat = x.flatten(1).bfloat16()
 
@@ -1559,14 +1520,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             mix_hc = hc_fn.size(0)
             d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
             s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            if _is_hcu:
-                deep_gemm.tf32_hc_prenorm_gemm(
-                    x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
-                )
-            else:
-                tf32_hc_prenorm_gemm(
-                    x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
-                )
+            tf32_hc_prenorm_gemm(
+                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
+            )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
@@ -1609,12 +1565,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            if _is_hcu and _use_aiter_tilelang_mhc:
-                return mhc_post_fwd(x, residual, post, comb)
-            else:
-                from sglang.kernels.ops.layernorm.mhc import mhc_post
+            from sglang.kernels.ops.layernorm.mhc import mhc_post
 
-                return mhc_post(x, residual, post, comb)
+            return mhc_post(x, residual, post, comb)
 
         elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
             from aiter.ops.mhc import mhc_post
@@ -1699,12 +1652,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        hidden_states = self.self_attn(
-            x=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self.self_attn(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=x_quant,
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1842,12 +1796,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
         if _use_cp:
-            if get_moe_a2a_backend().is_none():
+            moe_a2a_backend = get_moe_a2a_backend()
+            if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert get_moe_a2a_backend().is_deepep(), (
-                    "CP requires DeepEP (moe_a2a_backend == deepep). "
-                    "Only DeepEP is tested with CP's per-rank token split."
+                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
+                    "CP requires DeepEP or megaMoE "
+                    "(moe_a2a_backend == deepep or megamoe). "
+                    f"Got {moe_a2a_backend.value}."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
@@ -2142,7 +2098,6 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
-        self.first_k_dense_replace = config.first_k_dense_replace
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -2152,15 +2107,14 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        use_stream_pool = _is_hcu or _is_cuda or (
+        use_stream_pool = _is_cuda or (
             _is_hip
-            and not _is_hcu
             and (
                 envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
         )
-        num_alt_streams = 5 if (_is_cuda or _is_hcu) else 2
+        num_alt_streams = 5 if _is_cuda else 2
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
@@ -2352,10 +2306,7 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+            hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -2516,10 +2467,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if not isinstance(layer, PPMissingLayer)
-                and isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(
+                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                )
             }
         )
 
@@ -2617,7 +2569,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
-        if isinstance(hidden_states, PPProxyTensors):
+        if not self.pp_group.is_last_rank:
             return hidden_states
 
         aux_hidden_states = None
@@ -2671,14 +2623,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if _FP8_WO_A_GEMM and not _is_hcu:
+        if _FP8_WO_A_GEMM:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
             return
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
             if (
                 self_attn.compress_ratio in (4, 128)
@@ -2766,7 +2717,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             # HCU AITER TileLang MHC kernels are specialized lazily from real
             # request shapes. The generic bucket prewarm reuses that kernel
             # across synthetic n_splits shapes and can violate its cached input
-            # contract. Preserve the pre-20260703 HCU behavior here.
+            # contract. Preserve the validated HCU behavior.
             return
         if self._mhc_prewarmed_at_load:
             return
@@ -2840,7 +2791,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
-                weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                logger.info("Skip dequant fp8 wo_a")
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -2866,32 +2817,31 @@ class DeepseekV4ForCausalLM(nn.Module):
             return getattr(module, "weight_loader", default_weight_loader)
 
         def maybe_remap_compressed_tensors_scale_name(param_name: str) -> str:
-            # if (
-            #     self.quant_config is None
-            #     or self.quant_config.get_name() != "compressed_tensors"
-            # ):
-            #     return param_name
-
-            compressed_tensors_names = []
+            # Compressed-tensors checkpoints can expose *_scale_inv while the
+            # materialized layer parameter is named *_scale. The generic
+            # DeepSeek-V4 config alias does not expose this mapping itself.
+            candidate_names = []
             if param_name.endswith(".weight_scale_inv"):
-                compressed_tensors_names.append(
+                candidate_names.append(
                     param_name.replace(".weight_scale_inv", ".weight_scale")
                 )
             if param_name.endswith("_weight_scale_inv"):
-                compressed_tensors_names.append(
+                candidate_names.append(
                     param_name.replace("_weight_scale_inv", "_weight_scale")
                 )
-            if _FP8_WO_A_GEMM:
-                if param_name.endswith(".scale") and not param_name.endswith(
-                    ".weight_scale"
-                ):
-                    base = param_name[: -len(".scale")]
-                    compressed_tensors_names.append(base + ".weight_scale_inv")
-                    compressed_tensors_names.append(base + ".weight_scale")
+            if (
+                _FP8_WO_A_GEMM
+                and param_name.endswith(".scale")
+                and not param_name.endswith(".weight_scale")
+            ):
+                base = param_name[: -len(".scale")]
+                candidate_names.extend(
+                    [base + ".weight_scale_inv", base + ".weight_scale"]
+                )
 
-            for compressed_tensors_name in compressed_tensors_names:
-                if compressed_tensors_name in params_dict:
-                    return compressed_tensors_name
+            for candidate_name in candidate_names:
+                if candidate_name in params_dict:
+                    return candidate_name
             return param_name
 
         if is_nextn:
@@ -3152,9 +3102,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
-                                    name = maybe_remap_compressed_tensors_scale_name(
-                                        name
-                                    )
+                                    name = maybe_remap_compressed_tensors_scale_name(name)
                                 if name not in params_dict:
                                     if not name.startswith("mtp"):
                                         logger.warning(

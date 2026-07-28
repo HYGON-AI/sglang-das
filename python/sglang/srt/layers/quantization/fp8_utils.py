@@ -1,17 +1,3 @@
-# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
-#
-# Hygon modifications to this file are licensed under the Apache License,
-# Version 2.0 (the "License"); you may not use these modifications except
-# in compliance with the License. You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import logging
@@ -58,9 +44,9 @@ from sglang.srt.utils import (
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
-    is_hcu,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_hcu,
     is_hip,
     is_musa,
     is_sm90_supported,
@@ -70,13 +56,10 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-from lmslim import quant_ops
-from lmslim.quantize.quant_ops import BlockSize
-from lmslim.layers.gemm.fp8_utils import per_token_group_quant_fp8 as per_token_group_quant_fp8_hcu
 logger = logging.getLogger(__name__)
 
-_is_hip = is_hip()
 _is_hcu = is_hcu()
+_is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
@@ -163,7 +146,6 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
         (8192, 32768),
     ]
 
-_sglang_enable_torch_compile = get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
 
 if _use_aiter:
     import aiter
@@ -183,7 +165,7 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_scaled_mm
 
-    from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -193,12 +175,36 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
-    def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
+    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+
+    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
+    def _bmm_fp8_batched_op(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
+
+    def bmm_fp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], A.shape[1], B.shape[2]),
+                device=A.device,
+                dtype=dtype,
+            )
+        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
+        return out
+
 
 if _is_hcu:
     import deepgemm
@@ -460,6 +466,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     2. Auto-detection based on hardware capabilities
     """
     backend = get_fp8_gemm_runner_backend()
+
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
         return _dispatch_explicit_backend(backend)
@@ -570,10 +577,9 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_aiter():
         if not _use_aiter:
-            aiter_platform = "HCU devices" if _is_hcu else "AMD GPUs"
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
-                f"but AITER is not available. AITER requires {aiter_platform} with "
+                "but AITER is not available. AITER requires AMD GPUs with "
                 "SGLANG_USE_AITER=1 environment variable set."
             )
         return aiter_w8a8_block_fp8_linear
@@ -611,8 +617,6 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif _is_hcu:
-        return hipblaslt_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
@@ -999,77 +1003,6 @@ def aiter_w8a8_block_fp8_linear(
         dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
     ).view(*output_shape)
 
-def hipblaslt_w8a8_block_fp8_linear(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        block_size: List[int],
-        weight_scale: torch.Tensor,
-        input_scale: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-        input_2d = input.view(-1, input.shape[-1])
-        output_shape = [*input.shape[:-1], weight.shape[1]]
-        q_input, input_scale = per_token_group_quant_fp8_hcu(
-            input_2d, block_size[1], column_major_scales=False
-        )
-        enum_block_size = BlockSize.block_128x128
-
-        # if hasattr(self, "block_size") and self.block_size[0] == 64:
-        #     enum_block_size = BlockSize.block_64x64
-        
-        output = hipblaslt_w8a8_block_fp8_matmul(
-            A=q_input,
-            B=weight,
-            As=input_scale,
-            Bs=weight_scale,
-            block_size=enum_block_size,
-            output_dtype=input_2d.dtype,
-        )
-        if bias is not None:
-            output += bias
-        return output.to(dtype=input_2d.dtype).view(*output_shape)
-
-def hipblaslt_w8a8_block_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: BlockSize,
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    assert A.shape[1] == B.shape[0]
-    m, k = A.shape
-    _, n = B.shape
-    _, d = quant_ops.hipblaslt_w8a8_blockwise_gemm(A, B, As, Bs, m, n, k, 'NN', output_dtype, block_size, None)
-    
-    return d
-
-def torch_fp8_block_gemm(
-    a, b,
-    scale_a, scale_b,
-    block_size,
-    out_dtype=torch.bfloat16,
-):
-
-    a_cp = a.clone().to(torch.float32)
-    b_cp = b.clone().to(torch.float32)
-    scale_a_cp = scale_a.clone().to(torch.float32)
-    scale_b_cp = scale_b.clone().to(torch.float32)
-
-    m, k = a.shape
-    _, n = b.shape
-
-    k_block = torch.arange(k, device=a.device) // block_size   
-    n_block = torch.arange(n, device=a.device) // block_size   
-
-    scale_a_full = scale_a_cp[:, k_block]
-    scale_b_full = scale_b_cp[k_block][:, n_block]
-
-    a_scaled = a_cp * scale_a_full         
-    b_scaled = b_cp * scale_b_full         
-
-    c = a_scaled @ b_scaled
-    return c.to(out_dtype)
 
 def triton_w8a8_block_fp8_linear(
     input: torch.Tensor,
@@ -1403,6 +1336,7 @@ def dequant_mxfp4(
     )
     return out_raw.reshape(batch, n, k * 32)
 
+
 def input_to_float8(
     x: torch.Tensor, dtype: torch.dtype = fp8_dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1479,6 +1413,8 @@ def block_quant_dequant(
     block_n, block_k = block_size[0], block_size[1]
     *_, n, k = x_q_block.shape
 
+    # NOTE: This is very memory inefficient, results in *16384 memory requirement for scales
+    # with block_size = [128, 128].
     # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
     x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
         block_k, dim=-1
@@ -1809,7 +1745,7 @@ def apply_fp8_linear_bmm_flashinfer(
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM10X only)."""
+    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM100/SM120 Blackwell)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
     qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
@@ -1837,78 +1773,80 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not cutlass_fp8_supported and not _sglang_enable_torch_compile
+        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
+            "SGLANG_ENABLE_TORCH_COMPILE"
+        )
     output_padding = 17 if pad_output else None
 
-    if not isinstance(input, tuple):
-        # View input as 2D matrix for fp8 methods
-        input_2d = input.view(-1, input.shape[-1])
-        output_shape = [*input.shape[:-1], weight.shape[1]]
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[1]]
 
-        if compressed_tensor_quant:
-            # Maybe apply padding to output, see comment in __init__
-            num_token_padding = output_padding
-            if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-                num_token_padding = None
-            # Let inductor fuse static per-tensor activation quantization with
-            # surrounding ops. Eager and decode keep using the custom kernel.
-            if (
-                input_scale is not None
-                and input_scale.numel() == 1
-                and get_server_args().cuda_graph_config.prefill.tc_compiler
-                == "inductor"
-            ):
-                qinput = (
-                    (input_2d * input_scale.reciprocal())
-                    .clamp(min=fp8_min, max=fp8_max)
-                    .to(fp8_dtype)
-                )
-                x_scale = input_scale
-            else:
-                qinput, x_scale = scaled_fp8_quant(
-                    input_2d,
-                    input_scale,
-                    num_token_padding=num_token_padding,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic,
-                )
+    if compressed_tensor_quant:
+        # Maybe apply padding to output, see comment in __init__
+        num_token_padding = output_padding
+        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+            num_token_padding = None
+        # For static per-tensor activation scales when using inductor compiler,
+        # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
+        # Inductor fuses these with surrounding ops (RMSNorm, residual add),
+        # eliminating a separate kernel launch per linear layer.
+        # weight_scale shape does not matter here -- it is only used in the
+        # GEMM epilogue, not in the activation quant fusion. Only activates when
+        # cuda_graph_config[prefill].tc_compiler=inductor; eager PCG and
+        # decode both use the faster custom kernel.
+
+        if (
+            input_scale is not None
+            and input_scale.numel() == 1
+            and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+        ):
+            qinput = (
+                (input_2d * input_scale.reciprocal())
+                .clamp(min=fp8_min, max=fp8_max)
+                .to(fp8_dtype)
+            )
+            x_scale = input_scale
         else:
-            # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
-            if input_scale is not None:
-                assert input_scale.numel() == 1
-                # broadcast per-tensor scale to per-token scale when supporting cutlass
-                qinput, x_scale = static_quant_fp8(
-                    input_2d, input_scale, repeat_scale=cutlass_fp8_supported
-                )
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=num_token_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
+    else:
+        # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
+        if input_scale is not None:
+            assert input_scale.numel() == 1
+            # broadcast per-tensor scale to per-token scale when supporting cutlass
+            qinput, x_scale = static_quant_fp8(
+                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
+            )
+        else:
+            # default use per-token quantization if dynamic
+            if _is_cuda:
+                qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
             else:
-                # default use per-token quantization if dynamic
-                if _is_cuda:
-                    qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+                # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+                # final solution should be: 1. add support to per-tensor activation scaling.
+                # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+                if _is_hip and weight_scale.numel() == 1:
+                    qinput, x_scale = scaled_fp8_quant(
+                        input_2d,
+                        input_scale,
+                        use_per_token_if_dynamic=use_per_token_if_dynamic,
+                    )
                 else:
-                    # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
-                    # final solution should be: 1. add support to per-tensor activation scaling.
-                    # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
-                    if _is_hip and weight_scale.numel() == 1:
-                        qinput, x_scale = scaled_fp8_quant(
-                            input_2d,
-                            input_scale,
-                            use_per_token_if_dynamic=use_per_token_if_dynamic,
-                        )
-                    else:
-                        qinput, x_scale = per_token_group_quant_fp8(
-                            input_2d, group_size=input_2d.shape[1]
-                        )
+                    qinput, x_scale = per_token_group_quant_fp8(
+                        input_2d, group_size=input_2d.shape[1]
+                    )
 
-        if _is_hcu:
-            output = torch.empty(output_shape, device=input.device, dtype=input.dtype)
-            deepgemm.fp8_gemm((qinput,x_scale),(weight,weight_scale),output)
-
-            return output.view(*output_shape)
-
-    if _is_hcu and isinstance(input, tuple):
-        output_shape = [*input[0].shape[:-1], weight.shape[1]]
-        output = torch.empty(output_shape, device=input[0].device, dtype=torch.bfloat16)
-        deepgemm.fp8_gemm((input[0],input[1]),(weight,weight_scale),output)
-
+    if _is_hcu:
+        # HCU graph capture cannot reliably use torch._scaled_mm for the
+        # channel-wise compressed-tensors shapes used by DeepSeek-V4. Keep the
+        # validated DeepGEMM path after adopting the official quantization flow.
+        output = torch.empty(output_shape, device=input.device, dtype=input.dtype)
+        deepgemm.fp8_gemm((qinput, x_scale), (weight, weight_scale), output)
         return output.view(*output_shape)
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:

@@ -1,17 +1,3 @@
-# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
-#
-# Hygon modifications to this file are licensed under the Apache License,
-# Version 2.0 (the "License"); you may not use these modifications except
-# in compliance with the License. You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import warnings
@@ -21,7 +7,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-
 from sglang.srt.utils import is_hcu, is_hip, is_xpu
 
 _is_hcu = is_hcu()
@@ -66,6 +51,7 @@ Some other notes:
                all related length will be clipped to 512.
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
+
 
 def copy_metadata(
     *,
@@ -128,6 +114,7 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
@@ -136,22 +123,26 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or is_xpu()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            or _is_hcu
+        if _is_hcu or (
+            (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                or is_xpu()
+                or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            )
+            and not self.force_deep_gemm_metadata
         ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
 
-            use_jit_indexer = (
+            use_jit_indexer = not self.force_deep_gemm_metadata and (
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                 or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+                from sglang.kernels.ops.attention.dsv4 import (
+                    get_paged_mqa_logits_metadata,
+                )
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
@@ -166,7 +157,7 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.jit_kernel.dsv4 import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
         if envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_hcu:
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
@@ -187,7 +178,7 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
-    def copy_(self, other: "PagedIndexerMetadata"):
+    def copy_(self, other: PagedIndexerMetadata):
         if is_hip() and not _is_hcu:
             copy_fields = ["page_table", "c4_seq_lens"]
             assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
@@ -198,7 +189,11 @@ class PagedIndexerMetadata:
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size", "use_prefill_cuda_graph"],
+            check_eq_fields=[
+                "page_size",
+                "force_deep_gemm_metadata",
+                "use_prefill_cuda_graph",
+            ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )

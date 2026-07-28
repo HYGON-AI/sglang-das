@@ -131,16 +131,6 @@ class RocmPlatform(Platform):
                     dtype,
                 )
 
-        elif selected_backend == AttentionBackendEnum.SLA_ATTN:
-            if dtype not in (torch.float16, torch.bfloat16):
-                logger.warning(
-                    "ROCm SLA backend works best with bf16/fp16 inputs but got dtype=%s. "
-                    "Proceeding with SLA anyway.",
-                    dtype,
-                )
-            logger.info("Using ROCm sparse linear attention backend.")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.rocm_sparse_linear_attn.RocmSparseLinearAttentionBackend"
-
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
@@ -165,9 +155,19 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
+                from sglang.kernels.ops.attention.flash_attention_v3 import (
+                    _is_fa3_supported,
+                )
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )
+
+                if not _is_fa3_supported():
+                    logger.info(
+                        "FlashAttention backend now dispatches through FA3 "
+                        "(CUDA-only). Using Torch SDPA backend on ROCm."
+                    )
+                    target_backend = AttentionBackendEnum.TORCH_SDPA
 
                 if target_backend == AttentionBackendEnum.FA:
                     supported_sizes = FlashAttentionBackend.get_supported_head_sizes()

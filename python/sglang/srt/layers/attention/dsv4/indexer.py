@@ -1,28 +1,22 @@
-# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
-#
-# Hygon modifications to this file are licensed under the Apache License,
-# Version 2.0 (the "License"); you may not use these modifications except
-# in compliance with the License. You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeAlias,
+    Union,
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
@@ -31,6 +25,7 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -49,8 +44,8 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
-    is_hcu,
     is_gfx95_supported,
+    is_hcu,
     is_hip,
     is_xpu,
 )
@@ -65,10 +60,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+
 _is_hcu = is_hcu()
-_is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
+_is_aiter_fp8_paged_mqa_logits_supported = (
+    is_gfx942_supported() or is_gfx95_supported()
+)
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
-FP8_MAX = torch.finfo(FP8_DTYPE).max
+
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
@@ -271,24 +269,25 @@ def fp8_paged_mqa_logits_torch_sm120(
     return logits
 
 
-def topk_transform_512_pytorch_vectorized(
+def _topk_transform_512_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
+    topk_op_kwargs: Optional[Dict[str, object]] = None,
+    contiguous_topk_input: bool = False,
 ) -> None:
-    """Vectorized PyTorch fallback for topk_transform_512.
-    All helper tensors (arange, zeros) are cached to avoid device-tensor
-    creation during HIP/CUDA graph capture."""
-
     TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
     device = scores.device
+
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
+
     cache = _arange_cache
     key_seq = f"arange_{max_seq_len}_{device}"
     key_topk = f"arange_{TOPK}_{device}"
@@ -307,9 +306,13 @@ def topk_transform_512_pytorch_vectorized(
     masked_scores.masked_fill_(~valid_mask, float("-inf"))
 
     actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
+    topk_kwargs = (
+        {"dim": 1, "largest": True, "sorted": False}
+        if topk_op_kwargs is None
+        else topk_op_kwargs
     )
+    topk_input = masked_scores.contiguous() if contiguous_topk_input else masked_scores
+    _, raw_indices = topk_op(topk_input, actual_k, **topk_kwargs)
     raw_indices = raw_indices.to(torch.int32)
 
     if actual_k < TOPK:
@@ -338,65 +341,83 @@ def topk_transform_512_pytorch_vectorized(
 
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
+
     page_idx_clamped = torch.clamp(page_idx, min=0)
     physical_pages = torch.gather(page_tables, dim=1, index=page_idx_clamped.long())
+
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
     page_indices.masked_fill_(~valid_topk, -1)
 
     out_page_indices.copy_(page_indices)
+
     if out_raw_indices is not None:
         raw_indices = raw_indices.clone()
         raw_indices.masked_fill_(~valid_topk, -1)
         out_raw_indices.copy_(raw_indices)
 
-@triton.jit
-def _fused_scale_kernel(
-    weight_ptr,
-    q_scale_ptr,
-    out_ptr,
-    numel,
-    out_scale,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
 
-    w = tl.load(weight_ptr + offs, mask=mask)
-    qs = tl.load(q_scale_ptr + offs, mask=mask)
+def topk_transform_512_pytorch_vectorized(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Vectorized PyTorch fallback for topk_transform_512.
+    All helper tensors (arange, zeros) are cached to avoid device-tensor
+    creation during HIP/CUDA graph capture."""
 
-    acc = w.to(tl.float32) * out_scale * qs.to(tl.float32)
-    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
-
-
-def fused_scale(
-    weight: torch.Tensor,
-    out_scale: float,
-    q_scale: torch.Tensor,
-) -> torch.Tensor:
-    assert weight.is_contiguous() and q_scale.is_contiguous()
-    B, H = weight.shape
-    numel = B * H
-    out_dtype = torch.promote_types(weight.dtype, q_scale.dtype)
-    out = torch.empty((B, H, 1), device=weight.device, dtype=out_dtype)
-    BLOCK = 1024
-    grid = (triton.cdiv(numel, BLOCK),)
-    _fused_scale_kernel[grid](
-        weight,
-        q_scale,
-        out,
-        numel,
-        out_scale,
-        BLOCK=BLOCK,
+    _topk_transform_512_vectorized(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+        topk_op=torch.topk,
+        topk_op_kwargs={"dim": 1, "largest": True, "sorted": False},
     )
-    return out
+
+
+def topk_transform_512_flashinfer_unfused(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    import flashinfer
+
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        _flashinfer_tie_break_value,
+    )
+
+    _topk_transform_512_vectorized(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+        topk_op=flashinfer.top_k,
+        topk_op_kwargs={
+            "sorted": False,
+            "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+            "tie_break": _flashinfer_tie_break_value(),
+            "dsa_graph_safe": True,
+        },
+        contiguous_topk_input=True,
+    )
 
 
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
 
     def _forward_prepare_multi_stream(
         self,
@@ -456,42 +477,6 @@ class C4IndexerBackendMixin:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
-        # q = c4_indexer.compute_q(q_lora, positions=positions)
-
-        # if _is_hcu and _use_lightop_group_fp8_quant:
-        #     from lightop import op as ops
-        #     def act_quant_group_lightop(
-        #         x: torch.Tensor,
-        #         block_size: int = 128,
-        #         scale_fmt=None,
-        #         quant_dtype: torch.dtype = fp8_dtype,
-        #     ):
-        #         assert x.is_cuda
-        #         assert x.is_contiguous()
-        #         assert x.size(-1) % block_size == 0
-
-        #         N = x.size(-1)
-        #         groups = N // block_size
-
-        #         y = torch.empty_like(x, dtype=quant_dtype)
-        #         s = torch.empty(*x.shape[:-1], groups, dtype=torch.float32, device=x.device)
-
-        #         ops.per_token_group_quant_fp8(
-        #             y.view(-1, N),
-        #             x.view(-1, N),
-        #             s.view(-1, groups),
-        #             block_size,
-        #             1e-4,
-        #             scale_fmt is not None,
-        #         )
-
-        #         return y, s
-
-        #     q_fp8, q_scale = act_quant_group_lightop(q)
-    
-        # else:
-        #     q_fp8, q_scale = act_quant(q) # init
-        
         weights = c4_indexer.compute_weights(x, skip_scale=True)
         q, weights = c4_indexer.compute_q(q_lora, positions, weights)
         if not skip_compressor:
@@ -739,6 +724,10 @@ class C4IndexerBackendMixin:
             and _is_aiter_fp8_paged_mqa_logits_supported
         ):
             fn = _aiter_fp8_paged_mqa_logits
+        elif _is_hcu:
+            # HCU's LightOp implementation avoids materializing the large
+            # [batch, max_c4_seq_len] FP32 Torch fallback during graph capture.
+            from lightop.gemmopt import paged_mqa_logits as fn
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if is_sm120_supported():
                 fn = fp8_paged_mqa_logits_torch_sm120
@@ -751,19 +740,7 @@ class C4IndexerBackendMixin:
 
             fn = fp8_paged_mqa_logits_triton
         else:
-            dg_paged_mqa_chunk_size = getattr(
-                envs, "SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE", None
-            )
-            if (
-                dg_paged_mqa_chunk_size is not None
-                and dg_paged_mqa_chunk_size.get() != -1
-            ):
-                from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
-                    fp8_paged_mqa_logits_chunked as fn,
-                )
-            else:
-                # from deep_gemm import fp8_paged_mqa_logits as fn
-                from lightop.gemmopt import paged_mqa_logits as fn
+            from deep_gemm import fp8_paged_mqa_logits as fn
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
@@ -856,8 +833,20 @@ class C4IndexerBackendMixin:
                 f"got raw_indices.shape={raw_indices.shape}, logits.shape={logits.shape}"
             )
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        if (
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            or self.dsa_topk_backend.is_torch()
+        ):
             topk_transform_512_pytorch_vectorized(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
+        elif self.dsa_topk_backend.is_flashinfer():
+            topk_transform_512_flashinfer_unfused(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -877,16 +866,6 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
-            )
-        elif _is_hcu and envs.SGLANG_LIGHTOP_TOPK.get():
-            from lightop import topk_transform_512 as lightop_topk_transform_512
-            lightop_topk_transform_512(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
             )
         else:
             topk_transform_512(

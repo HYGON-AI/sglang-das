@@ -21,7 +21,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -1098,8 +1098,14 @@ def mhc_pre(
             big_fuse_n_splits = n_splits
 
     if _is_hcu and _use_aiter_tilelang_mhc:
-       pre_big_fuse_tilelang(
-            gemm_out_mul,
+        # AITER fixes the physical last dimension to hc_mult3. The small-batch
+        # split-k GEMM pads it to 32, so compact its valid prefix before the
+        # fused kernel instead of sending AITER a mismatched physical layout.
+        aiter_gemm_out_mul = gemm_out_mul
+        if gemm_last_dim != hc_mult3:
+            aiter_gemm_out_mul = gemm_out_mul[..., :hc_mult3].contiguous()
+        pre_big_fuse_tilelang(
+            aiter_gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
             hc_base,
@@ -1113,9 +1119,9 @@ def mhc_pre(
             mhc_sinkhorn_eps=hc_sinkhorn_eps,
             mhc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
-            n_splits=n_splits,
+            n_splits=big_fuse_n_splits,
             mhc_mult=hc_mult,
-        ) 
+        )
     elif norm_weight is not None:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
         assert norm_weight.shape == (

@@ -179,10 +179,7 @@ class ExpertLocationMetadata:
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:
             logical_count = logical_count.unsqueeze(0)
-        # EPLB placement is computed only during initialization. Keep the
-        # recorded counts on CPU to avoid restoring/running the placement
-        # calculation on a serialized GPU device in multi-process launches.
-        logical_count = logical_count.cpu()
+        logical_count = logical_count.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -776,8 +773,6 @@ def compute_initial_expert_location_metadata(
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
-        # Recorder outputs may contain tensors saved from a GPU rank. Always
-        # restore them on CPU so every worker does not target the saved device.
         data_dict = torch.load(data, weights_only=True, map_location="cpu")
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())

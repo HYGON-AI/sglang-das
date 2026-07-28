@@ -22,9 +22,10 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
+from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -299,7 +300,7 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
         return not _IS_HCU or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
-    if global_num_tokens:
+    if global_num_tokens and not is_dsa_enable_prefill_cp():
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]

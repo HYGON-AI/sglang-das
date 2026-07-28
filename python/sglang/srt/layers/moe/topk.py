@@ -82,7 +82,7 @@ try:
 except ImportError:
     pass
 
-from sglang.jit_kernel.dsv4 import mask_topk_ids
+from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
 from sglang.srt.distributed import (
     get_tp_group,
 )
@@ -140,6 +140,17 @@ _use_lightop_topk_ids_postprocess = get_bool_env_var(
 simulated_expert_balance = get_bool_env_var("SGLANG_SIMULATED_EXPERT_BALANCE")
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
 
+# Epsilon added to the top-k weight sum before renormalization, matching the
+# DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
+# and flashinfer's trtllm routing kernels (mSumEpsilon). With sigmoid scoring
+# plus a selection bias, a token whose selected experts all have deeply negative
+# router logits can have every gathered sigmoid weight underflow to exactly
+# zero; a bare division then yields 0/0 = NaN and poisons the token's output
+# row. For healthy tokens the sum is >= sigmoid(logit_max) >> 1e-20, so results
+# are unchanged. The renormalization is performed in float32 (the reference gate
+# computes the whole gate in fp32); the epsilon underflows to zero in float16.
+_RENORMALIZE_SUM_EPSILON = 1e-20
+
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
 # Padded (CUDA-graph) rows are discarded downstream and the MoE combine is
 # per-token, so zeroing their weights is in principle unnecessary. Gated off by
@@ -194,7 +205,7 @@ if _is_cuda or _is_hip or _is_xpu:
         from sglang.kernels.ops.moe import topk_softmax
 
         try:
-            from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
+            from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
         except ImportError:
             pass
 if _use_aiter:
@@ -794,7 +805,13 @@ def fused_topk_torch_native(
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
+        topk_weights = topk_weights / (
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+            + _RENORMALIZE_SUM_EPSILON
+        )
     return topk_weights, topk_ids
 
 
@@ -926,7 +943,7 @@ def fused_topk(
         elif packed_out is not None:
             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
             # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
-            from sglang.jit_kernel.trtllm_lora_temp.topk_softmax_pack import (
+            from sglang.kernels.ops.moe.trtllm_lora_temp.topk_softmax_pack import (
                 topk_softmax_pack,
             )
 
@@ -941,7 +958,7 @@ def fused_topk(
         # ===== END TO BE REFACTORED ====
         elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
-            from sglang.jit_kernel.moe_fused_gate import (
+            from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
             )
 
@@ -981,7 +998,7 @@ def fused_topk(
                 )
         elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
             # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
-            from sglang.jit_kernel.moe_fused_gate import (
+            from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
             )
 
@@ -1092,12 +1109,15 @@ def grouped_topk_gpu(
             )
 
     if renormalize:
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1221,8 +1241,11 @@ def kimi_k2_biased_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if renormalize:
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights / topk_weights_sum
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1277,12 +1300,15 @@ def biased_topk_impl(
             )
 
     if renormalize:
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1329,7 +1355,7 @@ def biased_topk_jit_kernel_impl(
         return topk_weights, topk_ids
 
     else:
-        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+        from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
@@ -1457,12 +1483,15 @@ def biased_grouped_topk_impl(
             )
 
     if renormalize:
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1649,7 +1678,9 @@ def biased_grouped_topk_gpu(
         # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
         # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
         # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
-        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
+        from sglang.kernels.ops.moe.moe_fused_gate import (
+            moe_fused_gate as jit_grouped_gate,
+        )
 
         return jit_grouped_gate(
             gating_output.to(dtype=torch.float32),
@@ -1726,7 +1757,9 @@ def biased_grouped_topk_gpu(
         # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the
         # unified Triton router replaces the retired AOT moe_fused_gate kernel. It
         # handles any experts-per-group (no MAX_VPT=32 cap) and any num_experts.
-        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
+        from sglang.kernels.ops.moe.moe_fused_gate import (
+            moe_fused_gate as jit_grouped_gate,
+        )
 
         return jit_grouped_gate(
             gating_output.to(dtype=torch.float32),
@@ -1803,7 +1836,7 @@ def biased_grouped_topk_gpu(
                     and lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
                 )
             if _use_jit_bf16_gate:
-                from sglang.jit_kernel.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
+                from sglang.kernels.ops.moe.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
                     kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
                 )
 
@@ -1817,7 +1850,7 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+            from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
 
             return jit_gate(
                 gating_output.to(dtype=torch.float32),
@@ -1841,7 +1874,7 @@ def biased_grouped_topk_gpu(
         ):
             # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
             # router, which subsumes the jit grouped_topk.cuh kernel here.
-            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
+            from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
 
             return jit_gate(
                 gating_output,
@@ -2415,9 +2448,10 @@ def select_experts(
                 **_fused_topk_kwargs,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
+        # custom_routing_function itself is padding-unaware; its output on
+        # padded rows is garbage. That is fine because _post_process_topk_ids
+        # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
+        # weights on HIP) after the logical->physical remap.
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
@@ -2507,5 +2541,5 @@ def select_experts(
 
 # NOTE: the AOT sgl_kernel::moe_fused_gate and sgl_kernel::kimi_k2_moe_fused_gate
 # ops (and their torch.compile fake impls) were retired here — both CUDA gate
-# paths now route through the unified Triton router (jit_kernel/moe_fused_gate.py),
+# paths now route through the unified Triton router (kernels/ops/moe/moe_fused_gate.py),
 # whose Python impl is traceable directly, so no register_fake shim is needed.

@@ -1,17 +1,3 @@
-# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
-#
-# Hygon modifications to this file are licensed under the Apache License,
-# Version 2.0 (the "License"); you may not use these modifications except
-# in compliance with the License. You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import importlib.util
@@ -122,9 +108,13 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     LIGHTOP = "lightop"
+    HPC_OPS = "hpc_ops"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
+
+    def is_hpc_ops(self):
+        return self == MoeRunnerBackend.HPC_OPS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
@@ -181,9 +171,6 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
-
-    def is_lightop(self):
-        return self == MoeRunnerBackend.LIGHTOP
 
 
 class DeepEPMode(Enum):
@@ -430,15 +417,14 @@ def get_tbo_token_distribution_threshold() -> float:
         moe.tbo_token_distribution_threshold = 0.48
     return moe.tbo_token_distribution_threshold
 
-# @lru_cache(maxsize=1)
+
+
 def should_use_flashinfer_trtllm_moe():
-    result = get_moe_runner_backend().is_flashinfer_trtllm() and (
+    return get_moe_runner_backend().is_flashinfer_trtllm() and (
         not importlib.util.find_spec("flashinfer")
         or pkg_version.parse(__import__("flashinfer").__version__)
         >= pkg_version.parse("0.2.9rc1")
     )
-    return result
-
 
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     """
@@ -518,6 +504,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
     if should_skip_mlp_all_reduce():
+        return True
+    if get_server_args().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True
