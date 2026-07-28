@@ -118,6 +118,7 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 _fused_qnorm_rope_cos_sin_cache: dict[tuple, torch.Tensor] = {}
 
+
 def _get_fused_qnorm_rope_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     key = (
         freqs_cis.device.type,
@@ -132,6 +133,7 @@ def _get_fused_qnorm_rope_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor
         ).contiguous()  # [max_pos, 64], first 32 cos, last 32 sin
         _fused_qnorm_rope_cos_sin_cache[key] = cache
     return cache
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -1217,7 +1219,9 @@ class DeepseekV4Model(nn.Module):
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
-        need_pre_hc_head = getattr(forward_batch, "return_hidden_states_before_norm", False)
+        need_pre_hc_head = getattr(
+            forward_batch, "return_hidden_states_before_norm", False
+        )
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if nsa_use_prefill_cp(forward_batch):
             pre_hc_head = None
