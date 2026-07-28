@@ -1,31 +1,36 @@
-      
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-import enum
-from enum import Enum
-from typing import Callable, List, Optional
-import torch
-
-from compressed_tensors.quantization import (QuantizationStrategy)
 import logging
+from typing import List, Optional
+
+import torch
+from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import (
+    _get_deepgemm_shuffle_unique,
+    get_moe_a2a_backend,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import set_weight_attrs, direct_register_custom_op
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, _get_deepgemm_shuffle_unique
+from sglang.srt.utils import direct_register_custom_op, set_weight_attrs
 try:
-    from lightop.moe import fused_experts_impl_int8_marlin
+    from lmslim.layers.fused_moe.fuse_moe_int8_marlin import (
+        fused_experts_impl_int8_marlin,
+    )
 except Exception:
-    print("INFO: Please install lightop if you want to infer the quantitative model of moe.\n")
+    print(
+        "INFO: Please install lmslim if you want to infer the quantitative model of moe.\n"
+    )
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "CompressedTensorsW8A8Int8MarlinMoEMethod",
 ]
+
 
 def fused_experts_impl_int8_marlin_wrapper(
     hidden_states: torch.Tensor,
@@ -86,6 +91,7 @@ def fused_experts_impl_int8_marlin_wrapper(
         i_s=i_s,
     )
 
+
 def fused_experts_impl_int8_marlin_fake(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -117,6 +123,7 @@ def fused_experts_impl_int8_marlin_fake(
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
+
 direct_register_custom_op(
     op_name="fused_experts_impl_int8_marlin",
     op_func=fused_experts_impl_int8_marlin_wrapper,
@@ -124,11 +131,8 @@ direct_register_custom_op(
     fake_impl=fused_experts_impl_int8_marlin_fake,
 )
 
-    
 
-def get_w8a8_int8_marlin_weights(
-         weight,
-         k_tile=64):
+def get_w8a8_int8_marlin_weights(weight, k_tile=64):
     # 7168, 512
     weight = weight.T
     size_k, size_n = weight.shape
@@ -139,6 +143,7 @@ def get_w8a8_int8_marlin_weights(
 
     return weight
 
+
 class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
@@ -147,86 +152,100 @@ class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
     ) -> "CompressedTensorsMarlinMoEMethod":
         # are supported + check if the layer is being ignored.
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
-        input_quant = quant_config.target_scheme_map["Linear"].get(
-            "input_activations")
+        input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
         if quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Int8MarlinMoEMethod(quant_config)
         else:
             raise RuntimeError(
-                f"Slimquant_marlin does not support the FusedMoe scheme: {weight_quant}, {input_quant}")
+                f"Slimquant_marlin does not support the FusedMoe scheme: {weight_quant}, {input_quant}"
+            )
+
 
 class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
     def __init__(
-            self,
-            quant_config: "CompressedTensorsMarlinConfig"  # type: ignore # noqa E501
+        self, quant_config: "CompressedTensorsMarlinConfig"  # type: ignore # noqa E501
     ):
         self.quant_config = quant_config
-        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get(
-            "weights")
+        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
-            "input_activations")
+            "input_activations"
+        )
         self.use_deepep = get_moe_a2a_backend().is_deepep()
         per_channel = (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and self.input_quant.strategy == QuantizationStrategy.TOKEN)
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
         if not per_channel:
             raise ValueError(
                 "For INT8 Fused MoE layers, we require channelwise, "
                 "dynamic per token quantization. Found "
-                f"{self.weight_quant}, {self.input_quant}")
+                f"{self.weight_quant}, {self.input_quant}"
+            )
 
         self.static_input_scales = not self.input_quant.dynamic
         if self.static_input_scales:
             raise ValueError(
                 "For INT8 Fused MoE layers, we require channelwise, "
-                "dynamic per token quantization. Found static input scales.")
+                "dynamic per token quantization. Found static input scales."
+            )
 
-        
-    def create_weights(self, layer: torch.nn.Module, num_experts: int,
-                       hidden_size: int, intermediate_size_per_partition: int,
-                       params_dtype: torch.dtype, **extra_weight_attrs):
-        
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.int8
 
         # WEIGHTS
-        w13_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            hidden_size,
-            dtype=params_dtype),
-                                        requires_grad=False)
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            dtype=params_dtype),
-                                       requires_grad=False)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
         assert self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-        w13_weight_scale = torch.nn.Parameter(torch.ones(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            1,
-            dtype=torch.float32),
-                                              requires_grad=False)
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        w2_weight_scale = torch.nn.Parameter(torch.ones(num_experts,
-                                                        hidden_size,
-                                                        1,
-                                                        dtype=torch.float32),
-                                             requires_grad=False)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
         extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value})
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
@@ -236,12 +255,9 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            weight8bit_nt_kpack2_marlin,
-        )
 
         if self.use_deepep:
-            from deepgemm import marlin_i8_masked_weight, marlin_i8_contiguous_weight
+            from deepgemm import marlin_i8_contiguous_weight, marlin_i8_masked_weight
 
             shuffle_unique, mode = _get_deepgemm_shuffle_unique()
 

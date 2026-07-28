@@ -333,6 +333,7 @@ def get_tbo_token_distribution_threshold() -> float:
         TBO_TOKEN_DISTRIBUTION_THRESHOLD = 0.48
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
+
 # @lru_cache(maxsize=1)
 def should_use_flashinfer_trtllm_moe():
     result = get_moe_runner_backend().is_flashinfer_trtllm() and (
