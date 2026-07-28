@@ -5,6 +5,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - v0.5.12_dev
+      - test/sensitive-diff-gate-0728
 
 permissions:
   contents: read
@@ -16,6 +17,6 @@ concurrency:
 jobs:
   gate:
     name: Checks
-    uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@67c28b3a58f254db143444511aa9da6852165498
+    uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@1ac753984f06826f75e23fabe4bbacfd7089ba24
     permissions:
       contents: read
