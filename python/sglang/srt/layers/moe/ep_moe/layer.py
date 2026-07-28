@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
-from collections import defaultdict
 from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin import \
     SlimQuantCompressedTensorsMarlinConfig
@@ -34,6 +33,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     # should_use_flashinfer_trtllm_moe, # 找不到
 )
+from sglang.srt.layers.moe.moe_runner.deep_gemm import copy_list_to_gpu_no_ce
 from sglang.srt.layers.moe.utils import _get_deepgemm_shuffle_unique
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
@@ -67,7 +67,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    sglang_per_token_group_quant_fp8,
+)
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
