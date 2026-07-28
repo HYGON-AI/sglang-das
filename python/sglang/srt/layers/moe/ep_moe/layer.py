@@ -1428,7 +1428,7 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
+        fuse_silu_and_mul(input=gateup_output.view(-1, N), output=down_input)
         del gateup_output
         down_output = torch.empty(
             (all_tokens, K),
