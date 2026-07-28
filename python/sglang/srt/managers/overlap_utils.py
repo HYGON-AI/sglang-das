@@ -149,7 +149,14 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         future_map._resolve_spec_extras(batch)
 
 
-CONFIDENCE_RELAY_RING_LAG: int = 2
+CONFIDENCE_RELAY_RING_LAG: int = (
+    envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()
+)
+if CONFIDENCE_RELAY_RING_LAG < 0:
+    raise ValueError(
+        "SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS must be non-negative, got "
+        f"{CONFIDENCE_RELAY_RING_LAG}."
+    )
 CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
 
 

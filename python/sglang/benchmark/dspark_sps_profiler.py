@@ -31,11 +31,6 @@ def _load_module_by_path(name: str, path: Path):
 
 
 try:
-    from sglang.benchmark.one_batch_server import (
-        DEFAULT_TIMEOUT,
-        should_skip_due_to_max_running_requests,
-        should_skip_due_to_token_capacity,
-    )
     from sglang.benchmark.utils import get_tokenizer
     from sglang.srt.speculative.dspark_components.dspark_sps import (
         SpsAdditiveCostTable,
@@ -56,10 +51,42 @@ except ImportError as exc:
     SpsAdditiveCostTable = _table_module.SpsAdditiveCostTable
     load_sps_table_from_path = _table_module.load_sps_table_from_path
     profile_sps_table = _table_module.profile_sps_table
-    DEFAULT_TIMEOUT = 60
     get_tokenizer = None
-    should_skip_due_to_max_running_requests = None
-    should_skip_due_to_token_capacity = None
+
+# Keep the SPS client independent from one_batch_server's report-only
+# dependencies (for example, tabulate). These helpers are intentionally tiny
+# and are the only one_batch_server functionality used by this profiler.
+DEFAULT_TIMEOUT = 600
+
+
+def should_skip_due_to_token_capacity(
+    batch_size, input_len, output_len, skip_token_capacity_threshold
+):
+    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+        logger.warning(
+            "Skip SPS round: batch_size=%s * (input_len=%s + output_len=%s) "
+            "exceeds token-capacity threshold %s.",
+            batch_size,
+            input_len,
+            output_len,
+            skip_token_capacity_threshold,
+        )
+        return True
+    return False
+
+
+def should_skip_due_to_max_running_requests(
+    batch_size, skip_max_running_requests_threshold
+):
+    if batch_size > skip_max_running_requests_threshold:
+        logger.warning(
+            "Skip SPS round: batch_size=%s exceeds max-running-requests "
+            "threshold %s.",
+            batch_size,
+            skip_max_running_requests_threshold,
+        )
+        return True
+    return False
 
 DEFAULT_OUT = "dspark_sps.json"
 DEFAULT_MAX_BATCH_SIZE = 256
