@@ -42,8 +42,8 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
-_MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT: Optional[Any] = None
-_MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = False
+_MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH: Optional[Any] = None
+_MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH_CHECKED = False
 _IS_HCU = is_hcu()
 
 _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM = "deep_gemm"
@@ -58,7 +58,7 @@ _MEGA_MOE_HCU_BACKEND_AUTO = "auto"
 _MEGA_MOE_HCU_BACKEND_LL = "ll"
 _MEGA_MOE_HCU_BACKEND_NORMAL = "normal"
 _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD"
-_MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD = 496
+_MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD = 512
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,13 @@ def _is_pd_prefill_instance() -> bool:
     except ValueError:
         return False
 
+def _is_pd_decode_instance() -> bool:
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        return get_global_server_args().disaggregation_mode == "decode"
+    except ValueError:
+        return False
 
 def _get_hcu_normal_ll_token_threshold() -> int:
     value = os.environ.get(_MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV)
@@ -116,6 +123,8 @@ def _select_hcu_megamoe_backend(selector_tokens: int) -> str:
         raise ValueError("MegaMoE backend selector token count must be non-negative")
     if _is_pd_prefill_instance():
         return _MEGA_MOE_HCU_BACKEND_NORMAL
+    if _is_pd_decode_instance():
+        return _MEGA_MOE_HCU_BACKEND_LL
 
     mode = os.environ.get(_MEGA_MOE_HCU_BACKEND_ENV, _MEGA_MOE_HCU_BACKEND_AUTO)
     mode = mode.strip().lower()
@@ -152,26 +161,29 @@ def _get_hcu_cuda_graph_max_tokens_per_rank(
     return graph_tokens
 
 
-def _get_hcu_w8a8_pre_dispatch_quant():
-    global _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
-    global _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED
+def _get_hcu_w8a8_fused_pre_dispatch():
+    global _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH
+    global _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH_CHECKED
 
-    if _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED:
-        return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
+    if _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH_CHECKED:
+        return _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH
 
     try:
-        from lightop.quant import per_token_quant_fp8
-
-        _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT = per_token_quant_fp8
+        import megamoe
     except Exception as exc:
-        logger.warning(
-            "lightop per-token FP8 quantization is unavailable; falling back "
-            "to megamoe.cast_to_fp8_channelwise: %s",
-            exc,
-        )
-        _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT = None
-    _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = True
-    return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
+        raise RuntimeError(
+            "HCU W8A8 MegaMoE requires megamoe.mega_moe_pre_dispatch"
+        ) from exc
+
+    fused_pre_dispatch = getattr(megamoe, "mega_moe_pre_dispatch", None)
+    if fused_pre_dispatch is None:
+        raise RuntimeError(
+            "HCU W8A8 MegaMoE requires megamoe.mega_moe_pre_dispatch; "
+            "rebuild the megamoe package"
+         )
+    _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH = fused_pre_dispatch
+    _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH_CHECKED = True
+    return _MEGA_MOE_HCU_W8A8_FUSED_PRE_DISPATCH
 
 
 def _prepare_standalone_megamoe_inputs(
@@ -181,29 +193,54 @@ def _prepare_standalone_megamoe_inputs(
     buf,
     num_tokens: int,
 ) -> None:
-    quant = _get_hcu_w8a8_pre_dispatch_quant()
-    if quant is not None:
-        quant_input = (
-            hidden_states
-            if hidden_states.is_contiguous()
-            else hidden_states.contiguous()
-        )
-        quant(
-            quant_input,
-            dtype=buf.x.dtype,
-            out_q=buf.x[:num_tokens],
-            out_scale=buf.x_sf[:num_tokens],
-        )
+    fused_pre_dispatch = _get_hcu_w8a8_fused_pre_dispatch()
+    quant_input = (
+        hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+    )
+    topk_ids_in = topk_ids if topk_ids.is_contiguous() else topk_ids.contiguous()
+    if topk_weights.dtype not in (torch.float32, torch.bfloat16):
+        topk_weights_in = topk_weights.to(buf.topk_weights.dtype)
     else:
-        import megamoe
+        topk_weights_in = (
+            topk_weights if topk_weights.is_contiguous() else topk_weights.contiguous()
+        )
+    fused_pre_dispatch(
+        quant_input,
+        topk_ids_in,
+        topk_weights_in,
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+        num_tokens=num_tokens,
+    )
 
-        x_fp8, x_scale = megamoe.cast_to_fp8_channelwise(hidden_states)
-        buf.x[:num_tokens].copy_(x_fp8)
-        buf.x_sf[:num_tokens].copy_(x_scale)
+def _get_hcu_graph_capture_capacity_tokens(
+    num_tokens: int,
+    buf,
+) -> int:
+    capacity_tokens = max(int(num_tokens), 1)
+    max_tokens = getattr(buf, "cuda_graph_max_tokens_per_rank", None)
+    if max_tokens is not None and capacity_tokens > int(max_tokens):
+        raise ValueError(
+            "HCU MegaMoE CUDA graph capture capacity must be <= "
+            f"cuda_graph_max_tokens_per_rank ({int(max_tokens)}), "
+            f"got {capacity_tokens}"
+        )
+    return capacity_tokens
 
-    buf.topk_idx[:num_tokens].copy_(topk_ids.to(buf.topk_idx.dtype))
-    buf.topk_weights[:num_tokens].copy_(topk_weights.to(buf.topk_weights.dtype))
-
+def _is_hcu_v4_pro_ll_masked_k1_shape(experts, w13, w2) -> bool:
+    return (
+        getattr(experts, "num_experts", None) == 384
+        and getattr(experts, "top_k", None) == 6
+        and getattr(experts, "num_fused_shared_experts", 0) == 0
+        and getattr(experts, "hidden_size", None) == 7168
+        and getattr(experts, "intermediate_size_per_partition", None) == 3072
+        and w13.dim() == 3
+        and w2.dim() == 3
+        and tuple(w13.shape[1:]) == (6144, 7168)
+        and tuple(w2.shape[1:]) == (7168, 3072)
+    )
 
 def set_mega_moe_cuda_graph_num_tokens(num_tokens: int) -> None:
     if not _is_standalone_megamoe_runtime():
@@ -212,7 +249,6 @@ def set_mega_moe_cuda_graph_num_tokens(num_tokens: int) -> None:
         graph_num_tokens = getattr(buf, "cuda_graph_num_tokens", None)
         if graph_num_tokens is not None:
             graph_num_tokens.fill_(num_tokens)
-
 
 def _apply_mega_moe_dg_env() -> None:
     """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
@@ -580,17 +616,22 @@ def _run_standalone_hcu_w8a8_mega_moe(
             num_tokens,
         )
 
-    output_rows = (
-        int(buf.cuda_graph_max_tokens_per_rank) if is_graph_capture else num_tokens
-    )
+    graph_capacity_tokens = _get_hcu_graph_capture_capacity_tokens(num_tokens, buf) if is_graph_capture else None
     y = torch.empty(
-        (output_rows, hidden_size),
+        (
+            max(
+                num_tokens,
+                graph_capacity_tokens if graph_capacity_tokens is not None else 1,
+            ),
+            hidden_size,
+        ),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
     api_kwargs = {"megamoe_backend": _select_hcu_megamoe_backend(dispatch_num_tokens)}
     if is_graph_capture:
         api_kwargs["graph"] = True
+        api_kwargs["capacity_num_tokens"] = graph_capacity_tokens
     else:
         api_kwargs["capacity_num_tokens"] = dispatch_num_tokens
 
@@ -747,18 +788,6 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
         )
         experts._mega_moe_hcu_weight_layout = "marlin_kpack2"
     else:
-        if (num_experts, hidden, intermediate) != (32, 4096, 2048):
-            raise ValueError(
-                "standalone megamoe currently supports only 32 local experts, "
-                "hidden=4096, intermediate=2048 (DSV4-Flash EP8)"
-            )
-        for label, weight in (("w13", w13), ("w2", w2)):
-            _, rows, cols = weight.shape
-            if rows % 256 != 0 or cols % 64 != 0:
-                raise ValueError(
-                    "standalone megamoe pack5 requires weight rows divisible "
-                    f"by 256 and K divisible by 64, got {label}={tuple(weight.shape)}"
-                )
 
         import megamoe
 
@@ -776,6 +805,17 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
                 )
             }
             experts._mega_moe_hcu_weight_layout = "normal"
+        elif _is_pd_decode_instance() and _is_hcu_v4_pro_ll_masked_k1_shape(experts, w13, w2):
+            experts.mega_l1_weights = {
+                "ll_pro_masked": (
+                    megamoe.weight8bit_nt_kpack2_marlin_masked(w13),
+                    w13_scale,
+                ),
+            }
+            experts.mega_l2_weights = {
+                "unified": (megamoe.flatten_pack5_weight(w2), w2_scale),
+            }
+            experts._mega_moe_hcu_weight_layout = "ll_pro_masked"
         else:
             experts.mega_l1_weights = {
                 "unified": (
