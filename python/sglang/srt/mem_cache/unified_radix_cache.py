@@ -556,7 +556,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             result = component.acquire_component_lock(node=node, result=result)
 
-        self._update_evictable_leaf_sets(node)
+        self.tree_core._update_evictable_leaf_sets(node)
         return result
 
     def dec_lock_ref(

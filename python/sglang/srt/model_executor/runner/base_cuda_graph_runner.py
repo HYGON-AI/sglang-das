@@ -23,10 +23,11 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
+    require_gathered_buffer,
 )
 
 if TYPE_CHECKING:
