@@ -836,10 +836,6 @@ class Indexer(MultiPlatformOp):
                         weights[:q_offset].to(torch.float32),
                         ks,
                         ke,
-                        q[:q_offset].shape[0],
-                        kv_bf16.shape[0],
-                        q.shape[1],
-                        q.shape[2],
                         None,
                         True,
                     )
@@ -858,10 +854,6 @@ class Indexer(MultiPlatformOp):
                         weights[:q_offset],
                         ks,
                         ke,
-                        q[:q_offset].shape[0],
-                        kv.shape[0],
-                        q.shape[1],
-                        q.shape[2],
                         scale.view(torch.float32).flatten(),
                         True
                     )
@@ -913,10 +905,6 @@ class Indexer(MultiPlatformOp):
                         weights[start:end].to(torch.float32),
                         ks[start:end],
                         ke[start:end],
-                        q[start:end].shape[0],
-                        kv_bf16.shape[0],
-                        q.shape[1],
-                        q.shape[2],
                         None,
                         True,
                     )
@@ -1125,10 +1113,6 @@ class Indexer(MultiPlatformOp):
                         weights.to(torch.float32),
                         ks,
                         ke,
-                        q.shape[0],
-                        kv_bf16.shape[0],
-                        q.shape[1],
-                        q.shape[2],
                         None,
                         True,
                     )
@@ -1182,10 +1166,6 @@ class Indexer(MultiPlatformOp):
                         weights.to(torch.float32),
                         ks,
                         ke,
-                        q.shape[0],
-                        k_fp8.shape[0],
-                        q.shape[1],
-                        q.shape[2],
                         None,
                         True,
                     )
