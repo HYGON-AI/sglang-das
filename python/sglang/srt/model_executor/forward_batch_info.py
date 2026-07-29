@@ -59,7 +59,6 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
-from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +78,7 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_hcu = is_hcu()
+
 
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
@@ -771,13 +771,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.pin_memory().to(device, non_blocking=True)
+                batch.extend_input_logprob_token_ids.pin_memory().to(
+                    device, non_blocking=True
+                )
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).pin_memory().to(
-                device, non_blocking=True
+            ret.num_token_non_padded = (
+                torch.tensor(num_tokens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
             )
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -797,14 +801,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).pin_memory().to(device, non_blocking=True)
+            ret.global_num_tokens_gpu = (
+                torch.tensor(global_num_tokens, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).pin_memory().to(device, non_blocking=True)
+            ret.global_num_tokens_for_logprob_gpu = (
+                torch.tensor(global_num_tokens_for_logprob, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1146,10 +1154,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
-            [pos for pos in mrope_positions_list],
-            dim=1,
-        ).pin_memory().to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        self.mrope_positions = (
+            torch.cat(
+                [pos for pos in mrope_positions_list],
+                dim=1,
+            )
+            .pin_memory()
+            .to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        )
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
@@ -1163,6 +1175,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.attn_attend_prefix_cache = attn_attend_prefix_cache
 
     def prepare_chunked_kv_indices(self, device: torch.device):
+        # Imported lazily: sgl_kernel is a compiled extension that needs a GPU
+        # runtime, so importing it at module scope breaks CPU-only environments.
+        from sgl_kernel.kvcacheio import hcu_create_chunked_prefix_cache_kv_indices
+
         self.prefix_chunk_kv_indices = []
         for idx in range(self.num_prefix_chunks):
             chunk_starts = self.prefix_chunk_starts[idx]
@@ -1174,15 +1190,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 num_chunk_tokens, dtype=torch.int32, device=device
             )
             hcu_create_chunked_prefix_cache_kv_indices(
-                    req_to_token = self.req_to_token_pool.req_to_token,
-                    req_pool_indices = self.req_pool_indices,
-                    chunk_starts = chunk_starts,
-                    chunk_seq_lens = chunk_seq_lens,
-                    chunk_cu_seq_lens = chunk_cu_seq_lens,
-                    chunk_kv_indices = chunk_kv_indices,
-                    col_num = self.req_to_token_pool.req_to_token.shape[1],
-                    bs = self.batch_size,
-                )
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_indices=self.req_pool_indices,
+                chunk_starts=chunk_starts,
+                chunk_seq_lens=chunk_seq_lens,
+                chunk_cu_seq_lens=chunk_cu_seq_lens,
+                chunk_kv_indices=chunk_kv_indices,
+                col_num=self.req_to_token_pool.req_to_token.shape[1],
+                bs=self.batch_size,
+            )
             # if self.use_sglang_create_chunked_prefix_cache_kv_indices:
             #     hcu_create_chunked_prefix_cache_kv_indices(
             #         req_to_token = self.req_to_token_pool.req_to_token,
