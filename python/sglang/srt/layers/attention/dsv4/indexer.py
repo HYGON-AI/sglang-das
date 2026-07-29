@@ -60,6 +60,44 @@ else:
     FP8_DTYPE = torch.float8_e4m3fn
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 
+FP8_E4M3_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dtype is not None
+)
+
+
+def _is_fp8_e4m3_fused_kvcache(kvcache: torch.Tensor) -> bool:
+    if kvcache.dtype in FP8_E4M3_DTYPES:
+        return True
+    return kvcache.dtype == torch.uint8 and kvcache.shape[-1] == 132
+
+
+def _is_gfx936() -> bool:
+    try:
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    except Exception:
+        return False
+    return "gfx936" in gcn_arch
+
+
+def _maybe_dequantize_indexer_q_to_bf16(
+    q: torch.Tensor, kvcache: torch.Tensor
+) -> torch.Tensor:
+    if not (_is_gfx936() and _is_fp8_e4m3_fused_kvcache(kvcache)):
+        return q
+    if q.dtype == torch.bfloat16:
+        return q.contiguous()
+    if q.dtype in FP8_E4M3_DTYPES:
+        return q.to(torch.bfloat16).contiguous()
+    if q.dtype in (torch.int8, torch.uint8):
+        q_u8 = q if q.dtype == torch.uint8 else q.view(torch.uint8)
+        return q_u8.view(FP8_DTYPE).to(torch.bfloat16).contiguous()
+    return q
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -383,6 +421,7 @@ class C4IndexerBackendMixin:
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)
+        q_for_logits = q_fp8
         assert len(c4_indexer_kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -400,6 +439,9 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
+            q_for_logits = _maybe_dequantize_indexer_q_to_bf16(
+                q_fp8, c4_indexer_kv_cache
+            )
             dg_paged_mqa_chunk_size = getattr(
                 envs, "SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE", None
             )
@@ -418,7 +460,7 @@ class C4IndexerBackendMixin:
         if _c4sl.dim() == 1:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
-            q_fp8,
+            q_for_logits,
             c4_indexer_kv_cache,
             weights,
             _c4sl,
