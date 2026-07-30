@@ -323,8 +323,13 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if sync_group_override is not None:
-        # Scheduler metadata always uses its dedicated CPU communicator.
+    if sync_group_override is not None and not (
+        len(offload_tags) == 0
+        and envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    ):
+        # Keep the dedicated Gloo group by default so scheduler progress stays
+        # isolated from model-forward collectives. The explicit opt-in below
+        # uses the normal DP device group, including PD Decode StepInfo.
         group = sync_group_override
         device = "cpu"
     elif len(offload_tags) == 0 and (
@@ -396,8 +401,13 @@ class SchedulerDPAttnMixin:
         sync_group_override = None
         epoch = None
         if is_disagg_decode:
-            sync_group_override = getattr(self, "dp_scheduler_cpu_group", None)
-            if sync_group_override is None:
+            use_device_scheduler_sync = (
+                envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+                and len(self.offload_tags) == 0
+            )
+            if not use_device_scheduler_sync:
+                sync_group_override = getattr(self, "dp_scheduler_cpu_group", None)
+            if sync_group_override is None and not use_device_scheduler_sync:
                 raise RuntimeError(
                     "dedicated dp_scheduler_cpu_group is not initialized"
                 )

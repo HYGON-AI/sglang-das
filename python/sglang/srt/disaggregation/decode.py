@@ -1470,7 +1470,16 @@ class DecodeTransferQueue:
         )
 
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
-            pass
+            # Fake PD has no prefill producer. Supply a shape-correct logical
+            # seed solely for graph/performance benchmarking when MTP index
+            # sharing is enabled; real P/D always keeps the transferred seed.
+            mtp_dim = self.metadata_buffers.mtp_topk_indices_dim
+            if not self.spec_algorithm.is_none() and mtp_dim > 0:
+                output_mtp_topk_indices = torch.zeros(
+                    mtp_dim,
+                    dtype=torch.int32,
+                    device=output_topk_index.device,
+                )
         elif actual_room == 0:
             # Case 1: Metadata not ready yet (actual_room == 0)
             # Keep request in queue and wait for next poll
