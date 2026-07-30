@@ -435,6 +435,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
                     "or SM120."
                 )
+        self.group_size = 32
 
     def create_weights(
         self,
@@ -1104,24 +1105,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+        #     w13_weight = upcast_from_mxfp(
+        #         layer.w13_weight,
+        #         layer.w13_weight_scale,
+        #         target_dtype=torch.bfloat16,
+        #         axis=-1,
+        #     )
+        #     w2_weight = upcast_from_mxfp(
+        #         layer.w2_weight,
+        #         layer.w2_weight_scale,
+        #         target_dtype=torch.bfloat16,
+        #         axis=-1,
+        #     )
+        #     del layer.w13_weight
+        #     del layer.w2_weight
+        #     del layer.w13_weight_scale
+        #     del layer.w2_weight_scale
+        #     layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+        #     layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1734,6 +1735,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                use_int4_w4a16=True,
+                block_shape=[0, self.group_size],
             )
         return self.runner.run(dispatch_output, quant_info)
 
