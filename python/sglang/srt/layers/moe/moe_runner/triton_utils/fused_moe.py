@@ -139,7 +139,7 @@ def inplace_fused_experts(
     topk_ids: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    activation: int = 0,  # 0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu 2 situ
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -162,7 +162,12 @@ def inplace_fused_experts(
     gate_up_interleaved: bool = True,
 ) -> None:
     if isinstance(activation, int):
-        activation = "silu" if activation == 0 else "gelu"
+        if activation == 0:
+            activation = "silu" 
+        elif activation == 2:
+            activation = "situ"
+        else:
+            activation = "gelu"
     fused_experts_impl(
         hidden_states,
         w1,
@@ -381,6 +386,8 @@ def fused_experts(
         )
         else 1
     )
+    if isinstance(moe_runner_config.activation, str) and moe_runner_config.activation.lower() == "situ":
+        act_id = 2
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -1179,7 +1186,7 @@ def fused_experts_impl(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
-    activation: int = 0,  # 0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu 2 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,

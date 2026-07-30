@@ -371,6 +371,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 raise NotImplementedError(
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90 or SM100."
                 )
+        self.group_size = 32
 
     def create_weights(
         self,
@@ -548,12 +549,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if (
-                not is_sm90_supported()
-                and not is_sm100_supported()
-                and not is_sm120_supported()
-            ):
-                raise RuntimeError("MXFP4 Marlin requires SM90+.")
+            # if (
+            #     not is_sm90_supported()
+            #     and not is_sm100_supported()
+            #     and not is_sm120_supported()
+            # ):
+            #     raise RuntimeError("MXFP4 Marlin requires SM90+.")
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
@@ -977,27 +978,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
-        else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+        # else:
+        #     from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+        #     w13_weight = upcast_from_mxfp(
+        #         layer.w13_weight,
+        #         layer.w13_weight_scale,
+        #         target_dtype=torch.bfloat16,
+        #         axis=-1,
+        #     )
+        #     w2_weight = upcast_from_mxfp(
+        #         layer.w2_weight,
+        #         layer.w2_weight_scale,
+        #         target_dtype=torch.bfloat16,
+        #         axis=-1,
+        #     )
+        #     del layer.w13_weight
+        #     del layer.w2_weight
+        #     del layer.w13_weight_scale
+        #     del layer.w2_weight_scale
+        #     layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+        #     layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1614,6 +1615,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                use_int4_w4a16=True,
+                block_shape=[0, self.group_size],
             )
         return self.runner.run(dispatch_output, quant_info)
 
