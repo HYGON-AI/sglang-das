@@ -89,8 +89,6 @@ def _maybe_dequantize_indexer_q_to_bf16(
 ) -> torch.Tensor:
     if not (_is_gfx936() and _is_fp8_e4m3_fused_kvcache(kvcache)):
         return q
-    if q.dtype == torch.bfloat16:
-        return q.contiguous()
     if q.dtype in FP8_E4M3_DTYPES:
         return q.to(torch.bfloat16).contiguous()
     if q.dtype in (torch.int8, torch.uint8):
