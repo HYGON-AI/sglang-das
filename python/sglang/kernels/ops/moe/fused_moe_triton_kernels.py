@@ -160,6 +160,7 @@ def fused_moe_kernel_gptq_awq(
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
+    use_mxfp4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
@@ -288,6 +289,24 @@ def fused_moe_kernel_gptq_awq(
         b = tl.load(b_ptrs)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
+            if use_mxfp4_w4a16:
+                # MXFP4 stores two E2M1 values per byte.  Its nibble is not a
+                # signed/zero-point INT4 value:
+                #   magnitude codes 0..7 -> 0, .5, 1, 1.5, 2, 3, 4, 6
+                #   bit 3                   -> sign
+                # Decode only the current GEMM tile so packed weights remain
+                # resident and no model-wide BF16 expansion is needed.
+                b_magnitude_code = b & 0x7
+                b_magnitude = tl.where(
+                    b_magnitude_code <= 4,
+                    b_magnitude_code.to(tl.float32) * 0.5,
+                    tl.where(
+                        b_magnitude_code == 5,
+                        3.0,
+                        tl.where(b_magnitude_code == 6, 4.0, 6.0),
+                    ),
+                )
+                b = tl.where((b & 0x8) == 0, b_magnitude, -b_magnitude)
 
         b_scale_ptrs = (
             b_scale_ptr
@@ -296,7 +315,12 @@ def fused_moe_kernel_gptq_awq(
             + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
         )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        if use_mxfp4_w4a16:
+            # The checkpoint scale byte is OCP UE8M0 with exponent bias 127.
+            # Scale code 255 is reserved and does not occur in valid weights.
+            b_scale = tl.exp2(b_scale.to(tl.float32) - 127.0)
+        else:
+            b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
@@ -323,6 +347,8 @@ def fused_moe_kernel_gptq_awq(
         # We accumulate along the K dimension.
         if has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        elif use_mxfp4_w4a16:
+            b = (b.to(tl.float32) * b_scale).to(compute_type)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
         accumulator = tl.dot(a, b, acc=accumulator)
@@ -866,6 +892,19 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
+        # Kimi-K3 checkpoint weights use packed E2M1 values plus uint8 UE8M0
+        # group scales.  On HCU, keep the packed tensors resident and select
+        # native tile-wise decode instead of treating them as affine INT4.
+        # Other platforms and ordinary INT4 checkpoints preserve the existing
+        # GPTQ/AWQ behavior.
+        use_mxfp4_w4a16 = (
+            _is_hcu
+            and use_int4_w4a16
+            and B_scale is not None
+            and B_scale.dtype == torch.uint8
+        )
+        if use_mxfp4_w4a16:
+            assert B_zp is None, "MXFP4 E2M1 does not use an affine zero point"
         assert (
             not fuse_sum_all_reduce
         ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
@@ -905,6 +944,7 @@ def invoke_fused_moe_kernel(
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a16=use_mxfp4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,
