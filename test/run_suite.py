@@ -202,6 +202,7 @@ NIGHTLY_SUITES = {
         "nightly-hcu-vlm",
         "nightly-hcu-core-functional",
         "nightly-hcu-accuracy-text",
+        "nightly-hcu-accuracy-evalscope",
         "nightly-hcu-perf-text",
         "nightly-hcu-large-model-4gpu",
         "nightly-hcu-large-model-8gpu",
