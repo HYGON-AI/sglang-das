@@ -464,7 +464,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         if is_per_channel:
             scale_np = scale.cpu().contiguous().numpy()
             scale_np.dtype = np.uint32
-            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
+            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).cuda()
             return scale_uint64_tensor
 
         # Per‑group: multiply channel and group scales, then pack into uint64

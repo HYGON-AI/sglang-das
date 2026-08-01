@@ -2556,6 +2556,23 @@ class KimiK3LinearModel(nn.Module):
 
 
 class KimiK3LinearForCausalLM(nn.Module):
+    # Runtime fused module names → checkpoint / quant_model_description shards.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2565,6 +2582,14 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None and hasattr(
+            quant_config, "update_packed_modules_mapping"
+        ):
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+        elif quant_config is not None and hasattr(
+            quant_config, "packed_modules_mapping"
+        ):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -2911,6 +2936,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
         "mm_projector.",
     )
 
+    packed_modules_mapping = KimiK3LinearForCausalLM.packed_modules_mapping
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.layers.": "language_model.model.layers.",
@@ -2919,6 +2946,20 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "block_sparse_moe": "mlp",
         },
     )
+
+    @staticmethod
+    def remap_quant_name_to_sglang(name: str) -> str:
+        """Map HF ModelSlim quant keys onto runtime module prefixes.
+
+        Checkpoint / quant_model_description.json use
+        ``language_model.model.layers.*.block_sparse_moe.*``, while
+        ``KimiK3LinearForCausalLM`` is constructed with ``prefix=""`` and
+        MoE modules live under ``mlp`` (see load_weights which strips
+        ``language_model.`` after hf_to_sglang_mapper).
+        """
+        if name.startswith("language_model."):
+            name = name[len("language_model.") :]
+        return name.replace("block_sparse_moe", "mlp")
 
     def __init__(
         self,
@@ -2930,6 +2971,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None and hasattr(
+            quant_config, "update_packed_modules_mapping"
+        ):
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+        elif quant_config is not None and hasattr(
+            quant_config, "packed_modules_mapping"
+        ):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
 
         # The dedicated K3 tower runs replicated (per-rank full weights);
         # shard work across ranks image-wise via the DP runner.
