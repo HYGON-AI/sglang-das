@@ -317,6 +317,7 @@ def dist_barrier_after_load(
     elastic_ep_backend: Optional[str],
     tp_rank: int,
     is_ep_joiner: bool = False,
+    loading_timeout_s: Optional[float] = None,
 ) -> None:
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
@@ -325,9 +326,15 @@ def dist_barrier_after_load(
     else:
         # Handle the case where some ranks do not finish loading.
         try:
+            # A fixed timeout is insufficient when ranks load from storage with
+            # different throughput.  Keep the conservative default while
+            # allowing the server's distributed timeout to extend this barrier.
+            loading_timeout_s = max(
+                UNBALANCED_MODEL_LOADING_TIMEOUT_S, loading_timeout_s or 0
+            )
             dist.monitored_barrier(
                 group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                timeout=datetime.timedelta(seconds=loading_timeout_s),
                 wait_all_ranks=True,
             )
         except RuntimeError:

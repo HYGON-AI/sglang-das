@@ -1108,6 +1108,7 @@ class ModelRunner:
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
+            loading_timeout_s=self.server_args.dist_timeout,
         )
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
