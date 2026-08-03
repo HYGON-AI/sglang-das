@@ -32,37 +32,12 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
-    is_hcu,
     is_hip,
     next_power_of_2,
 )
+from sgl_kernel.kvcacheio import hcu_alloc_decode_kernel, hcu_alloc_extend_kernel
 
 _is_hip = is_hip()
-_is_hcu = is_hcu()
-
-# Newer HCU runtime packages export the HCU-prefixed allocator kernels. The
-# deployed 0.5.12 package still exports the same ABI under the legacy DCU
-# names, so accept either spelling on HCU. Keeping an explicit HCU guard
-# prevents this compatibility path from affecting non-HCU runtimes; if neither
-# extension entry point exists, use the existing Triton allocator fallback.
-try:
-    from sgl_kernel.kvcacheio import (
-        hcu_alloc_decode_kernel,
-        hcu_alloc_extend_kernel,
-    )
-except ImportError:
-    if _is_hcu:
-        try:
-            from sgl_kernel.kvcacheio import (
-                dcu_alloc_decode_kernel as hcu_alloc_decode_kernel,
-            )
-            from sgl_kernel.kvcacheio import (
-                dcu_alloc_extend_kernel as hcu_alloc_extend_kernel,
-            )
-        except ImportError:
-            hcu_alloc_decode_kernel = hcu_alloc_extend_kernel = None
-    else:
-        hcu_alloc_decode_kernel = hcu_alloc_extend_kernel = None
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -223,10 +198,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        if (
-            self.sglang_kvalloc_kernel
-            and hcu_alloc_extend_kernel is not None
-        ):
+        if self.sglang_kvalloc_kernel:
             hcu_alloc_extend_kernel(
                 pre_lens_ptr = prefix_lens.to(torch.int64),
                 seq_lens_ptr = seq_lens.to(torch.int64),
@@ -279,10 +251,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
-        if (
-            self.sglang_kvalloc_kernel
-            and hcu_alloc_decode_kernel is not None
-        ):
+        if self.sglang_kvalloc_kernel:
             hcu_alloc_decode_kernel(
                 seq_lens_ptr = seq_lens,
                 last_loc_ptr = last_loc,
