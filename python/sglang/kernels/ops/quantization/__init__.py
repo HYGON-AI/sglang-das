@@ -181,6 +181,8 @@ _TRITON_KERNELS = [
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
     ("int8_kernel", "w8a8_block_int8_matmul"),
+    ("npu_int8_ops_triton", "npu_dynamic_quant"),
+    ("npu_int8_ops_triton", "npu_quant_matmul"),
     ("awq_triton", "awq_dequantize_triton"),
     ("awq_triton", "awq_gemm_triton"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),

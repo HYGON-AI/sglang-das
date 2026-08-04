@@ -120,10 +120,59 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         )
 
 
+def _has_npu_int8_ops() -> bool:
+    return (
+        hasattr(torch.ops, "npu")
+        and hasattr(torch.ops.npu, "npu_dynamic_quant")
+        and hasattr(torch.ops.npu, "npu_quant_matmul")
+    )
+
+
+def _npu_dynamic_quant(x: torch.Tensor):
+    """Ascend ``npu_dynamic_quant``, or Triton/torch fallback (HCU/ROCm)."""
+    if _has_npu_int8_ops():
+        return torch.ops.npu.npu_dynamic_quant(x)
+    from sglang.kernels.ops.quantization.npu_int8_ops_triton import npu_dynamic_quant
+
+    return npu_dynamic_quant(x)
+
+
+def _npu_quant_matmul(
+    quant_out: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    pertoken_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+):
+    """Ascend ``npu_quant_matmul``, or Triton/torch fallback (HCU/ROCm)."""
+    if _has_npu_int8_ops():
+        return torch.ops.npu.npu_quant_matmul(
+            quant_out,
+            weight,
+            weight_scale,
+            pertoken_scale=pertoken_scale,
+            bias=bias,
+            output_dtype=output_dtype,
+        )
+    from sglang.kernels.ops.quantization.npu_int8_ops_triton import npu_quant_matmul
+
+    return npu_quant_matmul(
+        quant_out,
+        weight,
+        weight_scale,
+        pertoken_scale=pertoken_scale,
+        bias=bias,
+        output_dtype=output_dtype,
+    )
+
+
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        # No-op off Ascend (keeps ND layout for Triton GEMM on HCU/ROCm).
         layer.weight.data = npu_format_cast(layer.weight.data)
 
         layer.weight_scale.data = layer.weight_scale.data.flatten()
@@ -144,8 +193,8 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             quant_out, dynamic_scale = x
         else:
             original_dtype = x.dtype
-            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
-        return torch.ops.npu.npu_quant_matmul(
+            quant_out, dynamic_scale = _npu_dynamic_quant(x)
+        return _npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
