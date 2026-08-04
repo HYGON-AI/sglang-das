@@ -24,6 +24,8 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_hcu,
+    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
 
 if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+elif _is_hcu:
+    from sgl_kernel import merge_state_v2
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
@@ -613,6 +617,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
