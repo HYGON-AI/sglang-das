@@ -633,7 +633,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.c128_kv_pool.kv_buffer,
         ]:
             for buf in bufs:
-                assert buf.ndim in 2, f"expected 2D buffer, got {buf.ndim}D"
+                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes)
@@ -646,7 +646,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
 
         for buf in self.swa_kv_pool.kv_buffer:
-            assert buf.ndim in 2, f"expected 2D buffer, got {buf.ndim}D"
+            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
