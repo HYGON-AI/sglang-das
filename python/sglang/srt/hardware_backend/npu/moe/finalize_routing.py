@@ -42,7 +42,11 @@ class NPUFinalizeRouting(BaseFinalizeRouting):
         expanded_row_idx: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.npu.npu_moe_finalize_routing(
+        from sglang.kernels.ops.moe.npu_moe_finalize_routing_triton import (
+            npu_moe_finalize_routing,
+        )
+
+        return npu_moe_finalize_routing(
             hidden_states,
             skip1=None,
             skip2=None,

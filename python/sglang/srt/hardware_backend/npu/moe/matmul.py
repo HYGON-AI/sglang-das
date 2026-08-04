@@ -37,7 +37,9 @@ class GroupedMatmul(BaseMatmul):
             raise AttributeError(
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
             )
-        return torch.ops.npu.npu_grouped_matmul(
+        from sglang.kernels.ops.moe.npu_grouped_matmul_triton import npu_grouped_matmul
+
+        return npu_grouped_matmul(
             x=[hidden_states],
             weight=[weight] if transposed else [weight.transpose(1, 2)],
             **scale_args,

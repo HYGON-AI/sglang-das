@@ -31,7 +31,11 @@ class NPUSwiglu(BaseActivation):
 
 class NPUSwigluQuant(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+        from sglang.kernels.ops.moe.npu_dequant_swiglu_quant_triton import (
+            npu_dequant_swiglu_quant,
+        )
+
+        hidden_states, swiglu_out_scale = npu_dequant_swiglu_quant(
             hidden_states,
             quant_mode=1,
             activate_left=True,

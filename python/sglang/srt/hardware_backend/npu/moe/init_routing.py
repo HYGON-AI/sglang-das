@@ -3,7 +3,7 @@ NPU MoE init routing components.
 
 Prepare token routing before expert computation. Two API versions are provided:
 - v1: legacy routing using ``npu_moe_init_routing``.
-- v2: improved routing using ``npu_moe_init_routing_v2``.
+- v2: Triton fallback of ``npu_moe_init_routing_v2`` (expert counts + optional quant).
 """
 
 from abc import ABC, abstractmethod
@@ -67,7 +67,8 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
     """
     NPU MoE init routing (v2 API).
 
-    Uses ``npu_moe_init_routing_v2``, which integrates expert token counting.
+    Uses the Triton fallback of ``npu_moe_init_routing_v2``, which integrates
+    expert token counting (and optional dynamic quant when ``quant_mode=1``).
     """
 
     def __init__(self, quant_mode: int = -1):
@@ -80,9 +81,13 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         num_experts: int,
         top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        from sglang.kernels.ops.moe.npu_moe_init_routing_triton import (
+            npu_moe_init_routing_v2,
+        )
+
         num_tokens = hidden_states.shape[0]
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
+            npu_moe_init_routing_v2(
                 hidden_states,
                 topk_ids,
                 active_num=num_tokens * top_k,
