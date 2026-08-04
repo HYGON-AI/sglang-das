@@ -17,7 +17,6 @@ from __future__ import annotations
 import enum
 import functools
 import logging
-import warnings
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -50,6 +49,10 @@ else:
         create_paged_compressor_data,
     )
 
+from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+    flash_mla_with_kvcache_entrypoint,
+)
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -61,25 +64,16 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton
-)
-from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
-    dequantize_k_cache_paged
+    quant_to_nope_fp8_rope_bf16_pack_lightop,
+    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
-)
-from sglang.srt.layers.attention.debug_flash_mla_adapter import (
-    flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
-)
-
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton, quant_to_nope_fp8_rope_bf16_pack_lightop
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -87,7 +81,9 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align, get_bool_env_var, is_hcu
 
 _is_hcu = is_hcu()
-_use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
+_use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
+    "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
+)
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -967,6 +963,7 @@ class DeepseekV4AttnBackend(
         else:
             if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
                 from lightop import kvcache as op
+
                 if hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store"):
                     self.token_to_kv_pool.set_swa_key_buffer_radix_lightop_fused(
                         layer_id=layer_id,
@@ -1262,7 +1259,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 4, 128],
         forward_batch: ForwardBatch,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        core_attn_metadata: DSV4AttnMetadataRadix,
+        core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
         if nsa_use_prefill_cp(forward_batch):
@@ -1310,9 +1307,9 @@ class DeepseekV4AttnBackend(
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
-                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
-                    "sparse prefill c4 path requires c4_sparse_raw_indices"
-                )
+                assert (
+                    core_attn_metadata.c4_sparse_raw_indices is not None
+                ), "sparse prefill c4 path requires c4_sparse_raw_indices"
                 cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
                 flat_token_ids = cache.c4_flat_token_ids
                 workspace = cache.c4_workspace
@@ -1407,9 +1404,7 @@ class DeepseekV4AttnBackend(
                 assert swa_k_cache.ndim == 2
                 swa_k_cache = swa_k_cache[
                     :, : swa_window_size * k_cache_total_dim
-                ].view(
-                    swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
-                )
+                ].view(swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim)
 
             if extra_k_cache is not None:
                 page_sizes = {
@@ -1417,9 +1412,9 @@ class DeepseekV4AttnBackend(
                     128: token_to_kv_pool.page_size // 128,
                 }
                 if use_bf16_sparse_attn:
-                    assert extra_k_cache.dtype == torch.bfloat16, (
-                        f"{extra_k_cache.dtype=}"
-                    )
+                    assert (
+                        extra_k_cache.dtype == torch.bfloat16
+                    ), f"{extra_k_cache.dtype=}"
                     extra_k_cache_bf16 = extra_k_cache[
                         :, : page_sizes[compress_ratio] * k_cache_total_dim
                     ]
