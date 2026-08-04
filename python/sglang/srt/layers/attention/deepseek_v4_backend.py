@@ -391,6 +391,7 @@ class DeepseekV4AttnBackend(
         assert (
             head_dim == 512
         ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        self.head_dim: int = head_dim
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -974,7 +975,7 @@ class DeepseekV4AttnBackend(
                     )
                     return
                 swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_lightop(swa_k)
-            else:   
+            else:
                 swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
@@ -1200,6 +1201,59 @@ class DeepseekV4AttnBackend(
             layer_id=layer_id,
         )
 
+    def _forward_bf16_sparse_mla(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache_bf16: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        attn_sink: torch.Tensor,
+        extra_k_cache_bf16: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        try:
+            from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
+        except ImportError:
+            from flash_mla import flash_mla_sparse_fwd
+
+        if q.ndim == 4:
+            assert q.shape[1] == 1, f"{q.shape=}"
+            q = q.squeeze(1)
+        if swa_page_indices.ndim == 2:
+            swa_page_indices = swa_page_indices.unsqueeze(1)
+        if swa_topk_lengths.ndim == 2 and swa_topk_lengths.shape[1] == 1:
+            swa_topk_lengths = swa_topk_lengths.squeeze(1)
+
+        kv = swa_k_cache_bf16.reshape(-1, 1, self.head_dim).contiguous()
+        indices = swa_page_indices.contiguous()
+        topk_lengths = swa_topk_lengths.contiguous()
+
+        if extra_k_cache_bf16 is not None:
+            assert extra_indices is not None
+            assert extra_topk_lengths is not None
+            if extra_indices.ndim == 2:
+                extra_indices = extra_indices.unsqueeze(1)
+            if extra_topk_lengths.ndim == 2 and extra_topk_lengths.shape[1] == 1:
+                extra_topk_lengths = extra_topk_lengths.squeeze(1)
+            extra_offset = kv.shape[0]
+            extra_kv = extra_k_cache_bf16.reshape(-1, 1, self.head_dim).contiguous()
+            kv = torch.cat([kv, extra_kv], dim=0)
+            indices = torch.cat([indices, extra_indices + extra_offset], dim=-1)
+            topk_lengths = topk_lengths + extra_topk_lengths
+
+        out, _, _ = flash_mla_sparse_fwd(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=topk_lengths,
+        )
+        return out
+
     def _forward_prefill_sparse(
         self,
         *,
@@ -1325,7 +1379,18 @@ class DeepseekV4AttnBackend(
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
-            extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
+            use_bf16_sparse_attn = token_to_kv_pool.dtype == torch.bfloat16
+
+            extra_k_cache, extra_k_cache_bf16, extra_indices, extra_topk_lengths = (
+                None,
+                None,
+                None,
+                None,
+            )
+            swa_k_cache_bf16 = None
+            swa_window_size = token_to_kv_pool.swa_window_size
+            k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
+
             if compress_ratio == 4:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
@@ -1335,26 +1400,38 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-            swa_window_size = token_to_kv_pool.swa_window_size
-            assert swa_k_cache.ndim == 2
-            k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
-            )
+            if use_bf16_sparse_attn:
+                assert swa_k_cache.dtype == torch.bfloat16, f"{swa_k_cache.dtype=}"
+                swa_k_cache_bf16 = swa_k_cache
+            else:
+                assert swa_k_cache.ndim == 2
+                swa_k_cache = swa_k_cache[
+                    :, : swa_window_size * k_cache_total_dim
+                ].view(
+                    swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
+                )
 
             if extra_k_cache is not None:
                 page_sizes = {
                     4: token_to_kv_pool.page_size // 4,
                     128: token_to_kv_pool.page_size // 128,
                 }
-                extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
-                ].view(
-                    extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
-                    1,
-                    k_cache_total_dim,
-                )
+                if use_bf16_sparse_attn:
+                    assert extra_k_cache.dtype == torch.bfloat16, (
+                        f"{extra_k_cache.dtype=}"
+                    )
+                    extra_k_cache_bf16 = extra_k_cache[
+                        :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    ]
+                else:
+                    extra_k_cache = extra_k_cache[
+                        :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    ].view(
+                        extra_k_cache.shape[0],
+                        page_sizes[compress_ratio],
+                        1,
+                        k_cache_total_dim,
+                    )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
@@ -1380,6 +1457,18 @@ class DeepseekV4AttnBackend(
                 assert (
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+            if use_bf16_sparse_attn:
+                assert swa_k_cache_bf16 is not None
+                return self._forward_bf16_sparse_mla(
+                    q=q,
+                    swa_k_cache_bf16=swa_k_cache_bf16,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache_bf16=extra_k_cache_bf16,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                )
 
             if not envs.SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA.get():
                 return self._forward_flash_mla_decode(

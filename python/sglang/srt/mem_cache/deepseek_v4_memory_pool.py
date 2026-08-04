@@ -165,7 +165,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
-        assert not self.is_bf16_attention_kv_cache
+        if self.is_bf16_attention_kv_cache:
+            raise RuntimeError(
+                "DeepSeekV4 BF16 KV cache must be written with set_key_buffer_bf16."
+            )
+
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -198,6 +202,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         cache_k: torch.Tensor,
         eps: float = 1e-8,
     ) -> None:
+        if self.is_bf16_attention_kv_cache:
+            self.set_key_buffer_bf16(layer_id, loc, cache_k)
+            return
+
         from lightop import kvcache as op
 
         op.quantize_nope_fp8_rope_bf16_pack_store(
@@ -330,6 +338,15 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     ) -> None:
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k, valid_mask)
+
+    def set_key_buffer_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        loc = self.translate_loc_to_hisparse_device(loc)
+        super().set_key_buffer_bf16(layer_id, loc, cache_k)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
@@ -616,7 +633,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.c128_kv_pool.kv_buffer,
         ]:
             for buf in bufs:
-                assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                assert buf.ndim in 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes)
@@ -629,7 +646,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
 
         for buf in self.swa_kv_pool.kv_buffer:
-            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+            assert buf.ndim in 2, f"expected 2D buffer, got {buf.ndim}D"
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
