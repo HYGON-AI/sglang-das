@@ -22,10 +22,12 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+# from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+# from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.kernels.ops.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_parallel
 from sgl_kernel.flash_mla import hcu_create_flashmla_kv_indices
 from sglang.srt.utils import get_bool_env_var, direct_register_custom_op
 
@@ -137,9 +139,16 @@ class HCUMLABackend(AttentionBackend):
             )
 
         self.num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Original HCU MLA initialization kept for Kimi K3 bring-up comparison:
+        # self.req_to_token = model_runner.req_to_token_pool.req_to_token
+
+        # HybridLinearAttnBackend requires the full-attention backend to expose
+        # both pools; retain req_to_token as the existing fast tensor alias.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token = self.req_to_token_pool.req_to_token
 
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -240,7 +249,7 @@ class HCUMLABackend(AttentionBackend):
                 num_splits,
                 block_kv_indices
             )
-        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend_v2()  or forward_batch.forward_mode.is_draft_extend() :
+        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend_v2():
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
@@ -403,6 +412,39 @@ class HCUMLABackend(AttentionBackend):
         self.cuda_graph_num_splits = num_splits
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Adapt the retained HCU MLA graph metadata path to the current API."""
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(
+                bs=forward_batch.batch_size,
+                num_tokens=forward_batch.positions.numel(),
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                encoder_lens=getattr(forward_batch, "encoder_lens", None),
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
+            return
+
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            encoder_lens=getattr(forward_batch, "encoder_lens", None),
+            forward_mode=forward_batch.forward_mode,
+            spec_info=forward_batch.spec_info,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+        )
+
+    # Original HCU MLA graph methods are intentionally retained below. The
+    # adapter above only maps the current AttentionBackend contract onto them
+    # so their stable cuda_graph_* buffers continue to be used for capture and
+    # replay instead of allocating eager metadata with unstable addresses.
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,

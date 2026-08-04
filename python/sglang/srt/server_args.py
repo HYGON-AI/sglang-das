@@ -205,6 +205,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    hcu_mla,
 ]
 
 HCU_ATTENTION_BACKEND_CHOICES = {
