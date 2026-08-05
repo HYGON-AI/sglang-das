@@ -6,11 +6,15 @@ import types
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.observability.scheduler_metrics_mixin import (
     PrefillStats,
     SchedulerMetricsMixin,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeReq:
@@ -63,7 +67,7 @@ class _DummyScheduler(SchedulerMetricsMixin):
     pass
 
 
-class TestForwardPassMetrics(unittest.TestCase):
+class TestForwardPassMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = _DummyScheduler()
         self.scheduler.enable_fpm = True
@@ -82,6 +86,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             decoding_reqs=[],
             prefill_stats=None,
             seq_lens_cpu=[],
+            seq_lens_sum=None,
             fpm_start_time=100.0,
         )
         defaults.update(overrides)
@@ -128,6 +133,81 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
+
+    def test_decode_metrics_fall_back_to_requests_without_cpu_mirror(self):
+        decode_reqs = [_FakeReq(8, output_len=3), _FakeReq(13, output_len=5)]
+        batch = self._make_batch(
+            reqs=decode_reqs,
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+        )
+
+        metrics = self.scheduler._build_scheduled_request_metrics(batch)
+
+        expected_sum = sum(req.seqlen for req in decode_reqs)
+        self.assertEqual(metrics.num_decode_requests, len(decode_reqs))
+        self.assertEqual(metrics.sum_decode_kv_tokens, expected_sum)
+        self.assertEqual(
+            self.scheduler._get_batch_seq_lens_sum(batch),
+            expected_sum,
+        )
+
+        batch.seq_lens_sum = expected_sum + 7
+        self.assertEqual(
+            self.scheduler._get_batch_seq_lens_sum(batch),
+            expected_sum + 7,
+        )
+
+    def test_schedule_batch_copy_preserves_seq_lens_sum_snapshot(self):
+        batch = ScheduleBatch(reqs=[], seq_lens_cpu=None, seq_lens_sum=123)
+
+        copied_batch = batch.copy()
+
+        self.assertEqual(copied_batch.seq_lens_sum, 123)
+
+    def test_result_snapshot_uses_pre_forward_deferred_seq_lens(self):
+        current_seq_lens_cpu = torch.tensor([11, 18], dtype=torch.int64)
+        next_seq_lens_cpu = torch.tensor([16, 23], dtype=torch.int64)
+        batch = ScheduleBatch(
+            reqs=[],
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            spec_info=types.SimpleNamespace(
+                new_seq_lens_cpu=current_seq_lens_cpu,
+            ),
+        )
+
+        result_seq_lens_cpu, result_seq_lens_sum = (
+            batch.get_seq_lens_snapshot_for_result()
+        )
+        batch.spec_info = types.SimpleNamespace(
+            new_seq_lens_cpu=next_seq_lens_cpu,
+        )
+        result_batch = batch.copy()
+        result_batch.seq_lens_cpu = result_seq_lens_cpu
+        result_batch.seq_lens_sum = result_seq_lens_sum
+
+        self.assertIs(result_batch.seq_lens_cpu, current_seq_lens_cpu)
+        self.assertIsNot(result_batch.seq_lens_cpu, next_seq_lens_cpu)
+        self.assertEqual(result_batch.seq_lens_sum, None)
+
+    def test_result_snapshot_copies_current_lengths_when_mirror_is_missing(self):
+        batch = ScheduleBatch(
+            reqs=[],
+            device="cpu",
+            seq_lens=torch.tensor([7, 12], dtype=torch.int64),
+            seq_lens_cpu=None,
+            # This can be stale after a spec-v2 filter/merge in overlap mode.
+            seq_lens_sum=999,
+            spec_info=types.SimpleNamespace(new_seq_lens_cpu=None),
+        )
+
+        result_seq_lens_cpu, result_seq_lens_sum = (
+            batch.get_seq_lens_snapshot_for_result()
+        )
+
+        self.assertTrue(torch.equal(result_seq_lens_cpu, batch.seq_lens))
+        self.assertIsNone(result_seq_lens_sum)
 
     def test_emit_uses_device_timer_gpu_time(self):
         self.scheduler._fpm_uses_device_timer = True

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from sgl_kernel.kvcacheio import hcu_assign_extend_cache_locs
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
@@ -49,17 +51,21 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_pin_memory_available,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
-from sglang.srt.utils import get_bool_env_var
-from sgl_kernel.kvcacheio import hcu_assign_extend_cache_locs
-
-import logging
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -75,6 +81,54 @@ if is_cuda() or is_musa():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+
+def start_async_seq_lens_cpu_copy(
+    seq_lens: torch.Tensor, device
+) -> tuple[torch.Tensor, Any]:
+    """Start the next iteration's sequence-length D2H copy asynchronously."""
+    if seq_lens.numel() == 0:
+        return torch.empty(seq_lens.shape, dtype=seq_lens.dtype, device="cpu"), None
+
+    use_pin_memory = is_pin_memory_available(device)
+    seq_lens_cpu = torch.empty(
+        tuple(seq_lens.shape),
+        dtype=seq_lens.dtype,
+        device="cpu",
+        pin_memory=use_pin_memory,
+    )
+    seq_lens_cpu.copy_(seq_lens, non_blocking=use_pin_memory)
+    done = torch.get_device_module(device).Event()
+    done.record()
+    return seq_lens_cpu, done
+
+
+def _supports_gpu_only_mtp_input(cuda_graph_runner: Any) -> bool:
+    """Whether the draft CUDA graph consumes GPU sequence metadata directly."""
+    if cuda_graph_runner is None:
+        return False
+    draft_attn_backend = getattr(cuda_graph_runner, "draft_attn_backend", None)
+    return type(draft_attn_backend).__name__ in {
+        "NativeSparseAttnMultiStepBackend",
+        "TritonMultiStepDraftBackend",
+    }
+
+
+def _materialize_seq_lens_cpu(
+    batch: ModelWorkerBatch,
+    seq_lens_cpu: torch.Tensor | None = None,
+    seq_lens_cpu_ready: Any = None,
+):
+    """Materialize CPU sequence lengths only for phases that require them."""
+    if batch.seq_lens_cpu is None:
+        if seq_lens_cpu is not None and len(seq_lens_cpu) == len(batch.seq_lens):
+            if seq_lens_cpu_ready is not None:
+                seq_lens_cpu_ready.synchronize()
+            batch.seq_lens_cpu = seq_lens_cpu
+        else:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+    if batch.seq_lens_sum is None:
+        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
 
 @triton.jit
@@ -107,20 +161,33 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
 
+    def materialize_seq_lens_cpu_for_batch(
+        self: EagleDraftInput, batch: ModelWorkerBatch
+    ):
+        _materialize_seq_lens_cpu(
+            batch,
+            self.new_seq_lens_cpu,
+            self.new_seq_lens_cpu_ready,
+        )
+        self.new_seq_lens_cpu = None
+        self.new_seq_lens_cpu_ready = None
+
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
+        use_pin_memory = is_pin_memory_available(batch.device)
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
+        # Keep the verify dependency on the compute stream. This lets the host
+        # prepare the next MTP replay while target verify is still executing.
+        batch.maybe_wait_verify_done_on_stream()
 
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
-            output_ids = torch.tensor(
+            output_ids_cpu = torch.tensor(
                 [
                     (
                         req.output_ids[-1]
@@ -130,8 +197,10 @@ class EagleDraftInputV2Mixin:
                     for req in batch.reqs
                 ],
                 dtype=torch.int64,
-                device=batch.device,
+                device="cpu",
+                pin_memory=use_pin_memory,
             )
+            output_ids = output_ids_cpu.to(batch.device, non_blocking=True)
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 output_ids
             )
@@ -159,14 +228,24 @@ class EagleDraftInputV2Mixin:
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+        cur_kv_lens_cpu = torch.tensor(
+            cur_kv_lens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=use_pin_memory,
+        )
+        nxt_kv_lens_cpu = torch.tensor(
+            nxt_kv_lens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=use_pin_memory,
+        )
+        cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
@@ -185,15 +264,17 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
+            cur_kv_lens,
+            nxt_kv_lens,
             out_cache_loc,
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        # Delay the CPU mirror so its async copy can overlap scheduler work.
+        # NSA materializes it at the draft replay boundary to size compact
+        # metadata; GPU-only backends may defer it further.
+        batch.seq_lens_cpu = None
+        batch.seq_lens_sum = None
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
@@ -233,9 +314,17 @@ class EagleDraftInputV2Mixin:
             else CaptureHiddenMode.LAST
         )
         batch.capture_hidden_mode = capture_mode
-        self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        self.positions = batch.seq_lens.repeat_interleave(
+            topk, dim=0, output_size=len(batch.seq_lens) * topk
+        )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        if batch.seq_lens_cpu is None and not (
+            can_cuda_graph and _supports_gpu_only_mtp_input(cuda_graph_runner)
+        ):
+            self.materialize_seq_lens_cpu_for_batch(batch)
+            forward_batch.seq_lens_cpu = batch.seq_lens_cpu
+            forward_batch.seq_lens_sum = batch.seq_lens_sum
         return forward_batch, can_cuda_graph
 
     def prepare_for_extend_to_fill_draft_kvcache(
@@ -246,6 +335,9 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        if batch.seq_lens_cpu is None:
+            self.materialize_seq_lens_cpu_for_batch(batch)
+
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
@@ -278,7 +370,9 @@ class EagleDraftInputV2Mixin:
 @dataclass
 class EagleVerifyInputV2Mixin:
 
-    use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
+    use_sglang_assign_extend_cache_locs = get_bool_env_var(
+        "SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"
+    )
 
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
@@ -336,8 +430,16 @@ class EagleVerifyInputV2Mixin:
                     next_power_of_2(bs),
                 )
 
-            # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
-            # TBO's split_spec_info can slice the custom_mask correctly.
+            # Target verify and TBO custom-mask splitting still require CPU
+            # lengths. Reuse the asynchronous copy from the prior verify when
+            # it is valid; otherwise materialize at this boundary only.
+            if batch.seq_lens_cpu is None:
+                _materialize_seq_lens_cpu(
+                    batch,
+                    self.seq_lens_cpu,
+                    getattr(self, "seq_lens_cpu_ready", None),
+                )
+                self.seq_lens_cpu_ready = None
             self.seq_lens_cpu = batch.seq_lens_cpu
             self.seq_lens_sum = batch.seq_lens_sum
 
@@ -526,7 +628,7 @@ class EagleVerifyInputV2Mixin:
         return predict, num_correct_drafts + 1, accept_index
 
 
-#@torch.compile(dynamic=True, disable=_is_npu)  #disable on hcu, is cause large bubble
+# @torch.compile(dynamic=True, disable=_is_npu)  #disable on hcu, is cause large bubble
 def select_top_k_tokens_tmp(
     i: int,
     topk_p: torch.Tensor,
@@ -554,7 +656,8 @@ def select_top_k_tokens_tmp(
         expand_scores = torch.mul(
             scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
         )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
+        # This legacy helper has no HCU call site; its import is CUDA/MUSA-only.
+        topk_cs_p, topk_cs_index = fast_topk(  # noqa: F821
             expand_scores.flatten(start_dim=1), topk, dim=-1
         )  # (b, topk)
         scores = topk_cs_p  # shape: (b, topk)
@@ -585,16 +688,18 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if is_cuda() or is_hip() :
+    if is_cuda() or is_hip():
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,
             device=device,
         )
-        use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
+        use_sglang_assign_extend_cache_locs = get_bool_env_var(
+            "SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"
+        )
         if use_sglang_assign_extend_cache_locs:
             hcu_assign_extend_cache_locs(
-                req_pool_indices,         
+                req_pool_indices,
                 req_to_token,
                 start_offset,
                 start_offset + draft_token_num,
@@ -604,7 +709,7 @@ def assign_extend_cache_locs_func(
             )
         else:
             assign_extend_cache_locs[(batch_size,)](
-                req_pool_indices,         
+                req_pool_indices,
                 req_to_token,
                 start_offset,
                 start_offset + draft_token_num,
@@ -614,6 +719,7 @@ def assign_extend_cache_locs_func(
             )
 
         return out_cache_loc
+
 
 @triton.jit
 def fill_bonus_tokens(

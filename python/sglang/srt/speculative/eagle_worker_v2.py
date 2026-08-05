@@ -65,6 +65,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_bonus_tokens,
+    start_async_seq_lens_cpu_copy,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -455,6 +456,12 @@ class EagleDraftWorker(BaseDraftWorker):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+        if (
+            model_worker_batch.seq_lens_sum is None
+            and tree_mask_buf is None
+            and self.tree_mask_mode == TreeMaskMode.FULL_MASK
+        ):
+            draft_input.materialize_seq_lens_cpu_for_batch(model_worker_batch)
 
         (
             tree_mask,
@@ -491,7 +498,8 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_token_num=self.speculative_num_draft_tokens,
             capture_hidden_mode=None,
             seq_lens_sum=None,
-            seq_lens_cpu=None,
+            seq_lens_cpu=draft_input.new_seq_lens_cpu,
+            seq_lens_cpu_ready=draft_input.new_seq_lens_cpu_ready,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -1258,6 +1266,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        new_seq_lens_cpu, new_seq_lens_cpu_ready = start_async_seq_lens_cpu_copy(
+            new_seq_lens, self.device
+        )
 
         # Update mamba state for hybrid GDN models after verification
         if (
@@ -1292,6 +1303,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
+            new_seq_lens_cpu=new_seq_lens_cpu,
+            new_seq_lens_cpu_ready=new_seq_lens_cpu_ready,
             verify_done=verify_done,
         )
 

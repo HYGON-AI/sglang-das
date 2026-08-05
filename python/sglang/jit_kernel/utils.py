@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import importlib
 import importlib.util
+import inspect
 import logging
 import os
 import pathlib
@@ -47,6 +48,16 @@ F = TypeVar("F", bound=Callable[..., Any])
 _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_keyword_arg(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+    )
 
 
 def should_run_full_tests() -> bool:
@@ -130,9 +141,9 @@ def _default_device_cflags() -> List[str]:
     )
     if not amdgpu_targets and torch.cuda.is_available():
         try:
-            amdgpu_targets = torch.cuda.get_device_properties(0).gcnArchName.split(
-                ":"
-            )[0]
+            amdgpu_targets = torch.cuda.get_device_properties(0).gcnArchName.split(":")[
+                0
+            ]
         except Exception:
             amdgpu_targets = None
 
@@ -254,9 +265,7 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     backend = "hip" if _is_rocm_build() else "cuda"
-    module_name = (
-        "sgl_kernel_jit_" + backend + "_" + "_".join(str(arg) for arg in args)
-    )
+    module_name = "sgl_kernel_jit_" + backend + "_" + "_".join(str(arg) for arg in args)
     default_device_cflags = _default_device_cflags()
     if header_only:
         from tvm_ffi.cpp import load_inline
@@ -270,6 +279,11 @@ def load_jit(
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
         with _jit_compile_context():
+            backend_kwargs = (
+                {"backend": "hip"}
+                if is_hip_runtime() and _supports_keyword_arg(load_inline, "backend")
+                else {}
+            )
             return load_inline(
                 module_name,
                 cpp_sources=cpp_sources,
@@ -279,12 +293,18 @@ def load_jit(
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
+                **backend_kwargs,
             )
     else:
         from tvm_ffi.cpp import load
 
         assert cpp_wrappers is None and cuda_wrappers is None
         with _jit_compile_context():
+            backend_kwargs = (
+                {"backend": "hip"}
+                if is_hip_runtime() and _supports_keyword_arg(load, "backend")
+                else {}
+            )
             return load(
                 module_name,
                 cpp_files=cpp_files,
@@ -294,8 +314,8 @@ def load_jit(
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
+                **backend_kwargs,
             )
-
 
 
 @dataclass
@@ -328,7 +348,8 @@ def _init_jit_cuda_arch_once():
 @contextmanager
 def _jit_compile_context():
     if is_hip_runtime():
-        yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
+        _patch_tvm_ffi_load_inline_for_hip()
+        yield
         return
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     old_value = os.environ.get(env_key, None)
@@ -373,25 +394,97 @@ def _find_hipcc() -> str:
 
 def _patch_tvm_ffi_load_inline_for_hip() -> None:
     """Teach CUDA-only tvm_ffi.cpp.load_inline builds to use hipcc on ROCm."""
-    load_inline_mod = importlib.import_module("tvm_ffi.cpp.load_inline")
-    if getattr(load_inline_mod, "_sglang_hipcc_patched", False):
+    tvm_ffi_cpp_mod = importlib.import_module("tvm_ffi.cpp")
+    if _supports_keyword_arg(getattr(tvm_ffi_cpp_mod, "load_inline", None), "backend"):
+        return
+
+    load_inline_mod = None
+    load_inline_globals = None
+    try:
+        load_inline_mod = importlib.import_module("tvm_ffi.cpp.load_inline")
+    except ModuleNotFoundError as e:
+        if e.name != "tvm_ffi.cpp.load_inline":
+            raise
+
+        # Newer tvm-ffi builds expose load_inline directly from tvm_ffi.cpp
+        # instead of as a tvm_ffi.cpp.load_inline submodule. Patch the function's
+        # globals in that layout so load_inline still picks up hipcc.
+        load_inline_mod = importlib.import_module("tvm_ffi.cpp")
+        load_inline_fn = getattr(load_inline_mod, "load_inline", None)
+        load_inline_globals = (
+            getattr(load_inline_fn, "__globals__", None)
+            if callable(load_inline_fn)
+            else None
+        )
+
+    def _get_load_inline_attr(name: str):
+        if hasattr(load_inline_mod, name):
+            return getattr(load_inline_mod, name)
+        if load_inline_globals is not None and name in load_inline_globals:
+            return load_inline_globals[name]
+        raise AttributeError(f"tvm_ffi.cpp.load_inline missing attribute {name}")
+
+    if getattr(load_inline_mod, "_sglang_hipcc_patched", False) or (
+        load_inline_globals is not None
+        and load_inline_globals.get("_sglang_hipcc_patched", False)
+    ):
         return
 
     def _generate_hip_ninja_build(
         name: str,
-        build_dir: str,
-        with_cuda: bool,
-        extra_cflags,
-        extra_cuda_cflags,
-        extra_ldflags,
-        extra_include_paths,
+        build_dir: str | None = None,
+        with_cuda: bool | None = None,
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_paths=None,
+        **kwargs,
     ) -> str:
+        cpp_files = kwargs.get("cpp_files")
+        cuda_files = kwargs.get("cuda_files")
+        if isinstance(cpp_files, (str, pathlib.Path)):
+            cpp_files = [str(cpp_files)]
+        if isinstance(cuda_files, (str, pathlib.Path)):
+            cuda_files = [str(cuda_files)]
+
+        build_dir = build_dir or kwargs.get("build_directory")
+        if build_dir is None:
+            source_files = list(cpp_files or []) + list(cuda_files or [])
+            if source_files:
+                build_dir = str(pathlib.Path(source_files[0]).resolve().parent)
+        if build_dir is None:
+            raise TypeError(
+                "build_dir or build_directory must be provided when "
+                f"cpp_files/cuda_files are absent; got kwargs={sorted(kwargs.keys())}"
+            )
+
+        if cpp_files is None:
+            cpp_files = [str((pathlib.Path(build_dir) / "main.cpp").resolve())]
+        if cuda_files is None:
+            cuda_files = (
+                [str((pathlib.Path(build_dir) / "cuda.cu").resolve())]
+                if with_cuda
+                else []
+            )
+        if with_cuda is None:
+            with_cuda = bool(cuda_files)
+
+        extra_cflags = extra_cflags or kwargs.get("extra_cflags") or []
+        extra_cuda_cflags = extra_cuda_cflags or kwargs.get("extra_cuda_cflags") or []
+        extra_ldflags = extra_ldflags or kwargs.get("extra_ldflags") or []
+        extra_include_paths = (
+            extra_include_paths or kwargs.get("extra_include_paths") or []
+        )
+
+        def _escape_ninja_path(path: str | pathlib.Path) -> str:
+            return str(pathlib.Path(path).resolve()).replace(":", "$:")
+
         default_include_paths = [
-            load_inline_mod.find_include_path(),
-            load_inline_mod.find_dlpack_include_path(),
+            _get_load_inline_attr("find_include_path")(),
+            _get_load_inline_attr("find_dlpack_include_path")(),
         ]
 
-        tvm_ffi_lib = load_inline_mod.find_libtvm_ffi()
+        tvm_ffi_lib = _get_load_inline_attr("find_libtvm_ffi")()
         tvm_ffi_lib_path = str(pathlib.Path(tvm_ffi_lib).parent)
         tvm_ffi_lib_name = pathlib.Path(tvm_ffi_lib).stem
 
@@ -405,9 +498,7 @@ def _patch_tvm_ffi_load_inline_for_hip() -> None:
         ]
 
         cflags = default_cflags + [flag.strip() for flag in extra_cflags]
-        cuda_cflags = default_cuda_cflags + [
-            flag.strip() for flag in extra_cuda_cflags
-        ]
+        cuda_cflags = default_cuda_cflags + [flag.strip() for flag in extra_cuda_cflags]
         ldflags = default_ldflags + [flag.strip() for flag in extra_ldflags]
         include_paths = default_include_paths + [
             str(pathlib.Path(path).resolve()) for path in extra_include_paths
@@ -446,32 +537,23 @@ def _patch_tvm_ffi_load_inline_for_hip() -> None:
                     "",
                 ]
             )
-        ninja.extend(
-            [
-                "rule link",
-                "  command = $cxx $in $ldflags -o $out",
-                "",
-                "build main.o: compile {}".format(
-                    str((pathlib.Path(build_dir) / "main.cpp").resolve()).replace(
-                        ":", "$:"
-                    )
-                ),
-            ]
-        )
+        ninja.extend(["rule link", "  command = $cxx $in $ldflags -o $out", ""])
+
+        object_files = []
+        for idx, cpp_file in enumerate(cpp_files):
+            obj = "main.o" if len(cpp_files) == 1 else f"main_{idx}.o"
+            object_files.append(obj)
+            ninja.append(f"build {obj}: compile {_escape_ninja_path(cpp_file)}")
+
         if with_cuda:
-            ninja.append(
-                "build cuda.o: compile_cuda {}".format(
-                    str((pathlib.Path(build_dir) / "cuda.cu").resolve()).replace(
-                        ":", "$:"
-                    )
+            for idx, cuda_file in enumerate(cuda_files):
+                obj = "cuda.o" if len(cuda_files) == 1 else f"cuda_{idx}.o"
+                object_files.append(obj)
+                ninja.append(
+                    f"build {obj}: compile_cuda {_escape_ninja_path(cuda_file)}"
                 )
-            )
         ext = ".so"
-        ninja.append(
-            "build {}{}: link main.o{}".format(
-                name, ext, " cuda.o" if with_cuda else ""
-            )
-        )
+        ninja.append(f"build {name}{ext}: link {' '.join(object_files)}")
         ninja.append("")
         ninja.append(f"default {name}{ext}")
         ninja.append("")
@@ -479,6 +561,9 @@ def _patch_tvm_ffi_load_inline_for_hip() -> None:
 
     load_inline_mod._generate_ninja_build = _generate_hip_ninja_build
     load_inline_mod._sglang_hipcc_patched = True
+    if load_inline_globals is not None:
+        load_inline_globals["_generate_ninja_build"] = _generate_hip_ninja_build
+        load_inline_globals["_sglang_hipcc_patched"] = True
 
 
 @contextmanager

@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
+    fill_decode_page_table_gpu,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
@@ -141,6 +142,17 @@ class NSAFlashMLAMetadata:
         else:
             self.flashmla_metadata.copy_(other.flashmla_metadata)
             self.num_splits.copy_(other.num_splits)
+
+
+def _can_fuse_flashmla_metadata(
+    *metadatas: Optional[NSAFlashMLAMetadata],
+) -> bool:
+    return all(
+        metadata is not None
+        and isinstance(metadata.flashmla_metadata, torch.Tensor)
+        and isinstance(metadata.num_splits, torch.Tensor)
+        for metadata in metadatas
+    )
 
 
 @dataclass(frozen=True)
@@ -1061,33 +1073,37 @@ class NativeSparseAttnBackend(
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
-        assert seq_lens_cpu is not None
-
         self.set_nsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
         metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = int(seq_lens_cpu.max().item())
-
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[req_pool_indices, :max_len]
-            metadata.page_table_1[:, :max_len].copy_(page_indices)
+            fill_decode_page_table_gpu(
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                metadata.page_table_1,
+                bs,
+            )
+            page_indices = metadata.page_table_1
             nsa_cache_seqlens = compute_nsa_seqlens(
                 cache_seqlens, nsa_index_topk=self.nsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
+            assert seq_lens_cpu is not None
             max_seqlen_k = int(
                 seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
             )
@@ -1120,6 +1136,7 @@ class NativeSparseAttnBackend(
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend(include_v2=True):
+            assert seq_lens_cpu is not None
             max_seqlen_k = int(seq_lens_cpu.max().item())
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -2686,7 +2703,10 @@ class NativeSparseAttnMultiStepBackend:
 
             # Use multi-backend fused copy when we have 3 or more backends
             # This is 3x faster than calling the single-backend copy 3 times
-            if self.speculative_num_steps > 3:
+            if (
+                self.speculative_num_steps > 3
+                and not envs.SGLANG_DISABLE_NSA_MULTI_REPLAY_OPT.get()
+            ):
                 try:
                     from sglang.jit_kernel.fused_metadata_copy import (
                         fused_metadata_copy_multi_cuda,
@@ -2700,7 +2720,15 @@ class NativeSparseAttnMultiStepBackend:
                     for i in range(3):
                         self.attn_backends[i].set_nsa_prefill_impl(forward_batch=None)
 
-                    # Prepare FlashMLA tensors if needed
+                    # DCU FlashMLA metadata may be a backend object rather than
+                    # a tensor. Fuse it only when every source/destination is a
+                    # plain tensor; otherwise copy it with its backend API below.
+                    fused_flashmla_metadata = _can_fuse_flashmla_metadata(
+                        precomputed.flashmla_metadata,
+                        metadata0.flashmla_metadata,
+                        metadata1.flashmla_metadata,
+                        metadata2.flashmla_metadata,
+                    )
                     flashmla_num_splits_src = None
                     flashmla_metadata_src = None
                     flashmla_num_splits_dst0 = None
@@ -2710,7 +2738,7 @@ class NativeSparseAttnMultiStepBackend:
                     flashmla_metadata_dst1 = None
                     flashmla_metadata_dst2 = None
 
-                    if precomputed.flashmla_metadata is not None:
+                    if fused_flashmla_metadata:
                         flashmla_num_splits_src = (
                             precomputed.flashmla_metadata.num_splits
                         )
@@ -2791,6 +2819,17 @@ class NativeSparseAttnMultiStepBackend:
                         precomputed.max_len,
                         precomputed.seqlens_expanded_size,
                     )
+
+                    if (
+                        precomputed.flashmla_metadata is not None
+                        and not fused_flashmla_metadata
+                    ):
+                        size = precomputed.seqlens_expanded_size
+                        for metadata in (metadata0, metadata1, metadata2):
+                            flashmla_metadata = metadata.flashmla_metadata.slice(
+                                slice(0, size + 1)
+                            )
+                            flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
                     # Copy remaining backends one by one (if > 3 backends)
                     for i in range(3, self.speculative_num_steps - 1):

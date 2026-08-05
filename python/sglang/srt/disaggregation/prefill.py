@@ -654,8 +654,14 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                result_seq_lens_cpu, result_seq_lens_sum = (
+                    batch.get_seq_lens_snapshot_for_result()
+                )
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                result_batch = batch.copy()
+                result_batch.seq_lens_cpu = result_seq_lens_cpu
+                result_batch.seq_lens_sum = result_seq_lens_sum
+                self.result_queue.append((result_batch, batch_result))
             else:
                 batch_result = None
 
@@ -979,9 +985,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # The matching batch result owns final resource cleanup.
                 self.chunked_req = None
             else:
-                maybe_cache_unfinished_req(
-                    chunked_req, self.tree_cache, chunked=True
-                )
+                maybe_cache_unfinished_req(chunked_req, self.tree_cache, chunked=True)
 
             if abort_pending or chunked_req.req_pool_idx is None:
                 self.running_batch.batch_is_full = False
@@ -1023,9 +1027,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender.abort()
         if req.req_pool_idx is not None:
             release_kv_cache(req, self.tree_cache)
-        release_req_to_metadata_buffer(
-            req, self.req_to_metadata_buffer_idx_allocator
-        )
+        release_req_to_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req._prefill_abort_cleanup_done = True
         self.stream_output([req], req.return_logprob, None)
         return True

@@ -24,6 +24,102 @@ register_cuda_ci(est_time=400, suite="nightly-kernel-1-gpu", nightly=True)
 # =============================================================================
 
 
+def test_multi_wrapper_normalizes_disabled_optional_tensors(monkeypatch):
+    import sglang.jit_kernel.fused_metadata_copy as fused_metadata_copy
+
+    class FakeModule:
+        args = None
+
+        def fused_metadata_copy_multi(self, *args):
+            self.args = args
+
+    fake_module = FakeModule()
+    monkeypatch.setattr(
+        fused_metadata_copy,
+        "_jit_fused_metadata_copy_multi_module",
+        lambda *_: fake_module,
+    )
+
+    tensor = torch.zeros((2, 2), dtype=torch.int32)
+    vector = torch.zeros(2, dtype=torch.int32)
+    fused_metadata_copy.fused_metadata_copy_multi_cuda(
+        vector,
+        vector,
+        tensor,
+        vector,
+        vector,
+        None,
+        None,
+        None,
+        vector,
+        vector,
+        tensor,
+        vector,
+        vector,
+        None,
+        None,
+        None,
+        vector,
+        vector,
+        tensor,
+        vector,
+        vector,
+        None,
+        None,
+        None,
+        vector,
+        vector,
+        tensor,
+        vector,
+        vector,
+        None,
+        None,
+        None,
+        2,
+        2,
+        2,
+    )
+
+    assert fake_module.args is not None
+    optional_arg_indices = (5, 6, 7, 13, 14, 15, 21, 22, 23, 29, 30, 31)
+    assert all(
+        isinstance(fake_module.args[index], torch.Tensor)
+        for index in optional_arg_indices
+    )
+
+
+def test_optional_tensor_normalization_rejects_backend_objects():
+    from sglang.jit_kernel.fused_metadata_copy import _as_optional_tensor
+
+    ref = torch.zeros(1, dtype=torch.int32)
+    with pytest.raises(TypeError, match="torch.Tensor or None"):
+        _as_optional_tensor(object(), ref, 1)
+
+
+def test_flashmla_backend_objects_are_not_sent_to_fused_kernel():
+    from sglang.srt.layers.attention.nsa_backend import (
+        NSAFlashMLAMetadata,
+        _can_fuse_flashmla_metadata,
+    )
+
+    tensor_metadata = NSAFlashMLAMetadata(
+        flashmla_metadata=torch.zeros(1, dtype=torch.int32),
+        num_splits=torch.zeros(1, dtype=torch.int32),
+    )
+    backend_metadata = NSAFlashMLAMetadata(
+        flashmla_metadata=object(),
+        num_splits=torch.zeros(1, dtype=torch.int32),
+    )
+
+    assert _can_fuse_flashmla_metadata(*(tensor_metadata,) * 4)
+    assert not _can_fuse_flashmla_metadata(
+        tensor_metadata,
+        backend_metadata,
+        tensor_metadata,
+        tensor_metadata,
+    )
+
+
 def create_test_metadata(
     bs: int,
     max_len: int,

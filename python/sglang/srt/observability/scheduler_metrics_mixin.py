@@ -89,6 +89,14 @@ class KvMetrics:
 class SchedulerMetricsMixin:
     enable_fpm: bool = False
 
+    @staticmethod
+    def _get_batch_seq_lens_sum(batch: ScheduleBatch) -> int:
+        if batch.seq_lens_sum is not None:
+            return int(batch.seq_lens_sum)
+        if batch.seq_lens_cpu is not None:
+            return int(batch.seq_lens_cpu.sum().item())
+        return sum(req.seqlen for req in batch.reqs)
+
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
@@ -284,8 +292,12 @@ class SchedulerMetricsMixin:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            for sl in batch.seq_lens_cpu:
-                decode_kv.add(int(sl))
+            if batch.seq_lens_cpu is not None:
+                for seq_len in batch.seq_lens_cpu:
+                    decode_kv.add(int(seq_len))
+            else:
+                for req in batch.reqs:
+                    decode_kv.add(req.seqlen)
 
         return ScheduledRequestMetrics(
             num_prefill_requests=num_prefill_requests,
@@ -451,7 +463,7 @@ class SchedulerMetricsMixin:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        total_context = float(batch.seq_lens_cpu.sum().item())
+        total_context = float(self._get_batch_seq_lens_sum(batch))
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * total_context
@@ -746,7 +758,7 @@ class SchedulerMetricsMixin:
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            self.stats.decode_sum_seq_lens = self._get_batch_seq_lens_sum(batch)
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)

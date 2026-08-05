@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.nsa.utils import compute_nsa_seqlens
 
@@ -58,6 +60,63 @@ def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     )
 
 
+@triton.jit
+def _fill_decode_page_table_kernel(
+    req_to_token,
+    req_pool_indices,
+    seq_lens,
+    page_table,
+    req_to_token_stride: tl.constexpr,
+    page_table_stride: tl.constexpr,
+    max_len: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    req_idx = tl.load(req_pool_indices + row)
+    seq_len = tl.load(seq_lens + row)
+    in_bounds = cols < max_len
+    valid = in_bounds & (cols < seq_len)
+    vals = tl.load(
+        req_to_token + req_idx * req_to_token_stride + cols,
+        mask=valid,
+        other=0,
+    ).to(tl.int32)
+    tl.store(page_table + row * page_table_stride + cols, vals, mask=in_bounds)
+
+
+def fill_decode_page_table_gpu(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    bs: int,
+):
+    """Fill the active decode page-table prefix from GPU sequence lengths."""
+    if bs == 0:
+        return
+    max_len = page_table.shape[1]
+    if max_len == 0:
+        return
+    # Clear the invalid tail inside the graph-capture width. The full page table
+    # is transformed/copied later, so leaving torch.empty() contents here can
+    # turn into an out-of-range cache address. This is ordinary NSA page-table
+    # hygiene and is independent of KPool support.
+    block = 1024
+    _fill_decode_page_table_kernel[(bs, triton.cdiv(max_len, block))](
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        page_table,
+        req_to_token.shape[1],
+        page_table.stride(0),
+        max_len,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+
 class NativeSparseAttnBackendMTPPrecomputeMixin:
     """Mixin class providing metadata precomputation for multi-step speculative decoding.
 
@@ -70,7 +129,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
         spec_info: Optional["SpecInput"],
     ) -> PrecomputedMetadata:
@@ -93,19 +152,20 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         """
         # Slice inputs to batch size
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Dispatch to mode-specific precomputation
         if forward_mode.is_decode_or_idle():
-            return self._precompute_decode_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu
-            )
+            return self._precompute_decode_mode(bs, req_pool_indices, seq_lens)
         elif forward_mode.is_target_verify():
+            assert seq_lens_cpu is not None
             return self._precompute_target_verify_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu
             )
         elif forward_mode.is_draft_extend():
+            assert seq_lens_cpu is not None
             return self._precompute_draft_extend_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu, spec_info
             )
@@ -117,17 +177,25 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
-        max_len = int(seq_lens_cpu.max().item())
-
         # Convert to int32 and compute cumsum
         cache_seqlens = seq_lens.to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
-        # Get page indices from cache
-        page_indices = self.req_to_token[req_pool_indices, :max_len].contiguous()
+        # Build only valid entries on device. The allocation follows the
+        # captured width, while the kernel masks each row by GPU seq_lens.
+        max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        page_indices = torch.empty(
+            (bs, max_len), dtype=torch.int32, device=seq_lens.device
+        )
+        fill_decode_page_table_gpu(
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_indices,
+            bs,
+        )
 
         # Compute NSA seqlens
         nsa_cache_seqlens = compute_nsa_seqlens(

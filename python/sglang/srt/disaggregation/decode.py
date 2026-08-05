@@ -50,7 +50,6 @@ from sglang.srt.disaggregation.utils import (
     all_reduce_status_by_rid,
     get_kv_class,
     is_mla_backend,
-    poll_and_all_reduce,
     poll_and_all_reduce_by_rid,
     poll_and_all_reduce_with_staging,
     poll_and_all_reduce_with_staging_by_rid,
@@ -667,9 +666,7 @@ class DecodePreallocQueue:
                 continue
             # Keep polling after the initial handshake. An asynchronous failure
             # must override the cached waiting_for_input state.
-            local_status_by_rid[decode_req.req.rid] = int(
-                decode_req.kv_receiver.poll()
-            )
+            local_status_by_rid[decode_req.req.rid] = int(decode_req.kv_receiver.poll())
         if rids_to_check is None:
             status_by_rid = all_reduce_status_by_rid(
                 local_status_by_rid, self.gloo_group
@@ -1698,8 +1695,14 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
+                result_seq_lens_cpu, result_seq_lens_sum = (
+                    batch.get_seq_lens_snapshot_for_result()
+                )
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                result_batch = batch.copy()
+                result_batch.seq_lens_cpu = result_seq_lens_cpu
+                result_batch.seq_lens_sum = result_seq_lens_sum
+                self.result_queue.append((result_batch, batch_result))
             else:
                 batch_result = None
 

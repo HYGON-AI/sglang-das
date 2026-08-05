@@ -2425,6 +2425,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
+    def maybe_wait_verify_done_on_stream(self, stream: Optional[torch.Stream] = None):
+        """Make the next GPU operation depend on the previous verify event.
+
+        Spec-v2 overlap keeps ``seq_lens`` on the forward stream until verify
+        completes.  Waiting on the event from the host serializes scheduler
+        preparation with target verify; a stream wait preserves the data
+        dependency without creating a CPU-side bubble between graph replays.
+        """
+        if self.is_spec_v2:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                if stream is None:
+                    stream = torch.get_device_module(self.device).current_stream()
+                stream.wait_event(draft_input.verify_done)
+
+    def _refresh_seq_lens_sum_from_reqs(self):
+        self.seq_lens_sum = sum(req.seqlen for req in self.reqs)
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2432,10 +2450,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
-
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2457,6 +2471,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # No need to filter
             return
 
+        # Keep the verify dependency on the GPU stream. The compacted tensors
+        # below must observe verified sequence lengths, but the host scheduler
+        # can prepare the next MTP replay while verify is still running.
+        self.maybe_wait_verify_done_on_stream()
+
         keep_indices_device = torch.tensor(
             keep_indices,
             dtype=torch.int64,
@@ -2472,10 +2491,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
-        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+        if self.is_spec_v2:
+            self.seq_lens_cpu = None
+        else:
+            self.seq_lens_cpu = (
+                self.seq_lens_cpu[keep_indices]
+                if self.seq_lens_cpu is not None
+                else None
+            )
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_sum = self.seq_lens_cpu.sum().item()
+        elif self.is_spec_v2:
+            self._refresh_seq_lens_sum_from_reqs()
+        else:
+            self.seq_lens_sum = None
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2514,7 +2545,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # In disagg decode + overlap, merge_batch can be called before
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
+        self.maybe_wait_verify_done_on_stream()
+        other.maybe_wait_verify_done_on_stream()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2529,10 +2561,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        if self.is_spec_v2 or other.is_spec_v2:
+            self.seq_lens_cpu = None
+        elif self.seq_lens_cpu is not None and other.seq_lens_cpu is not None:
+            self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        else:
+            self.seq_lens_cpu = None
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
+        merged_seq_lens_sum = (
+            self.seq_lens_sum + other.seq_lens_sum
+            if self.seq_lens_sum is not None and other.seq_lens_sum is not None
+            else None
+        )
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None
@@ -2548,6 +2589,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        if merged_seq_lens_sum is not None:
+            self.seq_lens_sum = merged_seq_lens_sum
+        elif self.is_spec_v2 or other.is_spec_v2:
+            self._refresh_seq_lens_sum_from_reqs()
+        else:
+            self.seq_lens_sum = None
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
@@ -2644,6 +2691,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
         )
 
+    def get_seq_lens_snapshot_for_result(self):
+        """Return current-input CPU lengths before spec-v2 advances the batch."""
+        seq_lens_cpu = self.seq_lens_cpu
+        seq_lens_sum = self.seq_lens_sum if seq_lens_cpu is not None else None
+        if seq_lens_cpu is None and self.spec_info is not None:
+            # The current draft input owns the D2H copy produced by the prior
+            # verify. run_batch() replaces spec_info with the next draft input,
+            # whose lengths already include this iteration's accepted tokens.
+            seq_lens_cpu = getattr(self.spec_info, "new_seq_lens_cpu", None)
+
+        if seq_lens_cpu is None:
+            # The first decode after prefill and batches changed by filter/merge
+            # do not have a reusable CPU mirror. Queue a copy of the current GPU
+            # lengths on the schedule stream. The overlap forward stream waits
+            # for this stream, and result.copy_done is recorded afterwards, so
+            # result processing can read this tensor without an extra event.
+            use_pin_memory = is_pin_memory_available(self.device)
+            seq_lens_cpu = torch.empty(
+                tuple(self.seq_lens.shape),
+                dtype=self.seq_lens.dtype,
+                device="cpu",
+                pin_memory=use_pin_memory,
+            )
+            seq_lens_cpu.copy_(self.seq_lens, non_blocking=use_pin_memory)
+
+        # A sum derived from Req objects can lag the GPU lengths in overlap
+        # scheduling. Let the result processor sum the preserved CPU snapshot
+        # unless seq_lens_cpu and seq_lens_sum were already a matching pair.
+        return seq_lens_cpu, seq_lens_sum
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
@@ -2666,6 +2743,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_sum=self.seq_lens_sum,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,

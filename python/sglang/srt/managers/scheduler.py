@@ -1676,8 +1676,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                result_seq_lens_cpu, result_seq_lens_sum = (
+                    batch.get_seq_lens_snapshot_for_result()
+                )
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                result_batch = batch.copy()
+                result_batch.seq_lens_cpu = result_seq_lens_cpu
+                result_batch.seq_lens_sum = result_seq_lens_sum
+                self.result_queue.append((result_batch, batch_result))
             else:
                 batch_result = None
 

@@ -109,6 +109,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
+    seq_lens_cpu_ready: Optional[torch.cuda.Event] = None
     grammar: BaseGrammarObject = None
     use_sglang_assign_req_to_token_pool = get_bool_env_var(
         "SGLANG_ASSIGN_REQ_TO_TOKEN_POOL"
@@ -803,6 +804,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # V2 overlap worker only
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
+    new_seq_lens_cpu: Optional[torch.Tensor] = None
+    new_seq_lens_cpu_ready: Optional[torch.cuda.Event] = None
     verify_done: Optional[torch.cuda.Event] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
@@ -874,6 +877,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        # The deferred CPU copy is indexed in the pre-filter batch order.
+        # Materialize synchronously if a later phase needs it after filtering.
+        self.new_seq_lens_cpu = None
+        self.new_seq_lens_cpu_ready = None
+
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
             if self.future_indices.indices.numel() == 0:
@@ -911,6 +919,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.mtp_topk_indices = self.mtp_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        # A concatenated batch cannot reuse either pre-merge async CPU mirror.
+        self.new_seq_lens_cpu = None
+        self.new_seq_lens_cpu_ready = None
+
         if (self.future_indices is None) != (spec_info.future_indices is None):
             raise ValueError(
                 "Cannot merge resolved and unresolved Eagle draft inputs; "
