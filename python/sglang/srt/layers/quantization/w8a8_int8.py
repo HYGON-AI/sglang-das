@@ -241,8 +241,13 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        input_quant_args: Optional[List[torch.Tensor]] = None,
     ):
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
+            if input_quant_args is not None:
+                raise NotImplementedError(
+                    "Pre-quantized input is not supported by the CPU W8A8 backend."
+                )
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -251,7 +256,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        x_q, x_scale = per_token_quant_int8(x)
+        if input_quant_args is not None:
+            assert len(input_quant_args) == 2
+            x_q, x_scale = input_quant_args
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
