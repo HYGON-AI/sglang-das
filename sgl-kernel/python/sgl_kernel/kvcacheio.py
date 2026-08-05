@@ -23,6 +23,10 @@ def is_hip() -> bool:
 
 _is_hip = is_hip()
 
+
+def get_rocm_kernel_accessible_ptrs(tensors: List[torch.Tensor]) -> List[int]:
+    return torch.ops.sgl_kernel.get_rocm_kernel_accessible_ptrs.default(tensors)
+
 def hcu_create_extend_after_decode_spec_info(
     verified_id: torch.Tensor,
     seq_lens: torch.Tensor,

@@ -8,10 +8,23 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#ifdef USE_ROCM
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#endif
 
 namespace {
+
+#ifdef USE_ROCM
+constexpr int ROTARY_EMBEDDING_MAX_THREADS = 256;
+using rotary_bfloat16 = hip_bfloat16;
+#else
+constexpr int ROTARY_EMBEDDING_MAX_THREADS = 512;
+using rotary_bfloat16 = nv_bfloat16;
+#endif
 
 template <typename scalar_t, bool IS_NEOX>
 inline __device__ void apply_token_rotary_embedding(
@@ -160,7 +173,7 @@ void launch_kernel(
   } else if (DTYPE_CODE == kDLFloat && DTYPE_BITS == 16) {                                                        \
     launch_kernel<half, IS_NEOX>(__VA_ARGS__);                                                                    \
   } else if (DTYPE_CODE == kDLBfloat && DTYPE_BITS == 16) {                                                       \
-    launch_kernel<nv_bfloat16, IS_NEOX>(__VA_ARGS__);                                                             \
+    launch_kernel<rotary_bfloat16, IS_NEOX>(__VA_ARGS__);                                                         \
   } else {                                                                                                        \
     RuntimeCheck(                                                                                                 \
         false, "Unsupported data type for rotary embedding. Only float32, float16, and bfloat16 are supported."); \
@@ -265,7 +278,7 @@ struct RotaryEmbeddingKernel {
     int64_t head_stride = (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
 
     dim3 grid(num_tokens);
-    dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
+    dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, ROTARY_EMBEDDING_MAX_THREADS));
 
     auto device = query.device();
     const cudaStream_t stream = LaunchKernel::resolve_device(device);

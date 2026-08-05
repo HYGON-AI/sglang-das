@@ -10,10 +10,11 @@ Tests cover:
 import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
@@ -58,6 +59,46 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
     return req
 
 
+class TestHiSparseConfig(unittest.TestCase):
+    def test_swap_in_block_size_is_parsed(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        config = parse_hisparse_config(
+            SimpleNamespace(
+                hisparse_config=(
+                    '{"top_k": 2048, "device_buffer_size": 6144, '
+                    '"host_to_device_ratio": 3, "swap_in_block_size": 256}'
+                )
+            )
+        )
+
+        self.assertEqual(config.swap_in_block_size, 256)
+
+    def test_swap_in_block_size_defaults_to_960(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        config = parse_hisparse_config(SimpleNamespace(hisparse_config=None))
+
+        self.assertEqual(config.swap_in_block_size, 960)
+
+    def test_swap_in_block_size_rejects_invalid_value(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        with self.assertRaisesRegex(ValueError, "range"):
+            parse_hisparse_config(
+                SimpleNamespace(
+                    hisparse_config='{"swap_in_block_size": 1025}'
+                )
+            )
+
+    @patch("sglang.jit_kernel.hisparse.is_hcu", return_value=True)
+    def test_swap_in_block_size_is_capped_for_hcu(self, _):
+        from sglang.jit_kernel.hisparse import resolve_hisparse_block_size
+
+        self.assertEqual(resolve_hisparse_block_size(960), 256)
+        self.assertEqual(resolve_hisparse_block_size(128), 128)
+
+
 class TestHiSparseUnit(unittest.TestCase):
     """Test class that builds a minimal HiSparse component stack."""
 
@@ -88,7 +129,7 @@ class TestHiSparseUnit(unittest.TestCase):
         cls._original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
         ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
 
-        global_page_size = 1 if is_hip() else PAGE_SIZE
+        global_page_size = 1 if is_hip() and not is_hcu() else PAGE_SIZE
 
         from sglang.srt.mem_cache.hisparse_memory_pool import (
             HiSparseNSATokenToKVPool,
@@ -172,6 +213,28 @@ class TestHiSparseUnit(unittest.TestCase):
     # ==================================================================
     # Low-level helpers
     # ==================================================================
+
+    def test_mla_location_dtype_boundary(self):
+        from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+
+        logical_loc = torch.tensor([0], dtype=torch.int64, device="cuda")
+        self.allocator.full_to_hisparse_device_index_mapping[logical_loc] = 7
+
+        translated_loc = self.device_pool.translate_loc_to_hisparse_device(
+            logical_loc
+        )
+        self.assertEqual(translated_loc.dtype, torch.int32)
+
+        with patch.object(
+            NSATokenToKVPool, "set_mla_kv_buffer", autospec=True
+        ) as set_mla_kv_buffer:
+            self.device_pool.set_mla_kv_buffer(
+                SimpleNamespace(layer_id=0), logical_loc, None, None
+            )
+
+        stored_loc = set_mla_kv_buffer.call_args.args[2]
+        self.assertEqual(stored_loc.dtype, torch.int64)
+        self.assertEqual(stored_loc.item(), 7)
 
     def _alloc_req_slot(self, req):
         """Allocate a req_pool_idx for the request."""

@@ -57,6 +57,19 @@ void* get_rocm_kernel_accessible_ptr(const at::Tensor& tensor) {
 }  // namespace
 #endif
 
+std::vector<int64_t> get_rocm_kernel_accessible_ptrs(const std::vector<at::Tensor>& tensors) {
+#ifdef USE_ROCM
+  std::vector<int64_t> ptrs;
+  ptrs.reserve(tensors.size());
+  for (const auto& tensor : tensors) {
+    ptrs.push_back(reinterpret_cast<int64_t>(get_rocm_kernel_accessible_ptr(tensor)));
+  }
+  return ptrs;
+#else
+  TORCH_CHECK(false, "get_rocm_kernel_accessible_ptrs is only available on ROCm");
+#endif
+}
+
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);

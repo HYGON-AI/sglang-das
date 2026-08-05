@@ -669,6 +669,8 @@ void transfer_kv_per_layer_mla(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+std::vector<int64_t> get_rocm_kernel_accessible_ptrs(const std::vector<at::Tensor>& tensors);
+
 void transfer_kv_per_layer_mla_pf_lf(
     const at::Tensor src,
     at::Tensor dst,

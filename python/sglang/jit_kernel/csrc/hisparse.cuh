@@ -8,14 +8,21 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_runtime.h>
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
 
 namespace {
 
+#ifdef USE_ROCM
+constexpr int WARP_SIZE = 64;
+using BallotMask = uint64_t;
+constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
+#else
 constexpr int WARP_SIZE = 32;
+using BallotMask = unsigned int;
+constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
+#endif
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 constexpr int32_t HASH_EMPTY = -1;
 
@@ -24,6 +31,25 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
 }
 
+#ifdef USE_ROCM
+__device__ __forceinline__ void transfer_item_warp(
+    int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
+  const auto src = static_cast<const char*>(src_addr);
+  auto dst = static_cast<char*>(dst_addr);
+
+  const int64_t word_count = item_size_bytes / static_cast<int64_t>(sizeof(uint64_t));
+  const auto src_words = reinterpret_cast<const uint64_t*>(src);
+  auto dst_words = reinterpret_cast<uint64_t*>(dst);
+  for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
+    dst_words[i] = src_words[i];
+  }
+
+  const int64_t tail_start = word_count * static_cast<int64_t>(sizeof(uint64_t));
+  for (int64_t i = tail_start + lane_id; i < item_size_bytes; i += WARP_SIZE) {
+    dst[i] = src[i];
+  }
+}
+#else
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
@@ -51,21 +77,38 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
   }
 }
+#endif
+
+__device__ __forceinline__ int popc_mask(BallotMask mask) {
+#ifdef USE_ROCM
+  return __popcll(mask);
+#else
+  return __popc(mask);
+#endif
+}
+
+__device__ __forceinline__ BallotMask ballot_mask(bool predicate) {
+#ifdef USE_ROCM
+  return __ballot(predicate);
+#else
+  return __ballot_sync(FULL_WARP_MASK, predicate);
+#endif
+}
 
 __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
   int idx = lane_id + offset;
   int val = (idx < count) ? s_data[idx] : 0;
 
 #pragma unroll
-  for (int i = 1; i < 32; i *= 2) {
-    int n = __shfl_up_sync(0xffffffff, val, i);
+  for (int i = 1; i < WARP_SIZE; i *= 2) {
+    int n = __shfl_up_sync(FULL_WARP_MASK, val, i);
     if (lane_id >= i) val += n;
   }
   val += accumulator;
   if (idx < count) {
     s_data[idx] = val;
   }
-  accumulator = __shfl_sync(0xffffffff, val, 31);
+  accumulator = __shfl_sync(FULL_WARP_MASK, val, WARP_SIZE - 1);
   return accumulator;
 }
 
@@ -132,7 +175,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
-  const unsigned int lanes_before = ((unsigned int)1 << lane_id) - 1;
+  const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
 
   const int64_t rid = req_pool_indices[bid];
   const int64_t seq_len = seq_lens[bid];
@@ -260,22 +303,33 @@ __global__ void load_cache_to_device_buffer_kernel(
     int local_hit_offset = 0;
     int local_evict_offset = 0;
     if (has_valid_chunk) {
-      const unsigned int hit_mask = __ballot_sync(0xFFFFFFFF, is_hit);
-      const unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
-      local_hit_offset = __popc(hit_mask & lanes_before);
-      local_evict_offset = __popc(evict_mask & lanes_before);
+      const BallotMask hit_mask = ballot_mask(is_hit);
+      const BallotMask evict_mask = ballot_mask(is_evictable);
+      local_hit_offset = popc_mask(hit_mask & lanes_before);
+      local_evict_offset = popc_mask(evict_mask & lanes_before);
       if (lane_id == 0) {
-        s_chunk_offset[chunk_idx + 1] = __popc(hit_mask);
-        s_evict_chunk_offset[chunk_idx + 1] = __popc(evict_mask);
+        s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
+        s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
       }
     }
     __syncthreads();
 
     if (warp_id == 0) {
+#ifdef USE_ROCM
+      // Wavefront64 is wider than NUM_WARPS for the block sizes used here.
+      // Restrict each scan to this iteration's window so later offsets are not
+      // overwritten by otherwise-active lanes.
+      const int scan_offset = iter * NUM_WARPS + 1;
+      const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
+      total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
+      total_evict_count =
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
+#else
       total_hit_count =
           warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
       total_evict_count =
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+#endif
       if (tid == 0) {
         s_total_hits = total_hit_count;
       }
@@ -324,9 +378,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
 
     if (has_valid_chunk) {
-      const unsigned int miss_mask = __ballot_sync(0xFFFFFFFF, is_miss);
-      local_miss_offset = __popc(miss_mask & lanes_before);
-      const int warp_miss_count = __popc(miss_mask);
+      const BallotMask miss_mask = ballot_mask(is_miss);
+      local_miss_offset = popc_mask(miss_mask & lanes_before);
+      const int warp_miss_count = popc_mask(miss_mask);
       if (lane_id == 0) {
         s_chunk_offset[chunk_idx + 1] = warp_miss_count;
       }
@@ -334,7 +388,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
+#ifdef USE_ROCM
+      const int scan_offset = iter * NUM_WARPS + 1;
+      const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
+      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
+#else
       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+#endif
     }
     __syncthreads();
 
@@ -354,6 +414,21 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+#ifdef USE_ROCM
+    // Keep the writeback loop within the launch bound used by ROCm builds.
+    constexpr int LRU_WRITEBACK_THREADS = (BLOCK_SIZE > 512) ? 512 : BLOCK_SIZE;
+    if (tid < LRU_WRITEBACK_THREADS) {
+      for (int i = tid; i < HOT_BUFFER_SIZE; i += LRU_WRITEBACK_THREADS) {
+        if (i < total_misses) {
+          req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+        } else if (i < total_evictable) {
+          req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+        } else {
+          req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+        }
+      }
+    }
+#else
     for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
       if (i < total_misses) {
         // Misses: just loaded from host, place right before hits
@@ -366,6 +441,7 @@ __global__ void load_cache_to_device_buffer_kernel(
         req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
       }
     }
+#endif
   }
 
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
@@ -430,9 +506,11 @@ void load_cache_to_device_buffer(
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+#ifndef USE_ROCM
     if constexpr (smem_bytes > 48u * 1024u) {
       cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     }
+#endif
     LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
         kernel_fn,
         static_cast<const int32_t*>(top_k_tokens.data_ptr()),

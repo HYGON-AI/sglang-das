@@ -205,6 +205,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("transfer_kv_all_direct_lf_pf_D2H_hcu(Tensor[] src_ptrs_k, Tensor[] src_ptrs_v,Tensor dst_ptrs_k, Tensor dst_ptrs_v,"
       "Tensor src_indices,Tensor dst_indices, int start_layer_id, int page_size) ->() ");
   m.impl("transfer_kv_all_direct_lf_pf_D2H_hcu", torch::kCUDA, &transfer_kv_all_direct_lf_pf_D2H_hcu);
+  m.def("get_rocm_kernel_accessible_ptrs(Tensor[] tensors) -> int[]");
+  m.impl("get_rocm_kernel_accessible_ptrs", torch::kCPU, &get_rocm_kernel_accessible_ptrs);
   m.def(
       "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
       "dst_indices, int item_size, int block_quota, int num_warps_per_block) -> ()");

@@ -51,9 +51,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
@@ -1136,16 +1137,24 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        raw_data_ptrs = [x.data_ptr() for x in self.data_refs]
+        if _is_hip:
+            from sgl_kernel.kvcacheio import get_rocm_kernel_accessible_ptrs
+
+            kernel_data_ptrs = get_rocm_kernel_accessible_ptrs(self.data_refs)
+        else:
+            kernel_data_ptrs = raw_data_ptrs
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
+            kernel_data_ptrs,
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self.raw_data_ptrs = raw_data_ptrs
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
-        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_ptrs = self.raw_data_ptrs
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.token_stride_size] * self.layer_num
         return data_ptrs, data_lens, item_lens

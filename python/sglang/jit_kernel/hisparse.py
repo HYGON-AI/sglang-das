@@ -6,9 +6,20 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+HCU_MAX_HISPARSE_BLOCK_SIZE = 256
+
+
+def resolve_hisparse_block_size(block_size: int) -> int:
+    """Return a launch-safe HiSparse block size for the active backend."""
+    if is_hcu():
+        return min(block_size, HCU_MAX_HISPARSE_BLOCK_SIZE)
+    return block_size
 
 
 @functools.cache
@@ -62,6 +73,8 @@ def _load_cache_to_device_buffer_mla(
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+
+    block_size = resolve_hisparse_block_size(block_size)
 
     module = _jit_sparse_module(
         item_size_bytes,

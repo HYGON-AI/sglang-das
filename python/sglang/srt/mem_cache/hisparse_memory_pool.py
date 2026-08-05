@@ -106,7 +106,10 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        loc = self.translate_loc_to_hisparse_device(loc)
+        # FlashMLA consumes translated indices as int32, while the HCU LightOp
+        # KV-store kernel requires int64 locations. Keep the public translation
+        # dtype unchanged and adapt only at this storage boundary.
+        loc = self.translate_loc_to_hisparse_device(loc).to(torch.int64)
         super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
     def get_mla_kv_buffer(

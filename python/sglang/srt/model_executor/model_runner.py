@@ -798,6 +798,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else self.tp_group.cpu_group
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    swap_in_block_size=hisparse_cfg.swap_in_block_size,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
