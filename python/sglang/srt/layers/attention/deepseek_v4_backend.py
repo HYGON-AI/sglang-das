@@ -1464,70 +1464,19 @@ class DeepseekV4AttnBackend(
                     extra_indices=extra_indices,
                     extra_topk_lengths=extra_topk_lengths,
                 )
-
-            if not envs.SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA.get():
-                return self._forward_flash_mla_decode(
-                    q=q,
-                    swa_k_cache=swa_k_cache,
-                    swa_page_indices=swa_page_indices,
-                    swa_topk_lengths=swa_topk_lengths,
-                    flashmla_metadata=flashmla_metadata,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices=extra_indices,
-                    extra_topk_lengths=extra_topk_lengths,
-                    compress_ratio=compress_ratio,
-                    layer_id=layer_id,
-                )
-
-            if forward_batch.forward_mode.is_decode_or_idle() or (
-                forward_batch.forward_mode.is_target_verify()
-            ):
-                return self._forward_flash_mla_decode(
-                    q=q,
-                    swa_k_cache=swa_k_cache,
-                    swa_page_indices=swa_page_indices,
-                    swa_topk_lengths=swa_topk_lengths,
-                    flashmla_metadata=flashmla_metadata,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices=extra_indices,
-                    extra_topk_lengths=extra_topk_lengths,
-                    compress_ratio=compress_ratio,
-                    layer_id=layer_id,
-                )
-
-            if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
-                if _should_use_sparse_prefill(q, forward_batch):
-                    return self._forward_prefill_sparse(
-                        q=q,
-                        layer_id=layer_id,
-                        compress_ratio=compress_ratio,
-                        forward_batch=forward_batch,
-                        token_to_kv_pool=token_to_kv_pool,
-                        core_attn_metadata=core_attn_metadata,
-                        attn_sink=attn_sink,
-                    )
-                return self._forward_flash_mla_prefill(
-                    q=q,
-                    swa_k_cache=swa_k_cache,
-                    swa_page_indices=swa_page_indices,
-                    swa_topk_lengths=swa_topk_lengths,
-                    flashmla_metadata=flashmla_metadata,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices=extra_indices,
-                    extra_topk_lengths=extra_topk_lengths,
-                    forward_batch=forward_batch,
-                    compress_ratio=compress_ratio,
-                    layer_id=layer_id,
-                )
-
-            raise NotImplementedError(
-                f"unsupported mode {forward_batch.forward_mode=} for DeepSeekV4 FlashMLA"
+            return self._forward_flash_mla_decode(
+                q=q,
+                swa_k_cache=swa_k_cache,
+                swa_page_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                flashmla_metadata=flashmla_metadata,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_lengths,
+                compress_ratio=compress_ratio,
+                layer_id=layer_id,
             )
-
-        raise NotImplementedError("ragged attention")
 
     def expand_prefill_casually(
         self,
