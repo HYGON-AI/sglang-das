@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import torch
@@ -5,6 +6,8 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+
+logger = logging.getLogger(__name__)
 
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
@@ -124,6 +127,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         if return_intermediate_states or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
+            logger.info("FlashKDA prefill fall back to Triton chunk_kda")
             return _triton_fallback(
                 q,
                 k,

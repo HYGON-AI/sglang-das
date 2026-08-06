@@ -14,9 +14,13 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.kernels.ops.attention.fla.kda_hcu import (
+    fused_recurrent_kda_packed_decode_hcu,
+)
 from sglang.srt.utils import get_bool_env_var
 
 _use_decode_aiter_linear_attn = get_bool_env_var("SGLANG_USE_AITER_LINEAR_ATTN")
+_USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -359,6 +363,59 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
+
+    if _USE_KDA_HCU and use_qk_l2norm_in_kernel and H == HV:
+        # Operator-team packed-decode kernels (see fla/kda_hcu.py).  They
+        # assume num_q_heads == num_kv_heads and always L2-normalize Q/K, so
+        # only take this path when both hold; otherwise fall through to the
+        # native kernels below.
+        return fused_recurrent_kda_packed_decode_hcu(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            out=out,
+            ssm_state_indices=ssm_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            lower_bound=lower_bound,
+        )
+
+    # Batched-decode CUDA fast path:
+    # row-streaming state update reaches the in-place R+W bandwidth of the
+    # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
+    # [BV, K] register tile per warp. ULP-level output differences only
+    # (reduction order); small batches keep triton (launch-bound anyway).
+    if use_qk_l2norm_in_kernel:
+        from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
+
+        if kda_decode_cuda.covered(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            out,
+            ssm_state_indices,
+            H,
+        ):
+            kda_decode_cuda.kda_packed_decode(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                out,
+                ssm_state_indices,
+                H,
+                None,  # plain GDN gate: no lower bound
+            )
+            return out, initial_state
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:

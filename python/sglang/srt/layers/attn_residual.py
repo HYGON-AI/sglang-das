@@ -24,7 +24,8 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip
+from sglang.kernels.ops.kimi_k3.attn_res_hcu import attn_res_hcu
+from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -32,6 +33,7 @@ _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
+_USE_HCU_ATTN_RES = is_hcu() and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU")
 
 def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
@@ -207,6 +209,8 @@ def _mix_fused(
     score_norm: RMSNorm,
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
+    if _USE_HCU_ATTN_RES:
+        return _mix_hcu(prefix_sum, bank, nvb, score_proj, score_norm)
     T, H = prefix_sum.shape
     cw = get_cw(score_proj, score_norm)
     n_h_blocks = H // _BLOCK_H
@@ -247,6 +251,29 @@ def _mix_fused(
         num_warps=4,
     )
     return out
+
+
+
+def _mix_hcu(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+) -> torch.Tensor:
+    """HCU single-kernel mix (vendored in kernels/ops/kimi_k3/attn_res_hcu.py):
+    score -> online softmax -> weighted sum. Same math as ``_mix_fused``."""
+    if nvb == 0:
+        return prefix_sum
+
+    return attn_res_hcu(
+        prefix_sum,
+        bank,
+        norm_weight=score_norm.weight,
+        qk_weight=score_proj.weight.squeeze(),
+        num_blocks=nvb,
+        eps=score_norm.variance_epsilon,
+    )
 
 
 def _aggregate_fused(
