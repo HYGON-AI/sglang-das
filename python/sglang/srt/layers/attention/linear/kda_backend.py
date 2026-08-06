@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_hcu, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # HCU: use the operator-library causal_conv1d (DAS/DTK build) for the plain
@@ -28,7 +28,10 @@ from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 # retrieve_*) that the library's causal_conv1d_update does not provide.
 _hcu_causal_conv1d_fn = None
 _hcu_causal_conv1d_update = None
-if is_hcu():
+_use_hcu_cc1d = is_hcu() and get_bool_env_var(
+    "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU"
+)
+if _use_hcu_cc1d:
     from causal_conv1d import (
         causal_conv1d_fn_hcu as _hcu_causal_conv1d_fn,
         causal_conv1d_update as _hcu_causal_conv1d_update,
