@@ -18,8 +18,8 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
-import os
 import logging
+import os
 from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -40,8 +40,8 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -126,14 +126,17 @@ if _is_npu:
 
 _FP32GEMM_GATE = None
 
+
 def _gate_fp32gemm(
-    hidden_states: torch.Tensor, weight: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
 ) -> torch.Tensor:
     global _FP32GEMM_GATE
     if _FP32GEMM_GATE is None:
         if os.environ.get("SGLANG_USE_FP32GEMM_GATE_CUSTOM", "0") == "1":
             try:
                 import fp32gemm
+
                 _FP32GEMM_GATE = fp32gemm
             except ImportError:
                 _FP32GEMM_GATE = False
@@ -1231,7 +1234,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         if _use_fused_rms_quant:
             pre_norm = hidden_states.clone() if residual is None else residual
             hidden_states, _ = self.layer_communicator.prepare_attn(
-                hidden_states, residual, forward_batch, skip_layernorm=True
+                hidden_states, residual, forward_batch
             )
             if residual is not None:
                 assert residual.shape[0] == hidden_states.shape[0], (
@@ -1319,13 +1322,17 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 rms_weight=self.input_layernorm.weight,
                 residual=residual,
             )
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, pre_norm)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, pre_norm
+            )
         else:
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual, None)
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, None
+                )
 
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1333,7 +1340,9 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
         return hidden_states, residual
 
@@ -1412,13 +1421,13 @@ class MiniMaxM2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-       
+
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-        )
+                config.vocab_size,
+                config.hidden_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+            )
 
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM2DecoderLayer(
@@ -1508,7 +1517,7 @@ class MiniMaxM2Model(nn.Module):
                         ),
                     )
 
-        if not self.pp_group.is_last_rank:   
+        if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -1562,13 +1571,13 @@ class MiniMaxM2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-        
+
         self.model = MiniMaxM2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
         if self.pp_group.is_last_rank:
-                   
+
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -1578,13 +1587,14 @@ class MiniMaxM2ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config)        
+        self.logits_processor = LogitsProcessor(config)
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
+
     @property
     def start_layer(self) -> int:
         return self.model.start_layer
@@ -1592,7 +1602,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
     @property
     def end_layer(self) -> int:
         return self.model.end_layer
-    
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
         if not self.pp_group.is_last_rank:
             return
