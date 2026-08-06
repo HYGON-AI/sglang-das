@@ -108,6 +108,43 @@ class MLPSyncBatchInfo:
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
+        if self.scheduler_step_info is None:
+            # Keep the upstream six-field path unchanged unless the optional
+            # PD Decode StepInfo fallback is explicitly enabled.
+            global_info_tensor = torch.empty(
+                (self.dp_size, self.tp_size * self.cp_size, 6),
+                dtype=torch.int64,
+                device=device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                local_info_tensor,
+                group=group,
+            )
+
+            if device == "cpu":
+                tp_active_ranks = get_tp_group().active_ranks_cpu
+            else:
+                tp_active_ranks = get_tp_group().active_ranks
+
+            tp_info = global_info_tensor.view(
+                self.dp_size * self.tp_size * self.cp_size, 6
+            )
+            tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+
+            tp0_info = global_info_tensor[:, 0, :]
+            self.tp0_info = tp0_info
+            cpu_data = tp0_info[:, :2].cpu()
+            self.global_num_tokens = cpu_data[:, 0].tolist()
+            self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+            self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
+            self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+            if _ENABLE_METRICS_DP_ATTENTION:
+                self.dp_cooperation_info = DPCooperationInfo.create(
+                    tp0_info[:, 5].tolist()
+                )
+            return
+
         width = int(local_info_tensor.numel())
         expected_world = self.dp_size * self.tp_size * self.cp_size
         actual_world = torch.distributed.get_world_size(group=group)
@@ -390,17 +427,33 @@ def prepare_mlp_sync_batch_raw(
 
 
 class SchedulerDPAttnMixin:
-    def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
-        # Fold scheduler epoch, queue stats and the original six MLPSync fields
-        # into one fixed-shape all-gather for PD Decode.
-        is_disagg_decode = (
-            self.server_args.disaggregation_mode == "decode"
+    def _is_pd_decode_stepinfo_sync_enabled(self: Scheduler) -> bool:
+        cached = getattr(self, "_enable_pd_decode_stepinfo_sync", None)
+        if cached is not None:
+            return cached
+        return (
+            envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get()
+            and self.server_args.disaggregation_mode == "decode"
             and self.server_args.enable_dp_attention
         )
+
+    def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
+        enable_pd_decode_stepinfo_sync = self._is_pd_decode_stepinfo_sync_enabled()
+        if (
+            enable_pd_decode_stepinfo_sync
+            and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC=1 is incompatible with "
+                "SGLANG_SCHEDULER_SKIP_ALL_GATHER=1"
+            )
+
         scheduler_step_info = None
         sync_group_override = None
         epoch = None
-        if is_disagg_decode:
+        if enable_pd_decode_stepinfo_sync:
+            # Optional HCU guard: fold scheduler progress into the MLPSync
+            # all-gather and validate one shared epoch per Decode iteration.
             use_device_scheduler_sync = (
                 envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
                 and len(self.offload_tags) == 0
@@ -457,7 +510,7 @@ class SchedulerDPAttnMixin:
             scheduler_step_info=scheduler_step_info,
             sync_group_override=sync_group_override,
         )
-        if is_disagg_decode:
+        if enable_pd_decode_stepinfo_sync:
             # Increment only after all ranks completed and validated the same
             # StepInfo collective.
             self._dp_scheduler_epoch = epoch + 1

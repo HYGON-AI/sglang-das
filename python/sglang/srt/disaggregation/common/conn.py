@@ -451,9 +451,11 @@ class CommonKVManager(BaseKVManager):
         socket = zmq.Context().socket(zmq.PUSH)
         if is_ipv6:
             socket.setsockopt(zmq.IPV6, 1)
-        # Avoid blocking the scheduler forever on a stalled PUSH.
-        socket.setsockopt(zmq.SNDTIMEO, 5000)
-        socket.setsockopt(zmq.SNDHWM, 1000)
+        if envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get():
+            # Part of the optional PD Decode hang fallback: bound a stalled
+            # PUSH so every DP scheduler can keep joining the StepInfo clock.
+            socket.setsockopt(zmq.SNDTIMEO, 5000)
+            socket.setsockopt(zmq.SNDHWM, 1000)
         socket.connect(endpoint)
         return socket
 
@@ -1195,9 +1197,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                # Avoid blocking the scheduler forever on a stalled PUSH.
-                sock.setsockopt(zmq.SNDTIMEO, 5000)
-                sock.setsockopt(zmq.SNDHWM, 1000)
+                if envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get():
+                    # Part of the optional PD Decode hang fallback: bound a
+                    # stalled PUSH so all schedulers can advance together.
+                    sock.setsockopt(zmq.SNDTIMEO, 5000)
+                    sock.setsockopt(zmq.SNDHWM, 1000)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -1474,9 +1478,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         bootstrap_rooms = data["bootstrap_rooms"]
         async with self.lock:
             aborted_rooms = [
-                int(room)
-                for room in bootstrap_rooms
-                if int(room) in self.aborted_rooms
+                int(room) for room in bootstrap_rooms if int(room) in self.aborted_rooms
             ]
         return web.json_response({"aborted_rooms": aborted_rooms}, status=200)
 

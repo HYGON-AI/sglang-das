@@ -2203,11 +2203,7 @@ class MooncakeKVManager(CommonKVManager):
             self.update_status(bootstrap_room, KVPoll.Failed)
             detected_rooms.append(bootstrap_room)
 
-        if (
-            detected_rooms
-            and self.attn_tp_rank == 0
-            and self.attn_cp_rank == 0
-        ):
+        if detected_rooms and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             logger.info(
                 "Marked decode prealloc rooms as failed after prefill abort: %s",
                 detected_rooms,
@@ -2507,6 +2503,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
     def _safe_send_multipart(self, sock, parts):
         """Swallow ZMQ send timeout so the decode scheduler can keep joining MLPSync."""
         import zmq
+
+        if not envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get():
+            # Preserve the upstream blocking/error behavior unless the
+            # StepInfo single-clock fallback is explicitly enabled.
+            sock.send_multipart(parts)
+            return True
 
         try:
             zmq.Socket.send_multipart(sock, parts)

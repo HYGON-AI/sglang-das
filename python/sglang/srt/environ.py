@@ -274,6 +274,10 @@ class Envs:
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Optional PD Decode single-clock fallback. Keep disabled by default so the
+    # scheduler follows the upstream skip-all-gather path unless explicitly
+    # enabled for deployments that need the extra cross-DP hang protection.
+    SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)

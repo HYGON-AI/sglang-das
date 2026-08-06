@@ -1222,15 +1222,23 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
-        # Do not mix recv-control or model-forward collectives into it.
-        # A process-group timeout is replica-fatal; no plain-barrier fallback.
-        self.dp_scheduler_cpu_group = None
-        self._dp_scheduler_epoch = 0
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
+        self._enable_pd_decode_stepinfo_sync = (
+            envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get()
+            and self.server_args.disaggregation_mode == "decode"
             and self.server_args.enable_dp_attention
-        ):
+        )
+
+        if self._is_pd_decode_stepinfo_sync_enabled():
+            # Optional dedicated Gloo group for epoch-tagged StepInfo/MLPSync.
+            # Do not mix recv-control or model-forward collectives into it.
+            # A process-group timeout is replica-fatal; no barrier fallback.
+            self.dp_scheduler_cpu_group = None
+            self._dp_scheduler_epoch = 0
+            if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+                raise RuntimeError(
+                    "SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC=1 is incompatible "
+                    "with SGLANG_SCHEDULER_SKIP_ALL_GATHER=1"
+                )
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
             if self.pp_size != 1:
