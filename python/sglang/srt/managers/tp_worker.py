@@ -63,6 +63,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_effective_token_capacity(
+    model_runner: "ModelRunner", enable_hisparse: bool
+) -> int:
+    if enable_hisparse:
+        return model_runner.token_to_kv_pool_allocator.size
+    return model_runner.max_total_num_tokens
+
+
 class BaseTpWorker(ABC):
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
@@ -296,7 +304,9 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Profile number of tokens
-        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        self.max_total_num_tokens = _get_effective_token_capacity(
+            self.model_runner, server_args.enable_hisparse
+        )
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = self.model_runner.max_running_requests
         assert self.max_running_requests > 0, "max_running_request is zero"
@@ -306,7 +316,7 @@ class TpModelWorker(BaseTpWorker):
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            self.max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (

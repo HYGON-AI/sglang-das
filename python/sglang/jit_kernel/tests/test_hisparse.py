@@ -4,11 +4,17 @@ import pytest
 import torch
 
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_cuda_ci(est_time=10, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -239,6 +245,40 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
 
+@pytest.mark.skipif(
+    not is_hcu(), reason="Covers HCU cudaHostRegister device-pointer translation."
+)
+def test_load_cache_to_device_buffer_from_host_registered_memory() -> None:
+    """Read a miss from the allocation mode used by the production host pool."""
+    state = _long_case()
+    registered_host_cache = torch.empty_like(
+        state["host_cache"], device="cpu", pin_memory=False
+    )
+    registered_host_cache.copy_(state["host_cache"])
+
+    cudart = torch.cuda.cudart()
+    register_result = cudart.cudaHostRegister(
+        registered_host_cache.data_ptr(),
+        registered_host_cache.numel() * registered_host_cache.element_size(),
+        0,
+    )
+    assert int(register_result) == 0
+    state["host_cache"] = registered_host_cache
+
+    try:
+        out = _run_kernel(
+            top_k_tokens=torch.tensor([[6]], dtype=torch.int32, device=DEVICE),
+            seq_len=8,
+            **state,
+        )
+        assert torch.equal(out.cpu(), torch.tensor([[9]], dtype=torch.int32))
+        assert torch.equal(state["device_buffer"][9].cpu(), registered_host_cache[6])
+    finally:
+        torch.cuda.synchronize()
+        unregister_result = cudart.cudaHostUnregister(registered_host_cache.data_ptr())
+        assert int(unregister_result) == 0
+
+
 def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     state = _make_state(
         [
@@ -293,6 +333,75 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     )
     assert torch.equal(state["lru_slots"][2].cpu(), padded_lru_before.cpu())
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+
+
+@pytest.mark.skipif(
+    not is_hip(), reason="Covers a ROCm wavefront64 LRU writeback regression."
+)
+def test_load_cache_to_device_buffer_rocm_benchmark_sized_lru() -> None:
+    """Exercise the 20K benchmark's 2K top-k and 12K hot-buffer shape."""
+    top_k = 2048
+    hot_buffer_size = 12288
+    seq_len = 18959
+    kv_dim = 4
+    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
+
+    top_k_tokens = torch.cat(
+        [
+            torch.arange(1000, 2000, dtype=torch.int32),
+            torch.arange(15000, 16048, dtype=torch.int32),
+        ]
+    ).view(1, -1)
+    device_buffer_tokens = torch.arange(hot_buffer_size, dtype=torch.int32).view(1, -1)
+    device_buffer_locs = torch.arange(hot_buffer_size + 1, dtype=torch.int32).view(
+        1, -1
+    )
+    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16).view(1, -1)
+    host_cache_locs = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
+
+    top_k_tokens = top_k_tokens.to(DEVICE)
+    device_buffer_tokens = device_buffer_tokens.to(DEVICE)
+    device_buffer_locs = device_buffer_locs.to(DEVICE)
+    lru_slots = lru_slots.to(DEVICE)
+    host_cache_locs = host_cache_locs.to(DEVICE)
+
+    host_cache = torch.zeros(
+        (seq_len, 1, kv_dim), dtype=DTYPE, device="cpu", pin_memory=True
+    )
+    device_buffer = torch.empty(
+        (hot_buffer_size + 1, 1, kv_dim), dtype=DTYPE, device=DEVICE
+    )
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        num_top_k=top_k,
+        hot_buffer_size=hot_buffer_size,
+        page_size=1,
+        block_size=1024,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    expected_lru = torch.cat(
+        [
+            torch.arange(2048, hot_buffer_size, dtype=torch.int16),
+            torch.arange(0, 1000, dtype=torch.int16),
+            torch.arange(2000, 2048, dtype=torch.int16),
+            torch.arange(1000, 2000, dtype=torch.int16),
+        ]
+    )
+    assert torch.equal(lru_slots.cpu().view(-1), expected_lru)
 
 
 if __name__ == "__main__":

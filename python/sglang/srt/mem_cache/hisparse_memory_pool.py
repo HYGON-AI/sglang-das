@@ -106,7 +106,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        loc = self.translate_loc_to_hisparse_device(loc)
+        loc = self._translate_loc_to_hisparse_device(loc)
         super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
     def get_mla_kv_buffer(
