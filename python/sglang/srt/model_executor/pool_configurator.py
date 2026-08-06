@@ -42,7 +42,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-from sglang.srt.utils.common import is_float4_e2m1fn_x2
+from sglang.srt.utils.common import ceil_div, is_float4_e2m1fn_x2
 
 
 @dataclass
@@ -95,6 +95,12 @@ class MemoryPoolConfigurator:
     ) -> MemoryPoolConfig:
         """Constraint path: recalculate pool sizes from a constrained max_tokens."""
         raise NotImplementedError
+
+    def finalize_with_max_running_requests(
+        self, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        """Finalize request-scoped pool sizes after per-worker concurrency is known."""
+        return config
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
@@ -324,8 +330,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """Configurator for DSV4 compressed-attention models.
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
-    pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
-    decode reserves a draft worker, mirroring dflash's cell_size scaling); bias = 0.
+    pools. The legacy C128 state pool is token/SWA-scoped. When
+    ``SGLANG_DSV4_REQUEST_SCOPED_C128_STATE`` is enabled, it becomes
+    request-scoped and is budgeted as fixed memory.
     """
 
     def __init__(self, mr: ModelRunner):
@@ -333,11 +340,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
-        self.compression_ratios = cfg.compress_ratios
+        self.request_scoped_c128_state = (
+            envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get()
+        )
+        self.context_len = cfg.context_len
+        self.compression_ratios = (
+            cfg.compress_ratios[mr.start_layer : mr.end_layer]
+            if self.request_scoped_c128_state
+            else cfg.compress_ratios
+        )
         self.kv_cache_dtype = mr.kv_cache_dtype
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.requested_max_running_requests_per_worker = (
+            mr.server_args.max_running_requests // mr.dp_size
+            if mr.server_args.max_running_requests is not None
+            else None
+        )
+        self.disaggregation_mode = mr.server_args.disaggregation_mode
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -372,10 +393,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # would need rollback / replay across draft and verify, which the
         # online path doesn't support yet.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            if self.request_scoped_c128_state:
+                raise RuntimeError(
+                    "SGLANG_DSV4_REQUEST_SCOPED_C128_STATE currently supports "
+                    "offline C128 only. Unset SGLANG_OPT_USE_ONLINE_COMPRESS "
+                    "or disable the request-scoped C128 state layout."
+                )
             assert (
                 mr.spec_algorithm.is_none()
             ), "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode (MTP) yet"
             logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
+
+        logger.info(
+            "DSV4 request-scoped C128 state layout: %s",
+            "enabled" if self.request_scoped_c128_state else "disabled",
+        )
 
     def _get_bytes_per_full_token(self) -> float:
         if self.kv_cache_dtype == torch.bfloat16:
@@ -403,7 +435,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * state_dtype_size
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
-        c128_state_ratio = self.c128_ring_size / self.swa_page_size
+        c128_state_ratio = (
+            0
+            if self.request_scoped_c128_state
+            else self.c128_ring_size / self.swa_page_size
+        )
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
@@ -431,8 +467,60 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
-            c128_state_pool_size=swa_tokens // self.swa_page_size * self.c128_ring_size,
+            c128_state_pool_size=(
+                0
+                if self.request_scoped_c128_state
+                else swa_tokens // self.swa_page_size * self.c128_ring_size
+            ),
         )
+
+    @staticmethod
+    def _get_decode_pre_alloc_size(max_running_requests: int) -> int:
+        pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+        return (
+            max_running_requests * 2 if max_running_requests <= 32 else pre_alloc_size
+        )
+
+    def _get_num_req_slots(self, max_running_requests: int) -> int:
+        if self.disaggregation_mode == "decode":
+            return (
+                max_running_requests
+                + self._get_decode_pre_alloc_size(max_running_requests)
+                + 1
+            )
+        return max_running_requests + 1
+
+    def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
+        if self.num_layers_ca128 == 0:
+            return 0
+
+        attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        state_dtype_size = 4
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            state_rows = num_req_slots + self.c128_ring_size + 1
+            state_last_dim = 3 * attn_head_dim
+        else:
+            state_pool_size = num_req_slots * self.c128_ring_size
+            state_rows = state_pool_size + self.c128_ring_size + 1
+            state_rows = ceil_div(state_rows, 128) * 128
+            state_last_dim = 2 * attn_head_dim
+
+        return state_rows * state_last_dim * state_dtype_size * self.num_layers_ca128
+
+    def _get_c128_state_fixed_bytes_for_token_capacity(
+        self, token_capacity: int
+    ) -> int:
+        if self.requested_max_running_requests_per_worker is not None:
+            return self._get_c128_state_fixed_bytes(
+                self.requested_max_running_requests_per_worker
+            )
+
+        estimated = int(token_capacity / self.context_len * 512)
+        estimated = max(min(estimated, 4096), 2048)
+        max_running_requests = min(estimated, token_capacity // 2)
+        return self._get_c128_state_fixed_bytes(max_running_requests)
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
@@ -454,6 +542,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c128_state_pool_size=sizes.c128_state_pool_size,
         )
 
+    def finalize_with_max_running_requests(
+        self, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        if not self.request_scoped_c128_state:
+            return config
+        assert config.max_running_requests is not None
+        num_req_slots = self._get_num_req_slots(config.max_running_requests)
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            config.c128_state_pool_size = num_req_slots
+        else:
+            config.c128_state_pool_size = num_req_slots * self.c128_ring_size
+        return config
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
@@ -461,12 +562,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
-        full_token = int(available_bytes / self.bytes_per_full_token)
+        if not self.request_scoped_c128_state:
+            c128_state_fixed_bytes = 0
+        elif self.requested_max_running_requests_per_worker is not None:
+            c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
+                self.requested_max_running_requests_per_worker
+            )
+        else:
+            full_token = int(available_bytes / self.bytes_per_full_token)
+            c128_state_fixed_bytes = (
+                self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
+            )
+
+        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
             f"DSV4 memory calculation: "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
+            f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

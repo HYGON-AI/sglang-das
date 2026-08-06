@@ -239,7 +239,12 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
+            match_result = match_prefix_for_req(
+                self.tree_cache,
+                r,
+                prefix_ids,
+                include_req=envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get(),
+            )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from

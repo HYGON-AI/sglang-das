@@ -132,7 +132,8 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
         swa_page_size: int,
         ring_size: int,
-        ) -> CompressorDecodePlan:
+        request_scoped_c128_state: bool = False,
+    ) -> CompressorDecodePlan:
         module = _jit_compress_plan_module()
         plan_d = torch.empty(
             (req_pool_indices.shape[0], 16),
@@ -148,6 +149,7 @@ class CompressorDecodePlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
+            bool(request_scoped_c128_state),
         )
         return CompressorDecodePlan(compress_ratio, plan_d)
 
@@ -210,6 +212,7 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        request_scoped_c128_state: bool = False,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type == "cuda"
         pin_buffer = torch.empty(
@@ -235,6 +238,7 @@ class CompressorPrefillPlan(NamedTuple):
             int(swa_page_size),
             int(ring_size),
             bool(use_cuda_graph),
+            bool(request_scoped_c128_state),
         )
         return CompressorPrefillPlan(
             compress_ratio,

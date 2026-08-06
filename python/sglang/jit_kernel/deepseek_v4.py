@@ -27,13 +27,12 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import (
-    is_hcu,
-    get_bool_env_var
-)
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
 _is_hcu = is_hcu()
-_use_linear_bf16_fp32_use_blaslt = get_bool_env_var("SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT")
+_use_linear_bf16_fp32_use_blaslt = get_bool_env_var(
+    "SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT"
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -761,6 +760,7 @@ def create_paged_compress_data_kernel(
     is_overlap: tl.constexpr,
     swa_page_size: tl.constexpr,
     ring_size: tl.constexpr,
+    request_scoped_c128_state: tl.constexpr,
     BLOCK: tl.constexpr,
 ) -> None:
     pid = tl.program_id(0)
@@ -792,18 +792,21 @@ def create_paged_compress_data_kernel(
         else:
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
-        loc = tl.load(
-            req_to_token_ptr
-            + rid.to(tl.int64) * stride_req_to_token_0
-            + pos.to(tl.int64) * stride_req_to_token_1,
-            mask=mask,
-            other=0,
-        ).to(tl.int32)
-        swa_loc = tl.load(full_to_swa_index_mapping_ptr + loc, mask=mask, other=0).to(
-            tl.int32
-        )
-        swa_page = swa_loc // swa_page_size
-        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        if request_scoped_c128_state and compress_ratio == 128:
+            state_loc = rid * ring_size + (pos % ring_size)
+        else:
+            loc = tl.load(
+                req_to_token_ptr
+                + rid.to(tl.int64) * stride_req_to_token_0
+                + pos.to(tl.int64) * stride_req_to_token_1,
+                mask=mask,
+                other=0,
+            ).to(tl.int32)
+            swa_loc = tl.load(
+                full_to_swa_index_mapping_ptr + loc, mask=mask, other=0
+            ).to(tl.int32)
+            swa_page = swa_loc // swa_page_size
+            state_loc = swa_page * ring_size + (swa_loc % ring_size)
         state_loc = state_loc // cr
         if i == 0:
             v0 = state_loc
@@ -838,6 +841,7 @@ def triton_create_paged_compress_data(
     extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
+    request_scoped_c128_state: bool = False,
     block: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch_size = req_pool_indices.shape[0]
@@ -863,6 +867,7 @@ def triton_create_paged_compress_data(
         is_overlap=1 if is_overlap else 0,
         swa_page_size=swa_page_size,
         ring_size=ring_size,
+        request_scoped_c128_state=request_scoped_c128_state,
         BLOCK=block,
     )
 
@@ -995,8 +1000,8 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
     if _is_hcu and _use_linear_bf16_fp32_use_blaslt:
         source = """
         #include <torch/extension.h>
-        #include <ATen/cuda/CUDAContext.h> 
-        #include <hipblaslt/hipblaslt.h>   
+        #include <ATen/cuda/CUDAContext.h>
+        #include <hipblaslt/hipblaslt.h>
 
         torch::Tensor linear_bf16_fp32(
             torch::Tensor X,
@@ -1017,16 +1022,16 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
 
             hipblasLtMatmulDesc_t matmul_desc;
             hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
-            
+
             int transA = HIPBLAS_OP_T;
             int transB = HIPBLAS_OP_N;
             hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
             hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
 
             hipblasLtMatrixLayout_t layoutA, layoutB, layoutC;
-            hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, in_features, out_features, in_features); 
-            hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, in_features, batch, in_features);        
-            hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_32F, out_features, batch, out_features);       
+            hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_16BF, in_features, out_features, in_features);
+            hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_16BF, in_features, batch, in_features);
+            hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_32F, out_features, batch, out_features);
 
             float alpha = 1.0f;
             float beta = 0.0f;
@@ -1041,11 +1046,11 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
                 X.data_ptr(), layoutB,
                 &beta,
                 Y.data_ptr(), layoutC,
-                Y.data_ptr(), layoutC, 
-                nullptr, 
-                nullptr, 
-                0,       
-                stream  
+                Y.data_ptr(), layoutC,
+                nullptr,
+                nullptr,
+                0,
+                stream
             );
 
             hipblasLtMatmulDescDestroy(matmul_desc);
@@ -1106,7 +1111,7 @@ def _jit_torch_cublas_bf16_fp32() -> Any:
     m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear (no bias)");
     }
     """
-     
+
     module = torch.utils.cpp_extension.load_inline(
         name="linear_bf16_fp32",
         cpp_sources="",

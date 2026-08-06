@@ -18,15 +18,15 @@ from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cas
 
 import torch
 
+from sglang.jit_kernel.deepseek_v4 import (
+    compress_fused_norm_rope_inplace,
+    fused_rope,
+)
 from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_norm_rope_store,
-)
-from sglang.jit_kernel.deepseek_v4 import (
-    compress_fused_norm_rope_inplace,
-    fused_rope,
 )
 from sglang.srt.environ import envs
 
@@ -147,10 +147,7 @@ class CompressorBackendMixin:
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
         state_pool = compressor.get_state_pool(forward_batch)
-        if (
-            token_to_kv_pool.is_bf16_attention_kv_cache
-            and not compressor.is_in_indexer
-        ):
+        if token_to_kv_pool.is_bf16_attention_kv_cache and not compressor.is_in_indexer:
             plan = self._get_paged_compress_metadata(compressor.ratio)
             is_online = _use_online_compress(compressor.ratio)
             kv_score_buffer = state_pool.kv_score_buffer.kv_score
@@ -160,9 +157,7 @@ class CompressorBackendMixin:
                 coff = 2 if is_overlap_compress(compressor.ratio) else 1
                 last_dim = 2 * compressor.head_dim * coff
                 assert kv_score_buffer.shape[-1] == last_dim
-                kv_score_buffer = kv_score_buffer.view(
-                    -1, compressor.ratio, last_dim
-                )
+                kv_score_buffer = kv_score_buffer.view(-1, compressor.ratio, last_dim)
             kv_compressed = compress_forward(
                 kv_score_buffer=kv_score_buffer,
                 kv_score_input=kv_score_input,
@@ -272,6 +267,9 @@ def create_paged_compressor_data(
 
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    request_scoped_c128_state = (
+        compress_ratio == 128 and envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get()
+    )
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
@@ -300,6 +298,7 @@ def create_paged_compressor_data(
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
             use_cuda_graph=use_prefill_cuda_graph,
+            request_scoped_c128_state=request_scoped_c128_state,
         )
     else:
         return CompressorDecodePlan.generate(
@@ -310,6 +309,7 @@ def create_paged_compressor_data(
             seq_lens=seq_lens.to(torch.int64),
             swa_page_size=swa_page_size,
             ring_size=ring_size,
+            request_scoped_c128_state=request_scoped_c128_state,
         )
 
 

@@ -47,6 +47,8 @@ class CompressStatePool:
         online: bool = False,
     ):
         self.ring_size = ring_size
+        self.ratio = ratio
+        self.online = online
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
@@ -79,3 +81,10 @@ class CompressStatePool:
                 )
                 if not online:
                     self.kv_score_buffer[-1].clear()
+
+    def translate_from_req_position_to_state_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Map request-local positions into the request-scoped state ring."""
+        state_loc = req_pool_indices * self.ring_size + positions % self.ring_size
+        return torch.where(positions < 0, -1, state_loc)

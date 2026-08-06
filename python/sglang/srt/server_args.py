@@ -496,7 +496,7 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
-    swa_full_tokens_ratio: float = 0.8
+    swa_full_tokens_ratio: Optional[float] = None
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -999,6 +999,13 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+
+        # Resolve swa_full_tokens_ratio to a model-appropriate default if
+        # the user did not explicitly set it. Model hooks (e.g. DeepSeek V4)
+        # may set a model-specific default above; this fallback supplies the
+        # global default for all other models.
+        if self.swa_full_tokens_ratio is None:
+            self.swa_full_tokens_ratio = 0.8
 
         # Set kernel backends.
         self._handle_sampling_backend()

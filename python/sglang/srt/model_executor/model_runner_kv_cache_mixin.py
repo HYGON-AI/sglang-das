@@ -52,9 +52,9 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
-    is_hip,
     is_hcu,
     is_hcu_native_fp8_supported,
+    is_hip,
     is_npu,
 )
 
@@ -103,8 +103,7 @@ class ModelRunnerKVCacheMixin:
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
                 use_bf16_index_cache = _is_hcu and (
-                    self.kv_cache_dtype
-                    not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    self.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
                     or not is_hcu_native_fp8_supported()
                 )
                 if use_bf16_index_cache:
@@ -446,6 +445,7 @@ class ModelRunnerKVCacheMixin:
                 compression_ratios = self.model_config.compress_ratios
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,
+                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
@@ -985,6 +985,7 @@ class ModelRunnerKVCacheMixin:
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 

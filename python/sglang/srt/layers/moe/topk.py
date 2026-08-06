@@ -1744,6 +1744,17 @@ def select_experts(
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
             )
+            # HCU does not enter the CUDA-only common postprocess below.  Keep
+            # the fused TopK path consistent with the existing HCU biased and
+            # grouped TopK paths by applying EPLB logical-to-physical mapping
+            # here exactly once.
+            if _is_hcu and (
+                expert_location_dispatch_info is not None
+                or num_token_non_padded is not None
+            ):
+                topk_ids = _topk_ids_postprocess(
+                    topk_ids, expert_location_dispatch_info, num_token_non_padded
+                )
     else:
         assert (
             num_token_non_padded is None

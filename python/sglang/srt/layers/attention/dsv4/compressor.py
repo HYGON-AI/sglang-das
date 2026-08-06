@@ -30,7 +30,8 @@ from sglang.jit_kernel.deepseek_v4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton, quant_to_nope_fp8_rope_bf16_pack_lightop
+    quant_to_nope_fp8_rope_bf16_pack_lightop,
+    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
@@ -40,10 +41,12 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils import get_bool_env_var, is_hcu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_hcu
+
 _is_hcu = is_hcu()
-_use_dpskv4_lightop_quant_k_cache = get_bool_env_var("SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE")
+_use_dpskv4_lightop_quant_k_cache = get_bool_env_var(
+    "SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE"
+)
 if _is_hcu:
     from lightop import kvcache as op
 
@@ -175,9 +178,13 @@ class CompressorBackendMixin:
                 )
                 return
             if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
-                pack = quant_to_nope_fp8_rope_bf16_pack_lightop(new_compressed_kv.bfloat16(), 1e-8)
+                pack = quant_to_nope_fp8_rope_bf16_pack_lightop(
+                    new_compressed_kv.bfloat16(), 1e-8
+                )
             else:
-                pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(
+                    new_compressed_kv.bfloat16()
+                )
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
@@ -258,6 +265,9 @@ def create_paged_compressor_data(
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    request_scoped_c128_state = (
+        compress_ratio == 128 and envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get()
+    )
     # assert ring_size % compress_ratio == 0
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
@@ -265,10 +275,13 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        if request_scoped_c128_state:
+            state_loc = req_pool_indices * ring_size + positions % ring_size
+        else:
+            loc = req_to_token[req_pool_indices, positions]
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+            swa_pages = swa_loc // swa_page_size
+            state_loc = swa_pages * ring_size + swa_loc % ring_size
         return (state_loc // compress_ratio).to(torch.int32)
 
     is_overlap = is_overlap_compress(compress_ratio)
@@ -285,6 +298,7 @@ def create_paged_compressor_data(
             extend_seq_lens=extend_lens,
             req_to_token=req_to_token,
             full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+            request_scoped_c128_state=request_scoped_c128_state,
         )
 
         plan_kwargs: dict

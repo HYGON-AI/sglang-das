@@ -22,6 +22,8 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
+    # DeepSeek-V4 C128 request-scoped compression state.
+    C128_STATE = "c128_state"
 
 
 @dataclasses.dataclass

@@ -20,8 +20,7 @@ on:
       - ".github/workflows/hcu-full-enabled.yml"
       - ".github/workflows/release-pypi-nightly-hcu.yml"
       - "scripts/ci/hcu/**"
-      - "python/pyproject*.toml"
-      - "python/sglang/**"
+      - "python/**"
       - "test/run_suite.py"
       - "test/registered/**"
       - "sgl-kernel/**"
@@ -167,21 +166,23 @@ jobs:
         id: filter
         if: steps.run-mode.outputs.run_all_tests != 'true'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cd "${HCU_CI_CHECKOUT_DIR}"
-          if [[ -z "${BASE_SHA}" ]]; then
+          set -euo pipefail
+
+          if [[ -z "${PR_NUMBER}" ]]; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
             echo "auto_run_ci=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
-          changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          changed_files="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[].filename')"
           echo "${changed_files}"
 
-          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/pyproject.*\.toml|python/sglang/|test/run_suite\.py|python/sglang/test/ci/|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_hcu\.txt$)'
+          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|test/run_suite\.py|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_hcu\.txt$)'
 
           if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
@@ -227,8 +228,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           FORCE_WHEEL_MODE: ${{ inputs.force_wheel_mode || false }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -239,23 +240,22 @@ jobs:
             exit 0
           fi
 
-          if [[ "${EVENT_NAME}" != "pull_request" || -z "${BASE_SHA}" ]]; then
+          if [[ "${EVENT_NAME}" != "pull_request" || -z "${PR_NUMBER}" ]]; then
             echo "wheel_required=false" >> "${GITHUB_OUTPUT}"
             echo "gateway_wheel_required=false" >> "${GITHUB_OUTPUT}"
             echo "Wheel mode disabled for non-PR run without force_wheel_mode."
             exit 0
           fi
 
-          cd "${HCU_CI_CHECKOUT_DIR:-${GITHUB_WORKSPACE}}"
-
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
-          changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          changed_files="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[].filename')"
           echo "${changed_files}"
 
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|sgl-kernel/|requirements_hcu\.txt$|python/pyproject.*\.toml|python/sglang/)'; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|sgl-kernel/|requirements_hcu\.txt$|python/)'; then
             wheel_required=true
           fi
 
@@ -534,7 +534,7 @@ jobs:
               name = path.name.replace("-", "_")
               if name.startswith(("sgl_kernel_", "sglang_kernel_")):
                   return "sgl-kernel"
-              if name.startswith("sgl_model_gateway_"):
+              if name.startswith(("sglang_router_", "sgl_model_gateway_")):
                   return "sgl-model-gateway"
               if name.startswith("sglang_"):
                   return "sglang"

@@ -40,7 +40,10 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_c128_state_indices,
     get_kv_class,
+    is_dsv4_c128_online_enabled,
+    is_dsv4_request_scoped_c128_state_enabled,
     is_mla_backend,
     poll_and_all_reduce_by_rid_attn_cp_tp_group,
     prepare_abort,
@@ -1043,10 +1046,11 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
+        transfer_input_len = len(req.origin_input_ids)
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(len(req.fill_ids), len(req.origin_input_ids))
+            else min(len(req.fill_ids), transfer_input_len)
         )
 
         if not last_chunk:
@@ -1071,7 +1075,12 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            seq_len = len(req.fill_ids)
+            seq_len = (
+                min(len(req.fill_ids), transfer_input_len)
+                if is_dsv4_request_scoped_c128_state_enabled()
+                else len(req.fill_ids)
+            )
+            c128_seq_len = transfer_input_len
 
             def _mamba_payload():
                 return [
@@ -1104,6 +1113,22 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
+            def _c128_state_payload():
+                online = is_dsv4_c128_online_enabled()
+                ring_size = (
+                    1
+                    if online
+                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
+                        128
+                    )
+                )
+                return get_dsv4_c128_state_indices(
+                    int(req.req_pool_idx),
+                    c128_seq_len,
+                    online=online,
+                    ring_size=ring_size,
+                )
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1115,6 +1140,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 

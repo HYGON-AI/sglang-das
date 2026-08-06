@@ -30,6 +30,35 @@ if TYPE_CHECKING:
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
+def is_dsv4_c128_online_enabled() -> bool:
+    """Return whether C128 uses the online compression algorithm."""
+    return envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def is_dsv4_request_scoped_c128_state_enabled() -> bool:
+    """Return whether PR #28612 request-scoped C128 state is enabled."""
+    return envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get()
+
+
+def get_dsv4_c128_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    online: bool,
+    ring_size: int,
+) -> np.ndarray:
+    """Return the PD transfer row/page indices for DSV4 C128 state."""
+    if seq_len == 0 or seq_len % 128 == 0:
+        return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
+    pages_per_req = ring_size // 128
+    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
+    return np.array([page], dtype=np.int32)
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -101,9 +130,7 @@ def all_reduce_status_by_rid(
     dist.all_reduce(status_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
 
     reduced_statuses = status_tensor.tolist()
-    return {
-        rid: reduced_statuses[index] for index, rid in enumerate(canonical_rids)
-    }
+    return {rid: reduced_statuses[index] for index, rid in enumerate(canonical_rids)}
 
 
 def poll_and_all_reduce_by_rid(
@@ -714,6 +741,20 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            if is_dsv4_request_scoped_c128_state_enabled() and hasattr(
+                token_to_kv_pool, "get_c128_state_buf_infos"
+            ):
+                c128_ptrs, c128_lens, c128_item_lens = (
+                    token_to_kv_pool.get_c128_state_buf_infos()
+                )
+                if c128_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.C128_STATE,
+                        c128_ptrs,
+                        c128_lens,
+                        c128_item_lens,
+                    )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()

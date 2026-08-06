@@ -216,14 +216,14 @@ class DeepSeekV4SingleKVPool(KVCache):
         valid_mask: Optional[torch.Tensor] = None,
     ) -> None:
         assert self.is_bf16_attention_kv_cache
-        assert cache_k.shape[-1] == self.logical_kv_dim, (
-            f"expected cache_k last dim {self.logical_kv_dim}, got {cache_k.shape}"
-        )
+        assert (
+            cache_k.shape[-1] == self.logical_kv_dim
+        ), f"expected cache_k last dim {self.logical_kv_dim}, got {cache_k.shape}"
         values = cache_k.to(torch.bfloat16).contiguous().view(-1, self.logical_kv_dim)
         n_values = values.shape[0]
-        assert loc.numel() == n_values, (
-            f"expected loc to match cache_k rows, got {loc.numel()=} {n_values=}"
-        )
+        assert (
+            loc.numel() == n_values
+        ), f"expected loc to match cache_k rows, got {loc.numel()=} {n_values=}"
         if n_values == 0:
             return
         kv_buffer = self.kv_buffer[layer_id].view(-1, self.logical_kv_dim)
@@ -452,6 +452,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def __init__(
         self,
         max_num_reqs: int,
+        num_req_slots: Optional[int],
         swa_size: int,
         c4_size: int,
         c128_size: int,
@@ -484,21 +485,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         c4_logical_size = c128_size * 32
 
-        logger.info(
-            "Initialize DeepSeekV4TokenToKVPool with "
-            f"{max_num_reqs=} {swa_size=} {c4_size=} "
-            f"{c4_logical_size=} {c128_size=} "
-            f"{c4_state_pool_size=} {c128_state_pool_size=}"
-        )
-
         self.max_num_reqs = max_num_reqs
+        # Decode PD adds pre-transfer request rows beyond max_num_reqs. C128
+        # state is indexed by req_pool_idx, so it must cover every addressable
+        # req_to_token row, including the padding row.
+        self.num_req_slots = (
+            num_req_slots if num_req_slots is not None else max_num_reqs + 1
+        )
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        c128_ring_size = self.get_ring_size(128)
+        if envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get():
+            if ONLINE_C128:
+                c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
+            else:
+                c128_state_pool_size = max(
+                    c128_state_pool_size, self.num_req_slots * c128_ring_size
+                )
         self.c128_state_pool_size = c128_state_pool_size
         self.state_dtype = state_dtype
         self.compression_ratios = compression_ratios
+
+        logger.info(
+            "Initialize DeepSeekV4TokenToKVPool with "
+            f"{max_num_reqs=} {self.num_req_slots=} {swa_size=} {c4_size=} "
+            f"{c4_logical_size=} {c128_size=} "
+            f"{c4_state_pool_size=} {c128_state_pool_size=}"
+        )
 
         # Determine this PP stage's absolute layer range
         if (
@@ -641,12 +656,36 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if (
+                    envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get()
+                    and pool.ratio == 128
+                ):
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.nbytes)
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
+        return data_ptrs, data_lens, item_lens
+
+    def get_c128_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Expose C128 state as a separate request-scoped PD component."""
+        if not envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get():
+            return [], [], []
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            state = pool.kv_score_buffer.kv_score
+            assert state.ndim == 2, f"expected 2D buffer, got {state.ndim}D"
+            data_ptrs.append(state.data_ptr())
+            data_lens.append(state.nbytes)
+            item_lens.append(state[0].nbytes if ONLINE_C128 else state[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
@@ -731,6 +770,59 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_state_pool is not None
         ), "Only c4/c128 layers have attention states."
         return compress_state_pool
+
+    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+        """Reset request-scoped C128 state before a PD transfer reuses the slot."""
+        if not envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get():
+            return
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+
+            state = pool.kv_score_buffer.kv_score
+            if ONLINE_C128:
+                row = state[req_pool_idx]
+                head_dim = row.shape[-1] // 3
+                row[:head_dim].fill_(float("-inf"))
+                row[head_dim:].zero_()
+            else:
+                start = req_pool_idx * pool.ring_size
+                rows = state[start : start + pool.ring_size]
+                half = rows.shape[-1] // 2
+                rows[:, :half].zero_()
+                rows[:, half:].fill_(float("-inf"))
+
+    def clear_unaccepted_c128_draft_states(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        """Clear offline C128 rows written by rejected speculative tokens."""
+        if (
+            not envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get()
+            or ONLINE_C128
+            or num_draft_tokens <= 1
+            or req_pool_indices.numel() == 0
+        ):
+            return
+
+        from sglang.jit_kernel.dsv4.c128_cleanup import (
+            clear_unaccepted_c128_draft_states,
+        )
+
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            clear_unaccepted_c128_draft_states(
+                pool.kv_score_buffer.kv_score,
+                req_pool_indices,
+                seq_lens,
+                accept_lens,
+                ring_size=pool.ring_size,
+                num_draft_tokens=num_draft_tokens,
+            )
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)

@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
     KVTransferMetric,
+    StateType,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -743,7 +744,10 @@ class CommonKVManager(BaseKVManager):
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int], int]:
         # Fast path: both sides use exactly the same PP layout
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
@@ -756,7 +760,7 @@ class CommonKVManager(BaseKVManager):
             # layer, so we locate the sub-range for this PP stage inside each
             # section of the dst flat list.
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
-                src_kv_ptrs, dst_kv_ptrs, mla_ratios
+                src_kv_ptrs, dst_kv_ptrs, mla_ratios, state_type
             )
             return (
                 sliced_src_kv_ptrs,
@@ -776,6 +780,7 @@ class CommonKVManager(BaseKVManager):
         src_kv_ptrs: List[int],
         dst_kv_ptrs: List[int],
         mla_ratios: List[int],
+        state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int]]:
         """Produce aligned (src, dst) pointer lists for compressed-MLA
         pools (e.g. DeepSeek V4) under PP.
@@ -821,7 +826,60 @@ class CommonKVManager(BaseKVManager):
         c128_off_s = sum(1 for r in mla_ratios[:start_layer] if r == 128)
         c128_off_e = sum(1 for r in mla_ratios[:end_layer] if r == 128)
 
-        if len(dst_kv_ptrs) == kv_layout_len:
+        if not envs.SGLANG_DSV4_REQUEST_SCOPED_C128_STATE.get():
+            if len(dst_kv_ptrs) == kv_layout_len:
+                sliced_dst = (
+                    list(dst_kv_ptrs[c4_off_s:c4_off_e])
+                    + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
+                    + list(
+                        dst_kv_ptrs[2 * c4_full + c128_off_s : 2 * c4_full + c128_off_e]
+                    )
+                )
+                return src_kv_ptrs, sliced_dst
+
+            swa_L = len(dst_kv_ptrs) - 2 * c4_full - c128_full
+            if swa_L < 0 or swa_L > len(mla_ratios):
+                raise ValueError(
+                    f"Unexpected compressed-MLA dst_kv_ptrs length "
+                    f"{len(dst_kv_ptrs)}; expected either {kv_layout_len} "
+                    f"(kv_data) or swa_L + {2 * c4_full + c128_full} "
+                    f"(state_data) given compression_ratios "
+                    f"(c4={c4_full}, c128={c128_full}, "
+                    f"total={len(mla_ratios)})."
+                )
+            assert end_layer <= swa_L, (
+                f"prefill_end_layer ({end_layer}) exceeds dst SWA pool "
+                f"buffer count ({swa_L}); compression_ratios may include "
+                f"layers (e.g. nextn) that the SWA pool does not cover."
+            )
+
+            c_non_zero_s = sum(1 for r in mla_ratios[:start_layer] if r != 0)
+            c_non_zero_e = sum(1 for r in mla_ratios[:end_layer] if r != 0)
+            compress_section_start = swa_L
+            indexer_section_start = swa_L + c4_full + c128_full
+            sliced_dst = (
+                list(dst_kv_ptrs[start_layer:end_layer])
+                + list(
+                    dst_kv_ptrs[
+                        compress_section_start
+                        + c_non_zero_s : compress_section_start
+                        + c_non_zero_e
+                    ]
+                )
+                + list(
+                    dst_kv_ptrs[
+                        indexer_section_start
+                        + c4_off_s : indexer_section_start
+                        + c4_off_e
+                    ]
+                )
+            )
+            return src_kv_ptrs, sliced_dst
+
+        if state_type == StateType.C128_STATE:
+            return src_kv_ptrs, list(dst_kv_ptrs[c128_off_s:c128_off_e])
+
+        if state_type != StateType.SWA and len(dst_kv_ptrs) == kv_layout_len:
             sliced_dst = (
                 list(dst_kv_ptrs[c4_off_s:c4_off_e])
                 + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
@@ -829,39 +887,31 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
-        # State-data layout. ``swa_L`` is derived from the actual dst
+        # SWA state-data layout. ``swa_L`` is derived from the actual dst
         # length so we tolerate cases where the SWA pool has fewer
-        # buffers than ``len(mla_ratios)`` (e.g. nextn padding).
-        swa_L = len(dst_kv_ptrs) - 2 * c4_full - c128_full
+        # buffers than ``len(mla_ratios)`` (e.g. nextn padding). C128
+        # state is transferred as its own StateType.C128_STATE component.
+        swa_L = len(dst_kv_ptrs) - 2 * c4_full
         if swa_L < 0 or swa_L > len(mla_ratios):
             raise ValueError(
                 f"Unexpected compressed-MLA dst_kv_ptrs length "
                 f"{len(dst_kv_ptrs)}; expected either {kv_layout_len} "
-                f"(kv_data) or swa_L + {2 * c4_full + c128_full} "
+                f"(kv_data) or swa_L + {2 * c4_full} "
                 f"(state_data) given compression_ratios "
                 f"(c4={c4_full}, c128={c128_full}, "
                 f"total={len(mla_ratios)})."
             )
-        # Guard against asking the prefill side to read past the SWA
-        # pool boundary.
-        assert end_layer <= swa_L, (
-            f"prefill_end_layer ({end_layer}) exceeds dst SWA pool "
-            f"buffer count ({swa_L}); compression_ratios may include "
-            f"layers (e.g. nextn) that the SWA pool does not cover."
-        )
-
-        # compress_state non-None count up to L = count(r != 0).
-        c_non_zero_s = sum(1 for r in mla_ratios[:start_layer] if r != 0)
-        c_non_zero_e = sum(1 for r in mla_ratios[:end_layer] if r != 0)
+        swa_s = min(start_layer, swa_L)
+        swa_e = min(end_layer, swa_L)
         compress_section_start = swa_L
-        indexer_section_start = swa_L + (c4_full + c128_full)
+        indexer_section_start = swa_L + c4_full
         sliced_dst = (
-            list(dst_kv_ptrs[start_layer:end_layer])
+            list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
                     compress_section_start
-                    + c_non_zero_s : compress_section_start
-                    + c_non_zero_e
+                    + c4_off_s : compress_section_start
+                    + c4_off_e
                 ]
             )
             + list(

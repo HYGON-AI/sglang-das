@@ -1269,6 +1269,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
         new_seq_lens_cpu, new_seq_lens_cpu_ready = start_async_seq_lens_cpu_copy(
             new_seq_lens, self.device
         )
+        clear_unaccepted_c128 = getattr(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
+            clear_unaccepted_c128(
+                batch.req_pool_indices,
+                batch.seq_lens,
+                accept_lens,
+                self.speculative_num_draft_tokens,
+            )
 
         # Update mamba state for hybrid GDN models after verification
         if (

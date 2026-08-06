@@ -2729,6 +2729,48 @@ class Scheduler(
 
         return ret
 
+    def _abort_request(
+        self, req: Req, adder, reason: str, extra_suffix: str = ""
+    ) -> None:
+        """Abort a request that exceeds KV cache pool capacity.
+
+        Args:
+            req: The request to abort.
+            adder: The PrefillAdder with pool budget state.
+            reason: Human-readable reason describing why the request can't fit.
+            extra_suffix: Optional extra info appended after the standard message.
+        """
+        pool_info = f"rem_total_tokens={adder.rem_total_tokens}"
+        if getattr(adder, "is_hybrid_swa", False):
+            pool_info += f", rem_swa_tokens={adder.rem_swa_tokens}"
+        error_msg = (
+            f"{reason} ({pool_info}). "
+            f"Aborting to unblock the scheduler. "
+            f"Consider increasing --mem-fraction-static or "
+            f"--swa-full-tokens-ratio."
+        )
+        if extra_suffix:
+            error_msg += f" {extra_suffix}"
+        logger.error(error_msg)
+        self.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "message": error_msg,
+                },
+                rid=req.rid,
+            ),
+            req,
+        )
+        # Release resources associated with the aborted request that would
+        # normally be cleaned up by abort_request(). The request was never
+        # scheduled, so there is no KV cache to release, but grammar
+        # compilation futures and hicache prefetch events must be cancelled.
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        self.grammar_manager.abort_requests(AbortReq(rid=req.rid))
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2810,6 +2852,24 @@ class Scheduler(
         else:
             self._chunked_req_scheduled_last_iter = False
 
+        # If the chunked_req cannot be scheduled for its next chunk and
+        # there is no other path to free pool space (no running requests,
+        # no waiting queue), abort it to break the deadlock.
+        if (
+            self.chunked_req is not None
+            and not self._chunked_req_scheduled_last_iter
+            and len(self.running_batch.reqs) == 0
+        ):
+            release_kv_cache(self.chunked_req, self.tree_cache)
+            self._abort_request(
+                self.chunked_req,
+                adder,
+                f"Chunked prefill request {self.chunked_req.rid} cannot be "
+                f"scheduled for its next chunk and no other requests "
+                f"can free pool space",
+            )
+            self.chunked_req = None
+
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
@@ -2880,34 +2940,18 @@ class Scheduler(
                 if (
                     len(adder.can_run_list) == 0
                     and len(self.running_batch.reqs) == 0
-                    and self.chunked_req is None
-                ):
-                    error_msg = (
-                        f"Request {req.rid} exceeds the available KV cache pool "
-                        f"capacity (extend_input_len={req.extend_input_len}, "
-                        f"rem_total_tokens={adder.rem_total_tokens}"
-                        + (
-                            f", rem_swa_tokens={adder.rem_swa_tokens}"
-                            if getattr(adder, "is_hybrid_swa", False)
-                            else ""
-                        )
-                        + f"). "
-                        f"Aborting to unblock the scheduler. "
-                        f"Consider increasing --mem-fraction-static or "
-                        f"--swa-full-tokens-ratio (default 0.8). "
-                        f"Result: {res}"
+                    and (
+                        self.chunked_req is None
+                        or not self._chunked_req_scheduled_last_iter
                     )
-                    logger.error(error_msg)
-                    self.send_to_tokenizer.send_output(
-                        AbortReq(
-                            finished_reason={
-                                "type": "abort",
-                                "status_code": HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                                "message": error_msg,
-                            },
-                            rid=req.rid,
-                        ),
+                ):
+                    self._abort_request(
                         req,
+                        adder,
+                        f"Request {req.rid} exceeds the available KV cache "
+                        f"pool capacity "
+                        f"(extend_input_len={req.extend_input_len})",
+                        extra_suffix=f"Result: {res}",
                     )
                     self.waiting_queue.remove(req)
                     continue

@@ -48,7 +48,9 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     all_reduce_status_by_rid,
+    get_dsv4_c128_state_indices,
     get_kv_class,
+    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_by_rid,
     poll_and_all_reduce_with_staging,
@@ -1022,8 +1024,24 @@ class DecodePreallocQueue:
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _c128_state_payload():
+                online = is_dsv4_c128_online_enabled()
+                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
+                return get_dsv4_c128_state_indices(
+                    int(decode_req.req.req_pool_idx),
+                    seq_len,
+                    online=online,
+                    ring_size=ring_size,
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
+            if StateType.C128_STATE in state_types:
+                clear_c128_state = getattr(
+                    self.token_to_kv_pool, "clear_c128_req_state", None
+                )
+                if clear_c128_state is not None:
+                    clear_c128_state(int(decode_req.req.req_pool_idx))
             for st in state_types:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
@@ -1031,6 +1049,8 @@ class DecodePreallocQueue:
                     state_indices.append(_swa_payload())
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 
