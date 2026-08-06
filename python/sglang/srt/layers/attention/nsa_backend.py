@@ -1651,6 +1651,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
             )
         elif nsa_impl == "fa3":
             return self._forward_fa3(
@@ -1796,6 +1797,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
             )
         elif self.nsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -1942,6 +1944,7 @@ class NativeSparseAttnBackend(
         layer,
         metadata: NSAMetadata,
         page_table_1,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not _is_hcu:
             from sgl_kernel.flash_mla import flash_mla_with_kvcache
@@ -1977,24 +1980,50 @@ class NativeSparseAttnBackend(
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
-            q=q_input,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=True,
-        )
+        # MLP-sync can append synthetic speculative rows whose cache length is
+        # zero and whose localized indices are all -1.  HCU FlashMLA must
+        # only see real request rows; restore the padded shape for downstream
+        # MLP-sync after the kernel returns.
+        num_total = q_input.shape[0]
+        num_valid = self._flashmla_kv_dp_padding_num_valid(forward_batch, num_total)
+        needs_repad = _is_hcu and num_valid is not None and 0 <= num_valid < num_total
+        flashmla_metadata = metadata.flashmla_metadata
+        if needs_repad:
+            q_input = q_input[:num_valid]
+            indices = indices[:num_valid]
+            cache_seqlens = cache_seqlens[:num_valid]
+            if num_valid > 0:
+                flashmla_metadata = self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens,
+                    seq_len_q=1,
+                )
+
+        if needs_repad and num_valid == 0:
+            o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
+        else:
+            o, _ = flash_mla_with_kvcache(
+                q=q_input,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+                num_splits=flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
+                ),
+                is_fp8_kvcache=True,
+            )
+
+        if needs_repad:
+            full_o = o.new_zeros((num_total, *o.shape[1:]))
+            full_o[:num_valid] = o
+            o = full_o
 
         if target_q_heads != num_q_heads:
-            o = o[:, :, :num_q_heads, :]
+            o = o[:, :, :num_q_heads, :].contiguous()
 
         return o
 
@@ -2378,19 +2407,46 @@ class NativeSparseAttnBackend(
         spec_info = getattr(forward_batch, "spec_info", None)
         if getattr(spec_info, "num_tokens_per_req", None) != 1:
             return None
-        planned_rows = getattr(
+        # EAGLE V2 can pre-plan the next draft while input_ids still contains
+        # all draft-token rows from verify.  Page tables are per request, so
+        # use the planned request batch rather than that transient token count.
+        planned_batch_size = getattr(forward_batch, "forward_metadata_planned_bs", None)
+        original_batch_size = getattr(forward_batch, "_original_batch_size", None)
+        if (
+            isinstance(planned_batch_size, int)
+            and 0 <= planned_batch_size < num_rows
+            and original_batch_size == planned_batch_size
+        ):
+            return planned_batch_size
+        return None
+
+    def _flashmla_kv_dp_padding_num_valid(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> Optional[int]:
+        """Return real speculative rows before IFB/DP/CP padding."""
+        forward_mode = effective_forward_mode(forward_batch)
+        if forward_mode.is_decode_or_idle():
+            return self._decode_dp_padding_num_valid(forward_batch, num_rows)
+        if not (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend(include_v2=True)
+        ):
+            return None
+
+        planned_num_tokens = getattr(
             forward_batch, "forward_metadata_planned_num_tokens", None
         )
         planned_batch_size = getattr(forward_batch, "forward_metadata_planned_bs", None)
         original_batch_size = getattr(forward_batch, "_original_batch_size", None)
-        if (
-            isinstance(planned_rows, int)
-            and 0 <= planned_rows < num_rows
-            and planned_batch_size == planned_rows
-            and original_batch_size == planned_rows
+        if not (
+            isinstance(planned_num_tokens, int)
+            and 0 <= planned_num_tokens < num_rows
+            and isinstance(original_batch_size, int)
+            and original_batch_size >= 0
+            and planned_batch_size == original_batch_size
         ):
-            return planned_rows
-        return None
+            return None
+        return planned_num_tokens
 
     def _transform_decode_topk_indices(
         self,

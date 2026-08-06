@@ -1008,6 +1008,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
+            # Preserve the real request count before either IFB/DP padding
+            # branch remaps the mode or grows the physical batch.
+            setattr(self, "_original_batch_size", self.batch_size)
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
@@ -1021,7 +1024,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
-                setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
