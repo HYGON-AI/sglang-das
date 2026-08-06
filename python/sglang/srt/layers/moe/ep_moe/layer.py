@@ -1070,11 +1070,13 @@ class DeepEPMoE(FusedMoE):
             q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
                 gateup_output,
                 fp8type=0,
+                expert_ids=m_indices,
             )
         else:
             q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant(
                 gateup_output,
                 fp8type=0,
+                expert_ids=m_indices,
                 limit=swiglu_limit,
             )
         del gateup_output
