@@ -196,6 +196,7 @@ NIGHTLY_SUITES = {
         "nightly-hcu-1-gpu",
         "nightly-hcu-2-gpu",
         "nightly-hcu-4-gpu",
+        "nightly-hcu-4-gpu-functional",
         "nightly-hcu-8-gpu",
         "nightly-hcu-accuracy",
         "nightly-hcu-perf",

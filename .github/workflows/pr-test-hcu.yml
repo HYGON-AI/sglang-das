@@ -760,6 +760,7 @@ jobs:
               --include-file registered/unit/parser/test_reasoning_parser.py \
               --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
               --include-file registered/attention/test_triton_attention_kernels.py \
+              --include-file registered/hcu/kernels/test_fp8_quant_reference_hcu.py \
               --include-file registered/layers/mamba/test_mamba_ssm.py \
               --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
               --include-file registered/rl/test_fp32_lm_head.py \
@@ -794,10 +795,12 @@ jobs:
               --include-file registered/hcu/openai_server/test_serving_chat_hcu.py \
               --include-file registered/hcu/openai_server/test_tool_choice_hcu.py \
               --include-file registered/hcu/reranker/bw1100/test_qwen3_reranker_hcu.py \
+              --include-file registered/hcu/lora/bw1100/test_qwen3_lora_server_hcu.py \
               --include-file registered/hcu/rotary/test_mrope_smoke_hcu.py \
               --include-file registered/hcu/spec/test_build_eagle_tree_hcu.py \
               --include-file registered/hcu/unit/function_call/test_json_schema_constraint_hcu.py \
               --include-file registered/hcu/unit/test_profile_merger_hcu.py \
+              --include-file registered/hcu/infra/test_hcu_server_guard_failures_hcu.py \
               --include-file registered/hcu/vlm_models/bw1100/test_qwen25_vl_3b_server_hcu.py \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size ${{ matrix.parts }} \

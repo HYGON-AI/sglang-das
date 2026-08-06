@@ -47,6 +47,7 @@ on:
           - nightly-hcu-long-scheduler
           - nightly-hcu-long-decoding
           - nightly-hcu-2gpu
+          - nightly-hcu-4gpu-functional
 
 permissions:
   contents: read
@@ -797,6 +798,16 @@ jobs:
             timeout_minutes: 120
             include_files: ""
             visible_devices: "0,1"
+          - name: four-gpu-functional
+            group: nightly-hcu-4gpu-functional
+            suite: nightly-hcu-4-gpu-functional
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 2400
+            timeout_minutes: 120
+            include_files: ""
+            visible_devices: "0,1,2,3"
           - name: api-models
             group: nightly-hcu-api-models
             suite: nightly-hcu-api-models
