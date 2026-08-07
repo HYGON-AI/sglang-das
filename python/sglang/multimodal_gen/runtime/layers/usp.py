@@ -21,6 +21,10 @@ import torch
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
+from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
+    pack_qkv_destination_major,
+)
+
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
@@ -57,6 +61,49 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
     return output.reshape(x_shape)
+
+
+def _usp_input_all_to_all_packed_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange packed 3D Q/K/V with one destination-major collective."""
+
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    assert q.ndim == 3 and q.shape == k.shape == v.shape
+    s_local, h_global, head_size = q.shape
+    assert h_global % world_size == 0
+    h_local = h_global // world_size
+
+    if (
+        q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+        and not torch.compiler.is_compiling()
+    ):
+        packed = pack_qkv_destination_major(q, k, v, world_size)
+    else:
+        packed = torch.empty(
+            (world_size, s_local, h_local, 3 * head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        for index, tensor in enumerate((q, k, v)):
+            head_shards = tensor.view(
+                s_local, world_size, h_local, head_size
+            ).permute(1, 0, 2, 3)
+            packed[..., index * head_size : (index + 1) * head_size].copy_(
+                head_shards
+            )
+
+    packed = _usp_all_to_all_single(packed)
+    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
+    return tuple(packed.split(head_size, dim=-1))
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:

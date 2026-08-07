@@ -119,9 +119,13 @@ class Backend(str, Enum):
 class ServerArgs(DisaggArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
+    model_subfolder: str | None = None
 
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
+
+    # Optional model partition selector used by multi-variant repositories.
+    model_variant: str | None = None
 
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
@@ -879,6 +883,12 @@ class ServerArgs(DisaggArgsMixin):
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
+            "--model-subfolder",
+            type=str,
+            default=ServerArgs.model_subfolder,
+            help="Optional Diffusers pipeline subfolder inside the model repository.",
+        )
+        parser.add_argument(
             "--model-id",
             type=str,
             default=ServerArgs.model_id,
@@ -888,6 +898,12 @@ class ServerArgs(DisaggArgsMixin):
                 "any registered HF repo name. Should be the repo name portion of the HF ID "
                 "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
             ),
+        )
+        parser.add_argument(
+            "--model-variant",
+            type=str,
+            default=ServerArgs.model_variant,
+            help="Select a model partition within a multi-variant model repository.",
         )
         parser.add_argument(
             "--pipeline-class-name",

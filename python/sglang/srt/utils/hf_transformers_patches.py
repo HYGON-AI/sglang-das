@@ -56,6 +56,7 @@ def apply_all():
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
+    _patch_broken_torchaudio_availability()
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
@@ -204,6 +205,26 @@ def _patch_flash_attn_availability():
             _u.is_flash_attn_2_available = lambda: False
     except ImportError:
         pass
+
+
+def _patch_broken_torchaudio_availability():
+    """Hide an installed torchaudio package when its native extension is unusable.
+
+    Transformers 5.12 imports its generic RNNT loss while importing unrelated
+    text models.  Package-presence detection alone reports torchaudio as
+    available even when the installed wheel targets a different accelerator
+    runtime, which then prevents every text model from importing.  H3 does not
+    use the RNNT loss; only report the optional package unavailable when a real
+    import already fails.
+    """
+    try:
+        import torchaudio  # noqa: F401
+    except (ImportError, OSError):
+        import transformers.utils as _u
+        import transformers.utils.import_utils as _ui
+
+        _ui.is_torchaudio_available = lambda: False
+        _u.is_torchaudio_available = lambda: False
 
 
 def _patch_removed_symbols():

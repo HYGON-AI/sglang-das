@@ -79,12 +79,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    ACTION = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.ACTION:
+            return "json"
         return "glb"
 
 

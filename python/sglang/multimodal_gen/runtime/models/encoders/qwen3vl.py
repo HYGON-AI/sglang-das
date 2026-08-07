@@ -51,7 +51,13 @@ class Qwen3VLTextAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        # Qwen3-VL variants (including MiniMax-H3's text encoder) may use an
+        # explicit head_dim that differs from hidden_size / num_attention_heads.
+        self.head_dim = (
+            int(config.head_dim)
+            if getattr(config, "head_dim", None) is not None
+            else config.hidden_size // config.num_attention_heads
+        )
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )

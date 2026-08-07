@@ -83,6 +83,10 @@ class VideoResponse(BaseModel):
 
 
 class VideoGenerationsRequest(BaseModel):
+    # MiniMax-H3 carries its native contract fields as OpenAI-compatible
+    # extensions (task, conditions, target, quality and modality shifts).
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None

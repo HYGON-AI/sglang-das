@@ -1,5 +1,8 @@
+import hashlib
 import importlib.util
 import os
+import sys
+import types
 
 import torch
 import torch.nn as nn
@@ -108,8 +111,32 @@ class VAELoader(ComponentLoader):
         if auto_model_map:
             module_path, cls_name = auto_model_map.rsplit(".", 1)
             custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
-            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
+            # Load repository-provided VAE code as a package module.  MiniMax-H3
+            # keeps the implementation beside the entry file and uses relative
+            # imports (for example ``from .attention import Attention``), which
+            # cannot work when the entry file is loaded as the top-level
+            # ``_custom`` module.
+            component_realpath = os.path.realpath(component_model_path)
+            package_suffix = hashlib.sha1(
+                component_realpath.encode("utf-8")
+            ).hexdigest()[:12]
+            package_name = f"_sglang_custom_vae_{package_suffix}"
+            if package_name not in sys.modules:
+                package = types.ModuleType(package_name)
+                package.__path__ = [component_realpath]
+                package.__package__ = package_name
+                sys.modules[package_name] = package
+
+            qualified_module_name = f"{package_name}.{module_path}"
+            spec = importlib.util.spec_from_file_location(
+                qualified_module_name, custom_module_file
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(
+                    f"Cannot create import spec for custom VAE: {custom_module_file}"
+                )
             custom_module = importlib.util.module_from_spec(spec)
+            sys.modules[qualified_module_name] = custom_module
             spec.loader.exec_module(custom_module)
             vae_cls = getattr(custom_module, cls_name)
             vae_dtype = PRECISION_TO_TYPE[vae_precision]

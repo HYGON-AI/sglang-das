@@ -390,3 +390,59 @@ class AITerImpl(AttentionImpl):
             return_lse=True,
         )
         return output
+
+    @torch.compiler.disable
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        attention_config = None
+        if USE_AITER_GFX942:
+            # The grouped-varlen ASM kernel hangs on H3's ~64K packed
+            # sequences on gfx942; AITER's Triton path handles this shape.
+            attention_func = importlib.import_module(
+                "aiter.ops.triton.attention.mha"
+            ).flash_attn_varlen_func
+        elif hasattr(aiter, "flash_attn_varlen_func"):
+            attention_func = aiter.flash_attn_varlen_func
+        else:
+            # Hygon AITER exposes the fused varlen implementation from its
+            # Triton MHA module instead of re-exporting it at package top level.
+            # Its wheel does not include a BW200-MHA-DEFAULT tuning JSON, so use
+            # the generic upstream forward tile that is embedded in mha.py.
+            attention_func = importlib.import_module(
+                "aiter.ops.triton.mha"
+            ).flash_attn_varlen_func
+            attention_config = {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "waves_per_eu": 2,
+                "num_warps": 4,
+                "num_ctas": 1,
+                "num_stages": 1,
+            }
+
+        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        attention_kwargs = {}
+        if attention_config is not None:
+            attention_kwargs["config"] = attention_config
+        output = attention_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            **attention_kwargs,
+        )
+        return output[0] if isinstance(output, tuple) else output

@@ -3,15 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from flash_attn import flash_attn_func as flash_attn_func_interface
+from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_interface
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    flash_attn_func,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -57,6 +56,7 @@ class FlashAttention2Impl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.dropout_p = float(extra_impl_args.get("dropout_p", 0.0))
 
     def forward(
         self,
@@ -65,15 +65,40 @@ class FlashAttention2Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ):
-        output = flash_attn_func(
-            q=query,  # type: ignore[no-untyped-call]
-            k=key,
-            v=value,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=None,
-            max_seqlen_k=None,
+        output = flash_attn_func_interface(
+            query,
+            key,
+            value,
+            dropout_p=self.dropout_p,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
         )
-        return output
+        return output[0] if isinstance(output, tuple) else output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        cu_seqlens = cu_seqlens.to(
+            device=query.device, dtype=torch.int32
+        ).contiguous()
+        output = flash_attn_varlen_func_interface(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            dropout_p=self.dropout_p,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return output[0] if isinstance(output, tuple) else output

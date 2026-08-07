@@ -49,6 +49,305 @@ from sglang.srt.observability.trace import extract_trace_headers
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
+_VIDEO_EXTENSIONS = {
+    ".avi",
+    ".gif",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".webm",
+}
+
+_MINIMAX_H3_CANCEL_FILE_EXTRA_KEY = "minimax_h3_cancel_file"
+
+
+def _video_cancel_path(video_id: str) -> str | None:
+    root = os.getenv("SGLANG_VIDEO_CANCEL_DIR")
+    if not root:
+        return None
+    cancel_root = os.path.abspath(root)
+    os.makedirs(cancel_root, exist_ok=True)
+    return os.path.join(cancel_root, f"{video_id}.cancel")
+
+
+def _video_cancel_requested(batch: Req) -> bool:
+    cancel_file = batch.extra.get(_MINIMAX_H3_CANCEL_FILE_EXTRA_KEY)
+    return isinstance(cancel_file, str) and bool(cancel_file) and os.path.isfile(
+        cancel_file
+    )
+
+
+async def _mark_video_cancelled(job_id: str) -> None:
+    await VIDEO_STORE.update_fields(
+        job_id,
+        {
+            "status": "cancelled",
+            "progress": 100,
+            "completed_at": int(time.time()),
+            "error": None,
+            "url": None,
+            "file_path": None,
+            "file_paths": None,
+            "num_outputs": None,
+        },
+    )
+
+
+def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
+    return (request.model_extra or {}).get(name)
+
+
+def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
+    value = getattr(request, name, None)
+    if value is not None:
+        return value
+    return _extra_value(request, name)
+
+
+def _parse_form_extra_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+_MULTIPART_EXTRA_FORM_FIELDS = (
+    "use_duration_template",
+    "use_resolution_template",
+    "use_system_prompt",
+    "use_guardrails",
+    "guardrails",
+    "video_path",
+    "video_url",
+    "generate_sound",
+    "sound_duration",
+    "condition_frame_indexes",
+    "action_mode",
+    "domain_id",
+    "domain_name",
+    "raw_action_dim",
+    "action_fps",
+    "action",
+    "action_view_point",
+    "action_normalization",
+    "condition_frame_indexes_vision",
+    "condition_video_keep",
+)
+
+
+def _video_sampling_params_cls(server_args) -> type[SamplingParams]:
+    """Resolve the params type selected for the current server."""
+
+    sampling_params_cls = SamplingParams
+    if server_args.pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    if sampling_params_cls is SamplingParams:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            sampling_params_cls = model_info.sampling_param_cls
+    return sampling_params_cls
+
+
+def _multipart_extra_form_keys(
+    sampling_params_cls: type[SamplingParams],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *VideoGenerationsRequest.model_fields,
+                *_MULTIPART_EXTRA_FORM_FIELDS,
+                *sorted(sampling_params_cls.video_request_extra_fields()),
+            )
+        )
+    )
+
+
+def _filter_multipart_declared_fields(
+    extra_from_form: Dict[str, Any],
+    sampling_params_cls: type[SamplingParams],
+) -> Dict[str, Any]:
+    declared = set(_multipart_extra_form_keys(sampling_params_cls))
+    return {key: value for key, value in extra_from_form.items() if key in declared}
+
+
+def _merge_multipart_extra_form_fields(
+    raw_form: Any,
+    extra_from_form: Dict[str, Any],
+    sampling_params_cls: type[SamplingParams],
+) -> None:
+    for key in _multipart_extra_form_keys(sampling_params_cls):
+        if key in raw_form and key not in extra_from_form:
+            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+
+
+def _multipart_video_extras(
+    raw_form: Any,
+    *,
+    extra_body: Any,
+    extra_params: Any,
+    sampling_params_cls: type[SamplingParams],
+) -> Dict[str, Any]:
+    """Build and validate multipart extras once for request construction."""
+
+    extra_from_form: Dict[str, Any] = {}
+    if extra_body:
+        try:
+            extra_from_form = flatten_extra_params(json.loads(extra_body))
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_body is not valid JSON"
+            ) from exc
+    if extra_params:
+        try:
+            extra_from_form.update(
+                flatten_extra_params({"extra_params": json.loads(extra_params)})
+            )
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_params is not valid JSON"
+            ) from exc
+    _merge_multipart_extra_form_fields(
+        raw_form,
+        extra_from_form,
+        sampling_params_cls,
+    )
+    flatten_extra_params(extra_from_form)
+    return _filter_multipart_declared_fields(extra_from_form, sampling_params_cls)
+
+
+def _is_probably_video_source(source: Any) -> bool:
+    content_type = (getattr(source, "content_type", "") or "").lower()
+    if content_type.startswith("video/"):
+        return True
+
+    if isinstance(source, str):
+        if source.lower().startswith("data:video"):
+            return True
+        source_name = source
+    else:
+        source_name = getattr(source, "filename", None)
+
+    if not source_name:
+        return False
+    source_name = str(source_name).split("?", 1)[0].split("#", 1)[0]
+    return os.path.splitext(source_name)[1].lower() in _VIDEO_EXTENSIONS
+
+
+def _is_cosmos3_server(server_args) -> bool:
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+
+    return isinstance(server_args.pipeline_config, Cosmos3Config)
+
+
+def _normalize_optional_string(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _coerce_optional_int_list(value: Any) -> list[int] | None:
+    value = _parse_form_extra_value(value)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
+def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
+    video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
+    if video_path:
+        return str(video_path)
+
+    input_reference = _request_value(req, "input_reference")
+    if _is_probably_video_source(input_reference):
+        return str(input_reference)
+
+    reference_url = _request_value(req, "reference_url")
+    if _is_probably_video_source(reference_url):
+        return str(reference_url)
+
+    return None
+
+
+def _resolve_image_path(
+    req: VideoGenerationsRequest, video_path: str | None
+) -> str | None:
+    image_path = _request_value(req, "input_reference")
+    if video_path and image_path == video_path:
+        return None
+    if _is_probably_video_source(image_path):
+        return None
+    return image_path
+
+
+def _resolve_sound_duration(
+    req: VideoGenerationsRequest, *, num_frames: int, fps: int
+) -> float | None:
+    generate_sound = _request_value(req, "generate_sound")
+    sound_duration = _request_value(req, "sound_duration")
+
+    if generate_sound is False:
+        return 0.0
+    if sound_duration is not None:
+        return float(sound_duration)
+    if generate_sound is True:
+        return float(num_frames) / float(fps)
+    return None
+
+
+def _cosmos3_sampling_param_kwargs(
+    req: VideoGenerationsRequest, *, num_frames: int, fps: int
+) -> Dict[str, Any]:
+    """Map HTTP/API aliases to Cosmos3SamplingParams field names."""
+    kwargs: Dict[str, Any] = {}
+
+    sound_duration = _resolve_sound_duration(req, num_frames=num_frames, fps=fps)
+    if sound_duration is not None:
+        kwargs["sound_duration"] = sound_duration
+
+    condition_frame_indexes = _request_value(req, "condition_frame_indexes")
+    if condition_frame_indexes is None:
+        condition_frame_indexes = _request_value(req, "condition_frame_indexes_vision")
+    condition_frame_indexes = _coerce_optional_int_list(condition_frame_indexes)
+    if condition_frame_indexes is not None:
+        kwargs["condition_frame_indexes"] = condition_frame_indexes
+
+    for name in (
+        "condition_video_keep",
+        "action_mode",
+        "domain_id",
+        "domain_name",
+        "raw_action_dim",
+        "action_fps",
+        "action",
+        "action_view_point",
+        "action_normalization",
+    ):
+        value = _parse_form_extra_value(_request_value(req, name))
+        value = _normalize_optional_string(value)
+        if value is not None:
+            kwargs[name] = value
+
+    return kwargs
+
 
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
@@ -60,36 +359,40 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     if num_outputs is None:
         num_outputs = request.n or 1
 
-    return build_sampling_params(
-        request_id,
-        prompt=request.prompt,
-        num_outputs_per_prompt=max(1, min(int(num_outputs), 10)),
-        size=request.size,
-        width=request.width,
-        height=request.height,
-        num_frames=num_frames,
-        fps=fps,
-        image_path=request.input_reference,
-        output_file_name=request_id,
-        seed=request.seed,
-        generator_device=request.generator_device,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
-        guidance_scale_2=request.guidance_scale_2,
-        negative_prompt=request.negative_prompt,
-        enable_teacache=request.enable_teacache,
-        enable_frame_interpolation=request.enable_frame_interpolation,
-        frame_interpolation_exp=request.frame_interpolation_exp,
-        frame_interpolation_scale=request.frame_interpolation_scale,
-        frame_interpolation_model_path=request.frame_interpolation_model_path,
-        enable_upscaling=request.enable_upscaling,
-        upscaling_model_path=request.upscaling_model_path,
-        upscaling_scale=request.upscaling_scale,
-        output_path=request.output_path,
-        output_compression=request.output_compression,
-        output_quality=request.output_quality,
-        perf_dump_path=request.perf_dump_path,
-    )
+    kwargs = {
+        "prompt": request.prompt,
+        "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
+        "size": request.size,
+        "width": request.width,
+        "height": request.height,
+        "num_frames": num_frames,
+        "fps": fps,
+        "image_path": request.input_reference,
+        "output_file_name": request_id,
+        "seed": request.seed,
+        "generator_device": request.generator_device,
+        "num_inference_steps": request.num_inference_steps,
+        "guidance_scale": request.guidance_scale,
+        "guidance_scale_2": request.guidance_scale_2,
+        "negative_prompt": request.negative_prompt,
+        "flow_shift": _extra_value(request, "flow_shift"),
+        "enable_teacache": request.enable_teacache,
+        "enable_frame_interpolation": request.enable_frame_interpolation,
+        "frame_interpolation_exp": request.frame_interpolation_exp,
+        "frame_interpolation_scale": request.frame_interpolation_scale,
+        "frame_interpolation_model_path": request.frame_interpolation_model_path,
+        "enable_upscaling": request.enable_upscaling,
+        "upscaling_model_path": request.upscaling_model_path,
+        "upscaling_scale": request.upscaling_scale,
+        "output_path": request.output_path,
+        "output_compression": request.output_compression,
+        "output_quality": request.output_quality,
+        "perf_dump_path": request.perf_dump_path,
+    }
+    server_args = get_global_server_args()
+    sampling_params_cls = _video_sampling_params_cls(server_args)
+    kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
+    return build_sampling_params(request_id, **kwargs)
 
 
 # extract metadata which http_server needs to know
@@ -138,15 +441,27 @@ async def _dispatch_job_async(
     job_id: str,
     batch: Req,
     *,
+    scheduler_batches: list[Req] | None = None,
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
 ) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
+        if _video_cancel_requested(batch):
+            await _mark_video_cancelled(job_id)
+            return
         save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
+            async_scheduler_client, batch, scheduler_batches=scheduler_batches
         )
+        if _video_cancel_requested(batch):
+            for output_path in save_file_path_list:
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+            await _mark_video_cancelled(job_id)
+            return
         save_file_path = save_file_path_list[0]
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
@@ -173,12 +488,29 @@ async def _dispatch_job_async(
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")
-        await VIDEO_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
-        )
+        if _video_cancel_requested(batch):
+            await _mark_video_cancelled(job_id)
+        else:
+            await VIDEO_STORE.update_fields(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": {"message": str(e)},
+                    "url": None,
+                    "file_path": None,
+                    "file_paths": None,
+                    "num_outputs": None,
+                },
+            )
     finally:
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
+        cancel_file = batch.extra.get(_MINIMAX_H3_CANCEL_FILE_EXTRA_KEY)
+        if isinstance(cancel_file, str) and cancel_file:
+            try:
+                os.remove(cancel_file)
+            except FileNotFoundError:
+                pass
 
 
 # TODO: support image to video generation
@@ -360,24 +692,62 @@ async def create_video(
     except (ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    job = _video_job_from_sampling(request_id, req, sampling_params)
-    await VIDEO_STORE.upsert(request_id, job)
+    batch: Req | None = None
+    scheduler_batches: list[Req] | None = None
+    try:
+        # Build Req for scheduler.
+        trace_headers = extract_trace_headers(request.headers)
+        batch = prepare_request(
+            server_args=server_args,
+            sampling_params=sampling_params,
+            external_trace_header=trace_headers,
+        )
+        cancel_file = _video_cancel_path(request_id)
+        if cancel_file is not None:
+            try:
+                os.remove(cancel_file)
+            except FileNotFoundError:
+                pass
+            batch.extra[_MINIMAX_H3_CANCEL_FILE_EXTRA_KEY] = cancel_file
+        # Add diffusers_kwargs if provided.
+        if req.diffusers_kwargs:
+            batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
+            if "max_sequence_length" in req.diffusers_kwargs:
+                batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
+            if "flow_shift" in req.diffusers_kwargs:
+                batch.flow_shift = req.diffusers_kwargs["flow_shift"]
+        await asyncio.to_thread(
+            sampling_params.prepare_video_request_for_queue,
+            batch,
+        )
+        scheduler_batches = sampling_params.expand_video_request_outputs_for_queue(
+            batch
+        )
+        job = _video_job_from_sampling(request_id, req, sampling_params)
+        job.update(sampling_params.project_video_queued_job_fields(batch))
+        await VIDEO_STORE.upsert(request_id, job)
+    except Exception as e:
+        if batch is not None:
+            try:
+                await asyncio.to_thread(sampling_params.cleanup_video_request, batch)
+            except Exception:
+                logger.warning(
+                    "Failed to clean up rejected video request resources",
+                    exc_info=True,
+                )
+        for td in temp_dirs:
+            shutil.rmtree(td, ignore_errors=True)
+        if isinstance(e, (TypeError, ValueError)):
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        raise
 
-    # Build Req for scheduler
-    trace_headers = extract_trace_headers(request.headers)
-    batch = prepare_request(
-        server_args=server_args,
-        sampling_params=sampling_params,
-        external_trace_header=trace_headers,
-    )
-    # Add diffusers_kwargs if provided
-    if req.diffusers_kwargs:
-        batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
+    assert batch is not None
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(
         _dispatch_job_async(
             request_id,
             batch,
+            scheduler_batches=scheduler_batches,
             temp_dirs=temp_dirs or None,
             output_persistent=output_persistent,
         )
@@ -421,15 +791,30 @@ async def retrieve_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
-    job["status"] = "deleted"
-    return VideoResponse(**job)
+    if job.get("status") in {"completed", "failed", "cancelled", "deleted"}:
+        deleted = await VIDEO_STORE.pop(video_id)
+        assert deleted is not None
+        deleted["status"] = "deleted"
+        return VideoResponse(**deleted)
+    cancel_file = _video_cancel_path(video_id)
+    if cancel_file is None:
+        raise HTTPException(
+            status_code=501,
+            detail="running video cancellation is not configured",
+        )
+    with open(cancel_file, "ab"):
+        pass
+    updated = await VIDEO_STORE.update_fields(
+        video_id,
+        {"status": "cancelling"},
+    )
+    assert updated is not None
+    return VideoResponse(**updated)
 
 
 @router.get("/{video_id}/content")
