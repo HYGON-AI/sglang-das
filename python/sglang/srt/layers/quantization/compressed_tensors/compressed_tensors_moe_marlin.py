@@ -255,6 +255,20 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
+        # === DEBUG: dump weight BEFORE packing ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_weight_before_pack
+            lid = layer.layer_id
+            debug_weight_before_pack(
+                lid,
+                "deepep" if self.use_deepep else "tp",
+                layer.w13_weight, layer.w2_weight,
+                layer.w13_weight_scale, layer.w2_weight_scale,
+            )
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
+
         if self.use_deepep:
             from deepgemm import marlin_i8_contiguous_weight, marlin_i8_masked_weight
 
@@ -286,6 +300,20 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             )
             del w2_packed
             torch.cuda.empty_cache()
+
+            # === DEBUG: dump weight AFTER deepgemm packing ===
+            try:
+                from sglang.srt.layers.moe.debug_int8_moe import debug_weight_after_pack
+                lid = layer.layer_id
+                debug_weight_after_pack(
+                    lid, "deepep",
+                    layer.w13_weight, layer.w2_weight,
+                    layer.w13_weight_scale, layer.w2_weight_scale,
+                )
+            except Exception:
+                pass
+            # === END DEBUG ===
+
             return
 
         w1_marlin_list = []
@@ -302,6 +330,19 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
 
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
+
+        # === DEBUG: dump weight AFTER marlin packing ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_weight_after_pack
+            lid = layer.layer_id
+            debug_weight_after_pack(
+                lid, "tp",
+                layer.w13_weight, layer.w2_weight,
+                layer.w13_weight_scale, layer.w2_weight_scale,
+            )
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -400,6 +441,20 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             else 1.0
         )
 
+        # === DEBUG: dump TP forward input ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_tp_forward_in
+            lid = layer.layer_id
+            debug_tp_forward_in(
+                lid, x, layer.w13_weight, layer.w2_weight,
+                layer.w13_weight_scale, layer.w2_weight_scale,
+                topk_ids, topk_weights,
+                layer.moe_runner_config.num_experts,
+            )
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
+
         output = torch.ops.sglang.fused_experts_impl_int8_marlin(
             x,
             layer.w13_weight,
@@ -420,6 +475,15 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             routed_scaling_factor=float(routed_scaling_factor),
             # expert_map=local_expert_mapping,
         )
+
+        # === DEBUG: dump TP forward output ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_tp_forward_out
+            lid = layer.layer_id
+            debug_tp_forward_out(lid, output)
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
 
         return StandardCombineInput(hidden_states=output)
 

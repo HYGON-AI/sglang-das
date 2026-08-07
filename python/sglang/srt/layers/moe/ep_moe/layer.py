@@ -1248,6 +1248,20 @@ class DeepEPMoE(FusedMoE):
             w13_weight = self.w13_weight
         if w2_weight is None:
             w2_weight = self.w2_weight
+
+        # === DEBUG: dump DeepEP forward input ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_deepep_forward_in
+            debug_deepep_forward_in(
+                self.layer_id, hidden_states, hidden_states_scale,
+                w13_weight, w2_weight,
+                self.w13_weight_scale, self.w2_weight_scale,
+                topk_ids, topk_weights, num_recv_tokens_per_expert,
+            )
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
+
         w13_weight_int8 = (
             w13_weight,
             (self.w13_weight_scale),
@@ -1312,6 +1326,14 @@ class DeepEPMoE(FusedMoE):
             shuffle_unique=shuffle_unique,
         )
 
+        # === DEBUG: dump DeepEP mid (after GEMM1, before silu_quant) ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_deepep_forward_mid
+            debug_deepep_forward_mid(self.layer_id, gateup_output, None, None)
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
+
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
 
@@ -1339,6 +1361,14 @@ class DeepEPMoE(FusedMoE):
             down_output, topk_ids, topk_weights, output_index, gather_out
         )
         del down_output
+
+        # === DEBUG: dump DeepEP output ===
+        try:
+            from sglang.srt.layers.moe.debug_int8_moe import debug_deepep_forward_out
+            debug_deepep_forward_out(self.layer_id, gather_out, gather_out)
+        except Exception as _e:
+            print(f"[DEBUG_MOE] ERROR: {_e}")
+        # === END DEBUG ===
 
         return gather_out
 
