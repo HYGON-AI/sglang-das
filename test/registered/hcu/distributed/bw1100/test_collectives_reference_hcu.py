@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_hcu_ci
 
 register_hcu_ci(
     est_time=180,
-    suite="nightly-hcu-2-gpu",
+    suite="nightly-hcu-2",
     nightly=True,
 )
 

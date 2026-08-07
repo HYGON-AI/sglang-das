@@ -128,7 +128,7 @@ python3 test/run_suite.py --hw hcu --suite nightly-hcu-vlm --nightly
 
 ## Two-node PD disaggregation
 
-`nightly-hcu-disaggregation-16gpu` is a real two-host suite. It is not a
+`nightly-hcu-disaggregation-16` is a real two-host suite. It is not a
 single-host emulation and must be launched through
 `.github/workflows/hcu-pd-1p1d.yml`.
 

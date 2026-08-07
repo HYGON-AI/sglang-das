@@ -17,7 +17,7 @@ from sglang.test.test_utils import find_available_port
 
 register_hcu_ci(
     est_time=1500,
-    suite="nightly-hcu-4-gpu-functional",
+    suite="nightly-hcu-4-functional",
     nightly=True,
 )
 

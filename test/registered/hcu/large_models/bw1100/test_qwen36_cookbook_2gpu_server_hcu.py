@@ -24,7 +24,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 register_hcu_ci(
     est_time=3600,
-    suite="nightly-hcu-2-gpu",
+    suite="nightly-hcu-2",
     nightly=True,
 )
 

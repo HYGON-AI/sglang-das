@@ -15,7 +15,7 @@ from sglang.test.hcu_server_guard import HcuServerGuard
 from sglang.test.hcu_utils import get_model_path
 from sglang.test.test_utils import find_available_port
 
-register_hcu_ci(est_time=1200, suite="nightly-hcu-1-gpu", nightly=True)
+register_hcu_ci(est_time=1200, suite="nightly-hcu-1", nightly=True)
 
 DEFAULT_MODEL = (
     "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"

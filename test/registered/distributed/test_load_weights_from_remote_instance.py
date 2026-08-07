@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 
 register_hcu_ci(
     est_time=240,
-    suite="nightly-hcu-2-gpu",
+    suite="nightly-hcu-2",
     nightly=True,
     disabled="HCU nightly disabled: remote weight loading OOMs or times out on BW1100; pending fix.",
 )

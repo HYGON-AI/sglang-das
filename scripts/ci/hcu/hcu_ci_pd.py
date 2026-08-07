@@ -1060,7 +1060,7 @@ class PDOrchestrator:
             "--hw",
             "hcu",
             "--suite",
-            "nightly-hcu-disaggregation-16gpu",
+            "nightly-hcu-disaggregation-16",
             "--nightly",
         ]
         self._run_monitored(
