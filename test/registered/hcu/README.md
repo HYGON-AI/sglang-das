@@ -36,7 +36,7 @@ Add a module level call near the top of the file:
 ```python
 from sglang.test.ci.ci_register import register_hcu_ci
 
-register_hcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=120, suite="stage-b-test-1-hcu-small")
 ```
 
 For nightly tests, set `nightly=True` and use a `nightly-hcu-*` suite.
@@ -120,15 +120,15 @@ Kernel whitelist selection is controlled by `SGLANG_HCU_KERNEL_TEST_SET`:
 ## Running locally
 
 ```bash
-python3 test/run_suite.py --hw hcu --suite stage-a-test-1-gpu-small-hcu
-python3 test/run_suite.py --hw hcu --suite stage-b-test-1-gpu-small-hcu
+python3 test/run_suite.py --hw hcu --suite stage-a-test-1-hcu-small
+python3 test/run_suite.py --hw hcu --suite stage-b-test-1-hcu-small
 python3 test/run_suite.py --hw hcu --suite nightly-hcu-accuracy --nightly
 python3 test/run_suite.py --hw hcu --suite nightly-hcu-vlm --nightly
 ```
 
 ## Two-node PD disaggregation
 
-`nightly-hcu-disaggregation-16gpu` is a real two-host suite. It is not a
+`nightly-hcu-disaggregation-16` is a real two-host suite. It is not a
 single-host emulation and must be launched through
 `.github/workflows/hcu-pd-1p1d.yml`.
 

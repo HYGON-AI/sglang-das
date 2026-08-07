@@ -21,7 +21,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_hcu_ci
 
-register_hcu_ci(est_time=600, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=600, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=600, suite="nightly-hcu-core-functional", nightly=True)
 
 from sglang.test.test_utils import (

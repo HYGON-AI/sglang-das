@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: keep disabled because TTFT/latency gate failed on local Qwen2.5-7B.
 register_hcu_ci(
     est_time=345,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: local Qwen2.5-7B run failed TTFT latency gate; median_e2e_latency_ms was about 20s vs 11s threshold, total runtime about 8min.",
 )
 

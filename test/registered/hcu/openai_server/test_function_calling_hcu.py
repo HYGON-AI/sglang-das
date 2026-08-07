@@ -22,7 +22,7 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_hcu_ci
 from sglang.test.hcu_utils import HCU_TEXT_SERVER_ARGS, get_server_args
 
-register_hcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=120, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=120, suite="nightly-hcu-api-models", nightly=True)
 
 from sglang.test.test_utils import (

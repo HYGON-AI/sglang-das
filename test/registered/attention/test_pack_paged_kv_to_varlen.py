@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.test.ci.ci_register import register_hcu_ci
 
-register_hcu_ci(est_time=60, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=60, suite="stage-b-test-1-hcu-small")
 
 
 def _import_pack_module():

@@ -19,14 +19,14 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
+from sglang.test.hcu_server_guard import HcuServerGuard
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_evaluation_test_results,
-    popen_launch_server,
     write_results_to_json,
 )
 
@@ -92,12 +92,10 @@ def _get_server_args_env(name: str) -> list[str]:
 class TestBW1100GSM8KEvalHCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = _get_model_env(
-            "SGLANG_HCU_GSM8K_MODEL", DEFAULT_HCU_GSM8K_MODEL
-        )
-        cls.threshold = _get_float_env("SGLANG_HCU_GSM8K_THRESHOLD", 0.65)
+        cls.model = _get_model_env("SGLANG_HCU_GSM8K_MODEL", DEFAULT_HCU_GSM8K_MODEL)
+        cls.threshold = _get_float_env("SGLANG_HCU_GSM8K_THRESHOLD", 0.88)
         cls.num_examples = _get_int_env_with_fallback(
-            "SGLANG_HCU_GSM8K_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 10
+            "SGLANG_HCU_GSM8K_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 100
         )
         cls.num_threads = _get_int_env("SGLANG_HCU_GSM8K_NUM_THREADS", 128)
         cls.num_shots = _get_int_env("SGLANG_HCU_GSM8K_NUM_SHOTS", 5)
@@ -110,36 +108,44 @@ class TestBW1100GSM8KEvalHCU(unittest.TestCase):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
-        process = None
         all_results = []
 
         try:
-            process = popen_launch_server(
-                model=self.model,
-                base_url=self.base_url,
+            with HcuServerGuard(
+                self.model,
+                self.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=_get_server_args_env("SGLANG_HCU_GSM8K_SERVER_ARGS"),
-            )
+            ):
+                args = SimpleNamespace(
+                    base_url=self.base_url,
+                    model=self.model,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=self.num_examples,
+                    num_threads=self.num_threads,
+                    num_shots=self.num_shots,
+                    max_tokens=512,
+                    gsm8k_data_path=self.data_path,
+                )
+                metrics = run_eval(args)
 
-            args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model,
-                eval_name="gsm8k",
-                num_examples=self.num_examples,
-                num_threads=self.num_threads,
-                num_shots=self.num_shots,
-                gsm8k_data_path=self.data_path,
-            )
-            metrics = run_eval(args)
             metrics["score"] = round(metrics["score"], 4)
+            write_hcu_accuracy_result(
+                model_key="qwen25_7b_instruct",
+                model="Qwen2.5-7B-Instruct",
+                score=metrics["score"],
+                threshold=self.threshold,
+                num_examples=self.num_examples,
+                invalid_rate=metrics.get("invalid"),
+                latency_seconds=metrics.get("latency"),
+                source_test=__file__,
+            )
             write_results_to_json(self.model, metrics, "w")
             all_results.append((self.model, metrics["score"], 0.0, None))
         except Exception as exc:
             all_results.append((self.model, None, None, str(exc)))
             raise
-        finally:
-            if process is not None:
-                kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:

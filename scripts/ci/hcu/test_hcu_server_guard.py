@@ -1,13 +1,66 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
+import os
+from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
+import types
 import unittest
 from unittest import mock
 
-from sglang.test import hcu_server_guard as guard
+import psutil  # Keep psutil registered while loading the isolated guard module.
+
+
+def _load_guard_module():
+    """Load the guard without importing the full accelerator runtime."""
+
+    def kill_process_tree(pid, wait_timeout=None):
+        del wait_timeout
+        os.kill(pid, signal.SIGTERM)
+
+    def popen_launch_server(*args, **kwargs):
+        raise AssertionError("popen_launch_server must be mocked by this unit test")
+
+    sglang = types.ModuleType("sglang")
+    sglang.__path__ = []
+    srt = types.ModuleType("sglang.srt")
+    srt.__path__ = []
+    srt_utils = types.ModuleType("sglang.srt.utils")
+    srt_utils.kill_process_tree = kill_process_tree
+    test_package = types.ModuleType("sglang.test")
+    test_package.__path__ = []
+    test_utils = types.ModuleType("sglang.test.test_utils")
+    test_utils.popen_launch_server = popen_launch_server
+
+    module_path = (
+        Path(__file__).resolve().parents[3]
+        / "python"
+        / "sglang"
+        / "test"
+        / "hcu_server_guard.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "hcu_server_guard_under_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    modules = {
+        "sglang": sglang,
+        "sglang.srt": srt,
+        "sglang.srt.utils": srt_utils,
+        "sglang.test": test_package,
+        "sglang.test.test_utils": test_utils,
+    }
+    with mock.patch.dict(sys.modules, modules):
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return module
+
+
+guard = _load_guard_module()
 
 
 class _FakeProcess:

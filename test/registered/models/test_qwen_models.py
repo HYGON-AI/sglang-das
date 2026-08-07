@@ -38,7 +38,7 @@ register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU PR baseline deferred: model matrix path needs local model mapping and BW1100 repeat validation.",
 )
 

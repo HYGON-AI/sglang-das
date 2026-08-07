@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 """topk > 1 tree drafting (EAGLE3 topk16 + EAGLE/Llama-2 topk8).
 
 topk > 1 routes to spec v1, except page_size==1 which can also stay on spec v2
@@ -22,7 +26,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlam
 register_cuda_ci(est_time=1180, stage="base-b", runner_config="1-gpu-small")
 register_hcu_ci(
     est_time=840,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     nightly=False,
     disabled="HCU CSV CI placeholder: EAGLE tree decoding needs BW1100 draft/target model mapping before enabling.",
 )

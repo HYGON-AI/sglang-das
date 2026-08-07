@@ -38,7 +38,7 @@ from sglang.test.ci.ci_register import (
 
 register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_hcu_ci(est_time=10, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu-small")
 
 
 class _MockTemplateManager:

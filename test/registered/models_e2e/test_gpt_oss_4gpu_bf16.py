@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
@@ -6,7 +10,7 @@ from sglang.test.gpt_oss_common import BaseTestGptOss
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=300,
-    suite="nightly-hcu-4-gpu",
+    suite="nightly-hcu-4",
     nightly=True,
     disabled="HCU CSV CI placeholder: 4-GPU GPT-OSS BF16 path needs BW1100 large-model validation before enabling.",
 )

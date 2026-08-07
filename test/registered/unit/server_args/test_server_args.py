@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 import importlib
 import json
 import os
@@ -22,7 +26,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
-register_hcu_ci(est_time=30, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small")
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,

@@ -13,21 +13,17 @@
 # limitations under the License.
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
-from sglang.srt.utils import kill_process_tree
+import requests
+
 from sglang.test.ci.ci_register import register_hcu_ci
-from sglang.test.hcu_utils import (
-    assert_generate_non_empty,
-    get_int_env,
-    get_model_path,
-    get_server_args,
-)
-from sglang.test.test_utils import (
-    DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
-)
+from sglang.test.hcu_server_guard import HcuServerGuard
+from sglang.test.hcu_utils import get_int_env, get_model_path, get_server_args
+from sglang.test.test_utils import find_available_port
 
 register_hcu_ci(est_time=900, suite="nightly-hcu-api-models", nightly=True)
+register_hcu_ci(est_time=180, suite="stage-b-test-1-hcu-small")
 
 DEFAULT_QWEN3_4B_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-4B"
 DEFAULT_QWEN3_LORA_1 = (
@@ -37,6 +33,8 @@ DEFAULT_QWEN3_LORA_2 = (
     "/public/opendas/DL_DATA/llm-models/lora/TanXS/"
     "Qwen3-4B-LoRA-ZH-WebNovelty-v0.0"
 )
+LORA_NAME_1 = "qwen3-lora-v2"
+LORA_NAME_2 = "qwen3-webnovel"
 
 
 def _default_lora_args() -> list[str]:
@@ -44,8 +42,8 @@ def _default_lora_args() -> list[str]:
     lora_2 = get_model_path("SGLANG_HCU_QWEN3_LORA_2", DEFAULT_QWEN3_LORA_2)
     return [
         "--lora-paths",
-        lora_1,
-        lora_2,
+        f"{LORA_NAME_1}={lora_1}",
+        f"{LORA_NAME_2}={lora_2}",
         "--max-loras-per-batch",
         "3",
         "--max-loaded-loras",
@@ -69,9 +67,11 @@ class TestBW1100Qwen3LoRAServerHCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = get_model_path("SGLANG_HCU_QWEN3_4B_MODEL", DEFAULT_QWEN3_4B_MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.lora_1 = get_model_path("SGLANG_HCU_QWEN3_LORA_1", DEFAULT_QWEN3_LORA_1)
+        cls.lora_2 = get_model_path("SGLANG_HCU_QWEN3_LORA_2", DEFAULT_QWEN3_LORA_2)
+        cls.base_url = f"http://127.0.0.1:{find_available_port(11400)}"
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
+        cls.server = HcuServerGuard(
             cls.model,
             cls.base_url,
             timeout=get_int_env("SGLANG_HCU_QWEN3_LORA_TIMEOUT", 900),
@@ -81,16 +81,71 @@ class TestBW1100Qwen3LoRAServerHCU(unittest.TestCase):
                 _default_lora_args(),
             ),
         )
+        cls.server.__enter__()
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        cls.server.__exit__(None, None, None)
 
-    def test_short_generate_with_lora_loaded(self):
-        content = assert_generate_non_empty(
-            self.base_url, "The capital of China is", api_key=self.api_key
+    @classmethod
+    def _headers(cls) -> dict[str, str]:
+        return {"Authorization": f"Bearer {cls.api_key}"}
+
+    @classmethod
+    def _generate(cls, lora_path: str | None) -> dict:
+        response = requests.post(
+            cls.base_url + "/generate",
+            headers=cls._headers(),
+            json={
+                "text": "The capital of China is",
+                "lora_path": lora_path,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 24},
+            },
+            timeout=180,
         )
-        self.assertGreater(len(content.strip()), 0)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("output_ids"):
+            raise AssertionError(f"empty LoRA generation: {payload}")
+        return payload
+
+    def _assert_adapters_listed(self, expected: set[str]) -> None:
+        response = requests.get(
+            self.base_url + "/v1/models", headers=self._headers(), timeout=60
+        )
+        response.raise_for_status()
+        adapters = {
+            item["id"] for item in response.json()["data"] if item.get("parent")
+        }
+        self.assertEqual(adapters, expected)
+
+    def test_lora_lifecycle_and_concurrent_requests(self):
+        self._assert_adapters_listed({LORA_NAME_1, LORA_NAME_2})
+
+        request_adapters = [None, LORA_NAME_1, LORA_NAME_2, LORA_NAME_1]
+        with ThreadPoolExecutor(max_workers=len(request_adapters)) as executor:
+            outputs = list(executor.map(self._generate, request_adapters))
+        self.assertEqual(len(outputs), len(request_adapters))
+
+        unload = requests.post(
+            self.base_url + "/unload_lora_adapter",
+            headers=self._headers(),
+            json={"lora_name": LORA_NAME_1},
+            timeout=120,
+        )
+        unload.raise_for_status()
+        self._assert_adapters_listed({LORA_NAME_2})
+
+        load = requests.post(
+            self.base_url + "/load_lora_adapter",
+            headers=self._headers(),
+            json={"lora_name": LORA_NAME_1, "lora_path": self.lora_1},
+            timeout=300,
+        )
+        load.raise_for_status()
+        self._assert_adapters_listed({LORA_NAME_1, LORA_NAME_2})
+        self._generate(LORA_NAME_1)
+        self.assertIsNone(self.server.process.poll())
 
 
 if __name__ == "__main__":

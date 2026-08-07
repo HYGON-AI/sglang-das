@@ -315,77 +315,77 @@ jobs:
       matrix:
         include:
           - name: stage-a
-            suite: stage-a-test-1-gpu-small-hcu
+            suite: stage-a-test-1-hcu-small
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
           - name: stage-b-small-0
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 0
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-1
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 1
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-2
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 2
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-small-3
-            suite: stage-b-test-1-gpu-small-hcu
+            suite: stage-b-test-1-hcu-small
             nightly: "false"
             part: 3
             parts: 4
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-large
-            suite: stage-b-test-1-gpu-large-hcu
+            suite: stage-b-test-1-hcu-large
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 2400
             timeout_minutes: 150
-          - name: stage-b-2gpu
-            suite: stage-b-test-2-gpu-large-hcu
+          - name: stage-b-2-hcu
+            suite: stage-b-test-2-hcu-large
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
-          - name: nightly-hcu-0
+          - name: nightly-hcu-general-0
             suite: nightly-hcu
             nightly: "true"
             part: 0
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-hcu-1
+          - name: nightly-hcu-general-1
             suite: nightly-hcu
             nightly: "true"
             part: 1
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-hcu-2
+          - name: nightly-hcu-general-2
             suite: nightly-hcu
             nightly: "true"
             part: 2
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-hcu-1gpu
-            suite: nightly-hcu-1-gpu
+          - name: nightly-hcu-1
+            suite: nightly-hcu-1
             nightly: "true"
             part: 0
             parts: 1
@@ -433,8 +433,8 @@ jobs:
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
-          - name: nightly-hcu-2gpu
-            suite: nightly-hcu-2-gpu
+          - name: nightly-hcu-2
+            suite: nightly-hcu-2
             nightly: "true"
             part: 0
             parts: 1
@@ -510,45 +510,45 @@ jobs:
             parts: 5
             timeout_per_file: 15000
             timeout_minutes: 480
-          - name: large-model-4gpu
-            suite: nightly-hcu-large-model-4gpu
+          - name: large-model-4-hcu
+            suite: nightly-hcu-large-model-4
             nightly: "true"
             part: 0
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 180
             visible_devices: "4,5,6,7"
-          - name: large-model-4gpu-1
-            suite: nightly-hcu-large-model-4gpu
+          - name: large-model-4-hcu-1
+            suite: nightly-hcu-large-model-4
             nightly: "true"
             part: 1
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 180
             visible_devices: "4,5,6,7"
-          - name: large-model-8gpu-0
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-0
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 0
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
-          - name: large-model-8gpu-1
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-1
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 1
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
-          - name: large-model-8gpu-2
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-2
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 2
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
-          - name: large-model-8gpu-3
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-3
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 3
             parts: 4
@@ -590,6 +590,9 @@ jobs:
       HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
       HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
       HCU_CI_VISIBLE_DEVICES: ${{ matrix.visible_devices || vars.HCU_CI_VISIBLE_DEVICES || '' }}
+      HCU_MODEL_EXTRA_HOST_PATHS: /public4/share:/public4/opendas/DL_DATA/llm-models:/public/opendas/DL_DATA/opencompass_data
+      SGLANG_HCU_GSM8K_DATA_PATH: /public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl
+      SGLANG_HCU_MMLU_DATASET_PATH: /public/opendas/DL_DATA/llm-models/datasets/mmlu
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
@@ -626,6 +629,21 @@ jobs:
 
       - name: Install dependencies
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_install_dependency.sh"
+
+      - name: Build and install selected-ref sgl-kernel
+        if: inputs.force_wheel_mode != true
+        run: |
+          set -euo pipefail
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" \
+            --container-name "${HCU_CI_CONTAINER_NAME}" \
+            -w /sglang-checkout/sgl-kernel \
+            -- bash -lc '
+              set -euo pipefail
+              source /opt/dtk/env.sh
+              python setup_hip.py bdist_wheel
+              python3 -m pip install --force-reinstall --no-deps dist/sglang_kernel-*.whl
+              python3 -c "from sgl_kernel import normal_decode_metadata_general; print(normal_decode_metadata_general)"
+            '
 
       - name: Run full enabled HCU suite
         run: |

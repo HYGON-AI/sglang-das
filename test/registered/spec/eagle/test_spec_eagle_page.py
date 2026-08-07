@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 """page_size > 1 variants at topk=1 (flashinfer).
 
 EAGLE3 page64 (spec v2) + EAGLE/Llama-2 page4 (spec v1). topk>1 page variants
@@ -18,7 +22,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlam
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
 register_hcu_ci(
     est_time=540,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     nightly=False,
     disabled="HCU CSV CI placeholder: EAGLE page-size variants need BW1100 validation before enabling.",
 )

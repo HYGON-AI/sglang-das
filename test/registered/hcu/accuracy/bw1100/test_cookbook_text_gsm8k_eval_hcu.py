@@ -16,9 +16,11 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
 from sglang.test.hcu_cookbook_utils import (
-    assert_cookbook_min_score,
     COOKBOOK_GSM8K_EVAL_MODELS,
+    assert_cookbook_min_score,
+    get_cookbook_threshold,
     run_cookbook_accuracy_eval,
     selected_configs,
 )
@@ -33,8 +35,13 @@ register_hcu_ci(
 
 COOKBOOK_GSM8K_MIN_SCORE = {
     "Qwen3-32B": 0.90,
-    "Qwen3-30B-A3B": 0.88,
+    "Qwen3-30B-A3B": 0.93,
     "Qwen3.6-35B-A3B": 0.93,
+}
+COOKBOOK_GSM8K_MODEL_KEYS = {
+    "Qwen3-32B": "qwen3_32b",
+    "Qwen3-30B-A3B": "qwen3_30b_a3b",
+    "Qwen3.6-35B-A3B": "qwen36_35b_a3b",
 }
 
 
@@ -43,8 +50,12 @@ class TestCookbookTextGSM8KEvalHCU(unittest.TestCase):
         configs = selected_configs(
             COOKBOOK_GSM8K_EVAL_MODELS, "SGLANG_HCU_COOKBOOK_GSM8K_MODEL_FILTER"
         )
-        num_examples = int(os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_NUM_EXAMPLES", "100"))
-        num_threads = int(os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_NUM_THREADS", "128"))
+        num_examples = int(
+            os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_NUM_EXAMPLES", "100")
+        )
+        num_threads = int(
+            os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_NUM_THREADS", "128")
+        )
         num_shots = int(os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_NUM_SHOTS", "5"))
         max_tokens = int(os.environ.get("SGLANG_HCU_COOKBOOK_GSM8K_MAX_TOKENS", "2048"))
 
@@ -60,6 +71,23 @@ class TestCookbookTextGSM8KEvalHCU(unittest.TestCase):
                     max_tokens=max_tokens,
                 )
                 self.assertIn("score", metrics)
+                threshold = get_cookbook_threshold(
+                    config,
+                    COOKBOOK_GSM8K_MIN_SCORE,
+                    "SGLANG_HCU_COOKBOOK_GSM8K_MIN_SCORE",
+                )
+                if threshold is None:
+                    raise AssertionError(f"missing GSM8K threshold for {config.name}")
+                write_hcu_accuracy_result(
+                    model_key=COOKBOOK_GSM8K_MODEL_KEYS[config.name],
+                    model=config.name,
+                    score=metrics["score"],
+                    threshold=threshold,
+                    num_examples=num_examples,
+                    invalid_rate=metrics.get("invalid"),
+                    latency_seconds=metrics.get("latency"),
+                    source_test=__file__,
+                )
                 assert_cookbook_min_score(
                     config,
                     metrics,

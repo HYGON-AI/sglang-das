@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 import multiprocessing as mp
 import unittest
 
@@ -32,7 +36,7 @@ register_cuda_ci(est_time=103, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=132, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 register_hcu_ci(
     est_time=132,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: reward-model matrix uses remote HF models; local reward model mapping is not yet validated on BW1100.",
 )
 

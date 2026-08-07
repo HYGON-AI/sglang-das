@@ -4,6 +4,7 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_accuracy_report import write_hcu_accuracy_result
 from sglang.test.hcu_cookbook_utils import (
     QWEN35_397B_A17B_CHANNEL_FP8_4GPU,
     run_cookbook_accuracy_eval,
@@ -52,6 +53,16 @@ class TestQwen35EvalHCU(unittest.TestCase):
         print(
             "HCU Qwen3.5-397B-A17B GSM8K: "
             f"accuracy={accuracy:.3f}, threshold={threshold:.3f}"
+        )
+        write_hcu_accuracy_result(
+            model_key="qwen35_397b_channel_fp8",
+            model="Qwen3.5-397B-A17B-Channel-FP8",
+            score=accuracy,
+            threshold=threshold,
+            num_examples=num_questions,
+            invalid_rate=metrics.get("invalid"),
+            latency_seconds=metrics.get("latency"),
+            source_test=__file__,
         )
         self.assertGreaterEqual(accuracy, threshold)
 

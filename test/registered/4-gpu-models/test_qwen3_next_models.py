@@ -25,7 +25,7 @@ register_cuda_ci(est_time=350, stage="stage-c", runner_config="4-gpu-h100")
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=300,
-    suite="nightly-hcu-4-gpu",
+    suite="nightly-hcu-4",
     nightly=True,
     disabled="HCU CSV CI placeholder: 4-GPU Qwen3-Next model path needs local model mapping before enabling.",
 )

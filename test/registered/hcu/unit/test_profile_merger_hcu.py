@@ -30,7 +30,7 @@ import unittest
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.test.ci.ci_register import register_hcu_ci
-register_hcu_ci(est_time=8, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=8, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=8, suite="nightly-hcu-core-functional", nightly=True)
 
 

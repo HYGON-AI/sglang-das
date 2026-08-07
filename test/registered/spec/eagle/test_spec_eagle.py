@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 """EAGLE3 spec-decoding core: overlap (spec v2) x no-overlap (spec v1) matrix,
 same standard config (topk=1, page_size=1), only ``disable_overlap`` differs.
 flashinfer is pinned (the 5090 default) so a default-selection change can't
@@ -21,7 +25,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
 register_hcu_ci(
     est_time=480,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     nightly=False,
     disabled="HCU CSV CI placeholder: EAGLE speculative decoding needs BW1100 draft/target model mapping before enabling.",
 )

@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="BW1100 quick validation failed: first LoRA load-from-tensor pytest item exited with code 137.",
 )
 

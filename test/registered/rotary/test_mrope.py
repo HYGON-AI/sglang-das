@@ -46,7 +46,7 @@ register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: local Qwen2/Qwen2.5 VL configs load offline, but Qwen2VLTextConfig/Qwen2_5_VLTextConfig lack rope_theta and all 32 MRoPE parameterized cases fail on BW1100.",
 )
 

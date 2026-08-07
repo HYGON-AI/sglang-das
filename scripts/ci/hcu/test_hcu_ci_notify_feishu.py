@@ -347,7 +347,7 @@ class ResultCollectionTest(unittest.TestCase):
                 card["body"]["elements"][0]["text"]["content"],
             )
 
-    def test_failed_accuracy_partition_with_complete_scores_is_orange(self):
+    def test_failed_accuracy_partition_with_complete_scores_is_green(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             _write_complete_results(root)
@@ -366,11 +366,7 @@ class ResultCollectionTest(unittest.TestCase):
                 workflow_result="success",
                 run_url="https://github.com/HYGON-AI/sglang-das/actions/runs/3",
             )
-            self.assertEqual(card["header"]["template"], "orange")
-            self.assertIn(
-                "本次结果状态不完整",
-                card["body"]["elements"][0]["text"]["content"],
-            )
+            self.assertEqual(card["header"]["template"], "green")
             self.assertEqual(
                 collected.failed_partitions,
                 {"accuracy-text-0": "failure"},

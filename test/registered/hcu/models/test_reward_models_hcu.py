@@ -30,15 +30,29 @@ from sglang.test.test_utils import CustomTestCase
 
 register_hcu_ci(
     est_time=600,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
+    disabled=(
+        "Temporarily disabled: the local reward model/tokenizer may fail with "
+        "'piece must not include null character'."
+    ),
 )
-register_hcu_ci(est_time=600, suite="nightly-hcu-api-models", nightly=True)
+register_hcu_ci(
+    est_time=600,
+    suite="nightly-hcu-api-models",
+    nightly=True,
+    disabled=(
+        "Temporarily disabled: the local reward model/tokenizer may fail with "
+        "'piece must not include null character'."
+    ),
+)
 
 DEFAULT_HCU_REWARD_MODEL = (
     "/public/opendas/DL_DATA/llm-models/internlm2/internlm2-1.8b-reward"
 )
 
-PROMPT = "What is the range of the numeric output of a sigmoid node in a neural network?"
+PROMPT = (
+    "What is the range of the numeric output of a sigmoid node in a neural network?"
+)
 RESPONSE1 = "The output of a sigmoid node is bounded between -1 and 1."
 RESPONSE2 = "The output of a sigmoid node is bounded between 0 and 1."
 

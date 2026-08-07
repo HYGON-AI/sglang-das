@@ -27,7 +27,7 @@ from sglang.utils import TypeBasedDispatcher
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
-register_hcu_ci(est_time=10, suite="nightly-hcu-1-gpu", nightly=True)
+register_hcu_ci(est_time=10, suite="nightly-hcu-1", nightly=True)
 
 
 class TestTypeBasedDispatcher(unittest.TestCase):

@@ -28,14 +28,14 @@ on:
   workflow_dispatch:
     inputs:
       target_stage_select:
-        description: "Select a HCU stage to run from dropdown (leave empty for all)"
+        description: "Select a HCU stage to run from dropdown"
         required: false
         type: choice
-        default: ""
+        default: all
         options:
-          - ""
-          - stage-a-test-1-gpu-small-hcu
-          - stage-b-test-1-gpu-small-hcu
+          - all
+          - stage-a-test-1-hcu-small
+          - stage-b-test-1-hcu-small
       target_stage:
         description: "Or type comma-separated HCU stage names"
         required: false
@@ -207,10 +207,10 @@ jobs:
           run_stage_a=false
           run_stage_b=false
 
-          if [[ "${requested}" == *",stage-a-test-1-gpu-small-hcu,"* ]]; then
+          if [[ "${requested}" == *",stage-a-test-1-hcu-small,"* ]]; then
             run_stage_a=true
           fi
-          if [[ "${requested}" == *",stage-b-test-1-gpu-small-hcu,"* ]]; then
+          if [[ "${requested}" == *",stage-b-test-1-hcu-small,"* ]]; then
             run_stage_b=true
           fi
 
@@ -589,7 +589,7 @@ jobs:
           fi
           echo "wheel_urls=${wheel_urls}" >> "${GITHUB_OUTPUT}"
 
-  stage-a-test-1-gpu-small-hcu:
+  stage-a-test-1-hcu-small:
     name: Stage A HCU smoke
     needs:
       - check-changes
@@ -647,13 +647,13 @@ jobs:
         run: |
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout --container-name "${HCU_CI_CONTAINER_NAME}" -- python3 scripts/ci/hcu/check_hcu_external_api_compat.py
 
-      - name: Run stage-a-test-1-gpu-small-hcu
+      - name: Run stage-a-test-1-hcu-small
         timeout-minutes: 30
         run: |
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
             python3 run_suite.py \
               --hw hcu \
-              --suite stage-a-test-1-gpu-small-hcu \
+              --suite stage-a-test-1-hcu-small \
               --include-file registered/hcu/interface/test_hcu_smoke.py \
               --timeout-per-file 120 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
@@ -662,13 +662,13 @@ jobs:
         if: always()
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
 
-  stage-b-test-1-gpu-small-hcu:
+  stage-b-test-1-hcu-small:
     name: Stage B HCU required (${{ matrix.name }})
     needs:
       - check-changes
       - call-gate
       - validate-config
-      - stage-a-test-1-gpu-small-hcu
+      - stage-a-test-1-hcu-small
       - wait-hcu-wheels
     if: always() && needs.check-changes.outputs.hcu == 'true' && needs.check-changes.outputs.run_stage_b == 'true' && needs.validate-config.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && (needs.wait-hcu-wheels.result == 'success' || needs.wait-hcu-wheels.result == 'skipped')
     runs-on: ${{ needs.validate-config.outputs.runner_label }}
@@ -748,9 +748,9 @@ jobs:
         run: |
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout --container-name "${HCU_CI_CONTAINER_NAME}" -- python3 scripts/ci/hcu/check_hcu_external_api_compat.py
 
-      - name: Run stage-b-test-1-gpu-small-hcu required partition
+      - name: Run stage-b-test-1-hcu-small required partition
         run: |
-          echo "Running stage-b-test-1-gpu-small-hcu required partition ${{ matrix.part }}/${{ matrix.parts }}"
+          echo "Running stage-b-test-1-hcu-small required partition ${{ matrix.part }}/${{ matrix.parts }}"
           # Temporarily excluded from the required HCU PR partition:
           # - test_server_args.py: HiCache expectations are stale after 1b9d81cc0.
           # - test_triton_scaled_mm.py: deterministic BW1100 int8 numeric mismatch.
@@ -758,7 +758,7 @@ jobs:
             -e SGLANG_HCU_RERANKER_MODEL="${SGLANG_HCU_RERANKER_MODEL}" -- \
             python3 run_suite.py \
               --hw hcu \
-              --suite stage-b-test-1-gpu-small-hcu \
+              --suite stage-b-test-1-hcu-small \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_0.py \
               --include-file registered/hcu/interface/test_hcu_stage_b_flow_1.py \
               --include-file registered/unit/observability/test_metrics_utils.py \
@@ -767,6 +767,7 @@ jobs:
               --include-file registered/unit/parser/test_reasoning_parser.py \
               --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
               --include-file registered/attention/test_triton_attention_kernels.py \
+              --include-file registered/hcu/kernels/test_fp8_quant_reference_hcu.py \
               --include-file registered/layers/mamba/test_mamba_ssm.py \
               --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
               --include-file registered/rl/test_fp32_lm_head.py \
@@ -801,10 +802,12 @@ jobs:
               --include-file registered/hcu/openai_server/test_serving_chat_hcu.py \
               --include-file registered/hcu/openai_server/test_tool_choice_hcu.py \
               --include-file registered/hcu/reranker/bw1100/test_qwen3_reranker_hcu.py \
+              --include-file registered/hcu/lora/bw1100/test_qwen3_lora_server_hcu.py \
               --include-file registered/hcu/rotary/test_mrope_smoke_hcu.py \
               --include-file registered/hcu/spec/test_build_eagle_tree_hcu.py \
               --include-file registered/hcu/unit/function_call/test_json_schema_constraint_hcu.py \
               --include-file registered/hcu/unit/test_profile_merger_hcu.py \
+              --include-file registered/hcu/infra/test_hcu_server_guard_failures_hcu.py \
               --include-file registered/hcu/vlm_models/bw1100/test_qwen25_vl_3b_server_hcu.py \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size ${{ matrix.parts }} \
@@ -822,8 +825,8 @@ jobs:
       - call-gate
       - validate-config
       - wait-hcu-wheels
-      - stage-a-test-1-gpu-small-hcu
-      - stage-b-test-1-gpu-small-hcu
+      - stage-a-test-1-hcu-small
+      - stage-b-test-1-hcu-small
     if: always()
     runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:

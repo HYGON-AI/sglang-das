@@ -19,16 +19,18 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_hcu_ci
+from sglang.test.hcu_server_guard import HcuServerGuard
 from sglang.test.run_eval import run_eval_once
-from sglang.test.simple_eval_common import set_ulimit
+from sglang.test.simple_eval_common import (
+    QUERY_TEMPLATE_MULTICHOICE_NO_COT,
+    set_ulimit,
+)
 from sglang.test.simple_eval_mmlu import MMLUEval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_evaluation_test_results,
-    popen_launch_server,
     write_results_to_json,
 )
 
@@ -37,9 +39,7 @@ register_hcu_ci(est_time=3600, suite="nightly-hcu-accuracy-text", nightly=True)
 DEFAULT_HCU_MMLU_MODEL = (
     "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
 )
-DEFAULT_HCU_MMLU_DATASET_PATH = (
-    "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
-)
+DEFAULT_HCU_MMLU_DATASET_PATH = "/public/opendas/DL_DATA/llm-models/datasets/mmlu"
 DEFAULT_HCU_SERVER_ARGS = [
     "--attention-backend",
     "fa3",
@@ -51,6 +51,7 @@ DEFAULT_HCU_SERVER_ARGS = [
     "warning",
     "--trust-remote-code",
 ]
+
 
 def _get_int_env(name: str, default: int) -> int:
     value = os.environ.get(name)
@@ -93,12 +94,10 @@ def _get_server_args_env(name: str) -> list[str]:
 class TestBW1100MMLUEvalHCU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = _get_model_env(
-            "SGLANG_HCU_MMLU_MODEL", DEFAULT_HCU_MMLU_MODEL
-        )
-        cls.threshold = _get_float_env("SGLANG_HCU_MMLU_THRESHOLD", 0.68)
+        cls.model = _get_model_env("SGLANG_HCU_MMLU_MODEL", DEFAULT_HCU_MMLU_MODEL)
+        cls.threshold = _get_float_env("SGLANG_HCU_MMLU_THRESHOLD", 0.72)
         cls.num_examples = _get_int_env_with_fallback(
-            "SGLANG_HCU_MMLU_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 50
+            "SGLANG_HCU_MMLU_NUM_EXAMPLES", "SGLANG_HCU_EVAL_NUM_EXAMPLES", 100
         )
         cls.num_threads = _get_int_env("SGLANG_HCU_MMLU_NUM_THREADS", 256)
         cls.dataset_path = _get_dataset_path_env(
@@ -110,31 +109,34 @@ class TestBW1100MMLUEvalHCU(unittest.TestCase):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
-        process = None
         all_results = []
 
         try:
-            process = popen_launch_server(
-                model=self.model,
-                base_url=self.base_url,
+            with HcuServerGuard(
+                self.model,
+                self.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=_get_server_args_env("SGLANG_HCU_MMLU_SERVER_ARGS"),
-            )
+            ):
+                set_ulimit()
+                os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+                base_url = f"{self.base_url}/v1"
+                eval_obj = MMLUEval(
+                    self.dataset_path,
+                    self.num_examples,
+                    self.num_threads,
+                    query_template=QUERY_TEMPLATE_MULTICHOICE_NO_COT,
+                )
+                args = SimpleNamespace(
+                    base_url=self.base_url,
+                    model=self.model,
+                    eval_name="mmlu",
+                    num_examples=self.num_examples,
+                    num_threads=self.num_threads,
+                    max_tokens=64,
+                )
+                result, latency, sampler = run_eval_once(args, base_url, eval_obj)
 
-            set_ulimit()
-            os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
-            base_url = f"{self.base_url}/v1"
-            eval_obj = MMLUEval(
-                self.dataset_path, self.num_examples, self.num_threads
-            )
-            args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model,
-                eval_name="mmlu",
-                num_examples=self.num_examples,
-                num_threads=self.num_threads,
-            )
-            result, latency, sampler = run_eval_once(args, base_url, eval_obj)
             metrics = result.metrics | {"score": result.score, "latency": latency}
             total_completion_tokens = sum(sampler._completion_tokens)
             if total_completion_tokens > 0 and latency > 0:
@@ -145,9 +147,6 @@ class TestBW1100MMLUEvalHCU(unittest.TestCase):
         except Exception as exc:
             all_results.append((self.model, None, None, str(exc)))
             raise
-        finally:
-            if process is not None:
-                kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:

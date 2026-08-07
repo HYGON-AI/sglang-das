@@ -27,7 +27,7 @@ from sglang.test.test_utils import CustomTestCase
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: local Qwen2-VL external model path passed three runs.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
 )
 register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")

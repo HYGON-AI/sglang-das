@@ -25,7 +25,7 @@ from sglang.test.hcu_utils import (
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
-register_hcu_ci(est_time=2400, suite="nightly-hcu-4-gpu", nightly=True)
+register_hcu_ci(est_time=2400, suite="nightly-hcu-4", nightly=True)
 
 DEFAULT_QWEN3_NEXT_MODEL = (
     "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Next-80B-A3B-Instruct"

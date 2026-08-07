@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 
 register_hcu_ci(
     est_time=210,
-    suite="nightly-hcu-1-gpu",
+    suite="nightly-hcu-1",
     nightly=True,
     disabled="HCU nightly disabled: cache flush fails on BW1100; pending fix.",
 )

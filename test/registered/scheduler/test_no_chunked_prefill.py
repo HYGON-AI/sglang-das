@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=108, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=108, suite="stage-b-test-1-gpu-small-amd")
-register_hcu_ci(est_time=108, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=108, suite="stage-b-test-1-hcu-small")
 register_hcu_ci(est_time=108, suite="nightly-hcu-functional-long", nightly=True)
 
 

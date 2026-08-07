@@ -42,7 +42,7 @@ register_cuda_ci(
 )
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
-register_hcu_ci(est_time=120, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=120, suite="stage-b-test-1-hcu-small")
 
 _MODEL_NAME = os.environ.get(
     "SGLANG_TEST_PRIORITY_METRICS_MODEL",

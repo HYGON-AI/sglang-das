@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_hcu_ci(est_time=1800, suite="stage-b-test-1-gpu-small-hcu")
+register_hcu_ci(est_time=1800, suite="stage-b-test-1-hcu-small")
 
 DEFAULT_QWEN25_VL_3B_MODEL = (
     "/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/"

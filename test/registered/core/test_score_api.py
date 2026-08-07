@@ -26,7 +26,7 @@ register_cuda_ci(est_time=260, stage="stage-b", runner_config="1-gpu-large")
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     nightly=False,
     disabled="HCU CSV CI placeholder: score API server/model path needs BW1100 validation before enabling.",
 )

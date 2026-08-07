@@ -27,14 +27,13 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.hcu_server_guard import HcuServerGuard
 from sglang.test.hcu_utils import (
     RED_DOT_IMAGE_DATA_URL,
     get_model_path,
     openai_base_url,
 )
 from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import popen_launch_server
 from sglang.utils import read_jsonl
 
 HCU_COOKBOOK_API_KEY = "sk-123456"
@@ -709,7 +708,7 @@ DEEPSEEK_V32_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
 DEEPSEEK_V32_CHANNEL_INT8_8GPU = HcuCookbookModelConfig(
     name="DeepSeek-V3.2-Channel-INT8",
     env_name="SGLANG_HCU_DEEPSEEK_V32_CHANNEL_INT8_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/deepseek-v3.2/vllm-w8a8-models/DeepSeek-V3.2-Channel-INT8",
+    default_path="/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/DeepSeek-V3.2-Channel-INT8",
     tp_size=8,
     timeout=7200,
     dtype_or_quant="w8a8_int8",
@@ -764,7 +763,7 @@ QWEN3_VL_4B_INSTRUCT = HcuCookbookModelConfig(
 GLM41V_9B_THINKING = HcuCookbookModelConfig(
     name="GLM-4.1V-9B-Thinking",
     env_name="SGLANG_HCU_GLM41V_9B_THINKING_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/glm4/GLM-4.1V-9B-Thinking",
+    default_path="/public/opendas/DL_DATA/llm-models/GLM-4.1V-9B-Thinking",
     tp_size=1,
     timeout=3600,
     dtype_or_quant="bf16",
@@ -786,7 +785,7 @@ QWEN3_VL_32B_INSTRUCT = HcuCookbookModelConfig(
 QWEN25_VL_72B_W8A8 = HcuCookbookModelConfig(
     name="Qwen2.5-VL-72B-Instruct-W8A8",
     env_name="SGLANG_HCU_QWEN25_VL_72B_W8A8_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/Qwen2.5-VL-72B-Instruct-quantized.w8a8",
+    default_path="/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-VL-72B-Instruct-quantized.w8a8",
     tp_size=8,
     timeout=7200,
     dtype_or_quant="w8a8",
@@ -799,7 +798,8 @@ QWEN3_4GPU_PERF_MODELS = [QWEN3_30B_A3B_4GPU, QWEN3_32B_4GPU]
 QWEN3_4GPU_QUANT_MODELS = [QWEN3_30B_A3B_W8A8_4GPU]
 QWEN36_2GPU_MODELS = [QWEN36_27B_2GPU, QWEN36_35B_A3B_2GPU]
 QWEN35_4GPU_MODELS = [QWEN35_397B_A17B_CHANNEL_FP8_4GPU]
-GLM51_8GPU_MODELS = [GLM51_CHANNEL_FP8_8GPU, GLM51_CHANNEL_INT8_8GPU]
+GLM51_8GPU_MODELS = [GLM51_CHANNEL_FP8_8GPU]
+GLM51_8GPU_INT8_MODELS = [GLM51_CHANNEL_INT8_8GPU]
 GLM51_8GPU_PERF_MODELS = [GLM51_CHANNEL_FP8_8GPU]
 DEEPSEEK_V32_8GPU_MODELS = [
     DEEPSEEK_V32_CHANNEL_FP8_8GPU,
@@ -919,35 +919,17 @@ def assert_server_info_ready(base_url: str, api_key: str) -> dict:
     return payload
 
 
-class CookbookServer:
+class CookbookServer(HcuServerGuard):
     def __init__(self, config: HcuCookbookModelConfig, base_url: str):
         self.config = config
-        self.base_url = base_url
-        self.model_path = config.resolve_model_path()
-        self.process = None
-
-    def __enter__(self):
-        try:
-            self.process = popen_launch_server(
-                self.model_path,
-                self.base_url,
-                timeout=self.config.timeout,
-                api_key=HCU_COOKBOOK_API_KEY,
-                other_args=list(self.config.server_args),
-                env=self.config.merged_env(),
-            )
-            assert_server_info_ready(self.base_url, HCU_COOKBOOK_API_KEY)
-        except Exception:
-            if self.process is not None:
-                kill_process_tree(self.process.pid)
-                self.process = None
-            raise
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.process is not None:
-            kill_process_tree(self.process.pid)
-            self.process = None
+        super().__init__(
+            config.resolve_model_path(),
+            base_url,
+            timeout=config.timeout,
+            api_key=HCU_COOKBOOK_API_KEY,
+            other_args=list(config.server_args),
+            env=config.merged_env(),
+        )
 
     def assert_chat_non_empty(self) -> str:
         response = requests.post(

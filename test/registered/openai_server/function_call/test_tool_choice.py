@@ -46,7 +46,7 @@ register_amd_ci(est_time=258, suite="stage-b-test-1-gpu-small-amd")
 
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: tool_choice model matrix is not fully local; Llama/Qwen have local candidates but Mistral/LFM models are remote/missing, so file-level PR gate cannot be enabled yet.",
 )
 

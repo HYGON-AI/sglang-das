@@ -34,20 +34,21 @@ on:
           - all
           - nightly-hcu-core
           - nightly-hcu-core-functional
-          - nightly-hcu-1gpu
+          - nightly-hcu-1
           - nightly-hcu-accuracy
           - nightly-hcu-accuracy-text
           - nightly-hcu-accuracy-reasoning-code
           - nightly-hcu-vlm
           - nightly-hcu-perf-text
-          - nightly-hcu-large-model-4gpu
-          - nightly-hcu-large-model-8gpu
+          - nightly-hcu-large-model-4
+          - nightly-hcu-large-model-8
           - nightly-hcu-quant-opt
           - nightly-hcu-functional-long
           - nightly-hcu-api-models
           - nightly-hcu-long-scheduler
           - nightly-hcu-long-decoding
-          - nightly-hcu-2gpu
+          - nightly-hcu-2
+          - nightly-hcu-4-functional
 
 permissions:
   contents: read
@@ -568,9 +569,9 @@ jobs:
             timeout_per_file: 3000
             timeout_minutes: 180
             include_files: ""
-          - name: one-gpu
-            group: nightly-hcu-1gpu
-            suite: nightly-hcu-1-gpu
+          - name: one-hcu
+            group: nightly-hcu-1
+            suite: nightly-hcu-1
             nightly: "true"
             part: 0
             parts: 1
@@ -713,9 +714,9 @@ jobs:
             include_files: ""
             visible_devices: "0,1,2,3,4,5,6,7"
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models"
-          - name: large-model-4gpu
-            group: nightly-hcu-large-model-4gpu
-            suite: nightly-hcu-large-model-4gpu
+          - name: large-model-4-hcu
+            group: nightly-hcu-large-model-4
+            suite: nightly-hcu-large-model-4
             nightly: "true"
             part: 0
             parts: 1
@@ -724,9 +725,9 @@ jobs:
             include_files: ""
             visible_devices: "4,5,6,7"
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models"
-          - name: large-model-8gpu-0
-            group: nightly-hcu-large-model-8gpu
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-0
+            group: nightly-hcu-large-model-8
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 0
             parts: 4
@@ -735,9 +736,9 @@ jobs:
             include_files: ""
             visible_devices: "0,1,2,3,4,5,6,7"
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models"
-          - name: large-model-8gpu-1
-            group: nightly-hcu-large-model-8gpu
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-1
+            group: nightly-hcu-large-model-8
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 1
             parts: 4
@@ -746,9 +747,9 @@ jobs:
             include_files: ""
             visible_devices: "0,1,2,3,4,5,6,7"
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models"
-          - name: large-model-8gpu-2
-            group: nightly-hcu-large-model-8gpu
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-2
+            group: nightly-hcu-large-model-8
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 2
             parts: 4
@@ -757,9 +758,9 @@ jobs:
             include_files: ""
             visible_devices: "0,1,2,3,4,5,6,7"
             extra_model_paths: "/public4/share:/public4/opendas/DL_DATA/llm-models"
-          - name: large-model-8gpu-3
-            group: nightly-hcu-large-model-8gpu
-            suite: nightly-hcu-large-model-8gpu
+          - name: large-model-8-hcu-3
+            group: nightly-hcu-large-model-8
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 3
             parts: 4
@@ -836,9 +837,9 @@ jobs:
             include_files: >-
               registered/constrained_decoding/test_constrained_decoding.py
               registered/openai_server/features/test_json_mode.py
-          - name: two-gpu
-            group: nightly-hcu-2gpu
-            suite: nightly-hcu-2-gpu
+          - name: two-hcu
+            group: nightly-hcu-2
+            suite: nightly-hcu-2
             nightly: "true"
             part: 0
             parts: 1
@@ -846,6 +847,16 @@ jobs:
             timeout_minutes: 120
             include_files: ""
             visible_devices: "0,1"
+          - name: four-hcu-functional
+            group: nightly-hcu-4-functional
+            suite: nightly-hcu-4-functional
+            nightly: "true"
+            part: 0
+            parts: 1
+            timeout_per_file: 2400
+            timeout_minutes: 120
+            include_files: ""
+            visible_devices: "0,1,2,3"
           - name: api-models
             group: nightly-hcu-api-models
             suite: nightly-hcu-api-models
@@ -874,6 +885,7 @@ jobs:
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       HCU_ACCURACY_SHARED_ROOT: /ci_public/sglang-das/hcu-accuracy
+      HCU_REASONING_CODE_SHARED_ROOT: /ci_public/sglang-das/hcu-reasoning-code
     steps:
       - name: Check job filter
         id: filter
@@ -966,33 +978,93 @@ jobs:
 
           echo "Running ${{ matrix.suite }} partition ${{ matrix.part }}/${{ matrix.parts }} nightly=${{ matrix.nightly }}"
           echo "HCU_CI_INSTALL_WHEEL_URLS=${HCU_CI_INSTALL_WHEEL_URLS}"
-          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" -w /sglang-checkout/test --container-name "${HCU_CI_CONTAINER_NAME}" -- \
-            "${cmd[@]}"
+          exec_args=(
+            -w /sglang-checkout/test
+            --container-name "${HCU_CI_CONTAINER_NAME}"
+          )
+          if [[ "${{ matrix.group }}" == "nightly-hcu-accuracy-text" ]]; then
+            exec_args+=(
+              -e SGLANG_HCU_ACCURACY_RESULT_DIR=/sglang-checkout/test-results/hcu-accuracy
+            )
+          fi
+          if [[ "${{ matrix.group }}" == "nightly-hcu-accuracy-reasoning-code" ]]; then
+            log_dir="${HCU_CI_CHECKOUT_DIR}/test-results/hcu-reasoning-code/.logs"
+            mkdir -p "${log_dir}"
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" "${exec_args[@]}" -- \
+              "${cmd[@]}" 2>&1 | tee "${log_dir}/${{ matrix.reasoning_model_key }}-suite.log"
+          else
+            bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" "${exec_args[@]}" -- \
+              "${cmd[@]}"
+          fi
 
       - name: Judge HumanEval in a restricted container
+        id: judge_humaneval
         if: >-
           always() &&
           steps.filter.outputs.should_run == 'true' &&
           matrix.group == 'nightly-hcu-accuracy-reasoning-code'
-        run: >-
-          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_judge_humaneval.sh"
-          "${{ matrix.reasoning_model_key }}"
+        run: |
+          set -euo pipefail
+          log_dir="${HCU_CI_CHECKOUT_DIR}/test-results/hcu-reasoning-code/.logs"
+          mkdir -p "${log_dir}"
+          bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_judge_humaneval.sh" \
+            "${{ matrix.reasoning_model_key }}" 2>&1 | \
+            tee "${log_dir}/${{ matrix.reasoning_model_key }}-judge.log"
 
-      - name: Upload reasoning/code results
+      - name: Capture HCU runtime image ID
         if: >-
           always() &&
           steps.filter.outputs.should_run == 'true' &&
-          matrix.group == 'nightly-hcu-accuracy-reasoning-code'
-        uses: actions/upload-artifact@v4
-        with:
-          name: hcu-reasoning-code-${{ matrix.reasoning_model_key }}-${{ github.run_id }}
-          path: ${{ env.HCU_CI_CHECKOUT_DIR }}/test-results/hcu-reasoning-code/${{ matrix.reasoning_model_key }}
-          if-no-files-found: warn
-          retention-days: 14
+          (matrix.group == 'nightly-hcu-accuracy-text' ||
+           matrix.group == 'nightly-hcu-accuracy-reasoning-code')
+        run: |
+          set -euo pipefail
+          image_id="$(docker inspect --format '{{.Image}}' "${HCU_CI_CONTAINER_NAME}" 2>/dev/null || true)"
+          if [[ -z "${image_id}" ]]; then
+            image_id="$(docker image inspect --format '{{.Id}}' "${HCU_CI_IMAGE}" 2>/dev/null || true)"
+          fi
+          echo "HCU_CI_RUNTIME_IMAGE_ID=${image_id:-unknown}" >> "${GITHUB_ENV}"
+          echo "Resolved HCU runtime image ID: ${image_id:-unknown}"
 
       - name: Cleanup HCU container
         if: always() && steps.filter.outputs.should_run == 'true'
         run: bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_cleanup_container.sh"
+
+      - name: Publish reasoning/code results to shared storage
+        if: >-
+          always() &&
+          steps.filter.outputs.should_run == 'true' &&
+          matrix.group == 'nightly-hcu-accuracy-reasoning-code'
+        env:
+          SUITE_OUTCOME: ${{ steps.run_suite.outcome }}
+          JUDGE_OUTCOME: ${{ steps.judge_humaneval.outcome }}
+          HCU_REASONING_COMMIT_SHA: ${{ needs.probe-hcu-wheels.outputs.full_sha }}
+          HCU_REASONING_TARGET_REF: ${{ needs.validate-config.outputs.target_ref }}
+        run: |
+          set -euo pipefail
+          outcome="failure"
+          if [[ "${SUITE_OUTCOME}" == "success" && "${JUDGE_OUTCOME}" == "success" ]]; then
+            outcome="success"
+          elif [[ "${SUITE_OUTCOME}" == "cancelled" || "${JUDGE_OUTCOME}" == "cancelled" ]]; then
+            outcome="cancelled"
+          fi
+          result_root="${HCU_CI_CHECKOUT_DIR}/test-results/hcu-reasoning-code"
+          python_bin="$(command -v python3.12 || command -v python3.10 || command -v python3.9 || command -v python3.8 || command -v python3)"
+          "${python_bin}" "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_publish_reasoning_code.py" \
+            --local-model-dir "${result_root}/${{ matrix.reasoning_model_key }}" \
+            --log-file "${result_root}/.logs/${{ matrix.reasoning_model_key }}-suite.log" \
+            --log-file "${result_root}/.logs/${{ matrix.reasoning_model_key }}-judge.log" \
+            --shared-root "${HCU_REASONING_CODE_SHARED_ROOT}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --model-key "${{ matrix.reasoning_model_key }}" \
+            --outcome "${outcome}" \
+            --target-ref "${HCU_REASONING_TARGET_REF}" \
+            --commit-sha "${HCU_REASONING_COMMIT_SHA}" \
+            --image-ref "${HCU_CI_IMAGE}" \
+            --image-id "${HCU_CI_RUNTIME_IMAGE_ID:-unknown}" \
+            --runner-name "${RUNNER_NAME}" \
+            --retention-days 14
 
       - name: Publish HCU accuracy results to shared storage
         if: >-

@@ -9,9 +9,6 @@ name: Bot Bump Docs Version
 # Triggers mirror release-docker.yml: a pushed `v*` tag (the release), or a
 # manual run with an explicit version.
 on:
-  push:
-    tags:
-      - "v[0-9]+.*"
   workflow_dispatch:
     inputs:
       version:

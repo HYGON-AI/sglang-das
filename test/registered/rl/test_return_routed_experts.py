@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 
 register_hcu_ci(
     est_time=120,
-    suite="stage-b-test-1-gpu-small-hcu",
+    suite="stage-b-test-1-hcu-small",
     disabled="HCU Stage-B deferred: upstream TestReturnRoutedExperts class is unittest.skip flaky; BW1100 collection reports 3 skipped, so it is not a PR-gate candidate yet.",
 )
 
