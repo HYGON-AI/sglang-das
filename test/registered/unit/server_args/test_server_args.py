@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
 register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small")
 
-from sglang.test.test_utils import (
+from sglang.test.test_utils import (  # noqa: E402
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
 )
@@ -572,6 +572,76 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.deepep_mode, "low_latency")
         self.assertFalse(server_args.disable_cuda_graph)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+
+class TestHcuDeepEPTopology(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hcu", return_value=True)
+    def test_rejects_four_local_ranks_for_multinode_low_latency(self, _mock_is_hcu):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=16,
+            pp_size=1,
+            dp_size=16,
+            ep_size=16,
+            nnodes=4,
+            moe_a2a_backend="deepep",
+            deepep_mode="low_latency",
+        )
+
+        with self.assertRaises(ValueError) as context:
+            server_args._handle_a2a_moe()
+
+        message = str(context.exception)
+        self.assertIn("tp_size=16", message)
+        self.assertIn("nnodes=4", message)
+        self.assertIn("ranks_per_node=4", message)
+        self.assertIn("deepep_mode=low_latency", message)
+        self.assertIn("TP16/D2", message)
+        self.assertIn("TP32/D4", message)
+
+    @patch("sglang.srt.server_args.is_hcu", return_value=True)
+    def test_allows_eight_local_ranks_for_multinode_low_latency(self, _mock_is_hcu):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=32,
+            pp_size=1,
+            dp_size=32,
+            ep_size=32,
+            nnodes=4,
+            moe_a2a_backend="deepep",
+            deepep_mode="low_latency",
+        )
+
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.ep_size, 32)
+
+    @patch("sglang.srt.server_args.is_hcu", return_value=True)
+    def test_rejects_tp32_decode_eager(self, _mock_is_hcu):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            tp_size=32,
+            pp_size=1,
+            dp_size=32,
+            ep_size=32,
+            nnodes=4,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            moe_a2a_backend="deepep",
+            deepep_mode="low_latency",
+            disable_cuda_graph=True,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            server_args._handle_a2a_moe()
+
+        message = str(context.exception)
+        self.assertIn("tp_size=32", message)
+        self.assertIn("dp_size=32", message)
+        self.assertIn("nnodes=4", message)
+        self.assertIn("execution_mode=eager", message)
+        self.assertIn("remove --disable-cuda-graph", message)
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
