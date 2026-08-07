@@ -60,7 +60,7 @@ pip install -e "python[all_hip]" --no-deps --no-build-isolation --no-index
 
 仓库提供独立 workflow `Manual HCU Unattended Model Test`（文件：`.github/workflows/hcu-manual-model-test.yml`），用于在 HCU runner 上手动启动长时间模型验证任务。它只支持 `workflow_dispatch`，不会在 `pull_request`、`push` 或 `schedule` 时自动触发，因此不属于 PR gate。
 
-使用方式：进入 GitHub Actions，选择 `Manual HCU Unattended Model Test`，点击 `Run workflow`。GitHub 页面上的分支下拉框决定默认测试 ref；也可以通过 `test_branch` 输入分支、tag、ref 或 SHA 覆盖。默认 suite 为 `nightly-hcu-accuracy`，可通过 `suite` 改成 `nightly-hcu`、`nightly-hcu-vlm`、`nightly-hcu-4-gpu` 等已注册 HCU suite。若只跑单个文件，填写 `include_file`，例如 `test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py`。
+使用方式：进入 GitHub Actions，选择 `Manual HCU Unattended Model Test`，点击 `Run workflow`。GitHub 页面上的分支下拉框决定默认测试 ref；也可以通过 `test_branch` 输入分支、tag、ref 或 SHA 覆盖。默认 suite 为 `nightly-hcu-accuracy`，可通过 `suite` 改成 `nightly-hcu`、`nightly-hcu-vlm`、`nightly-hcu-4` 等已注册 HCU suite。若只跑单个文件，填写 `include_file`，例如 `test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py`。
 
 常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 HCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 会传给 `SGLANG_HCU_GSM8K_MODEL`、`SGLANG_HCU_MMLU_MODEL` 和 `SGLANG_TEST_DEFAULT_MODEL_NAME`，可用于测试其它本地模型路径，例如 `/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct`。`run_suite.py` 尚无 `--model-name` 过滤参数，因此这里通过测试文件已支持的环境变量选择模型。
 

@@ -350,42 +350,42 @@ jobs:
             timeout_per_file: 1800
             timeout_minutes: 180
           - name: stage-b-large
-            suite: stage-b-test-1-gpu-large-hcu
+            suite: stage-b-test-1-hcu-large
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 2400
             timeout_minutes: 150
           - name: stage-b-2gpu
-            suite: stage-b-test-2-gpu-large-hcu
+            suite: stage-b-test-2-hcu-large
             nightly: "false"
             part: 0
             parts: 1
             timeout_per_file: 1200
             timeout_minutes: 90
-          - name: nightly-hcu-0
+          - name: nightly-hcu-general-0
             suite: nightly-hcu
             nightly: "true"
             part: 0
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-hcu-1
+          - name: nightly-hcu-general-1
             suite: nightly-hcu
             nightly: "true"
             part: 1
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-hcu-2
+          - name: nightly-hcu-general-2
             suite: nightly-hcu
             nightly: "true"
             part: 2
             parts: 3
             timeout_per_file: 3000
             timeout_minutes: 180
-          - name: nightly-hcu-1gpu
-            suite: nightly-hcu-1-gpu
+          - name: nightly-hcu-1
+            suite: nightly-hcu-1
             nightly: "true"
             part: 0
             parts: 1
@@ -433,8 +433,8 @@ jobs:
             parts: 2
             timeout_per_file: 7800
             timeout_minutes: 300
-          - name: nightly-hcu-2gpu
-            suite: nightly-hcu-2-gpu
+          - name: nightly-hcu-2
+            suite: nightly-hcu-2
             nightly: "true"
             part: 0
             parts: 1
@@ -511,7 +511,7 @@ jobs:
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-4gpu-0
-            suite: nightly-hcu-large-model-4gpu
+            suite: nightly-hcu-large-model-4
             nightly: "true"
             part: 0
             parts: 2
@@ -519,7 +519,7 @@ jobs:
             timeout_minutes: 180
             visible_devices: "4,5,6,7"
           - name: large-model-4gpu-1
-            suite: nightly-hcu-large-model-4gpu
+            suite: nightly-hcu-large-model-4
             nightly: "true"
             part: 1
             parts: 2
@@ -527,28 +527,28 @@ jobs:
             timeout_minutes: 180
             visible_devices: "4,5,6,7"
           - name: large-model-8gpu-0
-            suite: nightly-hcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 0
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-8gpu-1
-            suite: nightly-hcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 1
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-8gpu-2
-            suite: nightly-hcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 2
             parts: 4
             timeout_per_file: 15000
             timeout_minutes: 480
           - name: large-model-8gpu-3
-            suite: nightly-hcu-large-model-8gpu
+            suite: nightly-hcu-large-model-8
             nightly: "true"
             part: 3
             parts: 4

@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_hcu_ci(est_time=1200, suite="nightly-hcu-large-model-4gpu", nightly=True)
+register_hcu_ci(est_time=1200, suite="nightly-hcu-large-model-4", nightly=True)
 
 DEFAULT_QWEN3_MOE_MODEL = "/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-30B-A3B"
 DEFAULT_QWEN3_MOE_SMOKE_ARGS = [

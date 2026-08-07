@@ -22,7 +22,7 @@ from sglang.test.hcu_pd_utils import (
 
 register_hcu_ci(
     est_time=10800,
-    suite="nightly-hcu-disaggregation-16gpu",
+    suite="nightly-hcu-disaggregation-16",
     nightly=True,
 )
 
