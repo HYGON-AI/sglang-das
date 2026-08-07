@@ -90,6 +90,8 @@ elif _is_hip:
                 MoeSolutionType,
                 aiter_moe,
                 get_aiter_moe_config,
+                aiter_moe_shfl_weight,
+                aiter_moe_shfl_scale
             )
         except ImportError:
             raise ImportError(
@@ -606,6 +608,8 @@ def fused_experts_impl_aiter(
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
     quant_type: Optional[MoeQuantType] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ):
     M, K = hidden_states.shape
     E, N1, _ = w1.shape
@@ -656,6 +660,7 @@ def fused_experts_impl_aiter(
         assert moe_cfg.quant_type in (
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
+            MoeQuantType.WFP4A16,
         ), f"Unexpected quant_type: {moe_cfg.quant_type}"
         # print(
         #     f"[get_config_w4a16] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_shape[1]}, dtype={hidden_states.dtype} "
@@ -672,15 +677,20 @@ def fused_experts_impl_aiter(
             f"no solution found (expected on unsupported configs)"
         )
 
-    if (
-        quant_type == MoeQuantType.W4A16
-        and status
-        and _aiter_moec_solution_type(moe_cfg)
-        and getattr(moe_cfg, "need_shuffle_scale", False)
-    ):
-        w1_scale, w2_scale = _get_aiter_w4a16_moec_shuffled_scales(
-            w1_scale, w2_scale, w1, w2, moe_cfg
-        )
+    # if (
+    #     (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
+    #     and status
+    #     and _aiter_moec_solution_type(moe_cfg)
+    #     and getattr(moe_cfg, "need_shuffle_scale", False)
+    # ):
+    #     w1_scale, w2_scale = _get_aiter_w4a16_moec_shuffled_scales(
+    #         w1_scale, w2_scale, w1, w2, moe_cfg
+    #     )
+    if status and getattr(moe_cfg, "need_shuffle", False):
+        w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
+    if status and getattr(moe_cfg, "need_shuffle_scale", False):
+        w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
+    
     return aiter_moe(
         hidden_states,
         w1,
@@ -701,6 +711,8 @@ def fused_experts_impl_aiter(
         None,
         routed_scaling_factor,
         output_dtype=hidden_states.dtype,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
     )
 
 
@@ -1248,7 +1260,16 @@ def fused_experts_impl(
         and hidden_states.dtype == torch.bfloat16
     ):
         if use_int4_w4a16:
-            quant_type = MoeQuantType.W4A16
+            if (
+                _is_hip
+                and w1_scale is not None
+                and w1_scale.dtype == torch.uint8
+                and w2_scale is not None
+                and w2_scale.dtype == torch.uint8
+            ):
+                quant_type = MoeQuantType.WFP4A16
+            else:
+                quant_type = MoeQuantType.W4A16
         else:
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(
@@ -1268,6 +1289,8 @@ def fused_experts_impl(
             block_shape,
             routed_scaling_factor,
             quant_type,
+            gemm1_alpha,
+            gemm1_limit
         )
 
     if isinstance(activation, int):
