@@ -116,6 +116,44 @@ def _parse_form_extra_value(value: Any) -> Any:
         return value
 
 
+def _parse_multipart_extra_body(extra_body: Any) -> Dict[str, Any]:
+    """Parse the OpenAI multipart ``extra_body`` extension.
+
+    FastAPI exposes only the declared ``Form`` parameters directly. Model-specific
+    request fields (for example MiniMax-H3's task/conditions/target contract) are
+    carried in ``extra_body`` and must remain on ``VideoGenerationsRequest`` as
+    Pydantic extras.
+    """
+
+    if not extra_body:
+        return {}
+    try:
+        parsed = json.loads(extra_body)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail="extra_body is not valid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=400, detail="extra_body must be a JSON object"
+        )
+    return parsed
+
+
+def _merge_multipart_declared_values(
+    request_values: Dict[str, Any],
+    extra_from_form: Dict[str, Any],
+    explicit_form_fields: set[str],
+) -> Dict[str, Any]:
+    """Apply extra_body values only when the same Form field was not supplied."""
+
+    merged = dict(request_values)
+    for key in merged:
+        if key not in explicit_form_fields and key in extra_from_form:
+            merged[key] = extra_from_form[key]
+    return merged
+
+
 _MULTIPART_EXTRA_FORM_FIELDS = (
     "use_duration_template",
     "use_resolution_template",
@@ -589,46 +627,62 @@ async def create_video(
                 status_code=400, detail=f"Failed to process image source: {str(e)}"
             )
 
-        # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
-        extra_from_form: Dict[str, Any] = {}
-        if extra_body:
-            try:
-                extra_from_form = json.loads(extra_body)
-            except Exception:
-                extra_from_form = {}
+        # Preserve model-specific OpenAI extensions (such as MiniMax-H3's
+        # task/conditions/target contract) instead of using extra_body only for
+        # transport timing overrides.
+        extra_from_form = _parse_multipart_extra_body(extra_body)
 
-        fps_val = fps if fps is not None else extra_from_form.get("fps")
-        num_frames_val = (
-            num_frames if num_frames is not None else extra_from_form.get("num_frames")
+        # OpenAI clients commonly place both model-specific extensions and
+        # declared request fields in extra_body. An explicitly supplied Form
+        # field wins; otherwise use its extra_body value.
+        raw_form = await request.form()
+        explicit_form_fields = set(raw_form.keys())
+        request_values: Dict[str, Any] = {
+            "model": model,
+            "n": n,
+            "num_outputs_per_prompt": num_outputs_per_prompt,
+            "seconds": seconds if seconds is not None else 4,
+            "size": size,
+            "fps": fps,
+            "num_frames": num_frames,
+            "seed": seed,
+            "generator_device": generator_device,
+            "negative_prompt": negative_prompt,
+            "guidance_scale": guidance_scale,
+            "num_inference_steps": num_inference_steps,
+            "enable_teacache": enable_teacache,
+            "enable_frame_interpolation": enable_frame_interpolation,
+            "frame_interpolation_exp": frame_interpolation_exp,
+            "frame_interpolation_scale": frame_interpolation_scale,
+            "frame_interpolation_model_path": frame_interpolation_model_path,
+            "enable_upscaling": enable_upscaling,
+            "upscaling_model_path": upscaling_model_path,
+            "upscaling_scale": upscaling_scale,
+            "output_compression": output_compression,
+            "output_quality": output_quality,
+        }
+        request_values = _merge_multipart_declared_values(
+            request_values,
+            extra_from_form,
+            explicit_form_fields,
         )
+        handled_request_fields = {
+            "prompt",
+            "input_reference",
+            "reference_url",
+            *request_values,
+        }
+        model_extra_from_form = {
+            key: value
+            for key, value in extra_from_form.items()
+            if key not in handled_request_fields
+        }
 
         req = VideoGenerationsRequest(
             prompt=prompt,
             input_reference=input_path,
-            model=model,
-            n=n,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-            seconds=seconds if seconds is not None else 4,
-            size=size,
-            fps=fps_val,
-            num_frames=num_frames_val,
-            seed=seed,
-            generator_device=generator_device,
-            negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            enable_teacache=enable_teacache,
-            enable_frame_interpolation=enable_frame_interpolation,
-            frame_interpolation_exp=frame_interpolation_exp,
-            frame_interpolation_scale=frame_interpolation_scale,
-            frame_interpolation_model_path=frame_interpolation_model_path,
-            enable_upscaling=enable_upscaling,
-            upscaling_model_path=upscaling_model_path,
-            upscaling_scale=upscaling_scale,
-            output_compression=output_compression,
-            output_quality=output_quality,
-            **(
-                {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
-            ),
+            **request_values,
+            **model_extra_from_form,
         )
     else:
         try:
