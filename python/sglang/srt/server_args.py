@@ -1269,6 +1269,11 @@ class ServerArgs:
         "Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
         NS("parallel"),
     ] = False
+    hy3_sp: A[
+        bool,
+        "Enable Hunyuan V3 sequence parallelism over TP ranks.",
+        NS("parallel"),
+    ] = False
     enable_p2p_check: A[
         bool,
         "Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
@@ -5699,6 +5704,28 @@ class ServerArgs:
                     f"(attn_tp_size=1). Got {model_arch}; supported: "
                     f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
                 )
+
+        if self.hy3_sp:
+            if model_arch != "HYV3ForCausalLM":
+                raise ValueError(
+                    "--hy3-sp is only supported for HYV3ForCausalLM, "
+                    f"but the loaded architecture is {model_arch}."
+                )
+            if self.dp_size != 1 or self.enable_dp_attention:
+                raise ValueError(
+                    "--hy3-sp requires pure tensor parallelism: set --dp-size 1 "
+                    "and remove --enable-dp-attention."
+                )
+            if self.pp_size != 1:
+                raise ValueError("--hy3-sp does not support pipeline parallelism.")
+            if self.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "--hy3-sp requires --moe-a2a-backend deepep so routed experts "
+                    "can process sequence-sharded tokens."
+                )
+            if self.moe_dense_tp_size not in (None, 1):
+                raise ValueError("--hy3-sp requires --moe-dense-tp-size 1.")
+            self.moe_dense_tp_size = 1
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:

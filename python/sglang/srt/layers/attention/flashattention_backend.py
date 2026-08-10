@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -1575,8 +1576,24 @@ class FlashAttentionBackend(AttentionBackend):
                     ver=self.fa_impl_ver,
                 )
             else:
+                # SP (hy3_sp / minimax_opt) shards the sequence across TP ranks and
+                # pads q; trim the padding back to the metadata token count so the
+                # kernel does not attend over padding rows.
+                q_for_attn = q
+                server_args = get_global_server_args()
+                if (
+                    (server_args.minimax_opt or server_args.hy3_sp)
+                    and q.shape[0] != 0
+                    and cu_seqlens_q is not None
+                    and q.shape[0] > max_seqlen_q * (cu_seqlens_q.shape[0] - 1)
+                ):
+                    q_metadata_num_tokens = int(cu_seqlens_q[-1].item())
+                    if q.shape[0] > q_metadata_num_tokens:
+                        q_for_attn = q[:q_metadata_num_tokens]
                 result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q_for_attn.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
