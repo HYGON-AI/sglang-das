@@ -1665,7 +1665,9 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             if self._engine_paused:
                 # Paused ranks must still join MLPSync so DP peers do not hang.
-                if getattr(self, "require_mlp_sync", False):
+                if self._is_pd_decode_stepinfo_sync_enabled() and getattr(
+                    self, "require_mlp_sync", False
+                ):
                     self.maybe_prepare_mlp_sync_batch(None)
                 continue
 
@@ -1696,7 +1698,9 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             if self._engine_paused:
                 # Paused ranks must still join MLPSync so DP peers do not hang.
-                if getattr(self, "require_mlp_sync", False):
+                if self._is_pd_decode_stepinfo_sync_enabled() and getattr(
+                    self, "require_mlp_sync", False
+                ):
                     self.maybe_prepare_mlp_sync_batch(None)
                 continue
 
@@ -1844,8 +1848,9 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        """Advance local PD queues; cross-DP sync happens later in MLPSync."""
-        pd_t0 = time.monotonic()
+        """Advance local PD queues and optionally record StepInfo timing."""
+        enable_stepinfo_sync = self._is_pd_decode_stepinfo_sync_enabled()
+        pd_t0 = time.monotonic() if enable_stepinfo_sync else None
         try:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 self.decode_offload_manager.check_offload_progress()
@@ -1875,14 +1880,18 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     self.waiting_queue.extend(transferred_reqs)
         finally:
-            elapsed_ms = (time.monotonic() - pd_t0) * 1000.0
-            self._dp_scheduler_last_pd_ms = elapsed_ms
-            # Soft PD budget for StepInfo observability only (no fail-fast).
-            budget_ms = 5000.0
-            self._dp_scheduler_pd_over_budget = elapsed_ms > budget_ms
-            if self._dp_scheduler_pd_over_budget:
-                logger.warning(
-                    "PD Decode local progress exceeded budget: %.1fms > %.1fms",
-                    elapsed_ms,
-                    budget_ms,
-                )
+            if enable_stepinfo_sync:
+                assert pd_t0 is not None
+                elapsed_ms = (time.monotonic() - pd_t0) * 1000.0
+                self._dp_scheduler_last_pd_ms = elapsed_ms
+                # Soft PD budget for StepInfo observability only (no fail-fast).
+                budget_ms = 5000.0
+                self._dp_scheduler_pd_over_budget = elapsed_ms > budget_ms
+                # Debug only: over-budget can be true on many steps and would
+                # otherwise spam the default service log.
+                if self._dp_scheduler_pd_over_budget:
+                    logger.debug(
+                        "PD Decode local progress exceeded budget: %.1fms > %.1fms",
+                        elapsed_ms,
+                        budget_ms,
+                    )

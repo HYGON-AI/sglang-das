@@ -2520,6 +2520,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
         """Swallow ZMQ send timeout so the decode scheduler can keep joining MLPSync."""
         import zmq
 
+        if not envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get():
+            # Keep upstream blocking/error behavior unless PD Decode StepInfo
+            # sync is enabled (then timeouts must not stall one DP rank).
+            sock.send_multipart(parts)
+            return True
+
         try:
             zmq.Socket.send_multipart(sock, parts)
             return True
