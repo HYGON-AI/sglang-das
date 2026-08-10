@@ -930,8 +930,9 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 q_padded_num_tokens = q.shape[0]
                 q_num_tokens = q_padded_num_tokens
+                server_args = get_global_server_args()
                 if (
-                    get_global_server_args().minimax_opt
+                    (server_args.minimax_opt or server_args.hy3_sp)
                     and q_padded_num_tokens != 0
                     and cu_seqlens_q is not None
                     and q_padded_num_tokens

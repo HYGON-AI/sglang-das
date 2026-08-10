@@ -1135,11 +1135,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
+        model_sp = (
+            model_runner.server_args.minimax_opt or model_runner.server_args.hy3_sp
+        )
 
-        if not input_scattered and not model_runner.server_args.minimax_opt:
+        if not input_scattered and not model_sp:
             return
 
-        if model_runner.server_args.minimax_opt and not self.forward_mode.is_extend():
+        if model_sp and not self.forward_mode.is_extend():
             return
 
         if input_scattered:
