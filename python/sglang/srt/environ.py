@@ -478,6 +478,9 @@ class Envs:
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    # gfx938 length-masked persistent-MQA packaged in LightOp.
+    SGLANG_NSA_HCU_PERSISTENT_MQA_FASTPATH = EnvBool(False)
+    SGLANG_NSA_HCU_PERSISTENT_MQA_CTAS = EnvInt(0)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_DISABLE_NSA_MULTI_REPLAY_OPT = EnvBool(False)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)

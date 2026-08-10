@@ -67,9 +67,21 @@ if _use_aiter and not _use_aiter_preshuffle:
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
 _is_hcu = is_hcu()
+_use_hcu_persistent_mqa = _is_hcu and envs.SGLANG_NSA_HCU_PERSISTENT_MQA_FASTPATH.get()
 if _is_hcu:
     from lightop import attention as lightop_attention
     from lightop import kvcache as lightop_kvcache
+
+    if _use_hcu_persistent_mqa:
+        _hcu_persistent_mqa_package_operation = getattr(
+            lightop_attention,
+            "paged_mqa_logits_length_masked",
+            None,
+        )
+        from sglang.srt.layers.attention.nsa.hcu_persistent_mqa import (
+            paged_mqa_logits_length_masked,
+            preload_hcu_persistent_mqa,
+        )
 
     from sglang.srt.layers.attention.nsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
@@ -268,6 +280,13 @@ class Indexer(MultiPlatformOp):
                 else device_props.name
             )
             self.sm_count = device_props.multi_processor_count
+            if _use_hcu_persistent_mqa:
+                preload_hcu_persistent_mqa(
+                    is_hcu=_is_hcu,
+                    arch_name=device_name,
+                    num_cus=self.sm_count,
+                    package_operation=_hcu_persistent_mqa_package_operation,
+                )
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
@@ -690,17 +709,58 @@ class Indexer(MultiPlatformOp):
                     WavePerEU=5,
                 )
             elif _is_hcu:
-
-                logits = lightop_attention.paged_mqa_logits(
-                    q_fp8[:q_offset],
-                    kv_cache_fp8,
-                    weights[:q_offset],
-                    seqlens_32,
-                    block_tables,
-                    schedule_metadata,
-                    max_seq_len,
-                    clean_logits=True,
-                )
+                if not _use_hcu_persistent_mqa:
+                    logits = lightop_attention.paged_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_cache_fp8,
+                        weights[:q_offset],
+                        seqlens_32,
+                        block_tables,
+                        schedule_metadata,
+                        max_seq_len,
+                        clean_logits=True,
+                    )
+                else:
+                    active_q = q_fp8[:q_offset]
+                    active_weights = weights[:q_offset]
+                    # Scheduler metadata guarantees every sequence length is
+                    # within this block table's capacity. Avoid a per-layer
+                    # device reduction/synchronization to revalidate values.
+                    topk_context_lens = metadata.get_seqlens_expanded()
+                    fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
+                    force_unfused_topk = getattr(metadata, "force_unfused_topk", True)
+                    topk_transform_method_name = getattr(
+                        getattr(metadata, "topk_transform_method", None),
+                        "name",
+                        "",
+                    )
+                    logits = paged_mqa_logits_length_masked(
+                        active_q,
+                        kv_cache_fp8,
+                        active_weights,
+                        seqlens_32,
+                        block_tables,
+                        schedule_metadata,
+                        max_seq_len,
+                        is_hcu=_is_hcu,
+                        page_size=page_size,
+                        fuse_topk=fuse_topk,
+                        force_unfused_topk=force_unfused_topk,
+                        topk_transform_method_name=topk_transform_method_name,
+                        index_topk=self.index_topk,
+                        topk_context_lens=topk_context_lens,
+                    )
+                    if logits is None:
+                        logits = lightop_attention.paged_mqa_logits(
+                            active_q,
+                            kv_cache_fp8,
+                            active_weights,
+                            seqlens_32,
+                            block_tables,
+                            schedule_metadata,
+                            max_seq_len,
+                            clean_logits=True,
+                        )
             else:
                 logits = deep_gemm.fp8_paged_mqa_logits(
                     q_fp8[:q_offset],
