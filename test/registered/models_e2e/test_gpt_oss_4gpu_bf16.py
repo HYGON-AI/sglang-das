@@ -11,8 +11,8 @@ register_hcu_ci(
     disabled="HCU CSV CI placeholder: 4-GPU GPT-OSS BF16 path needs BW1100 large-model validation before enabling.",
 )
 
-register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-h100")
-register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=207, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=171, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestGptOss4GpuBf16(BaseTestGptOss):
