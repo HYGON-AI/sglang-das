@@ -696,6 +696,7 @@ class ServerArgs:
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_static_dispatch_policy: Literal["nearest", "locality_fair"] = "nearest"
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -6392,6 +6393,18 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
             help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--ep-static-dispatch-policy",
+            type=str,
+            choices=["nearest", "locality_fair"],
+            default=ServerArgs.ep_static_dispatch_policy,
+            help=(
+                "The replica selection policy for static expert dispatch. "
+                "`nearest` preserves the legacy nearest-replica behavior; "
+                "`locality_fair` fairly distributes source ranks among replicas "
+                "at the same locality level."
+            ),
         )
         parser.add_argument(
             "--init-expert-location",

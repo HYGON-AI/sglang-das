@@ -449,6 +449,9 @@ def compute_logical_to_rank_dispatch_physical_map(
     seed: int = 42,
 ):
     r = random.Random(seed)
+    dispatch_policy = getattr(server_args, "ep_static_dispatch_policy", "nearest")
+    if dispatch_policy not in ("nearest", "locality_fair"):
+        raise ValueError(f"Unknown static expert dispatch policy: {dispatch_policy}")
 
     device = logical_to_all_physical_map.device
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
@@ -468,6 +471,19 @@ def compute_logical_to_rank_dispatch_physical_map(
             candidate_physical_expert_ids = _logical_to_all_physical_raw(
                 logical_to_all_physical_map, layer_id, logical_expert_id
             )
+
+            if dispatch_policy == "locality_fair":
+                choices = _assign_locality_fair_experts(
+                    candidate_physical_expert_ids=candidate_physical_expert_ids,
+                    ep_size=ep_size,
+                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_local_node_physical_experts=num_local_node_physical_experts,
+                    r=r,
+                )
+                for moe_ep_rank, choice in enumerate(choices):
+                    result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
+                continue
 
             remaining_ranks = []
             for moe_ep_rank in range(ep_size):
@@ -558,6 +574,93 @@ def _find_nearest_expert(
 
     # 4. At last, leave it as -1 to indicate not found.
     return -1
+
+
+def _assign_locality_fair_experts(
+    candidate_physical_expert_ids: List[int],
+    ep_size: int,
+    num_local_gpu_physical_experts: int,
+    num_gpus_per_node: int,
+    num_local_node_physical_experts: int,
+    r: random.Random,
+) -> List[int]:
+    assignments = [-1] * ep_size
+    assignment_counts = {
+        physical_expert_id: 0 for physical_expert_id in candidate_physical_expert_ids
+    }
+
+    candidates_by_gpu = [[] for _ in range(ep_size)]
+    candidates_by_node = [[] for _ in range(ep_size // num_gpus_per_node)]
+    for physical_expert_id in candidate_physical_expert_ids:
+        gpu_id = _compute_gpu_id_of_physical_expert(
+            physical_expert_id, num_local_gpu_physical_experts
+        )
+        node_id = _compute_node_id_of_physical_expert(
+            physical_expert_id, num_local_node_physical_experts
+        )
+        candidates_by_gpu[gpu_id].append(physical_expert_id)
+        candidates_by_node[node_id].append(physical_expert_id)
+
+    # Keep the strongest locality preference: a source rank with a same-GPU
+    # replica always uses one of those replicas.
+    for moe_ep_rank in range(ep_size):
+        if candidates_by_gpu[moe_ep_rank]:
+            choice = _choose_least_assigned_expert(
+                candidates_by_gpu[moe_ep_rank], assignment_counts, r
+            )
+            assignments[moe_ep_rank] = choice
+            assignment_counts[choice] += 1
+
+    # Distribute the remaining source ranks fairly among same-node replicas.
+    # Counts from the same-GPU assignments are included, so local replicas end
+    # up with source-rank counts that differ by at most one.
+    for node_id, same_node_physical_expert_ids in enumerate(candidates_by_node):
+        if not same_node_physical_expert_ids:
+            continue
+
+        node_rank_begin = node_id * num_gpus_per_node
+        remaining_ranks = [
+            moe_ep_rank
+            for moe_ep_rank in range(
+                node_rank_begin, node_rank_begin + num_gpus_per_node
+            )
+            if assignments[moe_ep_rank] == -1
+        ]
+        r.shuffle(remaining_ranks)
+        for moe_ep_rank in remaining_ranks:
+            choice = _choose_least_assigned_expert(
+                same_node_physical_expert_ids, assignment_counts, r
+            )
+            assignments[moe_ep_rank] = choice
+            assignment_counts[choice] += 1
+
+    # A rank reaches this stage only when its node has no replica. Continue from
+    # the locality-aware counts so remote assignments do not undo the balance
+    # established by the same-GPU and same-node passes.
+    remaining_ranks = [
+        moe_ep_rank
+        for moe_ep_rank, assignment in enumerate(assignments)
+        if assignment == -1
+    ]
+    r.shuffle(remaining_ranks)
+    for moe_ep_rank in remaining_ranks:
+        choice = _choose_least_assigned_expert(
+            candidate_physical_expert_ids, assignment_counts, r
+        )
+        assignments[moe_ep_rank] = choice
+        assignment_counts[choice] += 1
+
+    return assignments
+
+
+def _choose_least_assigned_expert(
+    candidate_physical_expert_ids: List[int],
+    assignment_counts: dict[int, int],
+    r: random.Random,
+) -> int:
+    candidates = candidate_physical_expert_ids.copy()
+    r.shuffle(candidates)
+    return min(candidates, key=assignment_counts.__getitem__)
 
 
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:
