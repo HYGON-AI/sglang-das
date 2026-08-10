@@ -1222,25 +1222,30 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
-        # Do not mix recv-control or model-forward collectives into it.
-        # A process-group timeout is replica-fatal; no plain-barrier fallback.
+        # Optional PD Decode + DP attention sync path
+        # (SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC). When enabled, create a
+        # dedicated Gloo group and fold queue/epoch metadata into MLPSync so
+        # ranks that finish PD transfer at different times still share one
+        # scheduler clock. Default off for plain PD.
         self.dp_scheduler_cpu_group = None
         self._dp_scheduler_epoch = 0
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
+        self._enable_pd_decode_stepinfo_sync = (
+            envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.get()
+            and self.disaggregation_mode == DisaggregationMode.DECODE
             and self.server_args.enable_dp_attention
-        ):
-            if not self.require_mlp_sync:
-                raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
+        )
+        if self._enable_pd_decode_stepinfo_sync:
+            # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
+            # Do not mix recv-control or model-forward collectives into it.
+            # A process-group timeout is replica-fatal; no plain-barrier fallback.
+            if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+                raise RuntimeError(
+                    "SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC=1 is incompatible "
+                    "with SGLANG_SCHEDULER_SKIP_ALL_GATHER=1"
+                )
             if self.pp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
-                )
-            if self.attn_tp_size != 1 or self.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports attn_tp_size=1 and "
-                    "attn_cp_size=1 only"
                 )
 
             tp_ranks = list(self.tp_group.ranks)
@@ -1265,7 +1270,6 @@ class Scheduler(
 
             from datetime import timedelta
 
-            # Dedicated scheduler-group timeout for PD Decode DP sync.
             timeout_s = 60.0
             self.dp_scheduler_cpu_group = torch.distributed.new_group(
                 ranks=tp_ranks,
@@ -1274,10 +1278,12 @@ class Scheduler(
             )
             if self.tp_rank == 0:
                 logger.info(
-                    "PD Decode single-clock enabled: dedicated Gloo scheduler "
-                    "group, world=%s timeout=%.1fs",
+                    "PD Decode StepInfo sync enabled: dedicated Gloo scheduler "
+                    "group, world=%s timeout=%.1fs (attn_tp=%s attn_cp=%s)",
                     len(tp_ranks),
                     timeout_s,
+                    self.attn_tp_size,
+                    self.attn_cp_size,
                 )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
@@ -1813,16 +1819,12 @@ class Scheduler(
                     src=self.attn_cp_group.ranks[0],
                 )
 
-            # When local control broadcast is enabled (env preferred; CLI kept
-            # for compatibility), each DP group leader already receives control
-            # messages from the DP controller, so we broadcast within
-            # attn_tp_group + attn_cp_group instead of the full tp_group.
-            # This avoids an expensive all-ranks gloo sync.
-            _local_ctrl = (
-                envs.SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST.get()
-                or self.server_args.enable_dp_attention_local_control_broadcast
-            )
-            if _local_ctrl:
+            # When --enable-dp-attention-local-control-broadcast is set, each
+            # DP group leader already receives control messages from the DP
+            # controller, so we broadcast within attn_tp_group + attn_cp_group
+            # instead of the full tp_group. This avoids an expensive all-ranks
+            # gloo sync.
+            if self.server_args.enable_dp_attention_local_control_broadcast:
                 if self.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
