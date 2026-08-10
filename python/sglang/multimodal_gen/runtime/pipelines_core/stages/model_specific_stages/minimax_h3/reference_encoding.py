@@ -43,6 +43,15 @@ MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
 
 
+@functools.cache
+def _ffmpeg_executable() -> str:
+    # Reuse SGLang's canonical resolver, which already supports the bundled
+    # imageio-ffmpeg binary used by vendor containers without a system ffmpeg.
+    from sglang.multimodal_gen.runtime.entrypoints.utils import _resolve_ffmpeg_exe
+
+    return _resolve_ffmpeg_exe()
+
+
 class _AudioVAEDeterminismContext:
     """Scoped determinism config for the audio encode.
 
@@ -203,11 +212,10 @@ def _load_waveform(
 ) -> tuple[torch.Tensor, int]:
     """Apply the audio material chain.
 
-    Pure-audio references preserve their source rate while normalizing to
-    stereo. Video-bearing references first extract 44.1 kHz stereo PCM. The
-    audio VAE boundary then performs the single 32 kHz resample below. ffmpeg
-    writes bounded interleaved float PCM directly to stdout, avoiding a
-    temporary lossless file plus a second decode.
+    ffmpeg decodes every supported material chain directly to the audio VAE's
+    required 32 kHz stereo PCM. This preserves the upstream single-resample
+    contract without importing torchaudio, whose binary extension may target
+    CUDA rather than the vendor HCU PyTorch build.
     """
 
     import subprocess
@@ -225,19 +233,18 @@ def _load_waveform(
     if material_chain == "audio":
         if source_sample_rate is None or int(source_sample_rate) <= 0:
             raise ValueError("reference audio sample rate must be positive")
-        source_rate = int(source_sample_rate)
     elif material_chain in {
         "video.reference_preserve",
         "video_audio.reference_preserve",
     }:
-        source_rate = 44100
+        pass
     else:
         raise ValueError(
             f"unsupported MiniMax H3 audio material chain {material_chain!r}"
         )
 
     command = [
-        "ffmpeg",
+        _ffmpeg_executable(),
         "-v",
         "error",
     ]
@@ -251,9 +258,9 @@ def _load_waveform(
         "-vn",
         "-ac",
         str(MINIMAX_H3_AUDIO_CHANNELS),
+        "-ar",
+        str(MINIMAX_H3_AUDIO_SAMPLE_RATE),
     ]
-    if material_chain != "audio":
-        command += ["-ar", str(source_rate)]
     if max_duration_seconds is not None:
         command += ["-t", f"{max_duration_seconds:.9g}"]
     command += ["-f", "f32le", "pipe:1"]
@@ -272,14 +279,7 @@ def _load_waveform(
         .reshape(-1, MINIMAX_H3_AUDIO_CHANNELS)
         .T.copy()
     )
-    return waveform, source_rate
-
-
-@functools.lru_cache(maxsize=8)
-def _audio_resampler(source_rate: int):
-    import torchaudio
-
-    return torchaudio.transforms.Resample(source_rate, MINIMAX_H3_AUDIO_SAMPLE_RATE)
+    return waveform, MINIMAX_H3_AUDIO_SAMPLE_RATE
 
 
 @torch.inference_mode()
@@ -309,8 +309,6 @@ def minimax_h3_encode_reference_audio_rows(
     )
     if waveform.numel() == 0:
         raise ValueError(f"reference audio is empty: {audio_path}")
-    if int(source_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
-        waveform = _audio_resampler(int(source_rate))(waveform)
     waveform = waveform.to(device)
 
     with _AudioVAEDeterminismContext():
@@ -388,7 +386,7 @@ def minimax_h3_decode_reference_video_frames(
         f"scale={target_width}:{target_height}:flags=lanczos,"
         "setsar=1"
     )
-    command = ["ffmpeg", "-v", "error"]
+    command = [_ffmpeg_executable(), "-v", "error"]
     if start_time_seconds > 0:
         # Input seeking remains accurate while transcoding and avoids decoding
         # the unused prefix of a long reference into RGB frames.

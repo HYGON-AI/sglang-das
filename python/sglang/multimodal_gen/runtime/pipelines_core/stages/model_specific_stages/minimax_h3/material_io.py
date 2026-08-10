@@ -306,6 +306,81 @@ _FFPROBE_ENTRY_VARIANTS = (
 _ffprobe_entries: str | None = None
 
 
+def _pyav_probe_media(path: str) -> dict[str, Any]:
+    """Return the ffprobe subset used by H3 when no ffprobe binary exists."""
+
+    import av
+
+    streams: list[dict[str, Any]] = []
+    with av.open(path, mode="r") as container:
+        for stream in container.streams:
+            codec_type = str(stream.type)
+            if codec_type not in {"video", "audio"}:
+                continue
+            entry: dict[str, Any] = {
+                "codec_type": codec_type,
+                "duration": (
+                    float(stream.duration * stream.time_base)
+                    if stream.duration is not None and stream.time_base is not None
+                    else None
+                ),
+                "nb_frames": stream.frames or None,
+                "tags": dict(stream.metadata or {}),
+            }
+            codec_context = stream.codec_context
+            entry.update(
+                {
+                    "codec_name": codec_context.name,
+                    "profile": codec_context.profile,
+                    "pix_fmt": (
+                        codec_context.format.name
+                        if codec_context.format is not None
+                        else None
+                    ),
+                }
+            )
+            if codec_type == "video":
+                average_rate = getattr(stream, "average_rate", None)
+                base_rate = getattr(stream, "base_rate", None)
+                sample_aspect_ratio = getattr(stream, "sample_aspect_ratio", None)
+                display_aspect_ratio = getattr(stream, "display_aspect_ratio", None)
+                entry.update(
+                    {
+                        "width": codec_context.width,
+                        "height": codec_context.height,
+                        "avg_frame_rate": str(average_rate or "0/1"),
+                        "r_frame_rate": str(base_rate or average_rate or "0/1"),
+                        "sample_aspect_ratio": str(sample_aspect_ratio or "1:1"),
+                        "display_aspect_ratio": (
+                            str(display_aspect_ratio)
+                            if display_aspect_ratio is not None
+                            else None
+                        ),
+                    }
+                )
+            else:
+                entry.update(
+                    {
+                        "sample_rate": codec_context.sample_rate,
+                        "channels": codec_context.channels,
+                    }
+                )
+            streams.append(entry)
+
+        duration = (
+            float(container.duration / av.time_base)
+            if container.duration is not None
+            else None
+        )
+        return {
+            "streams": streams,
+            "format": {
+                "format_name": str(container.format.name or ""),
+                "duration": duration,
+            },
+        }
+
+
 def _ffprobe_media(path: str) -> dict[str, Any]:
     global _ffprobe_entries
 
@@ -336,6 +411,8 @@ def _ffprobe_media(path: str) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
             )
+        except FileNotFoundError:
+            return _pyav_probe_media(path)
         except subprocess.CalledProcessError as exc:
             # Only an unknown section name is worth retrying; a genuinely bad
             # input must fail on the first variant.

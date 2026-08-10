@@ -49,6 +49,21 @@ def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
     assert "stream_side_data" not in material_io._ffprobe_entries
 
 
+def test_ffprobe_falls_back_to_pyav_when_binary_is_missing(monkeypatch):
+    expected = {
+        "streams": [{"codec_type": "video", "width": 1360, "height": 768}],
+        "format": {"format_name": "mov,mp4", "duration": 4.0},
+    }
+
+    def missing(*_args, **_kwargs):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    monkeypatch.setattr(material_io, "_pyav_probe_media", lambda path: expected)
+
+    assert material_io._ffprobe_media("/input/ref.mp4") is expected
+
+
 def test_video_transform_runs_once_and_qwen_samples_shared_rgb(monkeypatch):
     expected = np.arange(25 * 4 * 6 * 3, dtype=np.uint8).reshape(25, 4, 6, 3)
     commands = []
@@ -58,6 +73,7 @@ def test_video_transform_runs_once_and_qwen_samples_shared_rgb(monkeypatch):
         return SimpleNamespace(stdout=expected.tobytes())
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(reference_encoding, "_ffmpeg_executable", lambda: "ffmpeg")
     frames = reference_encoding.minimax_h3_decode_reference_video_frames(
         "/input/ref.mp4",
         target_width=6,
@@ -100,6 +116,7 @@ def test_audio_decode_is_bounded_float_pcm_without_temp_files(monkeypatch):
         return SimpleNamespace(stdout=pcm)
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(reference_encoding, "_ffmpeg_executable", lambda: "ffmpeg")
     waveform, source_rate = reference_encoding._load_waveform(
         "/input/ref.mp4",
         material_chain="video.reference_preserve",
@@ -108,12 +125,13 @@ def test_audio_decode_is_bounded_float_pcm_without_temp_files(monkeypatch):
     )
 
     ffmpeg = next(command for command in commands if command[0] == "ffmpeg")
-    assert source_rate == 44100
+    assert source_rate == 32000
     torch.testing.assert_close(
         waveform,
         torch.tensor([[0, 2, 4, 6], [1, 3, 5, 7]], dtype=torch.float32),
     )
     assert ffmpeg[ffmpeg.index("-t") + 1] == "3.5"
+    assert ffmpeg[ffmpeg.index("-ar") + 1] == "32000"
     assert ffmpeg[ffmpeg.index("-ss") + 1] == "2.25"
     assert ffmpeg.index("-ss") < ffmpeg.index("-i")
     assert ffmpeg[-3:] == ["-f", "f32le", "pipe:1"]

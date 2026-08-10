@@ -373,10 +373,12 @@ def _probe_minimax_h3_output_fields(
         raise RuntimeError(
             "MiniMax H3 final output ffprobe timed out after 30 seconds"
         ) from exc
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "ffprobe is required to validate final MiniMax H3 output"
-        ) from exc
+    except FileNotFoundError:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
+            _ffprobe_media,
+        )
+
+        payload = _ffprobe_media(path)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or "").strip()
         suffix = f": {detail}" if detail else ""
@@ -384,12 +386,13 @@ def _probe_minimax_h3_output_fields(
             f"ffprobe failed for final MiniMax H3 output{suffix}"
         ) from exc
 
-    try:
-        payload = json.loads(probe.stdout)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "ffprobe returned invalid JSON for MiniMax H3 output"
-        ) from exc
+    else:
+        try:
+            payload = json.loads(probe.stdout)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "ffprobe returned invalid JSON for MiniMax H3 output"
+            ) from exc
     if not isinstance(payload, dict):
         raise RuntimeError("ffprobe returned invalid JSON for MiniMax H3 output")
     streams = payload.get("streams") or []
