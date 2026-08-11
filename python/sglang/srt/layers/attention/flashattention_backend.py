@@ -305,8 +305,8 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
-        self.flash_attn_varlen_func = flash_attn_varlen_func
-        self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        # self.flash_attn_varlen_func = flash_attn_varlen_func
+        # self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
