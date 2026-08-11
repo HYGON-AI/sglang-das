@@ -5,12 +5,21 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_hcu, is_npu
 
 if not is_cpu():
-    from sglang.kernels.ops.attention.fla.fused_recurrent import (
-        fused_recurrent_kda_packed_decode,
-    )
+    if is_hcu():
+        # HCU: operator-team packed-decode adapter. Its signature matches
+        # fused_recurrent_kda_packed_decode exactly (incl. lower_bound), so the
+        # call site below is unchanged. Requires num_v_heads == num_k_heads == H
+        # and L2-normalized Q/K, both true for Kimi-K3 (see kda_hcu.py docstring).
+        from sglang.kernels.ops.attention.fla.kda_hcu import (
+            fused_recurrent_kda_packed_decode_hcu as fused_recurrent_kda_packed_decode,
+        )
+    else:
+        from sglang.kernels.ops.attention.fla.fused_recurrent import (
+            fused_recurrent_kda_packed_decode,
+        )
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
