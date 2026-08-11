@@ -2,14 +2,16 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_hip
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
-_is_cuda = is_cuda()
-
-if _is_cuda:
+_enable_concat_mla_absorb_q = (
+    is_cuda() or (is_hip() and envs.SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q.get())
+)
+if _enable_concat_mla_absorb_q:
     from sgl_kernel import concat_mla_absorb_q
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
@@ -471,10 +473,20 @@ def mla_quantize_and_rope_for_fp8(
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):
-    if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
-        return concat_mla_absorb_q(q_nope, q_rope)
-    else:
+    can_use_custom_op = (
+        _enable_concat_mla_absorb_q
+        and q_nope.ndim == q_rope.ndim == 3
+        and q_nope.shape[:-1] == q_rope.shape[:-1]
+        and (q_nope.shape[-1], q_rope.shape[-1]) == (512, 64)
+        and q_nope.dtype == q_rope.dtype == torch.bfloat16
+        and q_nope.is_cuda
+        and q_nope.device == q_rope.device
+        and q_nope.stride(-1) == q_rope.stride(-1) == 1
+    )
+    if not can_use_custom_op:
         return torch.cat([q_nope, q_rope], dim=-1)
+
+    return concat_mla_absorb_q(q_nope, q_rope)
 
 
 @triton.jit

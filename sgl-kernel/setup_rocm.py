@@ -50,6 +50,7 @@ sources = [
     "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     "csrc/elementwise/l2norm_kernel.cu",
     "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
