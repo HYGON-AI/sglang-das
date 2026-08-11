@@ -193,6 +193,7 @@ class W8A8Int8Config(QuantizationConfig):
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
+    supports_fused_rms_quant = True
 
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
