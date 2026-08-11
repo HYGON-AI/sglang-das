@@ -155,20 +155,6 @@ def is_cuda_alike():
 
 
 @lru_cache(maxsize=1)
-def is_dcu() -> bool:
-    """Return whether the visible HIP device is a Hygon DCU/HCU architecture."""
-    if not is_hip():
-        return False
-    try:
-        props = torch.cuda.get_device_properties(0)
-        gcn_arch = getattr(props, "gcnArchName", "")
-        return any(arch in gcn_arch for arch in ("gfx928", "gfx936", "gfx938"))
-    except Exception as exc:
-        logger.warning("DCU detection failed (not a DCU or HIP misconfigured): %s", exc)
-        return False
-
-
-@lru_cache(maxsize=1)
 def is_hpu() -> bool:
     return hasattr(torch, "hpu") and torch.hpu.is_available()
 

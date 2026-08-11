@@ -62,39 +62,6 @@ _VIDEO_EXTENSIONS = {
     ".webm",
 }
 
-_MINIMAX_H3_CANCEL_FILE_EXTRA_KEY = "minimax_h3_cancel_file"
-
-
-def _video_cancel_path(video_id: str) -> str | None:
-    root = os.getenv("SGLANG_VIDEO_CANCEL_DIR")
-    if not root:
-        return None
-    cancel_root = os.path.abspath(root)
-    os.makedirs(cancel_root, exist_ok=True)
-    return os.path.join(cancel_root, f"{video_id}.cancel")
-
-
-def _video_cancel_requested(batch: Req) -> bool:
-    cancel_file = batch.extra.get(_MINIMAX_H3_CANCEL_FILE_EXTRA_KEY)
-    return isinstance(cancel_file, str) and bool(cancel_file) and os.path.isfile(
-        cancel_file
-    )
-
-
-async def _mark_video_cancelled(job_id: str) -> None:
-    await VIDEO_STORE.update_fields(
-        job_id,
-        {
-            "status": "cancelled",
-            "progress": 100,
-            "completed_at": int(time.time()),
-            "error": None,
-            "url": None,
-            "file_path": None,
-            "file_paths": None,
-            "num_outputs": None,
-        },
-    )
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
     return (request.model_extra or {}).get(name)
@@ -235,35 +202,6 @@ def _cosmos3_sampling_param_kwargs(
     return kwargs
 
 
-def _video_sampling_params_cls(server_args) -> type[SamplingParams]:
-    """Resolve the sampling-parameter class selected by the running pipeline."""
-
-    sampling_params_cls = SamplingParams
-    if server_args.pipeline_class_name:
-        from sglang.multimodal_gen.registry import (
-            get_pipeline_config_classes,
-        )
-
-        config_classes = get_pipeline_config_classes(
-            server_args.pipeline_class_name
-        )
-        if config_classes is not None:
-            _, sampling_params_cls = config_classes
-
-    if sampling_params_cls is SamplingParams:
-        from sglang.multimodal_gen.registry import get_model_info
-
-        model_info = get_model_info(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
-        if model_info is not None:
-            sampling_params_cls = model_info.sampling_param_cls
-
-    return sampling_params_cls
-
-
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
     delegate to the shared build_sampling_params."""
@@ -286,80 +224,45 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
                 server_args.pipeline_config.action_stats_path
             )
 
-    kwargs = {
-        "prompt": request.prompt,
-        "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
-        "size": request.size,
-        "width": request.width,
-        "height": request.height,
-        "num_frames": num_frames,
-        "fps": fps,
-        "image_path": image_path,
-        "video_path": video_path,
-        "output_file_name": request_id,
-        "seed": request.seed,
-        "generator_device": request.generator_device,
-        "num_inference_steps": request.num_inference_steps,
-        "guidance_scale": request.guidance_scale,
-        "guidance_scale_2": request.guidance_scale_2,
-        "true_cfg_scale": request.true_cfg_scale,
-        "negative_prompt": request.negative_prompt,
-        "max_sequence_length": request.max_sequence_length,
-        "flow_shift": request.flow_shift,
-        "use_duration_template": _extra_value(
-            request, "use_duration_template"
-        ),
-        "use_resolution_template": _extra_value(
-            request, "use_resolution_template"
-        ),
-        "use_system_prompt": _extra_value(request, "use_system_prompt"),
-        "use_guardrails": _extra_value(request, "use_guardrails"),
-        "enable_teacache": request.enable_teacache,
-        "enable_frame_interpolation": request.enable_frame_interpolation,
-        "frame_interpolation_exp": request.frame_interpolation_exp,
-        "frame_interpolation_scale": request.frame_interpolation_scale,
-        "frame_interpolation_model_path": request.frame_interpolation_model_path,
-        "enable_upscaling": request.enable_upscaling,
-        "upscaling_model_path": request.upscaling_model_path,
-        "upscaling_scale": request.upscaling_scale,
-        "output_path": request.output_path,
-        "output_compression": request.output_compression,
-        "output_quality": request.output_quality,
-        "perf_dump_path": request.perf_dump_path,
-        # These profiling fields exist in newer protocol revisions but are
-        # absent from the 0.5.15 VideoGenerationsRequest.  Keep this adapter
-        # compatible with both protocol layouts.
-        "profile": getattr(request, "profile", None),
-        "num_profiled_timesteps": getattr(
-            request, "num_profiled_timesteps", None
-        ),
-        "profile_all_stages": getattr(request, "profile_all_stages", None),
-        "diffusers_kwargs": request.diffusers_kwargs,
+    return build_sampling_params(
+        request_id,
+        prompt=request.prompt,
+        num_outputs_per_prompt=max(1, min(int(num_outputs), 10)),
+        size=request.size,
+        width=request.width,
+        height=request.height,
+        num_frames=num_frames,
+        fps=fps,
+        image_path=image_path,
+        video_path=video_path,
+        output_file_name=request_id,
+        seed=request.seed,
+        generator_device=request.generator_device,
+        num_inference_steps=request.num_inference_steps,
+        guidance_scale=request.guidance_scale,
+        guidance_scale_2=request.guidance_scale_2,
+        negative_prompt=request.negative_prompt,
+        max_sequence_length=request.max_sequence_length,
+        flow_shift=request.flow_shift,
+        use_duration_template=_extra_value(request, "use_duration_template"),
+        use_resolution_template=_extra_value(request, "use_resolution_template"),
+        use_system_prompt=_extra_value(request, "use_system_prompt"),
+        use_guardrails=_extra_value(request, "use_guardrails"),
+        enable_teacache=request.enable_teacache,
+        enable_frame_interpolation=request.enable_frame_interpolation,
+        frame_interpolation_exp=request.frame_interpolation_exp,
+        frame_interpolation_scale=request.frame_interpolation_scale,
+        frame_interpolation_model_path=request.frame_interpolation_model_path,
+        enable_upscaling=request.enable_upscaling,
+        upscaling_model_path=request.upscaling_model_path,
+        upscaling_scale=request.upscaling_scale,
+        output_path=request.output_path,
+        output_compression=request.output_compression,
+        output_quality=request.output_quality,
+        perf_dump_path=request.perf_dump_path,
+        diffusers_kwargs=request.diffusers_kwargs,
         **cosmos3_kwargs,
-    }
-
-    sampling_params_cls = _video_sampling_params_cls(server_args)
-    kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
-    return build_sampling_params(request_id, **kwargs)
-
-
-def _prepare_video_request_for_queue(batch: Req, sampling: SamplingParams) -> None:
-    """Run model-specific pre-queue hooks when the active sampling params support them."""
-    hook = getattr(sampling, "prepare_video_request_for_queue", None)
-    if callable(hook):
-        hook(batch)
-
-
-def _project_video_queued_job_fields(
-    batch: Req, sampling: SamplingParams
-) -> dict[str, str]:
-    """Project resolved queue-time fields into the public job record when available."""
-    hook = getattr(sampling, "project_video_queued_job_fields", None)
-    if callable(hook):
-        projected = hook(batch)
-        if isinstance(projected, dict):
-            return projected
-    return {}
+    )
 
 
 # extract metadata which http_server needs to know
@@ -414,20 +317,9 @@ async def _dispatch_job_async(
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        if _video_cancel_requested(batch):
-            await _mark_video_cancelled(job_id)
-            return
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
         )
-        if _video_cancel_requested(batch):
-            for output_path in save_file_path_list:
-                try:
-                    os.remove(output_path)
-                except FileNotFoundError:
-                    pass
-            await _mark_video_cancelled(job_id)
-            return
         save_file_path = save_file_path_list[0]
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
@@ -750,6 +642,7 @@ async def create_video(
         raise HTTPException(status_code=400, detail=str(e))
 
     job = _video_job_from_sampling(request_id, req, sampling_params)
+    await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
     trace_headers = extract_trace_headers(request.headers)
@@ -758,21 +651,6 @@ async def create_video(
         sampling_params=sampling_params,
         external_trace_header=trace_headers,
     )
-    try:
-        _prepare_video_request_for_queue(batch, sampling_params)
-    except Exception as e:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
-            minimax_h3_cleanup_temp_dirs,
-        )
-
-        minimax_h3_cleanup_temp_dirs(batch)
-        for td in temp_dirs:
-            shutil.rmtree(td, ignore_errors=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to prepare MiniMax H3 request for queue: {e}",
-        )
-
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
@@ -780,9 +658,6 @@ async def create_video(
             batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
         if "flow_shift" in req.diffusers_kwargs:
             batch.flow_shift = req.diffusers_kwargs["flow_shift"]
-
-    job.update(_project_video_queued_job_fields(batch, sampling_params))
-    await VIDEO_STORE.upsert(request_id, job)
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(
         _dispatch_job_async(

@@ -335,9 +335,6 @@ def _resolve_ffmpeg_exe() -> str:
     return ffmpeg_exe
 
 
-_BROWSER_COMPATIBLE_MP4_OUTPUT_PARAMS = ["-movflags", "+faststart"]
-
-
 def _mux_audio_np_into_mp4(
     *,
     save_file_path: str,
@@ -369,8 +366,6 @@ def _mux_audio_np_into_mp4(
                 "aac",
                 "-strict",
                 "experimental",
-                "-movflags",
-                "+faststart",
                 merged_path,
             ],
             check=True,
@@ -604,7 +599,6 @@ def save_materialized_output(
             format=data_type.get_default_extension(),
             codec="libx264",
             quality=quality,
-            output_params=_BROWSER_COMPATIBLE_MP4_OUTPUT_PARAMS,
         )
 
         _maybe_mux_audio_into_mp4(

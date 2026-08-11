@@ -38,20 +38,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 _original_similarity = None
 
 
-def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
-    """Remove Cache-DiT hooks so later requests use the native transformer forward."""
-
-    logger.info("Disabling cache-dit on %s", type(transformer).__name__)
-    target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
-    cache_dit.disable_cache(target)
-    if target is not transformer:
-        del transformer._sglang_cache_dit_adapter
-    for name in ("_is_parallelized", "_parallelism_config"):
-        if hasattr(transformer, name):
-            delattr(transformer, name)
-    return transformer
-
-
 def _patch_cache_dit_similarity():
     from cache_dit.caching.cache_contexts import cache_manager
 

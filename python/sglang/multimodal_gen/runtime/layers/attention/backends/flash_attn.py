@@ -8,7 +8,6 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 from flash_attn import flash_attn_func as flash_attn_func_interface
-from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_interface
 
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
@@ -467,29 +466,3 @@ class FlashAttentionImpl(AttentionImpl):
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
-
-    def forward_varlen(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        cu_seqlens_host: tuple[int, ...] | None = None,
-    ) -> torch.Tensor:
-        """Run Flash Attention for packed variable-length sequences."""
-        del cu_seqlens_host
-        output = flash_attn_varlen_func_interface(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            dropout_p=0.0,
-            softmax_scale=self.softmax_scale,
-            causal=self.causal,
-        )
-        return output[0] if isinstance(output, tuple) else output

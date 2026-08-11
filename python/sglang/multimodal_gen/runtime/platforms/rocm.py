@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.multimodal_gen.envs as envs
-from sglang.srt.utils import is_dcu
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -113,17 +112,7 @@ class RocmPlatform(Platform):
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
         elif selected_backend in (AttentionBackendEnum.FA, None):
-            if is_dcu() and dtype in (torch.float16, torch.bfloat16):
-                try:
-                    import flash_attn  # noqa: F401
-
-                    logger.info("Using HCU FlashAttention-2 backend on DCU.")
-                    return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
-                except ImportError:
-                    logger.info(
-                        "HCU FlashAttention-2 is unavailable; continuing to the "
-                        "Torch SDPA fallback."
-                    )
+            pass
 
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):

@@ -56,7 +56,6 @@ def apply_all():
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
-    _patch_broken_torchaudio_availability()
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
@@ -182,23 +181,6 @@ def _patch_flash_attn_availability():
             _u.is_flash_attn_2_available = lambda: False
     except ImportError:
         pass
-
-
-def _patch_broken_torchaudio_availability():
-    """Hide torchaudio when its native extension cannot be loaded.
-
-    Transformers may import torchaudio while importing unrelated text models.
-    On mixed accelerator images, the package can be installed but unusable,
-    which would otherwise break imports for models that do not need it.
-    """
-    try:
-        import torchaudio  # noqa: F401
-    except (ImportError, OSError):
-        import transformers.utils as _u
-        import transformers.utils.import_utils as _ui
-
-        _ui.is_torchaudio_available = lambda: False
-        _u.is_torchaudio_available = lambda: False
 
 
 def _patch_removed_symbols():

@@ -178,8 +178,6 @@ def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
 class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
-    model_subfolder: str | None = None
-    model_variant: str | None = None
 
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
@@ -1300,26 +1298,6 @@ class ServerArgs(DisaggServerArgsMixin):
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-        )
-        parser.add_argument(
-            "--model-subfolder",
-            type=str,
-            default=ServerArgs.model_subfolder,
-            help=(
-                "Advanced override for a Diffusers pipeline subfolder inside the "
-                "model repository. Prefer --model-variant when a model exposes "
-                "semantic variant-to-weights routing."
-            ),
-        )
-        parser.add_argument(
-            "--model-variant",
-            type=str,
-            default=ServerArgs.model_variant,
-            help=(
-                "Semantic checkpoint variant to serve. Models with partitioned "
-                "checkpoints use this value to select the compatible weights "
-                "without exposing repository subfolder layout."
-            ),
         )
         parser.add_argument(
             "--model-id",

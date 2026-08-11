@@ -208,11 +208,7 @@ class Qwen3VLTextAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = (
-            int(config.head_dim)
-            if getattr(config, "head_dim", None) is not None
-            else config.hidden_size // config.num_attention_heads
-        )
+        self.head_dim = config.hidden_size // config.num_attention_heads
         self.total_num_heads = config.num_attention_heads
         self.total_num_key_value_heads = config.num_key_value_heads
         tp_size = _tp_world_size() if use_tensor_parallel else 1
@@ -668,13 +664,10 @@ class Qwen3VLModel(nn.Module):
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
-    def __init__(self, config, *, use_tensor_parallel: bool = False):
+    def __init__(self, config):
         super().__init__()
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
-        self.language_model = Qwen3VLTextModel(
-            config.text_config,
-            use_tensor_parallel=use_tensor_parallel,
-        )
+        self.language_model = Qwen3VLTextModel(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
 

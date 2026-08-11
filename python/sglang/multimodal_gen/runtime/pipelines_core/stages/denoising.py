@@ -419,15 +419,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
 
-    def _cache_dit_requested(self) -> bool:
-        """Return whether Cache-DiT was requested by the environment.
-
-        Model-specific denoising stages may override this method to add their
-        own request conditions while still preserving the generic
-        ``SGLANG_CACHE_DIT_ENABLED`` switch.
-        """
-        return envs.SGLANG_CACHE_DIT_ENABLED
-
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
         return False
 

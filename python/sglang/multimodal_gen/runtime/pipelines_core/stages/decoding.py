@@ -162,23 +162,13 @@ class DecodingStage(PipelineStage):
     def scale_and_shift(self, latents: torch.Tensor, server_args):
         return scale_and_shift_latents(latents, server_args, self.vae)
 
-    def _get_vae_decode_fn(
-        self,
-        vae,
-        server_args: ServerArgs,
-        *,
-        decode_fn=None,
-        compiled_callable: ActiveTargetCompiledCallable | None = None,
-    ):
-        decode_fn = decode_fn or vae.decode
+    def _get_vae_decode_fn(self, vae, server_args: ServerArgs):
         if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
-            return decode_fn
-
-        compiled_callable = compiled_callable or self._compiled_vae_decode
+            return vae.decode
 
         will_compile = (
-            compiled_callable.target_id != id(vae)
-            or compiled_callable.compiled_module is None
+            self._compiled_vae_decode.target_id != id(vae)
+            or self._compiled_vae_decode.compiled_module is None
         )
         if current_platform.is_npu():
             compile_kwargs = build_torch_compile_kwargs(mode=None)
@@ -194,8 +184,8 @@ class DecodingStage(PipelineStage):
             if will_compile:
                 logger.info("Compiling VAE decode with mode: %s", mode)
 
-        return compiled_callable.get_or_compile(
-            vae, decode_fn, compile_kwargs=compile_kwargs
+        return self._compiled_vae_decode.get_or_compile(
+            vae, vae.decode, compile_kwargs=compile_kwargs
         )
 
     @torch.no_grad()
