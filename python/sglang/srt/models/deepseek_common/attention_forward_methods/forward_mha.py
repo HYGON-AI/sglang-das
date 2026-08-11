@@ -24,9 +24,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
-    _is_hcu,
-    _use_aiter_bpreshuffle_gfx95,
-    _use_aiter_gfx95,
+    _is_hcu
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
