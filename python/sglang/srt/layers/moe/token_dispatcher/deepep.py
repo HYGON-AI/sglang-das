@@ -204,10 +204,18 @@ class DeepEPBuffer:
     def _state(cls):
         from types import SimpleNamespace
 
-        from sglang.srt.runtime_context import get_resources
+        from sglang.srt.runtime_context import get_flags, get_resources
 
         buffers = get_resources().buffers
-        state = buffers.get("deepep_ep_state")
+        # DSpark's draft and target can use different expert layouts (257 vs
+        # 256 for DSV4). DeepEP's low-latency RDMA size depends on that layout,
+        # so each runtime scope needs its own process-level buffer.
+        state_key = (
+            "deepep_ep_state_speculative"
+            if get_flags().moe.in_speculative_a2a_scope
+            else "deepep_ep_state"
+        )
+        state = buffers.get(state_key)
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
@@ -216,7 +224,7 @@ class DeepEPBuffer:
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
             )
-            buffers["deepep_ep_state"] = state
+            buffers[state_key] = state
         return state
 
     @classmethod

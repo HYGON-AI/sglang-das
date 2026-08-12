@@ -1763,11 +1763,14 @@ class DeepEPMoE(FusedMoE):
         hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
             dispatch_output
         )
+        # This HCU low-latency DeepGEMM path predates the MoeRunner refactor.
+        # Its overlap state is therefore stored directly on DeepEPMoE by
+        # FusedMoE.set_overlap_args(), and no ``self.runner`` is constructed.
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
-            self.runner, "down_gemm_overlap_args", None
+            self, "down_gemm_overlap_args", None
         )
         meta_overlap_args: Optional[dict] = getattr(
-            self.runner, "meta_overlap_args", None
+            self, "meta_overlap_args", None
         )
         assert self.moe_runner_config.activation == "silu"
         # base shapes
