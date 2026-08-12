@@ -116,6 +116,14 @@ _is_npu = is_npu()
 
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 
+
+def _should_use_fused_rms_quant_for_layer(
+    fused_rms_quant_enabled: bool,
+    captured_last_layer_outputs: Optional[List[torch.Tensor]],
+) -> bool:
+    return fused_rms_quant_enabled and captured_last_layer_outputs is None
+
+
 from lightop.quant import per_token_quant_int8
 
 if _is_hcu:
@@ -1182,6 +1190,12 @@ class MiniMaxM2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
+        self.use_fused_rms_quant = _use_fused_rms_quant and getattr(
+            self.self_attn.qkv_proj.quant_method,
+            "supports_fused_rms_quant",
+            False,
+        )
+        self.speculative_algorithm = get_global_server_args().speculative_algorithm
 
         self.block_sparse_moe = MiniMaxM2MoE(
             config=config,
@@ -1231,10 +1245,20 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 residual=residual,
             )
 
-        if _use_fused_rms_quant:
+        # EAGLE needs residual-stream activations from selected target layers.
+        # Keep fused RMS-quant on all other INT8 layers, but use the standard
+        # path on capture layers so the auxiliary hidden states stay identical.
+        use_fused_rms_quant = _should_use_fused_rms_quant_for_layer(
+            self.use_fused_rms_quant,
+            captured_last_layer_outputs,
+        )
+        if use_fused_rms_quant:
             pre_norm = hidden_states.clone() if residual is None else residual
             hidden_states, _ = self.layer_communicator.prepare_attn(
-                hidden_states, residual, forward_batch
+                hidden_states,
+                residual,
+                forward_batch,
+                use_fused_rms_quant=True,
             )
             if residual is not None:
                 assert residual.shape[0] == hidden_states.shape[0], (
@@ -1260,6 +1284,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
                     residual,
                     forward_batch,
                     captured_last_layer_outputs=captured_last_layer_outputs,
+                    use_fused_rms_quant=False,
                 )
             )
             if not forward_batch.forward_mode.is_idle():
@@ -1308,7 +1333,12 @@ class MiniMaxM2DecoderLayer(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
-        if _use_fused_rms_quant:
+        # The minimax_opt path does not expose EAGLE capture lists per layer, so
+        # retain the correctness-first fallback for that specialized path.
+        use_fused_rms_quant = self.use_fused_rms_quant and (
+            self.speculative_algorithm not in ("EAGLE", "EAGLE3")
+        )
+        if use_fused_rms_quant:
             pre_norm = hidden_states.clone() if residual is None else residual
             if residual is not None:
                 assert residual.shape[0] == hidden_states.shape[0], (
@@ -1617,6 +1647,13 @@ class MiniMaxM2ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        if any(layer.use_fused_rms_quant for layer in self.model.layers):
+            logger.info(
+                "MiniMax EAGLE compatibility: standard RMSNorm on capture "
+                "layers %s; fused RMS-quant remains enabled on other layers.",
+                self.model.layers_to_capture,
+            )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
