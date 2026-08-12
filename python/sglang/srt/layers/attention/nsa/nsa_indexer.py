@@ -792,19 +792,52 @@ class Indexer(MultiPlatformOp):
     ) -> Tuple[bool, int]:
         """
         Detect whether we need to chunk the MQA logits computation to avoid OOM
-        Return: (need_chunk, free_mem)
+        Return: (need_chunk, logits_memory_budget_bytes)
         """
+        budget_gb = float(envs.SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB.get())
+        if not 0 < budget_gb < float("inf"):
+            raise ValueError(
+                "SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB must be a "
+                f"positive finite number, got {budget_gb}"
+            )
+        configured_budget_bytes = int(budget_gb * (1024**3))
+        if configured_budget_bytes <= 0:
+            raise ValueError(
+                "SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB is too small"
+            )
+
+        logits_bytes = num_q * num_k * 4  # float32
         # Quick static check for normal batches
-        if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
-            return False, 0
+        if (
+            num_q * num_k < 8_000_000
+            and logits_bytes <= configured_budget_bytes
+        ):  # 8M elements ≈ 32MB logits
+            return False, configured_budget_bytes
 
         free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4  # float32
-        logits_bytes = num_q * num_k * bytes_per_elem
 
-        # Logits should not exceed 50% of free memory or 30% of total memory
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
+        # Include reusable PyTorch allocator cache that mem_get_info omits.
+        try:
+            stats = torch.cuda.memory_stats(device)
+            reusable_mem = max(
+                0,
+                int(stats["reserved_bytes.all.current"])
+                - int(stats["active_bytes.all.current"])
+                - int(stats["inactive_split_bytes.all.current"]),
+            )
+            free_mem = min(int(total_mem), int(free_mem) + reusable_mem)
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            pass
+
+        logits_memory_budget_bytes = max(
+            1,
+            min(
+                configured_budget_bytes,
+                int(free_mem) // 2,
+                int(total_mem * 0.3),
+            ),
+        )
+        return logits_bytes > logits_memory_budget_bytes, logits_memory_budget_bytes
 
     def _get_topk_ragged(
         self,
@@ -896,7 +929,9 @@ class Indexer(MultiPlatformOp):
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
-        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+        need_chunk, logits_memory_budget_bytes = self._should_chunk_mqa_logits(
+            q_offset, k_offset, device
+        )
         if not need_chunk:
             assert q[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
@@ -948,11 +983,13 @@ class Indexer(MultiPlatformOp):
             return topk_result
 
         # Chunk path
-        bytes_per_elem = 4  # float32
-        bytes_per_row = k_offset * bytes_per_elem
-        # Reserve 50% of free memory for logits
-        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
-        max_rows = min(max_rows, q_offset)
+        max_rows = max(
+            1,
+            min(
+                q_offset,
+                logits_memory_budget_bytes // max(k_offset * 4, 1),
+            ),
+        )
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
 
