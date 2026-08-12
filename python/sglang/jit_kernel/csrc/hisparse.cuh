@@ -195,7 +195,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
+      if (token_pos >= 0 && token_pos < seq_len) {
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
       }
     }
@@ -246,6 +246,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
+    if (token_idx < 0 || token_idx >= seq_len) {
+      token_idx = 0;
+    }
     if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
@@ -449,7 +452,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int32_t miss_token = s_top_k_tokens[miss_idx];
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
-    const int64_t src_loc = req_host_cache_locs[miss_token];
+    const int32_t safe_miss_token = (miss_token >= 0 && miss_token < seq_len) ? miss_token : 0;
+    int64_t src_loc = req_host_cache_locs[safe_miss_token];
+    if (src_loc < 0) {
+      src_loc = req_host_cache_locs[0];
+    }
+    if (src_loc < 0) continue;
+
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
     if constexpr (IsDsv4Layout) {

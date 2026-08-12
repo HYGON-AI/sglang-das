@@ -851,6 +851,17 @@ class ModelRunnerKVCacheMixin:
 
         else:
             assert self.is_draft_worker
+            if isinstance(self.token_to_kv_pool, HiSparseNSATokenToKVPool):
+                mapping = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "full_to_hisparse_device_index_mapping",
+                    None,
+                )
+                assert mapping is not None, (
+                    "HiSparse draft worker expected full_to_hisparse_device_index_mapping "
+                    "from the shared target allocator."
+                )
+                self.token_to_kv_pool.register_mapping(mapping)
             if self.is_hybrid_swa:
                 swa_allocator = getattr(
                     self.token_to_kv_pool_allocator,

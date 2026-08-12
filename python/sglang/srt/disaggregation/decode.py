@@ -1470,7 +1470,27 @@ class DecodeTransferQueue:
         )
 
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
-            pass
+            # Fake prefill has no real prefill worker to populate metadata. Synthesize
+            # deterministic first-token metadata so decode-only benchmarks do not
+            # consume stale metadata-buffer contents.
+            output_id[0] = (
+                decode_req.req.origin_input_ids[-1]
+                if len(decode_req.req.origin_input_ids) > 0
+                else 0
+            )
+            input_len = len(decode_req.req.origin_input_ids)
+            cached_tokens.zero_()
+            cached_tokens[0] = input_len
+            if self.scheduler.enable_hisparse:
+                cached_tokens[2] = input_len
+            else:
+                cached_tokens[1] = input_len
+            output_topk_p.zero_()
+            output_topk_index.zero_()
+            output_hidden_states.zero_()
+            output_bootstrap_room[0] = expected_room
+            if output_mtp_topk_indices is not None:
+                output_mtp_topk_indices.zero_()
         elif actual_room == 0:
             # Case 1: Metadata not ready yet (actual_room == 0)
             # Keep request in queue and wait for next poll
