@@ -81,7 +81,7 @@ jobs:
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin "ciupload==0.3.0"
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -180,14 +180,19 @@ jobs:
           source /opt/dtk/env.sh
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
-          TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
-          echo "Local version: ${LOCAL_VER}"
           mkdir -p output
-          for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
-            [ -f "$whl" ] || continue
-            CIUpload --repair --torch_version $TORCH_VERSION --set_local_version $LOCAL_VER --outputdir output -f "$whl"
-          done
+          shopt -s nullglob
+          wheels=(sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl)
+          if (( ${#wheels[@]} == 0 )); then
+            echo "No HCU wheels were built" >&2
+            exit 1
+          fi
+          CIUpload REPAIR \
+            --dtk_version "${DTK_VER}" \
+            --torch_version "${TORCH_VERSION}" \
+            --git_commit "${WHEEL_COMMIT_SHA}" \
+            --outputdir output \
+            -f "${wheels[@]}"
           echo "=== Repaired wheels ==="
           ls -lh output/
 
@@ -201,21 +206,43 @@ jobs:
           mkdir -p "${WHEEL_DIR}"
           cp -v output/*.whl "${WHEEL_DIR}/"
 
-          export STAGING_DIR LOCAL_VER
+          export STAGING_DIR
           python3 - <<'PY_MANIFEST'
+          from email.parser import Parser
           import json
           import os
           import pathlib
+          import zipfile
 
           staging_dir = pathlib.Path(os.environ["STAGING_DIR"])
           wheel_dir = staging_dir / "wheels"
-          wheels = sorted(str(path.relative_to(staging_dir)) for path in wheel_dir.glob("*.whl"))
+          wheel_paths = sorted(wheel_dir.glob("*.whl"))
+          wheel_local_versions = {}
+          for path in wheel_paths:
+              with zipfile.ZipFile(path) as archive:
+                  metadata_names = [
+                      name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+                  ]
+                  if len(metadata_names) != 1:
+                      raise RuntimeError(f"Expected one METADATA file in {path.name}")
+                  metadata = Parser().parsestr(
+                      archive.read(metadata_names[0]).decode("utf-8")
+                  )
+              version = metadata.get("Version", "")
+              _, separator, local_version = version.partition("+")
+              if not separator or not local_version:
+                  raise RuntimeError(f"Missing local version in {path.name}: {version}")
+              wheel_local_versions[path.name] = local_version
+          unique_local_versions = set(wheel_local_versions.values())
+          local_version = next(iter(unique_local_versions)) if len(unique_local_versions) == 1 else None
+          wheels = [str(path.relative_to(staging_dir)) for path in wheel_paths]
           manifest = {
               "repository": os.environ.get("GITHUB_REPOSITORY", ""),
               "run_id": os.environ.get("GITHUB_RUN_ID", ""),
               "commit_sha": os.environ.get("WHEEL_COMMIT_SHA", ""),
               "torch_version": os.environ.get("TORCH_VERSION", ""),
-              "local_version": os.environ.get("LOCAL_VER", ""),
+              "local_version": local_version,
+              "wheel_local_versions": wheel_local_versions,
               "wheels": wheels,
           }
           (staging_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

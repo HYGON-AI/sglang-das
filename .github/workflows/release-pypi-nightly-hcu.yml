@@ -101,7 +101,7 @@ jobs:
       - name: Install build deps
         run: |
           yum install -y perl-IPC-Cmd perl-Time-Piece
-          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" ciupload
+          pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" "ciupload==0.3.0"
           wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
@@ -196,19 +196,30 @@ jobs:
       # =======================================================================
 
       - name: Apply DAS local version to wheels
+        env:
+          CIUPLOAD_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
         run: |
           source /opt/dtk/env.sh
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
-          TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
-          LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-6)"
-          echo "Local version: ${LOCAL_VER}"
           mkdir -p output
-          for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
-            [ -f "$whl" ] || continue
-            CIUpload --repair --torch_version $TORCH_VERSION --set_local_version $LOCAL_VER --outputdir output -f "$whl"
-          done
+          shopt -s nullglob
+          wheels=(sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl)
+          if (( ${#wheels[@]} == 0 )); then
+            echo "No HCU wheels were built" >&2
+            exit 1
+          fi
+          CIUpload REPAIR \
+            --dtk_version "${DTK_VER}" \
+            --torch_version "${TORCH_VERSION}" \
+            --git_commit "${WHEEL_COMMIT_SHA}" \
+            --outputdir output \
+            -f "${wheels[@]}"
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload --devpi_url http://10.16.1.201:9929 --devpi_user nightly --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename $DTK_PKG_URL) -f output/*.whl
+          CIUpload NIGHTLY \
+            --devpi_url http://10.16.1.201:9929 \
+            --password "${CIUPLOAD_PASSWORD}" \
+            --dtk_pkg_name "$(basename "${DTK_PKG_URL}")" \
+            -f output/*.whl
           rm -rf /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang/* || true
