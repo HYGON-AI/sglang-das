@@ -1781,6 +1781,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Expose the model's existing TopK-sharing decision to the NSA backend.
+        self.attn_mqa.reuse_topk_indices = bool(self.skip_topk and not self.is_nextn)
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,

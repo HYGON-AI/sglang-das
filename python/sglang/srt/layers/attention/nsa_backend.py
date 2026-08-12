@@ -1528,6 +1528,10 @@ class NativeSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        topk_was_padded = (
+            topk_indices is not None and topk_indices.shape[0] != q_nope.shape[0]
+        )
+
         # Align topk_indices with q dimensions
         # This handles cases where q is padded (TP + partial DP attention)
         if topk_indices is not None:
@@ -1632,12 +1636,21 @@ class NativeSparseAttnBackend(
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
 
+            skip_reused_topk_sort = (
+                envs.SGLANG_NSA_HCU_REUSE_SORTED_TOPK.get()
+                and getattr(layer, "reuse_topk_indices", False)
+                and not topk_was_padded
+                and envs.SGLANG_NSA_FUSE_TOPK.get()
+                and topk_transform_method == TopkTransformMethod.RAGGED
+                and forward_batch.hisparse_coordinator is None
+            )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                indices_are_sorted=skip_reused_topk_sort,
             )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -1890,12 +1903,8 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        indices_are_sorted: bool = False,
     ) -> torch.Tensor:
-        if not _is_hcu:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-        else:
-            from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
-
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
@@ -1921,13 +1930,45 @@ class NativeSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-        )
+        if _is_hcu:
+            from flash_mla import flash_mla_interface
+
+            raw_sparse_prefill_fwd = getattr(
+                getattr(flash_mla_interface, "flash_mla_cuda", None),
+                "sparse_prefill_fwd",
+                None,
+            )
+            can_skip_sort = (
+                indices_are_sorted and raw_sparse_prefill_fwd is not None
+            )
+            if can_skip_sort:
+                o, _, _ = raw_sparse_prefill_fwd(
+                    q_input,
+                    kv_cache,
+                    indices_input,
+                    sm_scale,
+                    v_head_dim,
+                    None,
+                    None,
+                )
+            else:
+                o, _, _ = flash_mla_interface.flash_mla_sparse_fwd(
+                    q=q_input,
+                    kv=kv_cache,
+                    indices=indices_input,
+                    sm_scale=sm_scale,
+                    d_v=v_head_dim,
+                )
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
 
         # Trim output back to original num_heads if we padded
         if (not _is_hcu) and need_padding:
