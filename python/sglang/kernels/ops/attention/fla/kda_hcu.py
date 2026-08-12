@@ -2154,7 +2154,7 @@ def fused_recurrent_kda_packed_decode_kernel_hcu(
 
     state_idx = tl.load(state_indices + i_n).to(tl.int64)
     p_out = out + (i_n * H + i_h) * V + o_v
-    if state_idx <= 0:
+    if state_idx < 0:
         tl.store(p_out, tl.zeros([BV], dtype=tl.float32), mask=mask_v)
         return
 
@@ -2373,7 +2373,7 @@ def fused_recurrent_kda_packed_decode_3d_kernel_hcu(
 
     state_idx = tl.load(state_indices + i_n).to(tl.int64)
     p_out = out + (i_n * H + i_h) * V + o_v
-    if state_idx <= 0:
+    if state_idx < 0:
         tl.store(p_out, 0.0, mask=mask_v)
         return
 
