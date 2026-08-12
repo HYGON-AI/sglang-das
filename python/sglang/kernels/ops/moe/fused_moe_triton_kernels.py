@@ -57,6 +57,11 @@ _is_hcu = is_hcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# Experimental Kimi-K3 MXFP4 Triton path: dynamically quantize each decoded
+# weight tile and its activation tile to FP8 before tl.dot so the GEMM uses
+# the FP8 tensor-core path.  Keep the existing WFP4A16 implementation as the
+# default for easy A/B testing.
+_use_mxfp4_w4a8_tc = get_bool_env_var("SGLANG_MXFP4_TRITON_W4A8") and _is_hcu
 
 if _is_hcu:
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
@@ -160,6 +165,7 @@ def fused_moe_kernel_gptq_awq(
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
+    use_mxfp4_w4a8_tc: tl.constexpr,
     use_mxfp4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
@@ -348,10 +354,36 @@ def fused_moe_kernel_gptq_awq(
         if has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         elif use_mxfp4_w4a16:
-            b = (b.to(tl.float32) * b_scale).to(compute_type)
+            b = b.to(tl.float32) * b_scale
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+
+        if use_mxfp4_w4a8_tc:
+            # Experimental W4A8 route.  The checkpoint remains packed MXFP4;
+            # only the current GEMM tile is decoded.  Quantize A per row and
+            # decoded B per column to E4M3, then restore both scales around
+            # the FP8 tensor-core dot.  This intentionally preserves the
+            # original WFP4A16 line below for direct A/B inspection.
+            fp8_max: tl.constexpr = 448.0
+            a_f32 = a.to(tl.float32)
+            a_absmax = tl.maximum(tl.max(tl.abs(a_f32), axis=1), 1.0e-10)
+            b_absmax = tl.maximum(tl.max(tl.abs(b), axis=0), 1.0e-10)
+            a_qscale = a_absmax / fp8_max
+            b_qscale = b_absmax / fp8_max
+            a_fp8 = tl.clamp(
+                a_f32 / a_qscale[:, None], -fp8_max, fp8_max
+            ).to(tl.float8e4nv)
+            b_fp8 = tl.clamp(
+                b / b_qscale[None, :], -fp8_max, fp8_max
+            ).to(tl.float8e4nv)
+            accumulator += (
+                tl.dot(a_fp8, b_fp8)
+                * a_qscale[:, None]
+                * b_qscale[None, :]
+            )
+        else:
+            # Original WFP4A16 route: decoded weights and activations use BF16.
+            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -950,6 +982,7 @@ def invoke_fused_moe_kernel(
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a8_tc=_use_mxfp4_w4a8_tc and use_mxfp4_w4a16,
             use_mxfp4_w4a16=use_mxfp4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
