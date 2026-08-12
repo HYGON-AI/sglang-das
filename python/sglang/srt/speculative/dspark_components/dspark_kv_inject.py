@@ -42,9 +42,9 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor] = None,
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> Optional[torch.cuda.Event]:
         if target_hidden is None or target_hidden.numel() == 0:
-            return
+            return None
         device = self.model_runner.device
         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
@@ -81,7 +81,7 @@ class TargetHiddenKvInjector:
                 state_slot=state_slot,
                 final_pos=final_pos,
             )
-            return
+            return self._record_cuda_event(device)
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
@@ -92,6 +92,15 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
             )
+        return self._record_cuda_event(device)
+
+    @staticmethod
+    def _record_cuda_event(device) -> Optional[torch.cuda.Event]:
+        if not torch.cuda.is_available():
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        return event
 
     def _inject_mla(
         self,
