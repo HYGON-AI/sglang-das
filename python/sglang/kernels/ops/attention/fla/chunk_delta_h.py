@@ -18,6 +18,11 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.utils import get_bool_env_var, is_hcu
+
+# Initial integration imported AITER unconditionally. Keep the original route
+# visible while avoiding an import-time dependency when the HCU path is off.
+# from aiter.ops.fla import chunk_gated_delta_rule_fwd_sglang_hip_blockdim64 as _aiter_fwd_h
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
@@ -25,6 +30,19 @@ GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
+# Initial integration only checked the env flag.
+# _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+# _USE_KDA_HCU = is_hcu() and get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+_USE_KDA_HCU = (
+    is_hcu()
+    and get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+    and not get_bool_env_var("SGLANG_KDA_DISABLE_AITER_CHUNK_H")
+)
+
+if _USE_KDA_HCU:
+    from aiter.ops.fla import (
+        chunk_gated_delta_rule_fwd_sglang_hip_blockdim64 as _aiter_fwd_h,
+    )
 
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into
@@ -345,6 +363,80 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+    if _USE_KDA_HCU and K == 128 and V == 128:
+        aiter_initial_state = initial_state
+        aiter_initial_state_indices = initial_state_indices
+        packed_state_valid_mask = None
+
+        # SGLang's unified state pool can be an envelope-strided view whose
+        # slot pitch spans all layers. AITER's current API has no
+        # stride_init_state argument and assumes contiguous slots. Gather only
+        # the states used by this batch into a compact local pool, remap the
+        # indices, then scatter the in-place final states back below.
+        # if (
+        #     initial_state is not None
+        #     and initial_state_indices is not None
+        #     and initial_state.stride(0) != H * V * K
+        # ):
+        if initial_state is not None and initial_state_indices is not None:
+            packed_state_valid_mask = initial_state_indices >= 0
+            gather_indices = initial_state_indices.clamp_min(0).to(torch.long)
+            aiter_initial_state = initial_state.index_select(
+                0, gather_indices
+            # ).contiguous()
+            ).to(dtype=torch.float32).contiguous()
+            local_indices = torch.arange(
+                initial_state_indices.numel(),
+                device=initial_state_indices.device,
+                dtype=initial_state_indices.dtype,
+            )
+            # aiter_initial_state_indices = torch.where(
+            #     packed_state_valid_mask,
+            #     local_indices,
+            #     torch.full_like(local_indices, -1),
+            # )
+            aiter_initial_state.masked_fill_(
+                (~packed_state_valid_mask).view(-1, 1, 1, 1),
+                0,
+            )
+            aiter_initial_state_indices = local_indices
+
+        # aiter's SGLang-aligned HIP kernel: in-place final-state update, same
+        # [B, NT, H, V, K] h layout and (h, v_new) return contract as the
+        # Triton path. The operator team's build ships the K=V=128 (BT=64)
+        # instantiation; other shapes fall through to Triton below.
+
+        h, v_new = _aiter_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            # initial_state=initial_state,
+            initial_state=aiter_initial_state,
+            # initial_state_indices=initial_state_indices,
+            initial_state_indices=aiter_initial_state_indices,
+            output_final_state=True,
+            chunk_size=CHUNK_SIZE,
+            save_new_value=save_new_value,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=use_exp2,
+            transpose_state_layout=True,
+        )
+        if packed_state_valid_mask is not None:
+            valid_global_indices = initial_state_indices[
+                packed_state_valid_mask
+            ].to(torch.long)
+            initial_state.index_copy_(
+                0,
+                valid_global_indices,
+                # aiter_initial_state[packed_state_valid_mask],
+                aiter_initial_state[packed_state_valid_mask].to(
+                    dtype=initial_state.dtype
+                ),
+            )
+        return h, v_new
 
     h = k.new_empty(B, NT, H, V, K)
 
