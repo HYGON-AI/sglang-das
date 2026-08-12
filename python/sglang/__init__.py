@@ -14,6 +14,18 @@ redirect_third_party_caches()
 import platform as _platform
 import sys as _sys
 
+try:
+    import torch as _torch
+
+    if _torch.version.hip is not None and hasattr(_torch.backends, "cuda"):
+        _torch.backends.cuda.enable_flash_sdp(False)
+        _torch.backends.cuda.enable_mem_efficient_sdp(False)
+        _torch.backends.cuda.enable_cudnn_sdp(False)
+        _torch.backends.cuda.enable_math_sdp(True)
+    del _torch
+except Exception:
+    pass
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     try:
         import torch as _torch

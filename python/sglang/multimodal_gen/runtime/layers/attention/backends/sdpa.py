@@ -64,6 +64,8 @@ class SDPAImpl(AttentionImpl):
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
 
     def _sdpa_context(self, query: torch.Tensor):
+        if query.device.type == "cuda" and torch.version.hip is not None:
+            return sdpa_kernel(SDPBackend.MATH)
         if self.allow_cudnn_sdp and query.device.type == "cuda":
             return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
         return nullcontext()

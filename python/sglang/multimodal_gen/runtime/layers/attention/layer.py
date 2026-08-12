@@ -77,6 +77,15 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.MATH,
 ]
 
+
+def _sdpa_context_for_device(query: torch.Tensor, allow_cudnn_sdp: bool):
+    if query.device.type == "cuda" and torch.version.hip is not None:
+        return sdpa_kernel(SDPBackend.MATH)
+    if allow_cudnn_sdp and query.device.type == "cuda":
+        return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+    return nullcontext()
+
+
 import sglang.multimodal_gen.envs as envs
 
 if envs.SGLANG_DIFFUSION_RING_ATTN_OVERLAP:
@@ -632,11 +641,7 @@ class LocalAttention(nn.Module):
                 k_ = k_.repeat_interleave(repeat_factor, dim=1)
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
-            sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
-                if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                else nullcontext()
-            )
+            sdpa_context = _sdpa_context_for_device(q_, self.allow_cudnn_sdp)
             attn_kwargs = {
                 "attn_mask": mask,
                 "dropout_p": 0.0,
@@ -959,11 +964,7 @@ class USPAttention(nn.Module):
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
-                sdpa_context = (
-                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
-                    if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                    else nullcontext()
-                )
+                sdpa_context = _sdpa_context_for_device(q_, self.allow_cudnn_sdp)
                 with sdpa_context:
                     return torch.nn.functional.scaled_dot_product_attention(
                         q_,
@@ -1131,11 +1132,7 @@ class USPAttention(nn.Module):
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
-            sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
-                if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                else nullcontext()
-            )
+            sdpa_context = _sdpa_context_for_device(q_, self.allow_cudnn_sdp)
             with sdpa_context:
                 out = torch.nn.functional.scaled_dot_product_attention(
                     q_,
@@ -1418,11 +1415,7 @@ class USPAttention(nn.Module):
             k_ = k_.repeat_interleave(repeat_factor, dim=1)
             v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
-        sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
-            if self.allow_cudnn_sdp and q_.device.type == "cuda"
-            else nullcontext()
-        )
+        sdpa_context = _sdpa_context_for_device(q_, self.allow_cudnn_sdp)
         with sdpa_context:
             out = torch.nn.functional.scaled_dot_product_attention(
                 q_,

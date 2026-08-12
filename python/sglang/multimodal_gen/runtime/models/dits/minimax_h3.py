@@ -65,6 +65,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+from sglang.srt.utils import is_hcu
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
@@ -277,6 +278,7 @@ def _apply_qk_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         q.is_cuda
+        and not is_hcu()
         and q.dtype == _BF16_DTYPE
         and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
         and q.stride(-1) == k.stride(-1) == 1

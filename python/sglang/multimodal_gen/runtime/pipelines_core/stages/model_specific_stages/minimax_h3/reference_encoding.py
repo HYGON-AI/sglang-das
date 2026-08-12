@@ -6,10 +6,8 @@ Encoding recipes for user-provided reference materials:
 - image reference: independent 2048px short-edge resize with upscale enabled,
   LANCZOS, and nearest-32 dimensions, then the SAME keyframe tokenizer recipe
   as fl2va (seed-42 sampled encode, normalize, [1,2,2] patchify);
-- audio reference: the audio material chain (pure
-  audio is losslessly normalized
-  to stereo; video soundtracks are extracted as 44.1 kHz stereo), then a
-  single resample to 32 kHz,
+- audio reference: the audio material chain uses ffmpeg to decode directly to
+  model-required 32 kHz stereo PCM,
   audio VAE posterior MEAN (encoder -> optional pre_block -> mean_proj; no
   sampling), canonical [2, T, 32], normalize with loader-injected audio stats,
   channel-major rows.
@@ -17,7 +15,6 @@ Encoding recipes for user-provided reference materials:
 
 from __future__ import annotations
 
-import functools
 import math
 from typing import Any
 
@@ -203,11 +200,10 @@ def _load_waveform(
 ) -> tuple[torch.Tensor, int]:
     """Apply the audio material chain.
 
-    Pure-audio references preserve their source rate while normalizing to
-    stereo. Video-bearing references first extract 44.1 kHz stereo PCM. The
-    audio VAE boundary then performs the single 32 kHz resample below. ffmpeg
-    writes bounded interleaved float PCM directly to stdout, avoiding a
-    temporary lossless file plus a second decode.
+    ffmpeg writes bounded interleaved float PCM directly to stdout and
+    normalizes every reference to the Audio VAE contract: 32 kHz stereo.
+    This avoids torchaudio, whose binary extension may not match the HCU torch
+    runtime in deployment containers.
     """
 
     import subprocess
@@ -225,12 +221,11 @@ def _load_waveform(
     if material_chain == "audio":
         if source_sample_rate is None or int(source_sample_rate) <= 0:
             raise ValueError("reference audio sample rate must be positive")
-        source_rate = int(source_sample_rate)
     elif material_chain in {
         "video.reference_preserve",
         "video_audio.reference_preserve",
     }:
-        source_rate = 44100
+        pass
     else:
         raise ValueError(
             f"unsupported MiniMax H3 audio material chain {material_chain!r}"
@@ -251,9 +246,9 @@ def _load_waveform(
         "-vn",
         "-ac",
         str(MINIMAX_H3_AUDIO_CHANNELS),
+        "-ar",
+        str(MINIMAX_H3_AUDIO_SAMPLE_RATE),
     ]
-    if material_chain != "audio":
-        command += ["-ar", str(source_rate)]
     if max_duration_seconds is not None:
         command += ["-t", f"{max_duration_seconds:.9g}"]
     command += ["-f", "f32le", "pipe:1"]
@@ -272,14 +267,7 @@ def _load_waveform(
         .reshape(-1, MINIMAX_H3_AUDIO_CHANNELS)
         .T.copy()
     )
-    return waveform, source_rate
-
-
-@functools.lru_cache(maxsize=8)
-def _audio_resampler(source_rate: int):
-    import torchaudio
-
-    return torchaudio.transforms.Resample(source_rate, MINIMAX_H3_AUDIO_SAMPLE_RATE)
+    return waveform, MINIMAX_H3_AUDIO_SAMPLE_RATE
 
 
 @torch.inference_mode()
@@ -310,7 +298,10 @@ def minimax_h3_encode_reference_audio_rows(
     if waveform.numel() == 0:
         raise ValueError(f"reference audio is empty: {audio_path}")
     if int(source_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
-        waveform = _audio_resampler(int(source_rate))(waveform)
+        raise RuntimeError(
+            "MiniMax H3 reference audio must be decoded to "
+            f"{MINIMAX_H3_AUDIO_SAMPLE_RATE} Hz, got {source_rate}"
+        )
     waveform = waveform.to(device)
 
     with _AudioVAEDeterminismContext():

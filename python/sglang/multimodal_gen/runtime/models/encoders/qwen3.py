@@ -1,8 +1,10 @@
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
@@ -25,6 +27,12 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+
+
+def _rocm_sdpa_context(tensor: torch.Tensor):
+    if tensor.device.type == "cuda" and torch.version.hip is not None:
+        return sdpa_kernel(SDPBackend.MATH)
+    return nullcontext()
 
 
 class Qwen3MLP(nn.Module):
@@ -229,14 +237,15 @@ class Qwen3Attention(nn.Module):
                 repeat_factor = self.num_heads // self.num_kv_heads
                 real_k = real_k.repeat_interleave(repeat_factor, dim=1)
                 real_v = real_v.repeat_interleave(repeat_factor, dim=1)
-            pad_output = torch.nn.functional.scaled_dot_product_attention(
-                pad_q,
-                real_k,
-                real_v,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.scaling,
-            ).transpose(1, 2)
+            with _rocm_sdpa_context(pad_q):
+                pad_output = torch.nn.functional.scaled_dot_product_attention(
+                    pad_q,
+                    real_k,
+                    real_v,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.scaling,
+                ).transpose(1, 2)
             outputs.append(torch.cat([real_output, pad_output], dim=1))
 
         return torch.cat(outputs, dim=0)

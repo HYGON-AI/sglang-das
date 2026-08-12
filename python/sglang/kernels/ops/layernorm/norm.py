@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -99,6 +100,10 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
+    # The JIT QK-Norm kernel emits CUDA-oriented source and includes CUDA headers.
+    # On HCU/HIP, keep the regular RMSNorm fallback instead of compiling it.
+    if is_hcu():
+        return False
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False

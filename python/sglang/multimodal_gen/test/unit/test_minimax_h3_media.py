@@ -106,7 +106,7 @@ def test_audio_decode_is_bounded_float_pcm_without_temp_files(monkeypatch):
     )
 
     ffmpeg = next(command for command in commands if command[0] == "ffmpeg")
-    assert source_rate == 44100
+    assert source_rate == 32000
     torch.testing.assert_close(
         waveform,
         torch.tensor([[0, 2, 4, 6], [1, 3, 5, 7]], dtype=torch.float32),
@@ -114,4 +114,6 @@ def test_audio_decode_is_bounded_float_pcm_without_temp_files(monkeypatch):
     assert ffmpeg[ffmpeg.index("-t") + 1] == "3.5"
     assert ffmpeg[ffmpeg.index("-ss") + 1] == "2.25"
     assert ffmpeg.index("-ss") < ffmpeg.index("-i")
+    assert ffmpeg[ffmpeg.index("-ar") + 1] == "32000"
+    assert ffmpeg[ffmpeg.index("-ac") + 1] == "2"
     assert ffmpeg[-3:] == ["-f", "f32le", "pipe:1"]

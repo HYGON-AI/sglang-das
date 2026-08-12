@@ -49,6 +49,62 @@ from transformers.activations import ACT2FN
 
 logger = logging.getLogger(__name__)
 
+
+def _is_rocm_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "cuda" and torch.version.hip is not None
+
+
+def _repeat_kv_for_gqa(
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    num_query_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_kv_heads = key_states.shape[1]
+    if num_query_heads == num_kv_heads:
+        return key_states, value_states
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_query_heads={num_query_heads} must be divisible by "
+            f"num_kv_heads={num_kv_heads}"
+        )
+    repeat_factor = num_query_heads // num_kv_heads
+    return (
+        key_states.repeat_interleave(repeat_factor, dim=1),
+        value_states.repeat_interleave(repeat_factor, dim=1),
+    )
+
+
+def _rocm_math_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    *,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+    key_states, value_states = _repeat_kv_for_gqa(
+        key_states, value_states, query_states.shape[1]
+    )
+
+    attn_weights = torch.matmul(
+        query_states.to(torch.float32),
+        key_states.to(torch.float32).transpose(-2, -1),
+    )
+    attn_weights.mul_(softmax_scale)
+    if causal:
+        q_len = query_states.shape[-2]
+        k_len = key_states.shape[-2]
+        causal_mask = torch.ones(
+            (q_len, k_len), dtype=torch.bool, device=query_states.device
+        ).triu(diagonal=1 + k_len - q_len)
+        attn_weights.masked_fill_(causal_mask, torch.finfo(attn_weights.dtype).min)
+    attn_weights = torch.softmax(attn_weights, dim=-1).to(value_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
+    return attn_output.transpose(1, 2)
+
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLTextConfig,
@@ -336,7 +392,18 @@ class Qwen3VLTextAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        attn_output = self.attn(query_states, key_states, value_states)
+        if _is_rocm_tensor(query_states):
+            # Avoid PyTorch flash SDP on ROCm/HIP for MiniMax-H3 text encoding.
+            # The flash path can segfault during 8-card startup/request handling.
+            attn_output = _rocm_math_attention(
+                query_states,
+                key_states,
+                value_states,
+                softmax_scale=self.scaling,
+                causal=self.is_causal,
+            )
+        else:
+            attn_output = self.attn(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         if not isinstance(
