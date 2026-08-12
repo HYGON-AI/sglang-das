@@ -126,7 +126,6 @@ if [[ -z "${DTK_VERSION}" ]]; then
   echo "Cannot derive the DTK version from ${DTK_PKG_URL}" >&2
   exit 2
 fi
-LOCAL_VERSION="das.dtk${DTK_VERSION}.torch${TORCH_VERSION//./}.g${SHA:0:12}"
 echo "Building HCU PD wheels for ${SHA} with ${BUILD_IMAGE}" >&2
 
 docker run --rm \
@@ -135,7 +134,8 @@ docker run --rm \
   --privileged \
   --user root \
   -e "HCU_PD_PACKAGE_VERSION=${PACKAGE_VERSION}" \
-  -e "HCU_PD_LOCAL_VERSION=${LOCAL_VERSION}" \
+  -e "HCU_PD_DTK_VERSION=${DTK_VERSION}" \
+  -e "HCU_PD_GIT_COMMIT=${SHA:0:6}" \
   -e "PIP_INDEX_URL=${PIP_INDEX_URL}" \
   -e "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" \
   -e "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" \
@@ -178,7 +178,7 @@ EOF_CARGO
       setuptools-scm \
       setuptools-rust \
       "maturin==1.9.6" \
-      ciupload \
+      "ciupload==0.3.0" \
       auditwheel \
       patchelf
     wget -q "${HCU_PD_PROTOC_URL}" -O /tmp/protoc.zip
@@ -220,14 +220,17 @@ EOF_CARGO
     cp -v target/wheels/*.whl /tmp/raw-wheels/
 
     mkdir -p /tmp/ci-repaired-wheels
-    for wheel in /tmp/raw-wheels/*.whl; do
-      CIUpload \
-        --repair \
-        --torch_version "${HCU_PD_TORCH_VERSION}" \
-        --set_local_version "${HCU_PD_LOCAL_VERSION}" \
-        --outputdir /tmp/ci-repaired-wheels \
-        -f "${wheel}"
-    done
+    mapfile -t raw_wheels < <(find /tmp/raw-wheels -maxdepth 1 -type f -name "*.whl" -print | sort)
+    if (( ${#raw_wheels[@]} == 0 )); then
+      echo "No HCU PD wheels were built" >&2
+      exit 1
+    fi
+    CIUpload REPAIR \
+      --dtk_version "${HCU_PD_DTK_VERSION}" \
+      --torch_version "${HCU_PD_TORCH_VERSION}" \
+      --git_commit "${HCU_PD_GIT_COMMIT}" \
+      --outputdir /tmp/ci-repaired-wheels \
+      -f "${raw_wheels[@]}"
     for wheel in /tmp/ci-repaired-wheels/*.whl; do
       if [[ "$(basename "${wheel}")" == sglang_router-* ]]; then
         auditwheel repair \
@@ -240,15 +243,32 @@ EOF_CARGO
     done
   '
 
-export SHA IMAGE BUILD_IMAGE PACKAGE_VERSION LOCAL_VERSION TEMP_DIR
+export SHA IMAGE BUILD_IMAGE PACKAGE_VERSION TEMP_DIR
 python3 - <<'PY_MANIFEST'
+from email.parser import Parser
 import hashlib
 import json
 import os
 import pathlib
+import zipfile
 
 temp_dir = pathlib.Path(os.environ["TEMP_DIR"])
 wheel_dir = temp_dir / "wheels"
+
+
+def wheel_local_version(path: pathlib.Path) -> str:
+    with zipfile.ZipFile(path) as archive:
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        if len(metadata_names) != 1:
+            raise RuntimeError(f"Expected one METADATA file in {path.name}")
+        metadata = Parser().parsestr(archive.read(metadata_names[0]).decode("utf-8"))
+    version = metadata.get("Version", "")
+    _, separator, local_version = version.partition("+")
+    if not separator or not local_version:
+        raise RuntimeError(f"Missing local version in {path.name}: {version}")
+    return local_version
 
 
 def wheel_kind(path: pathlib.Path) -> str | None:
@@ -263,6 +283,7 @@ def wheel_kind(path: pathlib.Path) -> str | None:
 
 
 found = {}
+wheel_local_versions = {}
 for wheel in sorted(wheel_dir.glob("*.whl")):
     kind = wheel_kind(wheel)
     if kind is None:
@@ -270,10 +291,14 @@ for wheel in sorted(wheel_dir.glob("*.whl")):
     if kind in found:
         raise SystemExit(f"duplicate {kind} wheels: {found[kind]} and {wheel}")
     found[kind] = wheel
+    wheel_local_versions[wheel.name] = wheel_local_version(wheel)
 
 expected = {"sglang", "sglang-kernel", "sglang-router"}
 if set(found) != expected:
     raise SystemExit(f"wheel bundle mismatch: expected={expected}, found={set(found)}")
+
+unique_local_versions = set(wheel_local_versions.values())
+local_version = next(iter(unique_local_versions)) if len(unique_local_versions) == 1 else None
 
 wheels = []
 for kind in sorted(found):
@@ -298,7 +323,8 @@ manifest = {
     "image": os.environ["IMAGE"],
     "build_image": os.environ["BUILD_IMAGE"],
     "package_version": os.environ["PACKAGE_VERSION"],
-    "local_version": os.environ["LOCAL_VERSION"],
+    "local_version": local_version,
+    "wheel_local_versions": wheel_local_versions,
     "wheels": wheels,
 }
 (temp_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
