@@ -864,7 +864,6 @@ class SchedulerDisaggregationPrefillMixin:
             DecodeTransferQueue,
         )
         from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
-        from sglang.srt.mem_cache import kv_cache_builder
         from sglang.srt.speculative.eagle_utils import (
             get_draft_recurrent_hidden_state_spec,
         )
@@ -882,11 +881,17 @@ class SchedulerDisaggregationPrefillMixin:
             self.server_args.disaggregation_transfer_backend
         )
 
-        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
+        # A regular (non-PD) server still calls this initializer to establish
+        # the common NULL-mode fields used by request routing. Do not build PD
+        # metadata or inspect speculative workers in that mode.
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            return
+
+        # Draft cache ownership moved to BaseSpecWorker on current main.
+        draft_token_to_kv_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
