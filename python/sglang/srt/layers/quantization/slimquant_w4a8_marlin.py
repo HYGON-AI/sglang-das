@@ -179,7 +179,7 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
-_use_triton_w4a16 = get_bool_env_var("SGLANG_W4A8_SLIMQUANT_TRITON", default='false')
+_use_triton_w4a16 = get_bool_env_var("SGLANG_ENABLE_SLIMQUANT_W4A16_TRITON_MOE")
 
 class MarlinMoeWorkspace:
     """
