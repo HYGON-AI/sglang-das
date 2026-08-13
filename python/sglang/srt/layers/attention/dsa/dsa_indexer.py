@@ -73,10 +73,22 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSFORM")
+_use_hcu_persistent_mqa = _is_hcu and envs.SGLANG_DSA_HCU_PERSISTENT_MQA_FASTPATH.get()
 
 if _is_hcu:
     from lightop import attention as lightop_attention
     from lightop import kvcache as lightop_kvcache
+
+    if _use_hcu_persistent_mqa:
+        _hcu_persistent_mqa_package_operation = getattr(
+            lightop_attention,
+            "paged_mqa_logits_length_masked",
+            None,
+        )
+        from sglang.srt.layers.attention.dsa.hcu_persistent_mqa import (
+            paged_mqa_logits_length_masked,
+            preload_hcu_persistent_mqa,
+        )
 
     from sglang.kernels.ops.attention.dsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
@@ -379,6 +391,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        if _use_hcu_persistent_mqa:
+            device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            device_arch = getattr(device_props, "gcnArchName", "")
+            if not device_arch:
+                device_arch = device_props.name
+            device_arch = device_arch.split(":")[0]
+            preload_hcu_persistent_mqa(
+                is_hcu=_is_hcu,
+                arch_name=device_arch,
+                num_cus=device_props.multi_processor_count,
+                package_operation=_hcu_persistent_mqa_package_operation,
+            )
 
     @staticmethod
     def _use_hcu_bf16_index_cache(pool) -> bool:
@@ -1020,15 +1044,40 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 active_weights = weights[:q_offset].to(torch.float32)
             else:
                 active_weights = weights[:q_offset]
-            logits = _hcu_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache,
-                active_weights,
-                seqlens_32,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-            )
+            active_q = q_fp8[:q_offset]
+            logits = None
+            if _use_hcu_persistent_mqa and not use_bf16_index_cache:
+                topk_context_lens = metadata.get_seqlens_expanded()
+                logits = paged_mqa_logits_length_masked(
+                    active_q.unsqueeze(1),
+                    kv_cache,
+                    active_weights,
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    is_hcu=_is_hcu,
+                    page_size=page_size,
+                    fuse_topk=envs.SGLANG_DSA_FUSE_TOPK.get(),
+                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
+                    topk_transform_method_name=getattr(
+                        getattr(metadata, "topk_transform_method", None),
+                        "name",
+                        "",
+                    ),
+                    index_topk=self.index_topk,
+                    topk_context_lens=topk_context_lens,
+                )
+            if logits is None:
+                logits = _hcu_paged_mqa_logits(
+                    active_q,
+                    kv_cache,
+                    active_weights,
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                )
         else:
             kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
             assert len(kv_cache_fp8.shape) == 2
