@@ -35,6 +35,16 @@ _HIP_SHAPE_GATE = None
 
 _USE_HCU_ATTN_RES = is_hcu() and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU")
 
+
+def _use_hcu_aggregate(num_tokens: int, nvb: int) -> bool:
+    """Route aggregation to the vendored HCU single-kernel mix when it beats
+    the official HIP kernel. Benchmark (H=7168): attn_res_hcu wins for
+    nvb >= 5 and T >= 256 (its online softmax avoids the official kernel's
+    next_pow2(nvb) x 8192 register tile); official wins at small T, so keep
+    the official path there. Requires the HCU env switch."""
+    return _USE_HCU_ATTN_RES and num_tokens >= 256 and nvb >= 5
+
+
 def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
     template instantiation; everything else takes the triton pipeline."""
@@ -209,8 +219,6 @@ def _mix_fused(
     score_norm: RMSNorm,
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
-    if _USE_HCU_ATTN_RES:
-        return _mix_hcu(prefix_sum, bank, nvb, score_proj, score_norm)
     T, H = prefix_sum.shape
     cw = get_cw(score_proj, score_norm)
     n_h_blocks = H // _BLOCK_H
@@ -251,29 +259,6 @@ def _mix_fused(
         num_warps=4,
     )
     return out
-
-
-
-def _mix_hcu(
-    prefix_sum: torch.Tensor,
-    bank: torch.Tensor,
-    nvb: int,
-    score_proj: ReplicatedLinear,
-    score_norm: RMSNorm,
-) -> torch.Tensor:
-    """HCU single-kernel mix (vendored in kernels/ops/kimi_k3/attn_res_hcu.py):
-    score -> online softmax -> weighted sum. Same math as ``_mix_fused``."""
-    if nvb == 0:
-        return prefix_sum
-
-    return attn_res_hcu(
-        prefix_sum,
-        bank,
-        norm_weight=score_norm.weight,
-        qk_weight=score_proj.weight.squeeze(),
-        num_blocks=nvb,
-        eps=score_norm.variance_epsilon,
-    )
 
 
 def _aggregate_fused(
@@ -323,6 +308,46 @@ def _aggregate_hip(
     return out, prefix
 
 
+def _aggregate_hcu(
+    prefix_a: torch.Tensor,
+    prefix_b: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: Optional[RMSNorm],
+    write_bank_row: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HCU branch: vendored single-kernel mix + separate out-norm / bank write.
+
+    Same contract as ``_aggregate_hip``: returns ``(out, prefix)`` with
+    ``prefix = prefix_a + prefix_b`` (rounded to the storage dtype) and
+    ``out = out_norm(mix)`` or the pre-norm mixture when ``out_norm`` is None.
+    Used when ``attn_res_hcu`` beats the official HIP kernel (T >= 256,
+    nvb >= 5); the extra out-norm launch is already included in the bench's
+    ``B_full`` numbers.
+    """
+    from sglang.kernels.ops.kimi_k3.attn_res_hcu import attn_res_hcu
+
+    if prefix_b is None:
+        prefix = prefix_a
+    else:
+        prefix = (prefix_a.float() + prefix_b.float()).to(prefix_a.dtype)
+    if write_bank_row:
+        assert bank.shape[1] > nvb, "write_bank_row requires NB > nvb"
+        bank[:, nvb, :] = prefix
+    mix = attn_res_hcu(
+        prefix,
+        bank,
+        norm_weight=score_norm.weight,
+        qk_weight=score_proj.weight.squeeze(),
+        num_blocks=nvb,
+        eps=score_norm.variance_epsilon,
+    )
+    out = out_norm(mix) if out_norm is not None else mix
+    return out, prefix
+
+
 def aggregate_stream_torch(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -356,6 +381,10 @@ def aggregate_stream(
     raw wire only carries the current block's running prefix."""
     if nvb == 0:
         return prefix_sum
+    if _use_hcu_aggregate(prefix_sum.shape[0], nvb):
+        return _aggregate_hcu(
+            prefix_sum, None, bank, nvb, score_proj, score_norm, None
+        )[0]
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
             prefix_sum, None, bank, nvb, score_proj, score_norm, None
@@ -378,6 +407,17 @@ def _aggregate_fused_add(
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
     write_bank_row rides _aggregate (fast path only)."""
+    if _use_hcu_aggregate(prefix_a.shape[0], nvb):
+        return _aggregate_hcu(
+            prefix_a,
+            prefix_b,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        )
     if _use_hip_fused(prefix_a.shape[1], nvb):
         # The hip kernel reads the prefix row anyway, so the add folds into it.
         return _aggregate_hip(
@@ -431,6 +471,17 @@ def _aggregate(
             out_norm,
             write_bank_row=write_bank_row,
         )
+    if _use_hcu_aggregate(prefix_sum.shape[0], nvb):
+        return _aggregate_hcu(
+            prefix_sum,
+            None,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        )[0]
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
             prefix_sum,
