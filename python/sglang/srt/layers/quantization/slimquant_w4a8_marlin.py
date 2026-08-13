@@ -43,9 +43,12 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, set_weight_attrs
 
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
@@ -176,6 +179,7 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
+_use_triton_w4a16 = get_bool_env_var("SGLANG_W4A8_SLIMQUANT_TRITON", default='false')
 
 class MarlinMoeWorkspace:
     """
@@ -474,8 +478,9 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, ignore: Optional[list[str]] = None):
+        super().__init__()
+        self.ignore = ignore
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -495,7 +500,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, any]) -> "SlimQuantW4A8Int8MarlinConfig":
-        return cls()
+        return cls(ignore=config.get("ignore"))
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -514,8 +519,21 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoE,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
+            # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
+            # experts; dense layers stay in BF16 and are listed in the
+            # checkpoint's ignore list (native compressed-tensors style, with
+            # "re:" regexes). Layers matched by the ignore list keep the
+            # unquantized path; anything else goes through the W4A8 linear
+            # method.
+            if self.ignore and should_ignore_layer(
+                layer_name=prefix,
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedLinearMethod()
             return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()
@@ -639,20 +657,53 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(
-            w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
-            requires_grad=False,
-        )
-        layer.w2_weight = Parameter(
-            w4a8_weight_repack_impl(layer.w2_weight, use_deepep=self.use_deepep),
-            requires_grad=False,
-        )
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        if _use_triton_w4a16:
+            # mxfp4_to_int4.py packs (even_k << 4) | odd_k with two's
+            # complement nibbles and stores scale/16 (the legacy lightop
+            # kernel applies the missing x16). The Triton W4A16 kernel instead
+            # expects even k in the LOW nibble, offset-8 unsigned nibbles, and
+            # the scale applied directly. Convert the checkpoint layout:
+            #   - swap nibbles (even k -> low nibble)
+            #   - flip bit 3 of every nibble (two's complement -> +8 offset)
+            #   - restore the true per-channel scale (x16)
+            def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
+                logger.info(f'{w.dtype=}')
+                u = w.data.to(torch.uint8)
+                u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
+                    torch.int8
+                )
+                return u.contiguous()
+
+            layer.w13_weight = Parameter(
+                _to_triton_layout(layer.w13_weight), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                _to_triton_layout(layer.w2_weight), requires_grad=False
+            )
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data * 16.0, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data * 16.0, requires_grad=False
+            )
+        else:
+            # Legacy lightop path: repack into the Marlin W4A8 layout.
+            layer.w13_weight = Parameter(
+                w4a8_weight_repack_impl(
+                    layer.w13_weight, use_deepep=self.use_deepep
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                w4a8_weight_repack_impl(layer.w2_weight, use_deepep=self.use_deepep),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -660,21 +711,48 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    @torch._dynamo.disable()  # TODO: 性能优化需lmslim/lightop配合
+    def _get_triton_quant_info(self, layer):
+        """W4A16 quant info for the Triton MoE runner (same path the native
+        MXFP4 model uses). Per-channel scales: block_shape[1] must be >= the K
+        dimension of BOTH GEMMs (w13: hidden_size, w2: intermediate_size), so
+        the kernel's group index stays 0 and the (E, N, 1) scale is read once
+        per output channel."""
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        k_max = max(layer.w13_weight.shape[2], layer.w2_weight.shape[2]) * 2
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            use_int4_w4a16=True,
+            per_channel_quant=True,
+            block_shape=[0, k_max],
+        )
+
+    @torch._dynamo.disable()
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output,
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
-        # local_expert_mapping,
+    ):
+        if _use_triton_w4a16:
+            return self.runner.run(dispatch_output, self._get_triton_quant_info(layer))
+        return self._apply_w4a8_marlin_lightop(layer, dispatch_output)
+
+    @torch._dynamo.disable()
+    def _apply_w4a8_marlin_lightop(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
     ):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+        from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
-
         topk_weights, topk_ids, _ = topk_output
         x, topk_weights = apply_topk_weights_cpu(
             self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
@@ -709,7 +787,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         )
         return StandardCombineInput(hidden_states=output)
 
-    @torch._dynamo.disable()  # TODO: 性能优化需lmslim/lightop配合
+    @torch._dynamo.disable()
     def apply_with_shared_output(
         self,
         layer: torch.nn.Module,
@@ -719,6 +797,35 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         topk_output=None,
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if _use_triton_w4a16:
+            from sglang.srt.layers.moe.token_dispatcher.standard import (
+                StandardDispatchOutput,
+            )
+
+            dispatch_output = StandardDispatchOutput(
+                hidden_states=x,
+                hidden_states_scale=None,
+                topk_output=topk_output,
+            )
+            output = self.runner.run(
+                dispatch_output, self._get_triton_quant_info(layer)
+            )
+            return output.hidden_states
+        return self._apply_with_shared_output_lightop(
+            layer, x, activation, shared_output, topk_output, i_q, i_s
+        )
+
+    @torch._dynamo.disable()
+    def _apply_with_shared_output_lightop(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        activation: str,
+        shared_output: Optional[torch.Tensor],
+        topk_output,
+        i_q: Optional[torch.Tensor],
+        i_s: Optional[torch.Tensor],
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 

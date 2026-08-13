@@ -106,6 +106,7 @@ QUANTIZATION_CHOICES = [
     "unquant",
     "slimquant_marlin",
     "humming",
+    "slimquant_w4a8_marlin",
 ]
 
 def _tool_call_parser_choices():
