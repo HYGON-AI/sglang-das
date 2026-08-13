@@ -667,7 +667,6 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             #   - flip bit 3 of every nibble (two's complement -> +8 offset)
             #   - restore the true per-channel scale (x16)
             def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
-                logger.info(f'{w.dtype=}')
                 u = w.data.to(torch.uint8)
                 u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
                     torch.int8
