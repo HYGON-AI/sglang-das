@@ -354,32 +354,39 @@ def fused_moe_kernel_gptq_awq(
         if has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         elif use_mxfp4_w4a16:
-            b = b.to(tl.float32) * b_scale
+            # Original W4A16 needs the dequantized weight tile.  The W4A8
+            # route below keeps `b` as decoded E2M1 and applies the original
+            # MXFP4 group scale after the FP8 MMAC instead.
+            if not use_mxfp4_w4a8_tc:
+                b = b.to(tl.float32) * b_scale
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
 
         if use_mxfp4_w4a8_tc:
             # Experimental W4A8 route.  The checkpoint remains packed MXFP4;
-            # only the current GEMM tile is decoded.  Quantize A per row and
-            # decoded B per column to E4M3, then restore both scales around
-            # the FP8 tensor-core dot.  This intentionally preserves the
-            # original WFP4A16 line below for direct A/B inspection.
+            # one MXFP4 scale group is decoded per K iteration (enforced by
+            # the launch-side BLOCK_SIZE_K override).  Quantize A directly
+            # from BF16 to E4M3 with one scale per row.  Every E2M1 value is
+            # exactly representable by E4M3, so B can be cast directly to FP8
+            # without materializing E2M1 * MXFP4_group_scale in FP32.  Apply
+            # the activation scale and the original UE8M0 weight group scale
+            # to this group's MMAC result before accumulating the next group.
             fp8_max: tl.constexpr = 448.0
-            a_f32 = a.to(tl.float32)
-            a_absmax = tl.maximum(tl.max(tl.abs(a_f32), axis=1), 1.0e-10)
-            b_absmax = tl.maximum(tl.max(tl.abs(b), axis=0), 1.0e-10)
+            a_absmax = tl.maximum(
+                tl.max(tl.abs(a).to(tl.float32), axis=1), 1.0e-10
+            )
             a_qscale = a_absmax / fp8_max
-            b_qscale = b_absmax / fp8_max
             a_fp8 = tl.clamp(
-                a_f32 / a_qscale[:, None], -fp8_max, fp8_max
+                a / a_qscale[:, None], -fp8_max, fp8_max
             ).to(tl.float8e4nv)
-            b_fp8 = tl.clamp(
-                b / b_qscale[None, :], -fp8_max, fp8_max
-            ).to(tl.float8e4nv)
+            b_fp8 = b.to(tl.float8e4nv)
+            # b_scale is repeated along the K rows within one MXFP4 group.
+            # Reduce that repeated view to the per-output-column group scale.
+            b_group_scale = tl.max(b_scale, axis=0)
             accumulator += (
                 tl.dot(a_fp8, b_fp8)
                 * a_qscale[:, None]
-                * b_qscale[None, :]
+                * b_group_scale[None, :]
             )
         else:
             # Original WFP4A16 route: decoded weights and activations use BF16.
@@ -943,6 +950,14 @@ def invoke_fused_moe_kernel(
         )
         if use_mxfp4_w4a16:
             assert B_zp is None, "MXFP4 E2M1 does not use an affine zero point"
+        use_mxfp4_w4a8_tc = _use_mxfp4_w4a8_tc and use_mxfp4_w4a16
+        if use_mxfp4_w4a8_tc:
+            # One FP8 MMAC must cover exactly one MXFP4 scale group so that
+            # its UE8M0 scale can be applied after the MMAC.  Copy the config
+            # to keep the caller's cached/default config immutable.
+            config = dict(config)
+            config["BLOCK_SIZE_K"] = block_shape[1]
+            even_Ks = K % config["BLOCK_SIZE_K"] == 0
         assert (
             not fuse_sum_all_reduce
         ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
@@ -982,7 +997,7 @@ def invoke_fused_moe_kernel(
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
-            use_mxfp4_w4a8_tc=_use_mxfp4_w4a8_tc and use_mxfp4_w4a16,
+            use_mxfp4_w4a8_tc=use_mxfp4_w4a8_tc,
             use_mxfp4_w4a16=use_mxfp4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
