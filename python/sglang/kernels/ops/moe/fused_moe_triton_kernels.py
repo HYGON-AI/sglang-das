@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -57,11 +58,9 @@ _is_hcu = is_hcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-# Experimental Kimi-K3 MXFP4 Triton path: dynamically quantize each decoded
-# weight tile and its activation tile to FP8 before tl.dot so the GEMM uses
-# the FP8 tensor-core path.  Keep the existing WFP4A16 implementation as the
-# default for easy A/B testing.
+
 _use_mxfp4_w4a8_tc = get_bool_env_var("SGLANG_MXFP4_TRITON_W4A8") and _is_hcu
+_use_int4_w4a8_tc = get_bool_env_var("SGLANG_INT4_TRITON_W4A8") and _is_hcu
 
 if _is_hcu:
     from lmslim.layers.gemm.int8_utils import per_token_quant_int8
@@ -165,6 +164,7 @@ def fused_moe_kernel_gptq_awq(
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
+    use_int4_w4a8_tc: tl.constexpr,
     use_mxfp4_w4a8_tc: tl.constexpr,
     use_mxfp4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
@@ -359,10 +359,30 @@ def fused_moe_kernel_gptq_awq(
             # MXFP4 group scale after the FP8 MMAC instead.
             if not use_mxfp4_w4a8_tc:
                 b = b.to(tl.float32) * b_scale
+        elif use_int4_w4a8_tc:
+            # INT4 W4A8 route: keep the raw signed INT4 tile (offset-8 is
+            # already applied by the checkpoint layout transform); the
+            # per-channel weight scale is applied after the int8 MMAC.
+            b = (b - b_zp_num).to(tl.int8)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
 
-        if use_mxfp4_w4a8_tc:
+        if use_int4_w4a8_tc:
+            # INT4 W4A8: per-token int8 activation quant, int8 x int8 tensor
+            # core, then per-token activation scale and per-channel weight
+            # scale on the fp32 accumulator.
+            a_absmax = tl.maximum(
+                tl.max(tl.abs(a).to(tl.float32), axis=1), 1.0e-10
+            )
+            a_qscale = a_absmax / 127.0
+            a_int8 = libdevice.round(a / a_qscale[:, None]).to(tl.int8)
+            # b_scale is repeated along K for the per-channel layout; reduce
+            # it to the per-output-column scale.
+            b_channel_scale = tl.max(b_scale, axis=0)
+            accumulator += (
+                tl.dot(a_int8, b) * a_qscale[:, None] * b_channel_scale[None, :]
+            )
+        elif use_mxfp4_w4a8_tc:
             # Experimental W4A8 route.  The checkpoint remains packed MXFP4;
             # one MXFP4 scale group is decoded per K iteration (enforced by
             # the launch-side BLOCK_SIZE_K override).  Quantize A directly
@@ -951,6 +971,13 @@ def invoke_fused_moe_kernel(
         if use_mxfp4_w4a16:
             assert B_zp is None, "MXFP4 E2M1 does not use an affine zero point"
         use_mxfp4_w4a8_tc = _use_mxfp4_w4a8_tc and use_mxfp4_w4a16
+        use_int4_w4a8_tc = (
+            _use_int4_w4a8_tc
+            and use_int4_w4a16
+            and not use_mxfp4_w4a16
+        )
+        if use_int4_w4a8_tc:
+            assert B_zp is None, "INT4 W4A8 does not use an affine zero point"
         if use_mxfp4_w4a8_tc:
             # One FP8 MMAC must cover exactly one MXFP4 scale group so that
             # its UE8M0 scale can be applied after the MMAC.  Copy the config
@@ -997,6 +1024,7 @@ def invoke_fused_moe_kernel(
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8_tc=use_int4_w4a8_tc,
             use_mxfp4_w4a8_tc=use_mxfp4_w4a8_tc,
             use_mxfp4_w4a16=use_mxfp4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
