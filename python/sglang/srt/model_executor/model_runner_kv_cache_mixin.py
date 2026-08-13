@@ -117,7 +117,19 @@ class ModelRunnerKVCacheMixin:
                     element_size = torch._utils._element_size(
                         NSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                index_cache_ratio = 1
+                if self.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    index_cache_ratio = parse_hisparse_config(
+                        self.server_args
+                    ).host_to_device_ratio
+                cell_size += (
+                    indexer_size_per_token
+                    * num_layers
+                    * element_size
+                    * index_cache_ratio
+                )
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)

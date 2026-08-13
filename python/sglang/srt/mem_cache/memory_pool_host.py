@@ -51,14 +51,18 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_direct_lf_pf_D2H_hcu,
+        transfer_kv_all_direct_pf_lf_H2D_hcu,
+        transfer_kv_all_kernel_lf_pf_D2H_hcu,
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
@@ -68,14 +72,11 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_direct,
         transfer_kv_per_layer,
         transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_kernel_pf_lf_H2D_hcu,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
-        transfer_kv_all_direct_lf_pf_D2H_hcu,
-        transfer_kv_all_direct_pf_lf_H2D_hcu,
-        transfer_kv_all_kernel_lf_pf_D2H_hcu,
-        transfer_kv_per_layer_kernel_pf_lf_H2D_hcu,
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
@@ -107,6 +108,69 @@ class HostTensorAllocator(abc.ABC):
         self.dims = dims
         tensor = torch.empty(dims, dtype=dtype, device=device)
         return tensor
+
+
+class HiSparseHostPoolMixin:
+    def _round_up_to_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
+        return self.alloc(num_pages * self.page_size)
+
+    def alloc_paged_token_slots(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_to_host_pool_allocated_len: torch.Tensor,
+        req_pool_idx: int,
+        start_pos: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Allocate request host slots by page and return token-granular slots."""
+        device = req_to_host_pool.device
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+
+        allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
+        end_pos = start_pos + num_tokens
+        page_end = self._round_up_to_page_size(end_pos)
+        assert start_pos <= allocated_len
+
+        if page_end > allocated_len:
+            num_new_pages = (page_end - allocated_len) // self.page_size
+            host_locs = self.alloc_page(num_new_pages)
+            if host_locs is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d host pages "
+                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
+                    num_new_pages,
+                    req_pool_idx,
+                    start_pos,
+                    num_tokens,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
+                )
+
+            req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
+                device=device, non_blocking=True
+            )
+            req_to_host_pool_allocated_len[req_pool_idx] = page_end
+
+        return req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def allocated_host_indices(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_pool_idx: int,
+        allocated_len: int,
+    ) -> torch.Tensor:
+        allocated_len = int(allocated_len)
+        host_len = min(
+            self._round_up_to_page_size(allocated_len),
+            req_to_host_pool.shape[1],
+        )
+        host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        return host_indices[host_indices >= 0]
 
 
 def get_allocator_from_storage(allocator_type):
@@ -802,6 +866,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
+
 class MHATokenToKVPoolHostHCU(HostKVCache):
     device_pool: MHATokenToKVPool
 
@@ -859,13 +924,27 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             # dim_k = (self.layer_num,self.page_num, self.head_num, self.page_size, self.head_dim)
             # dim_v = (self.layer_num,self.page_num, self.head_num, self.head_dim, self.page_size)
             # logger.info(f"self.head_dim:{self.head_dim},self.device_pool.v:{self.device_pool.v_head_dim}")
-            dim_k = (self.page_num,self.layer_num,self.head_num, self.page_size, self.head_dim)
-            dim_v = (self.page_num,self.layer_num,self.head_num, self.head_dim,self.page_size)
+            dim_k = (
+                self.page_num,
+                self.layer_num,
+                self.head_num,
+                self.page_size,
+                self.head_dim,
+            )
+            dim_v = (
+                self.page_num,
+                self.layer_num,
+                self.head_num,
+                self.head_dim,
+                self.page_size,
+            )
         else:
             raise ValueError(f"HCU HiCache Unsupported layout: {self.layout}")
         # self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         # self.layout_dim = self.token_stride_size * self.layer_num
-        self.token_stride_size = self.page_size * self.head_num * self.head_dim * self.dtype.itemsize
+        self.token_stride_size = (
+            self.page_size * self.head_num * self.head_dim * self.dtype.itemsize
+        )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer_k = alloc_func(
@@ -882,7 +961,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
         )
-        return (buffer_k,buffer_v)
+        return (buffer_k, buffer_v)
 
     @property
     def k_buffer(self):
@@ -918,7 +997,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layout_hcu":
-               transfer_kv_all_direct_pf_lf_H2D_hcu(
+                transfer_kv_all_direct_pf_lf_H2D_hcu(
                     src_ptrs_k=self.k_buffer,
                     src_ptrs_v=self.v_buffer,
                     dst_ptrs_k=device_pool.k_buffer,
@@ -927,8 +1006,8 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
                     dst_indices=device_indices,
                     start_layer_id=layer_id,
                     page_size=self.page_size,
-               )
-               logger.info("load_to_device_per_layer direct....")
+                )
+                logger.info("load_to_device_per_layer direct....")
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -976,34 +1055,50 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layout_hcu":
             real_index = index // self.page_size
-            data_page_k = self.kv_buffer[0][real_index : real_index + 1,:, :, :, :]
-            data_page_v = self.kv_buffer[1][real_index : real_index + 1,:, :, :, :]
+            data_page_k = self.kv_buffer[0][real_index : real_index + 1, :, :, :, :]
+            data_page_v = self.kv_buffer[1][real_index : real_index + 1, :, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
             data_page_k = data_page_k.flatten()
             data_page_v = data_page_v.flatten()
-        return (data_page_k,data_page_v)
+        return (data_page_k, data_page_v)
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
-            (self.page_num,self.layer_num, self.head_num, self.page_size,self.head_dim),
+            (
+                self.page_num,
+                self.layer_num,
+                self.head_num,
+                self.page_size,
+                self.head_dim,
+            ),
             dtype=self.dtype,
             device=self.device,
             pin_memory=self.pin_memory,
         ).flatten()
 
-    def set_from_flat_data_page(self, index: int, data_page_k: torch.Tensor,data_page_v: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self, index: int, data_page_k: torch.Tensor, data_page_v: torch.Tensor
+    ) -> None:
         if self.layout == "layout_hcu":
             real_index = index // self.page_size
-            self.kv_buffer[0][real_index:real_index + 1,:, :, :, :] = (
+            self.kv_buffer[0][real_index : real_index + 1, :, :, :, :] = (
                 data_page_k.reshape(
-                    self.page_num, self.layer_num,self.head_num,self.page_size, self.head_dim
+                    self.page_num,
+                    self.layer_num,
+                    self.head_num,
+                    self.page_size,
+                    self.head_dim,
                 )
             )
-            self.kv_buffer[1][real_index:real_index + 1,:, :, :, :] = (
+            self.kv_buffer[1][real_index : real_index + 1, :, :, :, :] = (
                 data_page_v.reshape(
-                    self.page_num, self.layer_num,self.head_num, self.head_dim,self.page_size
+                    self.page_num,
+                    self.layer_num,
+                    self.head_num,
+                    self.head_dim,
+                    self.page_size,
                 )
             )
         else:
@@ -1079,7 +1174,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
                     * self.layer_num
                     * self.head_num
                     * self.head_dim
-                    * self.dtype.itemsize 
+                    * self.dtype.itemsize
                 )
                 v_ptr = (
                     v_buffer_data_ptr
@@ -1087,19 +1182,24 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
                     * self.layer_num
                     * self.head_num
                     * self.head_dim
-                    * self.dtype.itemsize 
+                    * self.dtype.itemsize
                 )
                 ptr_list.append(k_ptr)
                 ptr_list.append(v_ptr)
             element_size = (
-                self.layer_num * self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.head_num
+                * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
         else:
             raise ValueError(f"HCU HiCache Unsupported layout: {self.layout}")
-        return ptr_list, element_size_list        
+        return ptr_list, element_size_list
 
-class MLATokenToKVPoolHost(HostKVCache):
+
+class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
 
     def __init__(
@@ -1147,7 +1247,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         for registering host memory with the disaggregation transfer engine."""
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.token_stride_size] * self.layer_num
+        item_lens = [self.token_stride_size * self.page_size] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
@@ -1334,6 +1434,19 @@ class MLATokenToKVPoolHost(HostKVCache):
                         cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
+                elif _is_hcu:
+                    # The all-layer table contains raw host virtual addresses.
+                    # Use the per-layer wrapper so ROCm can map each registered
+                    # host tensor through cudaHostGetDevicePointer.
+                    for layer_id in range(self.layer_num):
+                        transfer_kv_per_layer_mla(
+                            src=device_pool.kv_buffer[layer_id],
+                            dst=self.data_refs[layer_id],
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                            num_warps_per_block=4,
+                        )
                 else:
                     transfer_kv_all_layer_mla(
                         src_layers=device_pool.data_ptrs,

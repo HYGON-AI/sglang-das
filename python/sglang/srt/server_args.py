@@ -3457,6 +3457,51 @@ class ServerArgs:
                 f"with torch.compile)."
             )
 
+    def _validate_hcu_deepep_topology(self):
+        if (
+            not is_hcu()
+            or self.moe_a2a_backend != "deepep"
+            or self.deepep_mode not in ("auto", "low_latency")
+        ):
+            return
+
+        nnodes_per_tp_group = max(self.nnodes // self.pp_size, 1)
+        if nnodes_per_tp_group == 1:
+            return
+
+        ranks_per_node = self.tp_size // nnodes_per_tp_group
+        if ranks_per_node != 8:
+            raise ValueError(
+                "The current HCU deep_ep_shca multi-node low-latency runtime "
+                "requires exactly 8 TP/EP ranks per node. Got "
+                f"tp_size={self.tp_size}, ep_size={self.ep_size}, "
+                f"nnodes={self.nnodes}, pp_size={self.pp_size}, "
+                f"ranks_per_node={ranks_per_node}, deepep_mode={self.deepep_mode}. "
+                "Use TP16/D2 or TP32/D4 (8 ranks per node), or select a "
+                "validated non-DeepEP MoE A2A backend."
+            )
+
+        if (
+            self.disaggregation_mode == "decode"
+            and self.tp_size == 32
+            and self.dp_size == 32
+            and self.ep_size == 32
+            and self.pp_size == 1
+            and nnodes_per_tp_group == 4
+            and self.enable_dp_attention
+            and self.enable_dp_lm_head
+            and self.disable_cuda_graph
+        ):
+            raise ValueError(
+                "The current HCU TP32/D4 PD Decode path is not correct in eager "
+                "mode with DeepEP low-latency, DP attention, and DP LM head. Got "
+                f"tp_size={self.tp_size}, dp_size={self.dp_size}, "
+                f"ep_size={self.ep_size}, nnodes={self.nnodes}, "
+                f"pp_size={self.pp_size}, execution_mode=eager. "
+                "To start, remove --disable-cuda-graph and use the validated CUDA Graph "
+                "path, or select a validated non-DeepEP MoE A2A backend."
+            )
+
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
             logger.warning(
@@ -3474,6 +3519,8 @@ class ServerArgs:
                 "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
                 "auto-configuring --moe-a2a-backend megamoe."
             )
+
+        self._validate_hcu_deepep_topology()
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size

@@ -13,16 +13,17 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 
 register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
+register_hcu_ci(est_time=10, suite="stage-b-test-1-hcu")
 
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)
 # ---------------------------------------------------------------------------
 SIZE = 2048  # device buffer pool size (tokens)
-PAGE_SIZE = 64  # page size (must be 64 for CUDA, 1 for ROCm)
+PAGE_SIZE = 64  # page size (must be 64 for CUDA/HCU, 1 for other ROCm)
 TOP_K = 256  # top-k selection count
 DEVICE_BUFFER_SIZE = 512  # device buffer per request
 HOST_TO_DEVICE_RATIO = 2
@@ -88,7 +89,7 @@ class TestHiSparseUnit(unittest.TestCase):
         cls._original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
         ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
 
-        global_page_size = 1 if is_hip() else PAGE_SIZE
+        global_page_size = 1 if is_hip() and not is_hcu() else PAGE_SIZE
 
         from sglang.srt.mem_cache.hisparse_memory_pool import (
             HiSparseNSATokenToKVPool,
@@ -161,6 +162,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_to_device_buffer.zero_()
         self.coordinator.req_device_buffer_size.zero_()
         self.coordinator.req_to_host_pool.fill_(-1)
+        self.coordinator.req_to_host_pool_allocated_len.zero_()
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
@@ -237,10 +239,13 @@ class TestHiSparseUnit(unittest.TestCase):
         """Allocate host slots, write known patterns, register in coordinator.
         Returns host_indices (cuda tensor)."""
         host_pool = self.coordinator.mem_pool_host
-        host_indices = host_pool.alloc(fill_len)
-        self.assertIsNotNone(host_indices, "Host alloc failed")
-        host_indices = host_indices.to(device="cuda")
-        self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+        host_indices = host_pool.alloc_paged_token_slots(
+            self.coordinator.req_to_host_pool,
+            self.coordinator.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            0,
+            fill_len,
+        )
         for lid in range(LAYER_NUM):
             for i in range(fill_len):
                 host_pool.kv_buffer[lid][host_indices[i]] = self._kv_pattern(lid, i)
@@ -355,6 +360,30 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertEqual(logical, initial_sizes[0], f"Logical leak {msg}")
         self.assertEqual(hisparse, initial_sizes[1], f"HiSparse leak {msg}")
         self.assertEqual(host, initial_sizes[2], f"Host leak {msg}")
+
+    def test_mla_device_mapping_preserves_int64_dtype(self):
+        """The FP8 MLA KV store operator requires translated locations as int64."""
+        logical_loc = torch.tensor([1], dtype=torch.int64, device="cuda")
+        self.allocator.full_to_hisparse_device_index_mapping[logical_loc] = 7
+
+        translated = self.coordinator.mem_pool_device._translate_loc_to_hisparse_device(
+            logical_loc
+        )
+
+        self.assertEqual(translated.dtype, torch.int64)
+        self.assertEqual(translated.item(), 7)
+
+    def test_hisparse_host_pool_uses_device_page_size(self):
+        """PD source and decode host destination must use the same page size."""
+        self.assertEqual(self.coordinator.mem_pool_host.page_size, self.page_size)
+        _, _, item_lens = self.coordinator.mem_pool_host.get_contiguous_buf_infos()
+        self.assertTrue(
+            all(
+                item_len
+                == self.coordinator.mem_pool_host.token_stride_size * self.page_size
+                for item_len in item_lens
+            )
+        )
 
     # ==================================================================
     # Test: Kernel correctness — short sequence (fast path)
@@ -553,6 +582,70 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
+
+    def test_decode_backup_after_direct_admission(self):
+        """PD warmup's second decode step backs up the previous token safely."""
+        initial = self._get_initial_sizes()
+        fill_len = 4
+        req = _make_req("decode-backup", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
+        self._populate_host_pool(req, fill_len)
+        self.coordinator.admit_request_direct(req)
+
+        req_pool_indices = torch.tensor(
+            [req.req_pool_idx], dtype=torch.int64, device="cuda"
+        )
+        last_loc = kv_loc[-1:]
+        allocated_locs = [kv_loc]
+
+        for seq_len in (fill_len + 1, fill_len + 2):
+            seq_lens = torch.tensor([seq_len], dtype=torch.int64, device="cuda")
+            seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
+            out_loc = self.allocator.alloc_decode(
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                last_loc=last_loc,
+            )
+            self.assertIsNotNone(out_loc)
+            self.req_to_token_pool.write((req.req_pool_idx, seq_len - 1), out_loc)
+            req.kv_allocated_len = seq_len
+            req.kv_committed_len = seq_len
+
+            self.coordinator.map_last_loc_to_buffer(
+                seq_lens=seq_lens,
+                out_cache_loc=out_loc,
+                req_pool_indices=req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+            )
+            device_loc = self.allocator.full_to_hisparse_device_index_mapping[out_loc]
+            for layer_id in range(LAYER_NUM):
+                self.device_pool.kv_buffer[layer_id][device_loc] = self._kv_pattern(
+                    layer_id, seq_len - 1
+                )
+
+            allocated_locs.append(out_loc)
+            last_loc = out_loc
+
+        self.coordinator.wait_for_pending_backup()
+        torch.cuda.synchronize()
+
+        host_loc = self.coordinator.req_to_host_pool[req.req_pool_idx, fill_len]
+        self.assertGreaterEqual(int(host_loc.item()), 0)
+        for layer_id in range(LAYER_NUM):
+            actual = self.coordinator.mem_pool_host.kv_buffer[layer_id][host_loc]
+            expected = self._kv_pattern(layer_id, fill_len)
+            self.assertTrue(
+                torch.allclose(
+                    actual.float(),
+                    torch.full_like(actual.float(), expected),
+                    atol=1e-2,
+                )
+            )
+
+        self._cleanup_req(req, torch.cat(allocated_locs), logical_only=True)
+        self._assert_sizes_restored(initial, "decode_backup")
 
     # ==================================================================
     # Test: Direct-to-host (PD separated) path
