@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.dsa.flashmla_backend import (
 )
 from sglang.srt.layers.attention.dsa.forward_batch_utils import (
     effective_forward_mode,
+    get_flashmla_kv_valid_rows,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
@@ -2158,6 +2159,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2313,6 +2315,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2811,6 +2814,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         flash_mla_with_kvcache = get_flashmla_op(
             "flash_mla_with_kvcache", is_hcu=_is_hcu
@@ -2844,24 +2848,49 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
-            q=q_input,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=True,
-        )
+        # MLP-sync can append synthetic speculative rows. HCU FlashMLA must
+        # only see the real prefix; downstream MLP-sync still needs the padded
+        # output shape, so restore it after the kernel returns.
+        num_total = q_input.shape[0]
+        num_valid = get_flashmla_kv_valid_rows(forward_batch, num_total)
+        needs_repad = _is_hcu and num_valid is not None
+        flashmla_metadata = metadata.flashmla_metadata
+        if needs_repad:
+            q_input = q_input[:num_valid]
+            indices = indices[:num_valid]
+            cache_seqlens = cache_seqlens[:num_valid]
+            if num_valid > 0:
+                flashmla_metadata = self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens,
+                    seq_len_q=1,
+                )
+
+        if needs_repad and num_valid == 0:
+            o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
+        else:
+            o, _ = flash_mla_with_kvcache(
+                q=q_input,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+                num_splits=flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
+                ),
+                is_fp8_kvcache=True,
+            )
+
+        if needs_repad:
+            full_o = o.new_zeros((num_total, *o.shape[1:]))
+            full_o[:num_valid] = o
+            o = full_o
 
         if target_q_heads != num_q_heads:
-            o = o[:, :, :num_q_heads, :]
+            o = o[:, :, :num_q_heads, :].contiguous()
 
         return o
 
