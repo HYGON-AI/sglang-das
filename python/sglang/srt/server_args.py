@@ -220,7 +220,8 @@ HCU_DSA_PREFILL_BACKEND_CHOICES = {"flashmla_sparse", "flashmla_kv", "flashmla_a
 HCU_DSA_DECODE_BACKEND_CHOICES = {"flashmla_sparse", "flashmla_kv"}
 HCU_GENERIC_KV_CACHE_DTYPE_CHOICES = {"auto", "bf16", "bfloat16", "fp8_e5m2"}
 HCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES = {
-    *HCU_GENERIC_KV_CACHE_DTYPE_CHOICES, "fp8_e4m3"
+    *HCU_GENERIC_KV_CACHE_DTYPE_CHOICES,
+    "fp8_e4m3",
 }
 HCU_DSA_KV_CACHE_DTYPE_CHOICES = {"auto", "bf16", "bfloat16", "fp8_e4m3"}
 HCU_DSV4_KV_CACHE_DTYPE_CHOICES = HCU_DSA_KV_CACHE_DTYPE_CHOICES
@@ -377,7 +378,13 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
+    "auto",
+    "deepgemm",
+    "cutedsl",
+    "aiter",
+    "lightop",
+]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1785,7 +1792,7 @@ class ServerArgs:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm, LightOp on HCU), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only), 'lightop' (HCU only).",
             choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
@@ -1826,10 +1833,14 @@ class ServerArgs:
         NS("exec.kernel"),
     ] = "auto"
     pack_paged_kv_to_varlen_min_kv_tokens: A[
-        int, "Minimum total KV tokens for the packed paged-KV auto policy.", NS("exec.kernel")
+        int,
+        "Minimum total KV tokens for the packed paged-KV auto policy.",
+        NS("exec.kernel"),
     ] = 16384
     pack_paged_kv_to_varlen_min_q_tokens: A[
-        int, "Minimum query tokens for the packed paged-KV auto policy.", NS("exec.kernel")
+        int,
+        "Minimum query tokens for the packed paged-KV auto policy.",
+        NS("exec.kernel"),
     ] = 8192
     mamba_backend: A[
         str,
