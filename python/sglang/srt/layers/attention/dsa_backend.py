@@ -51,6 +51,7 @@ from sglang.srt.layers.attention.dsa.flashmla_backend import (
     DSAFlashMLAMetadata,
     can_fuse_flashmla_metadata,
     get_flashmla_op,
+    refresh_flashmla_metadata,
     wrap_flashmla_metadata_result,
 )
 from sglang.srt.layers.attention.dsa.forward_batch_utils import (
@@ -1281,14 +1282,14 @@ class DeepseekSparseAttnBackend(
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
             if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs + 1))
-                flashmla_metadata.copy_(
+                flashmla_metadata = refresh_flashmla_metadata(
+                    self.decode_cuda_graph_metadata["flashmla_metadata"],
                     self._compute_flashmla_metadata(
                         cache_seqlens=dsa_cache_seqlens_int32,
                         seq_len_q=1,
-                    )
+                    ),
+                    slice(0, bs + 1),
+                    is_hcu=_is_hcu,
                 )
             else:
                 flashmla_metadata = None
@@ -1343,15 +1344,14 @@ class DeepseekSparseAttnBackend(
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
             if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-
-                flashmla_metadata.copy_(
+                flashmla_metadata = refresh_flashmla_metadata(
+                    self.decode_cuda_graph_metadata["flashmla_metadata"],
                     self._compute_flashmla_metadata(
                         cache_seqlens=dsa_cache_seqlens_int32,
                         seq_len_q=1,
-                    )
+                    ),
+                    slice(0, bs * self.speculative_num_draft_tokens + 1),
+                    is_hcu=_is_hcu,
                 )
             else:
                 flashmla_metadata = None
@@ -1697,15 +1697,17 @@ class DeepseekSparseAttnBackend(
             assert metadata.real_page_table is metadata.page_table_1
 
         if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = metadata.flashmla_metadata.slice(
-                slice(0, seqlens_expanded_size + 1)
-            )
-            flashmla_metadata.copy_(
+            flashmla_metadata = refresh_flashmla_metadata(
+                metadata.flashmla_metadata,
                 self._compute_flashmla_metadata(
                     cache_seqlens=dsa_cache_seqlens,
                     seq_len_q=1,
-                )
+                ),
+                slice(0, seqlens_expanded_size + 1),
+                is_hcu=_is_hcu,
             )
+            if _is_hcu:
+                object.__setattr__(metadata, "flashmla_metadata", flashmla_metadata)
 
         self.forward_metadata = metadata
 
@@ -1850,11 +1852,26 @@ class DeepseekSparseAttnBackend(
                     precomputed.real_page_table
                 )
 
-            # Copy FlashMLA metadata in fallback path
-            if precomputed.flashmla_metadata is not None:
-                size = precomputed.seqlens_expanded_size
-                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-                flashmla_metadata.copy_(precomputed.flashmla_metadata)
+        if precomputed.flashmla_metadata is not None and (
+            _is_hcu or not fused_kernel_succeeded
+        ):
+            size = precomputed.seqlens_expanded_size
+            flashmla_source = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=precomputed.dsa_cache_seqlens,
+                    seq_len_q=1,
+                )
+                if _is_hcu
+                else precomputed.flashmla_metadata
+            )
+            flashmla_metadata = refresh_flashmla_metadata(
+                metadata.flashmla_metadata,
+                flashmla_source,
+                slice(0, size + 1),
+                is_hcu=_is_hcu,
+            )
+            if _is_hcu:
+                object.__setattr__(metadata, "flashmla_metadata", flashmla_metadata)
 
         # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
         # this replay (the captured graph holds stale data otherwise, which can
@@ -3640,11 +3657,31 @@ class DeepseekSparseAttnMultiStepBackend:
                     and not fused_flashmla_metadata
                 ):
                     size = precomputed.seqlens_expanded_size
-                    for metadata in (metadata0, metadata1, metadata2):
-                        flashmla_metadata = metadata.flashmla_metadata.slice(
-                            slice(0, size + 1)
+                    for backend, metadata in zip(
+                        self.attn_backends[:3],
+                        (metadata0, metadata1, metadata2),
+                        strict=True,
+                    ):
+                        flashmla_source = (
+                            backend._compute_flashmla_metadata(
+                                cache_seqlens=precomputed.dsa_cache_seqlens,
+                                seq_len_q=1,
+                            )
+                            if _is_hcu
+                            else precomputed.flashmla_metadata
                         )
-                        flashmla_metadata.copy_(precomputed.flashmla_metadata)
+                        flashmla_metadata = refresh_flashmla_metadata(
+                            metadata.flashmla_metadata,
+                            flashmla_source,
+                            slice(0, size + 1),
+                            is_hcu=_is_hcu,
+                        )
+                        if _is_hcu:
+                            object.__setattr__(
+                                metadata,
+                                "flashmla_metadata",
+                                flashmla_metadata,
+                            )
 
                 # Copy remaining backends one by one (if > 3 backends)
                 for i in range(3, self.speculative_num_steps - 1):
