@@ -120,6 +120,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -131,12 +132,18 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_cuda_graph_runner() -> bool:
+    """Whether this platform uses the CUDA-style EAGLE graph runners."""
+    return _is_cuda or _is_hcu or _is_musa
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -436,9 +443,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TokenspeedMLABackend,
             FlashInferAttnBackend,
         ]
-        if _is_cuda or _is_musa:
-            # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
-            # deep_gemm and the rest of the sparse-attention stack at import time.
+        if _supports_cuda_graph_runner():
+            # Import lazily so unsupported platforms do not pull in the sparse
+            # attention stack at module import time.
             from sglang.srt.layers.attention.dsa_backend import (
                 DeepseekSparseAttnBackend,
             )
@@ -461,8 +468,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tuple(graph_supported_backend_types),
         )
         supports_cuda_draft_extend_graph = (
-            _is_cuda or _is_musa
-        ) and graph_supported_backend
+            _supports_cuda_graph_runner() and graph_supported_backend
+        )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if (
