@@ -1826,7 +1826,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
-            pass
+            # Fake PD has no prefill producer. Supply a shape-correct logical
+            # DSA seed only for MTP index-share benchmarking; the normal
+            # request/spec/remap path localizes it for the decode allocator.
+            dsa_seed_dim = self.metadata_buffers.output_dsa_topk_indices_dim
+            if not self.spec_algorithm.is_none() and dsa_seed_dim > 0:
+                output_dsa_topk_indices = torch.zeros(
+                    dsa_seed_dim,
+                    dtype=torch.int32,
+                    device=output_topk_index.device,
+                )
         elif actual_room == 0:
             # Should never happen: _poll_with_metadata_gate already confirmed
             # readiness on all TP ranks. Abort deterministically to avoid
