@@ -2,13 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
@@ -30,6 +32,47 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_fake_transfer_supplies_logical_dsa_seed_for_mtp(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            output_dsa_topk_indices_dim=3,
+        )
+        req = SimpleNamespace(
+            rid="fake-mtp-seed",
+            bootstrap_host=None,
+            bootstrap_room=7,
+            output_ids=[],
+            pd_rebootstrap_forced_output_id=None,
+            return_logprob=False,
+            return_sampling_mask=False,
+            time_stats=MagicMock(),
+        )
+        receiver = FakeReceiver()
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            metadata_buffer_index=0,
+            is_rebootstrap=False,
+        )
+
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.metadata_buffers = buffers
+        queue.spec_algorithm = MagicMock()
+        queue.spec_algorithm.is_none.return_value = False
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(disaggregation_transfer_backend="fake")
+        )
+        queue._commit_hicache_local_restore_to_req = MagicMock()
+
+        queue._commit_transfer_to_req(decode_req)
+
+        self.assertEqual(req.output_dsa_topk_indices.tolist(), [0, 0, 0])
+        self.assertEqual(req.output_dsa_topk_indices.dtype, torch.int32)
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         page_size = 128
         fill_len = 574
