@@ -840,6 +840,9 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
+    # Opt-in gfx938 persistent paged-MQA path provided by LightOp.
+    SGLANG_DSA_HCU_PERSISTENT_MQA_FASTPATH = EnvBool(False)
+    SGLANG_DSA_HCU_PERSISTENT_MQA_CTAS = EnvInt(0)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
