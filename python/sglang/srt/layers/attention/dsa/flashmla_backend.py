@@ -57,6 +57,28 @@ def can_fuse_flashmla_metadata(
     )
 
 
+def refresh_flashmla_metadata(
+    destination: DSAFlashMLAMetadata,
+    source: DSAFlashMLAMetadata,
+    sli,
+    *,
+    is_hcu: bool,
+) -> DSAFlashMLAMetadata:
+    """Return the metadata wrapper the next forward must retain.
+
+    Tensor metadata is refreshed in-place so captured data pointers stay
+    stable. HCU scheduler objects carry shape-bound mutable state, so callers
+    must retain the fresh source object instead of mutating a sliced temporary
+    wrapper that the forward never reads.
+    """
+
+    if is_hcu:
+        return source
+    destination_view = destination.slice(sli)
+    destination_view.copy_(source)
+    return destination_view
+
+
 def wrap_flashmla_metadata_result(
     result: tuple[Any, Optional[torch.Tensor]], *, is_hcu: bool
 ) -> DSAFlashMLAMetadata:
