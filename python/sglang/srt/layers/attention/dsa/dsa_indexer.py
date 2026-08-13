@@ -433,7 +433,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
 
-        hadamard_scale = self.hidden_size**-0.5
+        hadamard_scale = self.head_dim**-0.5
         return lightop_kvcache.fuse_qk_quant_and_store_index_k_cache(
             query,
             key,
