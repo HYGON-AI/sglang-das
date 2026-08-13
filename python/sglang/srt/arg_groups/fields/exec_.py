@@ -814,6 +814,15 @@ class ExecMoe(msgspec.Struct):
         Optional[Literal["static", "dynamic", "fake", "lp"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
     ] = None
+    ep_static_dispatch_policy: A[
+        Literal["nearest", "locality_fair"],
+        "Choose the replica-selection policy for static expert dispatch. "
+        "`nearest` preserves the legacy nearest-replica behavior. "
+        "`locality_fair` builds a deterministic source-rank-to-replica map "
+        "that preserves same-GPU, then same-node locality while balancing "
+        "static bindings among equally local replicas; it does not rebalance "
+        "live token traffic.",
+    ] = "nearest"
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
