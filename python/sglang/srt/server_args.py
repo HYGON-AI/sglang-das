@@ -220,7 +220,8 @@ HCU_DSA_PREFILL_BACKEND_CHOICES = {"flashmla_sparse", "flashmla_kv", "flashmla_a
 HCU_DSA_DECODE_BACKEND_CHOICES = {"flashmla_sparse", "flashmla_kv"}
 HCU_GENERIC_KV_CACHE_DTYPE_CHOICES = {"auto", "bf16", "bfloat16", "fp8_e5m2"}
 HCU_NATIVE_FP8_KV_CACHE_DTYPE_CHOICES = {
-    *HCU_GENERIC_KV_CACHE_DTYPE_CHOICES, "fp8_e4m3"
+    *HCU_GENERIC_KV_CACHE_DTYPE_CHOICES,
+    "fp8_e4m3",
 }
 HCU_DSA_KV_CACHE_DTYPE_CHOICES = {"auto", "bf16", "bfloat16", "fp8_e4m3"}
 HCU_DSV4_KV_CACHE_DTYPE_CHOICES = HCU_DSA_KV_CACHE_DTYPE_CHOICES
@@ -1826,10 +1827,14 @@ class ServerArgs:
         NS("exec.kernel"),
     ] = "auto"
     pack_paged_kv_to_varlen_min_kv_tokens: A[
-        int, "Minimum total KV tokens for the packed paged-KV auto policy.", NS("exec.kernel")
+        int,
+        "Minimum total KV tokens for the packed paged-KV auto policy.",
+        NS("exec.kernel"),
     ] = 16384
     pack_paged_kv_to_varlen_min_q_tokens: A[
-        int, "Minimum query tokens for the packed paged-KV auto policy.", NS("exec.kernel")
+        int,
+        "Minimum query tokens for the packed paged-KV auto policy.",
+        NS("exec.kernel"),
     ] = 8192
     mamba_backend: A[
         str,
@@ -2386,6 +2391,16 @@ class ServerArgs:
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
+    ep_static_dispatch_policy: A[
+        Literal["nearest", "locality_fair"],
+        "Choose the replica-selection policy for static expert dispatch. "
+        "`nearest` preserves the legacy nearest-replica behavior. "
+        "`locality_fair` builds a deterministic source-rank-to-replica map "
+        "that preserves same-GPU, then same-node locality while balancing "
+        "static bindings among equally local replicas; it does not rebalance "
+        "live token traffic.",
+        NS("exec.moe"),
+    ] = "nearest"
     init_expert_location: A[str, "Initial location of EP experts.", NS("exec.moe")] = (
         "trivial"
     )
@@ -6878,6 +6893,12 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
+            raise ValueError(
+                "--ep-static-dispatch-policy must be one of "
+                "'nearest' or 'locality_fair'."
+            )
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
@@ -6893,6 +6914,16 @@ class ServerArgs:
         ):
             self.ep_dispatch_algorithm = (
                 "dynamic" if needs_rank_invariant_dispatch else "static"
+            )
+
+        if (
+            self.ep_static_dispatch_policy != "nearest"
+            and self.ep_dispatch_algorithm != "static"
+        ):
+            raise ValueError(
+                "--ep-static-dispatch-policy locality_fair requires "
+                "--ep-dispatch-algorithm static. It configures a startup-time "
+                "source-rank-to-replica map, not dynamic token balancing."
             )
 
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
