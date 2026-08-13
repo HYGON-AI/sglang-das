@@ -66,6 +66,12 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.flashmla_backend import (
+    DSAFlashMLAMetadata,
+    can_fuse_flashmla_metadata,
+    get_flashmla_op,
+    wrap_flashmla_metadata_result,
+)
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
@@ -228,24 +234,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
-
-
-@dataclass(frozen=True)
-class DSAFlashMLAMetadata:
-    """Metadata only needed by FlashMLA"""
-
-    flashmla_metadata: torch.Tensor
-    num_splits: torch.Tensor
-
-    def slice(self, sli):
-        return DSAFlashMLAMetadata(
-            flashmla_metadata=self.flashmla_metadata,
-            num_splits=self.num_splits[sli],
-        )
-
-    def copy_(self, other: DSAFlashMLAMetadata):
-        self.flashmla_metadata.copy_(other.flashmla_metadata)
-        self.num_splits.copy_(other.num_splits)
 
 
 @dataclass(frozen=True)
@@ -2554,16 +2542,21 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        flash_mla_sparse_fwd = get_flashmla_op("flash_mla_sparse_fwd", is_hcu=_is_hcu)
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
-
-        need_padding = num_heads % required_padding != 0
+        # The CUDA kernels require Hopper/Blackwell head padding. HCU's
+        # external FlashMLA implementation accepts the native TP head count.
+        if _is_hcu:
+            required_padding = num_heads
+            need_padding = False
+        else:
+            # Determine required padding based on GPU architecture (use cached value)
+            required_padding = 128 if self.device_sm_major >= 10 else 64
+            need_padding = num_heads % required_padding != 0
 
         if need_padding:
             assert required_padding % num_heads == 0, (
@@ -2968,7 +2961,9 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        flash_mla_with_kvcache = get_flashmla_op(
+            "flash_mla_with_kvcache", is_hcu=_is_hcu
+        )
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
@@ -3722,24 +3717,22 @@ class DeepseekSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from sgl_kernel.flash_mla import get_mla_metadata
+        get_mla_metadata = get_flashmla_op("get_mla_metadata", is_hcu=_is_hcu)
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
-        flashmla_metadata, num_splits = get_mla_metadata(
-            cache_seqlens=cache_seqlens,
-            # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
-            #      but the name looks like need seq_len_q?
-            num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
-            num_heads_k=1,
-            num_heads_q=num_heads_q,
-            is_fp8_kvcache=True,
-            topk=self.dsa_index_topk,
-        )
-
-        return DSAFlashMLAMetadata(
-            flashmla_metadata=flashmla_metadata,
-            num_splits=num_splits,
+        return wrap_flashmla_metadata_result(
+            get_mla_metadata(
+                cache_seqlens=cache_seqlens,
+                # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+                #      but the name looks like need seq_len_q?
+                num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
+                num_heads_k=1,
+                num_heads_q=num_heads_q,
+                is_fp8_kvcache=True,
+                topk=self.dsa_index_topk,
+            ),
+            is_hcu=_is_hcu,
         )
 
 
@@ -3837,6 +3830,16 @@ class DeepseekSparseAttnMultiStepBackend:
                 for i in range(3):
                     self.attn_backends[i].set_dsa_prefill_impl(forward_batch=None)
 
+                # HCU FlashMLA metadata may be a backend object rather than a
+                # tensor. Fuse it only when every source/destination is a
+                # plain tensor; otherwise copy it with its backend wrapper.
+                fused_flashmla_metadata = can_fuse_flashmla_metadata(
+                    precomputed.flashmla_metadata,
+                    metadata0.flashmla_metadata,
+                    metadata1.flashmla_metadata,
+                    metadata2.flashmla_metadata,
+                )
+
                 # Prepare FlashMLA tensors if needed
                 flashmla_num_splits_src = None
                 flashmla_metadata_src = None
@@ -3847,7 +3850,7 @@ class DeepseekSparseAttnMultiStepBackend:
                 flashmla_metadata_dst1 = None
                 flashmla_metadata_dst2 = None
 
-                if precomputed.flashmla_metadata is not None:
+                if fused_flashmla_metadata:
                     flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
                     flashmla_metadata_src = (
                         precomputed.flashmla_metadata.flashmla_metadata
@@ -3920,6 +3923,17 @@ class DeepseekSparseAttnMultiStepBackend:
                     precomputed.max_len,
                     precomputed.seqlens_expanded_size,
                 )
+
+                if (
+                    precomputed.flashmla_metadata is not None
+                    and not fused_flashmla_metadata
+                ):
+                    size = precomputed.seqlens_expanded_size
+                    for metadata in (metadata0, metadata1, metadata2):
+                        flashmla_metadata = metadata.flashmla_metadata.slice(
+                            slice(0, size + 1)
+                        )
+                        flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
                 for backend, metadata in zip(
                     self.attn_backends[:3],

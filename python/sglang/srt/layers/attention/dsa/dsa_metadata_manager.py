@@ -12,6 +12,9 @@ from sglang.kernels.ops.attention.dsa_metadata import (
     fused_dsa_target_verify_metadata,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.flashmla_backend import (
+    can_fuse_flashmla_metadata,
+)
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -84,8 +87,14 @@ class DSAMetadataManagementMixin:
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
 
-        # Use fused CUDA kernel for all copy operations
-        if not _is_hip:
+        # HCU FlashMLA can carry scheduler state in an object. The tensor-only
+        # fused copy accepts FlashMLA metadata only when both sides are tensors.
+        flashmla_metadata_can_fuse = precomputed.flashmla_metadata is None or (
+            can_fuse_flashmla_metadata(
+                precomputed.flashmla_metadata, metadata.flashmla_metadata
+            )
+        )
+        if not _is_hip and flashmla_metadata_can_fuse:
             try:
                 from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
