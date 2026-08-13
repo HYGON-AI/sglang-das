@@ -23,6 +23,9 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+    effective_forward_mode,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -403,15 +406,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # the decode skip is not decided per-step during capture; it is driven by
         # which graph variant is being captured instead.
         fb = forward_batch
+        forward_mode = effective_forward_mode(fb)
 
         # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
-        if fb.forward_mode.is_extend_without_speculative():
+        if forward_mode.is_extend_without_speculative():
             if fb.seq_lens_cpu is None or fb.seq_lens_cpu.numel() == 0:
                 return False
             return int(fb.seq_lens_cpu.max().item()) <= self.index_topk
 
         # Decode/idle.
-        if fb.forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle():
             # Decode k-only skip (both the captured dual-graph "dense" variant
             # and the eager per-step skip below) is currently HIP-only. On CUDA
             # this common code keeps the original behavior (decode never skips
@@ -817,10 +821,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        forward_mode = effective_forward_mode(forward_batch)
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
@@ -836,14 +838,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_mode.is_draft_extend_v2()
         )
         dsl_expand_factor, dsl_atom = 1, 1
-        if (
-            use_cute_dsl
-            and forward_batch.forward_mode.is_target_verify()
-            and next_n >= 2
-        ):
+        if use_cute_dsl and forward_mode.is_target_verify() and next_n >= 2:
             assert pick_dsl_expand is not None, "CuTe DSL paged MQA is CUDA-only."
             dsl_expand_factor, dsl_atom = pick_dsl_expand(
                 next_n,
@@ -857,7 +855,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
-            and forward_batch.forward_mode.is_target_verify()
+            and forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None
             and ctx_2d.shape == (B, next_n)
@@ -908,7 +906,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
                 B=B,
                 next_n=next_n,
-                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                is_target_verify=forward_mode.is_target_verify(),
                 dsl_expand_factor=dsl_expand_factor,
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
@@ -1023,7 +1021,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert effective_forward_mode(forward_batch).is_extend_without_speculative()
 
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
@@ -1235,9 +1233,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         #   - topk_result: pre-allocated padded buffer to fill in place (a downstream
         #     captured graph reads it at a fixed address). None => return a fresh,
         #     naturally-sized tensor.
+        forward_mode = effective_forward_mode(forward_batch)
         assert (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            or forward_batch.forward_mode.is_decode_or_idle()
+            forward_mode.is_extend_without_speculative()
+            or forward_mode.is_decode_or_idle()
         )
         x_meta = x[0] if isinstance(x, tuple) else x
 
@@ -1598,6 +1597,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
+        # MLP-sync can temporarily expose decode/verify/draft batches as
+        # EXTEND. Indexer routing must stay tied to the algorithmic mode.
+        forward_mode = effective_forward_mode(forward_batch)
+
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
@@ -1674,7 +1677,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
-        elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
+        elif enable_dual_stream and forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if not self.use_dsa_indexer_fusion:
@@ -1823,9 +1826,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     return maybe_capture_indexer_topk(layer_id, topk_result)
 
             if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata

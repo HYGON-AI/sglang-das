@@ -53,6 +53,9 @@ from sglang.srt.layers.attention.dsa.flashmla_backend import (
     get_flashmla_op,
     wrap_flashmla_metadata_result,
 )
+from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+    effective_forward_mode,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -765,7 +768,7 @@ class DeepseekSparseAttnBackend(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_cpu=seq_lens_cpu,
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=effective_forward_mode(forward_batch),
             spec_info=forward_batch.spec_info,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
@@ -775,8 +778,9 @@ class DeepseekSparseAttnBackend(
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
+        forward_mode = effective_forward_mode(forward_batch)
 
-        if forward_batch.forward_mode.is_target_verify():
+        if forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
         else:
             draft_token_num = 0
@@ -805,16 +809,14 @@ class DeepseekSparseAttnBackend(
         dsa_impl_for_batch = (
             self.dsa_decode_impl
             if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
         use_flashmla_kv = (not self.use_mha) and dsa_impl_for_batch == "flashmla_kv"
-        topk_transform_method = self.get_topk_transform_method(
-            forward_batch.forward_mode
-        )
+        topk_transform_method = self.get_topk_transform_method(forward_mode)
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -824,12 +826,12 @@ class DeepseekSparseAttnBackend(
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
 
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
-        elif forward_batch.forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify():
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
                 0,
@@ -850,7 +852,7 @@ class DeepseekSparseAttnBackend(
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
-        elif forward_batch.forward_mode.is_draft_extend_v2():
+        elif forward_mode.is_draft_extend_v2():
             if forward_batch.extend_prefix_lens_cpu is None:
                 assert forward_batch.extend_prefix_lens is not None
                 forward_batch.extend_prefix_lens_cpu = (
@@ -883,7 +885,7 @@ class DeepseekSparseAttnBackend(
                 sum(extend_seq_lens_cpu),
                 self.speculative_num_draft_tokens,
             )
-            if forward_batch.forward_mode.is_draft_extend_v2():
+            if forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
                 # tokens upfront. All requests extend by the same fixed
                 # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
@@ -897,7 +899,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
-        elif forward_batch.forward_mode.is_extend():
+        elif forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
@@ -999,7 +1001,7 @@ class DeepseekSparseAttnBackend(
                     extend_seq_lens,
                 )
         else:
-            assert False, f"Unsupported {forward_batch.forward_mode = }"
+            assert False, f"Unsupported {forward_mode = }"
 
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
             forward_batch, bs_idx_cpu
@@ -1018,12 +1020,12 @@ class DeepseekSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
         if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
-                forward_batch.forward_mode,
+                forward_mode,
                 cache_seqlens_int32,
                 seqlens_expanded,
                 forward_batch.batch_size,
@@ -1076,7 +1078,7 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         bs_idx: Optional[List[int]] = None,
     ):
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        if not effective_forward_mode(forward_batch).is_extend_without_speculative():
             return None, None
         if forward_batch.batch_size == 0 or (bs_idx is not None and len(bs_idx) == 0):
             empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
@@ -1114,7 +1116,7 @@ class DeepseekSparseAttnBackend(
                 (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
             )
             kv_len = seq_len
-            if forward_batch.forward_mode.is_target_verify():
+            if effective_forward_mode(forward_batch).is_target_verify():
                 kv_len += self.speculative_num_draft_tokens
             seq_lens_expanded = torch.arange(
                 kv_len - extend_seq_len + 1,
@@ -1897,11 +1899,13 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        forward_mode = effective_forward_mode(forward_batch)
         dsa_impl = (
             self.dsa_decode_impl
             if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
@@ -1921,7 +1925,7 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
-                is_prefill=True,
+                is_prefill=not forward_mode.is_decode_or_idle(),
             )
 
         if k is not None:
@@ -1970,9 +1974,7 @@ class DeepseekSparseAttnBackend(
             q_rope = q_all[:, :, layer.v_head_dim :]
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_topk_transform_method(
-            forward_batch.forward_mode
-        )
+        topk_transform_method = self.get_topk_transform_method(forward_mode)
 
         if self.use_fused_topk:
             if topk_indices is not None:
@@ -2003,8 +2005,8 @@ class DeepseekSparseAttnBackend(
                     page_size=1,
                     output_num_tokens=q_nope.shape[0],
                     page_table_is_expanded=(
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
+                        forward_mode.is_target_verify()
+                        or forward_mode.is_draft_extend_v2()
                     ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
@@ -2477,7 +2479,8 @@ class DeepseekSparseAttnBackend(
             return False
         # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
         # target-verify and draft-extend, which use dsa_decode_impl anyway).
-        if forward_batch.forward_mode != ForwardMode.EXTEND:
+        forward_mode = effective_forward_mode(forward_batch)
+        if forward_mode != ForwardMode.EXTEND:
             return False
         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
         if self.use_mha:
@@ -2490,10 +2493,7 @@ class DeepseekSparseAttnBackend(
             return False
         if is_dsa_enable_prefill_cp():
             return False
-        if (
-            self.get_topk_transform_method(forward_batch.forward_mode)
-            != TopkTransformMethod.RAGGED
-        ):
+        if self.get_topk_transform_method(forward_mode) != TopkTransformMethod.RAGGED:
             return False
         # Mirror the helper's head-padding compatibility check.
         if num_heads % 64 != 0 and 64 % num_heads != 0:
@@ -3218,8 +3218,8 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
                 output_num_tokens=q.shape[0],
                 page_table_is_expanded=(
-                    forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend_v2()
+                    effective_forward_mode(forward_batch).is_target_verify()
+                    or effective_forward_mode(forward_batch).is_draft_extend_v2()
                 ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
@@ -3328,7 +3328,8 @@ class DeepseekSparseAttnBackend(
             # guarantee correctness.
             self.use_mha = False
         elif (
-            forward_batch and forward_batch.forward_mode.is_extend_without_speculative()
+            forward_batch
+            and effective_forward_mode(forward_batch).is_extend_without_speculative()
         ):
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
@@ -3360,7 +3361,7 @@ class DeepseekSparseAttnBackend(
                 if (
                     is_blackwell()
                     and forward_batch is not None
-                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and effective_forward_mode(forward_batch) == ForwardMode.EXTEND
                 ):
                     total_kv_tokens = forward_batch.seq_lens_sum
                     total_q_tokens = forward_batch.extend_num_tokens
@@ -3398,15 +3399,13 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        forward_mode = effective_forward_mode(forward_batch)
         force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            self.hisparse_coordinator is not None and forward_mode.is_decode_or_idle()
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(
-                forward_batch.forward_mode
-            ),
+            topk_transform_method=self.get_topk_transform_method(forward_mode),
             topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
