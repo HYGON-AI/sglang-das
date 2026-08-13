@@ -251,7 +251,8 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
 
     def test_fused_qk_quant_store_keeps_lightop_scale_contract(self):
         indexer = object.__new__(Indexer)
-        indexer.hidden_size = 256
+        indexer.hidden_size = 6144
+        indexer.head_dim = 128
         indexer.softmax_scale = 0.125
         pool = SimpleNamespace(
             page_size=64,
@@ -281,7 +282,7 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
             )
 
         self.assertEqual(result, expected)
-        hadamard_scale = 256**-0.5
+        hadamard_scale = 128**-0.5
         lightop_kvcache.fuse_qk_quant_and_store_index_k_cache.assert_called_once_with(
             sentinel.query,
             sentinel.key,
