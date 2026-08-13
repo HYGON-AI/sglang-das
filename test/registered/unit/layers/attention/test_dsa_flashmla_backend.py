@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.dsa.flashmla_backend import (
     DSAFlashMLAMetadata,
     can_fuse_flashmla_metadata,
     get_flashmla_op,
+    refresh_flashmla_metadata,
     wrap_flashmla_metadata_result,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -86,6 +87,76 @@ class TestDSAFlashMLABackend(CustomTestCase):
         )
         self.assertTrue(torch.equal(destination.num_splits, source.num_splits))
         self.assertTrue(can_fuse_flashmla_metadata(source, destination))
+
+    def test_hcu_refresh_returns_fresh_scheduler_object(self):
+        captured_scheduler = SimpleNamespace(
+            have_initialized=True,
+            config="batch-6",
+            tile_scheduler_metadata=object(),
+            num_splits=object(),
+        )
+        fresh_scheduler = SimpleNamespace(
+            have_initialized=False,
+            config=None,
+            tile_scheduler_metadata=None,
+            num_splits=None,
+        )
+        destination = DSAFlashMLAMetadata(captured_scheduler, None)
+        source = DSAFlashMLAMetadata(fresh_scheduler, None)
+
+        refreshed = refresh_flashmla_metadata(
+            destination,
+            source,
+            slice(0, 6),
+            is_hcu=True,
+        )
+
+        self.assertIs(refreshed, source)
+        self.assertIs(refreshed.flashmla_metadata, fresh_scheduler)
+        self.assertIs(destination.flashmla_metadata, captured_scheduler)
+
+    def test_tensor_refresh_keeps_destination_storage(self):
+        destination = DSAFlashMLAMetadata(
+            flashmla_metadata=torch.zeros(2, dtype=torch.int32),
+            num_splits=torch.zeros(3, dtype=torch.int32),
+        )
+        source = DSAFlashMLAMetadata(
+            flashmla_metadata=torch.tensor([1, 2], dtype=torch.int32),
+            num_splits=torch.tensor([3, 4], dtype=torch.int32),
+        )
+        destination_metadata = destination.flashmla_metadata
+        destination_splits = destination.num_splits
+
+        refreshed = refresh_flashmla_metadata(
+            destination,
+            source,
+            slice(0, 2),
+            is_hcu=False,
+        )
+
+        self.assertIs(refreshed.flashmla_metadata, destination_metadata)
+        self.assertEqual(refreshed.num_splits.data_ptr(), destination_splits.data_ptr())
+        self.assertTrue(
+            torch.equal(refreshed.flashmla_metadata, source.flashmla_metadata)
+        )
+        self.assertTrue(torch.equal(refreshed.num_splits, source.num_splits))
+
+    def test_hcu_refresh_does_not_share_schedulers_across_steps(self):
+        destination = DSAFlashMLAMetadata(SimpleNamespace(), None)
+        first = DSAFlashMLAMetadata(SimpleNamespace(have_initialized=False), None)
+        second = DSAFlashMLAMetadata(SimpleNamespace(have_initialized=False), None)
+
+        first_refreshed = refresh_flashmla_metadata(
+            destination, first, slice(0, 6), is_hcu=True
+        )
+        second_refreshed = refresh_flashmla_metadata(
+            destination, second, slice(0, 6), is_hcu=True
+        )
+
+        self.assertIsNot(
+            first_refreshed.flashmla_metadata,
+            second_refreshed.flashmla_metadata,
+        )
 
 
 if __name__ == "__main__":
