@@ -15,11 +15,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import (
+    get_nsa_full_indexer_layer_ids,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
     is_deepseek_v4,
@@ -76,14 +77,36 @@ _is_hcu = is_hcu()
 
 
 class ModelRunnerKVCacheMixin:
+    def get_nsa_indexer_layer_ids_for_kv_pool(
+        self: ModelRunner,
+    ) -> Optional[list[int]]:
+        """Resolve layers that need physical Index-K storage in the built-in pool.
+
+        MTP layers keep their local Index-K because a missing share seed falls
+        back to running the Indexer. Out-of-tree pools keep their existing ABI.
+        """
+        if self.is_draft_worker:
+            return list(range(self.start_layer, self.end_layer))
+
+        from sglang.srt.platforms import current_platform
+
+        if (
+            current_platform.is_out_of_tree()
+            or self.server_args.attention_backend == "ascend"
+        ):
+            return None
+
+        indexer_layer_ids = get_nsa_full_indexer_layer_ids(
+            self.model_config.hf_config,
+            self.start_layer,
+            self.end_layer,
+        )
+        return indexer_layer_ids
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            cell_size = self.calculate_mla_kv_cache_dim() * num_layers * kv_size
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -102,6 +125,10 @@ class ModelRunnerKVCacheMixin:
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                indexer_layer_ids = self.get_nsa_indexer_layer_ids_for_kv_pool()
+                num_indexer_layers = (
+                    num_layers if indexer_layer_ids is None else len(indexer_layer_ids)
+                )
                 use_bf16_index_cache = _is_hcu and (
                     self.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
                     or not is_hcu_native_fp8_supported()
@@ -117,7 +144,19 @@ class ModelRunnerKVCacheMixin:
                     element_size = torch._utils._element_size(
                         NSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                indexer_ratio = 1
+                if self.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    indexer_ratio = parse_hisparse_config(
+                        self.server_args
+                    ).host_to_device_ratio
+                cell_size += int(
+                    indexer_size_per_token
+                    * num_indexer_layers
+                    * element_size
+                    * indexer_ratio
+                )
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -615,6 +654,7 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                indexer_layer_ids=self.get_nsa_indexer_layer_ids_for_kv_pool(),
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:

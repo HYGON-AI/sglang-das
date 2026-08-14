@@ -30,7 +30,11 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    get_nsa_full_indexer_layer_ids,
+    is_deepseek_nsa,
+)
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -752,6 +756,42 @@ class CommonKVManager(BaseKVManager):
         # Fast path: both sides use exactly the same PP layout
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
             return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
+
+        if state_type == StateType.NSA:
+            hf_config = getattr(self.model_config, "hf_config", None)
+            if hf_config is not None and is_deepseek_nsa(hf_config):
+                end_layer = self.kv_args.prefill_end_layer
+                if end_layer is None:
+                    raise ValueError(
+                        "prefill_end_layer is required for compact NSA state transfer"
+                    )
+
+                full_layer_ids = get_nsa_full_indexer_layer_ids(hf_config)
+                start_index = sum(
+                    layer_id < self.kv_args.prefill_start_layer
+                    for layer_id in full_layer_ids
+                )
+                end_index = sum(layer_id < end_layer for layer_id in full_layer_ids)
+                src_main_layers = end_index - start_index
+                src_draft_layers = len(src_kv_ptrs) - src_main_layers
+                if src_draft_layers < 0:
+                    raise ValueError(
+                        "NSA PP state pointer count is smaller than the number of "
+                        "Full Indexer layers in this stage"
+                    )
+
+                sliced_dst_kv_ptrs = list(dst_kv_ptrs[start_index:end_index])
+                if src_draft_layers:
+                    draft_start = len(full_layer_ids)
+                    sliced_dst_kv_ptrs.extend(
+                        dst_kv_ptrs[draft_start : draft_start + src_draft_layers]
+                    )
+                if len(sliced_dst_kv_ptrs) != len(src_kv_ptrs):
+                    raise ValueError(
+                        "NSA PP state pointer mismatch after Full Indexer mapping: "
+                        f"src={len(src_kv_ptrs)}, dst={len(sliced_dst_kv_ptrs)}"
+                    )
+                return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:

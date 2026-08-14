@@ -718,7 +718,10 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if (
+            isinstance(self.kv_cache, NSATokenToKVPool)
+            and self.kv_cache.indexer_layer_num > 0
+        ):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,

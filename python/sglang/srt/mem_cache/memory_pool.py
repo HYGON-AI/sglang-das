@@ -32,7 +32,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -2148,6 +2148,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        indexer_layer_ids: Optional[Sequence[int]] = None,
     ):
 
         override_dim = (
@@ -2171,6 +2172,29 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        layer_range = range(self.start_layer, self.start_layer + self.layer_num)
+        if indexer_layer_ids is None:
+            resolved_indexer_layer_ids = tuple(layer_range)
+        else:
+            if len(indexer_layer_ids) != len(set(indexer_layer_ids)):
+                raise ValueError("indexer_layer_ids must not contain duplicates")
+            resolved_indexer_layer_ids = tuple(sorted(indexer_layer_ids))
+            invalid_layer_ids = [
+                layer_id
+                for layer_id in resolved_indexer_layer_ids
+                if layer_id not in layer_range
+            ]
+            if invalid_layer_ids:
+                raise ValueError(
+                    f"indexer_layer_ids {invalid_layer_ids} are outside local layer "
+                    f"range [{self.start_layer}, "
+                    f"{self.start_layer + self.layer_num})"
+                )
+        self.indexer_layer_ids = resolved_indexer_layer_ids
+        self.indexer_layer_num = len(self.indexer_layer_ids)
+        self.indexer_layer_id_to_index = {
+            layer_id: index for index, layer_id in enumerate(self.indexer_layer_ids)
+        }
         if index_buf_size is None:
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
@@ -2221,7 +2245,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=device,
                     )
-                    for _ in range(layer_num)
+                    for _ in range(self.indexer_layer_num)
                 ]
             else:
                 self.index_k_buffer = [
@@ -2235,26 +2259,45 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         dtype=self.index_k_buffer_dtype,
                         device=device,
                     )
-                    for _ in range(layer_num)
+                    for _ in range(self.indexer_layer_num)
                 ]
         self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
-        del self.kv_buffer
+        super()._clear_buffers()
         del self.index_k_with_scale_buffer
+        del self.index_k_buffer
+
+    def _get_indexer_cache_index(self, layer_id: int) -> int:
+        try:
+            return self.indexer_layer_id_to_index[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Layer {layer_id} does not own an Index-K cache; active layers are "
+                f"{self.indexer_layer_ids}"
+            ) from exc
+
+    def get_indexer_local_layer_mapping(self) -> dict[int, int]:
+        """Map local transformer-layer offsets to compact Index-K slots."""
+        return {
+            layer_id - self.start_layer: index
+            for layer_id, index in self.indexer_layer_id_to_index.items()
+        }
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
+        cache_index = self._get_indexer_cache_index(layer_id)
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self.index_k_with_scale_buffer[cache_index]
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
+        cache_index = self._get_indexer_cache_index(layer_id)
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        return self.index_k_buffer[layer_id - self.start_layer]
+        return self.index_k_buffer[cache_index]
 
     def get_index_k_continuous(
         self,
@@ -2270,7 +2313,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             ]
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self._get_indexer_cache_index(layer_id)]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -2283,7 +2326,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self._get_indexer_cache_index(layer_id)]
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -2309,7 +2352,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self._get_indexer_cache_index(layer_id)]
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -2327,7 +2370,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self.index_k_with_scale_buffer[self._get_indexer_cache_index(layer_id)]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
@@ -2350,7 +2393,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
+        for layer_id in range(self.indexer_layer_num):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
@@ -2377,7 +2420,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
+        for layer_id in range(self.indexer_layer_num):
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
@@ -2396,7 +2439,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         if index_k.dtype != self.index_k_buffer_dtype:
             index_k = index_k.to(self.index_k_buffer_dtype)
 
-        self.index_k_buffer[layer_id - self.start_layer][
+        self.index_k_buffer[self._get_indexer_cache_index(layer_id)][
             loc // self.page_size, loc % self.page_size
         ] = index_k
 
@@ -2406,9 +2449,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.use_fp8_index_k_cache
             else self.index_k_buffer
         )
-        data_ptrs = [index_cache[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [index_cache[i].nbytes for i in range(self.layer_num)]
-        item_lens = [index_cache[i][0].nbytes for i in range(self.layer_num)]
+        data_ptrs = [buffer.data_ptr() for buffer in index_cache]
+        data_lens = [buffer.nbytes for buffer in index_cache]
+        item_lens = [buffer[0].nbytes for buffer in index_cache]
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):

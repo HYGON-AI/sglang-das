@@ -42,7 +42,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-from sglang.srt.utils.common import ceil_div, is_float4_e2m1fn_x2
+from sglang.srt.utils.common import (
+    ceil_div,
+    is_float4_e2m1fn_x2,
+    is_hcu,
+    is_hcu_native_fp8_supported,
+)
 
 
 @dataclass
@@ -136,13 +141,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size = None
+                if is_deepseek_nsa(mr.model_config.hf_config):
+                    draft_cell_size = self._compute_cell_size(
+                        mr,
+                        int(draft_num_layers),
+                        force_dense_nsa_indexer=True,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
+                    draft_cell_size_per_token=draft_cell_size,
                 )
 
-    def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
+    def _compute_cell_size(
+        self,
+        mr: ModelRunner,
+        num_layers: int,
+        *,
+        force_dense_nsa_indexer: bool = False,
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
         model_config = mr.model_config
@@ -152,11 +171,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            cell_size = mr.calculate_mla_kv_cache_dim() * num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -172,14 +187,43 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                if force_dense_nsa_indexer:
+                    num_indexer_layers = num_layers
+                else:
+                    indexer_layer_ids = mr.get_nsa_indexer_layer_ids_for_kv_pool()
+                    num_indexer_layers = (
+                        num_layers
+                        if indexer_layer_ids is None
+                        else len(indexer_layer_ids)
+                    )
+                use_bf16_index_cache = is_hcu() and (
+                    kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    or not is_hcu_native_fp8_supported()
                 )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                if use_bf16_index_cache:
+                    indexer_size_per_token = index_head_dim
+                    element_size = torch._utils._element_size(torch.bfloat16)
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
+                indexer_ratio = 1
+                if mr.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    indexer_ratio = parse_hisparse_config(
+                        mr.server_args
+                    ).host_to_device_ratio
+                cell_size += int(
+                    indexer_size_per_token
+                    * num_indexer_layers
+                    * element_size
+                    * indexer_ratio
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)

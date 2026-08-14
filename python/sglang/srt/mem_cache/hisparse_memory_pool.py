@@ -2,7 +2,7 @@
 
 import logging
 import weakref
-from typing import Optional
+from typing import Optional, Sequence
 
 import psutil
 import torch
@@ -52,6 +52,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        indexer_layer_ids: Optional[Sequence[int]] = None,
     ):
         super().__init__(
             size=size,
@@ -67,6 +68,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            indexer_layer_ids=indexer_layer_ids,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

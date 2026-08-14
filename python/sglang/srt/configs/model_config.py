@@ -155,6 +155,23 @@ def nsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def get_nsa_full_indexer_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
+) -> List[int]:
+    """Return NSA layers that run their own indexer instead of sharing top-k."""
+    assert is_deepseek_nsa(config)
+    if end_layer is None:
+        end_layer = config.num_hidden_layers
+    assert 0 <= start_layer <= end_layer
+    return [
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not nsa_layer_skips_topk(config, layer_id)
+    ]
+
+
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
