@@ -111,7 +111,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_hcu, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -119,6 +119,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -1142,7 +1143,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
-                self._release_pd_hidden_rows(decode_req)
+                self.transfer_queue._release_pd_hidden_rows(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1476,28 +1477,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     continue
 
                 pd_hidden_streaming = (
-                    self.kv_manager.supports_pd_hidden_streaming()
+                    not _is_hcu
+                    and self.kv_manager.supports_pd_hidden_streaming()
                     and hasattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk")
                 )
-                if not pd_hidden_streaming:
-                    message = (
-                        "PD hidden transfer requires streaming chunk injection support."
-                    )
-                    logger.error(message)
-                    prepare_abort(
-                        decode_req.req,
-                        message,
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    failed_reqs.append(decode_req)
-                    indices_to_remove.add(i)
-                    continue
-                pd_hidden_window_rows = min(pd_hidden_len, dspark_pool.size)
+                # Mooncake's streaming READY/ACK protocol is not available on
+                # HCU yet.  Keep the upstream streaming path on CUDA, and use
+                # the existing full hidden-row transfer representation on HCU.
+                # The full rows are injected into the draft cache after the KV
+                # receiver reports success (see _inject_full_pd_hidden).
+                pd_hidden_window_rows = (
+                    min(pd_hidden_len, dspark_pool.size)
+                    if pd_hidden_streaming
+                    else pd_hidden_len
+                )
                 if pd_hidden_window_rows <= 0:
                     message = (
                         "PD decode hidden receive pool has no streaming rows: "
@@ -1697,6 +1690,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
+
+            def _pd_hidden_payload():
+                if not pd_hidden_dst_indices_by_pp:
+                    return None
+                first_slice_indices = next(
+                    iter(pd_hidden_dst_indices_by_pp.values())
+                )
+                return np.asarray(first_slice_indices, dtype=np.int32)
+
+            payloads[StateType.PD_HIDDEN] = _pd_hidden_payload
+            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # DSV4 on NPU: per-pool dst page indices, produced by the same
+                # shared builder prefill uses so src/dst line up positionally.
+                if total_prefix_len != 0:
+                    raise RuntimeError(
+                        "DSV4 NPU PD disaggregation does not support decode-side "
+                        "prefix cache yet; disable disaggregation decode radix/HiCache "
+                        "for PD + chunked prefill."
+                    )
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
@@ -1714,34 +1726,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                elif st == StateType.C128_STATE:
-                    state_indices.append(_c128_state_payload())
-                elif st == StateType.PD_HIDDEN:
-                    first_slice_indices = None
-                    if pd_hidden_dst_indices_by_pp:
-                        first_slice_indices = next(
-                            iter(pd_hidden_dst_indices_by_pp.values())
-                        )
-                    state_indices.append(
-                        None
-                        if first_slice_indices is None
-                        else np.asarray(first_slice_indices, dtype=np.int32)
-                    )
-                else:
-                    state_indices.append(None)
             if state_indices and not any(
                 idx is not None and len(idx) > 0 for idx in state_indices
             ):
@@ -1826,7 +1810,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "DSV4 HiSparse direct PD transfer currently requires "
                         "the Mooncake backend"
                     )
-            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            metadata_kwargs = {}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
@@ -2627,7 +2611,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if dspark_pool is None:
             raise RuntimeError("PD hidden row pool disappeared on decode.")
-        inject_chunk = getattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk", None)
+        inject_chunk = getattr(
+            self.scheduler.draft_worker, "inject_pd_hidden_chunk", None
+        )
         if inject_chunk is None:
             raise RuntimeError(
                 "PD streaming hidden requires draft_worker.inject_pd_hidden_chunk."
@@ -2700,6 +2686,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 hidden_start=int(hidden_chunk.hidden_start),
                 is_last_hidden_chunk=hidden_chunk.is_last_hidden_chunk,
             )
+
+    def _inject_full_pd_hidden(self, decode_req: DecodeRequest) -> None:
+        """Inject a non-streaming PD hidden transfer into the DSpark draft KV."""
+        hidden_state = decode_req.pd_hidden_state
+        if not hidden_state.enabled or hidden_state.streaming:
+            return
+        indices = decode_req.pd_hidden_dst_indices
+        if indices is None and decode_req.pd_hidden_dst_indices_by_pp:
+            indices = next(iter(decode_req.pd_hidden_dst_indices_by_pp.values()))
+        if not indices:
+            return
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        if pool is None:
+            raise RuntimeError("PD hidden row pool disappeared on decode.")
+        inject_chunk = getattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk", None)
+        if inject_chunk is None:
+            raise RuntimeError(
+                "PD full hidden transfer requires draft_worker.inject_pd_hidden_chunk."
+            )
+        read_hidden = getattr(pool, "read_view", None) or pool.read
+        hidden = read_hidden(indices)
+        event = inject_chunk(decode_req.req, hidden, hidden_state.start)
+        if event is not None:
+            event.synchronize()
+        hidden_state.mark_hidden_done()
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
@@ -2819,6 +2830,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 hidden_state = decode_req.pd_hidden_state
                 hidden_state.mark_kv_done()
+                if hidden_state.enabled and not hidden_state.streaming:
+                    self._inject_full_pd_hidden(decode_req)
                 if not hidden_state.request_done():
                     continue
                 self._commit_transfer_to_req(decode_req)

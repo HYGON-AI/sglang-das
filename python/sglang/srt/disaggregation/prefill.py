@@ -579,6 +579,67 @@ class PrefillBootstrapQueue:
         required_rows = 0 if streaming_hidden else min(hidden_len, window_rows)
         return required_rows <= pool.size and required_rows > hidden_row_credits
 
+    def _get_consensus_bootstrap_resource_ready(
+        self, polls: List[KVPoll]
+    ) -> List[bool]:
+        """Agree on bootstrap resource admission across attention TP/CP ranks.
+
+        PD hidden rows are released asynchronously after the local hidden-state
+        transfer completes.  Consequently, attention CP ranks can momentarily
+        observe different free-row counts.  Reserving directly from those local
+        counts lets one rank move a request to the waiting queue while another
+        leaves it in the bootstrap queue, and the next variable-length Gloo
+        collective then fails.  Probe resources without side effects and admit
+        only the common FIFO prefix before performing any allocation.
+        """
+        ready = [True] * len(self.queue)
+        metadata_credits = (
+            self.req_to_metadata_buffer_idx_allocator.available_size()
+        )
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        hidden_row_credits = pool.available_size() if pool is not None else 0
+
+        resource_blocked = False
+        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+            if (
+                resource_blocked
+                or poll != KVPoll.WaitingForInput
+                or not req.pending_bootstrap
+                or should_force_retry(req)
+            ):
+                if resource_blocked and poll == KVPoll.WaitingForInput:
+                    ready[i] = False
+                continue
+
+            costs, error = self._probe_bootstrap_ready(
+                req, metadata_credits, hidden_row_credits
+            )
+            # Invalid request metadata is deterministic and must reach
+            # finalize_bootstrap on every rank so the request is failed cleanly.
+            if error is not None:
+                continue
+            if costs is None:
+                ready[i] = False
+                resource_blocked = True
+                continue
+
+            metadata_cost, hidden_cost = costs
+            metadata_credits -= metadata_cost
+            hidden_row_credits -= hidden_cost
+
+        ready_tensor = torch.tensor(ready, dtype=torch.uint8, device="cpu")
+        torch.distributed.all_reduce(
+            ready_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.scheduler.attn_tp_cpu_group,
+        )
+        torch.distributed.all_reduce(
+            ready_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.scheduler.attn_cp_cpu_group,
+        )
+        return [bool(value) for value in ready_tensor.tolist()]
+
     def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
         """Enter the resource-commit phase after metadata consensus."""
         rid_set = set(rids)
@@ -635,6 +696,11 @@ class PrefillBootstrapQueue:
             else plan.pool.alloc(plan.source_window_rows)
         )
         if src_indices is None and not plan.streaming_hidden:
+            # A request that fits in the pool can still lose a local allocation
+            # race to in-flight transfers.  This is temporary backpressure, not
+            # a malformed request; leave it pending for the next scheduler tick.
+            if plan.source_window_rows <= plan.pool.size:
+                return False
             message = (
                 "PD hidden rows exceed prefill hidden pool capacity: "
                 f"rid={req.rid}, hidden_len={plan.hidden_len}, "
@@ -729,6 +795,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
+        resource_ready = self._get_consensus_bootstrap_resource_ready(polls)
+
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
                 continue
@@ -754,6 +822,8 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
+                if not resource_ready[i]:
+                    continue
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
