@@ -757,6 +757,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # overrides go through explicit keyword arguments.
 
         pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
+        if (
+            model_runner.server_args.disaggregation_mode == "prefill"
+            and get_parallel().attn_cp_size > 1
+        ):
+            gathered_capture_layers = [None] * get_parallel().attn_cp_size
+            torch.distributed.all_gather_object(
+                gathered_capture_layers,
+                pd_hidden_capture_layer_ids,
+                group=get_parallel().attn_cp_group.cpu_group,
+            )
+            nonempty_capture_layers = [
+                [int(x) for x in layer_ids]
+                for layer_ids in gathered_capture_layers
+                if layer_ids
+            ]
+            if nonempty_capture_layers:
+                expected_capture_layers = nonempty_capture_layers[0]
+                if any(
+                    layer_ids != expected_capture_layers
+                    for layer_ids in nonempty_capture_layers[1:]
+                ):
+                    raise RuntimeError(
+                        "PD hidden capture layers disagree across prefill CP ranks: "
+                        f"{gathered_capture_layers}"
+                    )
+                pd_hidden_capture_layer_ids = expected_capture_layers
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
