@@ -154,6 +154,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_hcu = is_hcu()
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_mxfp4_w4a8 = get_bool_env_var("SGLANG_USE_MXFP4_W4A8") and _is_hcu
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -1784,7 +1785,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b2=getattr(layer, "w2_weight_bias", None),
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                use_int4_w4a16=True,
+                use_mxfp4_w4a16=not _use_mxfp4_w4a8,
+                use_mxfp4_w4a8=_use_mxfp4_w4a8,
                 block_shape=[0, self.group_size],
             )
         return self.runner.run(dispatch_output, quant_info)
