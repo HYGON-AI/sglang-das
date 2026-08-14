@@ -4,9 +4,24 @@
 import torch
 
 from sglang.srt.models.hunyuan_v3 import (
+    _apply_hy3_qk_norm,
     _merge_hy3_sp_attention_output,
     _pack_hy3_sp_qkv,
+    _reshape_hy3_sp_attention_output,
 )
+
+
+class _PerHeadRMSNorm(torch.nn.Module):
+    def __init__(self, head_dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.arange(1, head_dim + 1).float())
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        return (x.float() * torch.rsqrt(variance + self.eps) * self.weight).to(
+            x.dtype
+        )
 
 
 def test_pack_hy3_sp_qkv_gqa_tp8():
@@ -97,3 +112,42 @@ def test_merge_hy3_sp_attention_output_restores_full_q_width():
 
     assert merged.shape == (3, 32)
     torch.testing.assert_close(merged, output.permute(1, 0, 2).reshape(3, 32))
+
+
+def test_apply_hy3_qk_norm_is_per_head_and_preserves_width():
+    head_dim = 2
+    q = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    k = torch.tensor([[5.0, 6.0]])
+    q_norm = _PerHeadRMSNorm(head_dim)
+    k_norm = _PerHeadRMSNorm(head_dim)
+
+    q_actual, k_actual = _apply_hy3_qk_norm(
+        q, k, q_norm, k_norm, head_dim
+    )
+    q_expected = q_norm(q.view(-1, head_dim)).view_as(q)
+    k_expected = k_norm(k.view(-1, head_dim)).view_as(k)
+
+    assert q_actual.shape == q.shape
+    assert k_actual.shape == k.shape
+    torch.testing.assert_close(q_actual, q_expected)
+    torch.testing.assert_close(k_actual, k_expected)
+
+
+def test_reshape_hy3_sp_attention_output_uses_actual_token_count():
+    attn_output = torch.arange(8 * 3 * 4, dtype=torch.float32).view(24, 4)
+    reshaped = _reshape_hy3_sp_attention_output(
+        attn_output, tp_size=8, q_size=4
+    )
+
+    assert reshaped.shape == (8, 3, 4)
+    torch.testing.assert_close(reshaped.flatten(0, 1), attn_output)
+
+
+def test_reshape_hy3_sp_attention_output_rejects_invalid_token_count():
+    attn_output = torch.empty(23, 4)
+    try:
+        _reshape_hy3_sp_attention_output(attn_output, tp_size=8, q_size=4)
+    except ValueError as exc:
+        assert "token count must be divisible" in str(exc)
+    else:
+        raise AssertionError("Expected an invalid SP token count to be rejected")

@@ -130,6 +130,41 @@ def _merge_hy3_sp_attention_output(
     )
 
 
+def _apply_hy3_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply HY3's shared per-head Q/K RMSNorm and preserve packed widths."""
+    q_shape = q.shape
+    k_shape = k.shape
+    q = q_norm(q.reshape(-1, head_dim)).view(q_shape)
+    k = k_norm(k.reshape(-1, head_dim)).view(k_shape)
+    return q, k
+
+
+def _reshape_hy3_sp_attention_output(
+    attn_output: torch.Tensor,
+    tp_size: int,
+    q_size: int,
+) -> torch.Tensor:
+    """Split global-sequence attention output by its source sequence rank."""
+    if attn_output.ndim != 2 or attn_output.shape[1] != q_size:
+        raise ValueError(
+            "HY3 SP attention output must have shape [num_tokens, q_size], "
+            f"got {tuple(attn_output.shape)} with q_size={q_size}."
+        )
+    if attn_output.shape[0] % tp_size != 0:
+        raise ValueError(
+            "HY3 SP attention output token count must be divisible by the "
+            f"attention TP size, got {attn_output.shape[0]} and {tp_size}."
+        )
+    tokens_per_rank = attn_output.shape[0] // tp_size
+    return attn_output.view(tp_size, tokens_per_rank, q_size)
+
+
 class HYV3FeedForward(nn.Module):
     def __init__(
         self,
@@ -622,6 +657,9 @@ class HYV3Attention(nn.Module):
         )
         if self.use_qk_norm:
             rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
+            # HY3 stores one [head_dim] Q/K norm weight shared by all heads.
+            # MiniMax's per-layer Q/K norm instead stores weights spanning all
+            # heads, so its TP norm implementation is not interchangeable here.
             self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
         self.page_size = 64
@@ -734,11 +772,11 @@ class HYV3Attention(nn.Module):
                 epsilon=self.q_norm.variance_epsilon,
             )
             used_fused_hunyuan_rotary_kv_store = True
-        elif self.use_qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim))
-            q = q.view(-1, self.q_size)
-            k = self.k_norm(k.reshape(-1, self.head_dim))
-            k = k.view(-1, self.kv_size)
+        else:
+            if self.use_qk_norm:
+                q, k = _apply_hy3_qk_norm(
+                    q, k, self.q_norm, self.k_norm, self.head_dim
+                )
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(
             q,
@@ -768,11 +806,8 @@ class HYV3Attention(nn.Module):
             [self.q_size_full, self.kv_size_full, self.kv_size_full], dim=-1
         )
         if self.use_qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim)).view(
-                tokens_per_rank, self.q_size_full
-            )
-            k = self.k_norm(k.reshape(-1, self.head_dim)).view(
-                tokens_per_rank, self.kv_size_full
+            q, k = _apply_hy3_qk_norm(
+                q, k, self.q_norm, self.k_norm, self.head_dim
             )
         q, k = self.rotary_emb.forward_native(positions, q, k)
 
@@ -794,10 +829,9 @@ class HYV3Attention(nn.Module):
         q, k, v = qkv_by_source_rank.split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
-
         attn_output = self.attn(q, k, v, forward_batch)
-        attn_output_by_head_rank = attn_output.view(
-            attn_tp_size, tokens_per_rank, self.q_size
+        attn_output_by_head_rank = _reshape_hy3_sp_attention_output(
+            attn_output, attn_tp_size, self.q_size
         )
         attn_output_by_source_rank = torch.empty_like(attn_output_by_head_rank)
         attn_tp_group.all_to_all_single(
