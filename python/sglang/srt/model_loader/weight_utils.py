@@ -1078,17 +1078,46 @@ def fastsafetensors_weights_iterator(
         "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     )
 
+    # fastsafetensors' nogds copier lazily page-locks
+    # bbuf_size_kb*1024*max_threads per reader (defaults 64MB*16 = 1GB).
+    # On HCU (no GDS) that 1GB cudaHostAlloc can fail transiently and abort
+    # the whole load with "submit_io: submit_nogds_read failed, err=-1".
+    # Shrink the bounce buffer (tunable via env) and retry the transient
+    # failure once with a fresh loader.
+    bbuf_size_kb = int(
+        os.getenv("SGLANG_FASTSAFETENSORS_BBUF_KB", str(16 * 1024))
+    )
+    max_threads = int(os.getenv("SGLANG_FASTSAFETENSORS_MAX_THREADS", "8"))
+
     for f_list in tqdm(
         weight_files_sub_lists,
         desc="Loading safetensors using Fastsafetensor loader",
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-        loader.add_filenames(rank_file_map)
+        for attempt in range(2):
+            loader = SafeTensorsFileLoader(
+                pg,
+                device,
+                nogds=not enable_gds,
+                bbuf_size_kb=bbuf_size_kb,
+                max_threads=max_threads,
+            )
+            loader.add_filenames(rank_file_map)
+            try:
+                fb = loader.copy_files_to_device()
+                break
+            except Exception:
+                loader.close()
+                if attempt == 1:
+                    raise
+                logger.warning(
+                    "fastsafetensors copy_files_to_device failed "
+                    "(attempt %d/2); retrying with a fresh loader",
+                    attempt + 1,
+                )
         try:
-            fb = loader.copy_files_to_device()
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
