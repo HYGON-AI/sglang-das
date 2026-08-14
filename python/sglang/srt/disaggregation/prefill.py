@@ -281,7 +281,7 @@ class PrefillBootstrapQueue:
         )
         if use_dsv4_full_token_pool:
             self.max_total_num_tokens = (
-                self.scheduler.tp_worker.model_runner.max_token_pool_size
+                self.scheduler.tp_worker.model_runner.full_max_total_num_tokens
             )
             logger.info(
                 "DeepSeek-V4 PD prefill admission uses full token pool capacity: %d",
@@ -698,7 +698,6 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()
-        rids_to_check_set = set(rids_to_check) if rids_to_check is not None else None
 
         if len(self.queue) == 0:
             if return_failed_reqs is False:
@@ -732,15 +731,6 @@ class PrefillBootstrapQueue:
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
-                continue
-            if (
-                rids_to_check_set is not None
-                and req.rid not in rids_to_check_set
-                and poll != KVPoll.Failed
-            ):
-                # In PP mode, successful bootstrap still requires cross-rank
-                # consensus. Local failures are terminal and must be drained
-                # even if an earlier PP rank has already removed the request.
                 continue
 
             if poll == KVPoll.Failed:
