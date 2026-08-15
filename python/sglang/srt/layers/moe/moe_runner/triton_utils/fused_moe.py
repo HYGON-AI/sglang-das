@@ -171,6 +171,7 @@ def inplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
 ) -> None:
     if isinstance(activation, int):
         if activation == 0:
@@ -213,6 +214,7 @@ def inplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_int4_w4a8=use_int4_w4a8,
     )
 
 
@@ -294,6 +296,7 @@ def outplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
 ) -> torch.Tensor:
     if isinstance(activation, int):
         activation = "silu" if activation == 0 else "gelu"
@@ -331,6 +334,7 @@ def outplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_int4_w4a8=use_int4_w4a8,
     )
 
 
@@ -402,6 +406,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -455,6 +460,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_int4_w4a8=use_int4_w4a8,
         )
         return hidden_states
     else:
@@ -491,6 +497,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_int4_w4a8=use_int4_w4a8,
         )
 
 
@@ -750,6 +757,7 @@ def _prepare_fused_moe_run(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool = False,
     use_mxfp4_w4a16: bool,
     use_mxfp4_w4a8: bool,
     per_channel_quant: bool,
@@ -771,7 +779,10 @@ def _prepare_fused_moe_run(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=(
-            use_int4_w4a16 or use_mxfp4_w4a16 or use_mxfp4_w4a8
+            use_int4_w4a16
+            or use_int4_w4a8
+            or use_mxfp4_w4a16
+            or use_mxfp4_w4a8
         ),
         dtype=hidden_states.dtype,
     )
@@ -825,6 +836,7 @@ def _fused_moe_kernel_sequence(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool = False,
     use_mxfp4_w4a16: bool,
     use_mxfp4_w4a8: bool,
     per_channel_quant: bool,
@@ -915,6 +927,7 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not use_int4_w4a8)
         and (not use_mxfp4_w4a16)
         and (not use_mxfp4_w4a8)
     )
@@ -946,6 +959,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_mxfp4_w4a16=use_mxfp4_w4a16,
         use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
@@ -1158,6 +1172,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_mxfp4_w4a16=use_mxfp4_w4a16,
         use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
@@ -1290,12 +1305,14 @@ def fused_experts_impl(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
 ):
     if (
         _use_aiter_moe
         and not is_triton_forced_for_dspark_aiter_fallback()
         and (
             use_int4_w4a16
+            or use_int4_w4a8
             or use_mxfp4_w4a16
             or use_mxfp4_w4a8
             or use_int8_w8a8
@@ -1314,6 +1331,8 @@ def fused_experts_impl(
             quant_type = MoeQuantType.WFP4A16
         elif use_int4_w4a16:
             quant_type = MoeQuantType.W4A16
+        elif use_int4_w4a8:
+            quant_type = MoeQuantType.W4A8
         else:
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(
@@ -1344,7 +1363,12 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
+    if (
+        use_int4_w4a16
+        or use_int4_w4a8
+        or use_mxfp4_w4a16
+        or use_mxfp4_w4a8
+    ):
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -1372,6 +1396,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_mxfp4_w4a16=use_mxfp4_w4a16,
         use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
@@ -1396,6 +1421,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_mxfp4_w4a16=use_mxfp4_w4a16,
         use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
