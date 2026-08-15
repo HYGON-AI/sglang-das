@@ -38,7 +38,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
 from sglang.srt.utils import get_bool_env_var, set_weight_attrs
-
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
 
@@ -116,6 +116,7 @@ logger.info(
     f"resolved_backend={_resolved_backend}"
 )
 
+_use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
 _use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE")
 _use_int4_w4a8 = get_bool_env_var("SGLANG_USE_INT4_W4A8")
 
@@ -421,9 +422,11 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         the kernel's group index stays 0 and the (E, N, 1) scale is read once
         per output channel.  ``SGLANG_USE_INT4_W4A8`` switches between W4A16
         and W4A8 (int8 x int8 tensor core), mirroring the MXFP4 flags."""
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
         k_max = max(layer.w13_weight.shape[2], layer.w2_weight.shape[2]) * 2
+        block_shape = [0, k_max]
+        if _use_aiter_moe:
+            block_shape = None
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -432,7 +435,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             use_int4_w4a16=not _use_int4_w4a8,
             use_int4_w4a8=_use_int4_w4a8,
             per_channel_quant=True,
-            block_shape=[0, k_max],
+            block_shape=block_shape,
         )
 
     @torch._dynamo.disable()
