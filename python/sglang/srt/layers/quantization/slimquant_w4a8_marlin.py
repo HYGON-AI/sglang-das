@@ -179,7 +179,8 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
-_use_triton_w4a16 = get_bool_env_var("SGLANG_ENABLE_SLIMQUANT_W4A16_TRITON_MOE")
+_use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE")
+_use_int4_w4a8 = get_bool_env_var("SGLANG_USE_INT4_W4A8")
 
 class MarlinMoeWorkspace:
     """
@@ -657,7 +658,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _use_triton_w4a16:
+        if not _use_lightop_w4a8_marlin_moe:
             # mxfp4_to_int4.py packs (even_k << 4) | odd_k with two's
             # complement nibbles and stores scale/16 (the legacy lightop
             # kernel applies the missing x16). The Triton W4A16 kernel instead
@@ -715,7 +716,8 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         MXFP4 model uses). Per-channel scales: block_shape[1] must be >= the K
         dimension of BOTH GEMMs (w13: hidden_size, w2: intermediate_size), so
         the kernel's group index stays 0 and the (E, N, 1) scale is read once
-        per output channel."""
+        per output channel.  ``SGLANG_USE_INT4_W4A8`` switches between W4A16
+        and W4A8 (int8 x int8 tensor core), mirroring the MXFP4 flags."""
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
         k_max = max(layer.w13_weight.shape[2], layer.w2_weight.shape[2]) * 2
@@ -724,7 +726,8 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            use_int4_w4a16=True,
+            use_int4_w4a16=not _use_int4_w4a8,
+            use_int4_w4a8=_use_int4_w4a8,
             per_channel_quant=True,
             block_shape=[0, k_max],
         )
@@ -737,7 +740,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
     ):
-        if _use_triton_w4a16:
+        if not _use_lightop_w4a8_marlin_moe:
             return self.runner.run(dispatch_output, self._get_triton_quant_info(layer))
         return self._apply_w4a8_marlin_lightop(layer, dispatch_output)
 
@@ -797,7 +800,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if _use_triton_w4a16:
+        if not _use_lightop_w4a8_marlin_moe:
             from sglang.srt.layers.moe.token_dispatcher.standard import (
                 StandardDispatchOutput,
             )
