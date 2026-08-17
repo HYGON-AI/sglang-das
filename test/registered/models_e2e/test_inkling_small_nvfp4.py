@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1028, stage="extra-b", runner_config="4-gpu-b200")
 
 _MODEL_PATH = os.environ.get(
     "INKLING_SMALL_TEST_MODEL_PATH", "thinkingmachines/Inkling-Small-NVFP4"
