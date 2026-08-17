@@ -997,7 +997,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
-                self.transfer_queue._release_pd_hidden_rows(decode_req)
+                transfer_queue = getattr(self, "transfer_queue", None)
+                if transfer_queue is not None:
+                    transfer_queue._release_pd_hidden_rows(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -2122,6 +2124,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     Store the requests that is polling kv
     """
 
+    # Class-level default: the prealloc queue wires this up after construction,
+    # so the PD-hidden hooks must tolerate it being unset -- getattr(None, ...)
+    # short-circuits them into a no-op instead of raising AttributeError.
+    kv_manager = None
+
     def __init__(
         self,
         gloo_group: ProcessGroup,
@@ -2154,6 +2161,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        if getattr(self, "kv_manager", None) is None:
+            # PD hidden transfer was never wired up on this queue; nothing to
+            # release, and decode_req carries no pd_hidden_* bookkeeping.
+            return
         wait_ack_completions = getattr(
             self.kv_manager, "wait_pd_hidden_ack_completions", None
         )
@@ -2381,8 +2392,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _drain_pd_hidden_ready_chunks(self, decode_req: DecodeRequest) -> None:
-        hidden_state = decode_req.pd_hidden_state
-        if not hidden_state.streaming:
+        # Requests that never entered the PD-hidden path carry no state object.
+        hidden_state = getattr(decode_req, "pd_hidden_state", None)
+        if hidden_state is None or not hidden_state.streaming:
             return
         pop_chunks = getattr(self.kv_manager, "pop_pd_hidden_ready_chunks", None)
         if pop_chunks is None:
