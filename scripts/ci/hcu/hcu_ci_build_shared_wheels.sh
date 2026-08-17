@@ -178,7 +178,7 @@ EOF_CARGO
       setuptools-scm \
       setuptools-rust \
       "maturin==1.9.6" \
-      "ciupload==0.3.0" \
+      ciupload \
       auditwheel \
       patchelf
     wget -q "${HCU_PD_PROTOC_URL}" -O /tmp/protoc.zip
