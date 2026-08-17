@@ -99,6 +99,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    resolve_disagg_metadata_config,
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -1425,6 +1426,29 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # DSpark PD hidden-state transfer widens the metadata buffers and adds
+        # its own receive pool. NULL mode has no PD wire to size, and resolving
+        # it there would inspect speculative workers that need not exist.
+        metadata_buffer_kwargs = {}
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            disagg_metadata_config = resolve_disagg_metadata_config(
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                disaggregation_mode=self.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+                spec_algorithm=self.spec_algorithm,
+                model_config=self.model_config,
+                server_args=self.server_args,
+                model_runner=self.tp_worker.model_runner,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                gpu_id=self.ps.gpu_id,
+                max_prefill_tokens=self.max_prefill_tokens,
+            )
+            disagg_hidden_size = disagg_metadata_config.hidden_size
+            disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+            metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1447,6 +1471,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
             )
 
             # The decode requests polling kv cache
@@ -1493,6 +1518,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
