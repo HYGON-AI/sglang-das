@@ -636,7 +636,7 @@ jobs:
           set -euo pipefail
           bash "${HCU_CI_CHECKOUT_DIR}/scripts/ci/hcu/hcu_ci_exec.sh" \
             --container-name "${HCU_CI_CONTAINER_NAME}" \
-            -w /sglang-checkout/sgl-kernel \
+            -w /sglang-checkout/python/sglang/kernels/aot \
             -- bash -lc '
               set -euo pipefail
               source /opt/dtk/env.sh

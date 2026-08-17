@@ -328,10 +328,10 @@ jobs:
           set -euo pipefail
           {
             echo "Rebuilding sgl-kernel from selected ref to match /sglang-checkout/python source."
-            docker exec -w /sglang-checkout/sgl-kernel "${HCU_CI_CONTAINER_NAME}" \
+            docker exec -w /sglang-checkout/python/sglang/kernels/aot "${HCU_CI_CONTAINER_NAME}" \
               bash -lc "source /opt/dtk/env.sh && python setup_hip.py bdist_wheel && ls -lh dist/*.whl"
             docker exec "${HCU_CI_CONTAINER_NAME}" \
-              bash -lc "python3 -m pip install --force-reinstall --no-deps /sglang-checkout/sgl-kernel/dist/sglang_kernel-*.whl"
+              bash -lc "python3 -m pip install --force-reinstall --no-deps /sglang-checkout/python/sglang/kernels/aot/dist/sglang_kernel-*.whl"
             docker exec "${HCU_CI_CONTAINER_NAME}" \
               bash -lc 'python3 -c "import sgl_kernel; print(sgl_kernel.__file__); ok = hasattr(sgl_kernel, \"normal_decode_metadata_general\"); print(\"normal_decode_metadata_general=\", ok); raise SystemExit(0 if ok else \"rebuilt sgl-kernel does not expose normal_decode_metadata_general\")"'
           } 2>&1 | tee "${HCU_MANUAL_LOG_DIR}/rebuild-sgl-kernel.log"

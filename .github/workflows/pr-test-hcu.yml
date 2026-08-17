@@ -22,7 +22,7 @@ on:
       - "python/**"
       - "test/run_suite.py"
       - "test/registered/**"
-      - "sgl-kernel/**"
+      - "python/sglang/kernels/aot/**"
       - "sgl-model-gateway/**"
       - "requirements_hcu.txt"
   workflow_dispatch:
@@ -181,7 +181,7 @@ jobs:
             --jq '.[].filename')"
           echo "${changed_files}"
 
-          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|test/run_suite\.py|test/registered/|sgl-kernel/|sgl-model-gateway/|requirements_hcu\.txt$)'
+          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|test/run_suite\.py|test/registered/|python/sglang/kernels/aot/|sgl-model-gateway/|requirements_hcu\.txt$)'
 
           if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
@@ -254,7 +254,7 @@ jobs:
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|sgl-kernel/|requirements_hcu\.txt$|python/)'; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|python/sglang/kernels/aot/|requirements_hcu\.txt$|python/)'; then
             wheel_required=true
           fi
 

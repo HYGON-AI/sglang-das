@@ -23,7 +23,7 @@ if [[ ! "${SHA}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "HCU_PD_SHA must be a full lowercase Git SHA: ${SHA}" >&2
   exit 2
 fi
-if [[ ! -d "${CHECKOUT}/python" || ! -d "${CHECKOUT}/sgl-kernel" ]]; then
+if [[ ! -d "${CHECKOUT}/python" || ! -d "${CHECKOUT}/python/sglang/kernels/aot" ]]; then
   echo "Invalid HCU PD checkout: ${CHECKOUT}" >&2
   exit 2
 fi
@@ -203,7 +203,7 @@ EOF_CARGO
     mkdir -p /tmp/raw-wheels
     cp -a /source/. /tmp/sglang-pd-source/
 
-    cd /tmp/sglang-pd-source/sgl-kernel
+    cd /tmp/sglang-pd-source/python/sglang/kernels/aot
     rm -rf build dist
     SETUPTOOLS_SCM_PRETEND_VERSION="${HCU_PD_PACKAGE_VERSION}" \
       python3 setup_hip.py bdist_wheel

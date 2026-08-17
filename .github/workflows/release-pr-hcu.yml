@@ -8,7 +8,7 @@ on:
   pull_request:
     paths:
       - 'python/**'
-      - 'sgl-kernel/**'
+      - 'python/sglang/kernels/aot/**'
       - 'sgl-model-gateway/**'
       - 'requirements_hcu.txt'
       - '.github/workflows/release-pr-hcu.yml'
@@ -128,7 +128,7 @@ jobs:
         with:
           filters: |
             sgl-kernel:
-              - 'sgl-kernel/**'
+              - 'python/sglang/kernels/aot/**'
             sglang:
               - 'python/**'
             gateway:
@@ -142,7 +142,7 @@ jobs:
       - name: Build sgl-kernel (HIP)
         run: |
           source /opt/dtk/env.sh
-          cd sgl-kernel && python setup_hip.py bdist_wheel
+          cd python/sglang/kernels/aot && python setup_hip.py bdist_wheel
           echo "=== sgl-kernel wheel ==="
           ls -lh dist/*.whl
 
@@ -182,7 +182,7 @@ jobs:
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
           mkdir -p output
           shopt -s nullglob
-          wheels=(sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl)
+          wheels=(python/sglang/kernels/aot/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl)
           if (( ${#wheels[@]} == 0 )); then
             echo "No HCU wheels were built" >&2
             exit 1
