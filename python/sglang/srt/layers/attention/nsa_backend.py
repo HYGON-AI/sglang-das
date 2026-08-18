@@ -347,6 +347,49 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
 
+    def topk_transform_sparse_mask(
+        self,
+        logits: torch.Tensor,
+        nonzero_mask: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        """Run the only valid consumer for LightOp sparse Page-MQA logits."""
+
+        if (
+            not envs.SGLANG_USE_LIGHTOP_MASK_TOPK.get()
+            or not envs.SGLANG_NSA_FUSE_TOPK.get()
+            or self.force_unfused_topk
+            or self.topk_transform_method != TopkTransformMethod.PAGED
+            or topk != 2048
+        ):
+            raise RuntimeError(
+                "Sparse Page-MQA requires fused Paged mask-aware TopK=2048"
+            )
+
+        lengths = self.get_seqlens_expanded()
+        page_table_size_1 = self.attn_metadata.page_table_1
+        cu_seqlens_q = self.attn_metadata.cu_seqlens_q
+        if (
+            logits.dim() != 2
+            or logits.shape[0] != lengths.shape[0]
+            or page_table_size_1.shape[0] != logits.shape[0]
+            or cu_seqlens_q.shape[0] != logits.shape[0] + 1
+        ):
+            raise RuntimeError(
+                "Sparse Page-MQA metadata rows must match its paired Paged TopK"
+            )
+
+        from lightop.attention import fast_topk_transform_sparse_mask_fused
+
+        return fast_topk_transform_sparse_mask_fused(
+            score=logits,
+            nonzero_mask=nonzero_mask,
+            lengths=lengths,
+            page_table_size_1=page_table_size_1,
+            cu_seqlens_q=cu_seqlens_q,
+            topk=topk,
+        )
+
 
 _NSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
@@ -1947,9 +1990,7 @@ class NativeSparseAttnBackend(
                 "sparse_prefill_fwd",
                 None,
             )
-            can_skip_sort = (
-                indices_are_sorted and raw_sparse_prefill_fwd is not None
-            )
+            can_skip_sort = indices_are_sorted and raw_sparse_prefill_fwd is not None
             if can_skip_sort:
                 o, _, _ = raw_sparse_prefill_fwd(
                     q_input,
