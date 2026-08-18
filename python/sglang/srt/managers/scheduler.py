@@ -1346,11 +1346,11 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.pp_size != 1:
+            if self.ps.pp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.attn_tp_size != 1 or self.attn_cp_size != 1:
+            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports attn_tp_size=1 and "
                     "attn_cp_size=1 only"
@@ -1358,7 +1358,7 @@ class Scheduler(
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.server_args.dp_size * self.attn_tp_size * self.attn_cp_size
+                self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
@@ -1385,7 +1385,7 @@ class Scheduler(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_s),
             )
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 logger.info(
                     "PD Decode single-clock enabled: dedicated Gloo scheduler "
                     "group, world=%s timeout=%.1fs",
