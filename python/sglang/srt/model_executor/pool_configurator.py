@@ -28,6 +28,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -39,14 +40,16 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.hcu_int8_index_k_cache import (
+    index_k_cache_bytes_per_token,
+    index_k_workspace_bytes_per_token,
+    resolve_index_k_cache_mode,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
-    is_hcu,
-    is_hcu_native_fp8_supported,
 )
 
 
@@ -196,21 +199,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         if indexer_layer_ids is None
                         else len(indexer_layer_ids)
                     )
-                use_bf16_index_cache = is_hcu() and (
-                    kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
-                    or not is_hcu_native_fp8_supported()
+                cache_mode = resolve_index_k_cache_mode(
+                    kv_cache_dtype, mr.page_size, index_head_dim
                 )
-                if use_bf16_index_cache:
-                    indexer_size_per_token = index_head_dim
-                    element_size = torch._utils._element_size(torch.bfloat16)
-                else:
-                    indexer_size_per_token = (
-                        index_head_dim
-                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-                    )
-                    element_size = torch._utils._element_size(
-                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                    )
                 indexer_ratio = 1
                 if mr.enable_hisparse:
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -218,12 +209,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_ratio = parse_hisparse_config(
                         mr.server_args
                     ).host_to_device_ratio
-                cell_size += int(
-                    indexer_size_per_token
+                persistent_bytes = (
+                    index_k_cache_bytes_per_token(cache_mode)
                     * num_indexer_layers
-                    * element_size
                     * indexer_ratio
                 )
+                workspace_bytes = index_k_workspace_bytes_per_token(cache_mode)
+                # The configurator needs an integer coefficient. Round the
+                # per-page INT32 claim reservation up so the profiling path
+                # cannot overcommit the subsequently allocated workspace.
+                cell_size += math.ceil(persistent_bytes + workspace_bytes)
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)

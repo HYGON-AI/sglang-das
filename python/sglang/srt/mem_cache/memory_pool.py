@@ -43,6 +43,14 @@ from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.hcu_int8_index_k_cache import (
+    IndexKCacheMode,
+    create_index_k_int8_aliases,
+    dequantize_index_k_int8_paged,
+    index_k_cache_bytes_per_token,
+    quantize_and_store_index_k_int8,
+    resolve_index_k_cache_mode,
+)
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
@@ -63,7 +71,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hcu,
-    is_hcu_native_fp8_supported,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -2197,35 +2204,45 @@ class NSATokenToKVPool(MLATokenToKVPool):
         }
         if index_buf_size is None:
             index_buf_size = size
-        # num head == 1 and head dim == 128 for index_k in NSA
+        # NSA currently has one indexer head with dimension 128. Keep the
+        # assertion independent from the INT8 resolver so non-INT8 callers
+        # retain the existing contract.
         assert index_head_dim == 128
-        if _is_hcu:
-            self.use_fp8_index_k_cache = (
-                dtype
-                in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                )
-                and is_hcu_native_fp8_supported()
-            )
-        else:
-            self.use_fp8_index_k_cache = True
+        self.index_k_cache_mode = resolve_index_k_cache_mode(
+            dtype, page_size, index_head_dim
+        )
+        self.use_fp8_index_k_cache = (
+            self.index_k_cache_mode is IndexKCacheMode.FP8_SCALED
+        )
+        self.use_int8_index_k_cache = (
+            self.index_k_cache_mode is IndexKCacheMode.INT8_SCALED
+        )
+        self.use_scaled_index_k_cache = (
+            self.index_k_cache_mode is not IndexKCacheMode.BF16
+        )
         self.index_k_buffer_dtype = (
-            torch.bfloat16 if _is_hcu and not self.use_fp8_index_k_cache else self.dtype
+            torch.bfloat16
+            if self.index_k_cache_mode is IndexKCacheMode.BF16
+            else self.dtype
         )
 
         if _is_hip and not _is_hcu:  # and  not _is_hcu:nhb
             assert self.page_size == 1
         else:
             assert self.page_size == 64
-        with (
+        num_index_pages = (index_buf_size + page_size + 1) // self.page_size
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
             else nullcontext()
         ):
             self.index_k_with_scale_buffer = None
             self.index_k_buffer = None
-            if self.use_fp8_index_k_cache:
+            self.index_k_int8_k_aliases = None
+            self.index_k_int8_scale_aliases = None
+            self.index_k_dequant_workspace = None
+            self.index_k_page_claims = None
+            if self.use_scaled_index_k_cache:
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
                         # Layout:
@@ -2235,7 +2252,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         #         * buf[i, :page_size * head_dim] for fp8 data
                         #         * buf[i, page_size * head_dim:].view(float32) for scale
                         (
-                            (index_buf_size + page_size + 1) // self.page_size,
+                            num_index_pages,
                             self.page_size
                             * (
                                 index_head_dim
@@ -2247,11 +2264,31 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     )
                     for _ in range(self.indexer_layer_num)
                 ]
+                if self.use_int8_index_k_cache:
+                    aliases = [
+                        create_index_k_int8_aliases(buffer)
+                        for buffer in self.index_k_with_scale_buffer
+                    ]
+                    self.index_k_int8_k_aliases = [alias[0] for alias in aliases]
+                    self.index_k_int8_scale_aliases = [alias[1] for alias in aliases]
+                    self.index_k_dequant_workspace = torch.empty(
+                        (
+                            num_index_pages,
+                            self.page_size,
+                            1,
+                            self.index_head_dim,
+                        ),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    self.index_k_page_claims = torch.empty(
+                        (num_index_pages,), dtype=torch.int32, device=device
+                    )
             else:
                 self.index_k_buffer = [
                     torch.zeros(
                         (
-                            (index_buf_size + page_size + 1) // self.page_size,
+                            num_index_pages,
                             self.page_size,
                             1,
                             self.index_head_dim,
@@ -2262,11 +2299,33 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     for _ in range(self.indexer_layer_num)
                 ]
         self._finalize_allocation_log(size)
+        if self.use_int8_index_k_cache:
+            persistent_bytes = (
+                num_index_pages
+                * self.page_size
+                * index_k_cache_bytes_per_token(self.index_k_cache_mode)
+                * self.indexer_layer_num
+            )
+            workspace_bytes = self.index_k_dequant_workspace.nbytes
+            logger.info(
+                "NSA index-K cache mode=%s, persistent bytes/token/layer=%d, "
+                "workspace_count=1, workspace_bytes=%d, page_claim_bytes=%d, "
+                "persistent_bytes=%d",
+                self.index_k_cache_mode.value,
+                index_k_cache_bytes_per_token(self.index_k_cache_mode),
+                workspace_bytes,
+                self.index_k_page_claims.nbytes,
+                persistent_bytes,
+            )
 
     def _clear_buffers(self):
         super()._clear_buffers()
         del self.index_k_with_scale_buffer
         del self.index_k_buffer
+        del self.index_k_int8_k_aliases
+        del self.index_k_int8_scale_aliases
+        del self.index_k_dequant_workspace
+        del self.index_k_page_claims
 
     def _get_indexer_cache_index(self, layer_id: int) -> int:
         try:
@@ -2292,7 +2351,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return self.index_k_with_scale_buffer[cache_index]
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
-        assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
+        assert (
+            self.index_k_cache_mode is IndexKCacheMode.BF16
+        ), "BF16 index K cache is not enabled"
         cache_index = self._get_indexer_cache_index(layer_id)
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -2305,6 +2366,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        if self.use_int8_index_k_cache:
+            assert self.index_k_dequant_workspace is not None
+            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            return self.index_k_dequant_workspace[page_indices[:num_pages]].view(
+                -1, 1, self.index_head_dim
+            )[:seq_len]
         if not self.use_fp8_index_k_cache:
             num_pages = (seq_len + self.page_size - 1) // self.page_size
             buf = self.get_index_k_buffer(layer_id)
@@ -2316,6 +2383,26 @@ class NSATokenToKVPool(MLATokenToKVPool):
         buf = self.index_k_with_scale_buffer[self._get_indexer_cache_index(layer_id)]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def dequantize_index_k_int8_paged(
+        self,
+        layer_id: int,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.use_int8_index_k_cache, "INT8 index K cache is not enabled"
+        cache_index = self._get_indexer_cache_index(layer_id)
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return dequantize_index_k_int8_paged(
+            self.index_k_with_scale_buffer[cache_index],
+            block_tables,
+            context_lens,
+            self.index_k_dequant_workspace,
+            self.index_k_page_claims,
+            int8_k=self.index_k_int8_k_aliases[cache_index],
+            fp32_scales=self.index_k_int8_scale_aliases[cache_index],
         )
 
     def get_index_k_scale_continuous(
@@ -2375,6 +2462,23 @@ class NSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
+    def set_index_k_int8_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        assert self.use_int8_index_k_cache, "INT8 index K cache is not enabled"
+        cache_index = self._get_indexer_cache_index(layer_id)
+        quantize_and_store_index_k_int8(
+            index_k,
+            self.index_k_with_scale_buffer[cache_index],
+            loc,
+            page_size=self.page_size,
+            int8_k=self.index_k_int8_k_aliases[cache_index],
+            fp32_scales=self.index_k_int8_scale_aliases[cache_index],
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # NSA keeps a page-indexed indexer cache alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
@@ -2384,7 +2488,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
         index_k_cache = (
             self.index_k_with_scale_buffer
-            if self.use_fp8_index_k_cache
+            if self.use_scaled_index_k_cache
             else self.index_k_buffer
         )
 
@@ -2414,7 +2518,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_cpu = kv_cache_cpu_dict["index_k"]
         index_k_cache = (
             self.index_k_with_scale_buffer
-            if self.use_fp8_index_k_cache
+            if self.use_scaled_index_k_cache
             else self.index_k_buffer
         )
         torch.cuda.synchronize()
@@ -2435,7 +2539,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ) -> None:
-        assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
+        assert (
+            self.index_k_cache_mode is IndexKCacheMode.BF16
+        ), "BF16 index K cache is not enabled"
         if index_k.dtype != self.index_k_buffer_dtype:
             index_k = index_k.to(self.index_k_buffer_dtype)
 
@@ -2446,7 +2552,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
     def get_state_buf_infos(self):
         index_cache = (
             self.index_k_with_scale_buffer
-            if self.use_fp8_index_k_cache
+            if self.use_scaled_index_k_cache
             else self.index_k_buffer
         )
         data_ptrs = [buffer.data_ptr() for buffer in index_cache]
@@ -2458,11 +2564,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
         kv_size_bytes = super().get_kv_size_bytes()
         index_cache = (
             self.index_k_with_scale_buffer
-            if self.use_fp8_index_k_cache
+            if self.use_scaled_index_k_cache
             else self.index_k_buffer
         )
         for index_k_cache in index_cache:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.use_int8_index_k_cache:
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_dequant_workspace)
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_page_claims)
         return kv_size_bytes
 
 

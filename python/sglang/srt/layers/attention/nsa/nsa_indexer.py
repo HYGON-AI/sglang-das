@@ -23,6 +23,7 @@ import torch
 from einops import rearrange
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.hcu_int8_index_k_cache import IndexKCacheMode
 from sglang.srt.layers.attention.nsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     effective_forward_mode,
@@ -333,9 +334,24 @@ class Indexer(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
 
     def _use_hcu_bf16_index_cache(self, forward_batch: ForwardBatch) -> bool:
-        return _is_hcu and not getattr(
-            forward_batch.token_to_kv_pool, "use_fp8_index_k_cache", True
-        )
+        return _is_hcu and getattr(
+            forward_batch.token_to_kv_pool,
+            "index_k_cache_mode",
+            IndexKCacheMode.FP8_SCALED,
+        ) is IndexKCacheMode.BF16
+
+    def _use_hcu_int8_index_cache(self, forward_batch: ForwardBatch) -> bool:
+        return _is_hcu and getattr(
+            forward_batch.token_to_kv_pool,
+            "index_k_cache_mode",
+            IndexKCacheMode.FP8_SCALED,
+        ) is IndexKCacheMode.INT8_SCALED
+
+    def _use_hcu_bf16_indexer_compute(self, forward_batch: ForwardBatch) -> bool:
+        """Whether the LightOp consumer must receive BF16 K and FP32 weights."""
+        return self._use_hcu_bf16_index_cache(
+            forward_batch
+        ) or self._use_hcu_int8_index_cache(forward_batch)
 
     def _get_gate_input_tensor(
         self, x: torch.Tensor | tuple[torch.Tensor, ...]
@@ -651,7 +667,23 @@ class Indexer(MultiPlatformOp):
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
         sparse_mask: Optional[torch.Tensor] = None
-        if self._use_hcu_bf16_index_cache(forward_batch):
+        if self._use_hcu_int8_index_cache(forward_batch):
+            kv_cache = forward_batch.token_to_kv_pool.dequantize_index_k_int8_paged(
+                layer_id=layer_id,
+                block_tables=block_tables,
+                context_lens=seqlens_32,
+            )
+            logits = lightop_attention.paged_mqa_logits(
+                q[:q_offset].unsqueeze(1),
+                kv_cache,
+                weights[:q_offset].to(torch.float32),
+                seqlens_32,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=True,
+            )
+        elif self._use_hcu_bf16_index_cache(forward_batch):
             kv_cache = forward_batch.token_to_kv_pool.get_index_k_buffer(
                 layer_id=layer_id
             )
@@ -927,7 +959,13 @@ class Indexer(MultiPlatformOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        use_bf16_index_cache = self._use_hcu_bf16_index_cache(forward_batch)
+        use_bf16_index_cache = self._use_hcu_bf16_indexer_compute(forward_batch)
+        if self._use_hcu_int8_index_cache(forward_batch):
+            forward_batch.token_to_kv_pool.dequantize_index_k_int8_paged(
+                layer_id=layer_id,
+                block_tables=block_tables,
+                context_lens=metadata.get_indexer_seq_len(),
+            )
         if use_bf16_index_cache:
             # Ragged BF16 cannot consume the paged cache buffer directly.
             # Gather each request's valid pages into one continuous K tensor first,
@@ -1181,7 +1219,7 @@ class Indexer(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        use_bf16_index_cache = self._use_hcu_bf16_index_cache(forward_batch)
+        use_bf16_index_cache = self._use_hcu_bf16_indexer_compute(forward_batch)
         k_fp8_list = []
         k_scale_list = []
         k_bf16_list = []
@@ -1192,6 +1230,13 @@ class Indexer(MultiPlatformOp):
         batch_idx_list = []
 
         block_tables = metadata.get_page_table_64()
+
+        if self._use_hcu_int8_index_cache(forward_batch):
+            forward_batch.token_to_kv_pool.dequantize_index_k_int8_paged(
+                layer_id=layer_id,
+                block_tables=block_tables,
+                context_lens=metadata.get_indexer_seq_len(),
+            )
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1466,6 +1511,14 @@ class Indexer(MultiPlatformOp):
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
+        if _is_hcu and self._use_hcu_int8_index_cache(forward_batch):
+            forward_batch.token_to_kv_pool.set_index_k_int8_buffer(
+                layer_id=layer_id,
+                loc=forward_batch.out_cache_loc,
+                index_k=key,
+            )
+            return
+
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
             _is_cuda
@@ -1628,14 +1681,15 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if _is_hcu:
-                if self._use_hcu_bf16_index_cache(forward_batch):
+                if self._use_hcu_bf16_indexer_compute(forward_batch):
                     q_index, key = self._get_q_k_bf16(
                         q_lora, x, positions, False, forward_batch=forward_batch
                     )
-                    forward_batch.token_to_kv_pool.set_index_k_buffer(
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
                         layer_id=layer_id,
-                        loc=forward_batch.out_cache_loc,
-                        index_k=key,
+                        key=key,
+                        act_quant=act_quant,
                     )
                     weights = self._get_bf16_logits_head_gate(x)
                 else:
@@ -1703,7 +1757,7 @@ class Indexer(MultiPlatformOp):
                 q_index = q_fp8
         else:
             if _is_hcu:
-                if self._use_hcu_bf16_index_cache(forward_batch):
+                if self._use_hcu_bf16_indexer_compute(forward_batch):
                     q_index, key = self._get_q_k_bf16(
                         q_lora,
                         x,
@@ -1711,10 +1765,11 @@ class Indexer(MultiPlatformOp):
                         enable_dual_stream if not _is_hcu else False,
                         forward_batch=forward_batch,
                     )
-                    forward_batch.token_to_kv_pool.set_index_k_buffer(
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
                         layer_id=layer_id,
-                        loc=forward_batch.out_cache_loc,
-                        index_k=key,
+                        key=key,
+                        act_quant=act_quant,
                     )
                 else:
                     query, key = self._get_q_k_bf16(
@@ -1789,7 +1844,7 @@ class Indexer(MultiPlatformOp):
                 q_index = q_fp8
 
             x_for_gate = self._get_gate_input_tensor(x)
-            if self._use_hcu_bf16_index_cache(forward_batch):
+            if self._use_hcu_bf16_indexer_compute(forward_batch):
                 weights = (
                     self._project_and_scale_head_gates(x_for_gate).unsqueeze(-1)
                     * self.softmax_scale

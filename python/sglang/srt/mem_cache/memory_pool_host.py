@@ -2677,11 +2677,15 @@ class NSAIndexerPoolHost(HostKVCache):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.layer_num = device_pool.indexer_layer_num
-        self.use_fp8 = device_pool.use_fp8_index_k_cache
+        # Both scaled formats use the same 132-byte page-planar transfer ABI.
+        # INT8 mode is rejected with HiCache during server initialization today,
+        # but keeping the host view format-aware avoids treating its packed bytes
+        # as a BF16 tensor in direct pool users.
+        self.use_scaled_index_k_cache = device_pool.use_scaled_index_k_cache
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
         self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
-        if self.use_fp8:
+        if self.use_scaled_index_k_cache:
             self.indexer_size_per_token = (
                 self.index_head_dim
                 + self.index_head_dim // self.indexer_quant_block_size * 4
@@ -2723,7 +2727,7 @@ class NSAIndexerPoolHost(HostKVCache):
         self.clear()
 
     def _get_device_index_k_cache_for_transfer(self, device_pool):
-        if self.use_fp8:
+        if self.use_scaled_index_k_cache:
             return device_pool.index_k_with_scale_buffer
         return [
             buf.view(torch.uint8).view(buf.shape[0], -1)

@@ -479,6 +479,8 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_HCU_REUSE_SORTED_TOPK = EnvBool(False)
+    # gfx936-only proof-of-concept: page-planar INT8 K plus FP32 token scales.
+    SGLANG_NSA_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
     # Enable the paired LightOp sparse Page-MQA and mask-aware paged TopK path.
     # It remains opt-in because sparse logits cannot be consumed by dense TopK.
     SGLANG_USE_LIGHTOP_MASK_TOPK = EnvBool(False)

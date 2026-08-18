@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -27,6 +28,12 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.hcu_int8_index_k_cache import (
+    index_k_cache_bytes_per_token,
+    index_k_workspace_bytes_per_token,
+    resolve_index_k_cache_mode,
+    validate_hcu_int8_index_k_cache_server_args,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -53,8 +60,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
-    is_hcu,
-    is_hcu_native_fp8_supported,
     is_hip,
     is_npu,
 )
@@ -73,7 +78,6 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_hcu = is_hcu()
 
 
 class ModelRunnerKVCacheMixin:
@@ -129,21 +133,9 @@ class ModelRunnerKVCacheMixin:
                 num_indexer_layers = (
                     num_layers if indexer_layer_ids is None else len(indexer_layer_ids)
                 )
-                use_bf16_index_cache = _is_hcu and (
-                    self.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
-                    or not is_hcu_native_fp8_supported()
+                cache_mode = resolve_index_k_cache_mode(
+                    self.kv_cache_dtype, self.page_size, index_head_dim
                 )
-                if use_bf16_index_cache:
-                    indexer_size_per_token = index_head_dim
-                    element_size = torch._utils._element_size(torch.bfloat16)
-                else:
-                    indexer_size_per_token = (
-                        index_head_dim
-                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-                    )
-                    element_size = torch._utils._element_size(
-                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                    )
                 indexer_ratio = 1
                 if self.enable_hisparse:
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -151,12 +143,13 @@ class ModelRunnerKVCacheMixin:
                     indexer_ratio = parse_hisparse_config(
                         self.server_args
                     ).host_to_device_ratio
-                cell_size += int(
-                    indexer_size_per_token
+                persistent_bytes = (
+                    index_k_cache_bytes_per_token(cache_mode)
                     * num_indexer_layers
-                    * element_size
                     * indexer_ratio
                 )
+                workspace_bytes = index_k_workspace_bytes_per_token(cache_mode)
+                cell_size += math.ceil(persistent_bytes + workspace_bytes)
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -460,6 +453,8 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+        if is_nsa_model:
+            validate_hcu_int8_index_k_cache_server_args(self.server_args)
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
