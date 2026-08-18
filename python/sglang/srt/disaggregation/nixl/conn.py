@@ -22,13 +22,16 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    validate_nsa_state_transfer_abi,
 )
 from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
     pack_int_lists,
+    pack_string_list,
     unpack_int_lists,
+    unpack_string_list,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -133,12 +136,15 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
-    # Keep last: optional, parsed from a variable-length tail of the ZMQ
-    # frame in from_zmq() below, so positional construction stays stable.
+    dst_state_data_formats: List[str] = dataclasses.field(default_factory=list)
+    # Local-only validation result; this is never serialized on the wire.
+    registration_error: Optional[str] = dataclasses.field(default=None, repr=False)
+    # Staging keeps its legacy wire offsets; extension frames follow it.
     staging: Optional["StagingRegisterInfo"] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        has_state_data_formats = len(msg) > 16
         dst_state_data_ptrs = (
             unpack_int_lists(msg[7], "Q") if len(msg) > 7 and msg[7] != b"" else []
         )
@@ -147,6 +153,9 @@ class KVArgsRegisterInfo:
         )
         dst_state_dim_per_tensor = (
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
+        )
+        dst_state_data_formats = (
+            unpack_string_list(msg[16]) if has_state_data_formats else []
         )
 
         return cls(
@@ -164,6 +173,7 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            dst_state_data_formats=dst_state_data_formats,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
@@ -570,7 +580,10 @@ class NixlKVManager(CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             try:
-                if self.check_status(room) == KVPoll.Failed:
+                if (
+                    room not in self.request_status
+                    or self.check_status(room) == KVPoll.Failed
+                ):
                     continue
 
                 assert room in self.transfer_infos
@@ -588,6 +601,12 @@ class NixlKVManager(CommonKVManager):
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
                 handles: List = []
+
+                registration_error = self._get_registration_failure(
+                    reqs_to_be_processed
+                )
+                if registration_error is not None:
+                    raise RuntimeError(registration_error)
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -701,6 +720,7 @@ class NixlKVManager(CommonKVManager):
                             decode_tp_rank=dst_info.decode_tp_rank,
                             dst_state_item_lens=dst_info.dst_state_item_lens,
                             dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                            dst_state_data_formats=dst_info.dst_state_data_formats,
                         )
                         handles.extend(h for h in state_xfer_handles if h is not None)
 
@@ -805,11 +825,50 @@ class NixlKVManager(CommonKVManager):
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
-        if agent_name in self.decode_kv_args_table:
+        current_registration = self.decode_kv_args_table.get(agent_name)
+        if (
+            current_registration is not None
+            and current_registration.registration_error is None
+        ):
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+
+        try:
+            self.validate_remote_state_transfer_abis(
+                decode_kv_args.dst_state_data_formats,
+                decode_kv_args.dst_state_item_lens,
+            )
+        except RuntimeError as error:
+            decode_kv_args.registration_error = str(error)
+            self.decode_kv_args_table[agent_name] = decode_kv_args
+            logger.error(
+                "Decode peer %s registered an incompatible state ABI: %s",
+                agent_name,
+                error,
+            )
+            return
+
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+
+    def _get_registration_failure(
+        self, reqs: List[TransferInfo]
+    ) -> Optional[str]:
+        for req in reqs:
+            if req.is_dummy():
+                continue
+            registration_info = self.decode_kv_args_table.get(req.agent_name)
+            if registration_info is None:
+                return (
+                    "Decode peer registration is missing for NIXL agent "
+                    f"{req.agent_name!r}"
+                )
+            if registration_info.registration_error is not None:
+                return (
+                    f"Decode peer {req.agent_name!r} is incompatible: "
+                    f"{registration_info.registration_error}"
+                )
+        return None
 
     def _send_kvcache_generic(
         self,
@@ -1482,6 +1541,7 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int = 0,
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
+        dst_state_data_formats: List[str] | None = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -1492,6 +1552,7 @@ class NixlKVManager(CommonKVManager):
         )
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
+        dst_state_data_formats = dst_state_data_formats or []
 
         handles = []
         for i, st in enumerate(state_types):
@@ -1512,6 +1573,18 @@ class NixlKVManager(CommonKVManager):
                 dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else []
             )
             comp_notif = f"{notif}_{i}"
+
+            if st == StateType.NSA:
+                src_formats = getattr(self.kv_args, "state_data_formats", [])
+                src_format = src_formats[i] if i < len(src_formats) else ""
+                dst_format = (
+                    dst_state_data_formats[i]
+                    if i < len(dst_state_data_formats)
+                    else ""
+                )
+                validate_nsa_state_transfer_abi(
+                    src_format, dst_format, src_lens, dst_lens
+                )
 
             if st == StateType.C128_STATE:
                 if len(src_indices) == 0 and len(dst_indices) == 0:
@@ -1593,6 +1666,18 @@ class NixlKVManager(CommonKVManager):
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
+
+        if (
+            bootstrap_room not in self.request_status
+            or self.check_status(bootstrap_room) == KVPoll.Failed
+        ):
+            logger.debug(
+                "Request with bootstrap_room=%s already failed", bootstrap_room
+            )
+            return
+
+        if bootstrap_room not in self.transfer_infos:
+            return
 
         # Prefetch STAGING_REQ to decode before enqueueing so decode has
         # already allocated staging by the time the worker picks up the
@@ -1793,10 +1878,17 @@ class NixlKVManager(CommonKVManager):
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    registration_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    self._add_remote_peer(registration_info)
+                    logger.debug(
+                        "Registered KVArgs from %s%s",
+                        agent_name,
+                        (
+                            " with an incompatible state ABI"
+                            if registration_info.registration_error is not None
+                            else " successfully"
+                        ),
                     )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:
@@ -1817,8 +1909,22 @@ class NixlKVManager(CommonKVManager):
                         ),
                         0,
                     )
-                    logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
+                    registration_error = self._get_registration_failure(
+                        list(self.transfer_infos[room].values())
+                    )
+                    if registration_error is None:
+                        logger.debug(f"{room=} is bootstrapped")
+                    else:
+                        error = RuntimeError(registration_error)
+                        self.exceptions[room] = error
+                        self.record_failure(room, registration_error)
+                        self.update_status(room, KVPoll.Failed)
+                        logger.error(
+                            "Rejecting PD transfer for room %s: %s",
+                            room,
+                            registration_error,
+                        )
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2053,6 +2159,9 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_state_data_formats = pack_string_list(
+                getattr(self.kv_mgr.kv_args, "state_data_formats", []) or []
+            )
 
             # Include staging allocator metadata if available
             if (
@@ -2086,6 +2195,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_state_data_formats,
                     ]
                 )
 

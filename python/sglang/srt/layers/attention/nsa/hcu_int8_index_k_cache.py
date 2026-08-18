@@ -405,7 +405,7 @@ def dequantize_index_k_int8_paged(
 
 
 def validate_hcu_int8_index_k_cache_server_args(server_args) -> None:
-    """Reject first-stage combinations whose transfer/lifetime support is pending."""
+    """Reject combinations whose transfer/lifetime support is pending."""
     if not envs.SGLANG_NSA_HCU_INT8_INDEX_K_CACHE.get():
         return
     unsupported = []
@@ -415,8 +415,15 @@ def validate_hcu_int8_index_k_cache_server_args(server_args) -> None:
         unsupported.append("--enable-hierarchical-cache")
     if getattr(server_args, "cpu_offload_gb", 0) > 0:
         unsupported.append("--cpu-offload-gb")
-    if getattr(server_args, "disaggregation_mode", "null") != "null":
-        unsupported.append("--disaggregation-mode")
+    if (
+        getattr(server_args, "disaggregation_mode", "null") != "null"
+        and getattr(server_args, "disaggregation_transfer_backend", "mooncake")
+        not in ("mooncake", "nixl", "fake")
+    ):
+        unsupported.append(
+            "--disaggregation-transfer-backend="
+            f"{server_args.disaggregation_transfer_backend}"
+        )
     if getattr(server_args, "enable_two_batch_overlap", False):
         unsupported.append("--enable-two-batch-overlap")
     if unsupported:

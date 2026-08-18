@@ -66,6 +66,41 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+def validate_nsa_state_transfer_abi(
+    src_format: str,
+    dst_format: str,
+    src_item_lens: List[int],
+    dst_item_lens: List[int],
+) -> None:
+    """Validate the page ABI before transferring an NSA index-K cache.
+
+    NSA state is transferred one physical page at a time. Scaled cache modes
+    keep K and its scales in one packed page, so copying the full item also
+    transfers the scale payload. Requiring identical, uniform page sizes keeps
+    a P/D cache-mode mismatch from silently corrupting the destination pool.
+    """
+    if src_format != dst_format:
+        raise RuntimeError(
+            "NSA index-K cache transfer ABI mismatch between prefill and decode: "
+            f"prefill_format={src_format!r}, decode_format={dst_format!r}. "
+            "Ensure P and D use the same SGLANG_NSA_HCU_INT8_INDEX_K_CACHE "
+            "setting, page size, model, and SGLang revision."
+        )
+
+    src_sizes = {int(item_len) for item_len in src_item_lens}
+    dst_sizes = {int(item_len) for item_len in dst_item_lens}
+    if len(src_sizes) == 1 and src_sizes == dst_sizes:
+        return
+
+    raise RuntimeError(
+        "NSA index-K cache page layout mismatch between prefill and decode: "
+        f"prefill_item_lens={sorted(src_sizes)}, "
+        f"decode_item_lens={sorted(dst_sizes)}. Ensure P and D use the same "
+        "SGLANG_NSA_HCU_INT8_INDEX_K_CACHE setting, page size, model, and "
+        "SGLang revision."
+    )
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -231,6 +266,41 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def validate_remote_state_transfer_abis(
+        self,
+        dst_state_data_formats: List[str],
+        dst_state_item_lens: List[List[int]],
+    ) -> None:
+        """Validate request-state page layouts advertised by a decode peer."""
+        state_types = getattr(self.kv_args, "state_types", []) or []
+        src_state_data_formats = (
+            getattr(self.kv_args, "state_data_formats", []) or []
+        )
+        src_state_item_lens = getattr(self.kv_args, "state_item_lens", []) or []
+
+        for i, state_type in enumerate(state_types):
+            if state_type != StateType.NSA:
+                continue
+
+            src_format = (
+                src_state_data_formats[i] if i < len(src_state_data_formats) else ""
+            )
+            dst_format = (
+                dst_state_data_formats[i] if i < len(dst_state_data_formats) else ""
+            )
+            src_item_lens = (
+                src_state_item_lens[i] if i < len(src_state_item_lens) else []
+            )
+            dst_item_lens = (
+                dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
+            )
+            validate_nsa_state_transfer_abi(
+                src_format,
+                dst_format,
+                src_item_lens,
+                dst_item_lens,
+            )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.

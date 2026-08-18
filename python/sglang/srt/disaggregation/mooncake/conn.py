@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    validate_nsa_state_transfer_abi,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -45,7 +46,9 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
     pack_int_lists,
+    pack_string_list,
     unpack_int_lists,
+    unpack_string_list,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -147,13 +150,18 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    dst_state_data_formats: List[str] = dataclasses.field(default_factory=list)
+    # Local-only validation result; this is never serialized on the wire.
+    registration_error: Optional[str] = dataclasses.field(default=None, repr=False)
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
+    # Keep staging fields at their legacy wire offsets. Extension frames follow
+    # them so an older prefill can safely ignore the new metadata.
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        has_state_data_formats = len(msg) > 15
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -171,10 +179,12 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
+            dst_state_data_formats=(
+                unpack_string_list(msg[15]) if has_state_data_formats else []
+            ),
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
-            # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
         )
 
@@ -1604,6 +1614,19 @@ class MooncakeKVManager(CommonKVManager):
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
 
+            if st == StateType.NSA:
+                src_formats = getattr(self.kv_args, "state_data_formats", [])
+                dst_formats = (
+                    target_rank_registration_info.dst_state_data_formats
+                    if target_rank_registration_info is not None
+                    else []
+                )
+                src_format = src_formats[i] if i < len(src_formats) else ""
+                dst_format = dst_formats[i] if i < len(dst_formats) else ""
+                validate_nsa_state_transfer_abi(
+                    src_format, dst_format, src_item_lens, dst_item_lens
+                )
+
             if st == StateType.MAMBA:
                 if (
                     target_rank_registration_info is not None
@@ -1915,6 +1938,59 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def _mark_registration_failure(
+        self,
+        room: int,
+        reqs: List[TransferInfo],
+        failure_reason: str,
+        prefill_rank: int,
+    ) -> None:
+        """Fail one room without terminating the shared transfer worker."""
+        logger.error("Rejecting PD transfer for room %s: %s", room, failure_reason)
+        self.record_failure(room, failure_reason)
+        if room not in self.request_status:
+            self.update_status(room, KVPoll.WaitingForInput)
+        self.update_status(room, KVPoll.Failed)
+
+        for req in reqs:
+            if req.is_dummy:
+                continue
+            try:
+                self.sync_status_to_decode_endpoint(
+                    req.endpoint,
+                    req.dst_port,
+                    req.room,
+                    KVPoll.Failed,
+                    prefill_rank,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to report registration error for room %s to %s",
+                    room,
+                    NetworkAddress(req.endpoint, req.dst_port).to_host_port_str(),
+                )
+
+    def _get_registration_failure(
+        self, reqs: List[TransferInfo]
+    ) -> Optional[str]:
+        for req in reqs:
+            if req.is_dummy:
+                continue
+            registration_info = self.decode_kv_args_table.get(
+                req.mooncake_session_id
+            )
+            if registration_info is None:
+                return (
+                    "Decode peer registration is missing for Mooncake session "
+                    f"{req.mooncake_session_id!r}"
+                )
+            if registration_info.registration_error is not None:
+                return (
+                    f"Decode peer {req.mooncake_session_id!r} is incompatible: "
+                    f"{registration_info.registration_error}"
+                )
+        return None
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1933,7 +2009,7 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
                 reqs_to_be_processed = (
-                    self.transfer_infos[kv_chunk.room].values()
+                    list(self.transfer_infos[kv_chunk.room].values())
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
@@ -1945,6 +2021,17 @@ class MooncakeKVManager(CommonKVManager):
                     + self.pp_rank * self.attn_cp_size
                     + self.attn_cp_rank
                 )
+                registration_error = self._get_registration_failure(
+                    reqs_to_be_processed
+                )
+                if registration_error is not None:
+                    self._mark_registration_failure(
+                        kv_chunk.room,
+                        reqs_to_be_processed,
+                        registration_error,
+                        prefill_unique_rank,
+                    )
+                    continue
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -2141,16 +2228,33 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
+                    registration_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    try:
+                        self.validate_remote_state_transfer_abis(
+                            registration_info.dst_state_data_formats,
+                            registration_info.dst_state_item_lens,
+                        )
+                    except RuntimeError as error:
+                        registration_info.registration_error = str(error)
+                        logger.error(
+                            "Decode peer %s registered an incompatible state ABI: %s",
+                            mooncake_session_id,
+                            error,
+                        )
+                    self.decode_kv_args_table[mooncake_session_id] = registration_info
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
                     logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
+                        "Registered KVArgs from %s%s",
+                        mooncake_session_id,
+                        (
+                            " with an incompatible state ABI"
+                            if registration_info.registration_error is not None
+                            else " successfully"
+                        ),
                     )
                     continue
                 else:
@@ -2172,7 +2276,22 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
-                        self.update_status(room, KVPoll.WaitingForInput)
+                        reqs = list(self.transfer_infos[room].values())
+                        registration_error = self._get_registration_failure(reqs)
+                        if registration_error is None:
+                            self.update_status(room, KVPoll.WaitingForInput)
+                        else:
+                            prefill_unique_rank = (
+                                self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                                + self.pp_rank * self.attn_cp_size
+                                + self.attn_cp_rank
+                            )
+                            self._mark_registration_failure(
+                                room,
+                                reqs,
+                                registration_error,
+                                prefill_unique_rank,
+                            )
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2571,6 +2690,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_state_data_formats = pack_string_list(
+                getattr(self.kv_mgr.kv_args, "state_data_formats", []) or []
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -2610,6 +2732,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_state_data_formats,
                     ],
                 )
 
