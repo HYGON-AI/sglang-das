@@ -901,6 +901,15 @@ class NativeSparseAttnBackend(
                 if self.nsa_decode_impl == "flashmla_kv"
                 else None
             ),
+            # TARGET_VERIFY has a fixed number of query tokens per request.
+            # Keep those lengths on device so CUDA-graph replay does not build a
+            # Python list and issue a small H2D copy on every speculative step.
+            "target_verify_extend_seq_lens": torch.full(
+                (max_bs,),
+                self.speculative_num_draft_tokens or 0,
+                dtype=torch.int32,
+                device=self.device,
+            ),
         }
 
     def init_forward_metadata_capture_cuda_graph(
@@ -1117,15 +1126,15 @@ class NativeSparseAttnBackend(
             )
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
             page_indices = torch.repeat_interleave(
-                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                page_indices,
+                repeats=self.speculative_num_draft_tokens,
+                dim=0,
+                output_size=bs * self.speculative_num_draft_tokens,
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
+                self.decode_cuda_graph_metadata["target_verify_extend_seq_lens"][:bs],
                 cache_seqlens,
                 self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
