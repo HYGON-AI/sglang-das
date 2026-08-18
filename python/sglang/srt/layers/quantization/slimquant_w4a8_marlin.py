@@ -675,18 +675,41 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 )
                 return u.contiguous()
 
-            layer.w13_weight = Parameter(
-                _to_triton_layout(layer.w13_weight), requires_grad=False
-            )
-            layer.w2_weight = Parameter(
-                _to_triton_layout(layer.w2_weight), requires_grad=False
-            )
-            layer.w13_weight_scale = Parameter(
-                layer.w13_weight_scale.data * 16.0, requires_grad=False
-            )
-            layer.w2_weight_scale = Parameter(
-                layer.w2_weight_scale.data * 16.0, requires_grad=False
-            )
+            if _use_aiter_moe:
+                E = layer.w13_weight.shape[0]
+                layer.w13_weight = Parameter(
+                    repack_and_shuffle_w4a8(layer.w13_weight.data, E),
+                    requires_grad=False,
+                )
+                layer.w2_weight = Parameter(
+                    repack_and_shuffle_w4a8(layer.w2_weight.data, E),
+                    requires_grad=False,
+                )
+                scale_mul = 1.0
+                layer.w13_weight_scale = Parameter(
+                    layer.w13_weight_scale.data * scale_mul,
+                    requires_grad=False,
+                )
+                layer.w2_weight_scale = Parameter(
+                    layer.w2_weight_scale.data * scale_mul,
+                    requires_grad=False,
+                )
+            else:
+                layer.w13_weight = Parameter(
+                    _to_triton_layout(layer.w13_weight), requires_grad=False
+                )
+                layer.w2_weight = Parameter(
+                    _to_triton_layout(layer.w2_weight), requires_grad=False
+                )
+                scale_mul = 16.0
+                layer.w13_weight_scale = Parameter(
+                    layer.w13_weight_scale.data * scale_mul,
+                    requires_grad=False,
+                )
+                layer.w2_weight_scale = Parameter(
+                    layer.w2_weight_scale.data * scale_mul,
+                    requires_grad=False,
+                )
         else:
             # Legacy lightop path: repack into the Marlin W4A8 layout.
             layer.w13_weight = Parameter(
@@ -720,10 +743,12 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         per output channel.  ``SGLANG_USE_INT4_W4A8`` switches between W4A16
         and W4A8 (int8 x int8 tensor core), mirroring the MXFP4 flags."""
 
-        k_max = max(layer.w13_weight.shape[2], layer.w2_weight.shape[2]) * 2
-        block_shape = [0, k_max]
         if _use_aiter_moe:
             block_shape = None
+        else:
+            k_max = max(layer.w13_weight.shape[2], layer.w2_weight.shape[2]) * 2
+            block_shape = [0, k_max]
+
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
