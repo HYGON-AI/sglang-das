@@ -5,12 +5,15 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
@@ -46,6 +49,17 @@ _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
 }
+
+_MINIMAX_H3_CACHE_DIT_STATS_ENV = "SGLANG_MINIMAX_H3_CACHE_DIT_STATS"
+
+
+def _minimax_h3_cache_dit_stats_enabled() -> bool:
+    return os.getenv(_MINIMAX_H3_CACHE_DIT_STATS_ENV, "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -399,6 +413,36 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             or super()._cache_dit_requested()
         )
 
+    def _maybe_log_cache_dit_stats(self) -> None:
+        """Log detailed Cache-DiT statistics for H3 on global rank zero."""
+
+        if not _minimax_h3_cache_dit_stats_enabled():
+            return
+        if not getattr(self, "_cache_dit_enabled", False):
+            return
+
+        is_rank_zero = not (
+            dist.is_available() and dist.is_initialized() and dist.get_rank() != 0
+        )
+
+        try:
+            import cache_dit
+
+            summary = cache_dit.summary(
+                self.transformer,
+                details=True,
+                logging=False,
+            )
+            if is_rank_zero:
+                logger.info(
+                    "H3_CACHE_DIT_RUNTIME_SUMMARY=%s",
+                    json.dumps(summary, ensure_ascii=False, default=str),
+                )
+        except Exception:
+            # Statistics are diagnostic-only and must not fail generation.
+            if is_rank_zero:
+                logger.exception("Failed to collect MiniMax-H3 Cache-DiT statistics")
+
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
@@ -417,16 +461,70 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # a time. Combined with `quality` in the dynamic-batch signature, this
         # makes the process-wide hook transition safe at this batch boundary.
         if self._cache_dit_enabled and current_mode != desired_mode:
+            # Keep preservation enabled until Cache-DiT has released every
+            # retained input reference.
             self.transformer = disable_cache_on_transformer(self.transformer)
             self._cache_dit_enabled = False
             self._cached_num_steps = None
             self._minimax_h3_cache_mode = None
+            self._set_cache_dit_input_preservation(False)
 
         if desired_mode is None:
             return
-        super()._maybe_enable_cache_dit(num_inference_steps, batch)
+
+        # Arm before mounting because Cache-DiT replaces `blocks` with its
+        # wrapper and the real H3 blocks are only directly reachable here.
+        was_enabled = self._cache_dit_enabled
+        if not was_enabled:
+            self._set_cache_dit_input_preservation(True)
+        try:
+            super()._maybe_enable_cache_dit(num_inference_steps, batch)
+        except Exception:
+            if not was_enabled:
+                self._disarm_after_failed_mount()
+            raise
+
         if self._cache_dit_enabled:
             self._minimax_h3_cache_mode = desired_mode
+        elif not was_enabled:
+            self._set_cache_dit_input_preservation(False)
+
+    def _disarm_after_failed_mount(self) -> None:
+        """Restore the in-place path after confirming a failed mount is gone."""
+
+        try:
+            self.transformer = disable_cache_on_transformer(self.transformer)
+        except Exception:
+            logger.warning(
+                "Could not unmount Cache-DiT after a failed mount; leaving "
+                "MiniMax-H3 input preservation on",
+                exc_info=True,
+            )
+            return
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._minimax_h3_cache_mode = None
+        self._set_cache_dit_input_preservation(False)
+
+    def _set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Toggle the H3 block input-preservation path through wrappers."""
+
+        model = self.transformer
+        for _ in range(4):
+            if hasattr(model, "set_cache_dit_input_preservation"):
+                break
+            inner = getattr(model, "_orig_mod", None) or getattr(model, "module", None)
+            if inner is None:
+                break
+            model = inner
+        setter = getattr(model, "set_cache_dit_input_preservation", None)
+        if not callable(setter):
+            raise TypeError(
+                "MiniMax-H3 Cache-DiT requires set_cache_dit_input_preservation() "
+                f"on the transformer, but {type(self.transformer).__name__} does "
+                "not expose it"
+            )
+        setter(enabled)
 
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
@@ -610,6 +708,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+        self._maybe_log_cache_dit_stats()
 
     @contextmanager
     def _profile_denoising_step(self, step_index: int, *, batch: Req):
