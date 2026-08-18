@@ -232,29 +232,29 @@ def moe_fused_gate_hcu(
         num_fused_shared_experts,
         routed_scaling_factor,
     )
-    try:
-        topk_weights, topk_ids = op.moe_fused_gate(
-            *args, apply_routed_scaling_factor_on_output
-        )
-    except TypeError as error:
-        # Older LightOp builds only expose the 7-argument API. That API is
-        # compatible only when routed scaling remains outside the gate.
-        if (
-            apply_routed_scaling_factor_on_output
-            or "takes 7 positional arguments but 8 were given" not in str(error)
-        ):
-            raise
-        topk_weights, topk_ids = op.moe_fused_gate(*args)
-    # topk_weights, topk_ids = op.moe.moe_fused_gate(
-    #     gating_output,
-    #     correction_bias,
-    #     num_expert_group,
-    #     topk_group,
-    #     topk,
-    #     num_fused_shared_experts,
-    #     routed_scaling_factor,
-    #     apply_routed_scaling_factor_on_output,
-    # )
+    # try:
+    #     topk_weights, topk_ids = op.moe_fused_gate(
+    #         *args, apply_routed_scaling_factor_on_output
+    #     )
+    # except TypeError as error:
+    #     # Older LightOp builds only expose the 7-argument API. That API is
+    #     # compatible only when routed scaling remains outside the gate.
+    #     if (
+    #         apply_routed_scaling_factor_on_output
+    #         or "takes 7 positional arguments but 8 were given" not in str(error)
+    #     ):
+    #         raise
+    #     topk_weights, topk_ids = op.moe_fused_gate(*args)
+    topk_weights, topk_ids = op.moe_fused_gate(
+        gating_output,
+        correction_bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
     return topk_weights, topk_ids
 
 

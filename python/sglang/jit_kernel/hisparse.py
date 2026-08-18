@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 
 HCU_MAX_HISPARSE_BLOCK_SIZE = 256
+HISPARSE_HOST_PTRS_JIT_ABI_VERSION = "host_ptrs_v1"
 
 
 def resolve_hisparse_block_size(block_size: int) -> int:
@@ -35,7 +36,13 @@ def _jit_sparse_module(
         block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
     )
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        HISPARSE_HOST_PTRS_JIT_ABI_VERSION,
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
     )
     return load_jit(
         "sparse_cache",
@@ -58,6 +65,8 @@ def _load_cache_to_device_buffer_mla(
     host_cache_locs: torch.Tensor,
     device_buffer_locs: torch.Tensor,
     host_cache: torch.Tensor,
+    host_cache_ptrs: torch.Tensor | None,
+    host_cache_ptr_index: int,
     device_buffer: torch.Tensor,
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -86,6 +95,8 @@ def _load_cache_to_device_buffer_mla(
     )
 
     empty = torch.empty(0)
+    if host_cache_ptrs is None:
+        host_cache_ptrs = empty
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -98,6 +109,7 @@ def _load_cache_to_device_buffer_mla(
         host_cache_locs,
         device_buffer_locs,
         host_cache,
+        host_cache_ptrs,
         empty,
         device_buffer,
         empty,
@@ -106,6 +118,7 @@ def _load_cache_to_device_buffer_mla(
         seq_lens,
         lru_slots,
         num_real_reqs,
+        host_cache_ptr_index,
         page_size,
         item_size_bytes,
     )
@@ -128,6 +141,8 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    host_cache_ptrs: torch.Tensor | None = None,
+    host_cache_ptr_index: int = 0,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -137,6 +152,8 @@ def load_cache_to_device_buffer_mla(
         host_cache_locs=host_cache_locs,
         device_buffer_locs=device_buffer_locs,
         host_cache=host_cache,
+        host_cache_ptrs=host_cache_ptrs,
+        host_cache_ptr_index=host_cache_ptr_index,
         device_buffer=device_buffer,
         top_k_device_locs=top_k_device_locs,
         req_pool_indices=req_pool_indices,
@@ -168,6 +185,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    host_cache_ptrs: torch.Tensor | None = None,
+    host_cache_ptr_index: int = 0,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + linear host (kvcacheio.cuh layout)."""
     _load_cache_to_device_buffer_mla(
@@ -177,6 +196,8 @@ def load_cache_to_device_buffer_dsv4_mla(
         host_cache_locs=host_cache_locs,
         device_buffer_locs=device_buffer_locs,
         host_cache=host_cache,
+        host_cache_ptrs=host_cache_ptrs,
+        host_cache_ptr_index=host_cache_ptr_index,
         device_buffer=device_buffer,
         top_k_device_locs=top_k_device_locs,
         req_pool_indices=req_pool_indices,

@@ -796,6 +796,8 @@ class HiSparseCoordinator:
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            host_cache_ptrs=getattr(self.mem_pool_host, "data_ptrs", None),
+            host_cache_ptr_index=layer_id,
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,

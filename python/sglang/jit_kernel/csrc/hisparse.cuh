@@ -147,6 +147,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t* __restrict__ host_cache_locs,
     const int32_t* __restrict__ device_buffer_locs,
     const void* __restrict__ host_cache_k,
+    const uint64_t* __restrict__ host_cache_k_ptrs,
     const void* __restrict__ host_cache_v,
     void* __restrict__ device_buffer_k,
     void* __restrict__ device_buffer_v,
@@ -160,6 +161,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t lru_slot_stride_0,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
+    int64_t host_cache_ptr_index,
     int64_t page_size,
     int64_t item_size_bytes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
@@ -189,6 +191,13 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+  const void* active_host_cache_k = host_cache_k;
+  if (host_cache_k_ptrs != nullptr && host_cache_ptr_index >= 0) {
+    const uint64_t host_cache_k_addr = host_cache_k_ptrs[host_cache_ptr_index];
+    if (host_cache_k_addr != 0) {
+      active_host_cache_k = reinterpret_cast<const void*>(static_cast<uintptr_t>(host_cache_k_addr));
+    }
+  }
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
@@ -466,12 +475,12 @@ __global__ void load_cache_to_device_buffer_kernel(
       // Uses kvcacheio.cuh's hardcoded constants (kGPUPageSize=64, kCPUItemBytes=584).
       device::hisparse::transfer_item<device::hisparse::TransferDirection::HostToDevice>(
           /*dst_cache=*/device_buffer_k,
-          /*src_cache=*/const_cast<void*>(host_cache_k),
+          /*src_cache=*/const_cast<void*>(active_host_cache_k),
           /*dst_index=*/static_cast<int32_t>(dst_loc),
           /*src_index=*/static_cast<int32_t>(src_loc));
     } else {
       // Generic path: device + host both linear, stride = item_size_bytes.
-      const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+      const auto src_k = static_cast<const char*>(active_host_cache_k) + src_loc * item_size_bytes;
       auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
       transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
 
@@ -491,6 +500,7 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView host_cache_locs,
     tvm::ffi::TensorView device_buffer_locs,
     tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_k_ptrs,
     tvm::ffi::TensorView host_cache_v,
     tvm::ffi::TensorView device_buffer_k,
     tvm::ffi::TensorView device_buffer_v,
@@ -499,6 +509,7 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
+    int64_t host_cache_ptr_index,
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
@@ -510,6 +521,9 @@ void load_cache_to_device_buffer(
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+  const int64_t host_cache_k_ptrs_numel = host_cache_k_ptrs.numel();
+  const auto* host_cache_k_ptrs_ptr =
+      host_cache_k_ptrs_numel > 0 ? static_cast<const uint64_t*>(host_cache_k_ptrs.data_ptr()) : nullptr;
 
   // Generic lambda: int32/int64 kernel variants are compiled for both
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
@@ -527,6 +541,7 @@ void load_cache_to_device_buffer(
         static_cast<const int64_t*>(host_cache_locs.data_ptr()),
         static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
         host_cache_k.data_ptr(),
+        host_cache_k_ptrs_ptr,
         (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
         device_buffer_k.data_ptr(),
         (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
@@ -540,6 +555,7 @@ void load_cache_to_device_buffer(
         lru_slot_stride_0,
         top_k_tokens_stride,
         top_k_device_locs_stride,
+        host_cache_ptr_index,
         page_size,
         item_size_bytes);
   };
