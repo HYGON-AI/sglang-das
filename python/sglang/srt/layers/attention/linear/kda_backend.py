@@ -28,7 +28,7 @@ from sglang.srt.utils.common import rank0_log
 _hcu_causal_conv1d_fn = None
 _hcu_causal_conv1d_update = None
 _use_hcu_cc1d = is_hcu() and get_bool_env_var(
-    "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU"
+    "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU", default="true"
 )
 if _use_hcu_cc1d:
     from causal_conv1d import (
