@@ -58,6 +58,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "int slots_per_page) -> ()");
   m.impl("kpool_write_plan", torch::kCUDA, &kpool_write_plan);
 
+  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+
   m.def("l2norm(Tensor input, float eps) -> Tensor");
   m.impl("l2norm", torch::kCUDA, &l2norm);
 
