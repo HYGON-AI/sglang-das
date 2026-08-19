@@ -78,6 +78,10 @@ if _is_hcu:
     from lightop import attention as lightop_attention
     from lightop import kvcache as lightop_kvcache
 
+    from sglang.srt.layers.attention.dsa.hcu_sparse_mqa import (
+        lightop_sparse_mask_api_available,
+        select_lightop_sparse_mqa_route,
+    )
     from sglang.kernels.ops.attention.dsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
         hadamard_transform_optimized,
@@ -306,6 +310,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not is_neox_style
         )
         self.alt_stream = alt_stream
+        self.hcu_arch_name: Optional[str] = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -314,6 +319,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
+            pp_size = configured_pp_size()
+            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+        elif _is_hcu:
+            device_props = torch.cuda.get_device_properties(0)
+            self.hcu_arch_name = (
+                device_props.gcnArchName.split(":")[0]
+                if hasattr(device_props, "gcnArchName")
+                else device_props.name
+            )
+            self.sm_count = device_props.multi_processor_count
             pp_size = configured_pp_size()
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
@@ -1071,6 +1086,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        sparse_mask: Optional[torch.Tensor] = None
 
         if self.paged_mqa_logits_backend.is_lightop():
             kv_cache, use_bf16_index_cache = self._get_hcu_paged_index_k_cache(
@@ -1080,15 +1096,89 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 active_weights = weights[:q_offset].to(torch.float32)
             else:
                 active_weights = weights[:q_offset]
-            logits = _hcu_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache,
-                active_weights,
-                seqlens_32,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
+            active_q = q_fp8[:q_offset].unsqueeze(1)
+            use_mask_topk = envs.SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK.get()
+            sparse_route = select_lightop_sparse_mqa_route(
+                enabled=(
+                    use_mask_topk
+                    and not use_bf16_index_cache
+                    and metadata.topk_backend.is_sgl_kernel()
+                    and metadata.attn_metadata.page_table_1 is not None
+                    and self.num_init_tokens == 0
+                    and self.num_local_tokens == 0
+                ),
+                api_available=(
+                    use_mask_topk and lightop_sparse_mask_api_available()
+                ),
+                is_hcu=_is_hcu,
+                arch_name=self.hcu_arch_name or "",
+                num_cus=self.sm_count,
+                page_size=page_size,
+                topk=self.index_topk,
+                fuse_topk=envs.SGLANG_DSA_FUSE_TOPK.get(),
+                force_unfused_topk=metadata.force_unfused_topk,
+                topk_transform_method_name=metadata.topk_transform_method.name,
+                q=active_q,
+                fused_kv_cache=kv_cache,
+                weights=active_weights,
+                context_lens=seqlens_32,
+                block_table=block_tables,
+                max_context_len=max_seq_len,
+                batch_size=forward_batch.batch_size,
+                is_target_verify=forward_mode.is_target_verify(),
+                is_draft_extend_v2=forward_mode.is_draft_extend_v2(),
+                mtp_group_size=getattr(
+                    getattr(forward_batch, "spec_info", None),
+                    "num_tokens_per_req",
+                    None,
+                ),
+                grouping_lens_cpu=(
+                    forward_batch.extend_seq_lens_cpu
+                    if forward_batch.extend_seq_lens_cpu is not None
+                    else metadata.get_dsa_extend_len_cpu()
+                ),
             )
+            if sparse_route is None:
+                logits = _hcu_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache,
+                    active_weights,
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                )
+            elif sparse_route.group_size == 1:
+                from lightop.gemmopt import page_mqa_logits_sparse_mask
+
+                logits, sparse_mask = page_mqa_logits_sparse_mask(
+                    active_q,
+                    kv_cache,
+                    active_weights,
+                    seqlens_32,
+                    block_tables,
+                    None,
+                    max_seq_len,
+                    clean_logits=True,
+                    num_warps=4,
+                )
+            else:
+                from lightop.gemmopt import page_mqa_logits_sparse_mask_grouped
+
+                logits, sparse_mask = (
+                    page_mqa_logits_sparse_mask_grouped(
+                        active_q,
+                        kv_cache,
+                        active_weights,
+                        seqlens_32,
+                        block_tables,
+                        None,
+                        max_seq_len,
+                        clean_logits=True,
+                        num_warps=4,
+                        group_size=sparse_route.group_size,
+                    )
+                )
         else:
             kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
             assert len(kv_cache_fp8.shape) == 2
@@ -1156,9 +1246,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if sparse_mask is None:
+            # NOTE(dark): logits should be cleaned in topk_transform.
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
+        else:
+            topk_result = metadata.topk_transform_sparse_mask(
+                logits, sparse_mask, self.index_topk
+            )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
