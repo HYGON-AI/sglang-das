@@ -667,6 +667,7 @@ def pre_permute_standard_to_aiter(
     return AiterRunnerInput(
         hidden_states=hidden_states,
         topk_weights=topk_weights,
+        topk_ids=topk_ids,
         quant_type=quant_info.quant_type,
     )
 
