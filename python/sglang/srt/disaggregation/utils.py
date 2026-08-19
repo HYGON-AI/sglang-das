@@ -1020,6 +1020,7 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    data_format: str = "",
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -1027,6 +1028,7 @@ def append_state_component(
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
+    kv_args.state_data_formats.append(data_format)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
@@ -1058,6 +1060,7 @@ def setup_state_kv_args(
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
+    kv_args.state_data_formats = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
@@ -1154,6 +1157,11 @@ def setup_state_kv_args(
                 layer_ids,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
+            data_format = (
+                token_to_kv_pool.get_index_k_cache_transfer_abi()
+                if isinstance(token_to_kv_pool, DSATokenToKVPool)
+                else ""
+            )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1165,6 +1173,14 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
+                draft_data_format = (
+                    draft_token_to_kv_pool.get_index_k_cache_transfer_abi()
+                )
+                if draft_data_format != data_format:
+                    raise ValueError(
+                        "Target and draft DSA index-K cache transfer ABIs differ: "
+                        f"target={data_format!r}, draft={draft_data_format!r}"
+                    )
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
@@ -1172,7 +1188,12 @@ def setup_state_kv_args(
                 kv_args.total_kv_layers = total_kv_layers
             elif data_ptrs:
                 append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                    kv_args,
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    data_format=data_format,
                 )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same

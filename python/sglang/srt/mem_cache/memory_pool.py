@@ -4893,6 +4893,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         item_lens = [buffer[0].nbytes for buffer in index_cache]
         return data_ptrs, data_lens, item_lens
 
+    def get_index_k_cache_transfer_abi(self) -> str:
+        """Return the persistent index-K page ABI used by PD state transfer."""
+        return (
+            f"dsa-index-k-page-v1:{self.index_k_cache_mode.value}:"
+            f"page_size={self.page_size}:head_dim={self.index_head_dim}"
+        )
+
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
         index_cache = (

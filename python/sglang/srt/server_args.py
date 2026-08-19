@@ -5370,9 +5370,7 @@ class ServerArgs:
                     validate_hcu_int8_index_k_cache_server_args,
                 )
 
-                validate_hcu_int8_index_k_cache_server_args(
-                    self, allow_mooncake_pd=False
-                )
+                validate_hcu_int8_index_k_cache_server_args(self)
                 if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                     logger.warning(
                         f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."

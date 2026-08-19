@@ -66,6 +66,35 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+def validate_dsa_state_transfer_abi(
+    src_format: str,
+    dst_format: str,
+    src_item_lens: List[int],
+    dst_item_lens: List[int],
+) -> None:
+    """Validate the page ABI before transferring a DSA index-K cache."""
+    if src_format != dst_format:
+        raise RuntimeError(
+            "DSA index-K cache transfer ABI mismatch between prefill and decode: "
+            f"prefill_format={src_format!r}, decode_format={dst_format!r}. "
+            "Ensure P and D use the same SGLANG_DSA_HCU_INT8_INDEX_K_CACHE "
+            "setting, page size, model, and SGLang revision."
+        )
+
+    src_sizes = {int(item_len) for item_len in src_item_lens}
+    dst_sizes = {int(item_len) for item_len in dst_item_lens}
+    if len(src_sizes) == 1 and src_sizes == dst_sizes:
+        return
+
+    raise RuntimeError(
+        "DSA index-K cache page layout mismatch between prefill and decode: "
+        f"prefill_item_lens={sorted(src_sizes)}, "
+        f"decode_item_lens={sorted(dst_sizes)}. Ensure P and D use the same "
+        "SGLANG_DSA_HCU_INT8_INDEX_K_CACHE setting, page size, model, and "
+        "SGLang revision."
+    )
+
+
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
 # so we don't open a fresh TCP connection per query (that churns short-lived
 # sockets and can exhaust ephemeral ports under high concurrency). Thread-local
@@ -354,6 +383,41 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def validate_remote_state_transfer_abis(
+        self,
+        dst_state_data_formats: List[str],
+        dst_state_item_lens: List[List[int]],
+    ) -> None:
+        """Validate request-state page layouts advertised by a decode peer."""
+        state_types = getattr(self.kv_args, "state_types", []) or []
+        src_state_data_formats = (
+            getattr(self.kv_args, "state_data_formats", []) or []
+        )
+        src_state_item_lens = getattr(self.kv_args, "state_item_lens", []) or []
+
+        for i, state_type in enumerate(state_types):
+            if state_type != StateType.DSA:
+                continue
+
+            src_format = (
+                src_state_data_formats[i] if i < len(src_state_data_formats) else ""
+            )
+            dst_format = (
+                dst_state_data_formats[i] if i < len(dst_state_data_formats) else ""
+            )
+            src_item_lens = (
+                src_state_item_lens[i] if i < len(src_state_item_lens) else []
+            )
+            dst_item_lens = (
+                dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
+            )
+            validate_dsa_state_transfer_abi(
+                src_format,
+                dst_format,
+                src_item_lens,
+                dst_item_lens,
+            )
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
