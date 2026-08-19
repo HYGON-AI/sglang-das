@@ -18,7 +18,6 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_hcu, is_hcu_native_fp8_supported
 
-
 INDEX_K_PAGE_SIZE = 64
 INDEX_K_HEAD_DIM = 128
 INDEX_K_SCALE_BYTES = 4
@@ -114,11 +113,13 @@ def create_index_k_int8_aliases(
 
     num_pages = packed_cache.shape[0]
     k_bytes = INDEX_K_PAGE_SIZE * INDEX_K_HEAD_DIM
-    int8_k = packed_cache[:, :k_bytes].view(torch.int8).view(
-        num_pages, INDEX_K_PAGE_SIZE, INDEX_K_HEAD_DIM
+    int8_k = (
+        packed_cache[:, :k_bytes]
+        .view(torch.int8)
+        .view(num_pages, INDEX_K_PAGE_SIZE, INDEX_K_HEAD_DIM)
     )
-    fp32_scales = packed_cache[:, k_bytes:].view(torch.float32).view(
-        num_pages, INDEX_K_PAGE_SIZE
+    fp32_scales = (
+        packed_cache[:, k_bytes:].view(torch.float32).view(num_pages, INDEX_K_PAGE_SIZE)
     )
     return int8_k, fp32_scales
 
@@ -176,17 +177,13 @@ def _quantize_and_store_index_k_int8_kernel(
     key = tl.load(key_ptr + token_idx * key_stride_0 + offsets).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(key)), epsilon) / 127.0
     scaled = key / scale
-    rounded = tl.where(
-        scaled >= 0.0, tl.floor(scaled + 0.5), tl.ceil(scaled - 0.5)
-    )
+    rounded = tl.where(scaled >= 0.0, tl.floor(scaled + 0.5), tl.ceil(scaled - 0.5))
     quantized = tl.clamp(rounded, -127.0, 127.0).to(tl.int8)
 
     loc = tl.load(loc_ptr + token_idx).to(tl.int64)
     page = loc // PAGE_SIZE
     token_offset = loc % PAGE_SIZE
-    k_ptr = (
-        k_cache_ptr + page * k_page_stride_0 + token_offset * HEAD_DIM + offsets
-    )
+    k_ptr = k_cache_ptr + page * k_page_stride_0 + token_offset * HEAD_DIM + offsets
     scale_ptr = scale_cache_ptr + page * scale_page_stride_0 + token_offset
     tl.store(k_ptr, quantized)
     tl.store(scale_ptr, scale)
@@ -292,9 +289,7 @@ def _dequantize_index_k_int8_paged_kernel(
                         + offsets
                     ).to(tl.float32)
                     scale = tl.load(
-                        scale_ptr
-                        + physical_page * scale_page_stride_0
-                        + token_offset
+                        scale_ptr + physical_page * scale_page_stride_0 + token_offset
                     )
                     tl.store(
                         workspace_ptr

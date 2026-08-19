@@ -23,10 +23,10 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
-from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import IndexKCacheMode
 from sglang.srt.layers.attention.dsa.forward_batch_utils import (
     effective_forward_mode,
 )
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import IndexKCacheMode
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -79,13 +79,13 @@ if _is_hcu:
     from lightop import attention as lightop_attention
     from lightop import kvcache as lightop_kvcache
 
-    from sglang.srt.layers.attention.dsa.hcu_sparse_mqa import (
-        lightop_sparse_mask_api_available,
-        select_lightop_sparse_mqa_route,
-    )
     from sglang.kernels.ops.attention.dsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
         hadamard_transform_optimized,
+    )
+    from sglang.srt.layers.attention.dsa.hcu_sparse_mqa import (
+        lightop_sparse_mask_api_available,
+        select_lightop_sparse_mqa_route,
     )
 
     if _use_fast_hadamard_transform:
@@ -398,22 +398,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     @staticmethod
     def _use_hcu_bf16_index_cache(pool) -> bool:
-        return _is_hcu and getattr(
-            pool, "index_k_cache_mode", IndexKCacheMode.FP8_SCALED
-        ) is IndexKCacheMode.BF16
+        return (
+            _is_hcu
+            and getattr(pool, "index_k_cache_mode", IndexKCacheMode.FP8_SCALED)
+            is IndexKCacheMode.BF16
+        )
 
     @staticmethod
     def _use_hcu_int8_index_cache(pool) -> bool:
-        return _is_hcu and getattr(
-            pool, "index_k_cache_mode", IndexKCacheMode.FP8_SCALED
-        ) is IndexKCacheMode.INT8_SCALED
+        return (
+            _is_hcu
+            and getattr(pool, "index_k_cache_mode", IndexKCacheMode.FP8_SCALED)
+            is IndexKCacheMode.INT8_SCALED
+        )
 
     @classmethod
     def _use_hcu_bf16_indexer_compute(cls, pool) -> bool:
         """Whether LightOp must consume BF16 K with FP32 gate weights."""
-        return cls._use_hcu_bf16_index_cache(
+        return cls._use_hcu_bf16_index_cache(pool) or cls._use_hcu_int8_index_cache(
             pool
-        ) or cls._use_hcu_int8_index_cache(pool)
+        )
 
     @staticmethod
     def _get_gate_input_tensor(
@@ -1138,9 +1142,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     and self.num_init_tokens == 0
                     and self.num_local_tokens == 0
                 ),
-                api_available=(
-                    use_mask_topk and lightop_sparse_mask_api_available()
-                ),
+                api_available=(use_mask_topk and lightop_sparse_mask_api_available()),
                 is_hcu=_is_hcu,
                 arch_name=self.hcu_arch_name or "",
                 num_cus=self.sm_count,
@@ -1196,19 +1198,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             else:
                 from lightop.gemmopt import page_mqa_logits_sparse_mask_grouped
 
-                logits, sparse_mask = (
-                    page_mqa_logits_sparse_mask_grouped(
-                        active_q,
-                        kv_cache,
-                        active_weights,
-                        seqlens_32,
-                        block_tables,
-                        None,
-                        max_seq_len,
-                        clean_logits=True,
-                        num_warps=4,
-                        group_size=sparse_route.group_size,
-                    )
+                logits, sparse_mask = page_mqa_logits_sparse_mask_grouped(
+                    active_q,
+                    kv_cache,
+                    active_weights,
+                    seqlens_32,
+                    block_tables,
+                    None,
+                    max_seq_len,
+                    clean_logits=True,
+                    num_warps=4,
+                    group_size=sparse_route.group_size,
                 )
         else:
             kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)

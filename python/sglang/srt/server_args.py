@@ -5269,6 +5269,7 @@ class ServerArgs:
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
+            dsa_layer_skips_topk,
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
         )
@@ -5388,16 +5389,15 @@ class ServerArgs:
                 # The "dsa" attention fill moved to the override registry
                 # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-                if self.enable_two_batch_overlap and (
-                    index_topk_freq > 1
-                    or (index_topk_pattern is not None and "S" in index_topk_pattern)
-                ):
+                has_shared_topk_layers = any(
+                    dsa_layer_skips_topk(hf_config, layer_id)
+                    for layer_id in range(hf_config.num_hidden_layers)
+                )
+                if self.enable_two_batch_overlap and has_shared_topk_layers:
                     raise ValueError(
                         "--enable-two-batch-overlap is not supported with DSA "
-                        "index-topk sharing (index_topk_freq > 1 or an "
-                        "index_topk_pattern containing shared layers): the TBO op "
+                        "index-topk sharing (cli_factor/index_topk_freq/"
+                        "index_topk_pattern): the TBO op "
                         "path does not propagate topk indices across layers, so "
                         "shared layers would run sparse attention without indices."
                     )

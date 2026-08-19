@@ -184,11 +184,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu_amx_available,
     _is_cuda,
     _is_gfx95_supported,
+    _is_hcu,
     _is_hip,
     _is_musa,
     _is_npu,
     _is_xpu,
-    _is_hcu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -307,9 +307,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
-            _is_hip
-            and not _is_hcu
-            and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
+            _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -806,8 +804,7 @@ class DeepseekV2MoE(nn.Module):
                 config_quantization = getattr(config, "quantization_config", None)
                 is_compressed_tensors = (
                     isinstance(config_quantization, dict)
-                    and config_quantization.get("quant_method")
-                    == "compressed-tensors"
+                    and config_quantization.get("quant_method") == "compressed-tensors"
                 ) or (
                     self.shared_experts.gate_up_proj.quant_method.__class__.__module__.startswith(
                         "sglang.srt.layers.quantization.compressed_tensors"
@@ -1863,13 +1860,8 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = True
                 self.next_skip_topk = True
             else:
-                index_cli_factor = getattr(config, "cli_factor", 1)
-                if index_cli_factor > 1:
-                    self.skip_topk = layer_id % index_cli_factor != 0
-                    self.next_skip_topk = (layer_id + 1) % index_cli_factor != 0
-                else:
-                    self.skip_topk = dsa_layer_skips_topk(config, layer_id)
-                    self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
+                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,

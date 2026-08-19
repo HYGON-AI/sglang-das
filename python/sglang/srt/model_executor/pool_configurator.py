@@ -215,9 +215,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_cell_size = _dflash_draft_cell_size(kvc) or None
-                if (
-                    draft_cell_size is None
-                    and is_deepseek_dsa(kvc.model_config.hf_config)
+                if draft_cell_size is None and is_deepseek_dsa(
+                    kvc.model_config.hf_config
                 ):
                     draft_cell_size = self._compute_cell_size(
                         kvc,
@@ -289,9 +288,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     force_dense_dsa_indexer
                     or kvc.is_draft_worker
                     or kvc.server_args.enable_hisparse
-                    or getattr(
-                        kvc.server_args, "enable_hierarchical_cache", False
-                    )
+                    or getattr(kvc.server_args, "enable_hierarchical_cache", False)
                 )
                 if force_dense_dsa_indexer:
                     indexer_layer_ids = list(range(num_layers))

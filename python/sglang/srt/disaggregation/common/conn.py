@@ -391,9 +391,7 @@ class CommonKVManager(BaseKVManager):
     ) -> None:
         """Validate request-state page layouts advertised by a decode peer."""
         state_types = getattr(self.kv_args, "state_types", []) or []
-        src_state_data_formats = (
-            getattr(self.kv_args, "state_data_formats", []) or []
-        )
+        src_state_data_formats = getattr(self.kv_args, "state_data_formats", []) or []
         src_state_item_lens = getattr(self.kv_args, "state_item_lens", []) or []
 
         for i, state_type in enumerate(state_types):
@@ -1194,9 +1192,7 @@ class CommonKVManager(BaseKVManager):
                     layer_id < self.kv_args.prefill_start_layer
                     for layer_id in indexer_layer_ids
                 )
-                end_index = sum(
-                    layer_id < end_layer for layer_id in indexer_layer_ids
-                )
+                end_index = sum(layer_id < end_layer for layer_id in indexer_layer_ids)
                 src_main_layers = end_index - start_index
                 src_draft_layers = len(src_kv_ptrs) - src_main_layers
                 if src_draft_layers < 0:

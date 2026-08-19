@@ -60,11 +60,7 @@ def resolve_shared_index_layers(
     if not is_deepseek_dsa(hf_text_config):
         return None
     num_layers = hf_text_config.num_hidden_layers
-    cli_factor = getattr(hf_text_config, "cli_factor", 1) or 1
-    if cli_factor > 1:
-        pattern = [i % cli_factor != 0 for i in range(num_layers)]
-    else:
-        pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
+    pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
     if pp_size != 1 or is_speculative:

@@ -127,6 +127,7 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 _is_hcu = is_hcu()
 
+
 def conv_window_dedup_enabled(
     is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
 ) -> bool:
@@ -2432,13 +2433,21 @@ class MHATokenToKVPool(KVCache):
                 # Overlap the copy of K and V cache for small batch size
                 current_stream = self.device_module.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = cache_k
+                self.k_buffer[layer_id - self.start_layer][
+                    page_idxs, :, offsets, :
+                ] = cache_k
                 with self.device_module.stream(self.alt_stream):
-                    self.v_buffer[layer_id - self.start_layer][page_idxs, :, :, offsets] = cache_v
+                    self.v_buffer[layer_id - self.start_layer][
+                        page_idxs, :, :, offsets
+                    ] = cache_v
                 current_stream.wait_stream(self.alt_stream)
             else:
-                self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = cache_k
-                self.v_buffer[layer_id - self.start_layer][page_idxs, :, :, offsets] = cache_v
+                self.k_buffer[layer_id - self.start_layer][
+                    page_idxs, :, offsets, :
+                ] = cache_k
+                self.v_buffer[layer_id - self.start_layer][
+                    page_idxs, :, :, offsets
+                ] = cache_v
             return
 
         if dcp_kv_mask is not None:
@@ -4105,7 +4114,9 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype and self.dtype not in (
-            torch.float8_e5m2, torch.float8_e4m3fn):
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+        ):
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.kv_buffer[layer_id - self.start_layer], self.dtype
 
@@ -4158,7 +4169,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not (self.use_dsa and self.dsa_kv_cache_store_fp8)
-        cache_k = torch.cat([cache_k_nope, cache_k_rope],dim=-1)
+        cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -4168,7 +4179,6 @@ class MLATokenToKVPool(KVCache):
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
-
     def _write_mla_kv_buffer(
         self,
         dst_buffer: torch.Tensor,
@@ -4176,12 +4186,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if (
-            _is_hip
-            and not _is_hcu
-            and self.use_dsa
-            and self.dtype == fp8_dtype
-        ):
+        if _is_hip and not _is_hcu and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -4734,9 +4739,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         local_cache = self.index_key_cache.buffer[cache_index]
         if packed_cache is local_cache:
             int8_k, fp32_scales = self.index_k_int8_aliases[cache_index]
-        elif (
-            self.index_k_int8_remote_aliases is not None
-            and packed_cache is getattr(self.index_key_cache, "remote_buffer", None)
+        elif self.index_k_int8_remote_aliases is not None and packed_cache is getattr(
+            self.index_key_cache, "remote_buffer", None
         ):
             int8_k, fp32_scales = self.index_k_int8_remote_aliases
         else:

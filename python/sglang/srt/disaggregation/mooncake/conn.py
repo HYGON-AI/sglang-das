@@ -181,9 +181,7 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_state_data_formats=(
-                unpack_string_list(msg[18])
-                if len(msg) > 18 and msg[18] != b""
-                else []
+                unpack_string_list(msg[18]) if len(msg) > 18 and msg[18] != b"" else []
             ),
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]

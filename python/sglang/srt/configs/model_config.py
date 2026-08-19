@@ -204,6 +204,13 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
+    # LongCat-style configs use cli_factor as the authoritative sharing rule.
+    # Model overrides have already been applied to ``config`` by get_config(),
+    # so --json-model-override-args takes precedence over config.json here.
+    cli_factor = getattr(config, "cli_factor", 1) or 1
+    if cli_factor > 1:
+        return layer_id % cli_factor != 0
+
     pattern = getattr(config, "index_topk_pattern", None)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
