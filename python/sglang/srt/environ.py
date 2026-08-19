@@ -1802,6 +1802,10 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
+    SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"
+    )
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
