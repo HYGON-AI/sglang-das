@@ -1425,6 +1425,9 @@ class Envs:
     SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"
     )
+    SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
+    )
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

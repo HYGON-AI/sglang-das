@@ -1991,6 +1991,10 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        topk_was_padded = (
+            topk_indices is not None and topk_indices.shape[0] != q_nope.shape[0]
+        )
+
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(forward_mode)
 
@@ -2143,6 +2147,15 @@ class DeepseekSparseAttnBackend(
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            skip_reused_topk_sort = (
+                _is_hcu
+                and envs.SGLANG_DSA_HCU_REUSE_SORTED_TOPK.get()
+                and getattr(layer, "reuse_topk_indices", False)
+                and not topk_was_padded
+                and envs.SGLANG_DSA_FUSE_TOPK.get()
+                and topk_transform_method == TopkTransformMethod.RAGGED
+                and self.hisparse_coordinator is None
+            )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2150,6 +2163,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                indices_are_sorted=skip_reused_topk_sort,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2424,6 +2438,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        indices_are_sorted: bool = False,
     ) -> torch.Tensor:
         flash_mla_sparse_fwd = get_flashmla_op("flash_mla_sparse_fwd", is_hcu=_is_hcu)
 
@@ -2469,14 +2484,35 @@ class DeepseekSparseAttnBackend(
             # they ever diverge.
             topk_length = None
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            topk_length=topk_length,
-        )
+        raw_sparse_prefill_fwd = None
+        if _is_hcu and indices_are_sorted:
+            from flash_mla import flash_mla_interface
+
+            raw_sparse_prefill_fwd = getattr(
+                getattr(flash_mla_interface, "flash_mla_cuda", None),
+                "sparse_prefill_fwd",
+                None,
+            )
+
+        if raw_sparse_prefill_fwd is not None:
+            o, _, _ = raw_sparse_prefill_fwd(
+                q_input,
+                kv_cache,
+                indices_input,
+                sm_scale,
+                v_head_dim,
+                None,
+                topk_length,
+            )
+        else:
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                topk_length=topk_length,
+            )
 
         # Trim output back to original num_heads if we padded
         if need_padding:

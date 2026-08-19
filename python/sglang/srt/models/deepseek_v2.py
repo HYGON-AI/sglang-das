@@ -1921,6 +1921,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Reused DSA TopK indices were already sorted by the producing layer.
+        self.attn_mqa.reuse_topk_indices = bool(self.skip_topk and not self.is_nextn)
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
