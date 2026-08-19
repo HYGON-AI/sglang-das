@@ -5679,9 +5679,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         local_cache = self.index_key_cache.buffer[cache_index]
         if packed_cache is local_cache:
             int8_k, fp32_scales = self.index_k_int8_aliases[cache_index]
-        elif (
-            self.index_k_int8_remote_aliases is not None
-            and packed_cache is getattr(self.index_key_cache, "remote_buffer", None)
+        elif self.index_k_int8_remote_aliases is not None and packed_cache is getattr(
+            self.index_key_cache, "remote_buffer", None
         ):
             int8_k, fp32_scales = self.index_k_int8_remote_aliases
         else:

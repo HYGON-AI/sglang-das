@@ -46,12 +46,32 @@ class IndexKeyCache:
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
+
+        page_size = self.pool.page_size
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        tgt_page = tgt_loc_flat // page_size
+        src_page = src_loc_flat // page_size
+        tgt_offset = tgt_loc_flat % page_size
+        src_offset = src_loc_flat % page_size
+
+        k_bytes_per_token = self.pool.index_head_dim
+        scale_bytes_per_token = (
+            self.pool.index_head_dim // self.pool.quant_block_size * 4
+        )
+        k_bytes_per_page = page_size * k_bytes_per_token
+
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            k_view = index_k[:, :k_bytes_per_page].view(
+                -1, page_size, k_bytes_per_token
+            )
+            scale_view = index_k[:, k_bytes_per_page:].view(
+                -1, page_size, scale_bytes_per_token
+            )
+            k_view[tgt_page, tgt_offset] = k_view[src_page, src_offset]
+            scale_view[tgt_page, tgt_offset] = scale_view[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:

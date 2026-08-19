@@ -284,9 +284,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_cell_size = _dflash_draft_cell_size(kvc) or None
-                if (
-                    draft_cell_size is None
-                    and is_deepseek_dsa(kvc.model_config.hf_config)
+                if draft_cell_size is None and is_deepseek_dsa(
+                    kvc.model_config.hf_config
                 ):
                     draft_cell_size = self._compute_cell_size(
                         kvc,

@@ -52,22 +52,18 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
     if not cfg.enable_two_batch_overlap:
         return
 
-    index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-    indexer_types = getattr(hf_config, "indexer_types", None)
-    if (
-        index_topk_freq > 1
-        or (index_topk_pattern is not None and "S" in index_topk_pattern)
-        or (indexer_types is not None and "shared" in indexer_types)
-    ):
+    from sglang.srt.configs.model_config import dsa_layer_skips_topk
+
+    has_shared_topk_layers = any(
+        dsa_layer_skips_topk(hf_config, layer_id)
+        for layer_id in range(hf_config.num_hidden_layers)
+    )
+    if has_shared_topk_layers:
         raise ValueError(
             "--enable-two-batch-overlap is not supported with DSA "
             "index-topk sharing: the TBO op path does not propagate topk "
             "indices across layers, so shared layers would run sparse "
-            "attention without indices. Got "
-            f"index_topk_freq={index_topk_freq!r}, "
-            f"index_topk_pattern={index_topk_pattern!r}, and "
-            f"indexer_types={indexer_types!r}."
+            "attention without indices."
         )
 
 
