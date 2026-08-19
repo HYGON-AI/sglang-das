@@ -33,16 +33,23 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 # Initial integration only checked the env flag.
 # _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 # _USE_KDA_HCU = is_hcu() and get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
-_USE_KDA_HCU = (
+_USE_KDA_HCU_FROM_AITER = (
     is_hcu()
     and get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
-    and not get_bool_env_var("SGLANG_KDA_DISABLE_AITER_CHUNK_H")
+    and get_bool_env_var("SGLANG_KDA_DISABLE_TRITON_CHUNK_H")
+)
+_USE_KDA_HCU_FROM_TRITON = (
+    is_hcu()
+    and get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+    and not get_bool_env_var("SGLANG_KDA_DISABLE_TRITON_CHUNK_H")
 )
 
-if _USE_KDA_HCU:
+if _USE_KDA_HCU_FROM_AITER:
     from aiter.ops.fla import (
         chunk_gated_delta_rule_fwd_sglang_hip_blockdim64 as _aiter_fwd_h,
     )
+if _USE_KDA_HCU_FROM_TRITON:
+    from boltops.fla.gdn import chunk_gated_delta_rule_fwd_h as _triton_fwd_h
 
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into
@@ -347,6 +354,26 @@ def chunk_gated_delta_rule_fwd_h(
     assert not (
         use_exp2 and g is not None
     ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    if _USE_KDA_HCU_FROM_TRITON:
+        h, v_new, _ = _triton_fwd_h(
+            k,
+            w,
+            u,
+            g=g,
+            gk=gk,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            output_final_state=True,
+            inplace_final_state=True,
+            chunk_size=CHUNK_SIZE,
+            save_new_value=save_new_value,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=use_exp2,
+            transpose_state_layout=True,
+            kernel_cfg=None,
+        )
+        return h, v_new
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -363,7 +390,7 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
-    if _USE_KDA_HCU and K == 128 and V == 128:
+    if _USE_KDA_HCU_FROM_AITER and K == 128 and V == 128:
         aiter_initial_state = initial_state
         aiter_initial_state_indices = initial_state_indices
         packed_state_valid_mask = None

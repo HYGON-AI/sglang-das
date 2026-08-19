@@ -299,7 +299,12 @@ def outplace_fused_experts(
     use_int4_w4a8: bool = False,
 ) -> torch.Tensor:
     if isinstance(activation, int):
-        activation = "silu" if activation == 0 else "gelu"
+        if activation == 0:
+            activation = "silu"
+        elif activation == 2:
+            activation = "situ"
+        else:
+            activation = "gelu"
     return fused_experts_impl(
         hidden_states,
         w1,
@@ -646,9 +651,14 @@ def fused_experts_impl_aiter(
     E, N1, _ = w1.shape
     _, N2, _ = w2.shape
     if isinstance(activation, int):
-        activation = "silu" if activation == 0 else "gelu"
-    is_channelwise_w8a8 = quant_type == MoeQuantType.FP8_W8A8 and block_shape is None
-    if not is_channelwise_w8a8 and (block_shape is None or len(block_shape) < 2):
+        if activation == 0:
+            activation = "silu"
+        elif activation == 2:
+            activation = "situ"
+        else:
+            activation = "gelu"
+    is_channelwise_w4a8_w8a8 = (quant_type == MoeQuantType.FP8_W8A8 or quant_type == MoeQuantType.W4A8) and block_shape is None
+    if not is_channelwise_w4a8_w8a8 and (block_shape is None or len(block_shape) < 2):
         raise ValueError(
             "AITER MoE requires block_shape with two dimensions for this "
             "quantization mode, but got "
@@ -663,7 +673,7 @@ def fused_experts_impl_aiter(
             f"a1_scale_shape={_shape_str(a1_scale)}, "
             f"a2_scale_shape={_shape_str(a2_scale)}"
         )
-    block_size = 0 if is_channelwise_w8a8 else block_shape[1]
+    block_size = 0 if is_channelwise_w4a8_w8a8 else block_shape[1]
     config_kwargs = dict(
         M=M,
         E=E,
@@ -692,6 +702,7 @@ def fused_experts_impl_aiter(
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
             MoeQuantType.WFP4A16,
+            MoeQuantType.W4A8,
         ), f"Unexpected quant_type: {moe_cfg.quant_type}"
         # print(
         #     f"[get_config_w4a16] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_shape[1]}, dtype={hidden_states.dtype} "
@@ -708,19 +719,19 @@ def fused_experts_impl_aiter(
             f"no solution found (expected on unsupported configs)"
         )
 
-    # if (
-    #     (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
-    #     and status
-    #     and _aiter_moec_solution_type(moe_cfg)
-    #     and getattr(moe_cfg, "need_shuffle_scale", False)
-    # ):
-    #     w1_scale, w2_scale = _get_aiter_w4a16_moec_shuffled_scales(
-    #         w1_scale, w2_scale, w1, w2, moe_cfg
-    #     )
-    if status and getattr(moe_cfg, "need_shuffle", False):
-        w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
-    if status and getattr(moe_cfg, "need_shuffle_scale", False):
-        w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
+    if (
+        (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
+        and status
+        and _aiter_moec_solution_type(moe_cfg)
+        and getattr(moe_cfg, "need_shuffle_scale", False)
+    ):
+        w1_scale, w2_scale = _get_aiter_w4a16_moec_shuffled_scales(
+            w1_scale, w2_scale, w1, w2, moe_cfg
+        )
+    # if status and quant_type != MoeQuantType.W4A8 and getattr(moe_cfg, "need_shuffle", False):
+    #     w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
+    # if status and getattr(moe_cfg, "need_shuffle_scale", False):
+    #     w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
     
     return aiter_moe(
         hidden_states,

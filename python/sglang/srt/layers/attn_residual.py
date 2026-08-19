@@ -33,7 +33,7 @@ _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
-_USE_HCU_ATTN_RES = is_hcu() and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU")
+_USE_HCU_ATTN_RES = is_hcu() and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU", default="true")
 
 
 def _use_hcu_aggregate(num_tokens: int, nvb: int) -> bool:
