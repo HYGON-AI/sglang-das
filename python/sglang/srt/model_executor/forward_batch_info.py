@@ -178,6 +178,11 @@ def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
     )
 
 
+def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
+    """Use pinned staging for HCU metadata copied on a busy stream."""
+    return _is_hcu and is_pin_memory_available(device)
+
+
 def _elastic_should_preserve_local_token_counts(
     *,
     model_runner: ModelRunner,
@@ -1049,6 +1054,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        pin_host_metadata = _pin_host_metadata(device)
 
         ret.mm_token_modalities = _maybe_build_forward_token_modalities(
             model_runner.model_config,
@@ -1081,8 +1087,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if batch.extend_input_logprob_token_ids is not None:
+            extend_input_logprob_token_ids = batch.extend_input_logprob_token_ids
+            if (
+                pin_host_metadata
+                and extend_input_logprob_token_ids.device.type == "cpu"
+                and not extend_input_logprob_token_ids.is_pinned()
+            ):
+                extend_input_logprob_token_ids = (
+                    extend_input_logprob_token_ids.pin_memory()
+                )
             ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+                extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0

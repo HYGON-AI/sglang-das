@@ -2515,6 +2515,11 @@ def _post_process_topk_ids(
     recorder_topk_ids = None
     _fold_pad_into_append = False
     recorder_was_fused = False
+    skip_deepep_padded_tokens = (
+        _is_hcu
+        and get_moe_a2a_backend().is_deepep()
+        and get_moe_runner_backend().is_deep_gemm()
+    )
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2559,10 +2564,10 @@ def _post_process_topk_ids(
             )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Always fill the padded
-        # region with 0 so every kernel sees a valid in-range expert id.
-        # Routing weights for padded tokens are zeroed below so their
-        # contribution to the hidden state is still zero regardless of the id.
+        # (negative indices cause illegal memory access). Keep their padded IDs
+        # in range and zero their weights below. HCU DeepEP + DeepGEMM instead
+        # masks the final IDs to -1 after shared-expert remapping so dispatch can
+        # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         #
@@ -2571,12 +2576,13 @@ def _post_process_topk_ids(
         # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
         # _fill_padded_rows launch here.
         _fold_pad_into_append = (
-            num_fused_shared_experts > 0
+            not skip_deepep_padded_tokens
+            and num_fused_shared_experts > 0
             and _use_aiter
             and use_per_rank_shared_slots
             and not _eplb_remap_enabled()
         )
-        if not _fold_pad_into_append:
+        if not skip_deepep_padded_tokens and not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             _is_hip
@@ -2709,7 +2715,11 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if skip_deepep_padded_tokens:
+        # Apply this after shared-expert remapping so every padded route,
+        # including appended shared slots, is omitted by DeepEP dispatch.
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
+    elif _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
