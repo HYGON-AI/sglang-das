@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
+    fill_decode_page_table_gpu,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
@@ -1408,7 +1409,7 @@ class DeepseekSparseAttnBackend(
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
@@ -1479,8 +1480,14 @@ class DeepseekSparseAttnBackend(
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                 )
-                page_indices = self.req_to_token[req_pool_indices, :max_len]
-                metadata.page_table_1[:, :max_len].copy_(page_indices)
+                fill_decode_page_table_gpu(
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    metadata.page_table_1,
+                    bs,
+                )
+                page_indices = metadata.page_table_1
                 dsa_cache_seqlens = compute_dsa_seqlens(
                     cache_seqlens, dsa_index_topk=self.dsa_index_topk
                 )
