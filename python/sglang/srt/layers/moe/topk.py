@@ -130,6 +130,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _is_musa = is_musa()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_lightop_topk_ids_postprocess = get_bool_env_var(
@@ -2309,10 +2310,12 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
+    # HCU W8A8 deployments can select DeepGEMM through the legacy env while
+    # the global runner backend remains AUTO, so recognize both selectors.
     skip_deepep_padded_tokens = (
         _is_hcu
         and get_moe_a2a_backend().is_deepep()
-        and get_moe_runner_backend().is_deep_gemm()
+        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
     )
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
