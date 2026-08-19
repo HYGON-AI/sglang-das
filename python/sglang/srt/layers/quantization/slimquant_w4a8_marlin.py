@@ -180,7 +180,7 @@ def _resolve_w4a8_tpmoe_backend(
     return backend
 
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
-_use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE")
+_use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true")
 _use_int4_w4a8 = get_bool_env_var("SGLANG_USE_INT4_W4A8")
 
 class MarlinMoeWorkspace:
