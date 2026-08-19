@@ -202,6 +202,17 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             )
         return self.get_broadcastable_buffer(layer_id)
 
+    def get_write_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.pool._is_layer_owned(layer_id):
+            return super().get_write_buffer(layer_id)
+
+        # Non-owner local buffers have zero rows. HCU still needs to run the
+        # fused Q/K quant kernel to produce Q, so use the full-size remote
+        # scratch as its disposable K write target. The scratch no longer
+        # represents its previous layer and must be broadcast again before use.
+        self.remote_layer_id = None
+        return self.remote_buffer
+
     def get_k_and_scale(
         self,
         layer_id: int,

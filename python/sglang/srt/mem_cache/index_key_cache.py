@@ -80,6 +80,10 @@ class IndexKeyCache:
             )
         return self.buffer[self.pool._get_indexer_cache_index(layer_id)]
 
+    def get_write_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return storage that is safe for an in-place fused cache write."""
+        return self.get_local_buffer(layer_id)
+
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
 
