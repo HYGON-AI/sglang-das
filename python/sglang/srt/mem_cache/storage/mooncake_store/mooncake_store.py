@@ -26,10 +26,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.observability.metrics_collector import StorageMetrics
-from sglang.srt.utils import get_bool_env_var
+
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
-_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 logger = logging.getLogger(__name__)
 
 
@@ -288,18 +287,14 @@ class MooncakeBaseStore:
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
-        if _kv_layout_hcu_fa:
-            ptr_k = tensor[0].data_ptr()
-            ptr_v = tensor[1].data_ptr()
-            size_k = tensor[0].numel() * tensor[0].element_size()
-            size_v = tensor[1].numel() * tensor[1].element_size()
-            ret_code_k = self.store.register_buffer(ptr_k, size_k)
-            ret_code_v = self.store.register_buffer(ptr_v, size_v)
-            ret_code = ret_code_k if ret_code_k != 0 else ret_code_v 
-        else:
-            ptr = tensor.data_ptr()
-            size = tensor.numel() * tensor.element_size()
-            ret_code = self.store.register_buffer(ptr, size)
+        if isinstance(tensor, (tuple, list)):
+            for buffer in tensor:
+                self.register_buffer(buffer)
+            return
+
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
             raise RuntimeError(
