@@ -18,6 +18,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import (
     ModelConfig,
     dsa_layer_skips_topk,
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
@@ -1657,12 +1658,17 @@ class KVCacheConfigurator:
             PoolCls = Glm5NextDSATokenToKVPool
             pool_kwargs = glm5_next_pool_kwargs(self)
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
-            pool_kwargs["skip_topk_layers"] = [
-                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-                for layer_id in range(
-                    self.layer_info.start_layer, self.layer_info.end_layer
-                )
-            ]
+            indexer_layer_ids = get_dsa_full_indexer_layer_ids(
+                self.model_config.hf_config,
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
+            )
+        else:
+            indexer_layer_ids = list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
+            )
+        if not get_memory().enable_hisparse:
+            pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

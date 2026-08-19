@@ -19,7 +19,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    dsa_layer_skips_topk,
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -278,15 +278,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size = _dflash_draft_cell_size(kvc) or None
+                if (
+                    draft_cell_size is None
+                    and is_deepseek_dsa(kvc.model_config.hf_config)
+                ):
+                    draft_cell_size = self._compute_cell_size(
+                        kvc,
+                        int(draft_num_layers) * get_parallel().attn_dcp_size,
+                        force_dense_dsa_indexer=True,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
-                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+                    draft_cell_size_per_token=draft_cell_size,
                 )
 
-    def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
+    def _compute_cell_size(
+        self,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+        *,
+        force_dense_dsa_indexer: bool = False,
+    ) -> int:
         """Compute per-token KV cache cost in bytes."""
         from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
 
@@ -306,6 +322,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if kvc.server_args.enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
+        if force_dense_dsa_indexer:
+            effective_num_layers = num_layers
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
@@ -356,6 +374,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
+                    allocate_all_layers=force_dense_dsa_indexer,
                 )
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
@@ -536,6 +555,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         ):
             num_indexer_layers = num_layers
         else:
+            active_indexer_layers = get_dsa_full_indexer_layer_ids(
+                kvc.model_config.hf_config,
+                kvc.layer_info.start_layer,
+                kvc.layer_info.end_layer,
+            )
+            active_set = set(active_indexer_layers)
+            num_indexer_layers = len(active_indexer_layers)
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
                 get_layer_shard_range,
@@ -545,14 +571,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if shard_size > 1:
                 # GLM-5.3 hybrid-layer support is intentionally limited to the
                 # non-LayerSplit pool below.
-                active_indexer_layers = [
-                    layer_id
-                    for layer_id in range(
-                        kvc.layer_info.start_layer, kvc.layer_info.end_layer
-                    )
-                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-                ]
-                active_set = set(active_indexer_layers)
                 max_owned = 0
                 for rank in range(shard_size):
                     start, end = get_layer_shard_range(rank, shard_size, num_layers)
@@ -566,7 +584,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 num_indexer_layers = max_owned + 1
             else:
                 num_indexer_layers = sum(
-                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    layer_id in active_set
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
 

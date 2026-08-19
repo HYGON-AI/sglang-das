@@ -71,10 +71,8 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         self.remote_layer_id: Optional[int] = None
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
-        layer_id = self.pool.start_layer + layer_idx
-        if not self.pool._is_layer_owned(layer_id):
-            return 0
-        return super()._layer_num_pages(layer_idx, num_pages)
+        layer_id = self.pool.indexer_layer_ids[layer_idx]
+        return num_pages if self.pool._is_layer_owned(layer_id) else 0
 
     def clear(self) -> None:
         super().clear()
@@ -132,9 +130,9 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
 
     def get_broadcastable_buffer(self, layer_id: int) -> torch.Tensor:
         if self.remote_layer_id != layer_id:
-            local_idx = layer_id - self.pool.start_layer
+            cache_idx = self.pool._get_indexer_cache_index(layer_id)
             src_tensor = (
-                self.buffer[local_idx] if self.pool._is_layer_owned(layer_id) else None
+                self.buffer[cache_idx] if self.pool._is_layer_owned(layer_id) else None
             )
             self.pool._broadcast_tensor_from_owner(
                 self.remote_buffer,
@@ -145,14 +143,14 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         return self.remote_buffer
 
     def state_buf_infos(self):
-        owned_layer_ids = [
-            i
-            for i in range(self.pool.layer_num)
-            if self.pool._is_layer_owned(self.pool.start_layer + i)
+        owned_cache_indices = [
+            cache_idx
+            for cache_idx, layer_id in enumerate(self.pool.indexer_layer_ids)
+            if self.pool._is_layer_owned(layer_id)
         ]
-        data_ptrs = [self.buffer[i].data_ptr() for i in owned_layer_ids]
-        data_lens = [self.buffer[i].nbytes for i in owned_layer_ids]
-        item_lens = [self._item_len(i) for i in owned_layer_ids]
+        data_ptrs = [self.buffer[i].data_ptr() for i in owned_cache_indices]
+        data_lens = [self.buffer[i].nbytes for i in owned_cache_indices]
+        item_lens = [self._item_len(i) for i in owned_cache_indices]
         return data_ptrs, data_lens, item_lens
 
     def cpu_copy(self, indices):
@@ -161,7 +159,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for layer_id in range(self.pool.indexer_layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
                 continue
@@ -179,7 +177,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for layer_id in range(self.pool.indexer_layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue
             for i in range(0, len(page_indices), page_chunk_size):

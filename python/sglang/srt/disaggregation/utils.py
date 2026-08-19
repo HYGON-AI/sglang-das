@@ -1937,7 +1937,7 @@ def setup_state_kv_args(
                 kv_args.draft_kv_layers = (
                     draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
                 )
-            else:
+            elif data_ptrs:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
