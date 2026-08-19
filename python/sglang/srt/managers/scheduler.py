@@ -1504,7 +1504,7 @@ class Scheduler(
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
+                self.ps.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
