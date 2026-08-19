@@ -35,9 +35,10 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -73,6 +74,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    kernel_accessible_host_ptr,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
@@ -1758,6 +1760,8 @@ class DSAIndexerPoolHost(HostKVCache):
                 layout,
             )
         self.init_kv_buffer()
+        # The one-layer JIT wrapper passes raw CPU TensorView pointers. Keep the
+        # sidecar on the AOT path, which translates mapped HCU host addresses.
         self.can_use_jit = False
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
@@ -1805,7 +1809,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
             ]
             self.index_k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.index_k_data_refs],
+                [kernel_accessible_host_ptr(x) for x in self.index_k_data_refs],
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
@@ -1880,6 +1884,11 @@ class DSAIndexerPoolHost(HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        hcu_layer_split_kwargs = (
+            {"num_warps_per_block": 4}
+            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            else {}
+        )
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -1890,20 +1899,24 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
                     src=self.index_k_with_scale_buffer[host_layer_id],
-                    dst=self._get_device_index_k_cache_for_transfer(device_pool)[device_layer_id],
+                    dst=self._get_device_index_k_cache_for_transfer(device_pool)[
+                        device_layer_id
+                    ],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     item_size=self.indexer_page_stride_size,
+                    **hcu_layer_split_kwargs,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,
-                    dst=self._get_device_index_k_cache_for_transfer(device_pool)[device_layer_id],
+                    dst=device_index_k_cache[device_layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,
                     item_size=self.indexer_page_stride_size,
                     src_layout_dim=self.indexer_layout_dim,
+                    **hcu_layer_split_kwargs,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1911,7 +1924,11 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.index_k_with_scale_buffer[host_layer_id]],
-                    dst_layers=[self._get_device_index_k_cache_for_transfer(device_pool)[device_layer_id]],
+                    dst_layers=[
+                        self._get_device_index_k_cache_for_transfer(device_pool)[
+                            device_layer_id
+                        ]
+                    ],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     page_size=1,
@@ -1919,7 +1936,11 @@ class DSAIndexerPoolHost(HostKVCache):
             elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.index_k_with_scale_buffer],
-                    dst_ptrs=[self._get_device_index_k_cache_for_transfer(device_pool)[device_layer_id]],
+                    dst_ptrs=[
+                        self._get_device_index_k_cache_for_transfer(device_pool)[
+                            device_layer_id
+                        ]
+                    ],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,
@@ -1943,6 +1964,11 @@ class DSAIndexerPoolHost(HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        hcu_layer_split_kwargs = (
+            {"num_warps_per_block": 4}
+            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            else {}
+        )
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -1952,23 +1978,47 @@ class DSAIndexerPoolHost(HostKVCache):
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
-                    src=self._get_device_index_k_cache_for_transfer(device_pool)[device_layer_id],
+                    src=self._get_device_index_k_cache_for_transfer(device_pool)[
+                        device_layer_id
+                    ],
                     dst=self.index_k_with_scale_buffer[host_layer_id],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     item_size=self.indexer_page_stride_size,
+                    **hcu_layer_split_kwargs,
                 )
             elif self.layout == "page_first":
-                raise ValueError(
-                    "Layer-sharded DSA indexer HiCache backup with page_first "
-                    "layout is not supported without a per-layer LF->PF kernel."
-                )
+                if _is_hcu:
+                    # There is no per-layer LF->PF AOT kernel. Use a synchronous
+                    # HCU correctness fallback and keep the existing hard failure
+                    # on other backends where this path is unvalidated.
+                    host_layer = self.index_k_with_scale_buffer[:, host_layer_id].view(
+                        -1, self.indexer_page_stride_size
+                    )
+                    device_layer = device_index_k_cache[device_layer_id].view(
+                        -1, self.indexer_page_stride_size
+                    )
+                    copied_rows = device_layer.index_select(
+                        0, device_page_indices.to(device_layer.device)
+                    ).to(host_layer.device)
+                    host_layer.index_copy_(
+                        0, host_page_indices.to(host_layer.device), copied_rows
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded DSA indexer HiCache backup with page_first "
+                        "layout is not supported without a per-layer LF->PF kernel."
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[self._get_device_index_k_cache_for_transfer(device_pool)[device_layer_id]],
+                    src_layers=[
+                        self._get_device_index_k_cache_for_transfer(device_pool)[
+                            device_layer_id
+                        ]
+                    ],
                     dst_layers=[self.index_k_with_scale_buffer[host_layer_id]],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,

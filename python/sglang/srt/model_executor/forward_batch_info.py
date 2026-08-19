@@ -56,8 +56,8 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
-    is_hcu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_npu,
     support_triton,
@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.mem_cache.dsa_cache_layer_split import MainKVPagePlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -541,6 +542,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Built once from the global request table and reused by every DSA layer.
+    # Index-K metadata deliberately remains in the original physical layout.
+    dsa_layer_split_main_kv_page_plan: Optional[MainKVPagePlan] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None

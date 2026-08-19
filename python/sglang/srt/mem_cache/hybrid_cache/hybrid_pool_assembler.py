@@ -1954,6 +1954,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
+        kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
         logger.info(
             "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
             "transfer_layer_num=%s",

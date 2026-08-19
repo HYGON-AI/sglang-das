@@ -5471,12 +5471,26 @@ class ServerArgs:
                         f"{self.disaggregation_transfer_backend!r}. mori/nixl "
                         "support will be added later by the community."
                     )
-                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.pp_size > 1
+                    and not is_hcu()
+                ):
                     raise ValueError(
                         "--enable-dsa-cache-layer-split is not supported with "
-                        "pipeline parallelism (pp_size > 1) yet. It requires "
-                        "prefill context parallelism, and CP + PP has not been "
-                        "validated for this feature."
+                        "pipeline parallelism (pp_size > 1) on non-HCU devices "
+                        "yet. The PP + CP LayerSplit path is currently guarded "
+                        "to HCU because it has not been validated elsewhere."
+                    )
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and is_hcu()
+                    and self.hicache_storage_backend is not None
+                ):
+                    raise NotImplementedError(
+                        "HCU --enable-dsa-cache-layer-split currently supports "
+                        "HiCache L1/L2 only. --hicache-storage-backend (L3) is "
+                        "not layer-shard-aware yet."
                     )
 
             else:
