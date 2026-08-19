@@ -365,6 +365,12 @@ class DeepseekSparseAttnBackend(
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
+    def _translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
+        translate = getattr(
+            self.token_to_kv_pool, "translate_main_kv_loc_to_compact", None
+        )
+        return loc if translate is None else translate(loc)
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2132,6 +2138,11 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
+        # Index-K keeps physical metadata. Translate only the final Main-KV
+        # consumer locations into this batch's compact scratch layout.
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            page_table_1 = self._translate_main_kv_loc_to_compact(page_table_1)
+
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
@@ -2181,6 +2192,9 @@ class DeepseekSparseAttnBackend(
                             self.forward_metadata.page_table_1_flattened
                         )
                         assert page_table_1_flattened is not None
+                        page_table_1_flattened = self._translate_main_kv_loc_to_compact(
+                            page_table_1_flattened
+                        )
                         return self._forward_flashmla_sparse_q8kv8(
                             q_nope=q_nope,
                             q_rope=q_rope,
@@ -2228,6 +2242,9 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
+                    page_table_1_flattened = self._translate_main_kv_loc_to_compact(
+                        page_table_1_flattened
+                    )
                     kv_cache = dequantize_k_cache_paged(
                         kv_cache, page_table_1_flattened
                     )
@@ -3631,6 +3648,8 @@ class DeepseekSparseAttnBackend(
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:
             sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
+
+        page_table_1 = self._translate_main_kv_loc_to_compact(page_table_1)
 
         q_scale = 1.0
         k_scale = (

@@ -30,8 +30,11 @@ PD prefill workers under prefill-CP (see
 from __future__ import annotations
 
 import logging
+import weakref
+from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -52,6 +55,120 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(eq=False, frozen=True)
+class MainKVPagePlan:
+    """Physical pages needed by one ordinary prefill ``ForwardBatch``.
+
+    ``history_page_ids`` is the unique payload copied from each layer owner.
+    ``all_page_ids`` additionally contains pages receiving this step's newly
+    computed KV. Object identity deliberately serves as the batch identity.
+    """
+
+    history_page_ids: torch.Tensor
+    all_page_ids: torch.Tensor
+
+
+def _build_unique_physical_pages(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    sequence_lens: Sequence[int],
+    page_size: int,
+) -> torch.Tensor:
+    """Collect one physical page ID per logical page and remove duplicates."""
+
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if req_to_token.ndim != 2:
+        raise ValueError(
+            f"req_to_token must be 2-D, got shape={tuple(req_to_token.shape)}"
+        )
+
+    batch_size = len(sequence_lens)
+    if batch_size == 0:
+        return torch.empty(0, dtype=torch.long, device=req_to_token.device)
+    if req_pool_indices.numel() < batch_size:
+        raise ValueError(
+            "req_pool_indices is shorter than sequence_lens: "
+            f"{req_pool_indices.numel()} < {batch_size}"
+        )
+
+    page_counts = []
+    for sequence_len in sequence_lens:
+        sequence_len = int(sequence_len)
+        if sequence_len < 0:
+            raise ValueError(
+                f"sequence length must be non-negative, got {sequence_len}"
+            )
+        page_counts.append((sequence_len + page_size - 1) // page_size)
+
+    total_pages = sum(page_counts)
+    if total_pages == 0:
+        return torch.empty(0, dtype=torch.long, device=req_to_token.device)
+
+    max_pages = max(page_counts)
+    if (max_pages - 1) * page_size >= req_to_token.shape[1]:
+        raise ValueError(
+            "sequence length exceeds req_to_token capacity: "
+            f"max_pages={max_pages}, page_size={page_size}, "
+            f"capacity={req_to_token.shape[1]}"
+        )
+
+    device = req_to_token.device
+    page_counts_tensor = torch.tensor(page_counts, dtype=torch.long, device=device)
+    request_rows = torch.repeat_interleave(
+        req_pool_indices[:batch_size].to(device=device, dtype=torch.long),
+        page_counts_tensor,
+        output_size=total_pages,
+    )
+    request_page_starts = torch.cumsum(page_counts_tensor, dim=0) - page_counts_tensor
+    repeated_page_starts = torch.repeat_interleave(
+        request_page_starts,
+        page_counts_tensor,
+        output_size=total_pages,
+    )
+    logical_pages = (
+        torch.arange(total_pages, dtype=torch.long, device=device)
+        - repeated_page_starts
+    )
+    physical_page_starts = req_to_token[request_rows, logical_pages * page_size]
+    physical_pages = torch.div(
+        physical_page_starts, page_size, rounding_mode="floor"
+    ).to(torch.long)
+    # Physical page 0 is the pool's padded/dummy page, never request history.
+    return torch.unique(physical_pages[physical_pages > 0], sorted=True).contiguous()
+
+
+def build_main_kv_page_plan(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: Sequence[int],
+    current_locs: torch.Tensor,
+    page_size: int,
+) -> MainKVPagePlan:
+    """Build the deterministic, CP-global compact layout for one batch."""
+
+    history_page_ids = _build_unique_physical_pages(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+        page_size,
+    )
+    current_locs = current_locs.reshape(-1)
+    valid_current_locs = current_locs[current_locs >= 0]
+    current_page_ids = torch.unique(
+        torch.div(valid_current_locs, page_size, rounding_mode="floor").to(torch.long),
+        sorted=True,
+    )
+    current_page_ids = current_page_ids[current_page_ids > 0]
+    all_page_ids = torch.unique(
+        torch.cat((history_page_ids, current_page_ids)), sorted=True
+    ).contiguous()
+    return MainKVPagePlan(
+        history_page_ids=history_page_ids,
+        all_page_ids=all_page_ids,
+    )
 
 
 class LayerSplitIndexKeyCache(IndexKeyCache):
@@ -286,7 +403,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 comm.broadcast(tensor, src=owner_rank)
         else:
             torch.distributed.broadcast(
-                tensor, src=owner_rank, group=cp_group.cpu_group
+                tensor,
+                src=cp_group.ranks[owner_rank],
+                group=cp_group.device_group,
             )
         return tensor
 
@@ -323,6 +442,31 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
+                # Physical page 0 is translated to compact page 0 and may be
+                # read for padded/dummy entries. Compact broadcasts start at
+                # page 1, so initialize this page once instead of exposing the
+                # uninitialized contents of the scratch allocation.
+                self.remote_kv_buffer[: self.page_size].zero_()
+                if (self.size + self.page_size) % self.page_size != 0:
+                    raise ValueError(
+                        "LayerSplit MLA KV buffer must contain whole pages: "
+                        f"size={self.size}, page_size={self.page_size}"
+                    )
+                self.num_pool_pages = (self.size + self.page_size) // self.page_size
+                self.physical_to_compact_main_kv_page = torch.full(
+                    (self.num_pool_pages,),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.physical_to_compact_main_kv_page[0] = 0
+                self._active_main_kv_page_plan: Optional[MainKVPagePlan] = None
+                self._active_main_kv_batch_marker: Optional[
+                    weakref.ReferenceType[Any]
+                ] = None
+                self._active_main_kv_compact_page_ids = torch.empty(
+                    0, dtype=torch.long, device=self.device
+                )
                 self.remote_kv_layer_id: Optional[int] = None
                 self.device_module = torch.get_device_module(self.device)
                 self.kv_broadcast_stream = self.device_module.Stream()
@@ -336,6 +480,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.remote_kv_buffer
+        del self.physical_to_compact_main_kv_page
+        del self._active_main_kv_compact_page_ids
+        self._active_main_kv_page_plan = None
+        self._active_main_kv_batch_marker = None
         self._clear_index_k_buffers()
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
@@ -424,8 +572,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
         remote_kv_updatable = self.remote_kv_layer_id == layer_id
         if remote_kv_updatable:
+            remote_loc = self.translate_main_kv_loc_to_compact(loc)
             self._write_mla_kv_buffer(
-                self.remote_kv_buffer, loc, cache_k_nope, cache_k_rope
+                self.remote_kv_buffer, remote_loc, cache_k_nope, cache_k_rope
             )
         if not self._is_layer_owned(layer_id):
             return
@@ -437,6 +586,173 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         )
         if not remote_kv_updatable and self.remote_kv_layer_id == layer_id:
             self.remote_kv_layer_id = None
+
+    def configure_main_kv_page_plan(
+        self,
+        page_plan: Optional[MainKVPagePlan],
+        batch_marker: Any,
+    ) -> None:
+        """Install one batch's physical-to-compact Main-KV mapping.
+
+        History pages occupy compact slots ``[1, 1 + N_history)`` so the
+        transmitted payload is a single contiguous view. Pages used only by
+        this step follow them and are populated locally after CP AllGather.
+        """
+
+        if (
+            self._active_main_kv_batch_marker is not None
+            and self._active_main_kv_batch_marker() is batch_marker
+            and self._active_main_kv_page_plan is page_plan
+        ):
+            return
+
+        # A late side-stream broadcast must not write through a mapping owned
+        # by the next ForwardBatch.
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
+        self.physical_to_compact_main_kv_page.fill_(-1)
+        self.physical_to_compact_main_kv_page[0] = 0
+        self._active_main_kv_batch_marker = None
+        self._active_main_kv_page_plan = None
+        self._active_main_kv_compact_page_ids = torch.empty(
+            0, dtype=torch.long, device=self.device
+        )
+        if page_plan is None:
+            self._active_main_kv_batch_marker = weakref.ref(batch_marker)
+            return
+
+        history_page_ids = page_plan.history_page_ids.to(
+            device=self.device, dtype=torch.long
+        ).contiguous()
+        all_page_ids = page_plan.all_page_ids.to(
+            device=self.device, dtype=torch.long
+        ).contiguous()
+        for name, page_ids in (
+            ("history_page_ids", history_page_ids),
+            ("all_page_ids", all_page_ids),
+        ):
+            if page_ids.numel() == 0:
+                continue
+            invalid_page_ids = page_ids[
+                (page_ids <= 0) | (page_ids >= self.num_pool_pages)
+            ]
+            if invalid_page_ids.numel() != 0:
+                raise RuntimeError(
+                    "LayerSplit compact Main-KV page plan contains an out-of-range "
+                    f"{name} entry: page_id={int(invalid_page_ids[0].item())}, "
+                    f"valid_range=[1, {self.num_pool_pages})"
+                )
+        if all_page_ids.numel() > self.num_pool_pages - 1:
+            raise RuntimeError(
+                "LayerSplit compact Main-KV layout exceeds the remote buffer: "
+                f"pages={all_page_ids.numel()}, "
+                f"capacity_pages={self.num_pool_pages - 1}"
+            )
+
+        history_compact_ids = torch.arange(
+            1,
+            history_page_ids.numel() + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.physical_to_compact_main_kv_page.index_copy_(
+            0, history_page_ids, history_compact_ids
+        )
+
+        current_only_mask = (
+            self.physical_to_compact_main_kv_page.index_select(0, all_page_ids) < 0
+        )
+        current_only_page_ids = all_page_ids[current_only_mask]
+        current_compact_ids = torch.arange(
+            history_page_ids.numel() + 1,
+            history_page_ids.numel() + current_only_page_ids.numel() + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.physical_to_compact_main_kv_page.index_copy_(
+            0, current_only_page_ids, current_compact_ids
+        )
+        self._active_main_kv_compact_page_ids = torch.cat(
+            (history_page_ids, current_only_page_ids)
+        ).contiguous()
+        self._active_main_kv_page_plan = page_plan
+        self._active_main_kv_batch_marker = weakref.ref(batch_marker)
+
+    def translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
+        """Translate physical token locations for the active compact buffer."""
+
+        if self._active_main_kv_page_plan is None:
+            return loc
+
+        valid = loc >= 0
+        safe_loc = loc.clamp_min(0)
+        physical_page = torch.div(safe_loc, self.page_size, rounding_mode="floor").to(
+            torch.long
+        )
+        page_offset = safe_loc % self.page_size
+        compact_page = self.physical_to_compact_main_kv_page.index_select(
+            0, physical_page.reshape(-1)
+        ).reshape(physical_page.shape)
+        compact_loc = compact_page.to(loc.dtype) * self.page_size + page_offset
+        return torch.where(
+            valid & (compact_page >= 0),
+            compact_loc,
+            torch.full_like(compact_loc, -1),
+        )
+
+    def _broadcast_compact_main_kv_pages(
+        self,
+        layer_id: int,
+        src_tensor: Optional[torch.Tensor],
+        *,
+        include_current: bool = False,
+    ) -> None:
+        page_plan = self._active_main_kv_page_plan
+        assert page_plan is not None
+        num_pages = (
+            self._active_main_kv_compact_page_ids.numel()
+            if include_current
+            else page_plan.history_page_ids.numel()
+        )
+        if num_pages == 0:
+            return
+
+        page_ids = self._active_main_kv_compact_page_ids[:num_pages]
+        remote_pages = self.remote_kv_buffer.view(
+            self.num_pool_pages,
+            self.page_size,
+            1,
+            self.kv_cache_dim,
+        )
+        payload = remote_pages[1 : num_pages + 1]
+        bytes_to_broadcast = payload.numel() * payload.element_size()
+
+        if self._is_layer_owned(layer_id):
+            assert src_tensor is not None
+            local_pages = src_tensor.view(
+                self.num_pool_pages,
+                self.page_size,
+                1,
+                self.kv_cache_dim,
+            )
+            with torch.profiler.record_function(
+                "layersplit_main_kv_pack "
+                f"layer={layer_id} pages={num_pages} "
+                f"bytes={bytes_to_broadcast}"
+            ):
+                torch.index_select(local_pages, 0, page_ids, out=payload)
+
+        with torch.profiler.record_function(
+            "layersplit_main_kv_broadcast "
+            f"layer={layer_id} pages={num_pages} "
+            f"bytes={bytes_to_broadcast}"
+        ):
+            self._broadcast_tensor_from_owner(
+                payload,
+                layer_id,
+                src_tensor=(payload if self._is_layer_owned(layer_id) else None),
+                use_layer_broadcast_comm=True,
+            )
 
     def _finalize_pending_kv_broadcast(
         self, *, set_remote_layer_id: bool = True
@@ -454,6 +770,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         layer_id: int,
         layer_transfer_counter: Optional[LayerDoneCounter] = None,
         layer_transfer_idx: Optional[int] = None,
+        has_history: bool = True,
     ) -> None:
         """Kick off an async owner-broadcast of ``layer_id``'s latent KV.
 
@@ -468,30 +785,54 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 return
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
 
+        compact_history_is_empty = (
+            self._active_main_kv_page_plan is not None
+            and self._active_main_kv_page_plan.history_page_ids.numel() == 0
+        )
+        if compact_history_is_empty or (
+            self._active_main_kv_page_plan is None and not has_history
+        ):
+            # The gathered K will populate this scratch directly. Broadcasting
+            # an empty history would only duplicate data movement.
+            self.remote_kv_layer_id = layer_id
+            return
+
         local_idx = self._local_layer_idx(layer_id)
         src_tensor = (
             self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
+        transfer_counter = layer_transfer_counter or self.layer_transfer_counter
+        transfer_idx = (
+            layer_transfer_idx if layer_transfer_idx is not None else local_idx
+        )
         if self.layer_broadcast_comm is None:
-            self._broadcast_tensor_from_owner(
-                self.remote_kv_buffer,
-                layer_id,
-                src_tensor=src_tensor,
-                use_layer_broadcast_comm=True,
-            )
+            if transfer_counter is not None:
+                transfer_counter.wait_until(transfer_idx)
+            if self._active_main_kv_page_plan is not None:
+                self._broadcast_compact_main_kv_pages(layer_id, src_tensor)
+            else:
+                self._broadcast_tensor_from_owner(
+                    self.remote_kv_buffer,
+                    layer_id,
+                    src_tensor=src_tensor,
+                    use_layer_broadcast_comm=True,
+                )
             self.remote_kv_layer_id = layer_id
             return
 
         self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
-            if layer_transfer_counter is not None and layer_transfer_idx is not None:
-                layer_transfer_counter.wait_until(layer_transfer_idx)
-            self._broadcast_tensor_from_owner(
-                self.remote_kv_buffer,
-                layer_id,
-                src_tensor=src_tensor,
-                use_layer_broadcast_comm=True,
-            )
+            if transfer_counter is not None:
+                transfer_counter.wait_until(transfer_idx)
+            if self._active_main_kv_page_plan is not None:
+                self._broadcast_compact_main_kv_pages(layer_id, src_tensor)
+            else:
+                self._broadcast_tensor_from_owner(
+                    self.remote_kv_buffer,
+                    layer_id,
+                    src_tensor=src_tensor,
+                    use_layer_broadcast_comm=True,
+                )
         self.pending_remote_kv_layer_id = layer_id
         self.pending_remote_kv_broadcast = True
 
@@ -505,14 +846,43 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             src_tensor = (
                 self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
             )
-            self._broadcast_tensor_from_owner(
-                self.remote_kv_buffer,
-                layer_id,
-                src_tensor=src_tensor,
-                use_layer_broadcast_comm=True,
-            )
+            if self._active_main_kv_page_plan is not None:
+                # A missed prefetch reaches this fallback after current KV may
+                # already have been produced, so bootstrap every compact page.
+                self._broadcast_compact_main_kv_pages(
+                    layer_id,
+                    src_tensor,
+                    include_current=True,
+                )
+            else:
+                self._broadcast_tensor_from_owner(
+                    self.remote_kv_buffer,
+                    layer_id,
+                    src_tensor=src_tensor,
+                    use_layer_broadcast_comm=True,
+                )
             self.remote_kv_layer_id = layer_id
         return self.remote_kv_buffer
+
+    def invalidate_remote_kv_buffer_for_layer(self, layer_id: int) -> None:
+        """Invalidate a broadcast copy before HiCache restores its owner layer."""
+
+        if self.pending_remote_kv_layer_id == layer_id:
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        if self.remote_kv_layer_id == layer_id:
+            self.remote_kv_layer_id = None
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        return super().get_mla_kv_buffer(
+            layer,
+            self.translate_main_kv_loc_to_compact(loc),
+            dst_dtype,
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         size_limit = self.size + self.page_size

@@ -26,9 +26,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -251,6 +252,11 @@ class DSAIndexerPoolHost(HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        hcu_layer_split_kwargs = (
+            {"num_warps_per_block": 4}
+            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            else {}
+        )
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -264,6 +270,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     item_size=self.indexer_page_stride_size,
+                    **hcu_layer_split_kwargs,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
@@ -273,6 +280,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,
                     item_size=self.indexer_page_stride_size,
+                    **hcu_layer_split_kwargs,
                     src_layout_dim=self.indexer_layout_dim,
                 )
             else:
@@ -316,6 +324,11 @@ class DSAIndexerPoolHost(HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        hcu_layer_split_kwargs = (
+            {"num_warps_per_block": 4}
+            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            else {}
+        )
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -329,12 +342,29 @@ class DSAIndexerPoolHost(HostKVCache):
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     item_size=self.indexer_page_stride_size,
+                    **hcu_layer_split_kwargs,
                 )
             elif self.layout == "page_first":
-                raise ValueError(
-                    "Layer-sharded DSA indexer HiCache backup with page_first "
-                    "layout is not supported without a per-layer LF->PF kernel."
-                )
+                if _is_hcu:
+                    # No per-layer LF->PF AOT kernel exists; use a synchronous
+                    # correctness fallback for HCU.
+                    host_layer = self.index_k_with_scale_buffer[:, host_layer_id].view(
+                        -1, self.indexer_page_stride_size
+                    )
+                    device_layer = device_pool.index_k_with_scale_buffer[
+                        device_layer_id
+                    ].view(-1, self.indexer_page_stride_size)
+                    copied_rows = device_layer.index_select(
+                        0, device_page_indices.to(device_layer.device)
+                    ).to(host_layer.device)
+                    host_layer.index_copy_(
+                        0, host_page_indices.to(host_layer.device), copied_rows
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded DSA indexer HiCache backup with page_first "
+                        "layout is not supported without a per-layer LF->PF kernel."
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
