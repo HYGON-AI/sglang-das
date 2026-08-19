@@ -345,7 +345,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.remote_kv_buffer
-        self.index_key_cache.clear()
+        self._clear_index_k_buffers()
 
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 
@@ -355,6 +355,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.use_int8_index_k_cache:
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_dequant_workspace)
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_page_claims)
         return kv_size_bytes
 
     def get_contiguous_buf_infos(self):

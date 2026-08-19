@@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
 from __future__ import annotations
 
 import logging
+import math
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -29,6 +30,11 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+    index_k_cache_bytes_per_token,
+    index_k_workspace_bytes_per_token,
+    resolve_index_k_cache_mode,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -55,7 +61,6 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hcu,
-    is_hcu_native_fp8_supported,
     is_hip,
     is_npu,
     spec_decode_alloc_len_per_request,
@@ -513,28 +518,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+        cache_mode = resolve_index_k_cache_mode(
+            kvc.kv_cache_dtype,
+            kvc.page_size,
+            index_head_dim,
         )
-        element_size = torch._utils._element_size(
-            DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        )
-        if _is_hcu and (
-            kvc.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
-            or not is_hcu_native_fp8_supported()
-        ):
-            # HCU falls back to a bf16 index-K cache whenever the KV cache is not
-            # native FP8: no per-block scale tail, and a bf16 element size.
-            indexer_size_per_token = index_head_dim
-            element_size = torch._utils._element_size(torch.bfloat16)
+        index_k_bytes = index_k_cache_bytes_per_token(cache_mode)
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-            dtype = kvc.kv_cache_dtype
-            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
-            if dtype != torch.float8_e4m3fn:
-                indexer_size_per_token = index_head_dim
-                element_size = torch._utils._element_size(dtype)
+            # NPU BF16 layouts use native element size rather than FP8+scale.
+            if kvc.kv_cache_dtype != torch.float8_e4m3fn:
+                index_k_bytes = index_head_dim * torch._utils._element_size(
+                    kvc.kv_cache_dtype
+                )
             if not is_npu_arch35():
                 allocate_all_layers = True
         memory_config = get_memory()
@@ -588,9 +585,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
 
-        return int(
-            indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        persistent_bytes = (
+            index_k_bytes
+            * num_indexer_layers
+            * indexer_ratio
         )
+        workspace_bytes = index_k_workspace_bytes_per_token(cache_mode)
+        return math.ceil(persistent_bytes + workspace_bytes)
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
