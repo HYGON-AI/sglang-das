@@ -404,9 +404,7 @@ def dequantize_index_k_int8_paged(
     )
 
 
-def validate_hcu_int8_index_k_cache_server_args(
-    server_args, *, allow_mooncake_pd: bool
-) -> None:
+def validate_hcu_int8_index_k_cache_server_args(server_args) -> None:
     """Reject combinations whose INT8 cache lifetime is not implemented."""
     if not envs.SGLANG_DSA_HCU_INT8_INDEX_K_CACHE.get():
         return
@@ -424,7 +422,7 @@ def validate_hcu_int8_index_k_cache_server_args(
     disaggregation_mode = getattr(server_args, "disaggregation_mode", "null")
     if disaggregation_mode != "null":
         backend = getattr(server_args, "disaggregation_transfer_backend", "mooncake")
-        if not allow_mooncake_pd or backend not in ("mooncake", "mooncake_tcp"):
+        if backend not in ("mooncake", "mooncake_tcp"):
             unsupported.append(f"--disaggregation-transfer-backend={backend}")
 
     if unsupported:
