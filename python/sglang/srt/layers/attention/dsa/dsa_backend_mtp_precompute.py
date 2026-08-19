@@ -389,17 +389,17 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         # Page indices (repeated for each draft token)
         page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
         page_indices = torch.repeat_interleave(
-            page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+            page_indices,
+            repeats=self.speculative_num_draft_tokens,
+            dim=0,
+            output_size=seqlens_expanded_size,
         ).contiguous()
 
-        # Generate expanded seqlens on device. seq_lens_cpu is optional for DSA
-        # CUDA graph replay, so this fallback must not require a host mirror.
-        extend_seq_lens = torch.full(
-            (bs,),
-            self.speculative_num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        # seq_lens_cpu is optional for DSA CUDA graph replay, so this fallback
+        # reuses the graph-state tensor and does not require a host mirror.
+        extend_seq_lens = self.decode_cuda_graph_metadata[
+            "target_verify_extend_seq_lens"
+        ][:bs]
         seqlens_expanded = seqlens_expand_triton(
             extend_seq_lens,
             cache_seqlens,

@@ -1202,6 +1202,15 @@ class DeepseekSparseAttnBackend(
             "cu_seqlens_k": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
+            # TARGET_VERIFY has a fixed number of query tokens per request.
+            # Keep those lengths on device so graph replay does not allocate and
+            # fill a new tensor on every speculative step.
+            "target_verify_extend_seq_lens": torch.full(
+                (max_bs,),
+                self.speculative_num_draft_tokens or 0,
+                dtype=torch.int32,
+                device=self.device,
+            ),
             # fake page_table for sparse_prefill
             # Match req_to_token's width exactly. It is over-allocated beyond
             # context_len because spec decoding lets seq_len transiently overshoot.
@@ -1552,18 +1561,16 @@ class DeepseekSparseAttnBackend(
                 )
                 page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
                 page_indices = torch.repeat_interleave(
-                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                    page_indices,
+                    repeats=self.speculative_num_draft_tokens,
+                    dim=0,
+                    output_size=bs * self.speculative_num_draft_tokens,
                 )
                 metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
-                # Fill the constant per-req qo lengths on-device; torch.tensor(list,
-                # device=cuda) does a pageable H2D copy that blocks the host.
-                extend_seq_lens = torch.full(
-                    (bs,),
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+                extend_seq_lens = self.decode_cuda_graph_metadata[
+                    "target_verify_extend_seq_lens"
+                ][:bs]
                 seqlens_expanded = seqlens_expand_triton(
                     extend_seq_lens,
                     cache_seqlens,
