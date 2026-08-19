@@ -199,6 +199,36 @@ def is_pd_hidden_transfer_failed(req: Req) -> bool:
     return sender is not None and sender.conclude_state == KVPoll.Failed
 
 
+def _select_pd_hidden_payload_indices(
+    *,
+    rid: str,
+    owner_direct_sent: bool,
+    src_indices: Optional[List[int]],
+    capture_layer_ids: Optional[List[int]],
+    current_src_indices: Optional[List[int]],
+    has_current_pd_hidden: bool,
+    streaming_hidden: bool,
+    written: Optional[List[bool]],
+):
+    if owner_direct_sent:
+        return []
+    if src_indices is None and capture_layer_ids:
+        raise RuntimeError(
+            f"PD hidden row pool was not materialized before transfer: rid={rid}"
+        )
+    if streaming_hidden and has_current_pd_hidden:
+        return np.asarray(current_src_indices, dtype=np.int32)
+    if not src_indices:
+        return []
+    if written is not None and not all(written):
+        missing = [i for i, ok in enumerate(written) if not ok][:8]
+        raise RuntimeError(
+            "PD hidden rows are incomplete before transfer: "
+            f"rid={rid}, missing_offsets={missing}"
+        )
+    return np.asarray(src_indices, dtype=np.int32)
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -1917,8 +1947,11 @@ class SchedulerDisaggregationPrefillMixin:
             (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
         )
 
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
         state_indices: Optional[List] = None
-        if last_chunk or has_current_pd_hidden:
+        if last_chunk or (streaming_pd_hidden and has_current_pd_hidden):
             if last_chunk:
                 self.disagg_metadata_buffers.set_buf(req)
 
@@ -1990,41 +2023,40 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _pd_hidden_payload():
-                if pd_hidden_state(req).owner_direct_sent:
-                    return []
-                src_indices = pd_hidden_state(req).src_indices
-                if src_indices is None and pd_hidden_state(req).capture_layer_ids:
-                    raise RuntimeError(
-                        "PD hidden row pool was not materialized before transfer: "
-                        f"rid={req.rid}"
-                    )
-                if has_current_pd_hidden:
-                    return np.asarray(current_pd_hidden_src_indices, dtype=np.int32)
-                if not src_indices:
-                    return []
-                written = pd_hidden_state(req).written
-                if written is not None and not all(written):
-                    missing = [i for i, ok in enumerate(written) if not ok][:8]
-                    raise RuntimeError(
-                        "PD hidden rows are incomplete before transfer: "
-                        f"rid={req.rid}, missing_offsets={missing}"
-                    )
-                return np.asarray(src_indices, dtype=np.int32)
+                return _select_pd_hidden_payload_indices(
+                    rid=req.rid,
+                    owner_direct_sent=pd_hidden_state(req).owner_direct_sent,
+                    src_indices=pd_hidden_state(req).src_indices,
+                    capture_layer_ids=pd_hidden_state(req).capture_layer_ids,
+                    current_src_indices=current_pd_hidden_src_indices,
+                    has_current_pd_hidden=has_current_pd_hidden,
+                    streaming_hidden=streaming_pd_hidden,
+                    written=pd_hidden_state(req).written,
+                )
 
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            payloads = {
-                StateType.MAMBA: _mamba_payload,
-                StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
-                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
-                StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
-                StateType.BLOCK_SCALE: _full_kv_pages_payload,
-                StateType.BLOCK_SCALE_SWA: _swa_payload,
-            }
-            if _is_npu and isinstance(
+            # PD hidden rows stream with every chunk -- that is the fix this
+            # commit carries. Every other state component only rides along with
+            # the last chunk. Payload builders stay on the release's newer
+            # _full_kv_pages_payload (MINIMAX_INDEX_K included: index rows live
+            # at the same loc as main KV on the same page_size).
+            payloads = {StateType.PD_HIDDEN: _pd_hidden_payload}
+            if last_chunk:
+                payloads.update(
+                    {
+                        StateType.MAMBA: _mamba_payload,
+                        StateType.SWA: _swa_payload,
+                        StateType.DSA: _full_kv_pages_payload,
+                        StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                        StateType.SWA_RING: _swa_ring_payload,
+                        StateType.C128_STATE: _c128_state_payload,
+                        StateType.BLOCK_SCALE: _full_kv_pages_payload,
+                        StateType.BLOCK_SCALE_SWA: _swa_payload,
+                    }
+                )
+            if last_chunk and _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
                 DeepSeekV4TokenToKVPool,
             ):
@@ -2072,58 +2104,32 @@ class SchedulerDisaggregationPrefillMixin:
             )
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
-            if not req.disagg_kv_sender.should_send_kv_chunk(
+            send_hidden_chunk = (
+                streaming_pd_hidden and has_current_pd_hidden and is_final_segment
+            )
+            should_send_kv_chunk = req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
-            ):
+            )
+            if not should_send_kv_chunk and not send_hidden_chunk:
                 continue
+            if send_hidden_chunk:
+                source_event = self.device_module.Event()
+                source_event.record()
+                req.disagg_kv_sender.set_source_event(source_event)
+                req.disagg_kv_sender.set_pd_hidden_chunk_meta(
+                    int(current_pd_hidden_start),
+                    int(current_pd_hidden_row_len),
+                    bool(pd_hidden_state(req).current_is_last),
+                    current_pd_hidden_src_indices
+                    if streaming_pd_hidden
+                    else pd_hidden_state(req).src_indices,
+                )
             req.disagg_kv_sender.send(
                 page_indices,
-                state_indices if segment_is_last else None,
+                state_indices if segment_is_last or send_hidden_chunk else None,
                 num_kv_tokens=seg_end - seg_start,
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                elif st == StateType.C128_STATE:
-                    state_indices.append(_c128_state_payload())
-                elif st == StateType.PD_HIDDEN:
-                    state_indices.append(_pd_hidden_payload())
-                else:
-                    state_indices.append(None)
 
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, start_idx:end_idx
-        ]
-        page_indices = kv_to_page_indices(kv_indices, page_size)
-        should_send_kv_chunk = req.disagg_kv_sender.should_send_kv_chunk(
-            len(page_indices), last_chunk
-        )
-        if not should_send_kv_chunk and not has_current_pd_hidden:
-            return True
-        if has_current_pd_hidden:
-            source_event = self.device_module.Event()
-            source_event.record()
-            req.disagg_kv_sender.set_source_event(source_event)
-            req.disagg_kv_sender.set_pd_hidden_chunk_meta(
-                int(current_pd_hidden_start),
-                int(current_pd_hidden_row_len),
-                bool(pd_hidden_state(req).current_is_last),
-                current_pd_hidden_src_indices
-                if streaming_pd_hidden
-                else pd_hidden_state(req).src_indices,
-            )
-        req.disagg_kv_sender.send(page_indices, state_indices)
         if has_current_pd_hidden and streaming_pd_hidden:
             pd_hidden_state(req).src_indices = None
         pd_hidden_state(req).current_src_indices = None
