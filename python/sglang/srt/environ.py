@@ -673,6 +673,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Ablation: skip ModelSlim W4A8 MoE ``w13/w2_scale_bias`` in Triton
+    # GroupedMatmul dequant (float bias after weight_scale * per_token_scale).
+    # Use to diagnose FusedMoE latent Mean≈-0.4 / Max~100-1000x vs FP4.
+    SGLANG_W4A8_MOE_SKIP_SCALE_BIAS = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)

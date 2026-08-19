@@ -9,7 +9,7 @@
 import logging
 from collections.abc import Iterable
 from functools import cached_property
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -136,7 +136,58 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# MegaMoE SiTU sentinel: DeepGEMM 0.1.5.post1+ selects the K3 SiTU
+# Runtime fused module names → checkpoint / quant_model_description shards.
+_KIMI_K3_PACKED_MODULES_MAPPING: Dict[str, List[str]] = {
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+    "fused_qkvbfg_a_proj": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "b_proj",
+        "f_a_proj",
+        "g_a_proj",
+    ],
+    "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+}
+
+def kimi_k3_fuse_g_into_qkvg(quant_config: Optional[QuantizationConfig]) -> bool:
+    """Whether full-rank KDA may fuse g into ``fused_qkvg_proj``.
+
+    ModelSlim W4A8 keeps ``g_proj`` as FLOAT while ``q/k/v_proj`` are
+    ``W8A8_DYNAMIC``. Fusing them into one MergedColumnParallelLinear makes
+    the whole GEMM use W8A8 (``weight_scale`` allocated for all shards) while
+    g's scale is never loaded → NaN. In that mixed case keep g separate.
+    """
+    if quant_config is None:
+        return True
+    desc = getattr(quant_config, "quant_description", None)
+    if not isinstance(desc, dict):
+        return True
+    for key, scheme in desc.items():
+        if not isinstance(key, str) or not key.endswith(".g_proj.weight"):
+            continue
+        if scheme != "FLOAT":
+            continue
+        q_scheme = desc.get(key.replace(".g_proj.weight", ".q_proj.weight"), "")
+        if q_scheme and q_scheme != "FLOAT":
+            return False
+    return True
+
+
+def kimi_k3_packed_modules_mapping(
+    quant_config: Optional[QuantizationConfig] = None,
+) -> Dict[str, List[str]]:
+    """Runtime fused→shard map; drop ``g_proj`` from ``fused_qkvg_proj`` when mixed."""
+    mapping = {k: list(v) for k, v in _KIMI_K3_PACKED_MODULES_MAPPING.items()}
+    if not kimi_k3_fuse_g_into_qkvg(quant_config):
+        mapping["fused_qkvg_proj"] = ["q_proj", "k_proj", "v_proj"]
+    return mapping
+
+
+# MegaMoE SiTU sentinel: the patched deep_gemm mega kernel selects the K3 SiTU
 # activation when activation_clamp == 0.03125 (2^-5: exactly representable and
 # unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
 # negative sentinel is impossible). beta=4.0 / linear_beta=25.0 are baked into
@@ -542,12 +593,24 @@ class KimiK3MoE(nn.Module):
             and self.alt_stream is not None
         )
 
+        # Latent MoE projections. Pass quant_config through so ModelSlim
+        # W8A8_DYNAMIC checkpoints (Huawei W4A8) load weight_scale/offset and
+        # run quant matmul. quant_config=None previously treated int8 weights
+        # as bf16 → latent GEMM explosion (~1e4). FLOAT shards still resolve
+        # to UnquantizedLinearMethod via is_layer_skipped. Fused-front /
+        # gemm_ag paths already require bf16 weights and self-disable here.
+        # ModelSlim W4A8: latent 投影是量化的，必须带 quant_config。
+        # MXFP4 / compressed-tensors: latent 投影是 bf16，必须 UnquantizedLinearMethod。
+        from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+        latent_quant_config = (
+            quant_config if isinstance(quant_config, ModelSlimConfig) else None
+        )
         if self.use_latent_moe:
             self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -559,7 +622,7 @@ class KimiK3MoE(nn.Module):
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
         else:
@@ -1311,28 +1374,51 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
-            # Fuse only the alignment-friendly wide projections [q, k, v, g]
-            # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
-            # in as well skews the output dim to 6284 and measurably degrades
-            # the GEMM kernel selection; they stay as separate tiny GEMVs.
+            # Fuse only the alignment-friendly wide projections.
+            # Default: [q, k, v, g] (6144/rank at TP8). Folding b (12/rank)
+            # and f_a (128, replicated) in as well skews the output dim to
+            # 6284 and measurably degrades the GEMM kernel selection; they
+            # stay as separate tiny GEMVs.
+            # Mixed ModelSlim schemes (q/k/v W8A8 + g FLOAT): fuse [q,k,v]
+            # only and keep g_proj as a separate FLOAT ColumnParallelLinear
+            # so the quantized GEMM never sees an unloaded weight_scale shard.
+            self.fuse_g_into_qkvg = kimi_k3_fuse_g_into_qkvg(quant_config)
+            if self.fuse_g_into_qkvg:
+                fused_output_sizes = [
+                    projection_size,
+                    projection_size,
+                    projection_size,
+                    projection_size,
+                ]
+                self.split_sizes = [
+                    3 * projection_size // self.tp_size,
+                    projection_size // self.tp_size,
+                ]
+            else:
+                fused_output_sizes = [
+                    projection_size,
+                    projection_size,
+                    projection_size,
+                ]
+                self.split_sizes = None
+                self.g_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    tp_rank=self.attn_tp_rank,
+                    tp_size=self.attn_tp_size,
+                    prefix=f"{prefix}.g_proj",
+                )
             self.fused_qkvg_proj = MergedColumnParallelLinear(
                 self.hidden_size,
-                [
-                    projection_size,
-                    projection_size,
-                    projection_size,
-                    projection_size,
-                ],
+                fused_output_sizes,
                 bias=False,
                 quant_config=quant_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
-            self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
-            ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads,
@@ -1641,6 +1727,12 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
+            def _fused_qkv_and_g():
+                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                if self.fuse_g_into_qkvg:
+                    return torch.split(fused_states, self.split_sizes, dim=-1)
+                return fused_states, self.g_proj(hidden_states)[0]
+
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
@@ -1662,21 +1754,16 @@ class KimiK3DeltaAttention(nn.Module):
                         bfa = gemm(hidden_states, w)
                         forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                         beta = bfa[..., n_fa : n_fa + n_b]
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                    qkv, g_proj_states = torch.split(
-                        fused_states, self.split_sizes, dim=-1
-                    )
+                    qkv, g_proj_states = _fused_qkv_and_g()
                     cur.wait_stream(alt)
                     return qkv, beta, forget_gate, g_proj_states
 
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                qkv, g_proj_states = _fused_qkv_and_g()
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                qkv, g_proj_states = _fused_qkv_and_g()
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
@@ -2632,7 +2719,7 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
-
+    packed_modules_mapping = _KIMI_K3_PACKED_MODULES_MAPPING
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2642,6 +2729,15 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        packed_mapping = kimi_k3_packed_modules_mapping(quant_config)
+        if quant_config is not None and hasattr(
+            quant_config, "update_packed_modules_mapping"
+        ):
+            quant_config.update_packed_modules_mapping(packed_mapping)
+        elif quant_config is not None and hasattr(
+            quant_config, "packed_modules_mapping"
+        ):
+            quant_config.packed_modules_mapping = packed_mapping
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -2736,15 +2832,20 @@ class KimiK3LinearForCausalLM(nn.Module):
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
+        fuse_g_into_qkvg = kimi_k3_fuse_g_into_qkvg(self.quant_config)
         if use_full_rank_gate:
-            # Fused layout (K3): [q, k, v, g] column-parallel; b / f_a / f_b
-            # are standalone modules loaded by name.
+            # Fused layout (K3): [q, k, v] or [q, k, v, g] column-parallel;
+            # b / f_a / f_b are standalone. When g is FLOAT under ModelSlim
+            # mixed schemes it stays a standalone module (loaded by name).
             fused_qkvbfg_mapping = [
                 (".fused_qkvg_proj", ".q_proj", 0),
                 (".fused_qkvg_proj", ".k_proj", 1),
                 (".fused_qkvg_proj", ".v_proj", 2),
-                (".fused_qkvg_proj", ".g_proj", 3),
             ]
+            if fuse_g_into_qkvg:
+                fused_qkvbfg_mapping.append(
+                    (".fused_qkvg_proj", ".g_proj", 3),
+                )
         else:
             # Fused layout (low-rank gate): [q, k, v, b] + [f_a, g_a]
             fused_qkvbfg_mapping = [
@@ -2845,6 +2946,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                         continue
                     layer = self.model.layers[layer_id].self_attn
                     if not getattr(layer, "do_fuse_qkvbfg", False):
+                        continue
+                    # Mixed-scheme path: g stays on standalone g_proj.
+                    if (
+                        weight_name == ".g_proj"
+                        and param_name == ".fused_qkvg_proj"
+                        and not getattr(layer, "fuse_g_into_qkvg", True)
+                    ):
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
@@ -2987,6 +3095,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
         "mm_projector.",
     )
 
+    packed_modules_mapping = KimiK3LinearForCausalLM.packed_modules_mapping
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.layers.": "language_model.model.layers.",
@@ -2995,6 +3105,20 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "block_sparse_moe": "mlp",
         },
     )
+
+    @staticmethod
+    def remap_quant_name_to_sglang(name: str) -> str:
+        """Map HF ModelSlim quant keys onto runtime module prefixes.
+
+        Checkpoint / quant_model_description.json use
+        ``language_model.model.layers.*.block_sparse_moe.*``, while
+        ``KimiK3LinearForCausalLM`` is constructed with ``prefix=""`` and
+        MoE modules live under ``mlp`` (see load_weights which strips
+        ``language_model.`` after hf_to_sglang_mapper).
+        """
+        if name.startswith("language_model."):
+            name = name[len("language_model.") :]
+        return name.replace("block_sparse_moe", "mlp")
 
     def __init__(
         self,
@@ -3006,6 +3130,15 @@ class KimiK3ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        packed_mapping = kimi_k3_packed_modules_mapping(quant_config)
+        if quant_config is not None and hasattr(
+            quant_config, "update_packed_modules_mapping"
+        ):
+            quant_config.update_packed_modules_mapping(packed_mapping)
+        elif quant_config is not None and hasattr(
+            quant_config, "packed_modules_mapping"
+        ):
+            quant_config.packed_modules_mapping = packed_mapping
 
         # The dedicated K3 tower runs replicated (per-rank full weights);
         # shard work across ranks image-wise via the DP runner.

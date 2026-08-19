@@ -16,6 +16,10 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.runtime_context import get_parallel
 
+from sglang.kernels.npu_kernels.npu_moe_finalize_routing_triton import (  # noqa: E402
+    npu_moe_finalize_routing_triton,
+)
+
 
 class BaseFinalizeRouting(ABC):
     @abstractmethod
@@ -42,16 +46,18 @@ class NPUFinalizeRouting(BaseFinalizeRouting):
         expanded_row_idx: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.npu.npu_moe_finalize_routing(
+        device = hidden_states.device
+        out = npu_moe_finalize_routing_triton(
             hidden_states,
             skip1=None,
             skip2=None,
             bias=None,
             scales=topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=topk_ids,
+            expert_for_source_row=topk_ids,
             drop_pad_mode=self.drop_pad_mode,
         )
+        return out.to(device=device)
 
 
 class NPUMoETokenUnpermute(BaseFinalizeRouting):

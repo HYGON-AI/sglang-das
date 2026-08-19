@@ -1104,6 +1104,52 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+
+        # DEBUG: check fused_qkvg_proj.weight_scale / separate g_proj after mixed-scheme fix.
+        # Remove after confirming q/k/v scales are finite and g is FLOAT (no fused scale).
+        if getattr(self.ps, "tp_rank", 0) == 0:
+            try:
+                root = self.model
+                if hasattr(root, "language_model"):
+                    root = root.language_model
+                attn = root.model.layers[0].self_attn
+                fuse_g = getattr(attn, "fuse_g_into_qkvg", None)
+                m = getattr(attn, "fused_qkvg_proj", None)
+                g = getattr(attn, "g_proj", None)
+                logger.info(
+                    "[DEBUG] fuse_g_into_qkvg=%s fused_qkvg=%s g_proj=%s",
+                    fuse_g,
+                    m is not None,
+                    g is not None,
+                )
+                if m is not None and hasattr(m, "weight_scale"):
+                    ws = m.weight_scale.data.float().view(-1)
+                    n_shards = 4 if fuse_g else 3
+                    n = max(ws.numel() // n_shards, 1)
+                    names = ["q", "k", "v", "g"][:n_shards]
+                    logger.info(
+                        "[DEBUG] fused_qkvg_proj.weight_scale numel=%s dtype=%s shape=%s",
+                        ws.numel(),
+                        m.weight_scale.dtype,
+                        tuple(m.weight_scale.shape),
+                    )
+                    for i, name in enumerate(names):
+                        sl = ws[i * n : (i + 1) * n]
+                        logger.info(
+                            "[DEBUG] fused_qkvg weight_scale[%s] nan%%=%.4f max=%s",
+                            name,
+                            float(sl.isnan().float().mean()),
+                            sl.nan_to_num().abs().max().item(),
+                        )
+                if g is not None:
+                    logger.info(
+                        "[DEBUG] standalone g_proj weight dtype=%s has_weight_scale=%s",
+                        getattr(g.weight, "dtype", None),
+                        hasattr(g, "weight_scale"),
+                    )
+            except Exception as e:
+                logger.warning("[DEBUG] weight_scale check failed: %s", e)
+
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info

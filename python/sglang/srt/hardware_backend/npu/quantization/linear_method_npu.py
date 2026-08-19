@@ -7,6 +7,9 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
+from sglang.kernels.npu_kernels.npu_dynamic_quant_triton import npu_dynamic_quant_triton
+from sglang.kernels.npu_kernels.npu_quant_matmul_triton import npu_quant_matmul_triton
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
@@ -142,10 +145,12 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             """dynamic_scale is calculated in malprolog kernel"""
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
+            device = quant_out.device
         else:
             original_dtype = x.dtype
-            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
-        return torch.ops.npu.npu_quant_matmul(
+            device = x.device
+            quant_out, dynamic_scale = npu_dynamic_quant_triton(x)
+        out = npu_quant_matmul_triton(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -153,6 +158,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             bias=bias,
             output_dtype=original_dtype,
         )
+        return out.to(device=device)
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):

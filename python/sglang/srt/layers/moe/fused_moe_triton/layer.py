@@ -138,9 +138,39 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _should_use_ascend_tp_dispatcher(moe_runner_config: MoeRunnerConfig) -> bool:
+    """Whether AscendTPDispatcher is required for the effective MoE runner.
+
+    Ascend runner only registers pre/post-permute for ``ascend_tp`` (and
+    deepep_*), not ``standard``. Quant methods such as modelslim /
+    compressed_tensors W4A8 remap ``auto`` → ``ASCEND`` locally in
+    ``create_moe_runner`` (which runs before this helper), so we must not
+    rely solely on ``is_npu()`` / the global ``--moe-runner-backend`` flag.
+    """
+    if get_moe_runner_backend().is_ascend():
+        return True
+
+    layer = moe_runner_config.layer
+    if layer is None:
+        return False
+
+    for obj in (
+        getattr(layer, "quant_method", None),
+        getattr(layer, "scheme", None),
+    ):
+        if obj is None:
+            continue
+        runner = getattr(obj, "runner", None)
+        runner_backend = getattr(runner, "runner_backend", None) if runner else None
+        if runner_backend is not None and runner_backend.is_ascend():
+            return True
+    return False
+
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
+    if a2a_backend.is_none() and (
+        is_npu() or _should_use_ascend_tp_dispatcher(moe_runner_config)
+    ):
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()

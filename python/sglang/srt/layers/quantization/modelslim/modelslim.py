@@ -103,6 +103,22 @@ class ModelSlimConfig(QuantizationConfig):
                 for k, v in quant_config.items()
             }
 
+        # Kimi-K3 ModelSlim checkpoints name LM weights under
+        # language_model.model.*.block_sparse_moe.*, but runtime prefixes are
+        # model.*.mlp.* (language_model wrapper prefix is "" at construction).
+        is_kimi_k3 = any(
+            k.startswith("language_model.model.") and "block_sparse_moe" in k
+            for k in keys
+        )
+        if is_kimi_k3:
+            from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+            remap = KimiK3ForConditionalGeneration.remap_quant_name_to_sglang
+            quant_config = {
+                (remap(k) if isinstance(k, str) else k): v
+                for k, v in quant_config.items()
+            }
+
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
@@ -151,6 +167,53 @@ class ModelSlimConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelSlimConfig:
         return cls(config)
 
+    def _resolve_fused_mapping(self, prefix: str) -> Dict[str, List[str]]:
+        """Return fused→shard mapping for ``prefix``.
+
+        Supports both nested NPU-style maps
+        (``{"model": {"gate_up_proj": [...]}}``) and flat model-declared maps
+        (``{"gate_up_proj": [...]}``). Flat entries fill gaps left by the
+        nested subset so Kimi fused names like ``fused_qkvg_proj`` resolve.
+        """
+        key = "model"
+        if "vision_model" in prefix:
+            key = "vision_model"
+        elif "visual" in prefix:
+            key = "visual"
+
+        nested = self.packed_modules_mapping.get(key, {})
+        fused: Dict[str, List[str]] = dict(nested) if isinstance(nested, dict) else {}
+        for name, shards in self.packed_modules_mapping.items():
+            if isinstance(shards, list) and name not in fused:
+                fused[name] = shards
+        return fused
+
+    def _prefix_in_quant_config(
+        self, prefix: str, fused_mapping: Mapping[str, List[str]]
+    ) -> str:
+        """Map a fused runtime prefix onto a checkpoint/quant shard prefix.
+
+        Prefer the first shard that has a non-FLOAT scheme so mixed fused
+        modules (e.g. Kimi ``fused_qkvg_proj`` with FLOAT ``g_proj``) still
+        pick up the quantized scheme used by q/k/v.
+        """
+        proj_name = prefix.split(".")[-1]
+        shard_names = fused_mapping.get(proj_name)
+        if not shard_names:
+            return prefix
+
+        first_existing = None
+        for shard_name in shard_names:
+            candidate = prefix.replace(proj_name, shard_name)
+            scheme = self.quant_description.get(candidate + ".weight", "")
+            if not scheme:
+                continue
+            if first_existing is None:
+                first_existing = candidate
+            if scheme != "FLOAT":
+                return candidate
+        return first_existing if first_existing is not None else prefix
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -161,28 +224,14 @@ class ModelSlimConfig(QuantizationConfig):
 
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
-            key = "model"
-            if "vision_model" in prefix:
-                key = "vision_model"
-            elif "visual" in prefix:
-                key = "visual"
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
-            prefix_in_quant_config = prefix
-            proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
-                # Verify the remapped prefix exists in quant_description.
-                # If not (e.g. json uses fused name as-is), fall back to original.
-                if prefix_in_quant_config + ".weight" not in self.quant_description:
-                    prefix_in_quant_config = prefix
-            if self.is_layer_skipped(
-                prefix, packed_modules_mapping_subset
-            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
+            fused_mapping = self._resolve_fused_mapping(prefix)
+            prefix_in_quant_config = self._prefix_in_quant_config(
+                prefix, fused_mapping
+            )
+            if self.is_layer_skipped(prefix, fused_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
