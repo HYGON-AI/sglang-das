@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -188,10 +189,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                if is_deepseek_dsa(kvc.model_config.hf_config):
+                    self._cell_size += self._compute_cell_size(
+                        kvc,
+                        int(eagle_draft_num_layers),
+                        force_dense_dsa_indexer=True,
+                    )
+                else:
+                    self._cell_size = int(
+                        self._cell_size
+                        * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -205,15 +213,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size = _dflash_draft_cell_size(kvc) or None
+                if (
+                    draft_cell_size is None
+                    and is_deepseek_dsa(kvc.model_config.hf_config)
+                ):
+                    draft_cell_size = self._compute_cell_size(
+                        kvc,
+                        int(draft_num_layers) * get_parallel().attn_dcp_size,
+                        force_dense_dsa_indexer=True,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
-                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+                    draft_cell_size_per_token=draft_cell_size,
                 )
 
-    def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
+    def _compute_cell_size(
+        self,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+        *,
+        force_dense_dsa_indexer: bool = False,
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
         model_config = kvc.model_config
@@ -225,6 +249,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
             kvc, num_layers
         )
+        if force_dense_dsa_indexer:
+            effective_num_layers = num_layers
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
@@ -258,6 +284,58 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                use_dense_indexer_cache = (
+                    force_dense_dsa_indexer
+                    or kvc.is_draft_worker
+                    or kvc.server_args.enable_hisparse
+                    or getattr(
+                        kvc.server_args, "enable_hierarchical_cache", False
+                    )
+                )
+                if force_dense_dsa_indexer:
+                    indexer_layer_ids = list(range(num_layers))
+                elif use_dense_indexer_cache:
+                    indexer_layer_ids = list(
+                        range(
+                            kvc.layer_info.start_layer,
+                            kvc.layer_info.end_layer,
+                        )
+                    )
+                else:
+                    indexer_layer_ids = get_dsa_full_indexer_layer_ids(
+                        model_config.hf_config,
+                        kvc.layer_info.start_layer,
+                        kvc.layer_info.end_layer,
+                    )
+                indexer_layer_count = len(indexer_layer_ids)
+
+                from sglang.srt.layers.cp.utils import (
+                    get_glm_dsa_cp_layer_shard_info,
+                    get_layer_shard_range,
+                )
+
+                shard_rank, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+                if shard_rank is not None and not force_dense_dsa_indexer:
+                    local_indexer_ids = {
+                        layer_id - kvc.layer_info.start_layer
+                        for layer_id in indexer_layer_ids
+                    }
+                    owned_indexer_counts = []
+                    for rank in range(shard_size):
+                        owned_start, owned_end = get_layer_shard_range(
+                            rank, shard_size, num_layers
+                        )
+                        owned_indexer_counts.append(
+                            sum(
+                                owned_start <= layer_id < owned_end
+                                for layer_id in local_indexer_ids
+                            )
+                        )
+                    # Every rank also owns one remote scratch buffer. Use the
+                    # largest ownership intersection so all CP ranks derive the
+                    # same token capacity.
+                    indexer_layer_count = max(owned_indexer_counts, default=0) + 1
+
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 use_bf16_index_cache = _is_hcu and (
                     kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -283,7 +361,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     ).host_to_device_ratio
                 cell_size += int(
                     indexer_size_per_token
-                    * effective_num_layers
+                    * indexer_layer_count
                     * element_size
                     * indexer_ratio
                 )

@@ -15,6 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -1343,6 +1344,27 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        use_dense_indexer_cache = (
+            self.is_draft_worker
+            or self.server_args.enable_hisparse
+            or self.server_args.enable_hierarchical_cache
+        )
+        indexer_layer_ids = (
+            list(
+                range(
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+            )
+            if use_dense_indexer_cache
+            else get_dsa_full_indexer_layer_ids(
+                self.model_config.hf_config,
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
+            )
+        )
+        if not get_memory().enable_hisparse:
+            pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

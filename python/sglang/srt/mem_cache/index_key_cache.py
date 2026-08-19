@@ -26,7 +26,7 @@ class IndexKeyCache:
                     dtype=pool.index_k_with_scale_buffer_dtype,
                     device=pool.device,
                 )
-                for i in range(pool.layer_num)
+                for i in range(pool.indexer_layer_num)
             ]
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
@@ -56,7 +56,7 @@ class IndexKeyCache:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.buffer[layer_id - self.pool.start_layer]
+        return self.buffer[self.pool._get_indexer_cache_index(layer_id)]
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
@@ -100,7 +100,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self.buffer[self.pool._get_indexer_cache_index(layer_id)]
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
@@ -116,7 +116,7 @@ class IndexKeyCache:
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for layer_id in range(self.pool.indexer_layer_num):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
@@ -132,7 +132,7 @@ class IndexKeyCache:
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for layer_id in range(self.pool.indexer_layer_num):
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
@@ -142,7 +142,7 @@ class IndexKeyCache:
         torch.cuda.synchronize()
 
     def state_buf_infos(self):
-        layer_num = self.pool.layer_num
+        layer_num = self.pool.indexer_layer_num
         data_ptrs = [self.buffer[i].data_ptr() for i in range(layer_num)]
         data_lens = [self.buffer[i].nbytes for i in range(layer_num)]
         item_lens = [self.buffer[i][0].nbytes for i in range(layer_num)]

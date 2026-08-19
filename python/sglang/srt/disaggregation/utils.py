@@ -1170,7 +1170,7 @@ def setup_state_kv_args(
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
                 kv_args.total_kv_layers = total_kv_layers
-            else:
+            elif data_ptrs:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
