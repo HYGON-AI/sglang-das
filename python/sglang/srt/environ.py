@@ -1428,6 +1428,10 @@ class Envs:
     SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
     )
+    # gfx936-only: page-planar INT8 K plus one FP32 scale per token.
+    SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
+    )
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

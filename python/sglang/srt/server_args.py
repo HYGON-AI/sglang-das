@@ -5366,6 +5366,13 @@ class ServerArgs:
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+                from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+                    validate_hcu_int8_index_k_cache_server_args,
+                )
+
+                validate_hcu_int8_index_k_cache_server_args(
+                    self, allow_mooncake_pd=False
+                )
                 if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                     logger.warning(
                         f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."

@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import IndexKCacheMode
 from sglang.srt.layers.attention.dsa.forward_batch_utils import (
     effective_forward_mode,
 )
@@ -397,7 +398,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     @staticmethod
     def _use_hcu_bf16_index_cache(pool) -> bool:
-        return _is_hcu and not getattr(pool, "use_fp8_index_k_cache", True)
+        return _is_hcu and getattr(
+            pool, "index_k_cache_mode", IndexKCacheMode.FP8_SCALED
+        ) is IndexKCacheMode.BF16
+
+    @staticmethod
+    def _use_hcu_int8_index_cache(pool) -> bool:
+        return _is_hcu and getattr(
+            pool, "index_k_cache_mode", IndexKCacheMode.FP8_SCALED
+        ) is IndexKCacheMode.INT8_SCALED
+
+    @classmethod
+    def _use_hcu_bf16_indexer_compute(cls, pool) -> bool:
+        """Whether LightOp must consume BF16 K with FP32 gate weights."""
+        return cls._use_hcu_bf16_index_cache(
+            pool
+        ) or cls._use_hcu_int8_index_cache(pool)
 
     @staticmethod
     def _get_gate_input_tensor(
@@ -940,10 +956,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
     def _get_hcu_paged_index_k_cache(
-        self, pool, layer_id: int
+        self,
+        pool,
+        layer_id: int,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, bool]:
-        use_bf16_index_cache = self._use_hcu_bf16_index_cache(pool)
-        if use_bf16_index_cache:
+        if self._use_hcu_int8_index_cache(pool):
+            return (
+                pool.dequantize_index_k_int8_paged(
+                    layer_id=layer_id,
+                    block_tables=block_tables,
+                    context_lens=context_lens,
+                ),
+                True,
+            )
+        if self._use_hcu_bf16_index_cache(pool):
             return pool.get_index_k_buffer(layer_id=layer_id), True
 
         kv_cache = self._get_index_k_read_buffer(pool, layer_id)
@@ -1090,7 +1118,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if self.paged_mqa_logits_backend.is_lightop():
             kv_cache, use_bf16_index_cache = self._get_hcu_paged_index_k_cache(
-                pool, layer_id
+                pool,
+                layer_id,
+                block_tables,
+                metadata.get_seqlens_int32(),
             )
             if use_bf16_index_cache:
                 active_weights = weights[:q_offset].to(torch.float32)
@@ -1383,7 +1414,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        use_bf16_index_cache = self._use_hcu_bf16_index_cache(pool)
+        use_bf16_index_cache = self._use_hcu_bf16_indexer_compute(pool)
+        if self._use_hcu_int8_index_cache(pool):
+            pool.dequantize_index_k_int8_paged(
+                layer_id=layer_id,
+                block_tables=block_tables,
+                context_lens=metadata.get_indexer_seq_len(),
+            )
         if use_bf16_index_cache:
             kv_bf16 = torch.cat(
                 [
@@ -1687,7 +1724,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        use_bf16_index_cache = self._use_hcu_bf16_index_cache(pool)
+        use_bf16_index_cache = self._use_hcu_bf16_indexer_compute(pool)
         k_fp8_list = []
         k_scale_list = []
         k_bf16_list = []
@@ -1698,6 +1735,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         batch_idx_list = []
 
         block_tables = metadata.get_page_table_64()
+
+        if self._use_hcu_int8_index_cache(pool):
+            pool.dequantize_index_k_int8_paged(
+                layer_id=layer_id,
+                block_tables=block_tables,
+                context_lens=metadata.get_indexer_seq_len(),
+            )
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1900,6 +1944,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
 
         if _is_hcu:
+            if self._use_hcu_int8_index_cache(pool):
+                pool.set_index_k_int8_buffer(
+                    layer_id=layer_id,
+                    loc=out_cache_loc,
+                    index_k=key,
+                )
+                return
             if self._use_hcu_bf16_index_cache(pool):
                 pool.set_index_k_buffer(
                     layer_id=layer_id,
@@ -2073,7 +2124,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hcu:
             pool = get_token_to_kv_pool()
             x_for_gate = self._get_gate_input_tensor(x)
-            if self._use_hcu_bf16_index_cache(pool):
+            if self._use_hcu_bf16_indexer_compute(pool):
                 q_fp8, key, _ = self._get_q_k_bf16(
                     q_lora,
                     x,
