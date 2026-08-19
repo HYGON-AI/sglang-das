@@ -4701,6 +4701,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert self.use_scaled_index_k_cache, "Scaled index K cache is not enabled"
         return self.index_key_cache.get_local_buffer(layer_id)
 
+    def get_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
+        assert self.use_scaled_index_k_cache, "Scaled index K cache is not enabled"
+        return self.index_key_cache.get_write_buffer(layer_id)
+
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
         if self.layer_transfer_counter is not None:

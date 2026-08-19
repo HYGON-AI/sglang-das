@@ -472,7 +472,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return lightop_kvcache.fuse_qk_quant_and_store_index_k_cache(
             query,
             key,
-            pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            pool.get_index_k_with_scale_write_buffer(layer_id=layer_id),
             out_cache_loc.contiguous(),
             pool.page_size,
             weights,
