@@ -1690,7 +1690,10 @@ def _zero_topk_weights_padded_region(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _topk_ids_postprocess_torch(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     if _is_hip and num_token_non_padded is not None:
@@ -1702,6 +1705,8 @@ def _topk_ids_postprocess_torch(
         topk_ids[indices >= num_token_non_padded, :] = -1
     else:
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if output_int64 and topk_ids.dtype != torch.int64:
+        topk_ids = topk_ids.to(torch.int64)
     return topk_ids
 
 
@@ -1756,25 +1761,43 @@ def _topk_ids_postprocess(
     topk_ids: torch.Tensor,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     num_token_non_padded: Optional[torch.Tensor],
+    output_int64: bool = False,
 ) -> torch.Tensor:
-    if expert_location_dispatch_info is None and num_token_non_padded is None:
+    if (
+        expert_location_dispatch_info is None
+        and num_token_non_padded is None
+        and (not output_int64 or topk_ids.dtype == torch.int64)
+    ):
         return topk_ids
 
-    lightop_output = _try_lightop_topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
-    )
-    if lightop_output is not None:
-        return lightop_output
+    # An int32 -> int64 result must stay in the compiled fallback so Inductor
+    # can fuse it with the remap/padding work. If the input is already int64,
+    # the in-place LightOp path still satisfies the requested output dtype.
+    if not output_int64 or topk_ids.dtype == torch.int64:
+        lightop_output = _try_lightop_topk_ids_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
+        if lightop_output is not None:
+            return lightop_output
     return _topk_ids_postprocess_torch(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     return _topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
@@ -2376,11 +2399,16 @@ def _post_process_topk_ids(
         if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
             # DeepEP disables shared-expert fusion by default. On that main HCU
             # path no later operation can introduce another route, so remap and
-            # the final -1 padding mask can be compiled into one kernel. Keep
+            # the final -1 padding mask can be compiled into one kernel. Emit
+            # int64 from that kernel as well because DeepEP requires int64 IDs;
+            # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
             # the post-shared-expert mask below for the explicitly forced fused
             # shared-expert configuration.
             topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, remap_info, num_token_non_padded
+                topk_ids,
+                remap_info,
+                num_token_non_padded,
+                output_int64=True,
             )
             hip_deepep_postprocessed = True
         elif not skip_deepep_padded_tokens:
