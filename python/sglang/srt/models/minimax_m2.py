@@ -1272,7 +1272,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         if _use_fused_rms_quant:
             pre_norm = hidden_states.clone() if residual is None else residual
             hidden_states, _ = self.layer_communicator.prepare_attn(
-                hidden_states, residual, forward_batch, skip_layernorm=True
+                hidden_states, residual, forward_batch
             )
             if residual is not None:
                 assert residual.shape[0] == hidden_states.shape[0], (

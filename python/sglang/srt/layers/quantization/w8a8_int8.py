@@ -21,14 +21,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 import torch
 from torch.nn.parameter import Parameter
 
-
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -40,8 +39,8 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignor
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    is_cpu,
     get_bool_env_var,
+    is_cpu,
     is_cuda,
     is_hcu,
     is_host_cpu_arm64,
@@ -357,6 +356,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_hcu and get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_hcu_w8a8_int8_mega_moe_experts_weights,
+            )
+
+            build_hcu_w8a8_int8_mega_moe_experts_weights(layer)
+            return
         if _is_hcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,

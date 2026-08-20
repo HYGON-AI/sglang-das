@@ -66,6 +66,9 @@ _MEGA_MOE_HCU_BACKEND_NORMAL = "normal"
 _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD"
 _MEGA_MOE_HCU_NORMAL_LL_TOKEN_THRESHOLD = 496
 _MEGA_MOE_HCU_K3_TAIL_REDUCE_ENV = "K3_USE_ASM_TAIL_REDUCE"
+_MEGA_MOE_QUANT_MODE_FP8 = "fp8"
+_MEGA_MOE_QUANT_MODE_INT8 = "int8"
+_MEGA_MOE_HCU_WEIGHT_LAYOUT_NORMAL = "normal"
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +275,7 @@ def _get_mega_moe_symm_buffer(
     intermediate_hidden: int,
     *,
     runtime: str,
+    quant_mode: str = _MEGA_MOE_QUANT_MODE_FP8,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
 ) -> SymmBuffer:
     if _IS_HCU and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
@@ -289,6 +293,7 @@ def _get_mega_moe_symm_buffer(
 
     key = (
         package_key,
+        quant_mode,
         id(group),
         num_max_tokens_per_rank,
         cuda_graph_max_tokens_per_rank,
@@ -300,6 +305,8 @@ def _get_mega_moe_symm_buffer(
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
         kwargs = {}
+        if package_key == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+            kwargs["quant_mode"] = quant_mode
         if cuda_graph_max_tokens_per_rank is not None:
             kwargs["cuda_graph_max_tokens_per_rank"] = cuda_graph_max_tokens_per_rank
         buf = factory(
@@ -317,7 +324,11 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(
+    moe: DeepseekV2MoE,
+    hidden_states: torch.Tensor,
+    forward_batch: Optional[ForwardBatch] = None,
+) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -331,6 +342,21 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
                 f"built={built_runtime!r}, current={runtime!r}. Restart the "
                 "server after changing SGLANG_HCU_MEGA_MOE_RUNTIME."
             )
+        if (
+            runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+            and getattr(moe.experts, "_mega_moe_quant_mode", _MEGA_MOE_QUANT_MODE_FP8)
+            == _MEGA_MOE_QUANT_MODE_INT8
+        ):
+            if getattr(moe.experts, "_mega_moe_hcu_weight_layout", None) != (
+                _MEGA_MOE_HCU_WEIGHT_LAYOUT_NORMAL
+            ):
+                return False
+            if get_is_capture_mode():
+                raise RuntimeError(
+                    "The standalone HCU INT8 MegaMoE path requires eager "
+                    "execution and cannot run inside CUDA/HIP graph capture."
+                )
+            return True
     elif _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
             return False
@@ -347,9 +373,9 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"] = None,
+    forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -384,9 +410,9 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
@@ -433,6 +459,7 @@ def _run_mega_routed(
     )
 
     runtime = get_hcu_mega_moe_runtime() if _IS_HCU else _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM
+    quant_mode = getattr(moe.experts, "_mega_moe_quant_mode", _MEGA_MOE_QUANT_MODE_FP8)
     cuda_graph_max_tokens_per_rank = (
         _get_hcu_cuda_graph_max_tokens_per_rank(
             num_max_tokens_per_rank,
@@ -440,6 +467,7 @@ def _run_mega_routed(
         )
         if _IS_HCU
         and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+        and quant_mode == _MEGA_MOE_QUANT_MODE_FP8
         and get_is_capture_mode()
         else None
     )
@@ -451,21 +479,34 @@ def _run_mega_routed(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
         runtime=runtime,
+        quant_mode=quant_mode,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
     )
 
     if _IS_HCU:
         if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
-            y = _run_standalone_hcu_w8a8_mega_moe(
-                hidden_states=hidden_states,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                moe=moe,
-                buf=buf,
-                num_tokens=num_tokens,
-                hidden_size=hidden_size,
-                dispatch_num_tokens=dispatch_num_tokens,
-            )
+            if quant_mode == _MEGA_MOE_QUANT_MODE_INT8:
+                y = _run_standalone_hcu_w8a8_int8_mega_moe(
+                    hidden_states=hidden_states,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    moe=moe,
+                    buf=buf,
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    dispatch_num_tokens=dispatch_num_tokens,
+                )
+            else:
+                y = _run_standalone_hcu_w8a8_mega_moe(
+                    hidden_states=hidden_states,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    moe=moe,
+                    buf=buf,
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    dispatch_num_tokens=dispatch_num_tokens,
+                )
         else:
             y = _run_deep_gemm_hcu_w8a8_mega_moe(
                 hidden_states=hidden_states,
@@ -559,7 +600,7 @@ def _run_deep_gemm_hcu_w8a8_mega_moe(
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     buf,
     num_tokens: int,
     hidden_size: int,
@@ -598,7 +639,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     buf,
     num_tokens: int,
     hidden_size: int,
@@ -654,6 +695,72 @@ def _run_standalone_hcu_w8a8_mega_moe(
     return y[:num_tokens]
 
 
+def _run_standalone_hcu_w8a8_int8_mega_moe(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    moe: DeepseekV2MoE,
+    buf,
+    num_tokens: int,
+    hidden_size: int,
+    dispatch_num_tokens: int,
+) -> torch.Tensor:
+    import megamoe
+
+    if get_is_capture_mode():
+        raise RuntimeError(
+            "The standalone HCU INT8 MegaMoE path requires eager execution"
+        )
+    if num_tokens == 0 and dispatch_num_tokens == 0:
+        return torch.empty(
+            (0, hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+
+    if num_tokens > 0:
+        topk_ids = (
+            topk_ids.to(torch.int64).contiguous()
+            if topk_ids.dtype not in (torch.int32, torch.int64)
+            else topk_ids.contiguous()
+        )
+        topk_weights = topk_weights.to(buf.topk_weights.dtype).contiguous()
+        megamoe.mega_moe_pre_dispatch_int8(
+            hidden_states.contiguous(),
+            topk_ids,
+            topk_weights,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+        )
+
+    y = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    megamoe.int8_w8a8_mega_moe(
+        y,
+        moe.experts.mega_l1_weights,
+        moe.experts.mega_l2_weights,
+        buf,
+        cumulative_local_expert_recv_stats=getattr(
+            moe.experts, "mega_moe_recv_stats", None
+        ),
+        recipe=(1, 1, 32),
+        activation="swiglu",
+        activation_clamp=getattr(moe.config, "swiglu_limit", None),
+        fast_math=True,
+        megamoe_backend=_MEGA_MOE_HCU_BACKEND_NORMAL,
+        graph=False,
+        capacity_num_tokens=dispatch_num_tokens,
+    )
+    return y
+
+
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # Match DeepGEMM's L1 gate/up layout:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
@@ -683,7 +790,6 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
         .reshape(num_groups, mn, packed_sf_k)
     )
     return torch.empty_like(sf).copy_(result)
-
 
 
 def build_mega_moe_experts_weights(experts) -> None:
@@ -729,7 +835,9 @@ def build_mega_moe_experts_weights(experts) -> None:
         # the deep-ep path consumes the non-transposed interleaved scale and a
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights((w13, w13_sf))
+        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+            (w13, w13_sf)
+        )
         w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
         w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 
@@ -867,4 +975,92 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
 
     experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w8a8_weights = True
+    experts._mega_moe_quant_mode = _MEGA_MOE_QUANT_MODE_FP8
     experts._mega_moe_weights_built = True
+
+
+def build_hcu_w8a8_int8_mega_moe_experts_weights(experts) -> None:
+    runtime = get_hcu_mega_moe_runtime()
+    if runtime != _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+        raise ValueError(
+            "HCU INT8 MegaMoE weights require SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
+        )
+    if getattr(experts, "_mega_moe_weights_built", False):
+        built_runtime = getattr(experts, "_mega_moe_hcu_runtime", runtime)
+        built_quant_mode = getattr(
+            experts, "_mega_moe_quant_mode", _MEGA_MOE_QUANT_MODE_INT8
+        )
+        if built_runtime != runtime or built_quant_mode != _MEGA_MOE_QUANT_MODE_INT8:
+            raise RuntimeError(
+                "HCU MegaMoE expert weights were already built for an "
+                "incompatible runtime or quantization mode: "
+                f"runtime={built_runtime!r}, quant_mode={built_quant_mode!r}"
+            )
+        return
+
+    w13 = experts.w13_weight.data
+    w2 = experts.w2_weight.data
+    if w13.dim() != 3 or w2.dim() != 3:
+        raise ValueError(
+            "HCU INT8 MegaMoE requires grouped 3D expert weights; "
+            f"got w13={tuple(w13.shape)}, w2={tuple(w2.shape)}"
+        )
+    if w13.dtype != torch.int8 or w2.dtype != torch.int8:
+        raise ValueError("HCU INT8 MegaMoE requires signed INT8 expert weights")
+
+    num_local_experts, l1_rows, hidden_size = w13.shape
+    num_w2_experts, l2_rows, intermediate_size = w2.shape
+    if num_local_experts != num_w2_experts:
+        raise ValueError(
+            "HCU INT8 MegaMoE w13/w2 local expert count mismatch; "
+            f"got w13={tuple(w13.shape)}, w2={tuple(w2.shape)}"
+        )
+    if l2_rows != hidden_size or l1_rows != 2 * intermediate_size:
+        raise ValueError(
+            "HCU INT8 MegaMoE requires w13=[E,2I,H] and w2=[E,H,I]; "
+            f"got w13={tuple(w13.shape)}, w2={tuple(w2.shape)}"
+        )
+
+    device = w13.device
+    w13_scale = _hcu_channelwise_scale(experts, ("w13_weight_scale",), l1_rows, "w13")
+    w2_scale = _hcu_channelwise_scale(experts, ("w2_weight_scale",), l2_rows, "w2")
+    if w13_scale.device != device or w2_scale.device != device:
+        raise ValueError(
+            "HCU INT8 MegaMoE weights and channelwise scales must be on the same device"
+        )
+    for name, scale in (("w13_weight_scale", w13_scale), ("w2_weight_scale", w2_scale)):
+        if not torch.all(torch.isfinite(scale) & (scale > 0)).item():
+            raise ValueError(f"HCU INT8 MegaMoE {name} must be finite and positive")
+
+    import megamoe
+
+    l1_weights, l2_weights = megamoe.transform_int8_weights_for_mega_moe_normal(
+        (w13.contiguous(), w13_scale),
+        (w2.contiguous(), w2_scale),
+    )
+    for weights in (l1_weights, l2_weights):
+        packed_weight, scale = weights[_MEGA_MOE_HCU_WEIGHT_LAYOUT_NORMAL]
+        if packed_weight.device != device or scale.device != device:
+            raise RuntimeError(
+                "HCU INT8 MegaMoE weight repack must remain on the model device"
+            )
+
+    experts.w13_weight.data = torch.empty((0,), dtype=torch.int8, device=device)
+    experts.w2_weight.data = torch.empty((0,), dtype=torch.int8, device=device)
+
+    experts.mega_l1_weights = l1_weights
+    experts.mega_l2_weights = l2_weights
+    experts._mega_moe_hcu_runtime = runtime
+    experts._mega_moe_hcu_w8a8_weights = True
+    experts._mega_moe_quant_mode = _MEGA_MOE_QUANT_MODE_INT8
+    experts._mega_moe_hcu_weight_layout = _MEGA_MOE_HCU_WEIGHT_LAYOUT_NORMAL
+    experts._mega_moe_weights_built = True
+
+
+def destroy_mega_moe_symm_buffers() -> None:
+    buffers = list(dict.fromkeys(_MEGA_MOE_SYMM_BUFFER.values()))
+    for buffer in buffers:
+        destroy = getattr(buffer, "destroy", None)
+        if destroy is not None:
+            destroy()
+    _MEGA_MOE_SYMM_BUFFER.clear()

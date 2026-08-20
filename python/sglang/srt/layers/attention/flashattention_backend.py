@@ -17,6 +17,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -50,10 +51,20 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-from sglang.kernels.ops.attention.flash_attention import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
+if is_hcu():
+    from sglang.srt.layers.attention.flashattention_interface import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+        vllm_flash_attn_varlen_func,
+        vllm_flash_attn_with_kvcache,
+    )
+else:
+    from sglang.kernels.ops.attention.flash_attention import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
+
+_kv_layout_hcu_fa = is_hcu() and envs.SGLANG_KV_LAYOUT_HCU_FA.get()
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
@@ -263,7 +274,16 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
         if is_hcu():
+            # HCU uses the flash-attn compatibility wrappers. The imports in the
+            # FA3/FA4 branches below are function-local, so relying on the
+            # module-level names here leaves these two locals unbound.
+            from sglang.srt.layers.attention.flashattention_interface import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
             self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = None
         elif self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -1383,12 +1403,20 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if _kv_layout_hcu_fa:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim, self.page_size
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -1492,6 +1520,47 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    out=_fa_out,
+                    **kwargs,
+                )
+            elif _kv_layout_hcu_fa and max_seqlen_q > 1:
+                result = vllm_flash_attn_varlen_func(
+                    q=q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=cache_seqlens,
+                    max_seqlen_k=metadata.max_seq_len_k,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    block_table=page_table,
+                    fa_version=2,
+                    q_descale=fa_k_descale,
+                    k_descale=fa_k_descale,
+                    v_descale=fa_v_descale,
+                    out=_fa_out,
+                )
+            elif _kv_layout_hcu_fa:
+                result = vllm_flash_attn_with_kvcache(
+                    q=q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .unsqueeze(1),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
                     out=_fa_out,
                     **kwargs,
@@ -1888,16 +1957,24 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if _kv_layout_hcu_fa:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim, self.page_size
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
-                if self._decode_uses_static_max_seqlen_k:
+                if self._decode_uses_static_max_seqlen_k and not is_hcu():
                     kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1918,7 +1995,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
-                if self._decode_uses_static_max_seqlen_k:
+                if self._decode_uses_static_max_seqlen_k and not is_hcu():
                     kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1975,8 +2052,16 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
+                decode_attn_func = flash_attn_with_kvcache
+                decode_q = q_reshaped
+                if is_hcu():
+                    # The HCU paged FP8 KV layout is consumed by the vLLM
+                    # compatibility kernel rather than the fp16/bf16-only
+                    # flash-attn kvcache entry point.
+                    decode_attn_func = vllm_flash_attn_with_kvcache
+                    decode_q = q_reshaped.unsqueeze(1)
+                result = decode_attn_func(
+                    q=decode_q,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
