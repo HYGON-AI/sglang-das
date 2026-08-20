@@ -4,18 +4,7 @@
 name: docker-image
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-    branches:
-      - v0.5.15.post1_dev
-      - main
   workflow_dispatch:
-  schedule:
-    # 北京时间每天 0 点 (UTC 16:00)
-    - cron: '0 16 * * *'
 
 permissions:
   contents: read
@@ -62,22 +51,18 @@ jobs:
       - name: 生成镜像 tag
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR 触发: 使用带 PR 号的独立 tag, 不覆盖 nightly/latest
-            echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-pr-${{ github.event.pull_request.number }}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
-          else
-            echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
-            echo "LATEST_TAG=sglang:${SGLANG_VERSION}-latest" >> "$GITHUB_ENV"
-          fi
+          echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
+          echo "LATEST_TAG=sglang:${SGLANG_VERSION}-latest" >> "$GITHUB_ENV"
 
       - name: 构建镜像
         run: |
           FULL_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
+          FULL_LATEST_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
           docker build \
             --network=host \
             --no-cache \
             -t "${FULL_TAG}" \
-            ${LATEST_TAG:+ -t "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"} \
+            -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
             --build-arg "AICC_URL=${AICC_URL}" \
             --build-arg "AICC_VERSION=${AICC_VERSION}" \
@@ -98,9 +83,7 @@ jobs:
       - name: 推送镜像
         run: |
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
-          if [ -n "${LATEST_TAG}" ]; then
-            docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
-          fi
+          docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
