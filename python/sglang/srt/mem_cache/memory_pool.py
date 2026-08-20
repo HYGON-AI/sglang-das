@@ -4598,10 +4598,20 @@ class HybridLinearKVPool(KVCache):
         from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
 
         if not isinstance(self.full_kv_pool, Glm5NextDSATokenToKVPool):
+            layer_transfer_idx = layer_id - self.start_layer
+            prefetch_index = getattr(self.full_kv_pool, "prefetch_index_buffer", None)
+            if self.use_dsa and _is_hcu and prefetch_index is not None:
+                prefetch_index(
+                    full_layer_id,
+                    layer_transfer_counter=self.layer_transfer_counter,
+                    layer_transfer_idx=layer_transfer_idx,
+                    has_history=has_history,
+                )
             self.full_kv_pool.prefetch_kv_buffer(
                 full_layer_id,
                 layer_transfer_counter=self.layer_transfer_counter,
-                layer_transfer_idx=layer_id - self.start_layer,
+                layer_transfer_idx=layer_transfer_idx,
+                has_history=has_history,
             )
             return
         layer_transfer_idx = layer_id - self.start_layer
