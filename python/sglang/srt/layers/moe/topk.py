@@ -2497,7 +2497,7 @@ def _post_process_topk_ids(
         # Apply this after shared-expert remapping so every padded route,
         # including appended shared slots, is omitted by DeepEP dispatch.
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
-    elif _is_hip and not _skip_hip_pad_mask:
+    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
