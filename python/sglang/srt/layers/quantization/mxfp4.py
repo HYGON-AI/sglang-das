@@ -336,6 +336,53 @@ class Mxfp4Config(QuantizationConfig):
         return []
 
 
+def _read_mxfp4_group_size() -> int:
+    """从模型 config 读取 MXFP4 group_size。
+
+    Kimi-K3 config.json 里路径为
+    text_config.quantization_config.config_groups.<group>.weights.group_size
+    （也兼容 group_size 直接出现在顶层 quantization_config 的情况）。
+    读取失败回退 32。
+    """
+    try:
+        from sglang.srt.runtime_context import process_model_config
+
+        hf = process_model_config().hf_config
+    except Exception:
+        return 32
+    qc = getattr(hf, "quantization_config", None)
+    if qc is None:
+        text_cfg = getattr(hf, "text_config", None)
+        qc = (
+            getattr(text_cfg, "quantization_config", None)
+            if text_cfg is not None
+            else None
+        )
+    if qc is None:
+        return 32
+    groups = (
+        qc.get("config_groups", {})
+        if isinstance(qc, dict)
+        else getattr(qc, "config_groups", {})
+    )
+    for g in groups.values():
+        w = (
+            g.get("weights", {})
+            if isinstance(g, dict)
+            else getattr(g, "weights", None)
+        )
+        if w is None:
+            continue
+        gs = (
+            w.get("group_size")
+            if isinstance(w, dict)
+            else getattr(w, "group_size", None)
+        )
+        if gs is not None:
+            return int(gs)
+    return 32
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(
@@ -383,7 +430,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
                     "or SM120."
                 )
-        self.group_size = 32
+        self.group_size = _read_mxfp4_group_size()
 
     def create_weights(
         self,
