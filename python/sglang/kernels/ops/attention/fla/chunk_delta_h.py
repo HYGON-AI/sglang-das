@@ -49,7 +49,10 @@ if _USE_KDA_HCU_FROM_AITER:
         chunk_gated_delta_rule_fwd_sglang_hip_blockdim64 as _aiter_fwd_h,
     )
 if _USE_KDA_HCU_FROM_TRITON:
-    from boltops.fla.gdn import chunk_gated_delta_rule_fwd_h as _triton_fwd_h
+    from boltops.fla.gdn.triton import (
+        chunk_gated_delta_rule_fwd_h as _triton_fwd_h,
+    )
+
 
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into

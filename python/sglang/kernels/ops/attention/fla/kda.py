@@ -22,12 +22,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.kda_hcu import (
-    chunk_gla_fwd_o_gk_hcu,
-    fused_kda_gate_chunk_cumsum_hcu,
-    recompute_w_u_fwd_hcu,
-)
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_hcu
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
@@ -51,6 +46,14 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 RCP_LN2 = 1.4426950216293335
 
 _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+
+if is_hcu():
+    from boltops.fla.kda.triton import (
+        chunk_gla_fwd_o_gk as chunk_gla_fwd_o_gk_hcu,
+        fused_kda_gate_chunk_cumsum as fused_kda_gate_chunk_cumsum_hcu,
+        recompute_w_u_fwd as recompute_w_u_fwd_hcu,
+    )
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
@@ -723,8 +726,8 @@ def recompute_w_u_fwd(
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     if _USE_KDA_HCU:
-        # Operator-team recompute (selects the K3 beta-factored head-first
-        # kernel internally).  Returns (w, u, None, kg); fold to the native
+        # boltops recompute selects the K3 beta-factored head-first kernel
+        # internally.  Returns (w, u, None, kg); fold to the native
         # 3-tuple contract.
         w, u, _, kg = recompute_w_u_fwd_hcu(
             k=k,
@@ -1144,9 +1147,9 @@ def chunk_kda_fwd(
 
     if A_log is not None:
         if _USE_KDA_HCU:
-            # Operator-team fused gate activation + chunk-local cumsum (also
-            # computes beta, which we ignore: downstream keeps the model's
-            # post-sigmoid beta). See fla/kda_hcu.py.
+            # boltops fused gate activation + chunk-local cumsum (also computes
+            # beta, which we ignore: downstream keeps the model's post-sigmoid
+            # beta).
             g = fused_kda_gate_chunk_cumsum_hcu(
                 g,
                 beta,

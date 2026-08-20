@@ -11,21 +11,22 @@ from sglang.kernels.ops.attention.fla.chunk_intra_token_parallel import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.kda_hcu import (
-    chunk_kda_fwd_intra_hcu,
-    recompute_w_u_fwd_hcu,
-)
 from sglang.kernels.ops.attention.fla.op import exp2, gather
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_gather_supported,
     is_tf32_supported,
 )
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_hcu
 
-# Same switch as fla/kda.py: gates every KDA kernel swapped to the operator-team
-# HCU implementations (fla/kda_hcu.py).
+# Same switch as fla/kda.py: gates KDA kernels provided by boltops.
 _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+
+if is_hcu():
+    from boltops.fla.kda.triton import (
+        chunk_kda_fwd_intra as chunk_kda_fwd_intra_hcu,
+        recompute_w_u_fwd as recompute_w_u_fwd_hcu,
+    )
 
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
@@ -931,13 +932,11 @@ def chunk_kda_fwd_intra(
     fuse_diagonal: bool = False,
 ):
     if _USE_KDA_HCU:
-        # Operator-team full intra (fla/kda_hcu.py): step-1 variants
+        # boltops full intra: step-1 variants
         # (poly-solve / safe-gate sub-chunk / token-parallel) + step-2
-        # inter/solve, then the separate recompute kernel.  The teacher
+        # inter/solve, then the separate recompute kernel. The boltops
         # kernels are non-fused by design, so fuse_diagonal/fuse_recompute
         # are ignored on this path.
-        import logging
-        logger = logging.getLogger(__name__)
         Aqk, Akk = chunk_kda_fwd_intra_hcu(
             q=q,
             k=k,

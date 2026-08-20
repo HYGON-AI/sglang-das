@@ -5,17 +5,16 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_hcu, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hcu, is_npu
+
+_USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
 if not is_cpu():
-    if is_hcu():
-        # HCU: operator-team packed-decode adapter. Its signature matches
-        # fused_recurrent_kda_packed_decode exactly (incl. lower_bound), so the
-        # call site below is unchanged. Requires num_v_heads == num_k_heads == H
-        # and L2-normalized Q/K, both true for Kimi-K3 (see kda_hcu.py docstring).
-        from sglang.kernels.ops.attention.fla.kda_hcu import (
-            fused_recurrent_kda_packed_decode_hcu as fused_recurrent_kda_packed_decode,
-        )
+    if is_hcu() and _USE_KDA_HCU:
+        # HCU: use the stable boltops packed-decode implementation directly.
+        # Its API consumes raw gate/beta tensors; packed_decode reshapes them
+        # below without copying and returns the boltops output layout directly.
+        from boltops.fla.kda.triton import fused_recurrent_kda_packed_decode
     else:
         from sglang.kernels.ops.attention.fla.fused_recurrent import (
             fused_recurrent_kda_packed_decode,
@@ -109,6 +108,21 @@ class TritonKDAKernel(LinearAttnKernelBase):
             a = a.reshape(B, -1)
         if b.dim() != 2:
             b = b.reshape(B, -1)
+        if _USE_KDA_HCU:
+            K = ssm_states.shape[-1]
+            out, _ = fused_recurrent_kda_packed_decode(
+                mixed_qkv=mixed_qkv,
+                raw_g=a.reshape(1, B, num_v_heads, K),
+                raw_beta=b.reshape(1, B, num_v_heads),
+                A_log=A_log.reshape(-1),
+                dt_bias=dt_bias.reshape(-1),
+                lower_bound=lower_bound,
+                initial_state=ssm_states,
+                state_indices=cache_indices,
+                scale=scale,
+            )
+            return out
+
         fused_recurrent_kda_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
