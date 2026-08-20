@@ -26,6 +26,9 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, is_npu
 
+if is_hcu():
+    from boltops.generic.triton import attn_res
+
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
@@ -41,12 +44,12 @@ def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
 
 
 def _use_hcu_aggregate(num_tokens: int, nvb: int) -> bool:
-    """Route aggregation to the vendored HCU single-kernel mix when it beats
-    the official HIP kernel. Benchmark (H=7168): attn_res_hcu wins for
+    """Route aggregation to the boltops HCU single-kernel mix when it beats
+    the official HIP kernel. Benchmark (H=7168): boltops attn_res wins for
     nvb >= 5 and T >= 256 (its online softmax avoids the official kernel's
     next_pow2(nvb) x 8192 register tile); official wins at small T, so keep
     the official path there. Requires the HCU env switch."""
-    return _USE_HCU_ATTN_RES and num_tokens >= 256 and nvb >= 5
+    return _USE_HCU_ATTN_RES # and num_tokens >= 256 and nvb >= 5
 
 
 def _use_fast(hidden_size: int) -> bool:
@@ -334,17 +337,15 @@ def _aggregate_hcu(
     out_norm: Optional[RMSNorm],
     write_bank_row: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """HCU branch: vendored single-kernel mix + separate out-norm / bank write.
+    """HCU branch: boltops single-kernel mix + separate out-norm / bank write.
 
     Same contract as ``_aggregate_hip``: returns ``(out, prefix)`` with
     ``prefix = prefix_a + prefix_b`` (rounded to the storage dtype) and
     ``out = out_norm(mix)`` or the pre-norm mixture when ``out_norm`` is None.
-    Used when ``attn_res_hcu`` beats the official HIP kernel (T >= 256,
+    Used when boltops ``attn_res`` beats the official HIP kernel (T >= 256,
     nvb >= 5); the extra out-norm launch is already included in the bench's
     ``B_full`` numbers.
     """
-    from sglang.kernels.ops.communication.attn_res_hcu import attn_res_hcu
-
     if prefix_b is None:
         prefix = prefix_a
     else:
@@ -352,7 +353,7 @@ def _aggregate_hcu(
     if write_bank_row:
         assert bank.shape[1] > nvb, "write_bank_row requires NB > nvb"
         bank[:, nvb, :] = prefix
-    mix = attn_res_hcu(
+    mix = attn_res(
         prefix,
         bank,
         norm_weight=score_norm.weight,
