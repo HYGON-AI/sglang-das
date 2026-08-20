@@ -56,6 +56,37 @@ _requested_backend = (
 _lmslim_w4a8_marlin_available = False
 _lmslim_w4a8_triton_available = False
 _aiter_w4a8_marlin_available = False
+MoeQuantType = None
+aiter_moe = None
+get_aiter_moe_config = None
+w4a8_moe_layout_shuffle_gemm2 = None
+
+
+def _ensure_aiter_w4a8_marlin_available() -> None:
+    global _aiter_w4a8_marlin_available
+    global MoeQuantType, aiter_moe, get_aiter_moe_config
+    global w4a8_moe_layout_shuffle_gemm2
+
+    if _aiter_w4a8_marlin_available:
+        return
+    try:
+        from aiter.moe import MoeQuantType as _MoeQuantType
+        from aiter.moe import aiter_moe as _aiter_moe
+        from aiter.moe import get_aiter_moe_config as _get_aiter_moe_config
+        from aiter.ops.shuffle import (
+            w4a8_moe_layout_shuffle_gemm2 as _w4a8_moe_layout_shuffle_gemm2,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "SGLANG_DSPARK_FORCE_W4A8_TPMOE_AITER=1 requires the AITER W4A8 "
+            "MoE backend, but AITER could not be imported."
+        ) from e
+
+    MoeQuantType = _MoeQuantType
+    aiter_moe = _aiter_moe
+    get_aiter_moe_config = _get_aiter_moe_config
+    w4a8_moe_layout_shuffle_gemm2 = _w4a8_moe_layout_shuffle_gemm2
+    _aiter_w4a8_marlin_available = True
 
 if _requested_backend in {
     W4A8_TPMOE_BACKEND_AUTO,
@@ -402,9 +433,29 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if _resolved_backend == W4A8_TPMOE_BACKEND_AITER:
-                return SlimQuantW4A8Int8AiterMoEMethod(self)
-            return SlimQuantW4A8Int8MarlinMoEMethod(self)
+            from sglang.srt.layers.moe.utils import (
+                should_force_dspark_w4a8_tpmoe_aiter,
+            )
+
+            force_aiter = should_force_dspark_w4a8_tpmoe_aiter()
+            if force_aiter:
+                _ensure_aiter_w4a8_marlin_available()
+            use_aiter = force_aiter or (
+                _resolved_backend == W4A8_TPMOE_BACKEND_AITER
+            )
+            selected_method = (
+                SlimQuantW4A8Int8AiterMoEMethod
+                if use_aiter
+                else SlimQuantW4A8Int8MarlinMoEMethod
+            )
+            logger.info(
+                "[slimquant_w4a8_marlin] selected_moe_method=%s "
+                "force_dspark_aiter=%s resolved_backend=%s",
+                selected_method.__name__,
+                force_aiter,
+                _resolved_backend,
+            )
+            return selected_method(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:

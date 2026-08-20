@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,26 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+_force_dspark_w4a8_tpmoe_aiter = ContextVar(
+    "force_dspark_w4a8_tpmoe_aiter", default=False
+)
+
+
+def should_force_dspark_w4a8_tpmoe_aiter() -> bool:
+    return _force_dspark_w4a8_tpmoe_aiter.get()
+
+
+@contextmanager
+def dspark_w4a8_tpmoe_aiter_context():
+    """Force the SlimQuant W4A8 MoE method to AITER for one draft build."""
+    token = _force_dspark_w4a8_tpmoe_aiter.set(
+        envs.SGLANG_DSPARK_FORCE_W4A8_TPMOE_AITER.get()
+    )
+    try:
+        yield
+    finally:
+        _force_dspark_w4a8_tpmoe_aiter.reset(token)
 
 
 class MoeA2ABackend(Enum):

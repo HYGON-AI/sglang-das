@@ -496,6 +496,9 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Force the DSpark draft's SlimQuant W4A8 MoE method to use AITER without
+    # changing the target model's W4A8 or generic MoE backend.
+    SGLANG_DSPARK_FORCE_W4A8_TPMOE_AITER = EnvBool(False)
     # PD hidden-state receive pool size, in tokens (-1 = derive from the
     # decode-side chunk budget).
     SGLANG_PD_HIDDEN_RECV_POOL_TOKENS = EnvInt(-1)
