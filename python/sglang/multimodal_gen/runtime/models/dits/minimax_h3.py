@@ -73,6 +73,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+from sglang.srt.utils import is_hcu
 
 logger = init_logger(__name__)
 
@@ -290,6 +291,7 @@ def _apply_qk_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         q.is_cuda
+        and not is_hcu()
         and q.dtype == _BF16_DTYPE
         and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
         and q.stride(-1) == k.stride(-1) == 1
@@ -1588,6 +1590,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if isinstance(module, MiniMaxH3Attention):
                 module._set_attention_backend(backend)
         self._resolved_attention_backend = backend.get_enum()
+        logger.info(
+            "MiniMax-H3 transformer resolved attention backend: %s",
+            self._resolved_attention_backend,
+        )
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1608,6 +1614,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         if self.adaln_cache is not None:
             self.adaln_cache.load(self.video_patch_proj.weight.device)
+        # Component-scoped backend overrides only exist while this component is
+        # being constructed and loaded. Resolve here before the loader exits
+        # that context instead of waiting until the first request.
+        self._resolve_attention_backend_once()
 
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:

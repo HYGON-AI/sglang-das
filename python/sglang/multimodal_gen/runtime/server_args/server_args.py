@@ -85,6 +85,7 @@ from sglang.multimodal_gen.utils import (
     StoreBoolean,
     expand_path_fields,
 )
+from sglang.srt.utils.common import is_hcu
 
 logger = init_logger(__name__)
 
@@ -899,6 +900,25 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends
             )
         )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and type(self.pipeline_config).__name__ == "MiniMaxH3PipelineConfig"
+            and is_hcu()
+            and self.attention_backend == "fa"
+        ):
+            defaults = {
+                "text_encoder": "torch_sdpa",
+                "transformer": "fa",
+            }
+            for component, backend in defaults.items():
+                if component not in self.component_attention_backends:
+                    self.component_attention_backends[component] = backend
+                    logger.info(
+                        "Automatically set MiniMax-H3 HCU %s attention backend to %s",
+                        component,
+                        backend,
+                    )
 
         # attention_backend_config
         if self.attention_backend_config is None:

@@ -74,6 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
+    Backend,
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
@@ -190,6 +191,49 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(backend.name, "TORCH_SDPA")
         self.assertEqual(matched_key, "text_encoder")
+
+    def test_hcu_minimax_h3_fa_sets_safe_component_defaults(self):
+        args = ServerArgs.__new__(ServerArgs)
+        args.backend = Backend.AUTO
+        args.pipeline_config = MiniMaxH3PipelineConfig()
+        args.attention_backend = "fa"
+        args.component_attention_backends = {}
+        args.attention_backend_config = None
+        args.ring_degree = 1
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.server_args.is_hcu",
+            return_value=True,
+        ):
+            args._adjust_attention_backend()
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+
+    def test_hcu_minimax_h3_preserves_explicit_component_backend(self):
+        args = ServerArgs.__new__(ServerArgs)
+        args.backend = Backend.AUTO
+        args.pipeline_config = MiniMaxH3PipelineConfig()
+        args.attention_backend = "fa"
+        args.component_attention_backends = {
+            "text_encoder": "fa",
+            "transformer": "torch_sdpa",
+        }
+        args.attention_backend_config = None
+        args.ring_degree = 1
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.server_args.is_hcu",
+            return_value=True,
+        ):
+            args._adjust_attention_backend()
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "fa", "transformer": "torch_sdpa"},
+        )
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
