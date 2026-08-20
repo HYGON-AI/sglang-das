@@ -42,7 +42,7 @@ from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geom
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend, is_hcu
-from sglang.srt.utils.common import get_device_capability
+from sglang.srt.utils.common import get_bool_env_var, get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -54,6 +54,33 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
+_is_hcu = is_hcu()
+if _is_hcu:
+    from sglang.srt.layers.attention.flashattention_interface import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+        vllm_flash_attn_varlen_func,
+        vllm_flash_attn_with_kvcache,
+    )
+
+# HCU FlashAttention supports two KV cache memory layouts. Keep the vLLM/HCU FA
+# layout enabled by default on HCU, while non-HCU backends keep the normal
+# [num_blocks, page_size, heads, dim] view below.
+_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
+    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
+)
+
+
+def is_nmz_fp8(dtype: torch.dtype) -> bool:
+    if is_hcu():
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
+        if "gfx938" in gcn_arch and (
+            dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2
+        ):
+            return True
+    return False
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
@@ -262,8 +289,14 @@ class FlashAttentionBackend(AttentionBackend):
         # select CUDA-only FA3/FA4 wrappers.
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
-        if is_hcu():
+        if _is_hcu:
+            from sglang.srt.layers.attention.flashattention_interface import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
             self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = None
         elif self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -1293,7 +1326,7 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
+            q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         # Check if we should use local attention
@@ -1383,12 +1416,20 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if not _kv_layout_hcu_fa:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim, self.page_size
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -1495,6 +1536,44 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     **kwargs,
+                )
+            elif _kv_layout_hcu_fa and max_seqlen_q > 1:
+                result = vllm_flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=cache_seqlens,
+                    max_seqlen_k=metadata.max_seq_len_k,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    block_table=page_table,
+                    fa_version=2,
+                    q_descale=fa_k_descale,
+                    k_descale=fa_k_descale,
+                    v_descale=fa_v_descale,
+                )
+            elif _kv_layout_hcu_fa:
+                result = vllm_flash_attn_with_kvcache(
+                    q=q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .unsqueeze(1),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
             else:
                 result = flash_attn_with_kvcache(
@@ -1878,7 +1957,7 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
+            q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if fa_k_descale is not None:
@@ -1888,12 +1967,20 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if not _kv_layout_hcu_fa:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim, self.page_size
+                )
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -1975,57 +2062,102 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
-                    num_splits=(
-                        self.decode_num_splits
-                        if not is_swa_layer
-                        and not use_cascade_attn
-                        and not pa_swa_active
-                        else self.num_splits
-                    ),
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
-                )
+                if _kv_layout_hcu_fa:
+                    result = vllm_flash_attn_with_kvcache(
+                        q=q_reshaped.unsqueeze(1),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=(
+                            self.decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else self.num_splits
+                        ),
+                        ver=self.fa_impl_ver,
+                    )
+                else:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=(
+                            self.decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else self.num_splits
+                        ),
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        scheduler_metadata=sched_meta,
+                        **kwargs,
+                    )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     if self._decode_uses_static_max_seqlen_k:
                         kwargs["max_seqlen_k"] = (
                             self.forward_metadata_spec_decode_expand.max_seq_len_k
                         )
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q_reshaped,
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
-                            ver=self.fa_impl_ver,
-                            **kwargs,
+                    if _kv_layout_hcu_fa:
+                        o_expand, softmax_lse_expand, *rest_expand = (
+                            vllm_flash_attn_with_kvcache(
+                                q=q_reshaped.unsqueeze(1),
+                                k_cache=key_cache,
+                                v_cache=value_cache,
+                                page_table=self.forward_metadata_spec_decode_expand.page_table,
+                                cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                                cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                                cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                                max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                                softmax_scale=layer.scaling,
+                                causal=False,
+                                window_size=window_size,
+                                softcap=layer.logit_cap,
+                                return_softmax_lse=True,
+                                num_splits=self.num_splits,
+                                ver=self.fa_impl_ver,
+                            )
                         )
-                    )
+                    else:
+                        o_expand, softmax_lse_expand, *rest_expand = (
+                            flash_attn_with_kvcache(
+                                q=q_reshaped,
+                                k_cache=key_cache,
+                                v_cache=value_cache,
+                                page_table=self.forward_metadata_spec_decode_expand.page_table,
+                                cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                                cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                                cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                                max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                                softmax_scale=layer.scaling,
+                                causal=False,
+                                window_size=window_size,
+                                softcap=layer.logit_cap,
+                                return_softmax_lse=True,
+                                num_splits=self.num_splits,
+                                ver=self.fa_impl_ver,
+                                **kwargs,
+                            )
+                        )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),

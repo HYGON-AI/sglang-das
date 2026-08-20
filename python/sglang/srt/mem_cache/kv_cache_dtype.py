@@ -46,10 +46,7 @@ def configure_kv_cache_dtype(
         else:
             kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp8_e5m2":
-        if _is_hip:  # Using natively supported format
-            kv_cache_dtype = fp8_dtype
-        else:
-            kv_cache_dtype = torch.float8_e5m2
+        kv_cache_dtype = torch.float8_e5m2
     elif server_args_kv_cache_dtype == "fp8_e4m3":
         if _is_hip:  # Using natively supported format
             kv_cache_dtype = fp8_dtype
