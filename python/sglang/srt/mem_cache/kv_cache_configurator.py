@@ -1326,6 +1326,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        use_layer_split_pool = False
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -1340,6 +1341,7 @@ class KVCacheConfigurator:
             )
 
             PoolCls = LayerSplitDSATokenToKVPool
+            use_layer_split_pool = True
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
@@ -1349,6 +1351,11 @@ class KVCacheConfigurator:
             or self.server_args.enable_hisparse
             or self.server_args.enable_hierarchical_cache
         )
+        full_indexer_layer_ids = get_dsa_full_indexer_layer_ids(
+            self.model_config.hf_config,
+            self.layer_info.start_layer,
+            self.layer_info.end_layer,
+        )
         indexer_layer_ids = (
             list(
                 range(
@@ -1357,12 +1364,12 @@ class KVCacheConfigurator:
                 )
             )
             if use_dense_indexer_cache
-            else get_dsa_full_indexer_layer_ids(
-                self.model_config.hf_config,
-                self.layer_info.start_layer,
-                self.layer_info.end_layer,
-            )
+            else full_indexer_layer_ids
         )
+        if use_layer_split_pool:
+            # HiCache uses dense storage/transfer metadata, but skip-topk
+            # layers still must not enqueue an Index-K collective.
+            pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
         if not get_memory().enable_hisparse:
             pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
         token_to_kv_pool = PoolCls(

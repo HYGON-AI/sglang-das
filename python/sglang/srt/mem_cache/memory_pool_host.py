@@ -1702,7 +1702,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.use_fp8 = device_pool.use_fp8_index_k_cache
+        # FP8 and HCU INT8 share the same packed uint8 K+scale storage ABI.
+        self.use_scaled_index_cache = device_pool.use_scaled_index_k_cache
         self.target_layer_num = self._effective_host_layer_num()
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
@@ -1710,14 +1711,14 @@ class DSAIndexerPoolHost(HostKVCache):
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
         self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        if self.use_fp8:
+        if self.use_scaled_index_cache:
             self.indexer_size_per_token = (
                 self.index_head_dim
                 + self.index_head_dim // self.indexer_quant_block_size * 4
             )
         else:
-            self.indexer_size_per_token = (
-                device_pool.index_k_buffer[0][0].nbytes // self.page_size
+            self.indexer_size_per_token = self._infer_bf16_indexer_size_per_token(
+                device_pool
             )
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
@@ -1768,8 +1769,14 @@ class DSAIndexerPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def _infer_bf16_indexer_size_per_token(self, device_pool) -> int:
+        for buffer in device_pool.index_k_buffer:
+            if buffer.shape[0] > 0:
+                return buffer[0].nbytes // self.page_size
+        return self.index_head_dim * torch.bfloat16.itemsize
+
     def _get_device_index_k_cache_for_transfer(self, device_pool):
-        if self.use_fp8:
+        if self.use_scaled_index_cache:
             return device_pool.index_k_with_scale_buffer
         return [
             buf.view(torch.uint8).view(buf.shape[0], -1)

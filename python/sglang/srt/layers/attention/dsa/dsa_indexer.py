@@ -465,11 +465,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         out_cache_loc: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-
         hadamard_scale = self.head_dim**-0.5
-        return lightop_kvcache.fuse_qk_quant_and_store_index_k_cache(
+        result = lightop_kvcache.fuse_qk_quant_and_store_index_k_cache(
             query,
             key,
             pool.get_index_k_with_scale_write_buffer(layer_id=layer_id),
@@ -482,6 +479,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             False,
             not _is_fp8_fnuz,
         )
+        commit_write = getattr(pool, "commit_index_k_with_scale_write_buffer", None)
+        if commit_write is not None:
+            commit_write(layer_id, out_cache_loc)
+        return result
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -1938,10 +1939,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             out_cache_loc = forward_batch.out_cache_loc
 
         pool = get_token_to_kv_pool()
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            return
+        hcu_layer_split = _is_hcu and getattr(pool, "layer_shard_enabled", False)
+        if not hcu_layer_split:
+            if hasattr(pool, "invalidate_index_buffer_for_layer"):
+                pool.invalidate_index_buffer_for_layer(layer_id)
+            if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+                return
 
         if _is_hcu:
             if self._use_hcu_int8_index_cache(pool):
@@ -1959,15 +1962,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
                 return
 
+            write_buffer = pool.get_index_k_with_scale_write_buffer(layer_id=layer_id)
             lightop_kvcache.fuse_act_quant_and_store_index_k_cache(
                 key,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                write_buffer,
                 out_cache_loc.contiguous(),
                 pool.page_size,
                 1e-5,
                 False,
                 not _is_fp8_fnuz,
             )
+            commit_write = getattr(pool, "commit_index_k_with_scale_write_buffer", None)
+            if commit_write is not None:
+                commit_write(layer_id, out_cache_loc)
             return
 
         if (

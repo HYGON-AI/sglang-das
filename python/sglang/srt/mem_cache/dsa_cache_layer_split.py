@@ -39,6 +39,9 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+    quantize_and_store_index_k_int8,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -180,12 +183,15 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             if pool.custom_mem_pool
             else nullcontext()
         ):
-            self.remote_buffer = torch.empty(
+            self.remote_buffer = torch.zeros(
                 self._buffer_shape(num_pages),
                 dtype=pool.index_k_with_scale_buffer_dtype,
                 device=pool.device,
             )
         self.remote_layer_id: Optional[int] = None
+        self.pending_event = pool.device_module.Event()
+        self.pending_layer_id: Optional[int] = None
+        self.pending_broadcast = False
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         layer_id = self.pool.indexer_layer_ids[layer_idx]
@@ -198,6 +204,10 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
+        # The owner buffers are about to change outside the regular mirrored
+        # write path, so no cached remote layer remains valid.
+        self.finalize_pending(set_remote_layer_id=False)
+        self.remote_layer_id = None
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
         for index_k in self.buffer:
@@ -212,15 +222,59 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         return self.get_broadcastable_buffer(layer_id)
 
     def get_write_buffer(self, layer_id: int) -> torch.Tensor:
+        if not self.prepare_remote_write(layer_id):
+            # Correctness fallback for a missed prefetch. Broadcast history
+            # before any rank writes this step's new Index-K into scratch.
+            self.get_broadcastable_buffer(layer_id)
+
         if self.pool._is_layer_owned(layer_id):
             return super().get_write_buffer(layer_id)
 
         # Non-owner local buffers have zero rows. HCU still needs to run the
-        # fused Q/K quant kernel to produce Q, so use the full-size remote
-        # scratch as its disposable K write target. The scratch no longer
-        # represents its previous layer and must be broadcast again before use.
-        self.remote_layer_id = None
+        # fused Q/K quant kernel to produce Q, so write this step's Index-K
+        # directly into the already-prefetched remote scratch.
         return self.remote_buffer
+
+    def commit_write_buffer(self, layer_id: int, loc: torch.Tensor) -> None:
+        """Mirror an owner's fused Index-K writes into prefetched scratch."""
+
+        if not self.pool._is_layer_owned(layer_id) or not self.prepare_remote_write(
+            layer_id
+        ):
+            return
+
+        loc = loc.reshape(-1)
+        loc = loc[loc >= 0].to(torch.long)
+        if loc.numel() == 0:
+            return
+
+        local_buffer = self.buffer[self.pool._get_indexer_cache_index(layer_id)]
+        page_indices = torch.div(loc, self.pool.page_size, rounding_mode="floor")
+        token_offsets = loc % self.pool.page_size
+        k_bytes_per_page = self.pool.page_size * self.pool.index_head_dim
+        scale_bytes_per_token = (
+            self.pool.index_head_dim
+            // self.pool.quant_block_size
+            * torch.float32.itemsize
+        )
+
+        local_k = local_buffer[:, :k_bytes_per_page].view(
+            -1, self.pool.page_size, self.pool.index_head_dim
+        )
+        remote_k = self.remote_buffer[:, :k_bytes_per_page].view(
+            -1, self.pool.page_size, self.pool.index_head_dim
+        )
+        remote_k[page_indices, token_offsets] = local_k[page_indices, token_offsets]
+
+        local_scale = local_buffer[:, k_bytes_per_page:].view(
+            -1, self.pool.page_size, scale_bytes_per_token
+        )
+        remote_scale = self.remote_buffer[:, k_bytes_per_page:].view(
+            -1, self.pool.page_size, scale_bytes_per_token
+        )
+        remote_scale[page_indices, token_offsets] = local_scale[
+            page_indices, token_offsets
+        ]
 
     def get_k_and_scale(
         self,
@@ -248,16 +302,150 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        self.invalidate(layer_id)
+        if not self.prepare_remote_write(layer_id):
+            self.get_broadcastable_buffer(layer_id)
+        index_buf_accessor.SetKAndS.execute(
+            pool=self.pool,
+            buf=self.remote_buffer,
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
+        )
         if self.pool._is_layer_owned(layer_id):
             super().store_quantized(layer_id, loc, index_k, index_k_scale)
 
+    def store_int8(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        """Store current INT8 Index-K into scratch and the owner's shard."""
+
+        if not self.prepare_remote_write(layer_id):
+            self.get_broadcastable_buffer(layer_id)
+        assert self.pool.index_k_int8_remote_aliases is not None
+        remote_int8_k, remote_fp32_scales = self.pool.index_k_int8_remote_aliases
+        quantize_and_store_index_k_int8(
+            index_k,
+            self.remote_buffer,
+            loc,
+            page_size=self.pool.page_size,
+            int8_k=remote_int8_k,
+            fp32_scales=remote_fp32_scales,
+        )
+        if not self.pool._is_layer_owned(layer_id):
+            return
+
+        cache_idx = self.pool._get_indexer_cache_index(layer_id)
+        local_int8_k, local_fp32_scales = self.pool.index_k_int8_aliases[cache_idx]
+        quantize_and_store_index_k_int8(
+            index_k,
+            self.buffer[cache_idx],
+            loc,
+            page_size=self.pool.page_size,
+            int8_k=local_int8_k,
+            fp32_scales=local_fp32_scales,
+        )
+
+    def finalize_pending(self, *, set_remote_layer_id: bool = True) -> None:
+        if not self.pending_broadcast:
+            return
+        self.pool.device_module.current_stream().wait_event(self.pending_event)
+        self.pending_broadcast = False
+        if set_remote_layer_id and self.pending_layer_id is not None:
+            self.remote_layer_id = self.pending_layer_id
+        elif not set_remote_layer_id:
+            self.remote_layer_id = None
+        self.pending_layer_id = None
+
+    def prefetch(
+        self,
+        layer_id: int,
+        layer_transfer_counter: Optional[LayerDoneCounter] = None,
+        layer_transfer_idx: Optional[int] = None,
+        has_history: bool = True,
+    ) -> None:
+        """Broadcast a full Index-K buffer ahead of its indexer layer."""
+
+        # GLM-5.2 only allocates caches for layers that really run the
+        # indexer. skip-topk layers reuse prior results and need no collective.
+        if layer_id not in self.pool.indexer_prefetch_layer_ids:
+            return
+        if self.remote_layer_id == layer_id:
+            return
+        if self.pending_broadcast:
+            if self.pending_layer_id == layer_id:
+                return
+            self.finalize_pending(set_remote_layer_id=False)
+
+        if not has_history:
+            # This step's Index-K writes will populate every location read by
+            # the indexer. Page zero was initialized when scratch was created.
+            self.remote_layer_id = layer_id
+            return
+
+        cache_idx = self.pool._get_indexer_cache_index(layer_id)
+        src_tensor = (
+            self.buffer[cache_idx] if self.pool._is_layer_owned(layer_id) else None
+        )
+        transfer_counter = layer_transfer_counter or self.pool.layer_transfer_counter
+        transfer_idx = (
+            layer_transfer_idx
+            if layer_transfer_idx is not None
+            else layer_id - self.pool.start_layer
+        )
+
+        if self.pool.layer_broadcast_comm is None:
+            if transfer_counter is not None:
+                transfer_counter.wait_until(transfer_idx)
+            self.pool._broadcast_tensor_from_owner(
+                self.remote_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.remote_layer_id = layer_id
+            return
+
+        current_stream = self.pool.device_module.current_stream()
+        self.pool.kv_broadcast_stream.wait_stream(current_stream)
+        with self.pool.device_module.stream(self.pool.kv_broadcast_stream):
+            if transfer_counter is not None:
+                transfer_counter.wait_until(transfer_idx)
+            with torch.profiler.record_function(
+                "layersplit_index_k_broadcast "
+                f"layer={layer_id} bytes={self.remote_buffer.nbytes}"
+            ):
+                self.pool._broadcast_tensor_from_owner(
+                    self.remote_buffer,
+                    layer_id,
+                    src_tensor=src_tensor,
+                    use_layer_broadcast_comm=True,
+                )
+            self.pending_event.record()
+        self.remote_layer_id = None
+        self.pending_layer_id = layer_id
+        self.pending_broadcast = True
+
+    def prepare_remote_write(self, layer_id: int) -> bool:
+        if self.pending_broadcast:
+            self.finalize_pending(set_remote_layer_id=self.pending_layer_id == layer_id)
+        return self.remote_layer_id == layer_id
+
     def invalidate(self, layer_id: int) -> None:
+        if self.pending_broadcast and self.pending_layer_id == layer_id:
+            self.finalize_pending(set_remote_layer_id=False)
         if self.remote_layer_id == layer_id:
             self.remote_layer_id = None
 
     def get_broadcastable_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.pending_broadcast:
+            self.finalize_pending(set_remote_layer_id=self.pending_layer_id == layer_id)
         if self.remote_layer_id != layer_id:
+            # Index-K and Main-KV share the dedicated communicator. A fallback
+            # on the current stream must follow all side-stream collectives.
+            self.pool._drain_pending_layer_broadcasts(discard_index=True)
             cache_idx = self.pool._get_indexer_cache_index(layer_id)
             src_tensor = (
                 self.buffer[cache_idx] if self.pool._is_layer_owned(layer_id) else None
@@ -266,6 +454,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 self.remote_buffer,
                 layer_id,
                 src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
             )
             self.remote_layer_id = layer_id
         return self.remote_buffer
@@ -325,6 +514,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         *args,
         layer_shard_rank: int,
         layer_shard_size: int,
+        indexer_prefetch_layer_ids: Optional[Sequence[int]] = None,
         **kwargs,
     ):
         assert (
@@ -334,7 +524,14 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
+        self.indexer_prefetch_layer_ids = (
+            frozenset(indexer_prefetch_layer_ids)
+            if indexer_prefetch_layer_ids is not None
+            else None
+        )
         super().__init__(*args, **kwargs)
+        if self.indexer_prefetch_layer_ids is None:
+            self.indexer_prefetch_layer_ids = frozenset(self.indexer_layer_ids)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
         my_start, _ = self._owned_local_layer_range()
@@ -479,7 +676,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                     dtype=torch.int32,
                     device=self.device,
                 )
-                self.physical_to_compact_main_kv_page[0] = 0
+                # Keep this device-side to avoid a synchronous scalar H2D.
+                self.physical_to_compact_main_kv_page[0:1].zero_()
                 self._active_main_kv_page_plan: Optional[MainKVPagePlan] = None
                 self._active_main_kv_batch_marker: Optional[
                     weakref.ReferenceType[Any]
@@ -626,12 +824,18 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         ):
             return
 
-        # A late side-stream broadcast must not write through a mapping owned
-        # by the next ForwardBatch.
-        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        # A late side-stream broadcast must not write through state owned by
+        # the next ForwardBatch. Index scratch also depends on pool contents
+        # that may have changed through allocation, movement, or HiCache load.
+        self._drain_pending_layer_broadcasts(
+            discard_index=True,
+            discard_main=True,
+        )
+        self.index_key_cache.remote_layer_id = None
         self.remote_kv_layer_id = None
         self.physical_to_compact_main_kv_page.fill_(-1)
-        self.physical_to_compact_main_kv_page[0] = 0
+        # Keep this device-side to avoid a synchronous scalar H2D.
+        self.physical_to_compact_main_kv_page[0:1].zero_()
         self._active_main_kv_batch_marker = None
         self._active_main_kv_page_plan = None
         self._active_main_kv_compact_page_ids = torch.empty(
@@ -783,7 +987,34 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.pending_remote_kv_broadcast = False
         if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
+        elif not set_remote_layer_id:
+            self.remote_kv_layer_id = None
         self.pending_remote_kv_layer_id = None
+
+    def _drain_pending_layer_broadcasts(
+        self,
+        *,
+        discard_index: bool = False,
+        discard_main: bool = False,
+    ) -> None:
+        """Order synchronous fallbacks after side-stream collectives."""
+
+        self.index_key_cache.finalize_pending(set_remote_layer_id=not discard_index)
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=not discard_main)
+
+    def prefetch_index_buffer(
+        self,
+        layer_id: int,
+        layer_transfer_counter: Optional[LayerDoneCounter] = None,
+        layer_transfer_idx: Optional[int] = None,
+        has_history: bool = True,
+    ) -> None:
+        self.index_key_cache.prefetch(
+            layer_id,
+            layer_transfer_counter=layer_transfer_counter,
+            layer_transfer_idx=layer_transfer_idx,
+            has_history=has_history,
+        )
 
     def prefetch_kv_buffer(
         self,
@@ -862,6 +1093,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 set_remote_layer_id=self.pending_remote_kv_layer_id == layer_id
             )
         if self.remote_kv_layer_id != layer_id:
+            self._drain_pending_layer_broadcasts(discard_main=True)
             local_idx = self._local_layer_idx(layer_id)
             src_tensor = (
                 self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
@@ -910,6 +1142,14 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
         if tgt_loc.numel() == 0:
             return
+        # Compaction mutates owner storage. Finish any side-stream reads before
+        # moving it, and do not retain scratch identities across the mutation.
+        self._drain_pending_layer_broadcasts(
+            discard_index=True,
+            discard_main=True,
+        )
+        self.index_key_cache.remote_layer_id = None
+        self.remote_kv_layer_id = None
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
         for kv_cache in self.kv_buffer:
@@ -924,6 +1164,20 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self, layer_id: int
     ) -> torch.Tensor:
         return self.index_key_cache.get_buffer(layer_id)
+
+    def commit_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.index_key_cache.commit_write_buffer(layer_id, loc)
+
+    def set_index_k_int8_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        assert self.use_int8_index_k_cache, "INT8 index K cache is not enabled"
+        self.index_key_cache.store_int8(layer_id, loc, index_k)
 
     def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
         self.index_key_cache.invalidate(layer_id)
@@ -956,6 +1210,15 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         from sglang.srt.utils import current_platform
 
+        # A resume overwrites owner storage outside the mirrored write path.
+        # Drain broadcasts first so their completion cannot later make a stale
+        # scratch layer appear valid.
+        self._drain_pending_layer_broadcasts(
+            discard_index=True,
+            discard_main=True,
+        )
+        self.index_key_cache.remote_layer_id = None
+        self.remote_kv_layer_id = None
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size

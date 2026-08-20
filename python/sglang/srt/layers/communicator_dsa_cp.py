@@ -102,7 +102,7 @@ def maybe_prefetch_full_attention_kv(
     forward_batch: ForwardBatch,
     full_attention_layer_id: Optional[int],
 ) -> None:
-    """Configure the batch page plan and prefetch one DSA layer's Main-KV."""
+    """Configure the batch plan and prefetch one DSA layer's caches."""
 
     maybe_configure_main_kv_page_plan(forward_batch)
 
@@ -110,11 +110,20 @@ def maybe_prefetch_full_attention_kv(
         return
 
     token_to_kv_pool = get_token_to_kv_pool()
+    has_history = _dsa_prefill_has_history(forward_batch)
+    # Index-K and Main-KV share one communicator. Every rank must enqueue
+    # collectives in this order; skip-topk layers make the Index-K call a no-op.
+    prefetch_index_buffer = getattr(token_to_kv_pool, "prefetch_index_buffer", None)
+    if is_hcu() and prefetch_index_buffer is not None:
+        prefetch_index_buffer(
+            full_attention_layer_id,
+            has_history=has_history,
+        )
     prefetch_kv_buffer = getattr(token_to_kv_pool, "prefetch_kv_buffer", None)
     if prefetch_kv_buffer is not None:
         prefetch_kv_buffer(
             full_attention_layer_id,
-            has_history=_dsa_prefill_has_history(forward_batch),
+            has_history=has_history,
         )
 
 
