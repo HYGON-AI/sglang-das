@@ -189,7 +189,7 @@ jobs:
         run: |
           source /opt/dtk/env.sh
           DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
-          DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+          DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+(\.[0-9]+)+' | tr -d '.')
           mkdir -p output
           shopt -s nullglob
           wheels=(python/sglang/kernels/aot/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl)
