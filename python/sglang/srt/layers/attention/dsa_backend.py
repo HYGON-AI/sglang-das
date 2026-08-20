@@ -769,6 +769,36 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if _is_hcu:
+            # HCU records the static-shape metadata kernels through
+            # init_forward_metadata_in_graph. At replay the captured graph reads
+            # the live input buffers directly, so the host only has to select
+            # the metadata object captured for this batch-size bucket.
+            bs = forward_batch.batch_size
+            if bs not in self.decode_cuda_graph_metadata:
+                seq_lens_cpu = (
+                    forward_batch.seq_lens.cpu()
+                    if in_capture
+                    else forward_batch.seq_lens_cpu
+                )
+                self._build_forward_metadata_cuda_graph(
+                    bs=bs,
+                    num_tokens=None,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    forward_mode=effective_forward_mode(forward_batch),
+                    spec_info=forward_batch.spec_info,
+                    out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+                    actual_forward_mode=getattr(
+                        forward_batch, "actual_forward_mode", None
+                    ),
+                )
+            else:
+                self.set_dsa_prefill_impl(forward_batch=None)
+                self.forward_metadata = self.decode_cuda_graph_metadata[bs]
+            return
+
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -777,6 +807,24 @@ class DeepseekSparseAttnBackend(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             seq_lens_cpu=seq_lens_cpu,
+            forward_mode=effective_forward_mode(forward_batch),
+            spec_info=forward_batch.spec_info,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
+        )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if not _is_hcu:
+            return
+        # Restore the pre-forward-port behavior for HCU: metadata tensor
+        # generation is captured once and automatically replayed after the
+        # runner refreshes its static input buffers. This removes the per-step
+        # host launch train from _apply_cuda_graph_metadata.
+        self._apply_cuda_graph_metadata(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=None,
             forward_mode=effective_forward_mode(forward_batch),
             spec_info=forward_batch.spec_info,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
@@ -3589,7 +3637,7 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        if in_capture:
+        if in_capture or _is_hcu:
             inner_fb = build_inner_fb_view(
                 forward_batch,
                 bs=forward_batch.batch_size,
@@ -3597,7 +3645,7 @@ class DeepseekSparseAttnMultiStepBackend:
             )
             for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i].init_forward_metadata_out_graph(
-                    inner_fb, in_capture=True
+                    inner_fb, in_capture=in_capture
                 )
             return
 
@@ -3791,8 +3839,18 @@ class DeepseekSparseAttnMultiStepBackend:
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if _is_hcu:
+            from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
+                forward_mode=ForwardMode.DECODE,
+            )
+        else:
+            inner_fb = forward_batch
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
+            self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)
 
 
 # Backward-compat aliases (deprecated: use DSA class names)

@@ -1693,7 +1693,15 @@ def _topk_ids_postprocess_torch(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if _is_hip and num_token_non_padded is not None:
+        # Keep the HIP fallback as plain torch ops inside this compiled region.
+        # Calling _fill_padded_rows here would introduce a separate explicit
+        # Triton launch after the logical-to-physical gather, while Inductor can
+        # fuse this mask with that gather just like the pre-forward-port path.
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    else:
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
 
@@ -2317,6 +2325,7 @@ def _post_process_topk_ids(
         and get_moe_a2a_backend().is_deepep()
         and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
     )
+    hip_deepep_postprocessed = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2363,17 +2372,24 @@ def _post_process_topk_ids(
         # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        if not skip_deepep_padded_tokens:
-            _mask_topk_ids_padded_region(
-                topk_ids, num_token_non_padded, fill_value=0
+        remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
+        if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
+            # DeepEP disables shared-expert fusion by default. On that main HCU
+            # path no later operation can introduce another route, so remap and
+            # the final -1 padding mask can be compiled into one kernel. Keep
+            # the post-shared-expert mask below for the explicitly forced fused
+            # shared-expert configuration.
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, remap_info, num_token_non_padded
             )
+            hip_deepep_postprocessed = True
+        elif not skip_deepep_padded_tokens:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
-            )
+        if remap_info is not None and not hip_deepep_postprocessed:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
@@ -2477,7 +2493,7 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    if skip_deepep_padded_tokens:
+    if skip_deepep_padded_tokens and not hip_deepep_postprocessed:
         # Apply this after shared-expert remapping so every padded route,
         # including appended shared slots, is omitted by DeepEP dispatch.
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
