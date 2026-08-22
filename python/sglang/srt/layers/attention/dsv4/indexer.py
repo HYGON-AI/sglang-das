@@ -875,6 +875,17 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
+        elif envs.SGLANG_LIGHTOP_TOPK.get():
+            from lightop import topk_transform_512 as lightop_topk_transform_512
+
+            lightop_topk_transform_512(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
         else:
             topk_transform_512(
                 logits,
