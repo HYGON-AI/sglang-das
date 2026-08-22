@@ -177,6 +177,7 @@ QUANTIZATION_CHOICES = [
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
     "humming",
+    "slimquant_marlin",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
