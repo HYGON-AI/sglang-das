@@ -873,6 +873,10 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
+    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
+    # MLA path this covers ordinary prefill as well as decode-family forwards.
+    SGLANG_DSV4_DCU_USE_BF16_FLASH_MLA = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_LIGHTOP_TOPK = EnvBool(True)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
