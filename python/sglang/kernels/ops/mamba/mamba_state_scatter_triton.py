@@ -10,6 +10,18 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import get_bool_env_var, is_hcu
+
+_is_hcu = is_hcu()
+_use_bolt_mamba_state_scatter = get_bool_env_var(
+    "SGLANG_USE_BOLT_MAMBA_STATE_SCATTER"
+)
+
+if _is_hcu and _use_bolt_mamba_state_scatter:
+    from boltops.generic.triton.mamba_state_scatter import (
+        fused_mamba_state_scatter_with_mask as _bolt_mamba_state_scatter,
+    )
+
 
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
@@ -891,3 +903,8 @@ def track_mamba_states_all_layers(
         BLOCK_SIZE,
         check_freed_slots,
     )
+
+
+# HCU 且环境变量开启时，替换公共函数。
+if _is_hcu and _use_bolt_mamba_state_scatter:
+    fused_mamba_state_scatter_with_mask = _bolt_mamba_state_scatter
