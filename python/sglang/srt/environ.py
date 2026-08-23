@@ -1318,6 +1318,11 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
+    # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
+    # Enabling this also requires the native LightOp INT8 Paged MQA consumer;
+    # there is intentionally no BF16 dequantization fallback.
+    SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
