@@ -415,7 +415,13 @@ class CompressorBackendMixin:
         if kv_to_store.shape[0] == 0:
             return
 
-        if token_to_kv_pool.is_bf16_attention_kv_cache and not is_indexer:
+        if is_indexer and token_to_kv_pool.use_int8_index_k_cache:
+            token_to_kv_pool.set_index_k_int8_buffer(
+                layer_id=layer_id,
+                loc=out_loc_to_store,
+                cache_k=kv_to_store,
+            )
+        elif token_to_kv_pool.is_bf16_attention_kv_cache and not is_indexer:
             # The DSV4 BF16 attention cache has its own paged scatter path.  It
             # must not fall through to the FP8 pack path when the generic fused
             # store-cache optimization is disabled.

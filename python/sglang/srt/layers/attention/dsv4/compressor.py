@@ -259,7 +259,13 @@ class CompressorBackendMixin:
         out_loc = self.forward_metadata.core_metadata.c4_out_loc
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
-        if self.enable_deepseek_v4_fp4_indexer:
+        if token_to_kv_pool.use_int8_index_k_cache:
+            token_to_kv_pool.set_index_k_int8_buffer(
+                layer_id=layer_id,
+                loc=out_loc,
+                cache_k=new_compressed_kv,
+            )
+        elif self.enable_deepseek_v4_fp4_indexer:
             token_to_kv_pool.set_index_k_fp4(
                 layer_id=layer_id,
                 loc=out_loc,
