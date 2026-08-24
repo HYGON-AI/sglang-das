@@ -877,6 +877,9 @@ class Envs:
     # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
     # MLA path this covers ordinary prefill as well as decode-family forwards.
     SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # Use the native LightOp single/dual-cache gather+upconvert kernels instead
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
