@@ -114,34 +114,95 @@ class LightOpMoeQuantInfo(MoeQuantInfo):
     w2_scale: torch.Tensor
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
+    use_fp8_w8a8: bool = False
+    use_int8_w8a8: bool = True
+    origin_w13_shape: Optional[torch.Size] = None
+    origin_w2_shape: Optional[torch.Size] = None
 
 
-def get_lightop_marlin_weight(weight: torch.Tensor) -> torch.Tensor:
+def _is_moe_prefill_or_normal() -> bool:
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    return (
+        server_args.disaggregation_mode == "prefill"
+        or server_args.deepep_mode == "normal"
+    )
+
+
+def get_lightop_marlin_weight(
+    weight: torch.Tensor, *, use_fp8_w8a8: bool = False
+) -> torch.Tensor:
     if get_moe_a2a_backend().is_deepep():
+        if use_fp8_w8a8 and _is_moe_prefill_or_normal():
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                weight8bit_nt_kpack2_marlin,
+            )
+
+            return weight8bit_nt_kpack2_marlin(weight)
         return weight8bit_nt_kpack2_marlin1(weight)
+
+    if use_fp8_w8a8:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            w8a8_2_marlin_weight,
+        )
+
+        return w8a8_2_marlin_weight(weight)
     return get_w8a8_int8_marlin_weights(weight)
 
 
-def process_weights_after_loading_lightop(layer: torch.nn.Module) -> None:
+def process_weights_after_loading_lightop(
+    layer: torch.nn.Module, *, use_fp8_w8a8: bool = False
+) -> None:
+    origin_w13_shape = layer.w13_weight.shape
+    origin_w2_shape = layer.w2_weight.shape
+    if use_fp8_w8a8:
+        if (
+            layer.w13_weight.dim() != 3
+            or layer.w2_weight.dim() != 3
+            or layer.w13_weight.size(0) != layer.w2_weight.size(0)
+        ):
+            raise RuntimeError("Unexpected MoE weight shapes")
+        two_n, hidden_size = layer.w13_weight.shape[1:]
+        if layer.w2_weight.size(1) != hidden_size:
+            raise RuntimeError("Unexpected MoE w2 layout")
+        intermediate_size = layer.w2_weight.size(2)
+        if two_n != 2 * intermediate_size:
+            raise RuntimeError("Unexpected MoE hidden dims")
+        if (
+            hidden_size % 32 != 0
+            or intermediate_size % 16 != 0
+            or two_n % 32 != 0
+        ):
+            raise RuntimeError("Marlin packing requires alignment")
+
     w13_weight = torch.stack(
         [
-            get_lightop_marlin_weight(layer.w13_weight[i])
+            get_lightop_marlin_weight(
+                layer.w13_weight[i], use_fp8_w8a8=use_fp8_w8a8
+            )
             for i in range(layer.w13_weight.shape[0])
         ],
         dim=0,
     )
     w2_weight = torch.stack(
         [
-            get_lightop_marlin_weight(layer.w2_weight[i])
+            get_lightop_marlin_weight(
+                layer.w2_weight[i], use_fp8_w8a8=use_fp8_w8a8
+            )
             for i in range(layer.w2_weight.shape[0])
         ],
         dim=0,
     )
     layer.w13_weight = Parameter(w13_weight, requires_grad=False)
     layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+    layer._lightop_origin_w13_shape = origin_w13_shape
+    layer._lightop_origin_w2_shape = origin_w2_shape
 
 
-def get_lightop_quant_info(layer: torch.nn.Module) -> LightOpMoeQuantInfo:
+def get_lightop_quant_info(
+    layer: torch.nn.Module, *, use_fp8_w8a8: bool = False
+) -> LightOpMoeQuantInfo:
     return LightOpMoeQuantInfo(
         w13_weight=layer.w13_weight,
         w2_weight=layer.w2_weight,
@@ -149,6 +210,10 @@ def get_lightop_quant_info(layer: torch.nn.Module) -> LightOpMoeQuantInfo:
         w2_scale=layer.w2_weight_scale,
         a13_scale=layer.w13_input_scale,
         a2_scale=layer.w2_input_scale,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=not use_fp8_w8a8,
+        origin_w13_shape=getattr(layer, "_lightop_origin_w13_shape", None),
+        origin_w2_shape=getattr(layer, "_lightop_origin_w2_shape", None),
     )
 
 
@@ -168,25 +233,52 @@ class LightOpRunnerCore(MoeRunnerCore):
             else 1.0
         )
 
-        output = torch.ops.sglang.fused_experts_impl_int8_marlin(
-            runner_input.hidden_states,
-            quant_info.w13_weight,
-            quant_info.w2_weight,
-            topk_weights=runner_input.topk_weights,
-            topk_ids=runner_input.topk_ids,
-            inplace=self.config.inplace,
-            activation=self.config.activation,
-            apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-            use_int8_w8a8=True,
-            per_channel_quant=True,
-            global_num_experts=self.config.num_experts,
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            a1_scale=quant_info.a13_scale,
-            a2_scale=quant_info.a2_scale,
-            use_nn_moe=False,
-            routed_scaling_factor=float(routed_scaling_factor),
-        )
+        if quant_info.use_fp8_w8a8:
+            if (
+                quant_info.origin_w13_shape is None
+                or quant_info.origin_w2_shape is None
+            ):
+                raise RuntimeError("Missing original FP8 MoE weight shapes")
+
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                fused_moe_fp8_w8a8,
+            )
+
+            output = fused_moe_fp8_w8a8(
+                hidden_states=runner_input.hidden_states,
+                w1=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                topk_weights=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                global_num_experts=self.config.num_experts,
+                inplace=self.config.inplace,
+                origin_w1_shape=quant_info.origin_w13_shape,
+                origin_w2_shape=quant_info.origin_w2_shape,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        else:
+            output = torch.ops.sglang.fused_experts_impl_int8_marlin(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                topk_weights=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                inplace=self.config.inplace,
+                activation=self.config.activation,
+                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+                use_fp8_w8a8=False,
+                use_int8_w8a8=quant_info.use_int8_w8a8,
+                per_channel_quant=True,
+                global_num_experts=self.config.num_experts,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                a1_scale=quant_info.a13_scale,
+                a2_scale=quant_info.a2_scale,
+                use_nn_moe=False,
+                routed_scaling_factor=float(routed_scaling_factor),
+            )
         return LightOpRunnerOutput(hidden_states=output)
 
     @property

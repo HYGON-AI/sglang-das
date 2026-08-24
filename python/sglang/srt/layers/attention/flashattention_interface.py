@@ -159,9 +159,10 @@ def vllm_flash_attn_with_kvcache(
     return_softmax_lse=False,
     sinks=None,
     ver=3,
+    out=None,
 ):
     if _is_hcu and _use_triton_vllm_fa:
-        return triton_vllm_flash_attn_with_kvcache(
+        result = triton_vllm_flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -201,6 +202,12 @@ def _apply_flash_attn_varlen_out(result, out, return_softmax_lse):
         out.copy_(attn_out)
         return (out, lse, *rest)
     out.copy_(result)
+
+    # if return_softmax_lse:
+    #     attn_out, lse, *rest = result
+    #     out.copy_(attn_out.view_as(out))
+    #     return (out, lse, *rest)
+    # out.copy_(result.view_as(out))
     return out
 
 
@@ -293,9 +300,10 @@ def vllm_flash_attn_varlen_func(
     q_descale,
     k_descale,
     v_descale,
+    out=None,
 ):
     if _is_hcu and _use_triton_vllm_fa:
-        return triton_vllm_flash_attn_varlen_func(
+        result = triton_vllm_flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -312,21 +320,22 @@ def vllm_flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
         )
-
-    return vllm_flash_attn_varlen_func_interface(
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
-        seqused_k=seqused_k,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        block_table=block_table,
-        fa_version=fa_version,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
+    else:
+        result = vllm_flash_attn_varlen_func_interface(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_table,
+            fa_version=fa_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+    return _apply_flash_attn_varlen_out(result, out, False)

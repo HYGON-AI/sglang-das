@@ -2888,6 +2888,10 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    from sglang.srt.layers.moe.mega_moe import destroy_mega_moe_symm_buffers
+
+    destroy_mega_moe_symm_buffers()
+
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

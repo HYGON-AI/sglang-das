@@ -6921,6 +6921,19 @@ class ServerArgs:
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
         if a2a_backend == "megamoe":
+            if (
+                is_hcu()
+                and envs.SGLANG_HCU_MEGA_MOE_RUNTIME.get().strip().lower()
+                == "megamoe"
+                and resolved_view(self).quantization == "w8a8_int8"
+            ):
+                self.disable_shared_experts_fusion = True
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                logger.info(
+                    "HCU INT8 MegaMoE disables shared-expert fusion and CUDA "
+                    "graph because the standalone INT8 normal backend is eager-only."
+                )
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
 
