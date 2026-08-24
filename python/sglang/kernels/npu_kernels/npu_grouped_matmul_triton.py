@@ -53,7 +53,35 @@ def _pick_blocks(m: int, n: int, k: int):
     return bm, bn, bk
 
 
+def _group_ends_tensor(
+    group_list: GroupList, e: int, device: torch.device
+) -> torch.Tensor:
+    """Return cumsum ends as a contiguous int64 tensor on ``device``.
+
+    Hot-path safe: never reads GPU tensor values back to the host. Only the
+    shape (``numel``) is checked — value checks that would require ``.item()`` /
+    ``.tolist()`` are skipped here.
+    """
+    if group_list is None:
+        raise ValueError("group_list is required")
+    if isinstance(group_list, torch.Tensor):
+        ends = (
+            group_list.detach()
+            .to(device=device, dtype=torch.int64)
+            .reshape(-1)
+            .contiguous()
+        )
+    else:
+        ends = torch.as_tensor(
+            list(group_list), device=device, dtype=torch.int64
+        ).reshape(-1)
+    if ends.numel() != e:
+        raise ValueError(f"group_list length {ends.numel()} != E {e}")
+    return ends
+
+
 def _parse_group_ends(group_list: GroupList, e: int, m: int) -> List[int]:
+    """Host-side parse for golden / rare ``split_item`` 0/1 paths (may sync)."""
     if group_list is None:
         raise ValueError("group_list is required")
     if isinstance(group_list, torch.Tensor):
@@ -210,11 +238,14 @@ def grouped_matmul_triton(
             raise ValueError(f"K mismatch: x has {k}, weight has {weight.shape[1]}")
         n = int(weight.shape[2])
 
-    ends = _parse_group_ends(group_list, e, m)
-    starts = [0] + ends[:-1]
-    max_mi = max((ends[g] - starts[g] for g in range(e)), default=0)
+    # Prefer the activation device; fall back to default CUDA/HCU device.
+    device = x.device if x.is_cuda else _device()
+    # Keep group_list on device — never ``.tolist()`` on the hot path.
+    group_ends_t = _group_ends_tensor(group_list, e, device)
+    # Upper-bound max tokens per expert by M. Avoids ``amax().item()`` sync;
+    # empty / short groups early-return inside the kernel.
+    max_mi = m
 
-    device = _device()
     x_d = _to_device(x, device)
     w_d = _to_device(weight, device)
     bias_d = _to_device(bias, device)
@@ -228,7 +259,6 @@ def grouped_matmul_triton(
     # (W4A8 int8×int8) must keep the fp32 accumulator — casting to x.dtype
     # saturates at ±127 and breaks subsequent weight_scale * per_token_scale.
     y = torch.zeros((m, n), device=device, dtype=torch.float32)
-    group_ends_t = torch.tensor(ends, device=device, dtype=torch.int64)
 
     if m > 0 and max_mi > 0 and n > 0 and k > 0:
         bm, bn, bk = _pick_blocks(max_mi, n, k)
@@ -279,10 +309,14 @@ def grouped_matmul_triton(
     if x.dtype.is_floating_point:
         y = y.to(x.dtype)
 
-    if split_item in (0, 1):
-        return [y[starts[g] : ends[g]] for g in range(e)]
     if split_item in (2, 3):
         return [y]
+    if split_item in (0, 1):
+        # Rare path: host slices require reading ends (one sync). MoE uses
+        # split_item=2 and never hits this.
+        ends = group_ends_t.detach().cpu().tolist()
+        starts = [0] + ends[:-1]
+        return [y[starts[g] : ends[g]] for g in range(e)]
     raise ValueError(f"unsupported split_item={split_item}")
 
 # ---------------------------------------------------------------------------

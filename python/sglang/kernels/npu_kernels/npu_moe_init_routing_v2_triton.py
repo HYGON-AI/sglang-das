@@ -479,7 +479,11 @@ def npu_moe_init_routing_v2_triton(
     if expert_tokens_num_flag:
         if actual_expert_total_num > 0:
             ids = sorted_expert_idx[:actual_expert_total_num] - expert_start
-            counts = torch.bincount(ids, minlength=range_len).to(torch.int64)
+            # Device-side histogram only. Do NOT ``.tolist()`` / ``.cpu()`` the
+            # result on the MoE hot path — that sync dominated the profiler.
+            counts = torch.bincount(ids, minlength=range_len).to(
+                device=device, dtype=torch.int64
+            )
         else:
             counts = torch.zeros(range_len, dtype=torch.int64, device=device)
 
