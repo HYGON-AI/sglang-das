@@ -668,9 +668,18 @@ class DeepseekV4AttnBackend(
         self._dsv4_bf16_flashmla_decode = (
             envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.get()
         )
+        self._dsv4_lightop_bf16_gather = (
+            envs.SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER.get()
+        )
+        self._dsv4_lightop_kvcache_op = None
         self._dsv4_bf16_flashmla_workspaces: Dict[
             Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        if self._dsv4_lightop_bf16_gather and not self._dsv4_bf16_flashmla_decode:
+            raise RuntimeError(
+                "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER requires "
+                "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA=1"
+            )
         if self._dsv4_bf16_flashmla_decode:
             if not _is_hcu:
                 raise RuntimeError(
@@ -681,9 +690,33 @@ class DeepseekV4AttnBackend(
                     "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA is redundant because "
                     "the DSV4 attention KV cache is already BF16"
                 )
+            gather_backend = "Triton"
+            if self._dsv4_lightop_bf16_gather:
+                try:
+                    from lightop import op as lightop_kvcache
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=1 requires "
+                        "a LightOp package with the DPSKV4 gather/upconvert ops"
+                    ) from exc
+                required_ops = (
+                    "dsv4_gather_upconvert_k_cache_paged",
+                    "dsv4_gather_upconvert_dual_k_cache_paged",
+                )
+                missing_ops = [
+                    name for name in required_ops if not hasattr(lightop_kvcache, name)
+                ]
+                if missing_ops:
+                    raise RuntimeError(
+                        "The installed LightOp package is missing required DPSKV4 "
+                        f"gather/upconvert ops: {', '.join(missing_ops)}"
+                    )
+                self._dsv4_lightop_kvcache_op = lightop_kvcache
+                gather_backend = "LightOp"
             logger.info(
-                "Enabled DSV4 Triton FP8 KV gather/upconvert for BF16 "
-                "FlashMLA prefill/decode forwards"
+                "Enabled DSV4 %s FP8 KV gather/upconvert for BF16 FlashMLA "
+                "prefill/decode forwards",
+                gather_backend,
             )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -1774,10 +1807,83 @@ class DeepseekV4AttnBackend(
         extra_k_cache: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         assert swa_indices.ndim == 3 and swa_indices.shape[1] == 1
         num_queries, _, swa_topk = swa_indices.shape
         extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
+
+        if self._dsv4_lightop_bf16_gather:
+            op = self._dsv4_lightop_kvcache_op
+            if op is None:
+                raise RuntimeError("DSV4 LightOp gather backend was not initialized")
+
+            swa_gathered, swa_compact = self._get_dsv4_bf16_flashmla_workspace(
+                "swa", num_queries, swa_topk
+            )
+            swa_indices_2d = swa_indices[:, 0, :].contiguous()
+            swa_lengths = swa_topk_lengths.reshape(-1).contiguous()
+            swa_cache_u8 = swa_k_cache.view(torch.uint8)
+
+            if extra_k_cache is None:
+                op.dsv4_gather_upconvert_k_cache_paged(
+                    swa_cache_u8,
+                    swa_indices_2d,
+                    swa_lengths,
+                    swa_gathered,
+                    swa_compact,
+                    swa_k_cache.shape[1],
+                )
+                return (
+                    swa_gathered,
+                    swa_compact,
+                    swa_lengths,
+                    None,
+                    None,
+                    None,
+                )
+
+            assert extra_indices is not None and extra_topk_lengths is not None
+            assert extra_indices.ndim == 3 and extra_indices.shape[1] == 1
+            assert extra_indices.shape[0] == num_queries
+            extra_gathered, extra_compact = (
+                self._get_dsv4_bf16_flashmla_workspace(
+                    "extra", num_queries, extra_topk
+                )
+            )
+            extra_indices_2d = extra_indices[:, 0, :].contiguous()
+            extra_lengths = extra_topk_lengths.reshape(-1).contiguous()
+            extra_cache_u8 = extra_k_cache.view(torch.uint8)
+            op.dsv4_gather_upconvert_dual_k_cache_paged(
+                swa_cache_u8,
+                swa_indices_2d,
+                swa_lengths,
+                swa_gathered,
+                swa_compact,
+                swa_k_cache.shape[1],
+                extra_cache_u8,
+                extra_indices_2d,
+                extra_lengths,
+                extra_gathered,
+                extra_compact,
+                extra_k_cache.shape[1],
+            )
+            return (
+                swa_gathered,
+                swa_compact,
+                swa_lengths,
+                extra_gathered,
+                extra_compact,
+                extra_lengths,
+            )
+
+        # Preserve the original Triton fallback and its combined-cache ABI.
         combined_topk = swa_topk + extra_topk
         gathered_kv, compact_indices = self._get_dsv4_bf16_flashmla_workspace(
             "combined", num_queries, combined_topk
@@ -1805,7 +1911,14 @@ class DeepseekV4AttnBackend(
                 output_offsets=swa_topk_lengths,
             )
             combined_topk_lengths = swa_topk_lengths + extra_topk_lengths
-        return gathered_kv, compact_indices, combined_topk_lengths
+        return (
+            gathered_kv,
+            compact_indices,
+            combined_topk_lengths,
+            None,
+            None,
+            None,
+        )
 
     def _build_flash_mla_input_dict(
         self,
@@ -1954,23 +2067,21 @@ class DeepseekV4AttnBackend(
             and not logical_forward_mode.is_idle()
         )
         if use_bf16_gather and swa_k_cache.dtype != torch.bfloat16:
-            swa_k_cache, swa_page_indices, swa_topk_lengths = (
-                self._prepare_dsv4_bf16_flashmla_inputs(
-                    swa_k_cache=swa_k_cache,
-                    swa_indices=swa_page_indices,
-                    swa_topk_lengths=swa_topk_lengths,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices=extra_indices,
-                    extra_topk_lengths=extra_topk_lengths,
-                )
+            (
+                swa_k_cache,
+                swa_page_indices,
+                swa_topk_lengths,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_lengths,
+            ) = self._prepare_dsv4_bf16_flashmla_inputs(
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                extra_k_cache=extra_k_cache,
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_lengths,
             )
-            # The installed HCU BF16 sparse-decode kernel does not support its
-            # separate extra_kv arguments.  SWA and compressed KV were packed
-            # into one valid-prefix workspace above, preserving the same
-            # attention set and softmax semantics.
-            extra_k_cache = None
-            extra_indices = None
-            extra_topk_lengths = None
 
         input_dict = self._build_flash_mla_input_dict(
             q=q,
