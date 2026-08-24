@@ -26,6 +26,18 @@ def _to_cumsum(
     return gl
 
 
+def _row_expert_ids_from_cumsum(group_list: torch.Tensor, m: int) -> torch.Tensor:
+    """Map each of ``M`` token rows to its expert id from cumsum ends.
+
+    Fully on-device (no host sync). ``group_list[e]`` is the exclusive end
+    index of expert ``e``; empty experts appear as duplicate ends and are
+    skipped by ``searchsorted(..., right=True)``.
+    """
+    gl = group_list.to(torch.int64).reshape(-1)
+    rows = torch.arange(m, device=gl.device, dtype=gl.dtype)
+    return torch.searchsorted(gl, rows, right=True)
+
+
 def _scale_n_dim(scale: Optional[torch.Tensor]) -> Optional[int]:
     if scale is None:
         return None
@@ -179,33 +191,36 @@ class GroupedMatmul(BaseMatmul):
         )[0]
         if has_quant:
             # Triton runs on CUDA/HCU; keep scale/bias on the same device as y.
+            # Vectorized per-row expert gather — no ``.cpu().tolist()`` sync.
             compute_device = y.device
             y = y.to(torch.float32)
-            ends = group_list.detach().cpu().tolist()
-            starts = [0] + ends[:-1]
+            m_rows = int(y.shape[0])
+            eid = (
+                _row_expert_ids_from_cumsum(group_list.to(device=compute_device), m_rows)
+                if m_rows > 0
+                else None
+            )
 
-            if bias is not None and bias.dtype == torch.int32:
+            if bias is not None and bias.dtype == torch.int32 and eid is not None:
                 b = bias.to(device=compute_device, dtype=torch.float32)
-                for e, (s, t) in enumerate(zip(starts, ends)):
-                    if s < t:
-                        y[s:t] = y[s:t] + b[e].reshape(1, -1)
+                b = b.reshape(b.shape[0], -1)
+                y = y + b[eid]
 
-            if scale is not None:
+            if scale is not None and eid is not None:
                 sc = _scale_to_float32(scale).to(device=compute_device)
-                for e, (s, t) in enumerate(zip(starts, ends)):
-                    if s < t:
-                        y[s:t] = y[s:t] * sc[e].reshape(1, -1)
+                # Match previous ``sc[e].reshape(1, -1)``: flatten trailing dims.
+                sc = sc.reshape(sc.shape[0], -1)
+                y = y * sc[eid]
 
             if per_token_scale is not None:
                 y = y * per_token_scale.to(
                     device=compute_device, dtype=torch.float32
                 ).reshape(-1, 1)
 
-            if bias is not None and bias.dtype != torch.int32:
+            if bias is not None and bias.dtype != torch.int32 and eid is not None:
                 b = bias.to(device=compute_device, dtype=torch.float32)
-                for e, (s, t) in enumerate(zip(starts, ends)):
-                    if s < t:
-                        y[s:t] = y[s:t] + b[e].reshape(1, -1)
+                b = b.reshape(b.shape[0], -1)
+                y = y + b[eid]
 
             y = y.to(output_dtype)
         elif output_dtype is not None and y.dtype != output_dtype:
