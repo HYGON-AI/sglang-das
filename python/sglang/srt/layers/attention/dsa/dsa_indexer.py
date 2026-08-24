@@ -1288,7 +1288,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 pool,
                 layer_id,
                 block_tables,
-                metadata.get_seqlens_int32(),
+                # Target verify and draft extend expand the page table to one row
+                # per speculative token, so use the matching expanded lengths.
+                seqlens_32,
             )
             if use_bf16_index_cache:
                 active_weights = weights[:q_offset].to(torch.float32)
