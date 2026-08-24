@@ -1340,6 +1340,18 @@ class TestHiCacheArgs(unittest.TestCase):
         )
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_external_linker_rejects_disabled_radix_cache(self):
+        args = self._make_args(
+            enable_unified_cache_external_linker=True,
+            disable_radix_cache=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive",
+        ):
+            args._handle_cache_compatibility()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

@@ -8169,6 +8169,12 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_unified_cache_external_linker and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
