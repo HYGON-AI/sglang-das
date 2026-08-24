@@ -17,7 +17,6 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -51,20 +50,10 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
-if is_hcu():
-    from sglang.srt.layers.attention.flashattention_interface import (
-        flash_attn_varlen_func,
-        flash_attn_with_kvcache,
-        vllm_flash_attn_varlen_func,
-        vllm_flash_attn_with_kvcache,
-    )
-else:
-    from sglang.kernels.ops.attention.flash_attention import (
-        flash_attn_varlen_func,
-        flash_attn_with_kvcache,
-    )
-
-_kv_layout_hcu_fa = is_hcu() and envs.SGLANG_KV_LAYOUT_HCU_FA.get()
+from sglang.kernels.ops.attention.flash_attention import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
 
 _is_hcu = is_hcu()
 if _is_hcu:
@@ -81,6 +70,7 @@ if _is_hcu:
 _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
     "SGLANG_KV_LAYOUT_HCU_FA", default="true"
 )
+
 
 
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
@@ -1550,7 +1540,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif _kv_layout_hcu_fa and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
                     k=key_cache,
                     v=value_cache,
                     cu_seqlens_q=cu_seqlens_q,
@@ -1568,9 +1560,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif _kv_layout_hcu_fa:
                 result = vllm_flash_attn_with_kvcache(
-                    q=q.contiguous()
-                    .view(-1, layer.tp_q_head_num, layer.head_dim)
-                    .unsqueeze(1),
+                    q=q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ).unsqueeze(1),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
@@ -1995,7 +1987,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
-                if self._decode_uses_static_max_seqlen_k and not is_hcu():
+                if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -2016,7 +2008,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
-                if self._decode_uses_static_max_seqlen_k and not is_hcu():
+                if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
