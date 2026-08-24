@@ -75,10 +75,10 @@ def build_draft_tp_worker(
     draft_w4a8_context = nullcontext()
     if algo_label == "DSPARK":
         from sglang.srt.layers.moe.utils import (
-            dspark_w4a8_tpmoe_aiter_context,
+            dspark_w4a8_tpmoe_backend_context,
         )
 
-        draft_w4a8_context = dspark_w4a8_tpmoe_aiter_context()
+        draft_w4a8_context = dspark_w4a8_tpmoe_backend_context()
 
     # The draft's model construction runs its own MoE gates; the scope routes
     # their fusion decision to the speculative leaf and gives the target its
