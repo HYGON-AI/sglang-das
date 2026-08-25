@@ -1335,9 +1335,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_types = self.kv_manager.kv_args.state_types
             if (
                 self.scheduler.spec_algorithm.is_dspark()
-                and not _is_fake_transfer(
-                    decode_req.req, self.scheduler.server_args
-                )
+                and not _is_fake_transfer(decode_req.req)
                 and StateType.PD_HIDDEN in state_types
                 and pd_hidden_len > 0
             ):
