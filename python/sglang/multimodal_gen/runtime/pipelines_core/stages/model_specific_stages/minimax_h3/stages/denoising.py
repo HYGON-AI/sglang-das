@@ -776,7 +776,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 model,
                 positive,
                 device=device,
-                shared_conditioning=emb,
             )
             _precompute_rope_cache(
                 model,
