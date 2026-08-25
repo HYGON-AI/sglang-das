@@ -204,27 +204,24 @@ class DeepEPBuffer:
     def _state(cls):
         from types import SimpleNamespace
 
-        from sglang.srt.runtime_context import get_flags, get_resources
+        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
-        # DSpark's draft and target can use different expert layouts (257 vs
-        # 256 for DSV4). DeepEP's low-latency RDMA size depends on that layout,
-        # so each runtime scope needs its own process-level buffer.
-        state_key = (
-            "deepep_ep_state_speculative"
-            if get_flags().moe.in_speculative_a2a_scope
-            else "deepep_ep_state"
-        )
-        state = buffers.get(state_key)
+        # DeepEP's low-latency runtime is process-wide. Creating a second LL
+        # Buffer for the speculative model invalidates/hangs the first runtime
+        # on HCU, so target and draft must share one compatible allocation.
+        state = buffers.get("deepep_ep_state")
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
                 dispatch_mode=None,
+                deepep_mode=None,
+                group_size=None,
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
             )
-            buffers[state_key] = state
+            buffers["deepep_ep_state"] = state
         return state
 
     @classmethod
@@ -239,8 +236,45 @@ class DeepEPBuffer:
     ):
         state = cls._state()
         if state.buffer is not None:
+            incompatible = []
+            if state.group_size != group.size():
+                incompatible.append(
+                    f"EP size {state.group_size} != requested {group.size()}"
+                )
+            if state.hidden_size != hidden_size:
+                incompatible.append(
+                    f"hidden size {state.hidden_size} != requested {hidden_size}"
+                )
+            if deepep_mode.enable_normal() and not state.deepep_mode.enable_normal():
+                incompatible.append("existing buffer has no normal-mode allocation")
+            if deepep_mode.enable_low_latency():
+                if not state.deepep_mode.enable_low_latency():
+                    incompatible.append("existing buffer has no low-latency allocation")
+                if (
+                    state.num_max_dispatch_tokens_per_rank
+                    != num_max_dispatch_tokens_per_rank
+                ):
+                    incompatible.append(
+                        "max dispatch tokens "
+                        f"{state.num_max_dispatch_tokens_per_rank} != requested "
+                        f"{num_max_dispatch_tokens_per_rank}"
+                    )
+                if state.num_experts != num_experts:
+                    incompatible.append(
+                        f"expert count {state.num_experts} != requested {num_experts}"
+                    )
+            if incompatible:
+                raise RuntimeError(
+                    "Target and speculative DeepEP cannot create independent "
+                    "low-latency buffers in one process. Make their DeepEP "
+                    "layouts compatible or use a non-DeepEP speculative MoE "
+                    "backend. Incompatibilities: "
+                    + "; ".join(incompatible)
+                )
             return state.buffer
 
+        state.deepep_mode = deepep_mode
+        state.group_size = group.size()
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
