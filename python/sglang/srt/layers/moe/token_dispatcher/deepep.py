@@ -758,6 +758,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                             if is_hcu()
                             else get_model().quantization == "slimquant_marlin"
                         )
+                        or get_model().quantization == "slimquant_w4a8_marlin"
                         or _use_fp8_w8a8_moe
                         or _use_marlin_w16a16_moe
                     )

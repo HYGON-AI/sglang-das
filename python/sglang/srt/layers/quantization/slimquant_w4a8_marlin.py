@@ -660,46 +660,15 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not _use_lightop_w4a8_marlin_moe:
-            # mxfp4_to_int4.py packs (even_k << 4) | odd_k with two's
-            # complement nibbles and stores scale/16 (the legacy lightop
-            # kernel applies the missing x16). The Triton W4A16 kernel instead
-            # expects even k in the LOW nibble, offset-8 unsigned nibbles, and
-            # the scale applied directly. Convert the checkpoint layout:
-            #   - swap nibbles (even k -> low nibble)
-            #   - flip bit 3 of every nibble (two's complement -> +8 offset)
-            #   - restore the true per-channel scale (x16)
-            def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
-                u = w.data.to(torch.uint8)
-                u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
-                    torch.int8
-                )
-                return u.contiguous()
-
-            if _use_aiter_moe:
-                E = layer.w13_weight.shape[0]
+            if self.use_deepep:
+                from deepgemm import pack_w4a8_moe_hipc_weight
                 layer.w13_weight = Parameter(
-                    repack_and_shuffle_w4a8(layer.w13_weight.data, E),
+                    pack_w4a8_moe_hipc_weight(layer.w13_weight.data),
                     requires_grad=False,
                 )
                 layer.w2_weight = Parameter(
-                    repack_and_shuffle_w4a8(layer.w2_weight.data, E),
+                    pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                     requires_grad=False,
-                )
-                scale_mul = 1.0
-                layer.w13_weight_scale = Parameter(
-                    layer.w13_weight_scale.data * scale_mul,
-                    requires_grad=False,
-                )
-                layer.w2_weight_scale = Parameter(
-                    layer.w2_weight_scale.data * scale_mul,
-                    requires_grad=False,
-                )
-            else:
-                layer.w13_weight = Parameter(
-                    _to_triton_layout(layer.w13_weight), requires_grad=False
-                )
-                layer.w2_weight = Parameter(
-                    _to_triton_layout(layer.w2_weight), requires_grad=False
                 )
                 scale_mul = 16.0
                 layer.w13_weight_scale = Parameter(
@@ -710,6 +679,57 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                     layer.w2_weight_scale.data * scale_mul,
                     requires_grad=False,
                 )
+            else:
+                # mxfp4_to_int4.py packs (even_k << 4) | odd_k with two's
+                # complement nibbles and stores scale/16 (the legacy lightop
+                # kernel applies the missing x16). The Triton W4A16 kernel instead
+                # expects even k in the LOW nibble, offset-8 unsigned nibbles, and
+                # the scale applied directly. Convert the checkpoint layout:
+                #   - swap nibbles (even k -> low nibble)
+                #   - flip bit 3 of every nibble (two's complement -> +8 offset)
+                #   - restore the true per-channel scale (x16)
+                def _to_triton_layout(w: torch.Tensor) -> torch.Tensor:
+                    u = w.data.to(torch.uint8)
+                    u = ((((u & 0x0F) << 4) | ((u >> 4) & 0x0F)) ^ 0x88).to(
+                        torch.int8
+                    )
+                    return u.contiguous()
+
+                if _use_aiter_moe:
+                    E = layer.w13_weight.shape[0]
+                    layer.w13_weight = Parameter(
+                        repack_and_shuffle_w4a8(layer.w13_weight.data, E),
+                        requires_grad=False,
+                    )
+                    layer.w2_weight = Parameter(
+                        repack_and_shuffle_w4a8(layer.w2_weight.data, E),
+                        requires_grad=False,
+                    )
+                    scale_mul = 1.0
+                    layer.w13_weight_scale = Parameter(
+                        layer.w13_weight_scale.data * scale_mul,
+                        requires_grad=False,
+                    )
+                    layer.w2_weight_scale = Parameter(
+                        layer.w2_weight_scale.data * scale_mul,
+                        requires_grad=False,
+                    )
+                else:
+                    layer.w13_weight = Parameter(
+                        _to_triton_layout(layer.w13_weight), requires_grad=False
+                    )
+                    layer.w2_weight = Parameter(
+                        _to_triton_layout(layer.w2_weight), requires_grad=False
+                    )
+                    scale_mul = 16.0
+                    layer.w13_weight_scale = Parameter(
+                        layer.w13_weight_scale.data * scale_mul,
+                        requires_grad=False,
+                    )
+                    layer.w2_weight_scale = Parameter(
+                        layer.w2_weight_scale.data * scale_mul,
+                        requires_grad=False,
+                    )
         else:
             # Legacy lightop path: repack into the Marlin W4A8 layout.
             layer.w13_weight = Parameter(
