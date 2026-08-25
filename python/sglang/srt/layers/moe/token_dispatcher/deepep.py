@@ -629,7 +629,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 expert_alignment=(
                     256
                     if (
-                        get_global_server_args().quantization == "slimquant_marlin"
+                        get_global_server_args().quantization
+                        in (
+                            "slimquant_marlin",
+                            "slimquant_w4a8_marlin",
+                        )
                         or _use_fp8_w8a8_moe
                         or _use_marlin_w16a16_moe
                     )

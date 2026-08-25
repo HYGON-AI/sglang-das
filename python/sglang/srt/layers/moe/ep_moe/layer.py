@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     build_m_indices_triton,
@@ -118,7 +121,9 @@ from deepgemm import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_masked,
+    m_grouped_w4a8_gemm_nt_contiguous_hipc,
     m_grouped_w4a8_gemm_nt_masked,
+    m_grouped_w4a8_gemm_nt_masked_hipc,
 )
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import moe as lightop_op
@@ -138,6 +143,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
+_use_w4a8_contiguous_hipc = get_bool_env_var(
+    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
+)
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -336,6 +344,7 @@ def _ep_scatter_with_optional_lightop(
         recv_x_scale,
         recv_topk,
         num_recv_tokens_per_expert,
+        None,  # num_valid_tokens_per_expert is unused by the group-GEMM path
         expert_start_loc,
         output_tensor,
         output_tensor_scale,
@@ -366,6 +375,36 @@ def m_grouped_w4a8_gemm_nt_masked_wrapper(
 
 
 def m_grouped_w4a8_gemm_nt_masked_fake(
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+) -> torch.Tensor:
+    return d
+
+
+def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+) -> torch.Tensor:
+    return m_grouped_w4a8_gemm_nt_masked_hipc(
+        (a0, a1),
+        (b0, b1),
+        d,
+        masked_m,
+        expected_m_per_group,
+    )
+
+
+def m_grouped_w4a8_gemm_nt_masked_hipc_fake(
     a0: torch.Tensor,
     a1: torch.Tensor,
     b0: torch.Tensor,
@@ -435,12 +474,181 @@ def fuse_silu_mul_quant_ep_fake(
     return output, scales
 
 
+@triton.jit
+def _fuse_situ_mul_quant_contiguous_kernel(
+    input_ptr,
+    output_ptr,
+    scales_ptr,
+    hidden: tl.constexpr,
+    situ_beta: tl.constexpr,
+    situ_linear_beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden
+    row_input = input_ptr + row * (2 * hidden)
+    gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+    up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+    activated = (
+        situ_beta
+        * gate_tanh
+        * tl.sigmoid(gate)
+        * situ_linear_beta
+        * up_tanh
+    )
+    amax = tl.max(tl.abs(activated), axis=0)
+    scale = tl.where(amax > 0.0, amax / 127.0, 1.0)
+    quantized = libdevice.rint(activated / scale)
+    quantized = tl.maximum(-127.0, tl.minimum(127.0, quantized)).to(tl.int8)
+    tl.store(output_ptr + row * hidden + offsets, quantized, mask=mask)
+    tl.store(scales_ptr + row, scale)
+
+
+def fuse_situ_mul_quant_contiguous(
+    input: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input.ndim != 2 or input.shape[-1] % 2 != 0:
+        raise ValueError("input must have shape [tokens, 2 * hidden]")
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError("SiTU beta and linear_beta must be positive")
+    tokens, doubled_hidden = input.shape
+    hidden = doubled_hidden // 2
+    output = torch.empty(
+        (tokens, hidden), dtype=torch.int8, device=input.device
+    )
+    scales = torch.empty((tokens, 1), dtype=torch.float32, device=input.device)
+    _fuse_situ_mul_quant_contiguous_kernel[(tokens,)](
+        input,
+        output,
+        scales,
+        hidden=hidden,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
+        BLOCK_SIZE=triton.next_power_of_2(hidden),
+    )
+    return output, scales
+
+
+@triton.jit
+def _fuse_situ_mul_quant_ep_kernel(
+    input_ptr,
+    output_ptr,
+    scales_ptr,
+    masked_m_ptr,
+    tokens: tl.constexpr,
+    hidden: tl.constexpr,
+    situ_beta: tl.constexpr,
+    situ_linear_beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    expert = row // tokens
+    token = row - expert * tokens
+    valid_row = token < tl.load(masked_m_ptr + expert)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = (offsets < hidden) & valid_row
+    row_input = input_ptr + row * (2 * hidden)
+    gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+    # SiTU / SoftCap-GLU used by Kimi K3. Express tanh via sigmoid because
+    # that is supported consistently by the CUDA and HIP Triton backends.
+    gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+    up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+    activated = (
+        situ_beta
+        * gate_tanh
+        * tl.sigmoid(gate)
+        * situ_linear_beta
+        * up_tanh
+    )
+
+    amax = tl.max(tl.abs(activated), axis=0)
+    # A scale of one gives an exact, finite representation for an all-zero or
+    # padded row. Valid nonzero rows use symmetric per-token INT8 quantization.
+    scale = tl.where(valid_row & (amax > 0.0), amax / 127.0, 1.0)
+    quantized = libdevice.rint(activated / scale)
+    quantized = tl.maximum(-127.0, tl.minimum(127.0, quantized)).to(tl.int8)
+    tl.store(output_ptr + row * hidden + offsets, quantized, mask=offsets < hidden)
+    tl.store(scales_ptr + row, scale)
+
+
+def fuse_situ_mul_quant_ep(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input.ndim != 3 or input.shape[-1] % 2 != 0:
+        raise ValueError("input must have shape [experts, tokens, 2 * hidden]")
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+    experts, tokens, doubled_hidden = input.shape
+    if masked_m.shape != (experts,):
+        raise ValueError(f"masked_m must have shape ({experts},)")
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError("SiTU beta and linear_beta must be positive")
+    hidden = doubled_hidden // 2
+    output = torch.empty(
+        (experts, tokens, hidden), dtype=torch.int8, device=input.device
+    )
+    scales = torch.empty(
+        (experts, tokens, 1), dtype=torch.float32, device=input.device
+    )
+    _fuse_situ_mul_quant_ep_kernel[(experts * tokens,)](
+        input,
+        output,
+        scales,
+        masked_m,
+        tokens=tokens,
+        hidden=hidden,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
+        BLOCK_SIZE=triton.next_power_of_2(hidden),
+    )
+    return output, scales
+
+
+def fuse_situ_mul_quant_ep_fake(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    experts, tokens, doubled_hidden = input.shape
+    output = torch.empty(
+        (experts, tokens, doubled_hidden // 2), dtype=torch.int8, device=input.device
+    )
+    scales = torch.empty(
+        (experts, tokens, 1), dtype=torch.float32, device=input.device
+    )
+    return output, scales
+
+
 direct_register_custom_op(
     op_name="m_grouped_w4a8_gemm_nt_masked",
     op_func=m_grouped_w4a8_gemm_nt_masked_wrapper,
     mutates_args=[],
     fake_impl=m_grouped_w4a8_gemm_nt_masked_fake,
 )
+direct_register_custom_op(
+    op_name="m_grouped_w4a8_gemm_nt_masked_hipc",
+    op_func=m_grouped_w4a8_gemm_nt_masked_hipc_wrapper,
+    mutates_args=[],
+    fake_impl=m_grouped_w4a8_gemm_nt_masked_hipc_fake,
+)
+
 direct_register_custom_op(
     op_name="m_grouped_i8_gemm_nt_masked",
     op_func=m_grouped_i8_gemm_nt_masked_wrapper,
@@ -453,6 +661,13 @@ direct_register_custom_op(
     op_func=fuse_silu_mul_quant_ep_wrapper,
     mutates_args=[],
     fake_impl=fuse_silu_mul_quant_ep_fake,
+)
+
+direct_register_custom_op(
+    op_name="fuse_situ_mul_quant_ep",
+    op_func=fuse_situ_mul_quant_ep,
+    mutates_args=[],
+    fake_impl=fuse_situ_mul_quant_ep_fake,
 )
 
 
@@ -948,7 +1163,116 @@ class DeepEPMoE(FusedMoE):
         ) = dispatch_output
         # hidden_states_int8, hidden_states_scale = hidden_states_int8
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
+
+        if _use_w4a8_contiguous_hipc:
+            if num_recv_tokens_per_expert is None:
+                return hidden_states.bfloat16()
+            all_tokens = sum(num_recv_tokens_per_expert)
+            if all_tokens <= 0:
+                return hidden_states.bfloat16()
+
+            _, k = hidden_states.shape
+            n1 = self.w13_weight_scale.size(1)
+            hidden_states_shape = hidden_states.shape
+            hidden_states_device = hidden_states.device
+            counts_are_aligned = all(
+                count % 256 == 0 for count in num_recv_tokens_per_expert
+            )
+            if not counts_are_aligned or all_tokens % 256 != 0:
+                raise RuntimeError(
+                    "W4A8 contiguous HIPC requires DeepEP normal dispatch "
+                    "counts aligned to 256; restart all ranks with the updated "
+                    "deepep.py and SGLANG_GROUPGEMM=true. Got counts="
+                    f"{num_recv_tokens_per_expert}"
+                )
+
+            # Both HIPC kernels consume the true scale restored by
+            # process_weights_after_loading; no forward-time rescaling is needed.
+
+            # DeepEP normal dispatch is token-major. Scatter it into contiguous
+            # expert segments and retain output_index for the weighted gather.
+            a_int8 = torch.empty(
+                (all_tokens, k),
+                device=hidden_states_device,
+                dtype=hidden_states.dtype,
+            )
+            a_scale = torch.empty(
+                (all_tokens, 1),
+                device=hidden_states_device,
+                dtype=torch.float32,
+            )
+            if get_offloader().forbid_copy_engine_usage:
+                num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+                    num_recv_tokens_per_expert
+                )
+            else:
+                num_recv_tokens_per_expert_gpu = torch.tensor(
+                    num_recv_tokens_per_expert,
+                    dtype=torch.int32,
+                    pin_memory=True,
+                    device="cpu",
+                ).cuda(non_blocking=True)
+            m_indices, output_index = _ep_scatter_with_optional_lightop(
+                hidden_states,
+                hidden_states_scale,
+                topk_idx,
+                num_recv_tokens_per_expert_gpu,
+                a_int8,
+                a_scale,
+                all_tokens,
+                counts_are_aligned=counts_are_aligned,
+            )
+
+            gateup_output_factory = torch.empty if counts_are_aligned else torch.zeros
+            gateup_output = gateup_output_factory(
+                (all_tokens, n1),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            m_grouped_w4a8_gemm_nt_contiguous_hipc(
+                (a_int8, a_scale),
+                (self.w13_weight, self.w13_weight_scale),
+                gateup_output,
+                m_indices,
+            )
+            del a_int8, a_scale
+
+            if self.moe_runner_config.activation == "situ":
+                q_a2_all, q_a2_scale = fuse_situ_mul_quant_contiguous(
+                    gateup_output,
+                    self.moe_runner_config.gemm1_alpha,
+                    self.moe_runner_config.gemm1_clamp_limit,
+                )
+            else:
+                q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+            del gateup_output
+
+            down_output = torch.empty(
+                (all_tokens, k),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            m_grouped_w4a8_gemm_nt_contiguous_hipc(
+                (q_a2_all, q_a2_scale),
+                (self.w2_weight, self.w2_weight_scale),
+                down_output,
+                m_indices,
+            )
+
+            # This gather restores the normal-dispatch row order and applies
+            # top-k weights exactly as the existing FP8/W8A8 paths do.
+            gather_out = torch.zeros(
+                hidden_states_shape,
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            _ep_gather_with_optional_lightop(
+                down_output, topk_idx, topk_weights, output_index, gather_out
+            )
+            del down_output
+            return gather_out
+
         all_tokens = sum(num_recv_tokens_per_expert)
 
         if all_tokens <= 0:
@@ -1636,7 +1960,7 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
 
         # base shapes
         num_groups, m, k = hidden_states.size()
@@ -1656,7 +1980,7 @@ class DeepEPMoE(FusedMoE):
         )
 
         # ---- first GEMM ----
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
+        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc(
             hidden_states,
             hidden_states_scale,
             w13_weight,
@@ -1666,9 +1990,19 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
-            gateup_output, masked_m
-        )
+        # Kimi K3 uses SiTU, not SiLU. Keep the original SiLU path intact for
+        # other models and use the correctness-first Triton INT8 op only here.
+        if self.moe_runner_config.activation == "situ":
+            q_a2_all, q_a2_scale = torch.ops.sglang.fuse_situ_mul_quant_ep(
+                gateup_output,
+                masked_m,
+                self.moe_runner_config.gemm1_alpha,
+                self.moe_runner_config.gemm1_clamp_limit,
+            )
+        else:
+            q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+                gateup_output, masked_m
+            )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
@@ -1679,7 +2013,7 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
         )
 
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
+        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc(
             q_a2_all,
             q_a2_scale,
             w2_weight,
