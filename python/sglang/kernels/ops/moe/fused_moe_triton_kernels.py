@@ -60,6 +60,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+if _is_hcu:
+    from lightop.quant import per_token_quant_int8
 
 if _is_cuda:
     pass
