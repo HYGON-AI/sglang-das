@@ -79,6 +79,14 @@ class DraftBackendFactory:
 
         stamp, backend = backend_map[backend_type]()
         if backend is not None:
+            if stamps_children:
+                from sglang.srt.layers.attention.attention_registry import (
+                    attn_backend_wrapper_for_draft_decode,
+                )
+
+                backend = attn_backend_wrapper_for_draft_decode(
+                    self.draft_model_runner, backend
+                )
             backend.prefill_attention_backend_str = stamp
             backend.decode_attention_backend_str = stamp
             if stamps_children:
@@ -305,7 +313,7 @@ class DraftBackendFactory:
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             ),
         )
-    
+
     def _create_hcumla_decode_backend(self):
         from sglang.srt.layers.attention.hcu_mla_backend import (
             HCUMLAMultiStepDraftBackend,

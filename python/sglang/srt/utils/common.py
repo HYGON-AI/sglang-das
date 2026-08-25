@@ -101,7 +101,11 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_exec,
+    get_parallel,
+)
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -188,6 +192,7 @@ def is_npu() -> bool:
 
     return True
 
+
 @lru_cache(maxsize=1)
 def is_hcu() -> bool:
     if not is_hip():
@@ -212,6 +217,7 @@ def is_hcu_native_fp8_supported() -> bool:
     except Exception as e:
         logger.warning("HCU native FP8 detection failed: %s", e)
         return False
+
 
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
@@ -3609,10 +3615,12 @@ def bind_or_assign(target, source):
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
-def is_no_spec_infer_or_topk_one(server_args):
-    return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk == 1
-        and (server_args.page_size == 1 or server_args.page_size is None)
+def is_no_spec_infer_or_topk_one(cfg):
+    """``cfg`` is a resolving config view, not the published record: the
+    resolution pipeline is the only caller, and it asks mid-resolution."""
+    return cfg.speculative_eagle_topk is None or (
+        cfg.speculative_eagle_topk == 1
+        and (cfg.page_size == 1 or cfg.page_size is None)
     )
 
 
@@ -3788,7 +3796,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > server_args.tp_size // get_parallel().dp_size
+                > configured_tp_size() // get_parallel().dp_size
             )
     else:
         return False
@@ -3814,7 +3822,7 @@ def require_attn_tp_gather(server_args: ServerArgs):
         or get_parallel().moe_dense_tp_size is not None
     ):
         if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < server_args.tp_size
+            return get_parallel().dp_size < configured_tp_size()
         else:
             return True
     else:
@@ -3833,7 +3841,7 @@ def require_mlp_sync(server_args: ServerArgs):
 
 def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
     alignment = 1
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
     if require_gathered_buffer(server_args) or server_args.minimax_opt:
         alignment *= get_parallel().attn_tp_size
@@ -4735,6 +4743,7 @@ def get_or_create_event_loop():
         asyncio.set_event_loop(loop)
         return loop
 
+
 def get_numa_node_count() -> int:
     """
     Get the number of NUMA nodes available on the system.
@@ -4876,6 +4885,8 @@ def bind_to_closest_numa_node_cuda():
     if is_numa_available() and nvgpu_available():
         node_id = get_current_device_numa_node_cuda()
         numa_bind_to_node(node_id)
+
+
 # from vllm
 class W8a8GetCacheJSON:
     _instance = None
@@ -4888,44 +4899,42 @@ class W8a8GetCacheJSON:
 
     def _initialize(self):
         current_folder_path = os.path.dirname(os.path.abspath(__file__))
-        json_folder_path=current_folder_path+'/../../lmslim/configs/w8a8'
+        json_folder_path = current_folder_path + "/../../lmslim/configs/w8a8"
 
-        self.triton_json_dir=(os.getenv('TRITON_JSON_DIR', json_folder_path))
-        self.triton_json_dict={}
-        self.triton_moejson_dict={}
-        self.triton_json_list=[]
-        self.weight_shapes=[]
-        self.moe_weight_shapes=[]
-        arch_name = torch.cuda.get_device_properties("cuda").gcnArchName.split(':')[0]
-        arch_cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        self.triton_json_dir = os.getenv("TRITON_JSON_DIR", json_folder_path)
+        self.triton_json_dict = {}
+        self.triton_moejson_dict = {}
+        self.triton_json_list = []
+        self.weight_shapes = []
+        self.moe_weight_shapes = []
+        arch_name = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+        arch_cu = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
 
-        device_name =arch_name+'_'+str(arch_cu)+'cu'
-        self.device_name=device_name
-        self.topk=1
-        self.quant_method=None
+        device_name = arch_name + "_" + str(arch_cu) + "cu"
+        self.device_name = device_name
+        self.topk = 1
+        self.quant_method = None
 
-    #析构函数，最后会生成model.json的配置文件
-    def gen_model_json(self,E:Optional[int]=0,block_size:Optional[list]=None):
-        json_dir = os.getenv('LMSLIM_TUNING_JSON', "None")
+    # 析构函数，最后会生成model.json的配置文件
+    def gen_model_json(self, E: Optional[int] = 0, block_size: Optional[list] = None):
+        json_dir = os.getenv("LMSLIM_TUNING_JSON", "None")
         if json_dir != "None" and os.path.exists(json_dir):
-            #生成模型配置文件
+            # 生成模型配置文件
             # logger.info("model_tuning.json is at LMSLIM_TUNING_JSON:%s", json_dir)
             config = {
                 "layers": {
                     "linear": {
                         "shapes": [],
-                        "m_range":"None",
-                    },
-                    "moe": {
-                        "shapes": [],
                         "m_range": "None",
-                        "topk": self.topk
-                    }
+                    },
+                    "moe": {"shapes": [], "m_range": "None", "topk": self.topk},
                 },
                 "quantization_config": {
                     "quant_method": self.quant_method,
-                    "weight_block_size": "None"
-                }
+                    "weight_block_size": "None",
+                },
             }
 
             # 处理 MoE shapes
@@ -4935,7 +4944,7 @@ class W8a8GetCacheJSON:
                         "E": shape[0],
                         "N1": shape[1],
                         "N2": shape[2],
-                        "K": shape[3],      # 默认值
+                        "K": shape[3],  # 默认值
                     }
                     config["layers"]["moe"]["shapes"].append(moe_config)
 
@@ -4943,91 +4952,114 @@ class W8a8GetCacheJSON:
                 config["layers"]["linear"]["shapes"].append(shape)
 
             if block_size is not None:
-                config["quantization_config"]["weight_block_size"]=block_size
+                config["quantization_config"]["weight_block_size"] = block_size
 
-            with open(json_dir+"/model.json", 'w') as f:
+            with open(json_dir + "/model.json", "w") as f:
                 json.dump(config, f, indent=4)
         # else:
         #     logger.info("LMSLIM_TUNING_JSON is not set")
 
-    def getspec_config(self,configs_dict,M,N,K):
+    def getspec_config(self, configs_dict, M, N, K):
         if f"{M}_{N}_{K}" in configs_dict:
             return configs_dict[f"{M}_{N}_{K}"]
         else:
             return None
 
-    def get_triton_cache(self,file_path,n,k):
-        #在非tuning的时候使用，当文件不存在则直接返回none
-        cache_json_file=file_path
+    def get_triton_cache(self, file_path, n, k):
+        # 在非tuning的时候使用，当文件不存在则直接返回none
+        cache_json_file = file_path
 
         if os.path.exists(file_path):
-        #try:
-            with open(cache_json_file, 'r') as file:
+            # try:
+            with open(cache_json_file, "r") as file:
                 cachedata = json.load(file)
         else:
             return None
 
-        #把所有的cache解析成key:config的形式：[M_N_K]:[config]
-        configs_dict={}
+        # 把所有的cache解析成key:config的形式：[M_N_K]:[config]
+        configs_dict = {}
         for key, value in cachedata.items():
             for sub_key, sub_value in value.items():
-                configs_key= f"{sub_key}_{key}"
-                configs_dict[configs_key]=sub_value
+                configs_key = f"{sub_key}_{key}"
+                configs_dict[configs_key] = sub_value
         return configs_dict
 
-    def get_w8a8json_name(self,n,k):
-        return self.triton_json_dir+f"/W8A8_{n}_{k}_{self.device_name}.json"
+    def get_w8a8json_name(self, n, k):
+        return self.triton_json_dir + f"/W8A8_{n}_{k}_{self.device_name}.json"
 
-    def get_blockint8_triton_cache(self,file_path,n,k,block_n,block_k):
-        cache_json_file=file_path
+    def get_blockint8_triton_cache(self, file_path, n, k, block_n, block_k):
+        cache_json_file = file_path
 
         if os.path.exists(file_path):
-        #try:
-            with open(cache_json_file, 'r') as file:
+            # try:
+            with open(cache_json_file, "r") as file:
                 cachedata = json.load(file)
         else:
             return None
 
-        #把所有的cache解析成key:config的形式：[M_N_K]:[config]
-        configs_dict={}
+        # 把所有的cache解析成key:config的形式：[M_N_K]:[config]
+        configs_dict = {}
         for key, value in cachedata.items():
             for sub_key, sub_value in value.items():
-                configs_key= f"{sub_key}_{key}"
-                configs_dict[configs_key]=sub_value
+                configs_key = f"{sub_key}_{key}"
+                configs_dict[configs_key] = sub_value
         return configs_dict
 
-    def get_blockint8json_name(self,n,k,block_n,block_k):
-        return self.triton_json_dir+f"/linear_{n}_{k}_block[{block_n},{block_k}]_{self.device_name}.json"
+    def get_blockint8json_name(self, n, k, block_n, block_k):
+        return (
+            self.triton_json_dir
+            + f"/linear_{n}_{k}_block[{block_n},{block_k}]_{self.device_name}.json"
+        )
 
-    def get_moeint8json_name(self,E,N1,N2,K,TOPK,
-                             block_size:Optional[list]=None,use_int4_w4a8:Optional[bool]=False):
+    def get_moeint8json_name(
+        self,
+        E,
+        N1,
+        N2,
+        K,
+        TOPK,
+        block_size: Optional[list] = None,
+        use_int4_w4a8: Optional[bool] = False,
+    ):
         if use_int4_w4a8:
             if block_size is not None:
-                return self.triton_json_dir+f"/MOE_W4A8INT8[{block_size[0]},{block_size[1]}]_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                return (
+                    self.triton_json_dir
+                    + f"/MOE_W4A8INT8[{block_size[0]},{block_size[1]}]_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                )
             else:
-                return self.triton_json_dir+f"/MOE_W4A8INT8_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                return (
+                    self.triton_json_dir
+                    + f"/MOE_W4A8INT8_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                )
         else:
             if block_size is not None:
-                return self.triton_json_dir+f"/MOE_BLOCKINT8[{block_size[0]},{block_size[1]}]_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                return (
+                    self.triton_json_dir
+                    + f"/MOE_BLOCKINT8[{block_size[0]},{block_size[1]}]_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                )
             else:
-                return self.triton_json_dir+f"/MOE_W8A8INT8_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                return (
+                    self.triton_json_dir
+                    + f"/MOE_W8A8INT8_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json"
+                )
 
-    def get_moeint8_triton_cache(self,file_path,E,N1,N2,K,TOPK):
-        cache_json_file=file_path
+    def get_moeint8_triton_cache(self, file_path, E, N1, N2, K, TOPK):
+        cache_json_file = file_path
 
         if os.path.exists(file_path):
-        #try:
-            with open(cache_json_file, 'r') as file:
+            # try:
+            with open(cache_json_file, "r") as file:
                 cachedata = json.load(file)
         else:
             return None
 
-        #把所有的cache解析成key:config的形式：[M_N_K]:[config1,config2]
-        configs_dict={}
+        # 把所有的cache解析成key:config的形式：[M_N_K]:[config1,config2]
+        configs_dict = {}
         for key, value in cachedata.items():
             for sub_key, sub_value in value.items():
-                configs_key= f"{sub_key}_{key}"
-                configs_dict[configs_key]=sub_value
+                configs_key = f"{sub_key}_{key}"
+                configs_dict[configs_key] = sub_value
 
         return configs_dict
 

@@ -5,7 +5,7 @@ permissions:
   pull-requests: read
 
 on:
-  pull_request:
+  pull_request_target:
     paths:
       - 'python/**'
       - 'python/sglang/kernels/aot/**'
@@ -31,7 +31,7 @@ jobs:
   compile:
     # ---- 并发控制: 同一分支 + 同一 Python 版本的 job 只保留最新一个 ----
     concurrency:
-      group: release-pr-hcu-${{ github.ref }}-py${{ matrix.python-version }}
+      group: release-pr-hcu-${{ github.event.pull_request.number || github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
     runs-on: [self-hosted, hcu, nmz4]
@@ -59,8 +59,6 @@ jobs:
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
-      HCU_RUNNER_HOST_UID: ${{ vars.HCU_RUNNER_HOST_UID || '1000' }}
-      HCU_RUNNER_HOST_GID: ${{ vars.HCU_RUNNER_HOST_GID || '1000' }}
       WHEEL_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
 
@@ -69,14 +67,26 @@ jobs:
       # 环境准备
       # =======================================================================
 
+      - name: Detect runner workspace ownership
+        shell: bash
+        run: |
+          host_uid="$(stat -c '%u' "${RUNNER_TEMP}")"
+          host_gid="$(stat -c '%g' "${RUNNER_TEMP}")"
+          [[ "${host_uid}" =~ ^[0-9]+$ && "${host_gid}" =~ ^[0-9]+$ ]]
+          echo "HCU_RUNNER_HOST_UID=${host_uid}" >> "${GITHUB_ENV}"
+          echo "HCU_RUNNER_HOST_GID=${host_gid}" >> "${GITHUB_ENV}"
+
       - name: Normalize workspace ownership before checkout
         run: |
-          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}"
 
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
@@ -260,4 +270,4 @@ jobs:
       - name: Normalize workspace ownership
         if: always()
         run: |
-          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}"

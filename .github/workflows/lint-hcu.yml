@@ -1,9 +1,12 @@
 name: Lint (HCU)
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, v0.5.12_dev]
-  pull_request:
+  pull_request_target:
 
 jobs:
   lint-hcu:
@@ -20,7 +23,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Fetch PR base revision
+        if: github.event_name == 'pull_request_target'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "https://github.com/${BASE_REPOSITORY}.git" "${BASE_SHA}"
+          git cat-file -e "${BASE_SHA}^{commit}"
 
       - name: Install pre-commit hook
         run: |
@@ -28,10 +45,10 @@ jobs:
           pre-commit install
 
       - name: Run pre-commit checks (PR diff only)
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         run: |
           SKIP=no-commit-to-branch pre-commit run \
-            --from-ref origin/${{ github.base_ref }} \
+            --from-ref ${{ github.event.pull_request.base.sha }} \
             --to-ref HEAD \
             --show-diff-on-failure
 

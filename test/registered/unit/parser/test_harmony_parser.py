@@ -31,7 +31,7 @@ register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small")
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestPrefixHold(CustomTestCase):

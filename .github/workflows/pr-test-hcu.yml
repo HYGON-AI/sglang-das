@@ -2,7 +2,7 @@ name: PR Test (HCU)
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
-  pull_request:
+  pull_request_target:
     types:
       - opened
       - synchronize
@@ -105,13 +105,13 @@ on:
         default: false
 
 permissions:
-  actions: write
+  actions: read
   contents: read
   issues: read
   pull-requests: read
 
 concurrency:
-  group: pr-test-hcu-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage || inputs.target_stage_select || 'all' }}
+  group: pr-test-hcu-${{ github.event_name }}-${{ github.event.pull_request.number || github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || inputs.ref || 'current' }}-${{ inputs.target_stage || inputs.target_stage_select || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -129,6 +129,7 @@ jobs:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
         env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -139,7 +140,7 @@ jobs:
           echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
             -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
@@ -239,7 +240,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "${EVENT_NAME}" != "pull_request" || -z "${PR_NUMBER}" ]]; then
+          if [[ "${EVENT_NAME}" != "pull_request_target" || -z "${PR_NUMBER}" ]]; then
             echo "wheel_required=false" >> "${GITHUB_OUTPUT}"
             echo "gateway_wheel_required=false" >> "${GITHUB_OUTPUT}"
             echo "Wheel mode disabled for non-PR run without force_wheel_mode."
@@ -270,7 +271,7 @@ jobs:
   call-gate:
     name: Call PR gate
     needs: check-changes
-    if: github.event_name == 'pull_request' && needs.check-changes.outputs.hcu == 'true'
+    if: github.event_name == 'pull_request_target' && needs.check-changes.outputs.hcu == 'true'
     runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Fetch latest PR info
@@ -338,6 +339,7 @@ jobs:
       - name: Checkout code
         if: github.event_name != 'workflow_dispatch'
         env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -348,7 +350,7 @@ jobs:
           echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
             -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
@@ -361,6 +363,7 @@ jobs:
       - name: Checkout code for workflow_dispatch
         if: github.event_name == 'workflow_dispatch'
         env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -371,7 +374,7 @@ jobs:
           echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
             -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
@@ -407,7 +410,7 @@ jobs:
           if [[ "${CONTINUE_ON_ERROR}" == "true" ]]; then
             continue_on_error_flag="--continue-on-error"
           fi
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
             continue_on_error_flag="--continue-on-error"
           fi
 
@@ -468,6 +471,7 @@ jobs:
     steps:
       - name: Checkout code
         env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -477,7 +481,7 @@ jobs:
           echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
             -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
@@ -613,6 +617,7 @@ jobs:
     steps:
       - name: Checkout code
         env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -623,7 +628,7 @@ jobs:
           echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
             -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
@@ -714,6 +719,7 @@ jobs:
     steps:
       - name: Checkout code
         env:
+          CHECKOUT_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.ref }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -724,7 +730,7 @@ jobs:
           echo "HCU_CI_CHECKOUT_DIR=${CHECKOUT_DIR}" >> "${GITHUB_ENV}"
           git init "${CHECKOUT_DIR}"
           cd "${CHECKOUT_DIR}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "https://github.com/${CHECKOUT_REPOSITORY}.git"
           auth="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
           git \
             -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${auth}" \
