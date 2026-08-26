@@ -5908,6 +5908,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
         item_lens = [buffer[0].nbytes for buffer in index_cache]
         return data_ptrs, data_lens, item_lens
 
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the MLA KV transfer buffers."""
+        return list(range(self.start_layer, self.start_layer + self.layer_num))
+
+    def get_state_layer_ids(self):
+        """Global layer ids aligned with the DSA Index-K transfer buffers."""
+        return list(self.indexer_layer_ids)
+
     def get_index_k_cache_transfer_abi(self) -> str:
         """Return the persistent index-K page ABI used by PD state transfer."""
         return (

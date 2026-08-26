@@ -40,6 +40,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+    IndexKCacheMode,
     quantize_and_store_index_k_int8,
 )
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
@@ -176,8 +177,25 @@ def build_main_kv_page_plan(
 
 class LayerSplitIndexKeyCache(IndexKeyCache):
     def __init__(self, pool: LayerSplitDSATokenToKVPool, index_buf_size: int):
-        super().__init__(pool, index_buf_size)
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        if pool.index_k_cache_mode is IndexKCacheMode.BF16:
+            self.pool = pool
+            with (
+                torch.cuda.use_mem_pool(pool.custom_mem_pool)
+                if pool.custom_mem_pool
+                else nullcontext()
+            ):
+                self.buffer = [
+                    torch.zeros(
+                        self._buffer_shape(self._layer_num_pages(i, num_pages)),
+                        dtype=self._buffer_dtype(),
+                        device=pool.device,
+                    )
+                    for i in range(pool.indexer_layer_num)
+                ]
+        else:
+            super().__init__(pool, index_buf_size)
+
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
             if pool.custom_mem_pool
@@ -185,13 +203,28 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         ):
             self.remote_buffer = torch.zeros(
                 self._buffer_shape(num_pages),
-                dtype=pool.index_k_with_scale_buffer_dtype,
+                dtype=self._buffer_dtype(),
                 device=pool.device,
             )
         self.remote_layer_id: Optional[int] = None
         self.pending_event = pool.device_module.Event()
         self.pending_layer_id: Optional[int] = None
         self.pending_broadcast = False
+
+    def _buffer_shape(self, num_pages: int) -> tuple[int, ...]:
+        if self.pool.index_k_cache_mode is IndexKCacheMode.BF16:
+            return (
+                num_pages,
+                self.pool.page_size,
+                1,
+                self.pool.index_head_dim,
+            )
+        return super()._buffer_shape(num_pages)
+
+    def _buffer_dtype(self) -> torch.dtype:
+        if self.pool.index_k_cache_mode is IndexKCacheMode.BF16:
+            return self.pool.index_k_buffer_dtype
+        return self.pool.index_k_with_scale_buffer_dtype
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         layer_id = self.pool.indexer_layer_ids[layer_idx]
@@ -208,6 +241,16 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         # write path, so no cached remote layer remains valid.
         self.finalize_pending(set_remote_layer_id=False)
         self.remote_layer_id = None
+        if self.pool.index_k_cache_mode is IndexKCacheMode.BF16:
+            tgt_loc_flat = tgt_loc.view(-1).long()
+            src_loc_flat = src_loc.view(-1).long()
+            for index_k in self.buffer:
+                if index_k.shape[0] == 0:
+                    continue
+                flat_index_k = index_k.view(-1, 1, self.pool.index_head_dim)
+                flat_index_k[tgt_loc_flat] = flat_index_k[src_loc_flat]
+            return
+
         super().move(tgt_loc, src_loc)
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
@@ -309,6 +352,26 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         )
         if self.pool._is_layer_owned(layer_id):
             super().store_quantized(layer_id, loc, index_k, index_k_scale)
+
+    def store_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        """Store BF16 Index-K into scratch and the owner's persistent shard."""
+
+        if not self.prepare_remote_write(layer_id):
+            self.get_broadcastable_buffer(layer_id)
+        if index_k.dtype != self.pool.index_k_buffer_dtype:
+            index_k = index_k.to(self.pool.index_k_buffer_dtype)
+
+        page_indices = loc // self.pool.page_size
+        token_offsets = loc % self.pool.page_size
+        self.remote_buffer[page_indices, token_offsets] = index_k
+        if self.pool._is_layer_owned(layer_id):
+            cache_idx = self.pool._get_indexer_cache_index(layer_id)
+            self.buffer[cache_idx][page_indices, token_offsets] = index_k
 
     def store_int8(
         self,
@@ -689,7 +752,17 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self._init_layer_broadcast_comm()
 
     def _create_index_key_cache(self) -> IndexKeyCache:
-        return LayerSplitIndexKeyCache(self, self.index_buf_size)
+        cache = LayerSplitIndexKeyCache(self, self.index_buf_size)
+        self.index_k_buffer = (
+            cache.buffer if self.index_k_cache_mode is IndexKCacheMode.BF16 else None
+        )
+        return cache
+
+    @property
+    def index_k_with_scale_buffer(self):
+        if not self.use_scaled_index_k_cache:
+            return None
+        return self.index_key_cache.buffer
 
     def _clear_buffers(self):
         del self.kv_buffer
@@ -706,7 +779,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
-        for index_k_cache in self.index_k_with_scale_buffer:
+        for index_k_cache in self.index_key_cache.buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.use_int8_index_k_cache:
             kv_size_bytes += get_tensor_size_bytes(self.index_k_dequant_workspace)
@@ -727,6 +800,22 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.kv_buffer[i][0].nbytes * self.page_size for i in owned_layer_ids
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the owned-only KV transfer buffers."""
+        return [
+            self.start_layer + i
+            for i in range(self.layer_num)
+            if self._is_layer_owned(self.start_layer + i)
+        ]
+
+    def get_state_layer_ids(self):
+        """Global layer ids aligned with the owned-only Index-K buffers."""
+        return [
+            layer_id
+            for layer_id in self.indexer_layer_ids
+            if self._is_layer_owned(layer_id)
+        ]
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1155,6 +1244,19 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.index_key_cache.move(tgt_loc, src_loc)
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
+
+    def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
+        return self.index_key_cache.get_buffer(layer_id)
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
+        self.index_key_cache.store_bf16(layer_id, loc, index_k)
 
     def get_broadcastable_index_k_with_scale_buffer(
         self, layer_id: int

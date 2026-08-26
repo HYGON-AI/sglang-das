@@ -1334,11 +1334,7 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool) and not getattr(
-        token_to_kv_pool, "is_hcu_glm5_next_pool", False
-    ):
+    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1920,6 +1916,10 @@ def setup_state_kv_args(
                 if isinstance(token_to_kv_pool, DSATokenToKVPool)
                 else ""
             )
+            has_state_layer_ids = hasattr(token_to_kv_pool, "get_state_layer_ids")
+            state_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids() if has_state_layer_ids else []
+            )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1937,6 +1937,14 @@ def setup_state_kv_args(
                 tail_ptrs = tail_ptrs + draft_tail_ptrs
                 tail_lens = tail_lens + draft_tail_lens
                 tail_item_lens = tail_item_lens + draft_tail_item_lens
+                if has_state_layer_ids:
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "total_kv_layers is required for DSA draft state metadata"
+                        )
+                    state_layer_ids += [
+                        total_kv_layers + i for i in range(len(draft_data_ptrs))
+                    ]
                 draft_data_format = (
                     draft_token_to_kv_pool.get_index_k_cache_transfer_abi()
                 )
@@ -1960,6 +1968,7 @@ def setup_state_kv_args(
                     data_ptrs,
                     data_lens,
                     item_lens,
+                    layer_ids=state_layer_ids,
                     data_format=data_format,
                 )
                 if tail_ptrs:

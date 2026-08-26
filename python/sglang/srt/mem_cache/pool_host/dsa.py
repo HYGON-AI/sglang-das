@@ -73,6 +73,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
+        # FP8 and HCU INT8 share the packed uint8 K+scale storage ABI.
+        self.use_scaled_index_cache = device_pool.use_scaled_index_k_cache
         self.target_layer_num = self._effective_host_layer_num()
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
@@ -159,8 +161,8 @@ class DSAIndexerPoolHost(HostKVCache):
         if self.use_scaled_index_cache:
             return device_pool.index_k_with_scale_buffer
         return [
-            buffer.view(torch.uint8).view(buffer.shape[0], -1)
-            for buffer in device_pool.index_k_buffer
+            buf.view(torch.uint8).view(buf.shape[0], self.indexer_page_stride_size)
+            for buf in device_pool.index_k_buffer
         ]
 
     def get_size_per_token(self):
@@ -286,6 +288,7 @@ class DSAIndexerPoolHost(HostKVCache):
             host_indices, device_indices
         )
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -306,6 +309,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     item_size=self.indexer_page_stride_size,
                     **hcu_layer_split_kwargs,
                     src_layout_dim=self.indexer_layout_dim,
+                    **hcu_layer_split_kwargs,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -358,6 +362,7 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
+        device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
@@ -427,7 +432,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    self.target_layer_num + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )

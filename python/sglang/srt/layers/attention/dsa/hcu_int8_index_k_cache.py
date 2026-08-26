@@ -407,8 +407,6 @@ def validate_hcu_int8_index_k_cache_server_args(server_args) -> None:
     unsupported = []
     if getattr(server_args, "enable_hisparse", False):
         unsupported.append("--enable-hisparse")
-    if getattr(server_args, "enable_hierarchical_cache", False):
-        unsupported.append("--enable-hierarchical-cache")
     if getattr(server_args, "cpu_offload_gb", 0) > 0:
         unsupported.append("--cpu-offload-gb")
     if getattr(server_args, "enable_two_batch_overlap", False):
