@@ -126,7 +126,7 @@ from deepgemm import (
     m_grouped_w4a8_gemm_nt_masked_hipc,
 )
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import moe as lightop_op
+from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -2000,9 +2000,19 @@ class DeepEPMoE(FusedMoE):
                 self.moe_runner_config.gemm1_clamp_limit,
             )
         else:
-            q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
-                gateup_output, masked_m
-            )
+            # Only models that declare a SwiGLU clamp limit use the clamp kernel.
+            swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
+            if swiglu_limit is None:
+                q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+                    gateup_output, masked_m
+                )
+            else:
+                q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                    gateup_output,
+                    float(swiglu_limit),
+                    mask_m=masked_m,
+                    expect_m=expected_m,
+                )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
