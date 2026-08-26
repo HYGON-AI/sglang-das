@@ -120,11 +120,20 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
     if is_hip():
-        logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
-            f"for {model_arch}; set it explicitly to override."
-        )
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+        if (
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+            and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        ):
+            logger.warning(
+                "Keeping explicitly enabled SGLANG_OPT_FLASHMLA_SPARSE_PREFILL "
+                f"on ROCm/HIP for experimental {model_arch} validation."
+            )
+        else:
+            logger.warning(
+                "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on "
+                f"ROCm/HIP for {model_arch}; set it explicitly to override."
+            )
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
     # The kv-cache dtype default moved to the resolution pipeline
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
@@ -210,11 +219,20 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "('none', 'deepep', 'megamoe'), "
             f"got {server_args.moe_a2a_backend!r}."
         )
-    logger.warning(
-        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
-        "context parallelism is enabled."
-    )
-    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+    if (
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+        and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    ):
+        logger.warning(
+            "Keeping explicitly enabled SGLANG_OPT_FLASHMLA_SPARSE_PREFILL "
+            "for experimental DeepSeekV4 context-parallel validation."
+        )
+    else:
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+            "context parallelism is enabled."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
