@@ -219,6 +219,8 @@ def repack_and_shuffle_w4a8(weight_data, E):
     逐 expert 处理 [n, k_half]
     处理完直接写回 weight_data[i]
     """
+    from aiter.ops.shuffle import w4a8_moe_layout_shuffle_gemm2
+
     # 原始 shape: [E, n, k_half]
     for i in range(E):
         # 1. 取当前 expert [n, k_half]
