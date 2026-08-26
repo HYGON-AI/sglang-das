@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.slimquant_w4a8 import SlimQuantW4A8Int8LinearMethod
 from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils.common import get_bool_env_var
 
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
@@ -176,6 +177,63 @@ def _resolve_w4a8_tpmoe_backend(
         _ensure_aiter_w4a8_marlin_available()
     return backend
 
+W4A8_EP_USE_GROUPGEMM_ENV = "SGLANG_W4A8_EP_USE_GROUPGEMM"
+
+
+def should_use_w4a8_ep_groupgemm() -> bool:
+    """Use deepgemm groupgemm for EP W4A8 MoE (prefill/decode)."""
+    return get_bool_env_var(W4A8_EP_USE_GROUPGEMM_ENV, "false")
+
+
+def should_use_w4a8_aiter_ep_moe() -> bool:
+    """Route EP W4A8 MoE through aiter (same kernel/layout as TP8+CP8)."""
+    from sglang.srt.distributed import get_moe_expert_parallel_world_size
+
+    if get_moe_expert_parallel_world_size() <= 1:
+        return False
+    if should_use_w4a8_ep_groupgemm():
+        return False
+    dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()
+    if dspark_backend_override is None:
+        requested_backend = envs.SGLANG_W4A8_TPMOE_BACKEND.get()
+        env_name = W4A8_TPMOE_BACKEND_ENV
+    else:
+        requested_backend = dspark_backend_override
+        env_name = "SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND"
+    resolved_backend = _resolve_w4a8_tpmoe_backend(
+        requested_backend,
+        env_name=env_name,
+    )
+    return resolved_backend == W4A8_TPMOE_BACKEND_AITER
+
+
+def _deepep_activation_to_bf16(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    recv_token_num: Optional[int] = None,
+) -> torch.Tensor:
+    if hidden_states.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return hidden_states
+    if hidden_states.dtype == torch.int8:
+        if hidden_states_scale is None:
+            raise RuntimeError(
+                "DeepEP int8 activations require hidden_states_scale."
+            )
+        scale = hidden_states_scale
+        if scale.dim() == hidden_states.dim() - 1:
+            scale = scale.unsqueeze(-1)
+        return (hidden_states.float() * scale).to(torch.bfloat16)
+    if hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if hidden_states_scale is None:
+            raise RuntimeError(
+                "DeepEP fp8 activations require hidden_states_scale."
+            )
+        scale = hidden_states_scale
+        if scale.dim() == hidden_states.dim() - 1:
+            scale = scale.unsqueeze(-1)
+        return (hidden_states.float() * scale.float()).to(torch.bfloat16)
+    raise RuntimeError(f"Unsupported DeepEP activation dtype {hidden_states.dtype}.")
+
 
 class MarlinMoeWorkspace:
     """
@@ -208,11 +266,64 @@ class MarlinMoeWorkspace:
         return self.workspace, self.global_reduce_buffer
 
 
+def _repack_w4a8_moe_weights_for_runtime(layer: torch.nn.Module) -> None:
+    from sglang.srt.distributed import get_moe_expert_parallel_world_size
+    from deepgemm.group_gemm_weight_pack import pack_w4a8_moe_hipc_weight
+
+    E = layer.w13_weight.shape[0]
+    ep_world_size = get_moe_expert_parallel_world_size()
+    use_aiter_ep = should_use_w4a8_aiter_ep_moe()
+    use_hipc_pack = ep_world_size > 1 and (
+        should_use_w4a8_ep_groupgemm() or use_aiter_ep
+    )
+    logger.info(
+        "[slimquant_w4a8_marlin] repack_w4a8_moe ep_world_size=%s "
+        "use_hipc_pack=%s ep_groupgemm=%s use_aiter_ep=%s w13_shape=%s",
+        ep_world_size,
+        use_hipc_pack,
+        should_use_w4a8_ep_groupgemm(),
+        use_aiter_ep,
+        tuple(layer.w13_weight.shape),
+    )
+    if use_aiter_ep and ep_world_size > 1:
+        w13_raw = layer.w13_weight.data.clone()
+        w2_raw = layer.w2_weight.data.clone()
+        layer.w13_weight = Parameter(
+            repack_and_shuffle_w4a8(w13_raw, E), requires_grad=False
+        )
+        layer.w2_weight = Parameter(
+            repack_and_shuffle_w4a8(w2_raw, E), requires_grad=False
+        )
+        layer.w13_weight_hipc = Parameter(
+            pack_w4a8_moe_hipc_weight(w13_raw), requires_grad=False
+        )
+        layer.w2_weight_hipc = Parameter(
+            pack_w4a8_moe_hipc_weight(w2_raw), requires_grad=False
+        )
+    elif use_hipc_pack:
+        layer.w13_weight = Parameter(
+            pack_w4a8_moe_hipc_weight(layer.w13_weight.data.clone()),
+            requires_grad=False,
+        )
+        layer.w2_weight = Parameter(
+            pack_w4a8_moe_hipc_weight(layer.w2_weight.data.clone()),
+            requires_grad=False,
+        )
+    else:
+        layer.w13_weight = Parameter(
+            repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False
+        )
+        layer.w2_weight = Parameter(
+            repack_and_shuffle_w4a8(layer.w2_weight.data, E), requires_grad=False
+        )
+
+
 def repack_and_shuffle_w4a8(weight_data, E):
     """
     逐 expert 处理 [n, k_half]
     处理完直接写回 weight_data[i]
     """
+    _ensure_aiter_w4a8_marlin_available()
     # 原始 shape: [E, n, k_half]
     for i in range(E):
         # 1. 取当前 expert [n, k_half]
@@ -1151,13 +1262,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        E = layer.w13_weight.shape[0]
-        layer.w13_weight = Parameter(
-            repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False
-        )
-        layer.w2_weight = Parameter(
-            repack_and_shuffle_w4a8(layer.w2_weight.data, E), requires_grad=False
-        )
+        _repack_w4a8_moe_weights_for_runtime(layer)
 
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data, requires_grad=False
@@ -1172,21 +1277,23 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    @torch._dynamo.disable()
-    def apply(
+    def _prepare_topk_ids_for_aiter(
         self,
         layer: torch.nn.Module,
-        dispatch_output,
-    ):
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_ids_copy = topk_ids.to(torch.int32)
+        topk_ids_copy[topk_ids_copy == -1] = layer.w13_weight.size(0)
+        return topk_ids_copy
 
-        x = dispatch_output.hidden_states
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
-        # x, topk_weights = apply_topk_weights_cpu(
-        #     self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
-        # )
-        if x.shape[0] == 0:
-            return StandardCombineInput(hidden_states=x)
+    def _run_aiter_moe(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        _ensure_aiter_w4a8_marlin_available()
 
         e = layer.w13_weight.size(0)
         k = x.size(-1)
@@ -1214,12 +1321,13 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         )
         if not status:
             raise RuntimeError(
-                "aiter backend did not find a valid w4a8 tpmoe config for "
+                "aiter backend did not find a valid w4a8 moe config for "
                 f"M={m}, E={e}, N1={n1}, N2={n2}, K={k}, topk={topk}, "
                 f"dtype={x.dtype}."
             )
 
-        output = aiter_moe(
+        topk_ids = self._prepare_topk_ids_for_aiter(layer, topk_ids)
+        return aiter_moe(
             x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -1233,4 +1341,54 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             expert_map=None,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
+
+    @torch._dynamo.disable()
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ):
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        if x.shape[0] == 0:
+            return StandardCombineInput(hidden_states=x)
+
+        output = self._run_aiter_moe(layer, x, topk_weights, topk_ids)
         return StandardCombineInput(hidden_states=output)
+
+    def apply_deepep_normal(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ) -> torch.Tensor:
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
+        if num_recv_tokens_per_expert is None:
+            if hidden_states.dtype == torch.int8:
+                return hidden_states.bfloat16()
+            return hidden_states
+        if sum(num_recv_tokens_per_expert) <= 0:
+            if hidden_states.dtype == torch.int8:
+                return hidden_states.bfloat16()
+            return hidden_states
+
+        x = _deepep_activation_to_bf16(hidden_states, hidden_states_scale)
+        return self._run_aiter_moe(layer, x, topk_weights, topk_ids)
+
+    def apply_deepep_ll(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ) -> torch.Tensor:
+        hidden_states, hidden_states_scale, topk_ids, topk_weights, _, _ = (
+            dispatch_output
+        )
+        x = _deepep_activation_to_bf16(hidden_states, hidden_states_scale)
+        return self._run_aiter_moe(layer, x, topk_weights, topk_ids)
