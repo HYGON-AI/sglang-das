@@ -262,7 +262,7 @@ def _can_use_lightop_ep_gather(
         and input_index.dtype == torch.int32
         and topk_ids.shape == topk_weights.shape
         and topk_ids.shape == input_index.shape
-        and topk_ids.shape[1] <= 8
+        and topk_ids.shape[1] <= 16
         and input_tensor.is_contiguous()
         and output_tensor.is_contiguous()
         and topk_ids.is_contiguous()
