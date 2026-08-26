@@ -1,5 +1,6 @@
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -10,6 +11,10 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -254,24 +259,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.query_token_num), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
-            if self.model_runner.tp_rank == 0:
-                logger.info(
-                    "DSpark draft uses its checkpoint-local embedding and LM head."
-                )
-        else:
-            target_model = self.target_worker.model_runner.model
-            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
-            if lm_head is None or not hasattr(lm_head, "weight"):
-                raise RuntimeError(
-                    "DSpark requires the target model to expose `lm_head` with `weight`."
-                )
-            self.draft_model.attach_shared_modules(
-                embed_tokens=unwrap_lora_layer(
-                    self._resolve_target_embed_tokens(target_model)
-                ),
-                lm_head=lm_head,
-            )
+        self._attach_shared_modules()
         self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -399,6 +387,30 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+    def _attach_shared_modules(self) -> None:
+        if self._is_pd_prefill:
+            return
+
+        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DSpark draft uses its checkpoint-local embedding and LM head."
+                )
+            return
+
+        target_model = self.target_worker.model_runner.model
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise RuntimeError(
+                "DSpark requires the target model to expose `lm_head` with `weight`."
+            )
+        self.draft_model.attach_shared_modules(
+            embed_tokens=unwrap_lora_layer(
+                self._resolve_target_embed_tokens(target_model)
+            ),
+            lm_head=lm_head,
+        )
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -422,10 +434,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
-        return nullcontext()
+        with ExitStack() as stack:
+            if self._draft_dp_context_enabled:
+                stack.enter_context(
+                    draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
+                )
+            stack.enter_context(speculative_moe_backend_context())
+            stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
@@ -620,6 +638,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
+
+        # A PD prefill worker does not run local speculative decode. Keep the
+        # captured target states on the result so the scheduler can transfer
+        # them to the decode worker; injecting them into the local draft cache
+        # and clearing the result would make the remote draft start without its
+        # context features.
+        if self._is_pd_prefill:
+            batch_output.next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            return batch_output
+
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
@@ -713,6 +744,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
+    def inject_pd_hidden_chunk(
+        self,
+        req,
+        hidden: torch.Tensor,
+        hidden_start: int,
+    ) -> Optional[torch.cuda.Event]:
+        if hidden is None or hidden.numel() == 0:
+            return None
+        row_len = int(hidden.shape[0])
+        pos = torch.arange(
+            int(hidden_start),
+            int(hidden_start) + row_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        req_pool_idx = int(req.req_pool_idx)
+        cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
+        return self._kv_injector.inject_target_hidden(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=pos,
+        )
+
     def _decode_idle_result(
         self,
         *,
@@ -750,7 +804,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )

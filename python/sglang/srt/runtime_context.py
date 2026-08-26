@@ -560,6 +560,10 @@ class MoeFlags(_FlagGroupBase):
     # Draft construction/execution uses a separate one-sided A2A workspace from
     # the target model's concurrently live CUDA graphs.
     speculative_context: bool = False
+    # Set while the draft model is using its speculative A2A backend. Target
+    # and draft DeepEP instances can have different expert layouts, so their
+    # process-level communication buffers must not be shared.
+    in_speculative_a2a_scope: bool = False
 
 
 class DpFlags(_FlagGroupBase):

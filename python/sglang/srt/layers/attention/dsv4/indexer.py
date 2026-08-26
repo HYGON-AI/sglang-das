@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -80,6 +81,8 @@ if TYPE_CHECKING:
 _is_hcu = is_hcu()
 _is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+logger = logging.getLogger(__name__)
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -812,6 +815,9 @@ class C4IndexerBackendMixin:
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
+        use_int8_index_k_cache = _is_hcu and getattr(
+            token_to_kv_pool, "use_int8_index_k_cache", False
+        )
 
         if use_aiter_fp4:
             q = q_indexer
@@ -848,7 +854,9 @@ class C4IndexerBackendMixin:
         elif _is_hcu:
             # HCU's LightOp implementation avoids materializing the large
             # [batch, max_c4_seq_len] FP32 Torch fallback during graph capture.
-            from lightop.gemmopt import paged_mqa_logits as fn
+            import lightop.gemmopt as gemmopt
+
+            fn = gemmopt.paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if get_platform().is_sm120:
                 fn = fp8_paged_mqa_logits_torch_sm120
@@ -939,7 +947,18 @@ class C4IndexerBackendMixin:
             topk_plan: Optional[torch.Tensor] = None,
         ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
-            if (
+            if envs.SGLANG_LIGHTOP_TOPK.get():
+                from lightop import topk_transform_512 as lightop_topk_transform_512
+
+                lightop_topk_transform_512(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.compressed_page_size,
+                    row_raw_indices,
+                )
+            elif (
                 envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
                 or self.dsa_topk_backend.is_torch()
             ):
@@ -1053,6 +1072,46 @@ class C4IndexerBackendMixin:
                     run_fp4_indexer(
                         slice(start, min(start + rows_per_chunk, query_rows))
                     )
+        elif use_int8_index_k_cache:
+            from lightop.quant import per_token_dynamic_quant_int8
+
+            packed_cache = token_to_kv_pool.get_index_k_int8_packed_buffer(
+                layer_id=c4_indexer.layer_id,
+            )
+            packed_cache = packed_cache.view(torch.int8).view(
+                packed_cache.shape[0], 64, 1, 132
+            )
+            q_bf16 = q.to(torch.bfloat16).contiguous()
+            q_flat = q_bf16.view(-1, q_bf16.shape[-1])
+            smooth_scale = getattr(self, "_dsv4_int8_query_smooth_scale", None)
+            if (
+                smooth_scale is None
+                or smooth_scale.device != q.device
+                or smooth_scale.shape[0] != q_bf16.shape[-1]
+            ):
+                smooth_scale = torch.ones(
+                    q_bf16.shape[-1], dtype=torch.float32, device=q.device
+                )
+                self._dsv4_int8_query_smooth_scale = smooth_scale
+            q_int8, q_scales = per_token_dynamic_quant_int8(q_flat, smooth_scale)
+            q_int8 = q_int8.view_as(q_bf16)
+            adjusted_weights = (
+                weights.to(torch.float32) * q_scales.view(query_rows, -1)
+            ).contiguous()
+            logits = fn(
+                q_int8,
+                packed_cache,
+                adjusted_weights,
+                c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
+                page_table.to(torch.int32).contiguous(),
+                None,
+                indexer_metadata.max_compressed_seq_len,
+                False,
+            )
+            run_topk_transform(all_rows, logits)
+            if not hasattr(self, "_dsv4_int8_indexer_path_logged"):
+                logger.info("DSV4 INT8 index-K consumer=LightOp dense INT8 Paged MQA")
+                self._dsv4_int8_indexer_path_logged = True
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,

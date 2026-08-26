@@ -646,6 +646,23 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+def _is_supported_dspark_pd_prefill_cp(server_args: ServerArgs) -> bool:
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    attn_tp_size = (
+        server_args.tp_size // server_args.dp_size // server_args.attn_cp_size
+    )
+    return (
+        server_args.disaggregation_mode == "prefill"
+        and server_args.disaggregation_transfer_backend == "mooncake"
+        and server_args.pp_size == 1
+        and server_args.attn_cp_size > 1
+        and attn_tp_size == 1
+        and server_args.enable_prefill_cp
+        and server_args.cp_strategy == "interleave"
+        and model_arch == "DeepseekV4ForCausalLM"
+    )
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     # HCU uses the HIP PyTorch runtime, so the resolved device is not prefixed
     # with ``cuda``. Keep all other platforms rejected until they add a tested
@@ -661,15 +678,32 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark speculative decoding only supports CUDA, NPU and HCU devices."
             )
 
-    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
-    if cfg.enable_dp_attention and cfg.dp_size > 1:
+    pd_prefill_cp = _is_supported_dspark_pd_prefill_cp(server_args)
+    if cfg.attn_cp_size > 1 and not pd_prefill_cp:
+        raise ValueError(
+            "DSpark context parallel is only supported for DeepSeek-V4 PD prefill "
+            "with Mooncake, pp_size == 1, attn_tp_size == 1, and interleave CP; "
+            f"got disaggregation_mode={cfg.disaggregation_mode!r}, "
+            f"pp_size={cfg.pp_size}, attn_cp_size={cfg.attn_cp_size}, "
+            f"cp_strategy={cfg.cp_strategy!r}, "
+            f"transfer_backend={cfg.disaggregation_transfer_backend!r}."
+        )
+
+    # A one-way PD prefill CP path does not use the DP-only draft checks.
+    if cfg.enable_dp_attention and cfg.dp_size > 1 and not pd_prefill_cp:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        supports_target_moe = cfg.moe_a2a_backend in (
+            "none", "megamoe", "mori"
+        ) or (
+            cfg.moe_a2a_backend == "deepep"
+            and cfg.moe_runner_backend == "deep_gemm"
+        )
+        if not _is_npu and not supports_target_moe:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
-                f"{cfg.moe_a2a_backend!r}."
+                "DSpark with dp attention supports MoE A2A 'none', 'megamoe', "
+                "'mori', or 'deepep' with runner 'deep_gemm'; got "
+                f"a2a={cfg.moe_a2a_backend!r}, runner={cfg.moe_runner_backend!r}."
             )
         if not _is_npu and cfg.moe_a2a_backend != "none":
             from sglang.srt.speculative.ragged_verify import (
@@ -679,24 +713,27 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
             if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    "DSpark with dp attention + "
-                    f"moe_a2a_backend={cfg.moe_a2a_backend!r} requires "
+                    "DSpark with dp attention and MoE A2A requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-        if cfg.attn_cp_size > 1:
+        draft_a2a = (
+            cfg.speculative_moe_a2a_backend
+            if cfg.speculative_moe_a2a_backend is not None
+            else cfg.moe_a2a_backend
+        )
+        draft_runner = (
+            cfg.speculative_moe_runner_backend
+            if cfg.speculative_moe_runner_backend is not None
+            else cfg.moe_runner_backend
+        )
+        supports_draft_moe = draft_a2a in (
+            "none", "megamoe", "mori"
+        ) or (draft_a2a == "deepep" and draft_runner == "deep_gemm")
+        if not supports_draft_moe:
             raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={cfg.attn_cp_size})."
-            )
-        if (
-            not _is_npu
-            and cfg.speculative_moe_a2a_backend is not None
-            and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
-        ):
-            raise ValueError(
-                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
-                f"must match the target moe_a2a_backend={cfg.moe_a2a_backend!r} "
-                f"(got {cfg.speculative_moe_a2a_backend!r})."
+                "DSpark draft MoE A2A only supports 'none', 'megamoe', 'mori', "
+                "or 'deepep' with runner 'deep_gemm'; got "
+                f"a2a={draft_a2a!r}, runner={draft_runner!r}."
             )
 
     if cfg.pp_size != 1:

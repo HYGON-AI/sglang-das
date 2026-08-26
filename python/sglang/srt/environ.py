@@ -571,6 +571,12 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Force the DSpark draft's SlimQuant W4A8 MoE method to a selected backend
+    # without changing the target model's W4A8 or generic MoE backend.
+    SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND = EnvStr(None)
+    # PD hidden-state receive pool size, in tokens (-1 = derive from the
+    # decode-side chunk budget).
+    SGLANG_PD_HIDDEN_RECV_POOL_TOKENS = EnvInt(-1)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1044,8 +1050,15 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
+    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
+    # MLA path this covers ordinary prefill as well as decode-family forwards.
+    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # Use the native LightOp single/dual-cache gather+upconvert kernels instead
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
-    SGLANG_LIGHTOP_TOPK = EnvBool(True)
+    SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
     SGLANG_HCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
 
@@ -1061,6 +1074,8 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Global SlimQuant W4A8 TP-MoE backend selection.
+    SGLANG_W4A8_TPMOE_BACKEND = EnvStr("auto")
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1606,6 +1621,11 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
+    # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
+    # Enabling this also requires the native LightOp INT8 Paged MQA consumer;
+    # there is intentionally no BF16 dequantization fallback.
+    SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

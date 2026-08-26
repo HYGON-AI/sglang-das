@@ -46,6 +46,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -622,6 +623,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    pd_hidden_capture_layer_ids: Optional[List[int]] = None
+
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -897,6 +901,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
+        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
+        if (
+            model_runner.server_args.disaggregation_mode == "prefill"
+            and get_parallel().attn_cp_size > 1
+        ):
+            gathered_capture_layers = [None] * get_parallel().attn_cp_size
+            torch.distributed.all_gather_object(
+                gathered_capture_layers,
+                pd_hidden_capture_layer_ids,
+                group=get_parallel().attn_cp_group.cpu_group,
+            )
+            nonempty_capture_layers = [
+                [int(x) for x in layer_ids]
+                for layer_ids in gathered_capture_layers
+                if layer_ids
+            ]
+            if nonempty_capture_layers:
+                expected_capture_layers = nonempty_capture_layers[0]
+                if any(
+                    layer_ids != expected_capture_layers
+                    for layer_ids in nonempty_capture_layers[1:]
+                ):
+                    raise RuntimeError(
+                        "PD hidden capture layers disagree across prefill CP ranks: "
+                        f"{gathered_capture_layers}"
+                    )
+                pd_hidden_capture_layer_ids = expected_capture_layers
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
@@ -908,6 +939,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     get_server_return_hidden_states_mode(),
                 )
             )
+            if pd_hidden_capture_layer_ids:
+                request_capture_hidden_mode = max(
+                    request_capture_hidden_mode, CaptureHiddenMode.FULL
+                )
             capture_hidden_mode = get_required_capture_hidden_mode(
                 request_capture_hidden_mode,
                 batch.spec_info,
@@ -992,6 +1027,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,

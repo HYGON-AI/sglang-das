@@ -43,9 +43,9 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
-    ) -> None:
+    ) -> Optional[torch.cuda.Event]:
         if target_hidden is None or target_hidden.numel() == 0:
-            return
+            return None
         device = self.model_runner.device
         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
@@ -53,10 +53,22 @@ class TargetHiddenKvInjector:
         n_real = positions.shape[0]
         if target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
+        if target_hidden.shape[0] != n_real or cache_loc.shape[0] != n_real:
+            raise ValueError(
+                "DSpark target hidden injection requires one hidden row and cache "
+                f"location per position; got hidden_rows={target_hidden.shape[0]}, "
+                f"cache_locs={cache_loc.shape[0]}, positions={n_real}."
+            )
         if cache_loc_2d is not None:
             cache_loc_2d = cache_loc_2d.to(
                 device=device, dtype=torch.int64, non_blocking=True
             )
+            if cache_loc_2d.numel() != n_real:
+                raise ValueError(
+                    "DSpark target hidden injection requires cache_loc_2d to cover "
+                    f"every position; got cache_loc_2d={cache_loc_2d.numel()}, "
+                    f"positions={n_real}."
+                )
         if commit_lens is not None:
             commit_lens = commit_lens.to(
                 device=device, dtype=torch.int32, non_blocking=True
@@ -87,7 +99,7 @@ class TargetHiddenKvInjector:
                 state_slot=state_slot,
                 final_pos=final_pos,
             )
-            return
+            return self._record_cuda_event(device)
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
@@ -99,6 +111,15 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
             )
+        return self._record_cuda_event(device)
+
+    @staticmethod
+    def _record_cuda_event(device) -> Optional[torch.cuda.Event]:
+        if not torch.cuda.is_available():
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        return event
 
     def _inject_mla(
         self,
