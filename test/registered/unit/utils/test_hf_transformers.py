@@ -66,9 +66,7 @@ class TestGlmMoeDsaConfigCompatibility(CustomTestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
         self.assertEqual(config.index_topk_freq, 6)
-        get_config_dict.assert_called_once_with(
-            "test-model", revision="test-revision"
-        )
+        get_config_dict.assert_called_once_with("test-model", revision="test-revision")
 
     @patch.object(config_utils.PretrainedConfig, "get_config_dict")
     def test_ignores_other_architectures(self, get_config_dict):

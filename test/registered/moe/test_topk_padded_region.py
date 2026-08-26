@@ -169,9 +169,7 @@ class TestDeepEPPaddedTokenMasking(unittest.TestCase):
             patch.object(topk_mod, "_mask_topk_ids_padded_region") as mask_ids,
             patch.object(topk_mod, "_zero_topk_weights_padded_region") as zero_weights,
         ):
-            get_a2a.return_value.is_deepep.return_value = (
-                skip_deepep_padded_tokens
-            )
+            get_a2a.return_value.is_deepep.return_value = skip_deepep_padded_tokens
             get_runner.return_value.is_deep_gemm.return_value = (
                 skip_deepep_padded_tokens
             )
@@ -187,23 +185,19 @@ class TestDeepEPPaddedTokenMasking(unittest.TestCase):
         return mask_ids, zero_weights, topk_ids, num_token_non_padded
 
     def test_hcu_deepep_deepgemm_masks_ids_to_negative_one(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = (
-            self._run_post_process(skip_deepep_padded_tokens=True)
+        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
+            skip_deepep_padded_tokens=True
         )
 
-        mask_ids.assert_called_once_with(
-            topk_ids, num_token_non_padded, fill_value=-1
-        )
+        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=-1)
         zero_weights.assert_not_called()
 
     def test_other_hip_paths_keep_in_range_ids_and_zero_weights(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = (
-            self._run_post_process(skip_deepep_padded_tokens=False)
+        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
+            skip_deepep_padded_tokens=False
         )
 
-        mask_ids.assert_called_once_with(
-            topk_ids, num_token_non_padded, fill_value=0
-        )
+        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=0)
         zero_weights.assert_called_once()
 
 

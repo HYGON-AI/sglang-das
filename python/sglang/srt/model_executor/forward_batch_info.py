@@ -1096,8 +1096,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 extend_input_logprob_token_ids = (
                     extend_input_logprob_token_ids.pin_memory()
                 )
-            ret.extend_input_logprob_token_ids_gpu = (
-                extend_input_logprob_token_ids.to(device, non_blocking=True)
+            ret.extend_input_logprob_token_ids_gpu = extend_input_logprob_token_ids.to(
+                device, non_blocking=True
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
