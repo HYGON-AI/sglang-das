@@ -599,8 +599,11 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         return super().__new__(cls)
 
     def __init__(self, quant_config):
+        from lightop.moe import fused_experts_impl_w4a8_marlin
+
         self.quant_config = quant_config
         self.use_deepep = get_moe_a2a_backend().is_deepep()
+        self.fused_experts_impl_w4a8_marlin = fused_experts_impl_w4a8_marlin
 
     def create_weights(
         self,
@@ -815,7 +818,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             if self.moe_runner_config.routed_scaling_factor is not None
             else 1.0
         )
-        output = fused_experts_impl_w4a8_marlin(
+        output = self.fused_experts_impl_w4a8_marlin(
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -891,7 +894,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             if self.moe_runner_config.routed_scaling_factor is not None
             else 1.0
         )
-        return fused_experts_impl_w4a8_marlin(
+        return self.fused_experts_impl_w4a8_marlin(
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -945,7 +948,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         routed_scaling_factor = (
             1.0 if routed_scaling_factor is None else routed_scaling_factor
         )
-        return fused_experts_impl_w4a8_marlin(
+        return self.fused_experts_impl_w4a8_marlin(
             x,
             w1,
             w2,
@@ -1337,6 +1340,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer: torch.nn.Module,
         dispatch_output,
     ):
+        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         x = dispatch_output.hidden_states
