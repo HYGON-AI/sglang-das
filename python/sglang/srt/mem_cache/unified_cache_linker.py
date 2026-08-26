@@ -20,6 +20,7 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -44,6 +45,13 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
+
+logger = logging.getLogger(__name__)
+
+
+class ExternalLinkerLoadError(RuntimeError):
+    """A recoverable external-cache load failure for the current batch."""
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -277,6 +285,18 @@ class UnifiedCacheLinker(ABC):
         not here.
         """
 
+    def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Validate that a load can start before its pages enter the radix tree.
+
+        Backends whose lookup result can become stale should acquire a read
+        session/lease here.  Returning ``False`` makes the caller discard the
+        external hit and continue with normal prefill.
+        """
+        return True
+
+    def abort_prepared_load(self, rid: str) -> None:
+        """Release resources acquired by :meth:`prepare_load`."""
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -489,6 +509,45 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
+
+        # A metadata lookup is only advisory: the external object can disappear
+        # before it is read.  Acquire the backend read session before publishing
+        # the allocated pages in the radix tree.  All ranks must make the same
+        # decision or their prefix lengths (and therefore model collectives)
+        # would diverge.
+        prepared = False
+        try:
+            prepared = self.cache_linker.prepare_load(
+                req.rid, [transfer for _, transfer in component_transfers]
+            )
+        except BaseException:
+            logger.exception(
+                "External linker load preparation failed for rid=%s; "
+                "falling back to prefill.",
+                req.rid,
+            )
+        prepared_on_all_ranks = torch.tensor(int(prepared), dtype=torch.int)
+        cache._all_reduce_attn_groups(
+            prepared_on_all_ranks, torch.distributed.ReduceOp.MIN
+        )
+        if not bool(prepared_on_all_ranks.item()):
+            self.cache_linker.abort_prepared_load(req.rid)
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            req.host_hit_length = 0
+            req.swa_host_hit_length = 0
+            req.mamba_host_hit_length = 0
+            logger.warning(
+                "External linker load is no longer restorable for rid=%s; "
+                "falling back to normal prefill.",
+                req.rid,
+            )
+            return empty_indices, req.last_node
+
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -544,8 +603,14 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        if load_transfers and not self.cache_linker.load(req.rid, load_transfers):
-            raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
+        if load_transfers:
+            if not self.cache_linker.load(req.rid, load_transfers):
+                self.cache_linker.abort_prepared_load(req.rid)
+                raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
+        else:
+            # A concurrent insert may have adopted every prepared page.  No
+            # transfer will consume the session in that case.
+            self.cache_linker.abort_prepared_load(req.rid)
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != req.last_node:
@@ -700,6 +765,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.cache_linker.abort_prepared_load(rid)
 
     def close(self) -> None:
         self.cache_linker.close()
