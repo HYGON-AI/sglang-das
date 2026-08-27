@@ -123,10 +123,14 @@ from deepgemm import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_masked,
-    m_grouped_w4a8_gemm_nt_contiguous_hipc,
     m_grouped_w4a8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked_hipc,
 )
+try:
+    from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
+except ImportError:
+    m_grouped_w4a8_gemm_nt_contiguous_hipc = None
+
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
 from lightop.activation import (
@@ -1276,6 +1280,11 @@ class DeepEPMoE(FusedMoE):
         assert self.moe_runner_config.activation in ("silu", "situ")
 
         if _use_w4a8_contiguous_hipc:
+            if m_grouped_w4a8_gemm_nt_contiguous_hipc is None:
+                raise RuntimeError(
+                    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC requires a deepgemm build "
+                    "with m_grouped_w4a8_gemm_nt_contiguous_hipc support."
+                )
             if num_recv_tokens_per_expert is None:
                 return hidden_states.bfloat16()
             all_tokens = sum(num_recv_tokens_per_expert)
