@@ -52,6 +52,7 @@ from sglang.srt.utils import get_bool_env_var, set_weight_attrs
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
 
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
