@@ -117,6 +117,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.page_wise_load_batch_size = (
             server_args.mooncake_page_wise_load_batch_size
         )
+        self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
                 "--mooncake-page-wise-load-threshold must be positive, got "
@@ -426,7 +427,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                     )
 
-            if any(
+            if self.enable_page_wise_load and any(
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
