@@ -1355,7 +1355,18 @@ class DeepEPMoE(FusedMoE):
                     self.moe_runner_config.gemm1_clamp_limit,
                 )
             else:
-                q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+                # Apply the model-declared SwiGLU clamp when present. Models
+                # without swiglu_limit retain the original unclamped path.
+                swiglu_limit = getattr(
+                    self.moe_runner_config, "swiglu_limit", None
+                )
+                if swiglu_limit is None:
+                    q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+                else:
+                    q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                        gateup_output,
+                        float(swiglu_limit),
+                    )
             del gateup_output
 
             down_output = torch.empty(
