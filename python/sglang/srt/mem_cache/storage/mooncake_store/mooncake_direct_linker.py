@@ -28,9 +28,6 @@ from sglang.srt.utils import freeze_gc, get_device_module
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
-PAGE_WISE_LOAD_THRESHOLD = 10
-PAGE_WISE_LOAD_BATCH_SIZE = 128
-
 
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
@@ -114,6 +111,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
+        self.page_wise_load_threshold = (
+            server_args.mooncake_page_wise_load_threshold
+        )
+        self.page_wise_load_batch_size = (
+            server_args.mooncake_page_wise_load_batch_size
+        )
+        if self.page_wise_load_threshold <= 0:
+            raise ValueError(
+                "--mooncake-page-wise-load-threshold must be positive, got "
+                f"{self.page_wise_load_threshold}."
+            )
+        if self.page_wise_load_batch_size <= 0:
+            raise ValueError(
+                "--mooncake-page-wise-load-batch-size must be positive, got "
+                f"{self.page_wise_load_batch_size}."
+            )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
@@ -312,11 +325,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     for index, key in enumerate(new_keys)
                     if index >= len(results) or results[index] != 0
                 ]
-                logger.warning(
+                logger.debug(
                     "Mooncake lookup hit but get session start failed for rid=%s: "
                     "failed_objects=%s; falling back to prefill.",
                     rid,
                     failed_objects,
+                )
+                logger.warning(
+                    "Mooncake lookup hit but get session start failed for rid=%s: "
+                    "failed_objects=%d; falling back to prefill.",
+                    rid,
+                    len(failed_objects),
                 )
                 self._rollback_session_refs_locked(acquired)
                 self.stats["load_fallback"] = self.stats.get("load_fallback", 0) + 1
@@ -408,7 +427,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
             if any(
-                len(keys) >= PAGE_WISE_LOAD_THRESHOLD
+                len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
                 self._load_page_wise(counter_index, request_transfers, batches)
@@ -513,8 +532,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     sizes[index].extend(layer_sizes[index])
                     offsets[index].extend(layer_offsets[index])
 
-            for start in range(0, len(keys), PAGE_WISE_LOAD_BATCH_SIZE):
-                end = start + PAGE_WISE_LOAD_BATCH_SIZE
+            for start in range(0, len(keys), self.page_wise_load_batch_size):
+                end = start + self.page_wise_load_batch_size
                 chunk_keys = keys[start:end]
                 chunk_sizes = sizes[start:end]
                 result = self.storage.store.batch_get_into_multi_buffer_ranges(
