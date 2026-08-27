@@ -144,6 +144,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
+        extra_config["dfs_replica_num"] = server_args.mooncake_dfs_replica_num
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
