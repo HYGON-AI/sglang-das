@@ -275,6 +275,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.unified_cache_linker import ExternalLinkerLoadError
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1832,7 +1833,12 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
+                try:
+                    result = self.run_batch(batch)
+                except ExternalLinkerLoadError as error:
+                    self._abort_external_linker_failed_batch(batch, error)
+                    self.last_batch = None
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1892,7 +1898,16 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                try:
+                    batch_result = self.run_batch(batch)
+                except ExternalLinkerLoadError as error:
+                    # The previous result can share Req objects with this batch;
+                    # commit it before freeing the failed batch's request slots.
+                    while self.result_queue:
+                        pop_and_process()
+                    self._abort_external_linker_failed_batch(batch, error)
+                    self.last_batch = None
+                    continue
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -1918,6 +1933,45 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _abort_external_linker_failed_batch(
+        self, batch: ScheduleBatch, error: ExternalLinkerLoadError
+    ) -> None:
+        """Fail one request batch without terminating the scheduler process."""
+        logger.error(
+            "Mooncake direct load failed; aborting the current batch while "
+            "keeping the scheduler alive: rids=%s",
+            [req.rid for req in batch.reqs],
+            exc_info=error,
+        )
+
+        # Model execution has returned, but kernels may still be queued on the
+        # forward stream. Do not recycle request/KV slots until they are drained.
+        self.forward_stream.synchronize()
+        if hasattr(self.tree_cache, "mark_external_linker_load_failed"):
+            self.tree_cache.mark_external_linker_load_failed()
+
+        message = "Mooncake KV cache load failed. Please retry the request."
+        seen = set()
+        for req in batch.reqs:
+            if req.rid in seen:
+                continue
+            seen.add(req.rid)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            req.skip_radix_cache_insert = True
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            self._release_aborted_request(req.rid)
+            if req.req_pool_idx is not None:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(finished_reason=req.finished_reason.to_json(), rid=req.rid),
+                req,
+            )
+
+        if self.chunked_req in batch.reqs:
+            self.chunked_req = None
+            self._pending_chunked_abort_req = None
+        self.running_batch.filter_batch()
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -4185,6 +4239,12 @@ class Scheduler(
 
         if not self.is_fully_idle():
             return
+
+        if getattr(self.tree_cache, "external_linker_load_failed", False):
+            logger.warning(
+                "Resetting radix cache after a failed external-linker load."
+            )
+            self.flush_cache(empty_cache=False)
 
         if self.enable_unified_memory:
             try:

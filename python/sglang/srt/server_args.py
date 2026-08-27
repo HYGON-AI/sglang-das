@@ -2797,6 +2797,18 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "mooncake"
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+        NS("memory"),
+    ] = 10
+    mooncake_page_wise_load_batch_size: A[
+        int,
+        "Maximum number of keys in one complete-page Mooncake direct-linker "
+        "read call.",
+        NS("memory"),
+    ] = 128
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs

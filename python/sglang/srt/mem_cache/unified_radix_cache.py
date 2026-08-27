@@ -308,6 +308,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
+        self.external_linker_load_failed = False
+
+    def mark_external_linker_load_failed(self) -> None:
+        # Direct loads publish allocated pages before the layer-wise DMA ends.
+        # Avoid matching a potentially incomplete node until an idle reset.
+        self.external_linker_load_failed = True
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
@@ -424,6 +430,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.host_pool_group.destroy()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if self.external_linker_load_failed:
+            return self.tree_core.empty_match_result
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result

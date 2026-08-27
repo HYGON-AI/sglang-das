@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 from sglang.srt.mem_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
+    ExternalCacheHitMarker,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -224,6 +225,320 @@ def test_load_waits_for_scheduler_stream(monkeypatch):
     linker.load_queue.join()
     linker.load_queue.put(None)
     thread.join(timeout=5)
+
+
+def test_session_start_negative_result_falls_back_and_logs_key(caplog):
+    ended = []
+
+    class _Store:
+        def batch_get_session_start(self, keys):
+            assert keys == ["page-a", "page-b"]
+            return [0, -702]
+
+        def batch_get_session_end(self, keys):
+            ended.append(list(keys))
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=1)
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.session_refcounts = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a", "page-b"],
+        device_indices=torch.tensor([1, 2]),
+    )
+    assert not linker.prepare_load("rid", [transfer])
+    assert linker.prepared_load_sessions == {}
+    assert linker.session_refcounts == {}
+    assert ended == [["page-a"]]
+    assert linker.stats["load_fallback"] == 1
+    assert "lookup hit but get session start failed" in caplog.text
+    assert "page-b" in caplog.text
+    assert "-702" in caplog.text
+
+
+def test_range_get_negative_result_logs_key(caplog):
+    failures = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            return [-702]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: [0],
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[123]],
+            [[8]],
+            [[0]],
+        ),
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 1
+    linker.page_wise_load_threshold = 10
+    linker.page_wise_load_batch_size = 128
+    linker.pools = {PoolName.KV: pool}
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda index, layer: None,
+        fail=lambda index, error: failures.append(error),
+    )
+    linker.pending_loads = {}
+    linker.prepared_load_sessions = {"rid": ["page-a"]}
+    linker.session_refcounts = {"page-a": 1}
+    linker.session_lock = threading.Lock()
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["page-a"],
+                        host_indices=torch.tensor([0]),
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert failures
+    assert "lookup/session succeeded but range get failed" in caplog.text
+    assert "page-a" in caplog.text
+    assert "-702" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("key_count", "threshold", "uses_complete_page_flow"),
+    [(9, 10, False), (10, 10, True), (10, 11, False)],
+)
+def test_large_load_switches_to_complete_page_flow(
+    key_count, threshold, uses_complete_page_flow
+):
+    events = []
+    calls = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            calls.append((list(keys), ptrs, sizes, offsets))
+            events.append(("get", len(keys)))
+            return [sum(item) for item in sizes]
+
+        def batch_get_session_end(self, keys):
+            events.append(("session_end", len(keys)))
+
+    keys = [f"page-{index}" for index in range(key_count)]
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: indices.tolist(),
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[layer * 1000 + location] for location in locations],
+            [[layer + 1] for _ in locations],
+            [[layer * 10] for _ in locations],
+        ),
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 2
+    linker.page_wise_load_threshold = threshold
+    linker.page_wise_load_batch_size = 128
+    linker.pools = {PoolName.KV: pool}
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda values, transfer: (values, 1),
+        _tag_keys=lambda values: values,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda index, layer: events.append(("complete", layer)),
+        fail=lambda index, error: pytest.fail(str(error)),
+    )
+    linker.pending_loads = {}
+    linker.prepared_load_sessions = {"rid": list(keys)}
+    linker.session_refcounts = dict.fromkeys(keys, 1)
+    linker.session_lock = threading.Lock()
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=keys,
+                        host_indices=torch.arange(key_count),
+                    )
+                ],
+            )
+        ],
+    )
+
+    if not uses_complete_page_flow:
+        assert len(calls) == 2
+        assert calls[0][2][0] == [1]
+        assert calls[1][2][0] == [2]
+        assert events == [
+            ("get", key_count),
+            ("complete", 0),
+            ("get", key_count),
+            ("complete", 1),
+            ("session_end", key_count),
+        ]
+    else:
+        assert len(calls) == 1
+        assert calls[0][2][0] == [1, 2]
+        assert calls[0][3][0] == [0, 10]
+        assert events == [
+            ("get", 10),
+            ("session_end", 10),
+            ("complete", 0),
+            ("complete", 1),
+        ]
+
+
+def test_complete_page_load_honors_configured_batch_size():
+    calls = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            calls.append((list(keys), sizes))
+            return [sum(item) for item in sizes]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    key_count = 129
+    keys = [f"page-{index}" for index in range(key_count)]
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: indices.tolist(),
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[location] for location in locations],
+            [[8] for _ in locations],
+            [[layer * 8] for _ in locations],
+        ),
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 3
+    linker.page_wise_load_threshold = 10
+    linker.page_wise_load_batch_size = 64
+    linker.pools = {PoolName.KV: pool}
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda values, transfer: (values, 1),
+        _tag_keys=lambda values: values,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda index, layer: None,
+        fail=lambda index, error: pytest.fail(str(error)),
+    )
+    linker.pending_loads = {}
+    linker.prepared_load_sessions = {"rid": list(keys)}
+    linker.session_refcounts = dict.fromkeys(keys, 1)
+    linker.session_lock = threading.Lock()
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=keys,
+                        host_indices=torch.arange(key_count),
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert [len(call_keys) for call_keys, _ in calls] == [64, 64, 1]
+    assert all(sizes == [8, 8, 8] for _, chunk in calls for sizes in chunk)
+
+
+def test_wrapper_session_prepare_failure_falls_back_before_tree_insert():
+    aborted_components = []
+    aborted_sessions = []
+
+    class _Component:
+        component_type = ComponentType.FULL
+
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOAD
+            return PoolTransfer(
+                name=PoolName.KV,
+                keys=list(keys),
+                device_indices=torch.tensor([11, 12]),
+            )
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            if phase == ExternalLinkerLoadPhase.ABORT:
+                aborted_components.append(transfer.device_indices.clone())
+                return None
+            return transfer
+
+    empty = torch.empty((0,), dtype=torch.int64)
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=empty)
+        ),
+        _all_reduce_attn_groups=lambda value, op: None,
+    )
+    backend = SimpleNamespace(
+        prepare_load=lambda rid, transfers: False,
+        abort_prepared_load=aborted_sessions.append,
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["page-a", "page-b"],
+            device_hit_len=0,
+        )
+    }
+    req = SimpleNamespace(
+        rid="rid",
+        last_node=0,
+        prefix_indices=empty,
+        host_hit_length=2,
+        swa_host_hit_length=2,
+        mamba_host_hit_length=0,
+    )
+
+    indices, node = wrapper.load_back(req)
+
+    assert indices.numel() == 0
+    assert node == 0
+    assert aborted_sessions == ["rid"]
+    assert [value.tolist() for value in aborted_components] == [[11, 12]]
+    assert req.host_hit_length == 0
+    assert req.swa_host_hit_length == 0
 
 
 def test_offload_runs_on_background_thread(monkeypatch):
