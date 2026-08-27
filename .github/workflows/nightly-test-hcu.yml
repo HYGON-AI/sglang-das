@@ -368,6 +368,10 @@ jobs:
         run: |
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
+      - name: Trust checked-out workspace
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
       - name: Install build deps
         run: |
           pip install build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust maturin ciupload
