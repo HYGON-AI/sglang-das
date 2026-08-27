@@ -951,7 +951,10 @@ class HCUMLABackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+        ):
             if not self.skip_prefill:
                 return self.flashattn_backend.forward_extend(
                     q,
