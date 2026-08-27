@@ -2902,7 +2902,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if (
+                        if kv_chunk.kv_sent:
+                            ret = 0
+                        elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
@@ -2977,10 +2979,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
-                        if kv_chunk.kv_sent:
-                            ret = 0
-                        elif len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
-                            ret = 0
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
