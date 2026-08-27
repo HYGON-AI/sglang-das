@@ -164,8 +164,8 @@ jobs:
           source $HOME/.cargo/env
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
-          cd sgl-model-gateway && cargo build --release
-          maturin build --manifest-path bindings/python/Cargo.toml --release --skip-auditwheel
+          cd sgl-model-gateway && cargo build --release --features vendored-openssl
+          maturin build --manifest-path bindings/python/Cargo.toml --release --skip-auditwheel --features vendored-openssl
           echo "=== sgl-model-gateway wheel ==="
           ls -lh "$GITHUB_WORKSPACE/sgl-model-gateway/target/wheels/"*.whl
 

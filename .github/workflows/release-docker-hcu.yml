@@ -5,6 +5,8 @@ name: Release Docker Images (HCU)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 14 * * *"  # 22:00 Beijing Time daily
 
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}

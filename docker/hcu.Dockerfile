@@ -64,6 +64,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install boltops ${TORCH_TAG} \
     && das-install causal_conv1d==1.5.4 ${TORCH_TAG} \
     && das-install flash_mla ${TORCH_TAG} \
+    && das-install flash_kda ${TORCH_TAG} \
     && das-install fastsafetensors ${TORCH_TAG} \
     && das-install triton==3.6.0 ${TORCH_TAG} \
     && pip install --no-cache-dir numpy==1.25.0 \
