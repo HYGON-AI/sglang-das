@@ -2808,20 +2808,23 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+        # Tiled-kernel path only: set_kv_buffer already does scale/dtype
+        # conversion; doing it twice corrupts FP8 (integer div_ on uint8 view).
+        if not _kv_layout_hcu_fa and (_is_cuda or _is_hip):
+            if cache_k.dtype != self.dtype:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.contiguous().view(self.store_dtype)
-            cache_v = cache_v.contiguous().view(self.store_dtype)
-        else:
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.contiguous().view(self.store_dtype)
+                cache_v = cache_v.contiguous().view(self.store_dtype)
+            else:
+                cache_k = cache_k.contiguous()
+                cache_v = cache_v.contiguous()
 
         if loc_2d.device != self.k_buffer[0].device:
             loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
@@ -2834,7 +2837,9 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
-        if not (_is_cuda or _is_hip):
+        # HND slots aren't contiguous ROW_BYTES spans — the tiled kernel's
+        # `loc * row_bytes` walks off the buffer. Fall back to set_kv_buffer.
+        if not (_is_cuda or _is_hip) or _kv_layout_hcu_fa:
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
             valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()

@@ -20,7 +20,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.decode_attention import (
+    _extract_kv_strides,
+    _kv_layout_hcu_fa,
+)
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
@@ -340,6 +343,9 @@ def _fwd_kernel(
     stride_buf_ktok,
     stride_buf_vpage,
     stride_buf_vtok,
+    # V's per-D step: 1 everywhere except HND V where it's page_size.
+    # K's D is always innermost (stride=1), so no stride_buf_kd is needed.
+    stride_buf_vd,
     compact_batch_size,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
@@ -496,9 +502,8 @@ def _fwd_kernel(
                 other=0,
             )
 
-            # Page-aware KV address math. At PAGE_SIZE==1
-            # (legacy / non-shared / shared-at-ps=1), Triton specializes
-            # the else-branch away — byte-identical SASS to today.
+            # Page-aware KV address math (PAGE_SIZE==1 branch is specialized
+            # away by Triton). `* stride_buf_vd` handles HND V's non-1 D step.
             if PAGE_SIZE == 1:
                 # load k in transposed way
                 offs_buf_k = (
@@ -579,14 +584,14 @@ def _fwd_kernel(
                 offs_buf_v = (
                     offs_kv_loc[:, None] * stride_buf_vbs
                     + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
+                    + offs_dv[None, :] * stride_buf_vd
                 )
             else:
                 offs_buf_v = (
                     page_id[:, None] * stride_buf_vpage
                     + tok_in_p[:, None] * stride_buf_vtok
                     + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
+                    + offs_dv[None, :] * stride_buf_vd
                 )
             v = tl.load(
                 V_Buffer + offs_buf_v,
@@ -843,11 +848,11 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
-        k_buffer, page_size
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
+        _extract_kv_strides(k_buffer, page_size, is_value=False)
     )
-    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
-        v_buffer, page_size
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
+        _extract_kv_strides(v_buffer, page_size, is_value=True)
     )
 
     aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
@@ -891,6 +896,7 @@ def extend_attention_fwd(
         k_tok_stride,
         v_page_stride,
         v_tok_stride,
+        v_d_stride,
         batch_size,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
@@ -990,6 +996,9 @@ def _fwd_kernel_unified(
     stride_buf_ktok,
     stride_buf_vpage,
     stride_buf_vtok,
+    # V's per-D step: 1 everywhere except HND V where it's page_size.
+    # K's D is always innermost (stride=1), so no stride_buf_kd is needed.
+    stride_buf_vd,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -1148,7 +1157,8 @@ def _fwd_kernel_unified(
                 other=0,
             )
 
-            # Page-aware KV address math (see _fwd_kernel_stage1).
+            # Page-aware KV address math (see _fwd_kernel above).
+            # `* stride_buf_vd` handles HND V's non-1 D step.
             if PAGE_SIZE == 1:
                 # Load K
                 offs_buf_k = (
@@ -1231,14 +1241,14 @@ def _fwd_kernel_unified(
                 offs_buf_v = (
                     offs_kv_loc[:, None] * stride_buf_vbs
                     + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
+                    + offs_dv[None, :] * stride_buf_vd
                 )
             else:
                 offs_buf_v = (
                     page_id[:, None] * stride_buf_vpage
                     + tok_in_p[:, None] * stride_buf_vtok
                     + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
+                    + offs_dv[None, :] * stride_buf_vd
                 )
             v = tl.load(
                 V_Buffer + offs_buf_v,
@@ -1317,7 +1327,12 @@ def extend_attention_fwd_unified(
                          (None if sliding window not used)
         xai_temperature_len: XAI temperature length
     """
-    Lq, Lv = q.shape[-1], v_buffer.shape[-1]
+    Lq = q.shape[-1]
+    # HND V is [pages, H, D, ps]: D is at dim -2, not -1.
+    if _kv_layout_hcu_fa and v_buffer.ndim == 4:
+        Lv = v_buffer.shape[-2]
+    else:
+        Lv = v_buffer.shape[-1]
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
@@ -1326,8 +1341,11 @@ def extend_attention_fwd_unified(
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
-    # head_num lives at dim 1 (3-D) or dim 2 (4-D view).
-    kv_head_num = k_buffer.shape[-2]
+    # HND K is [pages, H, ps, D]: H is at dim -3; page-major/3-D keeps H at -2.
+    if _kv_layout_hcu_fa and k_buffer.ndim == 4:
+        kv_head_num = k_buffer.shape[-3]
+    else:
+        kv_head_num = k_buffer.shape[-2]
     kv_group_num = q.shape[1] // kv_head_num
 
     USE_CUSTOM_MASK = custom_mask is not None
@@ -1346,11 +1364,11 @@ def extend_attention_fwd_unified(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
-        k_buffer, page_size
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
+        _extract_kv_strides(k_buffer, page_size, is_value=False)
     )
-    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
-        v_buffer, page_size
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
+        _extract_kv_strides(v_buffer, page_size, is_value=True)
     )
 
     aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
@@ -1385,6 +1403,7 @@ def extend_attention_fwd_unified(
         k_tok_stride,
         v_page_stride,
         v_tok_stride,
+        v_d_stride,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
