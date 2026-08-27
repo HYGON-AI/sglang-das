@@ -388,9 +388,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.draft_model.prune_to_ctx_kv_injection()
 
     def _attach_shared_modules(self) -> None:
-        if self._is_pd_prefill:
-            return
-
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
             if self.ps.tp_rank == 0:
                 logger.info(
@@ -638,18 +635,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
-
-        # A PD prefill worker does not run local speculative decode. Keep the
-        # captured target states on the result so the scheduler can transfer
-        # them to the decode worker; injecting them into the local draft cache
-        # and clearing the result would make the remote draft start without its
-        # context features.
-        if self._is_pd_prefill:
-            batch_output.next_draft_input = make_next_draft_input(
-                bonus_tokens=next_token_ids,
-                new_seq_lens=batch.seq_lens,
-            )
-            return batch_output
 
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
