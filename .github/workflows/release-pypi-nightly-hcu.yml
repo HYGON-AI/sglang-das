@@ -150,6 +150,8 @@ jobs:
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
           cd python
+          # setup.py 固定读 pyproject.toml; HCU 依赖清单在 pyproject_hcu.toml, 构建前换入
+          cp pyproject_hcu.toml pyproject.toml
           export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}"
           python -m build --wheel --no-isolation -Cfeatures=all_hip
           echo "=== sglang wheel ==="
