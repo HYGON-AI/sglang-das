@@ -158,6 +158,7 @@ _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_w4a8_contiguous_hipc = get_bool_env_var(
     "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
 )
+_use_w4a8_masked_hipc = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -2109,8 +2110,16 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
         )
 
+        # The HIPC kernel requires a separately shuffled int8 weight layout.
+        # Keep the existing packed-weight kernel as the compatibility default.
+        grouped_w4a8_op = (
+            torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc
+            if _use_w4a8_masked_hipc
+            else torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked
+        )
+
         # ---- first GEMM ----
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc(
+        grouped_w4a8_op(
             hidden_states,
             hidden_states_scale,
             w13_weight,
@@ -2153,7 +2162,7 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
         )
 
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc(
+        grouped_w4a8_op(
             q_a2_all,
             q_a2_scale,
             w2_weight,
