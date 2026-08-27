@@ -2809,6 +2809,13 @@ class ServerArgs:
         "read call.",
         NS("memory"),
     ] = 128
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+        NS("memory"),
+    ] = True
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs

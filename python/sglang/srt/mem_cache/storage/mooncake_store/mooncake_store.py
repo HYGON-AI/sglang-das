@@ -672,8 +672,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         max_retries = 10
         retry_delay = 1.0  # seconds
 
+        config = self._replicate_config_cls()
+        config.dfs_replica_num = 1
+
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value)
+            ret = self.store.put(warmup_key, warmup_value, config)
             if ret == 0:
                 break
             logger.warning(
@@ -1345,9 +1348,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+            config.dfs_replica_num = 1
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
+            config.dfs_replica_num = 1
             return self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
@@ -1356,7 +1361,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            config = self._replicate_config_cls()
+            config.dfs_replica_num = 1
+            return self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes, config
+            )
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
