@@ -1181,7 +1181,6 @@ class Req(ReqDllmMixin):
         # kv_send(req.input_ids[req.start_send_idx:req.extend_range.end])
         # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
-        self.disagg_decode_prefix_len: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
@@ -1189,10 +1188,17 @@ class Req(ReqDllmMixin):
         self.tmp_end_idx: int = -1
         # Decode-side cached-prefix length; base of the staging chunk grid
         # (start_send_idx starts here but advances with every send).
-        self.disagg_decode_prefix_len: int = 0
+        # None until bootstrap pops it off the sender: the prefill bootstrap
+        # treats None as "not resolved yet", so a 0 here silently pins every
+        # request's decode prefix to 0.
+        self.disagg_decode_prefix_len: Optional[int] = None
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        # Upper bound on radix prefix reuse for DSpark PD-hidden requests.
+        # Set at bootstrap to the decode-committed prefix; see
+        # _compute_max_prefix_len.
+        self.pd_hidden_max_prefix_len: Optional[int] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -1425,6 +1431,11 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        # DSpark PD ships hidden states for [decode prefix, end). A reused
+        # prefix is never forwarded, so it yields no hidden rows; matching past
+        # the decode-committed prefix would leave holes that abort the transfer.
+        if self.pd_hidden_max_prefix_len is not None:
+            max_prefix_len = min(max_prefix_len, self.pd_hidden_max_prefix_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

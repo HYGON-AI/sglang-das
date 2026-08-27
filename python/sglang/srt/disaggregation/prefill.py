@@ -229,6 +229,24 @@ def _select_pd_hidden_payload_indices(
     return np.asarray(src_indices, dtype=np.int32)
 
 
+def _pd_hidden_chunk_ends(batch: ScheduleBatch) -> List[int]:
+    """Return logical sequence ends for mapping captured hidden rows.
+
+    Under CP with a radix hit, ``seq_lens_cpu`` can describe only the fresh
+    local segment. ``prefix_lens + extend_lens`` remains the global token
+    coordinate used by decode's ``hidden_start`` metadata.
+    """
+    if batch.prefix_lens is not None:
+        return [
+            int(prefix_len) + int(extend_len)
+            for prefix_len, extend_len in zip(
+                batch.prefix_lens, batch.extend_lens, strict=True
+            )
+        ]
+    assert batch.seq_lens_cpu is not None
+    return [int(x) for x in batch.seq_lens_cpu.tolist()]
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -502,6 +520,15 @@ class PrefillBootstrapQueue:
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
+        # Cap this request's radix prefix reuse at the prefix decode already
+        # holds: a reused prefix is never forwarded, so it yields no hidden rows
+        # for DSpark's PD hidden transfer. Gated on the server-level algorithm so
+        # every rank computes the same cap -- gating on per-request metadata lets
+        # ranks disagree and deadlocks the MoE dispatch collective.
+        if self.scheduler.server_args.speculative_algorithm is not None and str(
+            self.scheduler.server_args.speculative_algorithm
+        ).upper().endswith("DSPARK"):
+            req.pd_hidden_max_prefix_len = int(decode_prefix_len)
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
             num_kv_indices_to_send,
@@ -666,6 +693,42 @@ class PrefillBootstrapQueue:
             op=torch.distributed.ReduceOp.MIN,
             group=self.scheduler.attn_cp_cpu_group,
         )
+
+        # Only the rank hosting the bootstrap server hears decode's
+        # decode_prefix_len; the other ranks would resolve 0 and derive a
+        # diverging radix cap for the same request. Agree on the value with the
+        # same collectives as the readiness vote above, and backfill the manager
+        # dict so every rank's finalize_bootstrap resolves -- and pops -- the
+        # same value. A genuine 0 stays absent and keeps the default path.
+        prefix_tensor = torch.tensor(
+            [
+                int(
+                    self.kv_manager.req_to_decode_prefix_len.get(
+                        req.bootstrap_room, 0
+                    )
+                    or 0
+                )
+                for req in self.queue
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        torch.distributed.all_reduce(
+            prefix_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.scheduler.attn_tp_cpu_group,
+        )
+        torch.distributed.all_reduce(
+            prefix_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.scheduler.attn_cp_cpu_group,
+        )
+        for req, value in zip(self.queue, prefix_tensor.tolist()):
+            if value > 0:
+                self.kv_manager.req_to_decode_prefix_len[req.bootstrap_room] = int(
+                    value
+                )
+
         return [bool(value) for value in ready_tensor.tolist()]
 
     def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
@@ -1231,16 +1294,7 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
-        if batch.seq_lens_cpu is not None:
-            chunk_ends = [int(x) for x in batch.seq_lens_cpu.tolist()]
-        else:
-            assert batch.prefix_lens is not None
-            chunk_ends = [
-                int(prefix_len) + int(extend_len)
-                for prefix_len, extend_len in zip(
-                    batch.prefix_lens, batch.extend_lens, strict=True
-                )
-            ]
+        chunk_ends = _pd_hidden_chunk_ends(batch)
 
         hidden_offset = 0
         for req, extend_len, chunk_end in zip(
@@ -2155,7 +2209,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = 0
         self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
-        req.disagg_decode_prefix_len = 0
+        req.disagg_decode_prefix_len = None
         req.early_send_prefix_end = None
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None

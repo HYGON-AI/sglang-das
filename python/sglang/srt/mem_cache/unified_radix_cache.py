@@ -901,9 +901,15 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        # Repoint by full-attention residency. DSV4 prompt donation deliberately
+        # creates a full-only leaf whose SWA component is a tombstone.
+        match_result = self.match_prefix(
+            MatchPrefixParams(
+                key=radix_key,
+                req=req,
+                return_full_match=getattr(req, "force_radix_leaf_creation", False),
+            )
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len

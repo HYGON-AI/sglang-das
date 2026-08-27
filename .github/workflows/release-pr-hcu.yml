@@ -91,6 +91,10 @@ jobs:
           persist-credentials: false
           allow-unsafe-pr-checkout: true
 
+      - name: Trust checked-out workspace
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |

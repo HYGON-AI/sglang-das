@@ -14,6 +14,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _allow_dsv4_decode_radix_speculative(server_args: ServerArgs) -> bool:
+    """Allow only speculative paths covered by the experimental DSV4 cache."""
+    if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+        return False
+
+    algorithm = (server_args.speculative_algorithm or "").upper()
+    if algorithm == "DSPARK":
+        return True
+    return (
+        algorithm == "EAGLE"
+        and server_args.speculative_eagle_topk == 1
+        and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+    )
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
@@ -79,7 +95,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if server_args.speculative_algorithm is not None:
+            if (
+                server_args.speculative_algorithm is not None
+                and not _allow_dsv4_decode_radix_speculative(server_args)
+            ):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
