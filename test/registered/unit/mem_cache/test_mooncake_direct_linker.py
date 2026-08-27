@@ -291,6 +291,8 @@ def test_range_get_negative_result_logs_key(caplog):
     )
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.num_layers = 1
+    linker.page_wise_load_threshold = 10
+    linker.page_wise_load_batch_size = 128
     linker.pools = {PoolName.KV: pool}
     linker.storage = SimpleNamespace(
         store=_Store(),
@@ -328,8 +330,13 @@ def test_range_get_negative_result_logs_key(caplog):
     assert "-702" in caplog.text
 
 
-@pytest.mark.parametrize("key_count", [9, 10])
-def test_large_load_switches_to_complete_page_flow(key_count):
+@pytest.mark.parametrize(
+    ("key_count", "threshold", "uses_complete_page_flow"),
+    [(9, 10, False), (10, 10, True), (10, 11, False)],
+)
+def test_large_load_switches_to_complete_page_flow(
+    key_count, threshold, uses_complete_page_flow
+):
     events = []
     calls = []
 
@@ -353,6 +360,8 @@ def test_large_load_switches_to_complete_page_flow(key_count):
     )
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.num_layers = 2
+    linker.page_wise_load_threshold = threshold
+    linker.page_wise_load_batch_size = 128
     linker.pools = {PoolName.KV: pool}
     linker.storage = SimpleNamespace(
         store=_Store(),
@@ -384,16 +393,16 @@ def test_large_load_switches_to_complete_page_flow(key_count):
         ],
     )
 
-    if key_count < 10:
+    if not uses_complete_page_flow:
         assert len(calls) == 2
         assert calls[0][2][0] == [1]
         assert calls[1][2][0] == [2]
         assert events == [
-            ("get", 9),
+            ("get", key_count),
             ("complete", 0),
-            ("get", 9),
+            ("get", key_count),
             ("complete", 1),
-            ("session_end", 9),
+            ("session_end", key_count),
         ]
     else:
         assert len(calls) == 1
@@ -407,7 +416,7 @@ def test_large_load_switches_to_complete_page_flow(key_count):
         ]
 
 
-def test_complete_page_load_batches_at_most_128_keys():
+def test_complete_page_load_honors_configured_batch_size():
     calls = []
 
     class _Store:
@@ -430,6 +439,8 @@ def test_complete_page_load_batches_at_most_128_keys():
     )
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.num_layers = 3
+    linker.page_wise_load_threshold = 10
+    linker.page_wise_load_batch_size = 64
     linker.pools = {PoolName.KV: pool}
     linker.storage = SimpleNamespace(
         store=_Store(),
@@ -461,7 +472,7 @@ def test_complete_page_load_batches_at_most_128_keys():
         ],
     )
 
-    assert [len(call_keys) for call_keys, _ in calls] == [128, 1]
+    assert [len(call_keys) for call_keys, _ in calls] == [64, 64, 1]
     assert all(sizes == [8, 8, 8] for _, chunk in calls for sizes in chunk)
 
 

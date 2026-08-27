@@ -160,6 +160,25 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         self.assertEqual(server_args.load_balance_method, "total_tokens")
         self.assertEqual(server_args.tp_size, 4)
 
+    def test_mooncake_page_wise_load_options(self):
+        defaults = self.parser.parse_args(["--model", "dummy"])
+        self.assertEqual(defaults.mooncake_page_wise_load_threshold, 10)
+        self.assertEqual(defaults.mooncake_page_wise_load_batch_size, 128)
+
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--mooncake-page-wise-load-threshold",
+                "24",
+                "--mooncake-page-wise-load-batch-size",
+                "64",
+            ]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+        self.assertEqual(server_args.mooncake_page_wise_load_threshold, 24)
+        self.assertEqual(server_args.mooncake_page_wise_load_batch_size, 64)
+
 
 if __name__ == "__main__":
     unittest.main()
