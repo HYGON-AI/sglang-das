@@ -407,6 +407,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self.dfs_replica_num = (
+                extra_config.get("dfs_replica_num", 1) if extra_config else 1
+            )
             self._use_group_semantics = (
                 self.enable_group_semantics
                 and self._supports_group_ids
@@ -667,11 +670,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         max_retries = 10
         retry_delay = 1.0  # seconds
 
-        config = self._replicate_config_cls()
-        config.dfs_replica_num = 1
+        config_obj = self._replicate_config_cls() 
+        config_obj.dfs_replica_num = self.dfs_replica_num
 
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value, config)
+            ret = self.store.put(warmup_key, warmup_value, config_obj)
             if ret == 0:
                 break
             logger.warning(
@@ -1343,11 +1346,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
-            config.dfs_replica_num = 1
+            config.dfs_replica_num = self.dfs_replica_num
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            config.dfs_replica_num = 1
+            config.dfs_replica_num = self.dfs_replica_num
             return self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
@@ -1357,9 +1360,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         else:
             config = self._replicate_config_cls()
-            config.dfs_replica_num = 1
+            config.dfs_replica_num = self.dfs_replica_num
             return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
+                key_strs, buffer_ptrs, buffer_sizes,config
             )
 
     def _get_batch_zero_copy_impl(
