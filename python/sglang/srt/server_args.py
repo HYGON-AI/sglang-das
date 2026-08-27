@@ -2816,6 +2816,12 @@ class ServerArgs:
         "count threshold.",
         NS("memory"),
     ] = True
+    mooncake_dfs_replica_num: A[
+        int,
+        "Number of DFS replicas for Mooncake store ReplicateConfig. "
+        "Controls the dfs_replica_num field passed to put/batch_put operations.",
+        NS("memory"),
+    ] = 1
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
