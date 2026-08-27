@@ -19,6 +19,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _allow_dsv4_decode_radix_speculative(cfg: Any) -> bool:
+    """Allow only speculative paths covered by the experimental DSV4 cache."""
+    if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+        return False
+
+    algorithm = (cfg.speculative_algorithm or "").upper()
+    if algorithm == "DSPARK":
+        return True
+    return (
+        algorithm == "EAGLE"
+        and cfg.speculative_eagle_topk == 1
+        and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+    )
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
@@ -94,7 +110,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
+            if cfg.speculative_algorithm not in (
+                None,
+                "DSPARK",
+            ) and not _allow_dsv4_decode_radix_speculative(cfg):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "

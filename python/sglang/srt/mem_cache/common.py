@@ -185,7 +185,11 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if req.skip_radix_cache_insert:
-        return
+        # DSV4 decode radix prompt donation re-enables exactly one insert.
+        if getattr(req, "allow_radix_cache_insert_once", False):
+            req.allow_radix_cache_insert_once = False
+        else:
+            return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
 
