@@ -37,6 +37,9 @@ from sglang.srt.mem_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    SchedulerOutputStreamer,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -269,6 +272,100 @@ def test_session_start_negative_result_falls_back_and_logs_key(caplog):
     assert "lookup hit but get session start failed" in caplog.text
     assert "page-b" in caplog.text
     assert "-702" in caplog.text
+
+
+def test_prepare_load_reports_combined_disk_dfs_source():
+    ended = []
+
+    class _Store:
+        def batch_get_session_start(self, keys):
+            return [0] * len(keys)
+
+        def batch_get_session_sources(self, keys):
+            assert keys == ["page-a", "page-b"]
+            return ["local_disk", "disk_dfs"]
+
+        def batch_get_session_end(self, keys):
+            ended.append(list(keys))
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=1)
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        dfs_replica_num=1,
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a", "page-b"],
+        device_indices=torch.tensor([1, 2]),
+    )
+    assert linker.prepare_load("rid", [transfer])
+    assert linker.get_prepared_load_source("rid") == "disk_dfs"
+
+    linker.abort_prepared_load("rid")
+    assert ended == [["page-a", "page-b"]]
+    assert linker.session_sources == {}
+
+
+def test_successful_prefetch_records_sglang_and_mooncake_tokens():
+    sglang_metrics = []
+    mooncake_metrics = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pending_load_metrics = {
+        "rid": ("local_disk", 128, mooncake_direct_linker.time.perf_counter())
+    }
+    linker.storage_metrics_collector = SimpleNamespace(
+        log_l4_prefetch=lambda source, tokens, duration, success: sglang_metrics.append(
+            (source, tokens, success, duration)
+        )
+    )
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(
+            record_hicache_tokens=lambda operation, source, tokens: mooncake_metrics.append(
+                (operation, source, tokens)
+            )
+        )
+    )
+
+    linker._finish_l4_metric("prefetch", "rid", True)
+
+    assert sglang_metrics[0][:3] == ("local_disk", 128, True)
+    assert sglang_metrics[0][3] >= 0
+    assert mooncake_metrics == [("prefetch", "local_disk", 128)]
+
+
+def test_cached_tokens_details_exposes_direct_l4_source():
+    streamer = SchedulerOutputStreamer.__new__(SchedulerOutputStreamer)
+    streamer.enable_hicache_storage = lambda: False
+    req = SimpleNamespace(
+        cached_tokens_device=16,
+        cached_tokens_host=0,
+        cached_tokens_storage=32,
+        cached_tokens_storage_source="mooncake_disk_dfs",
+        cached_tokens=48,
+    )
+
+    assert streamer.get_cached_tokens_details(req) == {
+        "device": 16,
+        "host": 0,
+        "storage": 32,
+        "storage_backend": "mooncake_disk_dfs",
+    }
 
 
 def test_range_get_negative_result_logs_key(caplog):

@@ -297,6 +297,10 @@ class UnifiedCacheLinker(ABC):
     def abort_prepared_load(self, rid: str) -> None:
         """Release resources acquired by :meth:`prepare_load`."""
 
+    def get_prepared_load_source(self, rid: str) -> str | None:
+        """Return the selected L4 source for a prepared request, if known."""
+        return None
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -541,12 +545,29 @@ class UnifiedCacheLinkerWrapper:
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
             req.mamba_host_hit_length = 0
+            req.storage_hit_length = 0
+            req.cached_tokens_storage_source = None
             logger.warning(
                 "External linker load is no longer restorable for rid=%s; "
                 "falling back to normal prefill.",
                 req.rid,
             )
             return empty_indices, req.last_node
+
+        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
+        local_source = source_getter(req.rid) if source_getter is not None else None
+        source_code = torch.tensor(
+            2
+            if local_source == "disk_dfs"
+            else 1 if local_source == "local_disk" else 0,
+            dtype=torch.int,
+            device=prepared_on_all_ranks.device,
+        )
+        cache._all_reduce_attn_groups(source_code, torch.distributed.ReduceOp.MAX)
+        source = {1: "local_disk", 2: "disk_dfs"}.get(int(source_code.item()))
+        if source is not None:
+            req.storage_hit_length = len(tail_hashes) * cache.page_size
+            req.cached_tokens_storage_source = f"mooncake_{source}"
 
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
