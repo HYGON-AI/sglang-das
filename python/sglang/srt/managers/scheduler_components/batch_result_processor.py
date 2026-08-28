@@ -835,8 +835,10 @@ class SchedulerBatchResultProcessor:
         accept_lens = result.accept_lens.tolist()
         stride = _get_speculative_output_stride(result)
         num_non_draft = result.num_non_draft_tokens_per_req
+        # A zero-length verify result has no accepted non-draft token; count
+        # zero accepted drafts rather than a negative number.
         result.num_correct_drafts_per_req_cpu = [
-            length - num_non_draft for length in accept_lens
+            max(length - num_non_draft, 0) for length in accept_lens
         ]
         result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
 
