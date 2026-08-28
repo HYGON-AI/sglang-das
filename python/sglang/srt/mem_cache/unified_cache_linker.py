@@ -558,13 +558,13 @@ class UnifiedCacheLinkerWrapper:
         local_source = source_getter(req.rid) if source_getter is not None else None
         source_code = torch.tensor(
             2
-            if local_source == "disk_dfs"
+            if local_source == "dfs"
             else 1 if local_source == "local_disk" else 0,
             dtype=torch.int,
             device=prepared_on_all_ranks.device,
         )
         cache._all_reduce_attn_groups(source_code, torch.distributed.ReduceOp.MAX)
-        source = {1: "local_disk", 2: "disk_dfs"}.get(int(source_code.item()))
+        source = {1: "local_disk", 2: "dfs"}.get(int(source_code.item()))
         if source is not None:
             req.storage_hit_length = len(tail_hashes) * cache.page_size
             req.cached_tokens_storage_source = f"mooncake_{source}"

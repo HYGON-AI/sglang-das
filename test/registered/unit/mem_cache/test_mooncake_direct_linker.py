@@ -274,7 +274,7 @@ def test_session_start_negative_result_falls_back_and_logs_key(caplog):
     assert "-702" in caplog.text
 
 
-def test_prepare_load_reports_combined_disk_dfs_source():
+def test_prepare_load_reports_dfs_source():
     ended = []
 
     class _Store:
@@ -283,7 +283,7 @@ def test_prepare_load_reports_combined_disk_dfs_source():
 
         def batch_get_session_sources(self, keys):
             assert keys == ["page-a", "page-b"]
-            return ["local_disk", "disk_dfs"]
+            return ["local_disk", "dfs"]
 
         def batch_get_session_end(self, keys):
             ended.append(list(keys))
@@ -315,7 +315,7 @@ def test_prepare_load_reports_combined_disk_dfs_source():
         device_indices=torch.tensor([1, 2]),
     )
     assert linker.prepare_load("rid", [transfer])
-    assert linker.get_prepared_load_source("rid") == "disk_dfs"
+    assert linker.get_prepared_load_source("rid") == "dfs"
 
     linker.abort_prepared_load("rid")
     assert ended == [["page-a", "page-b"]]
@@ -348,7 +348,7 @@ def test_cached_tokens_details_exposes_direct_l4_source():
         cached_tokens_device=16,
         cached_tokens_host=0,
         cached_tokens_storage=32,
-        cached_tokens_storage_source="mooncake_disk_dfs",
+        cached_tokens_storage_source="mooncake_dfs",
         cached_tokens=48,
     )
 
@@ -356,7 +356,7 @@ def test_cached_tokens_details_exposes_direct_l4_source():
         "device": 16,
         "host": 0,
         "storage": 32,
-        "storage_backend": "mooncake_disk_dfs",
+        "storage_backend": "mooncake_dfs",
     }
 
 
