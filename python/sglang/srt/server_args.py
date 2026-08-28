@@ -2815,7 +2815,7 @@ class ServerArgs:
         "switches from layer-wise flow to complete-page flow based on key "
         "count threshold.",
         NS("memory"),
-    ] = True
+    ] = False
     mooncake_dfs_replica_num: A[
         int,
         "Number of DFS replicas for Mooncake store ReplicateConfig. "
