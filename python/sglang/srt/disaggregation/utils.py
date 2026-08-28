@@ -1474,7 +1474,6 @@ def setup_state_kv_args(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
-<<<<<<< HEAD
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
 
@@ -1488,8 +1487,6 @@ def setup_state_kv_args(
                 c128_item_lens,
             )
 
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     if pd_hidden_pool is not None:
         data_ptrs, data_lens, item_lens = pd_hidden_pool.get_state_buf_infos()
         if data_ptrs:

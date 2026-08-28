@@ -44,11 +44,8 @@ class DFlashDraftInputV2(SpecInput):
     hidden_states: torch.Tensor
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
-<<<<<<< HEAD
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     prefill_tail_hidden_states: Optional[torch.Tensor] = None
     prefill_tail_valid_mask: Optional[torch.Tensor] = None
     prefill_tail_start_positions: Optional[torch.Tensor] = None

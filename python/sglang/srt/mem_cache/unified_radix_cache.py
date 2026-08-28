@@ -241,7 +241,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
-<<<<<<< HEAD
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -266,9 +265,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_sum_rate_all": 0.0,
             "l3_sum_rate_main_weighted": 0.0,
         }
-=======
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
         self.reset()
         logger.info(

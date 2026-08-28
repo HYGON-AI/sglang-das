@@ -207,12 +207,6 @@ class DeepEPBuffer:
         from sglang.srt.runtime_context import get_flags, get_resources
 
         buffers = get_resources().buffers
-<<<<<<< HEAD
-        # DeepEP's low-latency runtime is process-wide. Creating a second LL
-        # Buffer for the speculative model invalidates/hangs the first runtime
-        # on HCU, so target and draft must share one compatible allocation.
-        state = buffers.get("deepep_ep_state")
-=======
         # DSpark's draft and target can use different expert layouts (257 vs
         # 256 for DSV4). DeepEP's low-latency RDMA size depends on that layout,
         # so each runtime scope needs its own process-level buffer.
@@ -222,7 +216,6 @@ class DeepEPBuffer:
             else "deepep_ep_state"
         )
         state = buffers.get(state_key)
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         if state is None:
             state = SimpleNamespace(
                 buffer=None,

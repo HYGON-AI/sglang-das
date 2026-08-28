@@ -108,17 +108,15 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-<<<<<<< HEAD
-    if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
-        from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
-=======
     if (
         envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
         or server_args.enable_unified_cache_external_linker
         or use_mlx()
     ):
         return _create_unified_radix_cache(ctx, server_args, params)
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
+    
+    if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+        from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)
 

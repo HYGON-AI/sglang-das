@@ -30,19 +30,15 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-<<<<<<< HEAD
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_serving,
 )
-=======
 from sglang.srt.mem_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
-from sglang.srt.runtime_context import get_parallel
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
 if TYPE_CHECKING:
     import torch

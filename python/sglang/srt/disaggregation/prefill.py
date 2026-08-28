@@ -227,7 +227,6 @@ def _select_pd_hidden_payload_indices(
             f"rid={rid}, missing_offsets={missing}"
         )
     return np.asarray(src_indices, dtype=np.int32)
-<<<<<<< HEAD
 
 
 def _pd_hidden_chunk_ends(batch: ScheduleBatch) -> List[int]:
@@ -246,8 +245,6 @@ def _pd_hidden_chunk_ends(batch: ScheduleBatch) -> List[int]:
         ]
     assert batch.seq_lens_cpu is not None
     return [int(x) for x in batch.seq_lens_cpu.tolist()]
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
 
 class PrefillBootstrapQueue:
@@ -696,7 +693,6 @@ class PrefillBootstrapQueue:
             op=torch.distributed.ReduceOp.MIN,
             group=self.scheduler.attn_cp_cpu_group,
         )
-<<<<<<< HEAD
 
         # Only the rank hosting the bootstrap server hears decode's
         # decode_prefix_len; the other ranks would resolve 0 and derive a
@@ -733,8 +729,6 @@ class PrefillBootstrapQueue:
                     value
                 )
 
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         return [bool(value) for value in ready_tensor.tolist()]
 
     def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
@@ -1300,20 +1294,7 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
-<<<<<<< HEAD
         chunk_ends = _pd_hidden_chunk_ends(batch)
-=======
-        if batch.seq_lens_cpu is not None:
-            chunk_ends = [int(x) for x in batch.seq_lens_cpu.tolist()]
-        else:
-            assert batch.prefix_lens is not None
-            chunk_ends = [
-                int(prefix_len) + int(extend_len)
-                for prefix_len, extend_len in zip(
-                    batch.prefix_lens, batch.extend_lens, strict=True
-                )
-            ]
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
         hidden_offset = 0
         for req, extend_len, chunk_end in zip(
@@ -2107,7 +2088,6 @@ class SchedulerDisaggregationPrefillMixin:
                     written=pd_hidden_state(req).written,
                 )
 
-<<<<<<< HEAD
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -2116,29 +2096,20 @@ class SchedulerDisaggregationPrefillMixin:
             # the last chunk. Payload builders stay on the release's newer
             # _full_kv_pages_payload (MINIMAX_INDEX_K included: index rows live
             # at the same loc as main KV on the same page_size).
-=======
             # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
             # as main KV on the same page_size.
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
             payloads = {StateType.PD_HIDDEN: _pd_hidden_payload}
             if last_chunk:
                 payloads.update(
                     {
                         StateType.MAMBA: _mamba_payload,
                         StateType.SWA: _swa_payload,
-<<<<<<< HEAD
                         StateType.DSA: _full_kv_pages_payload,
                         StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                         StateType.SWA_RING: _swa_ring_payload,
                         StateType.C128_STATE: _c128_state_payload,
                         StateType.BLOCK_SCALE: _full_kv_pages_payload,
                         StateType.BLOCK_SCALE_SWA: _swa_payload,
-=======
-                        StateType.DSA: _dsa_payload,
-                        StateType.MINIMAX_INDEX_K: _dsa_payload,
-                        StateType.SWA_RING: _swa_ring_payload,
-                        StateType.C128_STATE: _c128_state_payload,
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
                     }
                 )
             if last_chunk and _is_npu and isinstance(

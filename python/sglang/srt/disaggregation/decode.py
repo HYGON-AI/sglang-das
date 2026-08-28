@@ -28,10 +28,7 @@ import logging
 import math
 import time
 from collections import deque
-<<<<<<< HEAD
 from concurrent.futures import Future
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -110,15 +107,11 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-<<<<<<< HEAD
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
 )
-=======
-from sglang.srt.runtime_context import get_disagg, get_parallel
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_hcu, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -1470,7 +1463,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 reclaim_error = self._reclaim_swa_tail_capacity(
                     swa_len, decode_req.req.rid
                 )
-<<<<<<< HEAD
                 if reclaim_error is not None:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                         self._release_matched_prefix_lock(decode_req.req)
@@ -1489,8 +1481,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
 
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
             pd_hidden_dst_indices = None
             pd_hidden_dst_indices_by_pp = None
             pd_hidden_pp_slices = None
@@ -1499,13 +1489,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_types = self.kv_manager.kv_args.state_types
             if (
                 self.scheduler.spec_algorithm.is_dspark()
-<<<<<<< HEAD
                 and not _is_fake_transfer(decode_req.req)
-=======
-                and not _is_fake_transfer(
-                    decode_req.req, self.scheduler.server_args
-                )
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
                 and StateType.PD_HIDDEN in state_types
                 and pd_hidden_len > 0
             ):
@@ -2550,7 +2534,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
-<<<<<<< HEAD
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
@@ -2560,8 +2543,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         self.kv_manager = None
 
     def add(self, decode_req: DecodeRequest) -> None:
@@ -3009,7 +2990,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-<<<<<<< HEAD
                 if (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.abort_notified
@@ -3028,14 +3008,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
-=======
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                self._release_pd_hidden_rows(decode_req)
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
-                indices_to_remove.add(i)
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue

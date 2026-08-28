@@ -16,10 +16,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-<<<<<<< HEAD
 from sglang.srt.lora.layers import unwrap_lora_layer
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -303,7 +300,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill:
             return
 
-<<<<<<< HEAD
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
             if self.ps.tp_rank == 0:
                 logger.info(
@@ -313,22 +309,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
-=======
-        target_model = self.target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
         self.draft_model.attach_shared_modules(
-<<<<<<< HEAD
             embed_tokens=unwrap_lora_layer(
                 self._resolve_target_embed_tokens(target_model)
             ),
-=======
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
             lm_head=lm_head,
         )
 

@@ -1082,15 +1082,12 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
-<<<<<<< HEAD
         auxiliary_output = (
             result.logits_output.auxiliary_device_output
             if result.logits_output is not None
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
-=======
->>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         if (
             get_pd_hidden_capture_layer_ids(batch.reqs)
             and not self._pp_should_owner_direct_pd_hidden(batch)
