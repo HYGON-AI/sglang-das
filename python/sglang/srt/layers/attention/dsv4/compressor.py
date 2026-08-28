@@ -37,10 +37,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.distributed.parallel_state import get_attn_cp_group
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
-)
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.rlc import compute_rlc_metadata
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
@@ -688,7 +685,8 @@ class Compressor(BaseFusedOp):
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: Optional[AttentionBackend] = None,
+        attn_backend: AttentionBackend,
+        paged: FusedCompressMetadata,
     ) -> torch.Tensor:
         """Repartition-Local Compression path (attention c4, prefill-CP, round-robin).
 
@@ -698,9 +696,13 @@ class Compressor(BaseFusedOp):
         extend-first block reads its overlap from the (replicated) state pool -- patched locally on
         the owning rank -- and the chunk's trailing block is persisted back for the next chunk.
         Produces the same per-token output + state pool as the base path.
+
+        ``paged`` is the v1 ``(write_loc, extra_data, plan)`` metadata for the current batch,
+        built and passed by the caller (kept explicit so this method does not depend on the
+        backend's paged-metadata storage).
         """
         from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
-        
+
         cp_group = get_attn_cp_group()
         cp_size = cp_group.world_size
         cp_rank = cp_group.rank_in_group
@@ -711,10 +713,6 @@ class Compressor(BaseFusedOp):
         extend_lens = list(forward_batch.extend_seq_lens_cpu)
         seq_lens = list(forward_batch.seq_lens_cpu)
         prefix_lens = [int(s) - int(e) for s, e in zip(seq_lens, extend_lens)]
-
-        if TYPE_CHECKING:
-            assert isinstance(attn_backend, DeepseekV4AttnBackend)
-        paged = attn_backend.get_paged_compress_metadata(R)
 
         bundle = _get_rlc_bundle(
             extend_lens, prefix_lens, R, cp_size, cp_rank, device, paged.plan.write_plan

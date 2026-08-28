@@ -1,10 +1,22 @@
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
+#
+# Hygon modifications to this file are licensed under the Apache License,
+# Version 2.0 (the "License"); you may not use these modifications except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """RLC (Repartition-Local Compression) metadata for the DeepSeek-V4 c4 compressor.
 
 Pure-CPU metadata only: block partition / all-to-all routing / halo / local compress-event
 structure / expansion rows. No communication and no kernel calls -- those live in the consumer
-`compressor.py::_forward_rlc`. Ported from the validated prototype
-`mission_all/mission_comprssor/prototype/bench/test_accuracy_1.py`
-(`get_rlc_index` + the routing half of `build_rlc_meta_torch`).
+`compressor.py::_forward_rlc`.
 
 Dataflow this enables (per prefill chunk, over the chunk's `extend` tokens): round-robin-scattered
 tokens are all-to-all'd into "one contiguous block-run per rank + one leading halo block", each rank
@@ -38,8 +50,7 @@ def get_rlc_index(extend_lens: List[int], cp_size: int, ratio: int) -> List[List
     rank can compute that block's c4 overlap locally; the consumer drops the halo's output.
 
     Blocks per sequence use CEIL division, so a non-aligned sequence's partial tail counts as one
-    block for partitioning (it carries no compress event later). Ported verbatim from the prototype
-    bench `get_rlc_index`.
+    block for partitioning (it carries no compress event later).
     """
     block_size = [(L + ratio - 1) // ratio for L in extend_lens]
     block_size_sum = int(sum(block_size))
