@@ -1,4 +1,4 @@
-"""ModelSlim W4A8 MoE → aiter fused MoE (Plan A on DCU/HCU).
+"""ModelSlim W4A8 MoE → aiter fused MoE (Plan A on HCU).
 
 AscendV1 checkpoint packs int4 along **N**; aiter MOE_C expects int4 along **K**
 plus marlin shuffle. This module converts weights at load time and runs
@@ -61,7 +61,7 @@ def _resolve_moe_c_situ_glu():
 
         ImportError: cannot import name 'moe_c_situ_glu' from 'aiter'
 
-    Some DCU images expose the kernel only via ``aiter.ops.moe_c_op`` (not
+    Some HCU images expose the kernel only via ``aiter.ops.moe_c_op`` (not
   re-exported in ``aiter.__init__``).
     """
     global _moe_c_situ_glu_fn

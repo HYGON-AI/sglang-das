@@ -582,7 +582,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     Fused MoE method for ModelSlim quantization.
 
     Default (Ascend NPU): modular Ascend MoE runner.
-    Optional (DCU/HCU Plan A): ``MoeRunnerBackend.AITER`` for W4A8 — converts
+    Optional (HCU Plan A): ``MoeRunnerBackend.AITER`` for W4A8 — converts
     AscendV1 checkpoint layout to aiter MOE_C at load time and runs
     ``aiter_moe`` with ``activation=situ``.
 
@@ -666,13 +666,13 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         if want_aiter and self._is_w4a8_moe(layer):
             if not is_hcu():
                 raise RuntimeError(
-                    "ModelSlim W4A8 aiter MoE requires DCU/HCU "
+                    "ModelSlim W4A8 aiter MoE requires HCU "
                     "(--moe-runner-backend aiter / SGLANG_MODELSLIM_MOE_USE_AITER)."
                 )
             if not is_aiter_w4a8_available():
                 raise ImportError(
                     "aiter is required for ModelSlim W4A8 aiter MoE. "
-                    "Install the pip aiter wheel in the DCU container."
+                    "Install the pip aiter wheel in the HCU container."
                 )
             self._use_aiter_w4a8 = True
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
