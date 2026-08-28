@@ -322,9 +322,8 @@ def test_prepare_load_reports_combined_disk_dfs_source():
     assert linker.session_sources == {}
 
 
-def test_successful_prefetch_records_sglang_and_mooncake_tokens():
+def test_successful_prefetch_records_sglang_tokens():
     sglang_metrics = []
-    mooncake_metrics = []
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.pending_load_metrics = {
         "rid": ("local_disk", 128, mooncake_direct_linker.time.perf_counter())
@@ -334,19 +333,12 @@ def test_successful_prefetch_records_sglang_and_mooncake_tokens():
             (source, tokens, success, duration)
         )
     )
-    linker.storage = SimpleNamespace(
-        store=SimpleNamespace(
-            record_hicache_tokens=lambda operation, source, tokens: mooncake_metrics.append(
-                (operation, source, tokens)
-            )
-        )
-    )
+    linker.storage = SimpleNamespace(store=SimpleNamespace())
 
     linker._finish_l4_metric("prefetch", "rid", True)
 
     assert sglang_metrics[0][:3] == ("local_disk", 128, True)
     assert sglang_metrics[0][3] >= 0
-    assert mooncake_metrics == [("prefetch", "local_disk", 128)]
 
 
 def test_cached_tokens_details_exposes_direct_l4_source():

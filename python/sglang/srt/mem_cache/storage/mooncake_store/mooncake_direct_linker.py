@@ -522,8 +522,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
-                self._load_page_wise(counter_index, request_transfers, batches)
-                succeeded = True
+                succeeded = self._load_page_wise(
+                    counter_index, request_transfers, batches
+                )
                 return
 
             for layer in range(self.num_layers):
@@ -602,8 +603,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return
         duration = time.perf_counter() - started
         self._log_l4_metric(operation, source, tokens, duration, success)
-        if success:
-            self._record_mooncake_tokens(operation, source, tokens)
 
     def _log_l4_metric(
         self,
@@ -628,29 +627,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 exc_info=True,
             )
 
-    def _record_mooncake_tokens(
-        self, operation: str, source: str, tokens: int
-    ) -> None:
-        recorder = getattr(
-            getattr(self.storage, "store", None), "record_hicache_tokens", None
-        )
-        if recorder is None:
-            return
-        try:
-            recorder(operation, source, tokens)
-        except BaseException:
-            logger.warning(
-                "Failed to record Mooncake %s token metrics.",
-                operation,
-                exc_info=True,
-            )
-
     def _load_page_wise(
         self,
         counter_index: int,
         request_transfers: list[tuple[str, list[PoolTransfer]]],
         batches: dict[PoolName, tuple[list[str], list[int]]],
-    ) -> None:
+    ) -> bool:
         """Load complete pages before releasing their layers to the consumer."""
         for name, (keys, locations) in batches.items():
             ptrs: list[list[int]] = [[] for _ in keys]
@@ -705,6 +687,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.abort_prepared_load(rid)
         for layer in range(self.num_layers):
             self.layer_done_counter.complete(counter_index, layer)
+        return True
 
     @staticmethod
     def _validate_range_get_result(
@@ -786,7 +769,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self._log_l4_metric("backup", source, tokens, duration, success)
                 metric_recorded = True
                 if success:
-                    self._record_mooncake_tokens("backup", source, tokens)
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
