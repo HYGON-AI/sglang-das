@@ -44,8 +44,11 @@ class DFlashDraftInputV2(SpecInput):
     hidden_states: torch.Tensor
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
+<<<<<<< HEAD
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
+=======
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     prefill_tail_hidden_states: Optional[torch.Tensor] = None
     prefill_tail_valid_mask: Optional[torch.Tensor] = None
     prefill_tail_start_positions: Optional[torch.Tensor] = None
@@ -236,6 +239,30 @@ class DFlashDraftInputV2(SpecInput):
             else:
                 self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
             self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
+
+        if (
+            self.prefill_tail_hidden_states is not None
+            and self.prefill_tail_hidden_states.numel() > 0
+        ):
+            lengths = self.prefill_tail_valid_mask.to(torch.int64)
+            selected = torch.zeros(
+                lengths.shape[0], dtype=torch.bool, device=lengths.device
+            )
+            selected[new_indices] = True
+            row_mask = torch.repeat_interleave(selected, lengths)
+            self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[row_mask]
+        if (
+            self.prefill_tail_valid_mask is not None
+            and self.prefill_tail_valid_mask.numel() > 0
+        ):
+            self.prefill_tail_valid_mask = self.prefill_tail_valid_mask[new_indices]
+        if (
+            self.prefill_tail_start_positions is not None
+            and self.prefill_tail_start_positions.numel() > 0
+        ):
+            self.prefill_tail_start_positions = self.prefill_tail_start_positions[
+                new_indices
+            ]
 
         if (
             self.prefill_tail_hidden_states is not None

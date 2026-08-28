@@ -1935,6 +1935,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
+<<<<<<< HEAD
 
                 # Counted at dequeue, before the status check, so
                 # `outstanding == 0` means nothing is dequeued or in flight --
@@ -1955,6 +1956,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # Only a recorded Failed status has hidden-ack waiters to
                     # release; an unknown room never registered any.
                     if kv_chunk.room in self.request_status:
+=======
+                if kv_chunk.source_event is not None:
+                    kv_chunk.source_event.synchronize()
+                    kv_chunk.source_event = None
+                current_status = self.request_status.get(kv_chunk.room)
+                if current_status is None or current_status == KVPoll.Failed:
+                    if current_status == KVPoll.Failed:
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
                         self._wake_pd_hidden_ack_waiters(kv_chunk.room)
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"

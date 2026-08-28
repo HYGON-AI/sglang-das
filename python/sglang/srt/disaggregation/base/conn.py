@@ -28,11 +28,14 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+<<<<<<< HEAD
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).
     BLOCK_SCALE = "block_scale"
     BLOCK_SCALE_SWA = "block_scale_swa"
+=======
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     # Target aux hidden rows used to bootstrap decode-side draft KV.
     PD_HIDDEN = "pd_hidden"
 

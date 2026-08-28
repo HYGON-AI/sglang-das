@@ -3152,7 +3152,33 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
+<<<<<<< HEAD
         if run_tbo:
+=======
+        # PD disaggregation drives the capture set per batch; fall back to the
+        # model-level set for the non-disaggregated path.
+        dspark_layers_to_capture = getattr(
+            forward_batch, "pd_hidden_capture_layer_ids", None
+        )
+        if dspark_layers_to_capture is None:
+            dspark_layers_to_capture = self.dspark_layers_to_capture
+        capture_dspark = dspark_layers_to_capture is not None
+        if capture_dspark and use_prefill_cp and cp_v2_active:
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture does not yet support DeepSeek-V4 "
+                "CP-v2. Use the legacy prefill-CP path."
+            )
+        use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
+        pd_aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker(len(dspark_layers_to_capture))
+            if use_packed_pd_aux
+            else list(incoming_pd_aux_hidden_states)
+        )
+        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        # execution cannot expose per-layer completed hidden states), so skip
+        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        if self._can_run_tbo(forward_batch) and not capture_dspark:
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -3197,6 +3223,7 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+<<<<<<< HEAD
         # CP v2 partitions the output per rank, so it needs no output re-gather,
         # and TBO never applied the CP split in the first place.
         cp_gather_output = (
@@ -3204,6 +3231,11 @@ class DeepseekV4Model(nn.Module):
             and not cp_v2_active
             and not run_tbo
             and self.pp_group.is_last_rank
+=======
+        # CP v2 partitions the output per rank, so it needs no output re-gather.
+        cp_gather_output = (
+            use_prefill_cp and not cp_v2_active and self.pp_group.is_last_rank
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         )
 
         if isinstance(pd_aux_hidden_states, AuxHiddenStatePacker):

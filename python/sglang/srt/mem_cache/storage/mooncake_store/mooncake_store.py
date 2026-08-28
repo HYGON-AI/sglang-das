@@ -29,7 +29,12 @@ from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
-DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+DEFAULT_LOCAL_BUFFER_SIZE = int(
+    __import__("os").environ.get(
+        "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
+        16 * 1024 * 1024
+    )
+)
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
@@ -407,6 +412,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self.dfs_replica_num = (
+                extra_config.get("dfs_replica_num", 1) if extra_config else 1
+            )
             self._use_group_semantics = (
                 self.enable_group_semantics
                 and self._supports_group_ids
@@ -667,8 +675,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         max_retries = 10
         retry_delay = 1.0  # seconds
 
+        config_obj = self._replicate_config_cls() 
+        config_obj.dfs_replica_num = self.dfs_replica_num
+
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value)
+            ret = self.store.put(warmup_key, warmup_value, config_obj)
             if ret == 0:
                 break
             logger.warning(
@@ -767,7 +778,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
         suffixes = []
-        if pool_name == PoolName.MAMBA:
+        if pool_name == PoolName.KV:
+            suffixes = [f"_{self.mla_suffix}_k"]
+        elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
@@ -854,10 +867,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        # Start from every KV prefix and let each pool remove the stop points it
+        # cannot serve. Collect the whole set, not just its maximum: a
+        # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
+        # caller has to intersect these sets across ranks.
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
@@ -875,25 +892,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 page_exists = [False] * kv_pages
             boundary = 0
+            pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
                     boundary = page_exists.index(False)
                 except ValueError:
                     boundary = kv_pages
+                pool_restorable = list(range(1, boundary + 1))
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                # A stop point works when the window ending there is complete,
+                # so scan every one instead of stopping at the longest.
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -913,7 +939,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )
@@ -1325,9 +1351,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+            config.dfs_replica_num = self.dfs_replica_num
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
+            config.dfs_replica_num = self.dfs_replica_num
             return self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
@@ -1336,7 +1364,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            config = self._replicate_config_cls()
+            config.dfs_replica_num = self.dfs_replica_num
+            return self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes,config
+            )
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]

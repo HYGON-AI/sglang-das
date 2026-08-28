@@ -56,6 +56,17 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 logger = logging.getLogger(__name__)
 
 W4A8_TPMOE_BACKEND_ENV = "SGLANG_W4A8_TPMOE_BACKEND"
+<<<<<<< HEAD
+=======
+W4A8_TPMOE_BACKEND_AUTO = "auto"
+W4A8_TPMOE_BACKEND_LIGHTOP = "lightop"
+W4A8_TPMOE_BACKEND_AITER = "aiter"
+W4A8_TPMOE_BACKEND_TRITON = "triton"
+_requested_backend = (
+    os.getenv(W4A8_TPMOE_BACKEND_ENV, W4A8_TPMOE_BACKEND_AUTO).strip().lower()
+)
+
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
 _lmslim_w4a8_marlin_available = False
 _lmslim_w4a8_triton_available = False
@@ -70,6 +81,7 @@ aiter_moe = None
 get_aiter_moe_config = None
 w4a8_moe_layout_shuffle_gemm2 = None
 
+<<<<<<< HEAD
 
 def _ensure_lightop_w4a8_marlin_available() -> None:
     global _lmslim_w4a8_marlin_available
@@ -77,6 +89,13 @@ def _ensure_lightop_w4a8_marlin_available() -> None:
 
     if _lmslim_w4a8_marlin_available:
         return
+=======
+if _requested_backend in {
+    W4A8_TPMOE_BACKEND_AUTO,
+    W4A8_TPMOE_BACKEND_LIGHTOP,
+    W4A8_TPMOE_BACKEND_TRITON,
+}:
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     try:
         from lightop.moe import (
             fused_experts_impl_w4a8_marlin as _fused_experts_impl_w4a8_marlin,
@@ -89,8 +108,42 @@ def _ensure_lightop_w4a8_marlin_available() -> None:
             "lightop backend is selected for w4a8 tpmoe, but lightop is not available."
         ) from e
 
+<<<<<<< HEAD
     _lightop_w4a8_marlin.moe_align_block_size_lightop = (
         _safe_lightop_ep_moe_align_block_size
+=======
+    try:
+        from lightop._lmslim_native.layers.fused_moe import w4a8 as w4a8_triton
+        from lightop._lmslim_native.vllm_compat.fused_moe_cache import get_moe_cache
+        from lightop.quant import per_token_quant_int8
+
+        _lmslim_w4a8_triton_available = True
+    except Exception:
+        logger.info(
+            "INFO: Please install lightop triton kernels if you want to use w4a8 triton tpmoe.\n"
+        )
+
+if _requested_backend in {W4A8_TPMOE_BACKEND_AUTO, W4A8_TPMOE_BACKEND_AITER}:
+    try:
+        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+        from aiter.ops.shuffle import w4a8_moe_layout_shuffle_gemm2
+
+        _aiter_w4a8_marlin_available = True
+    except Exception:
+        pass
+
+if _requested_backend not in {
+    W4A8_TPMOE_BACKEND_AUTO,
+    W4A8_TPMOE_BACKEND_LIGHTOP,
+    W4A8_TPMOE_BACKEND_AITER,
+    W4A8_TPMOE_BACKEND_TRITON,
+}:
+    raise ValueError(
+        f"Unsupported {W4A8_TPMOE_BACKEND_ENV}={_requested_backend!r}. "
+        f"Supported values: {W4A8_TPMOE_BACKEND_AUTO!r}, "
+        f"{W4A8_TPMOE_BACKEND_LIGHTOP!r}, {W4A8_TPMOE_BACKEND_AITER!r}, "
+        f"{W4A8_TPMOE_BACKEND_TRITON!r}."
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     )
     fused_experts_impl_w4a8_marlin = _fused_experts_impl_w4a8_marlin
     _lmslim_w4a8_marlin_available = True
@@ -171,6 +224,7 @@ def _resolve_w4a8_tpmoe_backend(
         raise RuntimeError(
             "Neither lightop nor aiter backend is available for w4a8 tpmoe."
         )
+<<<<<<< HEAD
     if backend == W4A8_TPMOE_BACKEND_LIGHTOP:
         _ensure_lightop_w4a8_marlin_available()
     elif backend == W4A8_TPMOE_BACKEND_TRITON:
@@ -178,6 +232,32 @@ def _resolve_w4a8_tpmoe_backend(
     else:
         _ensure_aiter_w4a8_marlin_available()
     return backend
+=======
+elif _requested_backend == W4A8_TPMOE_BACKEND_LIGHTOP:
+    if not _lmslim_w4a8_marlin_available:
+        raise RuntimeError(
+            "lightop backend is selected for w4a8 tpmoe, but lightop is not available."
+        )
+    _resolved_backend = W4A8_TPMOE_BACKEND_LIGHTOP
+elif _requested_backend == W4A8_TPMOE_BACKEND_TRITON:
+    if not _lmslim_w4a8_triton_available:
+        raise RuntimeError(
+            "triton backend is selected for w4a8 tpmoe, but lightop triton kernels are not available."
+        )
+    _resolved_backend = W4A8_TPMOE_BACKEND_TRITON
+else:
+    if not _aiter_w4a8_marlin_available:
+        raise RuntimeError(
+            "aiter backend is selected for w4a8 tpmoe, but aiter is not available."
+        )
+    _resolved_backend = W4A8_TPMOE_BACKEND_AITER
+
+logger.info(
+    "[slimquant_w4a8_marlin] "
+    f"requested_backend={_requested_backend}, "
+    f"resolved_backend={_resolved_backend}"
+)
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
 _use_lightop_w4a8_marlin_moe = get_bool_env_var("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", default="true")
@@ -289,6 +369,7 @@ def _get_w4a8_triton_chunk_size(
     return min(requested_chunk_size, num_tokens, cache_token_capacity)
 
 
+<<<<<<< HEAD
 def _safe_lightop_ep_moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -324,6 +405,8 @@ def _safe_lightop_ep_moe_align_block_size(
     return sglang_moe_align_block_size(local_ids, block_size, local_num_experts)
 
 
+=======
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 def fused_experts_impl_w4a8_triton(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -339,7 +422,10 @@ def fused_experts_impl_w4a8_triton(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     routed_scaling_factor: float,
+<<<<<<< HEAD
     num_local_tokens: Optional[torch.Tensor] = None,
+=======
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     shared_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run SlimQuant W4A8 Triton MoE GEMMs without Marlin repack."""
@@ -354,6 +440,7 @@ def fused_experts_impl_w4a8_triton(
     top_k = topk_ids.shape[1]
     n1 = w1.shape[1]
     n2 = w2.shape[1]
+<<<<<<< HEAD
     if global_num_experts == -1:
         global_num_experts = w1.shape[0]
     expert_mask = None
@@ -363,6 +450,8 @@ def fused_experts_impl_w4a8_triton(
         expert_mask = torch.zeros(
             (num_tokens, top_k), dtype=torch.bool, device=hidden_states.device
         )
+=======
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     chunk_size = _get_w4a8_triton_chunk_size(
         cache13,
         top_k=top_k,
@@ -385,6 +474,7 @@ def fused_experts_impl_w4a8_triton(
         config1, config2 = w4a8_triton.get_w8a8moe_json(
             token_count, w1.shape[0], n1, n2, n1 // 2
         )
+<<<<<<< HEAD
         if expert_map is None:
             # StandardDispatcher apply path: topk_ids are LOCAL (0..E-1) with a
             # -1 sentinel for experts owned by other EP ranks. lightop's
@@ -415,6 +505,11 @@ def fused_experts_impl_w4a8_triton(
                 num_local_tokens=num_local_tokens,
                 ep_size=global_num_experts // w1.shape[0],
             )
+=======
+        sorted_ids, expert_ids, padded_count = w4a8_triton.moe_align_block_size(
+            current_ids, config1["BLOCK_SIZE_M"], global_num_experts, expert_map
+        )
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         qx, x_scale = per_token_quant_int8(current_x)
         w4a8_triton.invoke_fused_moe_kernel_w4a8(
             qx,
@@ -444,6 +539,7 @@ def fused_experts_impl_w4a8_triton(
         qactivated, activated_scale = per_token_quant_int8(
             activated.reshape(token_count * top_k, n1 // 2)
         )
+<<<<<<< HEAD
         if expert_map is not None:
             # The EP align only schedules this rank's slots, so the second
             # GEMM never writes the rows of slots routed to other ranks.
@@ -452,6 +548,8 @@ def fused_experts_impl_w4a8_triton(
             # local contributions, matching the marlin backend's masked
             # op.moe_sum reduce.
             cache3.zero_()
+=======
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
         w4a8_triton.invoke_fused_moe_kernel_w4a8(
             qactivated,
             w2,
@@ -601,6 +699,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
     def __init__(self, quant_config):
         self.quant_config = quant_config
         self.use_deepep = get_moe_a2a_backend().is_deepep()
+        self.use_triton = _resolved_backend == W4A8_TPMOE_BACKEND_TRITON
 
     def create_weights(
         self,
@@ -661,6 +760,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+<<<<<<< HEAD
         if not _use_lightop_w4a8_marlin_moe:
             if self.use_deepep:
                 from deepgemm import pack_w4a8_moe_hipc_weight
@@ -738,18 +838,35 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 w4a8_weight_repack_impl(
                     layer.w13_weight, use_deepep=self.use_deepep
                 ),
+=======
+        if self.use_triton:
+            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+        else:
+            layer.w13_weight = Parameter(
+                w4a8_weight_repack_impl(layer.w13_weight, use_deepep=self.use_deepep),
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
                 requires_grad=False,
             )
             layer.w2_weight = Parameter(
                 w4a8_weight_repack_impl(layer.w2_weight, use_deepep=self.use_deepep),
                 requires_grad=False,
             )
+<<<<<<< HEAD
             layer.w13_weight_scale = Parameter(
                 layer.w13_weight_scale.data, requires_grad=False
             )
             layer.w2_weight_scale = Parameter(
                 layer.w2_weight_scale.data, requires_grad=False
             )
+=======
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.data, requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.data, requires_grad=False
+        )
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -757,6 +874,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
+<<<<<<< HEAD
     def _get_triton_quant_info(self, layer):
         """W4A16 quant info for the Triton MoE runner (same path the native
         MXFP4 model uses). Per-channel scales: block_shape[1] must be >= the K
@@ -783,6 +901,48 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         )
 
     @torch._dynamo.disable()
+=======
+
+    def _apply_triton(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: str,
+        shared_output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        cache13 = get_moe_cache(
+            topk_ids.shape[1],
+            layer.w13_weight.shape[1],
+            layer.w2_weight.shape[1],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        routed_scaling_factor = (
+            self.moe_runner_config.routed_scaling_factor
+            if self.moe_runner_config.routed_scaling_factor is not None
+            else 1.0
+        )
+        return fused_experts_impl_w4a8_triton(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            cache13,
+            activation=activation,
+            apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
+            global_num_experts=self.moe_runner_config.num_experts,
+            expert_map=getattr(layer, "expert_map", None),
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            routed_scaling_factor=routed_scaling_factor,
+            shared_output=shared_output,
+        )
+
+    @torch._dynamo.disable()  # TODO: 性能优化需lmslim/lightop配合
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
     def apply(
         self,
         layer: torch.nn.Module,
@@ -809,6 +969,17 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         x, topk_weights = apply_topk_weights_cpu(
             self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
         )
+        if self.use_triton:
+            output = self._apply_triton(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                layer.moe_runner_config.activation,
+                shared_output=None,
+            )
+            return StandardCombineInput(hidden_states=output)
+
         workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
         routed_scaling_factor = (
             self.moe_runner_config.routed_scaling_factor
@@ -885,6 +1056,20 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         x, topk_weights = apply_topk_weights_cpu(
             self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
         )
+        if self.use_triton:
+            if i_q is not None or i_s is not None:
+                raise NotImplementedError(
+                    "pre-quantized activation input is not supported by the Triton W4A8 MoE path yet."
+                )
+            return self._apply_triton(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                activation,
+                shared_output=shared_output,
+            )
+
         workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
         routed_scaling_factor = (
             self.moe_runner_config.routed_scaling_factor
@@ -945,6 +1130,36 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         routed_scaling_factor = (
             1.0 if routed_scaling_factor is None else routed_scaling_factor
         )
+        if self.use_triton:
+            if shared_output is not None:
+                raise NotImplementedError(
+                    "shared_output is not supported by apply_ep Triton W4A8 MoE path yet."
+                )
+            cache13 = get_moe_cache(
+                topk_ids.shape[1],
+                w1.shape[1],
+                w2.shape[1],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            return fused_experts_impl_w4a8_triton(
+                x,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                cache13,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                routed_scaling_factor=float(routed_scaling_factor),
+                shared_output=None,
+            )
+
+        workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
         return fused_experts_impl_w4a8_marlin(
             x,
             w1,

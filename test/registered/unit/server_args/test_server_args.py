@@ -1452,6 +1452,7 @@ class TestHiCacheArgs(unittest.TestCase):
         )
         self.assertIsNone(args.decode_attention_backend)
 
+<<<<<<< HEAD
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",
@@ -1473,6 +1474,20 @@ class TestHiCacheArgs(unittest.TestCase):
 
         args._handle_cache_compatibility()
 
+=======
+    def test_external_linker_rejects_disabled_radix_cache(self):
+        args = self._make_args(
+            enable_unified_cache_external_linker=True,
+            disable_radix_cache=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive",
+        ):
+            args._handle_cache_compatibility()
+
+>>>>>>> repo-a/feat/rye_20260814_deepseek-v4_open_rebase
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
