@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_kv_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -355,7 +356,11 @@ class PrefillBootstrapQueue:
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+            (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
+            and (
+                not layer_shard_enabled
+                or layer_shard_rank == layer_shard_size - 1
+            )
         )
         kv_args.prefill_start_layer = (
             getattr(
@@ -370,30 +375,33 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
-        has_kv_layer_ids = hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-        kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids() if has_kv_layer_ids else []
-        )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+        draft_kv_pool = (
+            self.draft_token_to_kv_pool if transfer_draft_cache else None
+        )
+        num_draft_entries = 0
+        if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_kv_pool.get_contiguous_buf_infos()
             )
+            num_draft_entries = len(draft_kv_data_ptrs)
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
-            if has_kv_layer_ids:
-                target_layer_num = self.scheduler.model_config.num_hidden_layers
-                kv_layer_ids += [
-                    target_layer_num + i for i in range(len(draft_kv_data_ptrs))
-                ]
+
+        kv_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=self.token_to_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
+            num_draft_entries=num_draft_entries,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+        )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -629,7 +637,7 @@ class PrefillBootstrapQueue:
         if not local_layer_ids or pd_hidden_state(req).src_indices:
             return False
 
-        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        pool = getattr(getattr(self, "metadata_buffers", None), "pd_hidden_pool", None)
         if pool is None:
             return False
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
@@ -655,7 +663,9 @@ class PrefillBootstrapQueue:
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
         )
-        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        pool = getattr(
+            getattr(self, "metadata_buffers", None), "pd_hidden_pool", None
+        )
         hidden_row_credits = pool.available_size() if pool is not None else 0
 
         resource_blocked = False
@@ -958,19 +968,25 @@ class PrefillBootstrapQueue:
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
         )
-        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        pool = getattr(
+            getattr(self, "metadata_buffers", None), "pd_hidden_pool", None
+        )
         hidden_row_credits = pool.available_size() if pool is not None else 0
+        admission_blocked = False
 
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
                 failed_rids.append(req.rid)
             elif poll == KVPoll.WaitingForInput:
+                if admission_blocked:
+                    continue
                 if should_force_retry(req):
                     metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
                     if metadata_cost > metadata_credits:
-                        break
+                        admission_blocked = True
+                        continue
                     metadata_credits -= metadata_cost
-                elif req.pending_bootstrap:
+                elif getattr(req, "pending_bootstrap", False):
                     costs, error = self._probe_bootstrap_ready(
                         req, metadata_credits, hidden_row_credits
                     )
@@ -979,14 +995,17 @@ class PrefillBootstrapQueue:
                         failed_rids.append(req.rid)
                         continue
                     if costs is None:
-                        if self._is_pd_hidden_credit_blocked(
-                            req, metadata_credits, hidden_row_credits
-                        ):
-                            break
-                        break
+                        admission_blocked = True
+                        continue
                     metadata_cost, hidden_cost = costs
                     metadata_credits -= metadata_cost
                     hidden_row_credits -= hidden_cost
+                else:
+                    metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+                    if metadata_cost > metadata_credits:
+                        admission_blocked = True
+                        continue
+                    metadata_credits -= metadata_cost
                 good_rids.append(req.rid)
             elif poll == KVPoll.Bootstrapping:
                 continue
@@ -1623,16 +1642,19 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler,
+        transfer_status: Optional[Tuple[List[str], List[str]]] = None,
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        transfer_status: For PP, the globally agreed successful and failed rids.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
         done_reqs = []
+        success_rids = set(transfer_status[0]) if transfer_status is not None else set()
+        failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -1641,32 +1663,43 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         undone_reqs: List[Req] = []
-        terminal_rids_to_check = set(rids_to_check) if rids_to_check is not None else None
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if terminal_rids_to_check is not None:
-                if req.rid not in terminal_rids_to_check:
-                    undone_reqs.append(req)
+            if transfer_status is not None:
+                consensus_failed = req.rid in failed_rids
+                failure_pending = isinstance(req.finished_reason, FINISH_ABORT)
+                if consensus_failed or failure_pending:
+                    if consensus_failed and not failure_pending:
+                        prepare_abort(
+                            req,
+                            (
+                                "Prefill transfer failed on another PP rank; "
+                                "waiting for the local transfer to stop"
+                            ),
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    local_transfer_stopped = req.pending_bootstrap or poll in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    )
+                    if not local_transfer_stopped:
+                        undone_reqs.append(req)
+                        continue
+                    self.handle_inflight_transfer_failure(req)
+                    done_reqs.append(req)
                     continue
 
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
-                    logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
-                    )
+                if req.rid not in success_rids:
                     undone_reqs.append(req)
                     continue
 
             maybe_release_pd_hidden_rows_on_hidden_done(
                 req,
-                getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
+                getattr(
+                    getattr(self, "disagg_metadata_buffers", None),
+                    "pd_hidden_pool",
+                    None,
+                ),
             )
 
             if req.pending_bootstrap:
@@ -1730,7 +1763,11 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req,
                 self.req_to_metadata_buffer_idx_allocator,
-                getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None),
+                getattr(
+                    getattr(self, "disagg_metadata_buffers", None),
+                    "pd_hidden_pool",
+                    None,
+                ),
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs
@@ -1766,7 +1803,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
-    def get_transferred_rids(self: Scheduler) -> List[str]:
+    def get_transferred_rids(
+        self: Scheduler,
+    ) -> Tuple[List[str], List[str]]:
         """
         Used by PP to inspect local terminal transfers without popping requests.
         """
@@ -1776,17 +1815,20 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
-        transferred_rids: List[str] = []
+        success_rids: List[str] = []
+        failed_rids: List[str] = []
         pd_hidden_pool = getattr(
             self.disagg_metadata_buffers, "pd_hidden_pool", None
         )
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             maybe_release_pd_hidden_rows_on_hidden_done(req, pd_hidden_pool)
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
-                transferred_rids.append(req.rid)
+            if poll == KVPoll.Success:
+                success_rids.append(req.rid)
+            elif poll == KVPoll.Failed:
+                failed_rids.append(req.rid)
 
-        return transferred_rids
+        return success_rids, failed_rids
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.

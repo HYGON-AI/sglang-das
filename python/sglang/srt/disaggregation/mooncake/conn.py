@@ -52,7 +52,10 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    pack_state_types,
     resolve_dcp_dst_entry_indices,
+    resolve_state_component_dst_index,
+    unpack_state_types,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -152,6 +155,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_state_data_formats: List[str] = dataclasses.field(default_factory=list)
     # Local-only validation result; this is never serialized on the wire.
     registration_error: Optional[str] = dataclasses.field(default=None, repr=False)
@@ -194,6 +198,7 @@ class KVArgsRegisterInfo:
             dst_state_data_formats=(
                 unpack_string_list(msg[18]) if len(msg) > 18 and msg[18] != b"" else []
             ),
+            dst_state_types=unpack_state_types(msg[19]) if len(msg) > 19 else [],
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -1481,32 +1486,52 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_state_layer_ids = (
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
+            dst_component_index = i
             if target_rank_registration_info is not None:
+                dst_component_index = resolve_state_component_dst_index(
+                    state_types,
+                    target_rank_registration_info.dst_state_types,
+                    i,
+                )
                 dst_data_ptrs = (
-                    target_rank_registration_info.dst_state_data_ptrs[i]
-                    if i < len(target_rank_registration_info.dst_state_data_ptrs)
+                    target_rank_registration_info.dst_state_data_ptrs[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_data_ptrs)
                     else []
                 )
                 dst_item_lens = (
-                    target_rank_registration_info.dst_state_item_lens[i]
-                    if i < len(target_rank_registration_info.dst_state_item_lens)
+                    target_rank_registration_info.dst_state_item_lens[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_item_lens)
                     else []
                 )
                 dst_dim_per_tensor = (
-                    target_rank_registration_info.dst_state_dim_per_tensor[i]
-                    if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
+                    target_rank_registration_info.dst_state_dim_per_tensor[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_dim_per_tensor)
                     else []
                 )
                 dst_state_layer_ids = (
-                    target_rank_registration_info.dst_state_layer_ids[i]
-                    if i < len(target_rank_registration_info.dst_state_layer_ids)
+                    target_rank_registration_info.dst_state_layer_ids[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_layer_ids)
                     else []
                 )
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
             dst_indices = (
-                req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
+                req.dst_state_indices[dst_component_index]
+                if dst_component_index < len(req.dst_state_indices)
+                else []
             )
 
             if st == StateType.MAMBA:
@@ -3180,6 +3205,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
+            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
@@ -3238,6 +3264,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
+                            packed_state_types,
                     f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
                 self.conclude_state = KVPoll.Failed
