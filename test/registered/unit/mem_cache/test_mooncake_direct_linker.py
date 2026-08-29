@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    SchedulerOutputStreamer,
+)
 from sglang.srt.mem_cache.base_prefix_cache import InsertResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -36,9 +39,6 @@ from sglang.srt.mem_cache.unified_cache_linker import (
     DevicePoolGroup,
     ExternalCacheHitMarker,
     UnifiedCacheLinkerWrapper,
-)
-from sglang.srt.managers.scheduler_components.output_streamer import (
-    SchedulerOutputStreamer,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -276,14 +276,15 @@ def test_session_start_negative_result_falls_back_and_logs_key(caplog):
 
 def test_prepare_load_reports_dfs_source():
     ended = []
+    calls = []
 
     class _Store:
-        def batch_get_session_start(self, keys):
-            return [0] * len(keys)
+        def batch_get_session_start_with_sources(self, keys):
+            calls.append("combined")
+            return [0] * len(keys), ["local_disk", "dfs"]
 
-        def batch_get_session_sources(self, keys):
-            assert keys == ["page-a", "page-b"]
-            return ["local_disk", "dfs"]
+        def batch_get_session_start(self, keys):
+            pytest.fail("combined session start should be used")
 
         def batch_get_session_end(self, keys):
             ended.append(list(keys))
@@ -316,10 +317,103 @@ def test_prepare_load_reports_dfs_source():
     )
     assert linker.prepare_load("rid", [transfer])
     assert linker.get_prepared_load_source("rid") == "dfs"
+    assert calls == ["combined"]
 
     linker.abort_prepared_load("rid")
     assert ended == [["page-a", "page-b"]]
     assert linker.session_sources == {}
+
+
+def test_prepare_load_combined_start_exception_does_not_retry_legacy():
+    calls = []
+
+    class _Store:
+        def batch_get_session_start_with_sources(self, keys):
+            calls.append("combined")
+            raise RuntimeError("binding failed after dispatch")
+
+        def batch_get_session_start(self, keys):
+            calls.append("legacy")
+            return [0] * len(keys)
+
+        def batch_get_session_end(self, keys):
+            pytest.fail("no session result was available to clean up")
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=1)
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a"],
+        device_indices=torch.tensor([1]),
+    )
+    assert not linker.prepare_load("rid", [transfer])
+    assert calls == ["combined"]
+    assert linker.prepared_load_sessions == {}
+    assert linker.session_refcounts == {}
+    assert linker.stats["load_fallback"] == 1
+
+
+def test_prepare_load_legacy_start_does_not_lookup_source():
+    calls = []
+
+    class _Store:
+        def batch_get_session_start(self, keys):
+            calls.append("legacy")
+            return [0] * len(keys)
+
+        def batch_get_session_sources(self, keys):
+            pytest.fail("legacy fallback must not issue a source lookup")
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=1)
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        dfs_replica_num=1,
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a"],
+        device_indices=torch.tensor([1]),
+    )
+    assert linker.prepare_load("rid", [transfer])
+    assert calls == ["legacy"]
+    assert linker.get_prepared_load_source("rid") == "dfs"
 
 
 def test_successful_prefetch_records_sglang_tokens():
@@ -581,7 +675,92 @@ def test_complete_page_load_honors_configured_batch_size():
     assert all(sizes == [8, 8, 8] for _, chunk in calls for sizes in chunk)
 
 
-def test_wrapper_session_prepare_failure_falls_back_before_tree_insert():
+def test_page_wise_batch_failure_marks_every_request_metric_failed():
+    mooncake_tokens = []
+    sglang_metrics = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            expected = [sum(item) for item in sizes]
+            return [expected[0], expected[1] - 1]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+        def record_prefetched_tokens(self, tokens):
+            mooncake_tokens.append(tokens)
+
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: indices.tolist(),
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[location] for location in locations],
+            [[8] for _ in locations],
+            [[0] for _ in locations],
+        ),
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 1
+    linker.page_wise_load_threshold = 1
+    linker.page_wise_load_batch_size = 8
+    linker.enable_page_wise_load = True
+    linker.page_size = 1
+    linker.pools = {PoolName.KV: pool}
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda values, transfer: (values, 1),
+        _tag_keys=lambda values: values,
+    )
+    linker.storage_metrics_collector = SimpleNamespace(
+        log_l4_prefetch=lambda source, tokens, duration, success: sglang_metrics.append(
+            (source, tokens, success)
+        )
+    )
+    failures = []
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda index, layer: pytest.fail("failed batch must not complete"),
+        fail=lambda index, error: failures.append(error),
+    )
+    linker.pending_loads = {}
+    linker.pending_load_metrics = {
+        "rid-a": ("dfs", 1, mooncake_direct_linker.time.perf_counter()),
+        "rid-b": ("dfs", 1, mooncake_direct_linker.time.perf_counter()),
+    }
+    linker.prepared_load_sessions = {"rid-a": ["page-a"], "rid-b": ["page-b"]}
+    linker.session_refcounts = {"page-a": 1, "page-b": 1}
+    linker.session_lock = threading.Lock()
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid-a",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["page-a"],
+                        host_indices=torch.tensor([0]),
+                    )
+                ],
+            ),
+            (
+                "rid-b",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["page-b"],
+                        host_indices=torch.tensor([1]),
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert failures
+    assert mooncake_tokens == []
+    assert sorted(sglang_metrics) == [("dfs", 1, False), ("dfs", 1, False)]
+
+
+def test_wrapper_peer_prepare_failure_falls_back_before_tree_insert():
     aborted_components = []
     aborted_sessions = []
 
@@ -605,17 +784,23 @@ def test_wrapper_session_prepare_failure_falls_back_before_tree_insert():
             return transfer
 
     empty = torch.empty((0,), dtype=torch.int64)
+    collectives = []
     cache = SimpleNamespace(
         page_size=1,
         _components_tuple=(_Component(),),
         tree_core=SimpleNamespace(
             empty_match_result=SimpleNamespace(device_indices=empty)
         ),
-        _all_reduce_attn_groups=lambda value, op: None,
+        _all_reduce_attn_groups=lambda value, op: (
+            collectives.append((value.item(), op)),
+            value.fill_(0),
+        ),
     )
     backend = SimpleNamespace(
-        prepare_load=lambda rid, transfers: False,
+        prepare_load=lambda rid, transfers: True,
+        get_prepared_load_source=lambda rid: "local_disk",
         abort_prepared_load=aborted_sessions.append,
+        load=lambda rid, transfers: pytest.fail("peer failure must not queue a load"),
     )
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
@@ -634,6 +819,8 @@ def test_wrapper_session_prepare_failure_falls_back_before_tree_insert():
         host_hit_length=2,
         swa_host_hit_length=2,
         mamba_host_hit_length=0,
+        storage_hit_length=2,
+        cached_tokens_storage_source="mooncake_local_disk",
     )
 
     indices, node = wrapper.load_back(req)
@@ -644,6 +831,83 @@ def test_wrapper_session_prepare_failure_falls_back_before_tree_insert():
     assert [value.tolist() for value in aborted_components] == [[11, 12]]
     assert req.host_hit_length == 0
     assert req.swa_host_hit_length == 0
+    assert req.storage_hit_length == 0
+    assert req.cached_tokens_storage_source is None
+    assert len(collectives) == 1
+
+
+def test_wrapper_combines_prepare_and_source_in_one_collective():
+    collectives = []
+
+    class _Component:
+        component_type = ComponentType.FULL
+
+        def build_external_linker_transfer(self, phase, node, keys):
+            return PoolTransfer(
+                name=PoolName.KV,
+                keys=list(keys),
+                device_indices=torch.tensor([11, 12]),
+            )
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            return transfer
+
+    empty = torch.empty((0,), dtype=torch.int64)
+    node = SimpleNamespace(id=0, parent=None, external_cache_stored=False)
+
+    def reduce_source(value, op):
+        collectives.append((value.item(), op))
+        value.fill_(3)  # A peer selected DFS; it wins over local_disk under MIN.
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=empty),
+            collect_full_device_indices=lambda last, previous: torch.tensor([11, 12]),
+        ),
+        _all_reduce_attn_groups=reduce_source,
+        insert=lambda params: SimpleNamespace(
+            mamba_exist=False,
+            last_device_node=0,
+            adopted_ranges={ComponentType.FULL: [(0, 2)]},
+        ),
+        resolve_node_handle=lambda value: node,
+    )
+    backend = SimpleNamespace(
+        prepare_load=lambda rid, transfers: True,
+        get_prepared_load_source=lambda rid: "local_disk",
+        load=lambda rid, transfers: True,
+        abort_prepared_load=lambda rid: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["page-a", "page-b"],
+            device_hit_len=0,
+        )
+    }
+    req = SimpleNamespace(
+        rid="rid",
+        last_node=0,
+        prefix_indices=empty,
+        host_hit_length=2,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
+        storage_hit_length=0,
+        cached_tokens_storage_source=None,
+        kv=None,
+    )
+
+    wrapper.load_back(req)
+
+    assert len(collectives) == 1
+    assert req.cached_tokens_storage_source == "mooncake_dfs"
 
 
 def test_offload_runs_on_background_thread(monkeypatch):

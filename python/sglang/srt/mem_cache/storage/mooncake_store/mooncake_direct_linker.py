@@ -117,12 +117,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
-        self.page_wise_load_threshold = (
-            server_args.mooncake_page_wise_load_threshold
-        )
-        self.page_wise_load_batch_size = (
-            server_args.mooncake_page_wise_load_batch_size
-        )
+        self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
+        self.page_wise_load_batch_size = server_args.mooncake_page_wise_load_batch_size
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
@@ -199,10 +195,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.register_buffers()
         self.layer_done_counter = LayerWiseLoadCounter(
             self.num_layers,
-            sync_groups=(params.attn_cp_cache_group, params.attn_tp_cache_group)
-            if params.attn_cp_cache_group is not None
-            or params.attn_tp_cache_group is not None
-            else (params.tp_cache_group,),
+            sync_groups=(
+                (params.attn_cp_cache_group, params.attn_tp_cache_group)
+                if params.attn_cp_cache_group is not None
+                or params.attn_tp_cache_group is not None
+                else (params.tp_cache_group,)
+            ),
         )
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -343,22 +341,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             sources = []
             try:
                 if new_keys:
-                    results = list(self.storage.store.batch_get_session_start(new_keys))
-                    source_getter = getattr(
-                        self.storage.store, "batch_get_session_sources", None
+                    start_with_sources = getattr(
+                        self.storage.store,
+                        "batch_get_session_start_with_sources",
+                        None,
                     )
-                    if source_getter is not None:
-                        try:
-                            sources = list(source_getter(new_keys))
-                        except BaseException:
-                            logger.warning(
-                                "Mooncake session source lookup failed for rid=%s; "
-                                "using the configured direct-storage source.",
-                                rid,
-                                exc_info=True,
-                            )
+                    if start_with_sources is not None:
+                        results, sources = start_with_sources(new_keys)
+                        results = list(results)
+                        sources = list(sources)
                     else:
-                        sources = []
+                        results = list(
+                            self.storage.store.batch_get_session_start(new_keys)
+                        )
                     if len(sources) != len(new_keys):
                         fallback_source = (
                             "dfs"
@@ -526,6 +521,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     counter_index, request_transfers, batches
                 )
                 if not all(request_success.values()):
+                    request_success = {rid: False for rid, _ in request_transfers}
                     raise RuntimeError(
                         "Mooncake page-wise load failed for one or more requests."
                     )
@@ -595,9 +591,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
             for rid, _ in request_transfers:
-                self._finish_l4_metric(
-                    "prefetch", rid, request_success.get(rid, False)
-                )
+                self._finish_l4_metric("prefetch", rid, request_success.get(rid, False))
                 self.abort_prepared_load(rid)
 
     def _finish_l4_metric(self, operation: str, rid: str, success: bool) -> None:
@@ -670,9 +664,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -712,9 +704,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         actual = (
                             result
                             if result is None or isinstance(result, int)
-                            else transferred[index]
-                            if index < len(transferred)
-                            else None
+                            else (
+                                transferred[index] if index < len(transferred) else None
+                            )
                         )
                         wanted = expected[index] if index < len(expected) else None
                         if actual != wanted:
@@ -800,9 +792,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         source = (
-            "dfs"
-            if getattr(self.storage, "dfs_replica_num", 0) > 0
-            else "local_disk"
+            "dfs" if getattr(self.storage, "dfs_replica_num", 0) > 0 else "local_disk"
         )
         ready_event = device_module.Event()
         ready_event.record()

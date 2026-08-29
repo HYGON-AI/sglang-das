@@ -530,11 +530,20 @@ class UnifiedCacheLinkerWrapper:
                 "falling back to prefill.",
                 req.rid,
             )
-        prepared_on_all_ranks = torch.tensor(int(prepared), dtype=torch.int)
-        cache._all_reduce_attn_groups(
-            prepared_on_all_ranks, torch.distributed.ReduceOp.MIN
+        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
+        local_source = source_getter(req.rid) if prepared and source_getter else None
+        source_code = (
+            0 if local_source == "dfs" else 1 if local_source == "local_disk" else 2
         )
-        if not bool(prepared_on_all_ranks.item()):
+        # MIN makes a failed preparation (0) win globally.  For successful
+        # ranks, the encoding preserves the prior DFS-over-local precedence.
+        prepared_and_source = torch.tensor(
+            0 if not prepared else 3 + source_code, dtype=torch.int
+        )
+        cache._all_reduce_attn_groups(
+            prepared_and_source, torch.distributed.ReduceOp.MIN
+        )
+        if int(prepared_and_source.item()) < 3:
             self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
@@ -554,17 +563,7 @@ class UnifiedCacheLinkerWrapper:
             )
             return empty_indices, req.last_node
 
-        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
-        local_source = source_getter(req.rid) if source_getter is not None else None
-        source_code = torch.tensor(
-            2
-            if local_source == "dfs"
-            else 1 if local_source == "local_disk" else 0,
-            dtype=torch.int,
-            device=prepared_on_all_ranks.device,
-        )
-        cache._all_reduce_attn_groups(source_code, torch.distributed.ReduceOp.MAX)
-        source = {1: "local_disk", 2: "dfs"}.get(int(source_code.item()))
+        source = {0: "dfs", 1: "local_disk"}.get(int(prepared_and_source.item()) - 3)
         if source is not None:
             req.storage_hit_length = len(tail_hashes) * cache.page_size
             req.cached_tokens_storage_source = f"mooncake_{source}"
