@@ -605,6 +605,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if metric is None:
             return
         source, tokens, started = metric
+        if success and tokens > 0:
+            recorder = getattr(
+                getattr(self.storage, "store", None), "record_prefetched_tokens", None
+            )
+            if recorder is not None:
+                try:
+                    recorder(tokens)
+                except BaseException:
+                    logger.warning(
+                        "Failed to record Mooncake prefetched token metric.",
+                        exc_info=True,
+                    )
         if source not in ("local_disk", "dfs"):
             return
         duration = time.perf_counter() - started

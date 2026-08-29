@@ -341,6 +341,22 @@ def test_successful_prefetch_records_sglang_tokens():
     assert sglang_metrics[0][3] >= 0
 
 
+def test_successful_memory_prefetch_records_mooncake_tokens():
+    mooncake_tokens = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pending_load_metrics = {
+        "rid": ("memory", 128, mooncake_direct_linker.time.perf_counter())
+    }
+    linker.storage_metrics_collector = None
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(record_prefetched_tokens=mooncake_tokens.append)
+    )
+
+    linker._finish_l4_metric("prefetch", "rid", True)
+
+    assert mooncake_tokens == [128]
+
+
 def test_cached_tokens_details_exposes_direct_l4_source():
     streamer = SchedulerOutputStreamer.__new__(SchedulerOutputStreamer)
     streamer.enable_hicache_storage = lambda: False
