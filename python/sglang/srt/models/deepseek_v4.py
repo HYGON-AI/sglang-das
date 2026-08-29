@@ -3083,14 +3083,6 @@ class DeepseekV4Model(nn.Module):
                     if key.startswith("pd_aux_hidden_states_")
                 )
             ]
-            if hidden_states.shape[0] != positions.shape[0]:
-                rids = getattr(forward_batch, "rids", None)
-                raise RuntimeError(
-                    "PP proxy hidden token count does not match current positions: "
-                    f"pp_rank={self.pp_group.rank_in_group}, "
-                    f"hidden_tokens={hidden_states.shape[0]}, "
-                    f"position_tokens={positions.shape[0]}, rids={rids}"
-                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
