@@ -514,6 +514,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     transfer_engine = None
 
                 setup_kwargs = {}
+                setup_kwargs["enable_client_http_server"] = True
+                try:
+                    from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+                    _dp_rank = get_attention_dp_rank()
+                except Exception:
+                    _dp_rank = 0
+                setup_kwargs["client_http_port"] = 9301 + _dp_rank
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:

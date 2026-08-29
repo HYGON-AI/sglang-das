@@ -500,17 +500,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         request_success = {rid: False for rid, _ in request_transfers}
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
-            for _, transfers in request_transfers:
+            batch_rids: dict[PoolName, list[str]] = {}
+            for rid, transfers in request_transfers:
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
-                    keys.extend(self.storage._tag_keys(component_keys))
+                    tagged_keys = self.storage._tag_keys(component_keys)
+                    keys.extend(tagged_keys)
                     locations.extend(
                         self.pools[transfer.name].prepare_locations(
                             transfer.host_indices
                         )
+                    )
+                    batch_rids.setdefault(transfer.name, []).extend(
+                        [rid] * len(tagged_keys)
                     )
 
             if self.enable_page_wise_load and any(
@@ -518,7 +523,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 for keys, _ in batches.values()
             ):
                 request_success = self._load_page_wise(
-                    counter_index, request_transfers, batches
+                    counter_index, request_transfers, batches, batch_rids
                 )
                 if not all(request_success.values()):
                     request_success = {rid: False for rid, _ in request_transfers}
@@ -644,19 +649,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index: int,
         request_transfers: list[tuple[str, list[PoolTransfer]]],
         batches: dict[PoolName, tuple[list[str], list[int]]],
+        batch_rids: dict[PoolName, list[str]],
     ) -> dict[str, bool]:
         """Load complete pages before releasing their layers to the consumer."""
         request_success = {rid: True for rid, _ in request_transfers}
-        batch_rids: dict[PoolName, list[str]] = {}
-        for rid, transfers in request_transfers:
-            for transfer in transfers:
-                component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                    list(transfer.keys), transfer
-                )
-                tagged_keys = self.storage._tag_keys(component_keys)
-                batch_rids.setdefault(transfer.name, []).extend(
-                    [rid] * len(tagged_keys)
-                )
+
+        # Keep failure attribution conservative.  The batch lists are expected
+        # to stay aligned with ``batch_rids``; if a backend/component violates
+        # that contract, a failed object cannot be safely assigned to one rid.
+        # Treat the whole batch as failed instead of accidentally completing the
+        # layer counter for an affected request.
+        mapping_valid = all(
+            len(batch_rids.get(name, ())) == len(keys)
+            for name, (keys, _) in batches.items()
+        )
+        if not mapping_valid:
+            logger.error(
+                "Mooncake page-wise request attribution mismatch; "
+                "marking the whole batch failed."
+            )
+            request_success = {rid: False for rid, _ in request_transfers}
 
         for name, (keys, locations) in batches.items():
             ptrs: list[list[int]] = [[] for _ in keys]
@@ -711,7 +723,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         wanted = expected[index] if index < len(expected) else None
                         if actual != wanted:
                             rid = chunk_rids[index] if index < len(chunk_rids) else None
-                            if rid is not None:
+                            if rid is None:
+                                request_success = {
+                                    request_rid: False
+                                    for request_rid, _ in request_transfers
+                                }
+                            else:
                                 request_success[rid] = False
                             failed_objects.append(
                                 {

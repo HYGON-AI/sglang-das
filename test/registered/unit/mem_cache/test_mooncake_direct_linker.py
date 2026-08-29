@@ -760,6 +760,81 @@ def test_page_wise_batch_failure_marks_every_request_metric_failed():
     assert sorted(sglang_metrics) == [("dfs", 1, False), ("dfs", 1, False)]
 
 
+def test_page_wise_attribution_mismatch_fails_the_batch():
+    sglang_metrics = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            return [sum(item) for item in sizes]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: indices.tolist(),
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[location] for location in locations],
+            [[8] for _ in locations],
+            [[0] for _ in locations],
+        ),
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 1
+    linker.page_wise_load_threshold = 1
+    linker.page_wise_load_batch_size = 8
+    linker.enable_page_wise_load = True
+    linker.page_size = 1
+    linker.pools = {PoolName.KV: pool}
+    tag_call_count = 0
+
+    def tag_keys(keys):
+        nonlocal tag_call_count
+        tag_call_count += 1
+        return keys if tag_call_count == 1 else []
+
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda values, transfer: (values, 1),
+        _tag_keys=tag_keys,
+    )
+    linker.storage_metrics_collector = SimpleNamespace(
+        log_l4_prefetch=lambda source, tokens, duration, success: sglang_metrics.append(
+            (source, tokens, success)
+        )
+    )
+    failures = []
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda index, layer: pytest.fail("mismatched batch must not complete"),
+        fail=lambda index, error: failures.append(error),
+    )
+    linker.pending_loads = {}
+    linker.pending_load_metrics = {
+        "rid": ("dfs", 1, mooncake_direct_linker.time.perf_counter())
+    }
+    linker.prepared_load_sessions = {"rid": ["page-a"]}
+    linker.session_refcounts = {"page-a": 1}
+    linker.session_lock = threading.Lock()
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["page-a"],
+                        host_indices=torch.tensor([0]),
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert failures
+    assert sglang_metrics == [("dfs", 1, False)]
+
+
 def test_wrapper_peer_prepare_failure_falls_back_before_tree_insert():
     aborted_components = []
     aborted_sessions = []
