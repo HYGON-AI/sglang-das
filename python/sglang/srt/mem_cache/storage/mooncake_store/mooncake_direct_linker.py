@@ -209,9 +209,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.prepared_load_sessions: dict[str, list[str]] = {}
         self.session_refcounts: dict[str, int] = {}
-        self.session_sources: dict[str, str] = {}
+        self.session_sources: dict[str, str | None] = {}
         self.prepared_load_sources: dict[str, str | None] = {}
-        self.pending_load_metrics: dict[str, tuple[str | None, int, float]] = {}
+        self.prepared_load_page_sources: dict[
+            str, dict[tuple[PoolName, str], str | None]
+        ] = {}
+        self.pending_load_metrics: dict[str, tuple[int, dict[str, int], float]] = {}
         self.session_lock = threading.Lock()
         self.gc_frozen = False
         self.load_queue: Queue[
@@ -288,18 +291,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
-        kv = next(
-            (transfer for transfer in transfers if transfer.name == PoolName.KV),
-            None,
+        prepared_page_sources = getattr(self, "prepared_load_page_sources", {}).get(
+            rid, {}
         )
-        page_count = (
-            len(kv.keys)
-            if kv is not None
-            else max((len(transfer.keys) for transfer in transfers), default=0)
-        )
+        logical_page_sources: dict[str, set[str | None]] = {}
+        for transfer in expanded:
+            for page_key in transfer.keys:
+                logical_page_sources.setdefault(page_key, set()).add(
+                    prepared_page_sources.get((transfer.name, page_key))
+                )
+        source_tokens: dict[str, int] = {}
+        for sources in logical_page_sources.values():
+            if "dfs" in sources:
+                source = "dfs"
+            elif "local_disk" in sources:
+                source = "local_disk"
+            else:
+                continue
+            source_tokens[source] = source_tokens.get(source, 0) + self.page_size
         self.pending_load_metrics[rid] = (
-            self.get_prepared_load_source(rid),
-            page_count * self.page_size,
+            len(logical_page_sources) * self.page_size,
+            dict(source_tokens),
             time.perf_counter(),
         )
         return True
@@ -315,11 +327,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         keys = []
         seen = set()
+        pool_page_components: dict[tuple[PoolName, str], list[str]] = {}
         for transfer in expanded:
-            component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                list(transfer.keys), transfer
+            component_keys, key_multiplier = (
+                self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
             )
-            for key in self.storage._tag_keys(component_keys):
+            tagged_component_keys = self.storage._tag_keys(component_keys)
+            for page_index, page_key in enumerate(transfer.keys):
+                start = page_index * key_multiplier
+                pool_page_components.setdefault((transfer.name, page_key), []).extend(
+                    tagged_component_keys[start : start + key_multiplier]
+                )
+            for key in tagged_component_keys:
                 if key not in seen:
                     seen.add(key)
                     keys.append(key)
@@ -354,13 +375,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         results = list(
                             self.storage.store.batch_get_session_start(new_keys)
                         )
+                    # Older Mooncake APIs, and malformed source responses,
+                    # cannot identify the replica selected for each object.
+                    # Keep that attribution unknown rather than guessing from
+                    # configured DFS replicas (which can misclassify memory).
                     if len(sources) != len(new_keys):
-                        fallback_source = (
-                            "dfs"
-                            if getattr(self.storage, "dfs_replica_num", 0) > 0
-                            else "local_disk"
-                        )
-                        sources = [fallback_source] * len(new_keys)
+                        sources = [None] * len(new_keys)
             except BaseException:
                 logger.warning(
                     "Mooncake get session start raised for rid=%s; "
@@ -379,9 +399,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if result == 0:
                     self.session_refcounts[key] = 1
                     source = (
-                        sources[source_index]
-                        if source_index < len(sources)
-                        else "unknown"
+                        sources[source_index] if source_index < len(sources) else None
                     )
                     session_sources[key] = source
                     acquired.append(key)
@@ -416,12 +434,33 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             source = (
                 "dfs"
                 if "dfs" in acquired_sources
-                else "local_disk" if "local_disk" in acquired_sources else None
+                else "local_disk"
+                if "local_disk" in acquired_sources
+                else None
             )
             prepared_sources = getattr(self, "prepared_load_sources", None)
             if prepared_sources is None:
                 prepared_sources = self.prepared_load_sources = {}
             prepared_sources[rid] = source
+            page_sources: dict[tuple[PoolName, str], str | None] = {}
+            for pool_page, component_keys in pool_page_components.items():
+                component_sources = {
+                    session_sources.get(component_key)
+                    for component_key in component_keys
+                }
+                if "dfs" in component_sources:
+                    page_source = "dfs"
+                elif "local_disk" in component_sources:
+                    page_source = "local_disk"
+                elif "memory" in component_sources:
+                    page_source = "memory"
+                else:
+                    page_source = None
+                page_sources[pool_page] = page_source
+            prepared_page_sources = getattr(self, "prepared_load_page_sources", None)
+            if prepared_page_sources is None:
+                prepared_page_sources = self.prepared_load_page_sources = {}
+            prepared_page_sources[rid] = page_sources
         return True
 
     def get_prepared_load_source(self, rid: str) -> str | None:
@@ -450,6 +489,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def abort_prepared_load(self, rid: str) -> None:
         self.pending_loads.pop(rid, None)
         getattr(self, "prepared_load_sources", {}).pop(rid, None)
+        getattr(self, "prepared_load_page_sources", {}).pop(rid, None)
         with self.session_lock:
             keys = self.prepared_load_sessions.pop(rid, [])
             self._rollback_session_refs_locked(keys)
@@ -603,23 +643,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         metric = getattr(self, "pending_load_metrics", {}).pop(rid, None)
         if metric is None:
             return
-        source, tokens, started = metric
-        if success and tokens > 0:
+        total_tokens, source_tokens, started = metric
+        if success and total_tokens > 0:
             recorder = getattr(
                 getattr(self.storage, "store", None), "record_prefetched_tokens", None
             )
             if recorder is not None:
                 try:
-                    recorder(tokens)
+                    recorder(total_tokens)
                 except BaseException:
                     logger.warning(
                         "Failed to record Mooncake prefetched token metric.",
                         exc_info=True,
                     )
-        if source not in ("local_disk", "dfs"):
-            return
         duration = time.perf_counter() - started
-        self._log_l4_metric(operation, source, tokens, duration, success)
+        for source, tokens in source_tokens.items():
+            self._log_l4_metric(operation, source, tokens, duration, success)
 
     def _log_l4_metric(
         self,
@@ -780,7 +819,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             actual = (
                 result
                 if result is None or isinstance(result, int)
-                else transferred[index] if index < len(transferred) else None
+                else transferred[index]
+                if index < len(transferred)
+                else None
             )
             wanted = expected[index] if index < len(expected) else None
             if actual != wanted:

@@ -413,14 +413,58 @@ def test_prepare_load_legacy_start_does_not_lookup_source():
     )
     assert linker.prepare_load("rid", [transfer])
     assert calls == ["legacy"]
-    assert linker.get_prepared_load_source("rid") == "dfs"
+    assert linker.get_prepared_load_source("rid") is None
+
+
+def test_prepare_load_source_mismatch_does_not_guess_dfs():
+    class _Store:
+        def batch_get_session_start_with_sources(self, keys):
+            return [0] * len(keys), []
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.page_size = 16
+    linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=16)
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        dfs_replica_num=1,
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a"],
+        device_indices=torch.tensor([1]),
+    )
+
+    assert linker.prepare_load("rid", [transfer])
+    assert linker.get_prepared_load_source("rid") is None
+    assert linker.prepared_load_page_sources["rid"] == {(PoolName.KV, "page-a"): None}
 
 
 def test_successful_prefetch_records_sglang_tokens():
     sglang_metrics = []
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.pending_load_metrics = {
-        "rid": ("local_disk", 128, mooncake_direct_linker.time.perf_counter())
+        "rid": (
+            128,
+            {"local_disk": 128},
+            mooncake_direct_linker.time.perf_counter(),
+        )
     }
     linker.storage_metrics_collector = SimpleNamespace(
         log_l4_prefetch=lambda source, tokens, duration, success: sglang_metrics.append(
@@ -439,7 +483,7 @@ def test_successful_memory_prefetch_records_mooncake_tokens():
     mooncake_tokens = []
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.pending_load_metrics = {
-        "rid": ("memory", 128, mooncake_direct_linker.time.perf_counter())
+        "rid": (128, {}, mooncake_direct_linker.time.perf_counter())
     }
     linker.storage_metrics_collector = None
     linker.storage = SimpleNamespace(
@@ -449,6 +493,206 @@ def test_successful_memory_prefetch_records_mooncake_tokens():
     linker._finish_l4_metric("prefetch", "rid", True)
 
     assert mooncake_tokens == [128]
+
+
+@pytest.mark.parametrize(
+    ("total_tokens", "source_tokens", "expected_l4"),
+    [
+        (192, {"dfs": 64}, [("dfs", 64, True)]),
+        (
+            128,
+            {"local_disk": 64, "dfs": 64},
+            [("dfs", 64, True), ("local_disk", 64, True)],
+        ),
+    ],
+)
+def test_prefetch_metrics_keep_mooncake_total_and_split_actual_sources(
+    total_tokens, source_tokens, expected_l4
+):
+    mooncake_tokens = []
+    sglang_metrics = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pending_load_metrics = {
+        "rid": (
+            total_tokens,
+            source_tokens,
+            mooncake_direct_linker.time.perf_counter(),
+        )
+    }
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(record_prefetched_tokens=mooncake_tokens.append)
+    )
+    linker.storage_metrics_collector = SimpleNamespace(
+        log_l4_prefetch=lambda source, tokens, duration, success: sglang_metrics.append(
+            (source, tokens, success)
+        )
+    )
+
+    linker._finish_l4_metric("prefetch", "rid", True)
+
+    assert mooncake_tokens == [total_tokens]
+    assert sorted(sglang_metrics) == expected_l4
+
+
+def test_failed_mixed_source_prefetch_records_each_duration_without_tokens():
+    mooncake_tokens = []
+    sglang_metrics = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pending_load_metrics = {
+        "rid": (
+            128,
+            {"local_disk": 64, "dfs": 64},
+            mooncake_direct_linker.time.perf_counter(),
+        )
+    }
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(record_prefetched_tokens=mooncake_tokens.append)
+    )
+    linker.storage_metrics_collector = SimpleNamespace(
+        log_l4_prefetch=lambda source, tokens, duration, success: sglang_metrics.append(
+            (source, tokens, success)
+        )
+    )
+
+    linker._finish_l4_metric("prefetch", "rid", False)
+
+    assert mooncake_tokens == []
+    assert sorted(sglang_metrics) == [
+        ("dfs", 64, False),
+        ("local_disk", 64, False),
+    ]
+
+
+def test_prepare_load_attributes_component_sources_once_per_logical_page():
+    class _Store:
+        def batch_get_session_start_with_sources(self, keys):
+            return [0] * len(keys), ["memory", "memory", "local_disk", "dfs"]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    kv_pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    draft_pool = SimpleNamespace(
+        name=PoolName.DRAFT,
+        indices_from_pool=PoolName.DRAFT,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.page_size = 16
+    linker.pool_group = DevicePoolGroup(
+        [kv_pool, draft_pool], num_layers=1, page_size=16
+    )
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (
+            [
+                component
+                for key in keys
+                for component in (
+                    f"{key}-{transfer.name}-a",
+                    f"{key}-{transfer.name}-b",
+                )
+            ],
+            2,
+        ),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.prepared_load_page_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a"],
+        device_indices=torch.tensor([1]),
+    )
+    draft_transfer = PoolTransfer(
+        name=PoolName.DRAFT,
+        keys=["page-a"],
+        device_indices=torch.tensor([1]),
+    )
+
+    assert linker.prepare_load("rid", [transfer, draft_transfer])
+    assert linker.prepared_load_page_sources["rid"] == {
+        (PoolName.KV, "page-a"): "memory",
+        (PoolName.DRAFT, "page-a"): "dfs",
+    }
+    # DFS wins across actual components/pools and the shared logical page is
+    # counted once.
+    assert linker.load("rid", [transfer, draft_transfer])
+    assert linker.pending_load_metrics["rid"][:2] == (16, {"dfs": 16})
+
+
+def test_load_counts_only_adopted_pages_and_uses_actual_pool_sources():
+    class _Store:
+        def batch_get_session_start_with_sources(self, keys):
+            return [0] * len(keys), ["local_disk", "memory", "dfs", "dfs"]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    kv_pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    draft_pool = SimpleNamespace(
+        name=PoolName.DRAFT,
+        indices_from_pool=PoolName.DRAFT,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.page_size = 16
+    linker.pool_group = DevicePoolGroup(
+        [kv_pool, draft_pool], num_layers=1, page_size=16
+    )
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (
+            [f"{key}-{transfer.name}" for key in keys],
+            1,
+        ),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.prepared_load_page_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {}
+    linker.stats = {"load_fallback": 0}
+    kv_transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page-a", "page-b"],
+        device_indices=torch.tensor([1, 2]),
+    )
+    draft_transfer = PoolTransfer(
+        name=PoolName.DRAFT,
+        keys=["page-a", "page-c"],
+        device_indices=torch.tensor([1, 3]),
+    )
+
+    # prepare sees three logical pages, but the adopted load only includes KV.
+    assert linker.prepare_load("rid", [kv_transfer, draft_transfer])
+    assert linker.load("rid", [kv_transfer])
+    assert linker.pending_load_metrics["rid"][:2] == (32, {"local_disk": 16})
+
+    linker.cancel_queued_load("rid")
+    assert linker.prepare_load("rid-all", [kv_transfer, draft_transfer])
+    assert linker.load("rid-all", [kv_transfer, draft_transfer])
+    total_tokens, source_tokens, _ = linker.pending_load_metrics["rid-all"]
+    # Actual overlapping and distinct pool pages are unioned: a, b, c.
+    assert (total_tokens, source_tokens) == (48, {"dfs": 32})
+    assert sum(source_tokens.values()) <= total_tokens
 
 
 def test_cached_tokens_details_exposes_direct_l4_source():
@@ -722,8 +966,8 @@ def test_page_wise_batch_failure_marks_every_request_metric_failed():
     )
     linker.pending_loads = {}
     linker.pending_load_metrics = {
-        "rid-a": ("dfs", 1, mooncake_direct_linker.time.perf_counter()),
-        "rid-b": ("dfs", 1, mooncake_direct_linker.time.perf_counter()),
+        "rid-a": (1, {"dfs": 1}, mooncake_direct_linker.time.perf_counter()),
+        "rid-b": (1, {"dfs": 1}, mooncake_direct_linker.time.perf_counter()),
     }
     linker.prepared_load_sessions = {"rid-a": ["page-a"], "rid-b": ["page-b"]}
     linker.session_refcounts = {"page-a": 1, "page-b": 1}
@@ -809,7 +1053,7 @@ def test_page_wise_attribution_mismatch_fails_the_batch():
     )
     linker.pending_loads = {}
     linker.pending_load_metrics = {
-        "rid": ("dfs", 1, mooncake_direct_linker.time.perf_counter())
+        "rid": (1, {"dfs": 1}, mooncake_direct_linker.time.perf_counter())
     }
     linker.prepared_load_sessions = {"rid": ["page-a"]}
     linker.session_refcounts = {"page-a": 1}
