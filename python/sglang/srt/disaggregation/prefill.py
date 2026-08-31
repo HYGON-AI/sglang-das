@@ -810,6 +810,14 @@ class SchedulerDisaggregationPrefillMixin:
                         logprob_pt += num_input_logprobs
 
                 if self.enable_overlap:
+                    # Under overlap scheduling this chunk is handed over while
+                    # its own forward may still be running on forward_stream,
+                    # and the transfer worker reads device memory outside the
+                    # CUDA stream. Gate that read on this chunk's writes, the
+                    # same way the early-send path below does.
+                    ev = torch.cuda.Event()
+                    ev.record(self.forward_stream)
+                    req.disagg_kv_sender._early_send_wait_event = ev
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -1142,5 +1150,16 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+        # PP + chunked prefill (overlap off) sends intermediate chunks from
+        # process_prefill_chunk while the writer is still on forward_stream.
+        # Record the barrier here so mooncake wait_event is never None on
+        # that path. sgl-project/sglang#33970 only recorded the overlap arm.
+        if getattr(req.disagg_kv_sender, "_early_send_wait_event", None) is None:
+            stream = getattr(self, "forward_stream", None)
+            if stream is None:
+                stream = torch.cuda.current_stream()
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            req.disagg_kv_sender._early_send_wait_event = ev
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
