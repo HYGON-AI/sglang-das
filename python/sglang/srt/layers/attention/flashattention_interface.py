@@ -28,6 +28,10 @@ from sglang.srt.utils.common import get_bool_env_var
 
 _use_triton_vllm_fa = get_bool_env_var("SGLANG_USE_TRITON_VLLM_FA")
 _is_hcu = is_hcu()
+_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
+    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
+)
+_hcu_fa_layout = "bhsd" if _is_hcu and not _kv_layout_hcu_fa else None
 
 if _is_hcu and _use_triton_vllm_fa:
     from sglang.srt.layers.attention.triton_vllm_flash_attn import (
@@ -231,8 +235,11 @@ def flash_attn_varlen_func(
     sinks=None,
     ver=3,
     out=None,
+    layout=None,
 ):
     global _SERVER_ARGS, IS_SLIMQUANT_W4A8, IS_KVCACHE_FP8_E4M3
+    if layout is None:
+        layout = _hcu_fa_layout
 
     if IS_KVCACHE_FP8_E4M3 is None:
         from sglang.srt.server_args import get_global_server_args
@@ -258,6 +265,7 @@ def flash_attn_varlen_func(
             causal=causal,
             return_attn_probs=return_softmax_lse,
             softcap=softcap,
+            **({"layout": layout} if layout is not None else {}),
         )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
@@ -273,6 +281,7 @@ def flash_attn_varlen_func(
         causal=causal,
         return_attn_probs=return_softmax_lse,
         softcap=softcap,
+        **({"layout": layout} if layout is not None else {}),
     )
     return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
