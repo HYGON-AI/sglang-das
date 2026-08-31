@@ -35,6 +35,14 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
+    if getattr(server_args, "enable_dp_attention", False):
+        from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+        return get_attention_dp_rank()
+    return getattr(params, "dp_rank", None) or 0
+
+
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
@@ -180,7 +188,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             labels = {
                 "storage_backend": "mooncake_direct",
                 "tp_rank": tp_rank,
-                "dp_rank": getattr(server_args, "dp_rank", 0),
+                "dp_rank": _get_mooncake_storage_metrics_dp_rank(server_args, params),
                 "pp_rank": params.pp_rank,
                 "pp_size": params.pp_size,
                 "attn_cp_rank": params.attn_cp_rank,

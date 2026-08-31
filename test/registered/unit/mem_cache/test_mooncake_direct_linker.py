@@ -98,6 +98,86 @@ def test_mooncake_client_http_port_falls_back_without_distributed(monkeypatch):
     assert _get_mooncake_client_http_port() == 9301
 
 
+@pytest.mark.parametrize(
+    ("enable_dp_attention", "dp_rank", "attention_dp_rank", "expected_dp_rank"),
+    [
+        (False, 1, None, 1),
+        (True, None, 3, 3),
+        (False, None, None, 0),
+    ],
+)
+def test_mooncake_direct_linker_storage_metrics_dp_rank(
+    monkeypatch, enable_dp_attention, dp_rank, attention_dp_rank, expected_dp_rank
+):
+    captured_labels = {}
+
+    class _Collector:
+        def __init__(self, labels):
+            captured_labels.update(labels)
+
+    class _NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(
+        mooncake_direct_linker,
+        "resolve_collector_class",
+        lambda *_args: _Collector,
+    )
+    monkeypatch.setattr(
+        mooncake_direct_linker,
+        "resolve_hybrid_device_pool_group",
+        lambda **_kwargs: SimpleNamespace(entry_map={}, num_layers=1),
+    )
+    monkeypatch.setattr(mooncake_direct_linker.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+    if enable_dp_attention:
+        from sglang.srt.layers import dp_attention
+
+        monkeypatch.setattr(
+            dp_attention,
+            "get_attention_dp_rank",
+            lambda: attention_dp_rank,
+        )
+
+    server_args = SimpleNamespace(
+        mooncake_page_wise_load_threshold=1,
+        mooncake_page_wise_load_batch_size=1,
+        mooncake_enable_page_wise_load=False,
+        hicache_storage_backend_extra_config=None,
+        mooncake_dfs_replica_num=0,
+        tp_size=1,
+        model_path="test-model",
+        enable_dp_attention=enable_dp_attention,
+        extra_metric_labels={},
+    )
+    params = SimpleNamespace(
+        page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: object()),
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        enable_metrics=True,
+        dp_rank=dp_rank,
+    )
+
+    MooncakeDirectLinker(
+        server_args,
+        params,
+        components=None,
+        storage=SimpleNamespace(store=SimpleNamespace()),
+    )
+
+    assert captured_labels["dp_rank"] == expected_dp_rank
+
+
 class _Allocator:
     def __init__(self, slots=None):
         self.slots = slots
