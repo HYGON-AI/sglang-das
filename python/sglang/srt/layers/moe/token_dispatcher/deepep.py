@@ -83,6 +83,8 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
+from sglang.srt.runtime_context import get_resources
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
@@ -202,8 +204,6 @@ class DeepEPBuffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get("deepep_ep_state")

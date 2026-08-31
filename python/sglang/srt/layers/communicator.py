@@ -80,6 +80,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_platform,
     get_server_args,
     get_spec,
 )
@@ -91,14 +92,12 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm90_supported = _is_cuda and is_sm90_supported()
-_is_sm100_supported = _is_cuda and is_sm100_supported()
+_is_sm90_supported = _is_cuda and get_platform().is_sm90
+_is_sm100_supported = _is_cuda and get_platform().is_sm100
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()

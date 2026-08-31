@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -411,6 +412,8 @@ def fused_moe_kernel(
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
+    USE_GDC: tl.constexpr = False,
+    GDC_EARLY: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -439,6 +442,11 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        if GDC_EARLY:
+            tl.extra.cuda.gdc_launch_dependents()
+
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -733,6 +741,9 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
+    if USE_GDC and not GDC_EARLY:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 # -----------------------------------------------------------------------------
 # TMA allocator: set once per process (avoid per-call triton.set_allocator)
@@ -1007,6 +1018,11 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
+            if is_arch_support_pdl()
+            else {}
+        )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -1055,9 +1071,10 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
-            FUSE_SWIGLU=fuse_swiglu,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            FUSE_SWIGLU=fuse_swiglu,
+            **pdl_kwargs,
             **config,
         )
 
@@ -1206,6 +1223,7 @@ def _moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -1223,6 +1241,10 @@ def _moe_sum_reduce_kernel(
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
@@ -1261,6 +1283,7 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
@@ -1274,6 +1297,7 @@ def moe_sum_reduce_triton(
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return
 
