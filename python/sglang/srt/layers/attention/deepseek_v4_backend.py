@@ -673,7 +673,7 @@ class DeepseekV4AttnBackend(
         )
         self._dsv4_lightop_kvcache_op = None
         self._dsv4_bf16_flashmla_workspaces: Dict[
-            Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]
+            str, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
         if self._dsv4_lightop_bf16_gather and not self._dsv4_bf16_flashmla_decode:
             raise RuntimeError(
@@ -1760,11 +1760,17 @@ class DeepseekV4AttnBackend(
     ) -> None:
         if not self._dsv4_bf16_flashmla_decode or capacity <= 0 or topk <= 0:
             return
-        key = (slot, topk)
-        current = self._dsv4_bf16_flashmla_workspaces.get(key)
-        current_capacity = 0 if current is None else current[0].shape[0]
-        if current_capacity >= capacity:
-            return
+        current = self._dsv4_bf16_flashmla_workspaces.get(slot)
+        if current is not None:
+            current_capacity = current[0].shape[0]
+            current_topk = current[0].shape[1]
+            if current_capacity >= capacity and current_topk == topk:
+                return
+            # Drop the previous buffer before reallocating. c128 topk grows
+            # every prefill chunk; keeping one workspace per topk OOMs on
+            # long context with small chunked_prefill_size.
+            del self._dsv4_bf16_flashmla_workspaces[slot]
+            del current
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "DSV4 BF16 FlashMLA gather workspace must be allocated before "
@@ -1780,7 +1786,7 @@ class DeepseekV4AttnBackend(
             dtype=torch.int32,
             device=self.device,
         )
-        self._dsv4_bf16_flashmla_workspaces[key] = (
+        self._dsv4_bf16_flashmla_workspaces[slot] = (
             gathered_kv,
             compact_indices,
         )
@@ -1792,7 +1798,7 @@ class DeepseekV4AttnBackend(
         topk: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._allocate_dsv4_bf16_flashmla_workspace(slot, num_queries, topk)
-        workspace = self._dsv4_bf16_flashmla_workspaces.get((slot, topk))
+        workspace = self._dsv4_bf16_flashmla_workspaces.get(slot)
         if workspace is None:
             raise RuntimeError("DSV4 BF16 FlashMLA gather workspace is unavailable")
         gathered_kv, compact_indices = workspace
