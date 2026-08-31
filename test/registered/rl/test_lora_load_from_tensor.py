@@ -31,7 +31,7 @@ register_hcu_ci(
 
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=102, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=105, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"

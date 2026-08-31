@@ -28,7 +28,7 @@ register_hcu_ci(
     disabled="HCU Stage-B deferred: multiprocessing CUDA tensor transfer failed on BW1100 with HIP_VISIBLE_DEVICES=2,3; 1 subtest passed and 3 subtests failed, then wrapper timed out during cleanup.",
 )
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-2-gpu-large-amd")
 
 
