@@ -41,7 +41,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
-# HCU-only: LightOp supplies the FP8 quant/GEMM entry points on DCU.
+# HCU-only: LightOp supplies the FP8 quant/GEMM entry points on HCU.
 from lightop import gemm_ops as quant_ops
 from lightop.gemm_ops import BlockSize
 from lightop.quant import per_token_group_quant_fp8 as per_token_group_quant_fp8_hcu

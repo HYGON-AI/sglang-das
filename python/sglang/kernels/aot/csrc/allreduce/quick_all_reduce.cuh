@@ -510,7 +510,7 @@ __quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value
 
 #if defined(__gfx906__) || defined(__gfx926__) || defined(__gfx928__) || \
     defined(__gfx936__) || defined(__gfx938__)
-  // HCU (gfx9xx DCU) has no v_cvt_pk_f16_f32. Convert the two already-scaled
+  // HCU (gfx9xx) has no v_cvt_pk_f16_f32. Convert the two already-scaled
   // f32 components separately: the multiplies above have their own results, so
   // there is no fused (bf16_as_f32 * scale) -> fp16 expression left for LLVM to
   // reassociate, which is what the ISA form is guarding against.

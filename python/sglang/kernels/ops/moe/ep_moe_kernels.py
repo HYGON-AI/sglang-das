@@ -2896,6 +2896,21 @@ def moe_unpermute(
 
 
 @triton.jit
+def count_expert_histogram_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    numel,
+    E: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * 1024 + tl.arange(0, 1024)  # [1024]
+    mask = offs < numel
+    expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+    valid_mask = (expert_id >= 0) & (expert_id < E)
+    tl.atomic_add(counts_ptr + expert_id, 1, mask=valid_mask)
+
+
+@triton.jit
 def compute_slots_kernel(
     counts_ptr,
     slots_ptr,
@@ -2906,6 +2921,45 @@ def compute_slots_kernel(
         cnt = tl.load(counts_ptr + i)
         slot = (cnt + 255) // 256  # equivalent to ceil(cnt/256)
         tl.store(slots_ptr + i, slot)
+
+
+@triton.jit
+def build_m_indices_kernel(
+    prefix_slots_ptr,
+    actual_counts_ptr,
+    m_indices_ptr,
+    E,
+    MAX_E: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    total_slots = tl.load(prefix_slots_ptr + E - 1)
+    total_elements = total_slots * 256
+
+    mask = offs < total_elements
+
+    slot_id = offs >> 8  # Equivalent to offs // 256
+
+    expert = tl.zeros([BLOCK], dtype=tl.int32)
+    for i in range(0, MAX_E):
+        ps = tl.load(prefix_slots_ptr + i, mask=i < E, other=2**30)
+        expert += slot_id >= ps
+
+    start_slot = tl.where(
+        expert > 0, tl.load(prefix_slots_ptr + expert - 1, mask=expert > 0, other=0), 0
+    )
+
+    rel_slot = slot_id - start_slot
+    pos_in_slot = offs & 0xFF
+    rel_pos = rel_slot * 256 + pos_in_slot
+
+    count_for_expert = tl.load(actual_counts_ptr + expert, mask=mask)
+
+    valid_pos = rel_pos < count_for_expert
+
+    result = tl.where(valid_pos, expert, -1)
+    tl.store(m_indices_ptr + offs, result, mask=mask)
 
 
 def build_m_indices_triton(topk_ids, device, num_experts):
