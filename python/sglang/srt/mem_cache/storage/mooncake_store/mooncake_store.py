@@ -37,6 +37,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = int(
 )
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
+MOONCAKE_CLIENT_HTTP_PORT_BASE = 9301
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,16 @@ def _normalize_tenant_id(value) -> str:
         return DEFAULT_TENANT_ID
     tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
+    """Return a metrics port unique to this physical scheduler process."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        global_rank = torch.distributed.get_rank()
+        if dp_rank is not None:
+            global_rank += dp_rank * torch.distributed.get_world_size()
+        return MOONCAKE_CLIENT_HTTP_PORT_BASE + global_rank
+    return MOONCAKE_CLIENT_HTTP_PORT_BASE
 
 
 @dataclass
@@ -515,13 +526,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
                 setup_kwargs = {}
                 setup_kwargs["enable_client_http_server"] = True
-                try:
-                    from sglang.srt.layers.dp_attention import get_attention_dp_rank
-
-                    _dp_rank = get_attention_dp_rank()
-                except Exception:
-                    _dp_rank = 0
-                setup_kwargs["client_http_port"] = 9301 + _dp_rank
+                setup_kwargs["client_http_port"] = _get_mooncake_client_http_port(
+                    getattr(storage_config, "dp_rank", None)
+                )
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:

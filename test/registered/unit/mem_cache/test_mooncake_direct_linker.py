@@ -23,7 +23,10 @@ from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+    MooncakeStore,
+    _get_mooncake_client_http_port,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
@@ -44,6 +47,55 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_mooncake_client_http_port_uses_default_process_group_rank(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    ports = []
+    for rank in range(8):
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+        ports.append(_get_mooncake_client_http_port())
+
+    assert ports == list(range(9301, 9309))
+
+
+def test_mooncake_client_http_port_distinguishes_regular_dp_worlds(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    ports = []
+    for dp_rank in range(2):
+        for rank in range(2):
+            monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+            ports.append(_get_mooncake_client_http_port(dp_rank))
+
+    assert ports == [9301, 9302, 9303, 9304]
+
+
+def test_mooncake_client_http_port_keeps_cp_ep_ranks_unique(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    ports = []
+    for rank in (0, 2, 5, 7):
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+        ports.append(_get_mooncake_client_http_port())
+
+    assert len(ports) == len(set(ports))
+
+
+def test_mooncake_client_http_port_falls_back_without_distributed(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_rank",
+        lambda: pytest.fail("get_rank must not be called before distributed init"),
+    )
+
+    assert _get_mooncake_client_http_port() == 9301
 
 
 class _Allocator:

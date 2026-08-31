@@ -159,6 +159,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_page_first_layout=False,
             model_name=server_args.model_path,
             extra_config=extra_config,
+            dp_rank=getattr(params, "dp_rank", None),
         )
         if storage is None:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
