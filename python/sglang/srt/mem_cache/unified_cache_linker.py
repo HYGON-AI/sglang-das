@@ -297,6 +297,10 @@ class UnifiedCacheLinker(ABC):
     def abort_prepared_load(self, rid: str) -> None:
         """Release resources acquired by :meth:`prepare_load`."""
 
+    def get_prepared_load_source(self, rid: str) -> str | None:
+        """Return the selected L4 source for a prepared request, if known."""
+        return None
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -526,11 +530,20 @@ class UnifiedCacheLinkerWrapper:
                 "falling back to prefill.",
                 req.rid,
             )
-        prepared_on_all_ranks = torch.tensor(int(prepared), dtype=torch.int)
-        cache._all_reduce_attn_groups(
-            prepared_on_all_ranks, torch.distributed.ReduceOp.MIN
+        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
+        local_source = source_getter(req.rid) if prepared and source_getter else None
+        source_code = (
+            0 if local_source == "dfs" else 1 if local_source == "local_disk" else 2
         )
-        if not bool(prepared_on_all_ranks.item()):
+        # MIN makes a failed preparation (0) win globally.  For successful
+        # ranks, the encoding preserves the prior DFS-over-local precedence.
+        prepared_and_source = torch.tensor(
+            0 if not prepared else 3 + source_code, dtype=torch.int
+        )
+        cache._all_reduce_attn_groups(
+            prepared_and_source, torch.distributed.ReduceOp.MIN
+        )
+        if int(prepared_and_source.item()) < 3:
             self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
@@ -541,12 +554,19 @@ class UnifiedCacheLinkerWrapper:
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
             req.mamba_host_hit_length = 0
+            req.storage_hit_length = 0
+            req.cached_tokens_storage_source = None
             logger.warning(
                 "External linker load is no longer restorable for rid=%s; "
                 "falling back to normal prefill.",
                 req.rid,
             )
             return empty_indices, req.last_node
+
+        source = {0: "dfs", 1: "local_disk"}.get(int(prepared_and_source.item()) - 3)
+        if source is not None:
+            req.storage_hit_length = len(tail_hashes) * cache.page_size
+            req.cached_tokens_storage_source = f"mooncake_{source}"
 
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
