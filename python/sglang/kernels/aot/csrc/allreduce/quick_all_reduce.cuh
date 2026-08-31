@@ -508,9 +508,18 @@ __quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value
   scaled.x *= scale;
   scaled.y *= scale;
 
+#if defined(__gfx906__) || defined(__gfx926__) || defined(__gfx928__) || \
+    defined(__gfx936__) || defined(__gfx938__)
+  // HCU (gfx9xx DCU) has no v_cvt_pk_f16_f32. Convert the two already-scaled
+  // f32 components separately: the multiplies above have their own results, so
+  // there is no fused (bf16_as_f32 * scale) -> fp16 expression left for LLVM to
+  // reassociate, which is what the ISA form is guarding against.
+  return __halves2half2(__float2half_rn(scaled.x), __float2half_rn(scaled.y));
+#else
   int packed;
   asm volatile("v_cvt_pk_f16_f32 %0, %1, %2" : "=v"(packed) : "v"(scaled.x), "v"(scaled.y));
   return *reinterpret_cast<half2*>(&packed);
+#endif
 }
 
 // Twoshot All Reduce

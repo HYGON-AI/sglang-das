@@ -2893,3 +2893,51 @@ def moe_unpermute(
 
     assert outputs is not None
     return outputs
+
+
+@triton.jit
+def compute_slots_kernel(
+    counts_ptr,
+    slots_ptr,
+    E,
+):
+    i = tl.program_id(0)
+    if i < E:
+        cnt = tl.load(counts_ptr + i)
+        slot = (cnt + 255) // 256  # equivalent to ceil(cnt/256)
+        tl.store(slots_ptr + i, slot)
+
+
+def build_m_indices_triton(topk_ids, device, num_experts):
+
+    actual_counts = torch.zeros(num_experts, device=topk_ids.device, dtype=torch.int32)
+    grid = (triton.cdiv(topk_ids.numel(), 1024),)
+    count_expert_histogram_kernel[grid](
+        topk_ids, actual_counts, topk_ids.numel(), E=num_experts
+    )
+
+    slots_per_expert = torch.empty_like(actual_counts)
+    compute_slots_kernel[(num_experts,)](actual_counts, slots_per_expert, num_experts)
+
+    prefix_slots = torch.cumsum(slots_per_expert, dim=0)
+
+    total_slots = prefix_slots[-1].item()
+    total_elements = total_slots * 256
+    m_indices = torch.full(
+        (total_elements,),
+        -1,
+        device=device,
+        dtype=torch.int32,
+    )
+
+    BLOCK = 1024
+    grid = (triton.cdiv(total_elements, BLOCK),)
+    build_m_indices_kernel[grid](
+        prefix_slots,
+        actual_counts,
+        m_indices,
+        num_experts,
+        MAX_E=num_experts,
+        BLOCK=BLOCK,
+    )
+    return m_indices
