@@ -31,7 +31,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -132,6 +132,10 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _matches_abort_rid(recv_req, rid: str) -> bool:
+    return bool(getattr(recv_req, "abort_all", False) or rid.startswith(recv_req.rid))
 
 
 class DecodeReqToTokenPool:
@@ -376,6 +380,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        self.locally_aborted_rids: Set[str] = set()
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
@@ -732,6 +737,123 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return
 
             self.pending_reqs.append(decode_req)
+
+    def _abort_one_prealloc(
+        self, decode_req: DecodeRequest, *, handshake_failed: bool = False
+    ) -> None:
+        rid = decode_req.req.rid
+        receiver = decode_req.kv_receiver
+        if handshake_failed:
+            error_message = (
+                f"Decode handshake failed for request rank={self.tp_rank} "
+                f"{rid=} {decode_req.req.bootstrap_room=}"
+            )
+            if receiver is not None:
+                try:
+                    receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+            logger.error(error_message)
+            prepare_abort(
+                decode_req.req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.scheduler.output_streamer.stream_output(
+                [decode_req.req], decode_req.req.return_logprob
+            )
+            if self.scheduler.metrics_reporter.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+        else:
+            logger.warning("Abort decode prealloc queue immediately. rid=%s", rid)
+        if receiver is not None:
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning("kv_receiver.abort failed for rid=%s: %s", rid, e)
+            try:
+                receiver.clear()
+            except Exception:
+                pass
+        req = decode_req.req
+        if req.req_pool_idx is not None or getattr(req, "mamba_pool_idx", None) is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        transfer_queue = getattr(self, "transfer_queue", None)
+        if transfer_queue is not None:
+            transfer_queue._release_pd_hidden_rows(decode_req)
+        idx = decode_req.metadata_buffer_index
+        if idx is not None and idx != -1:
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.metadata_buffer_index = -1
+
+    def drop_by_rids(self, rids: List[str]) -> List[str]:
+        rid_set = set(rids)
+        if not rid_set:
+            return []
+        dropped: List[str] = []
+        remaining: List[DecodeRequest] = []
+        for decode_req in self.queue:
+            if decode_req.req.rid in rid_set:
+                poll = (
+                    int(decode_req.kv_receiver.poll())
+                    if decode_req.kv_receiver is not None
+                    else int(KVPoll.Failed)
+                )
+                handshake_failed = (
+                    poll == int(KVPoll.Failed)
+                    and decode_req.req.rid not in self.locally_aborted_rids
+                )
+                self._abort_one_prealloc(
+                    decode_req, handshake_failed=handshake_failed
+                )
+                dropped.append(decode_req.req.rid)
+            else:
+                remaining.append(decode_req)
+        self.queue = remaining
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if decode_req.req.rid not in rid_set
+        ]
+        return dropped
+
+    def abort_matching(self, recv_req) -> List[str]:
+        rids = [
+            decode_req.req.rid
+            for decode_req in self.queue
+            if _matches_abort_rid(recv_req, decode_req.req.rid)
+        ]
+        rids.extend(
+            decode_req.req.rid
+            for decode_req in self.pending_reqs
+            if _matches_abort_rid(recv_req, decode_req.req.rid)
+            and decode_req.req.rid not in rids
+        )
+        if not rids:
+            return []
+        rid_set = set(rids)
+        self.locally_aborted_rids.update(rid_set)
+        # Only mark Failed. Freeing KV here lets PP0 reuse pages before PP1
+        # sees the abort and causes cross-rank page mix / garbled decode.
+        for decode_req in list(self.queue) + list(self.pending_reqs):
+            if decode_req.req.rid not in rid_set:
+                continue
+            receiver = decode_req.kv_receiver
+            if receiver is None:
+                continue
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning(
+                    "kv_receiver.abort failed for prealloc rid=%s: %s",
+                    decode_req.req.rid,
+                    e,
+                )
+        logger.warning(
+            "Abort decode prealloc marked Failed; KV released after PP consensus. rids=%s",
+            rids,
+        )
+        return rids
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
@@ -2548,6 +2670,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
         self.kv_manager = None
+        self.locally_aborted_rids: Set[str] = set()
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2558,6 +2681,197 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
+
+    def is_commit_ready(self, decode_req: DecodeRequest) -> bool:
+        """Validate metadata before this PP rank votes for transfer success."""
+        if decode_req.kv_receiver is None:
+            return False
+        if _is_fake_transfer(decode_req.req):
+            return True
+        idx = decode_req.metadata_buffer_index
+        if idx is None or idx < 0:
+            return False
+        output_bootstrap_room = self.metadata_buffers.get_buf(idx)[-1]
+        actual_room = int(output_bootstrap_room[0].item())
+        if actual_room == 0:
+            return False
+
+        expected_room = int(
+            decode_req.req.bootstrap_room
+            if decode_req.req.bootstrap_room is not None
+            else 0
+        )
+        if actual_room == expected_room:
+            return True
+
+        rid = decode_req.req.rid
+        if rid not in self.locally_aborted_rids:
+            self.locally_aborted_rids.add(rid)
+            logger.error(
+                "V2 metadata room mismatch before PP consensus: rid=%s "
+                "expected_room=%s actual_room=%s metadata_buffer_index=%s "
+                "tp_rank=%s",
+                rid,
+                expected_room,
+                actual_room,
+                idx,
+                self.tp_rank,
+            )
+            try:
+                decode_req.kv_receiver.abort()
+            except Exception as e:
+                logger.warning(
+                    "kv_receiver.abort failed for V2 metadata mismatch "
+                    "rid=%s: %s",
+                    rid,
+                    e,
+                )
+        return False
+
+    def filter_commit_ready_rids(self, rids: List[str]) -> List[str]:
+        rid_set = set(rids)
+        ready = {
+            decode_req.req.rid
+            for decode_req in self.queue
+            if decode_req.req.rid in rid_set and self.is_commit_ready(decode_req)
+        }
+        return [rid for rid in rids if rid in ready]
+
+    def _free_metadata_buffer(self, decode_req: DecodeRequest) -> None:
+        if (
+            self.enable_staging
+            and self.staging_handler is not None
+            and decode_req.req.bootstrap_room is not None
+            and self.staging_handler.is_staging_room(decode_req.req.bootstrap_room)
+        ):
+            self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+        idx = decode_req.metadata_buffer_index
+        if idx is not None and idx != -1:
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.metadata_buffer_index = -1
+
+    def _drop_uncommitted(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        stream_error: bool,
+        error_prefix: str = "Decode transfer failed",
+    ) -> None:
+        rid = decode_req.req.rid
+        receiver = decode_req.kv_receiver
+        if receiver is not None:
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning("kv_receiver.abort failed for rid=%s: %s", rid, e)
+        if stream_error:
+            error_message = (
+                f"{error_prefix} for request rank={self.tp_rank} {rid=} "
+                f"{decode_req.req.bootstrap_room=}"
+            )
+            is_propagated = False
+            if receiver is not None:
+                try:
+                    receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+            if is_propagated:
+                logger.debug(error_message)
+            else:
+                logger.error(error_message)
+            prepare_abort(
+                decode_req.req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.scheduler.output_streamer.stream_output(
+                [decode_req.req], decode_req.req.return_logprob
+            )
+            if self.scheduler.enable_hisparse:
+                self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+            if self.scheduler.metrics_reporter.enable_metrics:
+                self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+        self._clean_hicache_prefetch_resources(decode_req)
+        if (
+            stream_error
+            and self.enable_deferred_kv_release
+            and receiver is not None
+            and receiver.abort_notified
+        ):
+            self._defer_release(decode_req)
+            if receiver is not None:
+                decode_req.kv_receiver = None
+            return
+        if receiver is not None:
+            try:
+                receiver.clear()
+            except Exception:
+                pass
+            decode_req.kv_receiver = None
+        req = decode_req.req
+        if req.req_pool_idx is not None or getattr(req, "mamba_pool_idx", None) is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_pd_hidden_rows(decode_req)
+        self._free_metadata_buffer(decode_req)
+
+    def drop_by_rids(
+        self,
+        rids: List[str],
+        *,
+        stream_error: bool = False,
+    ) -> List[str]:
+        rid_set = set(rids)
+        if not rid_set:
+            return []
+        dropped: List[str] = []
+        remaining: List[DecodeRequest] = []
+        for decode_req in self.queue:
+            if decode_req.req.rid in rid_set:
+                self._drop_uncommitted(decode_req, stream_error=stream_error)
+                dropped.append(decode_req.req.rid)
+            else:
+                remaining.append(decode_req)
+        self.queue = remaining
+        return dropped
+
+    def abort_matching(self, recv_req) -> List[str]:
+        rids = [
+            decode_req.req.rid
+            for decode_req in self.queue
+            if _matches_abort_rid(recv_req, decode_req.req.rid)
+        ]
+        if not rids:
+            return []
+        rid_set = set(rids)
+        self.locally_aborted_rids.update(rid_set)
+        for decode_req in self.queue:
+            if decode_req.req.rid not in rid_set:
+                continue
+            receiver = decode_req.kv_receiver
+            if receiver is None:
+                continue
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning(
+                    "kv_receiver.abort failed for transfer rid=%s: %s",
+                    decode_req.req.rid,
+                    e,
+                )
+            if (
+                receiver.kv_mgr.enable_deferred_decode_kv_release
+                and receiver.abort_notified
+            ):
+                receiver.kv_mgr.register_deferred_abort_room(
+                    decode_req.req.bootstrap_room
+                )
+        logger.warning(
+            "Abort decode transfer marked Failed; KV released after PP consensus. rids=%s tp_rank=%s",
+            rids,
+            self.tp_rank,
+        )
+        return rids
 
     def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
         if getattr(self, "kv_manager", None) is None:

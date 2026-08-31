@@ -2306,25 +2306,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.dst_device_kv_indices[kv_chunk.index_slice]
                                 )
 
-                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                            if len(chunked_dst_kv_indice) < len(
-                                kv_chunk.prefill_kv_indices
-                            ):
-                                logger.warning(
-                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                            # A source/destination page-count mismatch means the
+                            # decode allocation no longer describes this prefill
+                            # chunk. Truncating either side silently accepts a
+                            # partial KV cache and can produce plausible-looking
+                            # but corrupted tokens. Fail the request before RDMA
+                            # instead; PP consensus will release both stages.
+                            src_page_count = len(kv_chunk.prefill_kv_indices)
+                            dst_page_count = len(chunked_dst_kv_indice)
+                            if src_page_count != dst_page_count:
+                                failure_reason = (
+                                    "KV page-count mismatch before Mooncake transfer: "
+                                    f"room={kv_chunk.room}, src_pages={src_page_count}, "
+                                    f"dst_pages={dst_page_count}, slice={kv_chunk.index_slice}"
                                 )
-                                kv_chunk.prefill_kv_indices = (
-                                    kv_chunk.prefill_kv_indices[
-                                        : len(chunked_dst_kv_indice)
-                                    ]
+                                logger.error(failure_reason)
+                                self.record_failure(kv_chunk.room, failure_reason)
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
                                 )
-                            if chunked_dst_device_kv_indice is not None:
-                                chunked_dst_device_kv_indice = (
-                                    chunked_dst_device_kv_indice[
-                                        : len(kv_chunk.prefill_kv_indices)
-                                    ]
-                                )
+                                break
 
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
