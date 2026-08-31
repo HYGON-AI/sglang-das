@@ -211,9 +211,11 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoE,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+        # Experts-only slimquant ckpt: dense Linear stays BF16.
         if isinstance(layer, LinearBase):
-            return SlimQuantW4A8Int8LinearMethod(self)
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             return SlimQuantW4A8Int8MoEMethod(self)
         return None
