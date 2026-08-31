@@ -878,7 +878,8 @@ def test_range_get_negative_result_logs_key(caplog):
 
     class _Store:
         def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
-            return [-702]
+            # Mooncake may return a scalar error code instead of per-key bytes.
+            return 707
 
         def batch_get_session_end(self, keys):
             pass
@@ -929,7 +930,8 @@ def test_range_get_negative_result_logs_key(caplog):
     assert failures
     assert "lookup/session succeeded but range get failed" in caplog.text
     assert "page-a" in caplog.text
-    assert "-702" in caplog.text
+    assert "'rid': 'rid'" in caplog.text
+    assert "707" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1018,7 +1020,7 @@ def test_large_load_switches_to_complete_page_flow(
         ]
 
 
-def test_complete_page_load_honors_configured_batch_size():
+def test_complete_page_load_fetches_all_pages_once():
     calls = []
 
     class _Store:
@@ -1074,8 +1076,86 @@ def test_complete_page_load_honors_configured_batch_size():
         ],
     )
 
-    assert [len(call_keys) for call_keys, _ in calls] == [64, 64, 1]
+    assert [len(call_keys) for call_keys, _ in calls] == [129]
     assert all(sizes == [8, 8, 8] for _, chunk in calls for sizes in chunk)
+
+
+def test_complete_page_load_aggregates_all_pools_into_one_call():
+    calls = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            calls.append((list(keys), ptrs, sizes, offsets))
+            return [sum(item) for item in sizes]
+
+        def batch_get_session_end(self, keys):
+            pass
+
+    def make_pool(base):
+        return SimpleNamespace(
+            prepare_locations=lambda indices: indices.tolist(),
+            get_prepared_layer_range_meta=lambda locations, layer: (
+                [[base + layer * 100 + location] for location in locations],
+                [[layer + 1] for _ in locations],
+                [[layer * 10] for _ in locations],
+            ),
+        )
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 2
+    linker.page_wise_load_threshold = 1
+    linker.page_wise_load_batch_size = 8
+    linker.enable_page_wise_load = True
+    linker.pools = {
+        PoolName.KV: make_pool(1000),
+        PoolName.SWA: make_pool(2000),
+    }
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda values, transfer: (values, 1),
+        _tag_keys=lambda values: values,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda index, layer: None,
+        fail=lambda index, error: pytest.fail(str(error)),
+    )
+    linker.pending_loads = {}
+    linker.prepared_load_sessions = {
+        "rid": ["kv-0", "kv-1", "swa-state"]
+    }
+    linker.session_refcounts = {
+        "kv-0": 1,
+        "kv-1": 1,
+        "swa-state": 1,
+    }
+    linker.session_lock = threading.Lock()
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["kv-0", "kv-1"],
+                        host_indices=torch.tensor([0, 1]),
+                    ),
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        keys=["swa-state"],
+                        host_indices=torch.tensor([2]),
+                    ),
+                ],
+            )
+        ],
+    )
+
+    assert len(calls) == 1
+    keys, _, sizes, offsets = calls[0]
+    assert keys == ["kv-0", "kv-1", "swa-state"]
+    assert sizes == [[1, 2], [1, 2], [1, 2]]
+    assert offsets == [[0, 10], [0, 10], [0, 10]]
 
 
 def test_page_wise_batch_failure_marks_every_request_metric_failed():
