@@ -174,7 +174,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 MooncakeStore,
             )
 
-            self.storage = MooncakeStore(storage_config, mem_pool=None)
+            self.storage = MooncakeStore(
+                storage_config,
+                mem_pool=None,
+                enable_client_http_server=params.enable_metrics,
+            )
         else:
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeStore,
     _get_mooncake_client_http_port,
+    _get_mooncake_client_http_setup_kwargs,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
@@ -50,6 +52,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def test_mooncake_client_http_port_uses_default_process_group_rank(monkeypatch):
+    monkeypatch.delenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, raising=False)
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
 
@@ -62,6 +65,7 @@ def test_mooncake_client_http_port_uses_default_process_group_rank(monkeypatch):
 
 
 def test_mooncake_client_http_port_distinguishes_regular_dp_worlds(monkeypatch):
+    monkeypatch.delenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, raising=False)
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
@@ -76,6 +80,7 @@ def test_mooncake_client_http_port_distinguishes_regular_dp_worlds(monkeypatch):
 
 
 def test_mooncake_client_http_port_keeps_cp_ep_ranks_unique(monkeypatch):
+    monkeypatch.delenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, raising=False)
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
 
@@ -88,6 +93,7 @@ def test_mooncake_client_http_port_keeps_cp_ep_ranks_unique(monkeypatch):
 
 
 def test_mooncake_client_http_port_falls_back_without_distributed(monkeypatch):
+    monkeypatch.delenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, raising=False)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(
         torch.distributed,
@@ -96,6 +102,27 @@ def test_mooncake_client_http_port_falls_back_without_distributed(monkeypatch):
     )
 
     assert _get_mooncake_client_http_port() == 9301
+
+
+def test_mooncake_client_http_setup_kwargs_follow_metrics(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+    monkeypatch.setenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, "17001")
+
+    assert _get_mooncake_client_http_setup_kwargs(False) == {}
+    assert _get_mooncake_client_http_setup_kwargs(True) == {
+        "enable_client_http_server": True,
+        "client_http_port": 17001,
+    }
+
+
+def test_mooncake_client_http_port_uses_configured_base(monkeypatch):
+    monkeypatch.setenv(envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.name, "18001")
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+    assert _get_mooncake_client_http_port(dp_rank=1) == 18007
 
 
 @pytest.mark.parametrize(
