@@ -80,7 +80,7 @@ jobs:
           echo "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
-          
+
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
