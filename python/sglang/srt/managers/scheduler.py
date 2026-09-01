@@ -3410,6 +3410,12 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _mark_waiting_queue_reason(self, reason: str, start: int = 0) -> None:
+        """Attribute the current admission blocker to queued requests."""
+        ts = time.perf_counter()
+        for req in self.waiting_queue[start:]:
+            req.time_stats.set_queue_wait_reason(reason, ts)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3462,6 +3468,8 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if self.waiting_queue:
+                self._mark_waiting_queue_reason("running_batch_full")
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -3474,6 +3482,7 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
+            self._mark_waiting_queue_reason("min_free_slots_delay")
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -3487,6 +3496,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self._mark_waiting_queue_reason("request_slots_full")
             return None, running_batch
 
         # Get priority queue
@@ -3496,6 +3506,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            self._mark_waiting_queue_reason("test_retract_hold")
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch
@@ -3554,8 +3565,9 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for queue_index, req in enumerate(self.waiting_queue):
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                req.time_stats.set_queue_wait_reason("lora_capacity")
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3572,12 +3584,14 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    self._mark_waiting_queue_reason("running_batch_full", queue_index)
                     break
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    req.time_stats.set_queue_wait_reason("hicache_prefetch")
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
@@ -3629,6 +3643,12 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    reason = (
+                        "token_or_kv_capacity"
+                        if res == AddReqResult.NO_TOKEN
+                        else "prefill_admission_limit"
+                    )
+                    req.time_stats.set_queue_wait_reason(reason)
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
@@ -3640,6 +3660,15 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                if queue_index + 1 < len(self.waiting_queue):
+                    blocked_reason = (
+                        "head_of_line_token_capacity"
+                        if res == AddReqResult.NO_TOKEN
+                        else "head_of_line_admission_limit"
+                    )
+                    self._mark_waiting_queue_reason(
+                        blocked_reason, queue_index + 1
+                    )
                 break
 
         if mamba_allocator is not None:

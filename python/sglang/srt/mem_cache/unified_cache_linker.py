@@ -21,6 +21,7 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -297,6 +298,13 @@ class UnifiedCacheLinker(ABC):
     def abort_prepared_load(self, rid: str) -> None:
         """Release resources acquired by :meth:`prepare_load`."""
 
+    def get_prepared_load_source(self, rid: str) -> str | None:
+        """Return the selected L4 source for a prepared request, if known."""
+        return None
+
+    def set_request_time_stats(self, rid: str, time_stats) -> None:
+        """Associate request timing state with a subsequently queued load."""
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -405,8 +413,18 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        lookup_started = time.perf_counter()
+        try:
+            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        finally:
+            time_stats = getattr(req, "time_stats", None)
+            timing_adder = getattr(
+                time_stats, "add_direct_lookup_duration", None
+            )
+            if timing_adder is not None:
+                timing_adder(time.perf_counter() - lookup_started)
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -515,6 +533,9 @@ class UnifiedCacheLinkerWrapper:
         # the allocated pages in the radix tree.  All ranks must make the same
         # decision or their prefix lengths (and therefore model collectives)
         # would diverge.
+        time_stats = getattr(req, "time_stats", None)
+        if time_stats is not None:
+            time_stats.set_direct_load_prepare_start_time()
         prepared = False
         try:
             prepared = self.cache_linker.prepare_load(
@@ -526,11 +547,22 @@ class UnifiedCacheLinkerWrapper:
                 "falling back to prefill.",
                 req.rid,
             )
-        prepared_on_all_ranks = torch.tensor(int(prepared), dtype=torch.int)
-        cache._all_reduce_attn_groups(
-            prepared_on_all_ranks, torch.distributed.ReduceOp.MIN
+        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
+        local_source = source_getter(req.rid) if prepared and source_getter else None
+        source_code = (
+            0 if local_source == "dfs" else 1 if local_source == "local_disk" else 2
         )
-        if not bool(prepared_on_all_ranks.item()):
+        # MIN makes a failed preparation (0) win globally.  For successful
+        # ranks, the encoding preserves the prior DFS-over-local precedence.
+        prepared_and_source = torch.tensor(
+            0 if not prepared else 3 + source_code, dtype=torch.int
+        )
+        cache._all_reduce_attn_groups(
+            prepared_and_source, torch.distributed.ReduceOp.MIN
+        )
+        if int(prepared_and_source.item()) < 3:
+            if time_stats is not None:
+                time_stats.set_direct_load_prepare_finish_time()
             self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
@@ -541,12 +573,19 @@ class UnifiedCacheLinkerWrapper:
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
             req.mamba_host_hit_length = 0
+            req.storage_hit_length = 0
+            req.cached_tokens_storage_source = None
             logger.warning(
                 "External linker load is no longer restorable for rid=%s; "
                 "falling back to normal prefill.",
                 req.rid,
             )
             return empty_indices, req.last_node
+
+        source = {0: "dfs", 1: "local_disk"}.get(int(prepared_and_source.item()) - 3)
+        if source is not None:
+            req.storage_hit_length = len(tail_hashes) * cache.page_size
+            req.cached_tokens_storage_source = f"mooncake_{source}"
 
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
@@ -604,6 +643,11 @@ class UnifiedCacheLinkerWrapper:
         )
 
         if load_transfers:
+            timing_setter = getattr(
+                self.cache_linker, "set_request_time_stats", None
+            )
+            if timing_setter is not None and time_stats is not None:
+                timing_setter(req.rid, time_stats)
             if not self.cache_linker.load(req.rid, load_transfers):
                 self.cache_linker.abort_prepared_load(req.rid)
                 raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
@@ -612,6 +656,8 @@ class UnifiedCacheLinkerWrapper:
             # transfer will consume the session in that case.
             self.cache_linker.abort_prepared_load(req.rid)
 
+        if time_stats is not None:
+            time_stats.set_direct_load_prepare_finish_time()
         node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != req.last_node:
             node.external_cache_stored = True

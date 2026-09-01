@@ -1880,6 +1880,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+<<<<<<< HEAD
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
             documentation="Buffer-mode backup tokens dropped by write-path rate "
@@ -1893,6 +1894,64 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "(e.g. the SWA trailing window) could not allocate host staging "
             "— the whole storage fetch is forfeited, not just the aux part.",
             labelnames=labels.keys(),
+=======
+        l4_source_labels = [*labels.keys(), "source"]
+        l4_result_labels = [*l4_source_labels, "result"]
+        self.l4_prefetched_tokens_total = Counter(
+            name="sglang:l4_prefetched_tokens_total",
+            documentation="Number of tokens prefetched from L4 by source.",
+            labelnames=l4_source_labels,
+        )
+        self.l4_backuped_tokens_total = Counter(
+            name="sglang:l4_backuped_tokens_total",
+            documentation="Number of tokens backed up to L4 by source.",
+            labelnames=l4_source_labels,
+        )
+        token_buckets = [1, 16, 64, 256, 512, 1024, 2048, 4096, 8192, 16384,
+                         32768, 65536, 131072, 262144]
+        self.l4_prefetched_tokens_per_request = Histogram(
+            name="sglang:l4_prefetched_tokens_per_request",
+            documentation="Tokens successfully prefetched from L4 per request.",
+            labelnames=l4_source_labels,
+            buckets=token_buckets,
+        )
+        self.l4_backuped_tokens_per_operation = Histogram(
+            name="sglang:l4_backuped_tokens_per_operation",
+            documentation="Tokens successfully backed up to L4 per operation.",
+            labelnames=l4_source_labels,
+            buckets=token_buckets,
+        )
+        duration_buckets = [
+            0.0001,
+            0.00025,
+            0.0005,
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20,
+        ]
+        self.l4_prefetch_duration_seconds = Histogram(
+            name="sglang:l4_prefetch_duration_seconds",
+            documentation="L4 prefetch wall-clock duration in seconds.",
+            labelnames=l4_result_labels,
+            buckets=duration_buckets,
+        )
+        self.l4_backup_duration_seconds = Histogram(
+            name="sglang:l4_backup_duration_seconds",
+            documentation="L4 backup wall-clock duration in seconds.",
+            labelnames=l4_result_labels,
+            buckets=duration_buckets,
+>>>>>>> rye_20260814_deepseek-v4_open_rebase
         )
 
         bucket_io = [
@@ -1949,6 +2008,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
 
+<<<<<<< HEAD
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
@@ -1957,6 +2017,34 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if num_tokens > 0:
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
+=======
+    def log_l4_prefetch(
+        self, source: str, tokens: int, duration_seconds: float, success: bool
+    ) -> None:
+        source_labels = {**self.labels, "source": source}
+        self.l4_prefetch_duration_seconds.labels(
+            **source_labels, result="success" if success else "failure"
+        ).observe(duration_seconds)
+        if success and tokens > 0:
+            self.log_prefetched_tokens(tokens)
+            self.l4_prefetched_tokens_total.labels(**source_labels).inc(tokens)
+            self.l4_prefetched_tokens_per_request.labels(**source_labels).observe(
+                tokens
+            )
+
+    def log_l4_backup(
+        self, source: str, tokens: int, duration_seconds: float, success: bool
+    ) -> None:
+        source_labels = {**self.labels, "source": source}
+        self.l4_backup_duration_seconds.labels(
+            **source_labels, result="success" if success else "failure"
+        ).observe(duration_seconds)
+        if success and tokens > 0:
+            self.log_backuped_tokens(tokens)
+            self.l4_backuped_tokens_total.labels(**source_labels).inc(tokens)
+            self.l4_backuped_tokens_per_operation.labels(**source_labels).observe(
+                tokens
+>>>>>>> rye_20260814_deepseek-v4_open_rebase
             )
 
     def _log_histogram(self, histogram, data: Union[int, float]):

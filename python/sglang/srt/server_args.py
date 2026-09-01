@@ -2896,8 +2896,8 @@ class ServerArgs:
     ] = 10
     mooncake_page_wise_load_batch_size: A[
         int,
-        "Maximum number of keys in one complete-page Mooncake direct-linker "
-        "read call.",
+        "Deprecated compatibility option. Complete-page Mooncake direct-linker "
+        "loads are submitted in one read call.",
         NS("memory"),
     ] = 128
     mooncake_enable_page_wise_load: A[
