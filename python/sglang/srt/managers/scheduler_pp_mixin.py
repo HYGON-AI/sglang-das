@@ -1530,36 +1530,43 @@ class SchedulerPPMixin:
             bad_prealloc_rids = sorted(
                 set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
             )
+        aborted = self.disagg_decode_prealloc_queue.locally_aborted_rids
+        if aborted:
+            bad_prealloc_rids = sorted(set(bad_prealloc_rids) | set(aborted))
+            good_prealloc_rids = sorted(set(good_prealloc_rids) - set(bad_prealloc_rids))
         return [good_prealloc_rids, bad_prealloc_rids]
 
+    def _pp_pd_local_transfer_status(self: Scheduler):
+        success_rids, failed_rids = self.get_rids_by_rid(
+            self.disagg_decode_transfer_queue.queue,
+            False,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+            tp_cpu_group=self.attn_tp_cpu_group,
+        )
+        success_rids = self.disagg_decode_transfer_queue.filter_commit_ready_rids(
+            success_rids
+        )
+        aborted = self.disagg_decode_transfer_queue.locally_aborted_rids
+        failed_rids = sorted(set(failed_rids) | set(aborted))
+        success_rids = sorted(set(success_rids) - set(failed_rids))
+        return success_rids, failed_rids
+
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Success requires every PP rank; Failed is a union and wins. Mixing
+        # Success|Failed in one intersection lets PP0 abort while PP1 commits,
+        # or leaves PP1 in the transfer queue after PP0 has already popped.
+        success_rids, failed_rids = self._pp_pd_local_transfer_status()
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids_by_rid(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-                tp_cpu_group=self.attn_tp_cpu_group,
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage(
-                tag=PP_TRANSFER_TAG
-            )
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids_by_rid(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-                tp_cpu_group=self.attn_tp_cpu_group,
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = sorted(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
+            return [success_rids, failed_rids]
+
+        prev_success_rids, prev_failed_rids = self._pp_recv_pyobj_from_prev_stage(
+            tag=PP_TRANSFER_TAG
+        )
+        success_rids = sorted(set(prev_success_rids) & set(success_rids))
+        failed_rids = sorted(set(prev_failed_rids) | set(failed_rids))
+        success_rids = sorted(set(success_rids) - set(failed_rids))
+        return [success_rids, failed_rids]
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -1581,9 +1588,11 @@ class SchedulerPPMixin:
                 good_consensus_prealloc_rids,
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
+            self.disagg_decode_prealloc_queue.drop_by_rids(bad_consensus_prealloc_rids)
+            for rid in bad_consensus_prealloc_rids:
+                self.disagg_decode_prealloc_queue.locally_aborted_rids.discard(rid)
             good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                rids_to_check=good_consensus_prealloc_rids
-                + bad_consensus_prealloc_rids,
+                rids_to_check=good_consensus_prealloc_rids,
             )
             self.disagg_decode_transfer_queue.extend(good_reqs)
             return [
@@ -1595,13 +1604,43 @@ class SchedulerPPMixin:
     def process_decode_transfer_queue(
         self: Scheduler, release_rids: Optional[List[str]]
     ):
-        if release_rids is not None:
-            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                release_rids
+        if release_rids is None:
+            return None
+        if (
+            isinstance(release_rids, (list, tuple))
+            and len(release_rids) == 2
+            and not (release_rids and isinstance(release_rids[0], str))
+        ):
+            success_rids, failed_rids = release_rids
+        else:
+            success_rids, failed_rids = list(release_rids), []
+        if failed_rids:
+            failed_set = set(failed_rids)
+            poll_failed = []
+            force_drop = []
+            for decode_req in self.disagg_decode_transfer_queue.queue:
+                if decode_req.req.rid not in failed_set:
+                    continue
+                poll = (
+                    int(decode_req.kv_receiver.poll())
+                    if decode_req.kv_receiver is not None
+                    else int(KVPoll.Failed)
+                )
+                if poll == int(KVPoll.Failed):
+                    poll_failed.append(decode_req.req.rid)
+                else:
+                    force_drop.append(decode_req.req.rid)
+            self.disagg_decode_transfer_queue.drop_by_rids(
+                poll_failed, stream_error=True
             )
-            self.waiting_queue.extend(released_reqs)
-            return [req.rid for req in released_reqs]
-        return None
+            self.disagg_decode_transfer_queue.drop_by_rids(
+                force_drop, stream_error=False
+            )
+            for rid in failed_rids:
+                self.disagg_decode_transfer_queue.locally_aborted_rids.discard(rid)
+        released_reqs = self.disagg_decode_transfer_queue.pop_transferred(success_rids)
+        self.waiting_queue.extend(released_reqs)
+        return [req.rid for req in released_reqs]
 
 
 class ChunkSizePredictor:
