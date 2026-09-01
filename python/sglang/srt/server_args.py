@@ -111,6 +111,21 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
+def _pre_warm_nccl_help() -> str:
+    if is_hcu():
+        return (
+            "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT "
+            "cold-start latency. Default: enabled for HCU/HIP/RCCL, disabled "
+            "for CUDA/NCCL."
+        )
+    return (
+        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT "
+        "cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled "
+        "for NVIDIA/CUDA (NCCL)."
+    )
+
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
@@ -2110,7 +2125,7 @@ class ServerArgs:
     ] = False
     pre_warm_nccl: A[
         bool,
-        "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+        _pre_warm_nccl_help(),
         NS("exec.comm"),
     ] = False
     enable_quant_communications: A[
@@ -8916,9 +8931,14 @@ class ServerArgs:
                 if is_hip():
                     # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
-                    logger.info(
-                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
-                    )
+                    if is_hcu():
+                        logger.info(
+                            "HCU/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        )
+                    else:
+                        logger.info(
+                            "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                        )
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
@@ -9116,9 +9136,14 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
                 or self.cuda_graph_config.prefill.backend != Backend.DISABLED
             ):
-                logger.warning(
-                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
-                )
+                if is_hcu():
+                    logger.warning(
+                        "Cuda graph is disabled for diffusion LLM inference on HCU"
+                    )
+                else:
+                    logger.warning(
+                        "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                    )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 

@@ -1,17 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-name: docker-image
+name: Release Docker Images (HCU)
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: docker-image-${{ github.ref }}
-  cancel-in-progress: true
+  schedule:
+    - cron: "0 14 * * *"  # 22:00 Beijing Time daily
 
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
@@ -19,13 +14,13 @@ env:
   BASE_IMAGE: ${{ vars.DTK2604_IMAGE_UBUNTU_PY310 }}
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
-  SGLANG_VERSION: "0.5.15.post1"
+  SGLANG_VERSION: "0.5.18"
   TORCH_VERSION: "2.11.0"
 
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on: [self-hosted, hcu, nmz4]
+    runs-on: [self-hosted, hcu]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -82,8 +77,10 @@ jobs:
 
       - name: 推送镜像
         run: |
+          echo "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
+          
 
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace

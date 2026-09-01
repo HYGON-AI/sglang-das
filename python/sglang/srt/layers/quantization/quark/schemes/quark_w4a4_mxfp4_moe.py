@@ -702,6 +702,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 # Perform dequantization and requantization only when all data is loaded AND no other threads are still loading.
                 if layer._fp8_loaded_numel == total_target_numel:
                     if dynamic_mxfp4_quant is None:
+                        if _is_hcu:
+                            raise NotImplementedError(
+                                "MXFP4 quantization for MoE is unavailable on HCU."
+                            )
                         raise NotImplementedError(
                             "MXFP4 quantization for MoE is only supported on AMD GPUs."
                         )

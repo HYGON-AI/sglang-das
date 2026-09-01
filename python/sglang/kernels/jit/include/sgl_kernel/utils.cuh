@@ -87,7 +87,7 @@ using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 using fp32x4_t = float4;
 #else
 // HCU: native HIP FP8 vector types instead of the uint-backed aliases used by
-// generic ROCm, so the DCU elementwise/quantization kernels keep their typed
+// generic ROCm, so the HCU elementwise/quantization kernels keep their typed
 // conversions.
 using fp32_t = float;
 using fp16_t = __half;

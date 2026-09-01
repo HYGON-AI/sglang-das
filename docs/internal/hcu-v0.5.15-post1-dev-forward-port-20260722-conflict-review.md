@@ -15,13 +15,13 @@
 
 The merge ports the complete endpoint rather than replaying selected patches.
 Current `v0.5.15.post1_dev` file locations and APIs remain canonical, while
-newer old-branch DCU behavior is preserved or translated to its current
+newer old-branch HCU behavior is preserved or translated to its current
 equivalent.
 
 ## Commit groups
 
 - HY3 pipeline parallelism and latest static/dynamic EPLB routing fix.
-- DCU causal-conv HCU API adaptation.
+- HCU causal-conv HCU API adaptation.
 - AITER custom all-reduce backend and Fabric transport selection.
 - DeepSeek-V4 PD prefill full-token-pool admission.
 - Qwen2.5-VL FA3 `cu_seqlens` correction.
@@ -37,7 +37,7 @@ equivalent.
 | `srt/disaggregation/common/conn.py` | Kept current shared ZMQ context, socket cache, disconnect monitor, keepalive, and zero-linger lifecycle. Added the old branch's 5-second send timeout and HWM limit to both manager and receiver PUSH sockets. |
 | `srt/disaggregation/decode.py` | Kept current HiCache/offload structure and `DecodeHiCachePreallocMixin`; ported local-progress timing and paused-rank MLPSync participation to `dp_attn_adapter` rather than calling the removed scheduler Mixin method. |
 | `srt/disaggregation/prefill.py` | Preserved current PP-aware transfer setup and ported DSV4 full-token-pool admission with a hybrid-SWA fallback cap. |
-| `srt/distributed/device_communicators/custom_all_reduce.py` | Added `auto/native/aiter/off` dispatch and AITER Fabric/IPC graph-registration semantics. Retained current CUDA V2 capability checking and corrected the old undefined `_is_hcu` predicate to `_is_dcu`. |
+| `srt/distributed/device_communicators/custom_all_reduce.py` | Added `auto/native/aiter/off` dispatch and AITER Fabric/IPC graph-registration semantics. Retained current CUDA V2 capability checking and corrected the old undefined `_is_hcu` predicate to `_is_hcu`. |
 | `srt/distributed/parallel_state.py` | Propagated the selected backend through current `GroupCoordinator`; kept strict explicit-AITER Fabric failure, QuickAllReduce suppression for Fabric/auto transport, and canonical per-rank startup evidence. |
 | `srt/environ.py` | Added the live DSV4 full-token-pool switch. Did not retain the old `SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS` symbol because current `disaggregation_decode_extra_slots` already owns that behavior and the old symbol would be unused. |
 | `srt/layers/moe/topk.py` | Accepted the newest old-branch LightOp EPLB postprocess, which supersedes the earlier no-remap comment and is required by the static/dynamic EPLB accuracy fix. |
@@ -46,7 +46,7 @@ equivalent.
 | `srt/models/hunyuan_v3.py` | Ported PP ownership/proxy/loading behavior to current `make_layers`, `get_stream("alt")`, and `PPMissingLayer` APIs. EPLB recording contains both routing and expert execution; lazy expert-weight enumeration is restricted to the local PP layer range. |
 | `srt/server_args.py` | Added only the new custom-all-reduce backend as an Annotated field and retained environment promotion/disable precedence. The obsolete old hand-written CLI block was not restored. |
 
-## Refactor and `_is_dcu` audit
+## Refactor and `_is_hcu` audit
 
 - The old `scheduler_dp_attn_mixin.py` implementation moved to current
   `scheduler_components/dp_attn.py`; the dedicated Gloo group, epoch check,
@@ -56,9 +56,9 @@ equivalent.
 - HY3 PP uses the current stream registry and current `make_layers` PP
   placeholders. Missing imports introduced by the structural merge were
   restored, and non-local placeholders are not inspected as MoE layers.
-- DCU causal convolution imports the installed `causal_conv1d_fn_hcu` symbol;
+- HCU causal convolution imports the installed `causal_conv1d_fn_hcu` symbol;
   the update function remains sourced from the current interface module.
-- AITER logging and dispatch use `_is_dcu`; user-visible `HCU` remains only in
+- AITER logging and dispatch use `_is_hcu`; user-visible `HCU` remains only in
   the installed API/model naming. Generic CUDA keeps its V2 availability gate.
 - The latest LightOp EPLB remap is retained as the endpoint behavior rather
   than preserving the earlier intermediate MiMo comment.
@@ -77,7 +77,7 @@ equivalent.
 - ServerArgs accepted `--custom-all-reduce-backend native` through the current
   Annotated CLI builder.
 - The DP StepInfo 7+10 layout assertion passed.
-- DCU registration passed with 277 registered files and the existing
+- HCU registration passed with 277 registered files and the existing
   CPU-utils warning.
 - DSA alias/CLI/registry passed all 19 tests.
 - Ruff is not installed in `rye_sglang_0716`; it was recorded as unavailable,

@@ -477,7 +477,7 @@ def main(argv):
         print("Checked scope:")
         print(" - Only files changed by the pull request or push are checked.")
         print(
-            " - HCU/DCU paths, HCU-specific files, and files with HCU code markers are covered."
+            " - HCU paths, HCU-specific files, and files with HCU code markers are covered."
         )
         print(" - Python: user-visible strings in print/logger/raise/skip/help.")
         print(" - Shell/YAML/C/C++: common visible output statements and fields.")

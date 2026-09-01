@@ -292,6 +292,9 @@ jobs:
     if: needs.validate-config.result == 'success' && needs.probe-hcu-wheels.outputs.wheel_available != 'true'
     runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
     container:
       image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
       options: >
@@ -327,6 +330,10 @@ jobs:
         with:
           ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
+
+      - name: Trust checked-out workspace
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Install build deps
         run: |

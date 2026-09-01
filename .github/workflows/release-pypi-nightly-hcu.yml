@@ -4,37 +4,19 @@ permissions:
   contents: read
 
 on:
-  workflow_call:
+  # ---- 合入 release 分支后触发 ----
+  push:
+    branches:
+      - release/20260825_v0.5.18
+
+  # ---- 手动触发，仅构建产物，不上传 NIGHTLY ----
+  workflow_dispatch:
     inputs:
       ref:
-        description: 'Git ref, branch, tag, or SHA to build'
+        description: '要构建的 Git ref/branch/tag/SHA，默认当前分支 HEAD'
         required: false
         default: ''
         type: string
-      torch_version:
-        description: 'PyTorch version to install'
-        required: false
-        default: '2.10.0'
-        type: string
-      skip_gateway:
-        description: 'Skip sgl-model-gateway build'
-        required: false
-        default: false
-        type: boolean
-
-  # ---- 手动触发，可传参 ----
-  workflow_dispatch:
-    inputs:
-      torch_version:
-        description: 'PyTorch version to install'
-        required: false
-        default: '2.10.0'
-        type: string
-      skip_gateway:
-        description: 'Skip sgl-model-gateway build'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   compile:
@@ -43,11 +25,14 @@ jobs:
       group: release-nightly-hcu-${{ github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
-    runs-on: [self-hosted, hcu, nmz4]
+    runs-on: [self-hosted, hcu]
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
 
     container:
-      image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
+      image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY310 }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -62,11 +47,11 @@ jobs:
         python-version: ['3.10']
 
     env:
-      TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
-      SKIP_GATEWAY: ${{ inputs.skip_gateway != false }}
-      PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
-      PIP_TRUSTED_HOST: 10.16.1.201
-      RESOURCE_SERVER: http://10.16.1.201:8000/
+      TORCH_VERSION: '2.11.0'
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      PIP_INDEX_URL: ${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/
+      RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+      DTK_PKG_URL: ${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
       WHEEL_COMMIT_SHA: ${{ inputs.ref || github.sha }}
 
     steps:
@@ -85,16 +70,21 @@ jobs:
           echo "WHEEL_COMMIT_SHA=${WHEEL_COMMIT_SHA}" >> "${GITHUB_ENV}"
           echo "Building HCU wheels for ${WHEEL_COMMIT_SHA}"
 
+      - name: Resolve PIP_TRUSTED_HOST from PYPI_URL
+        run: |
+          PIP_TRUSTED_HOST="$(echo "${PYPI_URL}" | sed -E 's#^https?://([^/:]+).*#\1#')"
+          echo "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}" >> "${GITHUB_ENV}"
+
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
         run: |
           yum install -y perl-IPC-Cmd perl-Time-Piece
           pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.8" ciupload
-          wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
+          wget ${RESOURCE_SERVER_URL}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
           unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
           chmod +x /usr/local/bin/protoc
           ln -s /usr/local/bin/protoc /usr/bin/protoc
-          wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/rustup-init.sh
+          wget ${RESOURCE_SERVER_URL}/Jenkins/CompileDep/sglang/rustup-init.sh
           export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
           export RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
           bash rustup-init.sh -y
@@ -120,7 +110,6 @@ jobs:
 
       - name: Install DTK
         run: |
-          DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           cd /opt
           wget -q $DTK_PKG_URL
           tar -xzf $(basename $DTK_PKG_URL)
@@ -143,8 +132,7 @@ jobs:
               - 'sgl-model-gateway/**'
 
       # =======================================================================
-      # 编译阶段: 按检测结果增量编译
-      # workflow_dispatch 时忽略检测结果，全量编译
+      # 编译阶段: 按检测结果增量编译；workflow_dispatch 时忽略检测结果，全量编译
       # =======================================================================
 
       - name: Build sgl-kernel (HIP)
@@ -155,29 +143,31 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Build sglang python package
-        # if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
         env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: "0.5.15.post1"
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.5.18"
         run: |
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
           cd python
+          # setup.py 固定读 pyproject.toml; HCU 依赖清单在 pyproject_hcu.toml, 构建前换入
+          cp pyproject_hcu.toml pyproject.toml
           export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}"
           python -m build --wheel --no-isolation -Cfeatures=all_hip
           echo "=== sglang wheel ==="
           ls -lh dist/*.whl
 
       - name: Build sgl-model-gateway
-        if: ${{ env.SKIP_GATEWAY != 'true' && (steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') }}
+        if: steps.changes.outputs.gateway == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
-          cd sgl-model-gateway && cargo build --release
-          cd bindings/python && maturin build --release --skip-auditwheel
+          cd sgl-model-gateway && cargo build --release --features vendored-openssl
+          maturin build --manifest-path bindings/python/Cargo.toml --release --skip-auditwheel --features vendored-openssl
           echo "=== sgl-model-gateway wheel ==="
-          ls -lh target/wheels/*.whl
+          ls -lh "$GITHUB_WORKSPACE/sgl-model-gateway/target/wheels/"*.whl
 
       # =======================================================================
       # 修复 (auditwheel) & 上传产物
@@ -188,11 +178,10 @@ jobs:
           CIUPLOAD_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
         run: |
           source /opt/dtk/env.sh
-          DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
           DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+(\.[0-9]+)+' | tr -d '.')
           mkdir -p output
           shopt -s nullglob
-          wheels=(python/sglang/kernels/aot/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl)
+          wheels=(python/sglang/kernels/aot/dist/*.whl python/dist/*.whl sgl-model-gateway/target/wheels/*.whl)
           if (( ${#wheels[@]} == 0 )); then
             echo "No HCU wheels were built" >&2
             exit 1
@@ -205,11 +194,13 @@ jobs:
             -f "${wheels[@]}"
           echo "=== Repaired wheels ==="
           ls -lh output/
-          CIUpload NIGHTLY \
-            --devpi_url http://10.16.1.201:9929 \
-            --password "${CIUPLOAD_PASSWORD}" \
-            --dtk_pkg_name "$(basename "${DTK_PKG_URL}")" \
-            -f output/*.whl
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            CIUpload NIGHTLY \
+              --devpi_url "${PYPI_URL}" \
+              --password "${CIUPLOAD_PASSWORD}" \
+              --dtk_pkg_name "$(basename "${DTK_PKG_URL}")" \
+              -f output/*.whl
+          fi
           rm -rf /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang/* || true
 
       - name: Upload wheels
@@ -218,3 +209,9 @@ jobs:
           name: hcu-wheels-py${{ matrix.python-version }}
           path: output/*.whl
           if-no-files-found: warn
+
+      # 容器 job 以 root 运行, 会在共享 workspace 留下 root 文件,
+      # 导致同机器上其他 job 的 checkout 失败; 跑完清掉
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true

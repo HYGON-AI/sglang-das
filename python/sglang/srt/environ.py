@@ -874,7 +874,7 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
     # ===================================================================
-    # HCU (Hygon DCU) - platform-specific knobs
+    # HCU - platform-specific knobs
     # ===================================================================
     SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)

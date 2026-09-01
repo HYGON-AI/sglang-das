@@ -153,9 +153,12 @@ if _is_hip:
         )
         from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
     except ImportError:
-        print(
-            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-        )
+        if _is_hcu:
+            print("aiter kernel library is unavailable on this HCU device.")
+        else:
+            print(
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+            )
 elif _is_hcu:
     from sglang.srt.layers.attention.flashattention_interface import (
         flash_attn_varlen_func,

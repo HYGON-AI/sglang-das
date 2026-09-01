@@ -704,7 +704,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if is_activation_quantization_format(quant_format):
             # HCU: the w4a4 nvfp4 scheme is intentionally not selected here; see
-            # the DSV4 compressed-tensors notes in the DCU conflict ledger.
+            # the DSV4 compressed-tensors notes in the HCU conflict ledger.
             # if self._is_fp4a4_nvfp4(weight_quant, input_quant):
             #     is_fp4a4_nvfp4_supported = self._check_scheme_supported(
             #         CompressedTensorsW4A4Fp4.get_min_capability(), error=False

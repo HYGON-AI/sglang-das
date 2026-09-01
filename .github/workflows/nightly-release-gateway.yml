@@ -3,10 +3,7 @@
 name: Nightly Release SGLang Model Gateway to PyPI
 
 on:
-  schedule:
-    # Run at 2 AM UTC every day
-    - cron: '0 2 * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
   build:

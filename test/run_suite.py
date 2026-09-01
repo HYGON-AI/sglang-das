@@ -93,6 +93,7 @@ HW_MAPPING = {
     "mlx": HWBackend.MLX,
 }
 
+
 # Per-commit test suites (run on every PR).
 # Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
@@ -598,7 +599,7 @@ def main():
         "--nightly",
         action="store_true",
         help=(
-            "Include tests registered with nightly=True (AMD/CPU/NPU). CUDA "
+            "Include tests registered with nightly=True (HCU/AMD/CPU/NPU). CUDA "
             "scheduled suites are selected by name and take no flag."
         ),
     )

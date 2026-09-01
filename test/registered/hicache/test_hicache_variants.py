@@ -31,7 +31,7 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import is_hcu, is_hip, kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -45,6 +45,7 @@ from sglang.test.test_utils import (
 )
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 
 
 class HiCacheBaseServer(CustomTestCase):
@@ -104,7 +105,10 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     mgsm_en_score_threshold = 0.8
 
 
-@unittest.skipIf(is_hip(), "Disabled for AMD-aiter")
+@unittest.skipIf(
+    _is_hip,
+    "Disabled for HCU" if _is_hcu else "Disabled for AMD-aiter",
+)
 class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     """HiCache with EAGLE speculative decoding tests"""
 

@@ -13,7 +13,7 @@ landed on internal `main` through merge
 | Branch / tag | Role |
 |---|---|
 | `main` | Internal trunk. Periodically integrates exact official-main checkpoints and receives forward-ports from the release branch after release. |
-| `v0.5.15.post1_dev` | Active DCU development/release branch for debugging, optimization, stabilization, and release preparation. |
+| `v0.5.15.post1_dev` | Active HCU development/release branch for debugging, optimization, stabilization, and release preparation. |
 | `sync/official-main-daily-YYYYMMDD` | Short-lived exact-endpoint official sync branch created from `main`; never created from the release branch. |
 | `backport/main-to-v0.5.15-post1-dev-*` | Exceptional selective backport of a required, already-integrated main fix into the active release branch. |
 | `forward-port/v0.5.15-post1-dev-*` | Reviewable post-release port of release-branch patches back to `main`. |
@@ -31,8 +31,8 @@ Official changes continue to enter `main` independently of release work:
    official SHAs.
 2. Create `sync/official-main-daily-YYYYMMDD` from current `main`.
 3. Merge only the exact official endpoint with `--no-ff`.
-4. Resolve against official structure, current `main`, and retained DCU intent;
-   keep `_is_dcu` ahead of generic `_is_hip` where DCU has a dedicated path.
+4. Resolve against official structure, current `main`, and retained HCU intent;
+   keep `_is_hcu` ahead of generic `_is_hip` where HCU has a dedicated path.
 5. Run the current static gates and the agreed pure-TP functional gate.
 6. Update the conflict ledger and conflict-review artifact, then merge and push
    `main` without rewriting history.
@@ -45,11 +45,11 @@ main SHA in the release-branch commit message or PR.
 
 ## 3. Release development lane
 
-All near-term DCU debugging, optimization, and release stabilization targets
+All near-term HCU debugging, optimization, and release stabilization targets
 `v0.5.15.post1_dev`:
 
 - one feature or bug class per commit/PR where practical;
-- preserve `_is_dcu` separation for LightOp, AITER, DeepEP, DeepGEMM, DSV4,
+- preserve `_is_hcu` separation for LightOp, AITER, DeepEP, DeepGEMM, DSV4,
   cache layout, graph, FP8, and communicator behavior;
 - do not merge official main directly into the release branch;
 - do not mix unrelated official sync with a release fix;
@@ -64,7 +64,7 @@ Recommended labels:
 - `release: v0.5.15.post1`
 - `needs-forward-port`
 - `main-equivalent-present`
-- `dcu-release-only`
+- `hcu-release-only`
 
 ## 4. Validation policy
 
@@ -73,7 +73,7 @@ For each release-branch patch, Codex scope remains intentionally bounded:
 1. Complete code changes, conflict fixes, and static validation.
 2. Compile changed Python files and run targeted Ruff
    `E9,F401,F811,F821,F841`, precise marker scan, and `git diff --check`.
-3. Run DCU registration, DSA alias/CLI/registry, and gfx938 HIP metadata gates
+3. Run HCU registration, DSA alias/CLI/registry, and gfx938 HIP metadata gates
    when applicable.
 4. Immediately before model validation, check every candidate below with
    `hy-smi`; never launch on a node with VRAM or HCU activity:
@@ -123,7 +123,7 @@ Before release:
 1. Freeze new features on `v0.5.15.post1_dev`.
 2. Complete owner-run CI, accuracy, topology, and performance validation.
 3. Resolve the internal release-tag name without moving the existing public
-   `v0.5.15.post1` marker. A distinct DCU release tag is required unless the
+   `v0.5.15.post1` marker. A distinct HCU release tag is required unless the
    repository owner explicitly authorizes a public tag migration.
 4. Record the release commit, artifacts, known issues, and validation evidence.
 
@@ -135,7 +135,7 @@ After release:
 3. Group dependency-related patches into small
    `forward-port/v0.5.15-post1-dev-*` branches.
 4. Port to current main APIs and preserve both newer official behavior and the
-   release patch's DCU intent.
+   release patch's HCU intent.
 5. Validate and merge each group to `main`; update the patch table immediately.
 6. Retire `v0.5.15.post1_dev` to release-only maintenance after all required
    rows are `complete` or owner-approved `skipped`.
