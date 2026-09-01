@@ -102,7 +102,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
     resolve_hidden_bootstrap_plan,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hcu, is_npu
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -1786,6 +1786,12 @@ class SchedulerDisaggregationPrefillMixin:
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
+                    if is_hcu():
+                        # HCU overlap transfer reads this chunk outside the forward
+                        # stream; wait for the chunk's writes before starting RDMA.
+                        ev = torch.cuda.Event()
+                        ev.record(self.forward_stream)
+                        req.disagg_kv_sender.set_source_event(ev)
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -2207,7 +2213,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+            req.disagg_kv_sender.set_source_event(ev)
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
@@ -2463,6 +2469,17 @@ class SchedulerDisaggregationPrefillMixin:
                     if streaming_pd_hidden
                     else pd_hidden_state(req).src_indices,
                 )
+            elif req.disagg_kv_sender._source_event is None:
+                # PP + chunked prefill (overlap off) sends intermediate chunks
+                # from process_prefill_chunk while the writer is still on
+                # forward_stream. Record the barrier here so source_event is
+                # never None on that path.
+                stream = getattr(self, "forward_stream", None)
+                if stream is None:
+                    stream = torch.cuda.current_stream()
+                source_event = self.device_module.Event()
+                source_event.record(stream)
+                req.disagg_kv_sender.set_source_event(source_event)
             req.disagg_kv_sender.send(
                 page_indices,
                 state_indices if segment_is_last or send_hidden_chunk else None,

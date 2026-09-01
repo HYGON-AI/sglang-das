@@ -349,6 +349,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
+    is_hcu,
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
@@ -5668,26 +5669,27 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+            if is_hcu():
+                # PP must agree on failed requests before either rank frees KV.
+                self.disagg_decode_prealloc_queue.abort_matching(recv_req)
+                self.disagg_decode_transfer_queue.abort_matching(recv_req)
+            else:
+                # Abort requests that have not yet finished preallocation.
+                for decode_req in self.disagg_decode_prealloc_queue.queue:
+                    if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                        logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                        decode_req.kv_receiver.abort()
+                        if get_parallel().pp_size > 1:
+                            prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if decode_req.host_staged:
-                        # Keep the host destination alive until prefill stops writing.
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-                        continue
-                    # The receiver arms drain-ack accounting before sending the
-                    # ABORT (see CommonKVReceiver._send_abort_notification), so
-                    # an ack racing back is never dropped.
-                    decode_req.kv_receiver.abort()
+                # Abort requests waiting for KV cache to release tree cache.
+                for decode_req in self.disagg_decode_transfer_queue.queue:
+                    if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                        logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                        if decode_req.host_staged:
+                            prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                            continue
+                        decode_req.kv_receiver.abort()
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:
