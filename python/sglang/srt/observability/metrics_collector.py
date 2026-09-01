@@ -1880,7 +1880,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
-<<<<<<< HEAD
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
             documentation="Buffer-mode backup tokens dropped by write-path rate "
@@ -1894,7 +1893,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "(e.g. the SWA trailing window) could not allocate host staging "
             "— the whole storage fetch is forfeited, not just the aux part.",
             labelnames=labels.keys(),
-=======
+        )
+
         l4_source_labels = [*labels.keys(), "source"]
         l4_result_labels = [*l4_source_labels, "result"]
         self.l4_prefetched_tokens_total = Counter(
@@ -1951,7 +1951,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             documentation="L4 backup wall-clock duration in seconds.",
             labelnames=l4_result_labels,
             buckets=duration_buckets,
->>>>>>> rye_20260814_deepseek-v4_open_rebase
         )
 
         bucket_io = [
@@ -2008,7 +2007,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
 
-<<<<<<< HEAD
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
@@ -2017,7 +2015,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if num_tokens > 0:
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
-=======
+            )
+
     def log_l4_prefetch(
         self, source: str, tokens: int, duration_seconds: float, success: bool
     ) -> None:
@@ -2044,7 +2043,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.l4_backuped_tokens_total.labels(**source_labels).inc(tokens)
             self.l4_backuped_tokens_per_operation.labels(**source_labels).observe(
                 tokens
->>>>>>> rye_20260814_deepseek-v4_open_rebase
             )
 
     def _log_histogram(self, histogram, data: Union[int, float]):
