@@ -163,9 +163,7 @@ def recompute_w_u_fwd(
     return w, u
 
 
-# HCU 且环境变量开启时，替换公共函数。
 if _is_hcu and _use_bolt_recompute_w_u:
     recompute_w_u_fwd = _bolt_recompute_w_u_fwd
 
-# 该别名也必须在完成替换后再赋值。
 fwd_recompute_w_u = recompute_w_u_fwd
