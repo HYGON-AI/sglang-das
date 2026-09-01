@@ -3048,15 +3048,9 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-<<<<<<< HEAD
                 self._release_aborted_request(candidate_req.rid)
                 if self.enable_hierarchical_cache and not self.enable_hicache_storage:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
-=======
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(candidate_req.rid)
->>>>>>> 20260825_v0.5.18_zhu
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."

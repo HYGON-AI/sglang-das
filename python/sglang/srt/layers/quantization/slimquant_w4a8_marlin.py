@@ -78,6 +78,88 @@ aiter_moe = None
 get_aiter_moe_config = None
 w4a8_moe_layout_shuffle_gemm2 = None
 
+if _requested_backend in {
+    W4A8_TPMOE_BACKEND_AUTO,
+    W4A8_TPMOE_BACKEND_LIGHTOP,
+    W4A8_TPMOE_BACKEND_TRITON,
+}:
+    try:
+        from lightop.moe import (
+            fused_experts_impl_w4a8_marlin,
+        )
+
+        _lmslim_w4a8_marlin_available = True
+    except Exception:
+        logger.info(
+            "INFO: Please install lightop if you want to infer the quantitative model of moe.\n"
+        )
+
+    try:
+        from lightop._lmslim_native.layers.fused_moe import w4a8 as w4a8_triton
+        from lightop._lmslim_native.vllm_compat.fused_moe_cache import get_moe_cache
+        from lightop.quant import per_token_quant_int8
+
+        _lmslim_w4a8_triton_available = True
+    except Exception:
+        logger.info(
+            "INFO: Please install lightop triton kernels if you want to use w4a8 triton tpmoe.\n"
+        )
+
+if _requested_backend in {W4A8_TPMOE_BACKEND_AUTO, W4A8_TPMOE_BACKEND_AITER}:
+    try:
+        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+        from aiter.ops.shuffle import w4a8_moe_layout_shuffle_gemm2
+
+        _aiter_w4a8_marlin_available = True
+    except Exception:
+        pass
+
+if _requested_backend not in {
+    W4A8_TPMOE_BACKEND_AUTO,
+    W4A8_TPMOE_BACKEND_LIGHTOP,
+    W4A8_TPMOE_BACKEND_AITER,
+    W4A8_TPMOE_BACKEND_TRITON,
+}:
+    raise ValueError(
+        f"Unsupported {W4A8_TPMOE_BACKEND_ENV}={_requested_backend!r}. "
+        f"Supported values: {W4A8_TPMOE_BACKEND_AUTO!r}, "
+        f"{W4A8_TPMOE_BACKEND_LIGHTOP!r}, {W4A8_TPMOE_BACKEND_AITER!r}, "
+        f"{W4A8_TPMOE_BACKEND_TRITON!r}."
+    )
+
+if _requested_backend == W4A8_TPMOE_BACKEND_AUTO:
+    if _lmslim_w4a8_marlin_available:
+        _resolved_backend = W4A8_TPMOE_BACKEND_LIGHTOP
+    elif _aiter_w4a8_marlin_available:
+        _resolved_backend = W4A8_TPMOE_BACKEND_AITER
+    else:
+        raise RuntimeError(
+            "Neither lightop nor aiter backend is available for w4a8 tpmoe."
+        )
+elif _requested_backend == W4A8_TPMOE_BACKEND_LIGHTOP:
+    if not _lmslim_w4a8_marlin_available:
+        raise RuntimeError(
+            "lightop backend is selected for w4a8 tpmoe, but lightop is not available."
+        )
+    _resolved_backend = W4A8_TPMOE_BACKEND_LIGHTOP
+elif _requested_backend == W4A8_TPMOE_BACKEND_TRITON:
+    if not _lmslim_w4a8_triton_available:
+        raise RuntimeError(
+            "triton backend is selected for w4a8 tpmoe, but lightop triton kernels are not available."
+        )
+    _resolved_backend = W4A8_TPMOE_BACKEND_TRITON
+else:
+    if not _aiter_w4a8_marlin_available:
+        raise RuntimeError(
+            "aiter backend is selected for w4a8 tpmoe, but aiter is not available."
+        )
+    _resolved_backend = W4A8_TPMOE_BACKEND_AITER
+
+logger.info(
+    "[slimquant_w4a8_marlin] "
+    f"requested_backend={_requested_backend}, "
+    f"resolved_backend={_resolved_backend}"
+)
 
 def _ensure_lightop_w4a8_marlin_available() -> None:
     global _lmslim_w4a8_marlin_available
@@ -611,11 +693,8 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
 
         self.quant_config = quant_config
         self.use_deepep = get_moe_a2a_backend().is_deepep()
-<<<<<<< HEAD
         self.use_triton = _resolved_backend == W4A8_TPMOE_BACKEND_TRITON
-=======
         self.fused_experts_impl_w4a8_marlin = fused_experts_impl_w4a8_marlin
->>>>>>> 20260825_v0.5.18_zhu
 
     def create_weights(
         self,
@@ -985,7 +1064,6 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         routed_scaling_factor = (
             1.0 if routed_scaling_factor is None else routed_scaling_factor
         )
-<<<<<<< HEAD
         if self.use_triton:
             if shared_output is not None:
                 raise NotImplementedError(
@@ -1016,10 +1094,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             )
 
         workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
-        return fused_experts_impl_w4a8_marlin(
-=======
         return self.fused_experts_impl_w4a8_marlin(
->>>>>>> 20260825_v0.5.18_zhu
             x,
             w1,
             w2,
