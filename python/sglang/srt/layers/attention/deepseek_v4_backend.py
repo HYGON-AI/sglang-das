@@ -97,6 +97,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    build_cp_sparse_query_metadata,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
@@ -212,13 +213,15 @@ T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
 def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+    sparse_prefill_enabled = envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    explicit_cp_override = (
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+        and sparse_prefill_enabled
+    )
     return (
         not _is_sm120
-        and not dsa_use_prefill_cp(forward_batch)
-        and (
-            q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-        )
+        and (not dsa_use_prefill_cp(forward_batch) or explicit_cp_override)
+        and (q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD or sparse_prefill_enabled)
     )
 
 
@@ -2497,27 +2500,43 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
-            )
-        else:
-            query_lens = extend_seq_lens.to(torch.int32)
-        # padding rows are never combined
+        # The current sparse-prefill API uses a required, rank-local query_pos.
+        # HCU CP needs physical/real lengths split so dummy rows cannot alias a
+        # request's C4/C128 workspace. Keep the device-side metadata path HCU-only.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
+        real_query_lens = None
+        if is_cp_active(forward_batch):
+            if _is_hcu:
+                assert forward_batch.extend_start_loc is not None
+                query_lens, real_query_lens, query_pos = (
+                    build_cp_sparse_query_metadata(
+                        extend_seq_lens=extend_seq_lens.to(torch.int32),
+                        extend_start_loc=forward_batch.extend_start_loc.to(torch.int32),
+                        query_positions=query_pos.to(torch.int32).contiguous(),
+                        cp_size=get_parallel().attn_cp_size,
+                        cp_rank=get_parallel().attn_cp_rank,
+                    )
+                )
+            else:
+                query_lens = torch.tensor(
+                    interleave_rows_per_request(
+                        _as_int_list(extend_seq_lens_cpu),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                    ),
+                    dtype=torch.int32,
+                    device=extend_seq_lens.device,
+                )
+        else:
+            query_lens = extend_seq_lens.to(torch.int32)
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=extend_seq_lens.to(torch.int32),
             query_lens=query_lens,
             query_pos=query_pos,
+            real_query_seq_lens=real_query_lens,
             req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,

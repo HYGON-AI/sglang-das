@@ -817,6 +817,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if self._is_layer_owned(layer_id)
         ]
 
+    def get_kv_layer_ids(self):
+        my_start, my_end = self._owned_local_layer_range()
+        return list(range(self.start_layer + my_start, self.start_layer + my_end))
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)

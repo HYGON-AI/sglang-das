@@ -4758,6 +4758,7 @@ class DeepseekV4Model(nn.Module):
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         incoming_pd_aux_hidden_states: List[torch.Tensor] = []
+        local_dspark_aux_hidden_states: List[torch.Tensor] = []
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4775,14 +4776,6 @@ class DeepseekV4Model(nn.Module):
                     if key.startswith("pd_aux_hidden_states_")
                 )
             ]
-            if hidden_states.shape[0] != positions.shape[0]:
-                rids = getattr(forward_batch, "rids", None)
-                raise RuntimeError(
-                    "PP proxy hidden token count does not match current positions: "
-                    f"pp_rank={self.pp_group.rank_in_group}, "
-                    f"hidden_tokens={hidden_states.shape[0]}, "
-                    f"position_tokens={positions.shape[0]}, rids={rids}"
-                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
@@ -4921,7 +4914,9 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    pd_aux_hidden_states.append(completed.mean(dim=1))
+                    captured_hidden = completed.mean(dim=1)
+                    pd_aux_hidden_states.append(captured_hidden)
+                    local_dspark_aux_hidden_states.append(captured_hidden)
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -4937,6 +4932,17 @@ class DeepseekV4Model(nn.Module):
             and self.pp_group.is_last_rank
         )
 
+        # With PP+D-Spark, each stage projects only its own capture features.
+        # The final stage receives the prior projected accumulator separately,
+        # so its logits output must contain local features rather than the old
+        # concatenated raw-hidden relay.
+        if (
+            capture_dspark
+            and self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+        ):
+            pd_aux_hidden_states = local_dspark_aux_hidden_states
+
         if isinstance(pd_aux_hidden_states, AuxHiddenStatePacker):
             pd_aux_hidden = pd_aux_hidden_states.finalize()
         else:
@@ -4949,6 +4955,14 @@ class DeepseekV4Model(nn.Module):
                 for idx, aux_hidden in enumerate(pd_aux_hidden_states):
                     proxy_tensors[f"pd_aux_hidden_states_{idx}"] = (
                         aux_hidden.flatten(1) if aux_hidden.ndim == 3 else aux_hidden
+                    )
+                if local_dspark_aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        local_dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = (
+                        hidden_states.new_empty(hidden_states.shape[0], 0)
                     )
             return PPProxyTensors(proxy_tensors)
 
@@ -5202,14 +5216,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):

@@ -12,12 +12,14 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+_is_hcu = is_hcu()
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
@@ -30,11 +32,21 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
     if get_platform().is_hip:
-        logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
-            f"for {model_arch}; set it explicitly to override."
+        explicit_sparse_prefill = (
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+            and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
         )
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+        if _is_hcu and explicit_sparse_prefill:
+            logger.warning(
+                "Keeping explicitly enabled SGLANG_OPT_FLASHMLA_SPARSE_PREFILL "
+                f"on HCU for {model_arch}."
+            )
+        else:
+            logger.warning(
+                "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL on ROCm/HIP "
+                f"for {model_arch}; HCU can explicitly enable it."
+            )
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
     # The kv-cache dtype default moved to the resolution pipeline
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
@@ -151,8 +163,22 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."
         )
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
-        # The CP-aware sparse prefill chunk cache is validated on V4.1 only.
+    explicit_hcu_sparse_cp = (
+        _is_hcu
+        and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+        and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    )
+    if explicit_hcu_sparse_cp:
+        logger.warning(
+            "Keeping explicitly enabled HCU sparse prefill with DeepSeekV4 CP."
+        )
+    elif model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        # The generic CP-aware sparse chunk cache is validated on V4.1 only.
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+            "context parallelism is enabled."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
             "context parallelism is enabled."

@@ -654,7 +654,6 @@ def _is_supported_dspark_pd_prefill_cp(server_args: ServerArgs) -> bool:
     return (
         server_args.disaggregation_mode == "prefill"
         and server_args.disaggregation_transfer_backend == "mooncake"
-        and server_args.pp_size == 1
         and server_args.attn_cp_size > 1
         and attn_tp_size == 1
         and server_args.enable_prefill_cp
@@ -682,7 +681,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_cp_size > 1 and not pd_prefill_cp:
         raise ValueError(
             "DSpark context parallel is only supported for DeepSeek-V4 PD prefill "
-            "with Mooncake, pp_size == 1, attn_tp_size == 1, and interleave CP; "
+            "with Mooncake, attn_tp_size == 1, and interleave CP; "
             f"got disaggregation_mode={cfg.disaggregation_mode!r}, "
             f"pp_size={cfg.pp_size}, attn_cp_size={cfg.attn_cp_size}, "
             f"cp_strategy={cfg.cp_strategy!r}, "
