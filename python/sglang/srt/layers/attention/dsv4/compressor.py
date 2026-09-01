@@ -424,8 +424,9 @@ def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, w
     local compress plan (v1) with PER-SEGMENT PREFIX, expansion rows, the per-segment global sequence
     indices (used to gather load pages from the global paged metadata), and the state-pool WRITE
     indices (compact/remap gather -- pure geometry from `write_plan`). Cached by
-    (ratio, cp_rank, device, extend_lens, prefix_lens) -> reused across all c4 layers of a forward."""
-    key = (ratio, cp_rank, str(device),
+    (ratio, cp_size, cp_rank, device, extend_lens, prefix_lens) -> reused across all c4 layers of a
+    forward."""
+    key = (ratio, cp_size, cp_rank, str(device),
            tuple(int(x) for x in extend_lens), tuple(int(x) for x in prefix_lens))
     bundle = _rlc_bundle_cache.get(key)
     if bundle is not None:

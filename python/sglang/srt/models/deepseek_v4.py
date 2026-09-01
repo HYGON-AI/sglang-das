@@ -313,7 +313,9 @@ def _hcu_arch_supports_tilelang_mmac() -> bool:
             torch.cuda.get_device_properties(0), "gcnArchName", ""
         )
     except Exception:
-        return True
+        # Fail closed: an unreadable arch must not take the tilelang path,
+        # which fatals at LayerInference on unsupported HCUs.
+        return False
     return any(a in gcn_arch for a in ("gfx938", "gfx92a", "gfx946"))
 
 

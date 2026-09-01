@@ -1418,8 +1418,6 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
-    # Deprecated: DSV4 compressor V2 is always used.
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
