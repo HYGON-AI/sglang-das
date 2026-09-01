@@ -5,6 +5,9 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+    effective_forward_mode,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -13,6 +16,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
     get_parallel,
     process_model_config,
 )
@@ -67,27 +72,24 @@ INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
+def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
         is_cuda()
         and envs.SGLANG_DSA_FUSE_TOPK.get()
-        and server_args.disaggregation_mode == "decode"
-        and not server_args.enable_hisparse
+        and get_disagg().disaggregation_mode == "decode"
+        and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
     )
 
 
-def should_use_dsa_fused_topk(
-    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
-) -> bool:
+def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     """Select fused TopK for PD IndexShare.
 
     PD Prefill worker:
@@ -98,10 +100,10 @@ def should_use_dsa_fused_topk(
     - Draft decode / target verify / draft extend: fused TopK enabled.
     """
     pd_index_share_seed = (
-        server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+        get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
     return envs.SGLANG_DSA_FUSE_TOPK.get() and (
-        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
     )
 
 
@@ -143,12 +145,12 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
         is_cuda()
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        and forward_batch.forward_mode.is_extend_without_speculative()
+        and effective_forward_mode(forward_batch).is_extend_without_speculative()
     )
 
 
 def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
+    if not effective_forward_mode(forward_batch).is_context_parallel_extend():
         return False
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
@@ -257,7 +259,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     if (
         cp_size <= 1
         or not use_dsa
-        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not effective_forward_mode(forward_batch).is_context_parallel_extend()
         or not is_dsa_enable_prefill_cp()
         or sum(forward_batch.extend_seq_lens_cpu) < cp_size
     ):
@@ -331,7 +333,7 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
     if (
         forward_batch.attn_cp_metadata is not None
         and dsa_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend()
+        and effective_forward_mode(forward_batch).is_context_parallel_extend()
     ):
         return True
     else:

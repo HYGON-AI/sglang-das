@@ -17,6 +17,16 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_gather_supported,
     is_tf32_supported,
 )
+from sglang.srt.utils import get_bool_env_var, is_hcu
+
+# Same switch as fla/kda.py: gates KDA kernels provided by boltops.
+_USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+
+if is_hcu():
+    from boltops.fla.kda.triton import (
+        chunk_kda_fwd_intra as chunk_kda_fwd_intra_hcu,
+        recompute_w_u_fwd as recompute_w_u_fwd_hcu,
+    )
 
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
@@ -921,6 +931,34 @@ def chunk_kda_fwd_intra(
     fuse_recompute: bool = False,
     fuse_diagonal: bool = False,
 ):
+    if _USE_KDA_HCU:
+        # boltops full intra: step-1 variants
+        # (poly-solve / safe-gate sub-chunk / token-parallel) + step-2
+        # inter/solve, then the separate recompute kernel. The boltops
+        # kernels are non-fused by design, so fuse_diagonal/fuse_recompute
+        # are ignored on this path.
+        Aqk, Akk = chunk_kda_fwd_intra_hcu(
+            q=q,
+            k=k,
+            gk=gk,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=safe_gate,
+        )
+        w, u, _, kg = recompute_w_u_fwd_hcu(
+            k=k,
+            v=v,
+            beta=beta,
+            A=Akk,
+            gk=gk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        return w, u, None, kg, Aqk, Akk
+
     B, T, H, K = k.shape
     V = v.shape[-1]
     BT = chunk_size

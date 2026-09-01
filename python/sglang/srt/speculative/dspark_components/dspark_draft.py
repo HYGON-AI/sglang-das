@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import envs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -84,8 +85,19 @@ def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    prefill_tail_hidden_states: torch.Tensor | None = None,
+    prefill_tail_valid_mask: torch.Tensor | None = None,
+    prefill_tail_start_positions: torch.Tensor | None = None,
+    prefill_tail_hidden_projected: bool = True,
 ) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    return make_draft_input_v2(
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        prefill_tail_hidden_states=prefill_tail_hidden_states,
+        prefill_tail_valid_mask=prefill_tail_valid_mask,
+        prefill_tail_start_positions=prefill_tail_start_positions,
+        prefill_tail_hidden_projected=prefill_tail_hidden_projected,
+    )
 
 
 def resolve_greedy_mask(
@@ -201,7 +213,7 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = target_model.get_input_embeddings()
+        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
@@ -343,9 +355,9 @@ class DraftBlockProposer:
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
@@ -421,6 +433,10 @@ class DraftBlockProposer:
         forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
+        # Graph bucket selection uses the raw per-rank request counts.  Keep
+        # them separate from global_num_tokens_cpu below, which is scaled into
+        # draft-token units for DP/MoE synchronization.
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,

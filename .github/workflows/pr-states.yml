@@ -5,13 +5,10 @@ name: PR States
 #
 # Three triggers, each covering a gap:
 #   - pull_request_target: push / open / label change (all PRs incl forks).
-#   - workflow_run: initial pr-test* completion (incl fork PRs; the
-#     notify-job below can't fire on forks — their pull_request
-#     GITHUB_TOKEN is forced read-only). Does NOT re-fire for rerun
-#     attempts, which is why workflow_dispatch is needed too.
-#   - workflow_dispatch: rerun completions for non-fork PRs, dispatched by
-#     pr-test*'s notify-pr-states job. workflow_dispatch is the only event
-#     GITHUB_TOKEN can cascade-create.
+#   - workflow_run: pr-test* requested / completed events (incl fork PRs).
+#     `requested` is absent on reruns, but `completed` still fires.
+#   - workflow_dispatch: explicit refreshes for a provided PR number. This
+#     is the only event here that GITHUB_TOKEN can cascade-create.
 
 on:
   pull_request_target:
@@ -63,6 +60,13 @@ jobs:
               prNumber = context.payload.pull_request.number;
             } else if (context.eventName === 'workflow_run') {
               const wr = context.payload.workflow_run;
+              // Only pull_request runs are the PR gate. Manual runs on a PR
+              // branch can also be PR-associated, but the rows below
+              // deliberately ignore them.
+              if (wr.event !== 'pull_request') {
+                core.info(`Triggering run event '${wr.event}' is not pull_request; skipping.`);
+                return;
+              }
               if (wr.pull_requests && wr.pull_requests.length > 0) {
                 prNumber = wr.pull_requests[0].number;
               } else if (wr.head_repository && wr.head_branch) {
@@ -119,6 +123,9 @@ jobs:
                 repo: context.repo.repo,
                 workflow_id: workflowFile,
                 head_sha: sha,
+                // Every row reports the PR gate, so exclude other events for
+                // this SHA: both workflows also accept workflow_dispatch.
+                event: 'pull_request',
                 per_page: 1,
               });
               return data.workflow_runs[0] || null;
@@ -140,9 +147,15 @@ jobs:
             // on just-removed-label to catch removal-after-push.
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
-            const ptRun = await findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts);
-            // pr-test-extra gates on BOTH labels (see check-changes there).
-            const peRun = await findRun('pr-test-extra.yml', (hasCI && hasExtra) ? labelOnOpts : labelOffOpts);
+
+            const [ptRun, peRun] = await Promise.all([
+              findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
+              // pr-test-extra gates on BOTH labels (see check-changes there).
+              findRun(
+                'pr-test-extra.yml',
+                (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
+              ),
+            ]);
 
             // Skipped run = "no real run" -- happens when a label is added
             // after a commit, because GHA doesn't retrigger on `labeled`.
@@ -152,7 +165,6 @@ jobs:
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again or use /rerun-failed-ci to dispatch.';
-
             // Status icon: body otherwise looks uniformly "dispatched" even
             // for gate-failed runs (call-gate exits on missing label).
             function runIcon(run) {
@@ -176,16 +188,14 @@ jobs:
               : !hasCI
                 ? peBlockedByCIText
                 : !hasExtra
-                ? notExtraEnabledText
-                : stalePushText;
-
+                  ? notExtraEnabledText
+                  : stalePushText;
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
             const ptStart    = '<!-- slot:pr-test:start -->';
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
-
             const newBlock = [
               outerStart,
               '---',

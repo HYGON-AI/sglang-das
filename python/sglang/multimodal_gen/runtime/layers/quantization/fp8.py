@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 from torch.nn import Module
@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
@@ -49,6 +50,7 @@ from sglang.multimodal_gen.runtime.utils.common import (
     use_intel_amx_backend,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
@@ -83,100 +85,23 @@ if USE_AITER or _use_hip_int4:
     pass
 
 
-ACTIVATION_SCHEMES = ["static", "dynamic"]
-
 logger = logging.getLogger(__name__)
 
 
-class Fp8Config(QuantizationConfig):
+class Fp8Config(SRTFp8Config, QuantizationConfig):
     """Config class for FP8.
 
     No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
     ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
     """
 
-    def __init__(
-        self,
-        is_checkpoint_fp8_serialized: bool = False,
-        activation_scheme: str = "dynamic",
-        ignored_layers: Optional[List[str]] = None,
-        weight_block_size: Optional[List[int]] = None,
-        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
-    ) -> None:
-        super().__init__()
-        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
-        if is_checkpoint_fp8_serialized:
-            logger.info("Detected fp8 checkpoint.")
-        if activation_scheme not in ACTIVATION_SCHEMES:
-            raise ValueError(f"Unsupported activation scheme {activation_scheme}")
-        self.activation_scheme = activation_scheme
-        self.ignored_layers = ignored_layers or []
-        self.packed_modules_mapping = packed_modules_mapping or {}
-        if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
-            if len(weight_block_size) != 2:
-                raise ValueError(
-                    f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
-                )
-            if activation_scheme != "dynamic":
-                raise ValueError(
-                    f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
-                )
-        self.weight_block_size = weight_block_size
-
-    @classmethod
-    def get_name(cls) -> str:
-        return "fp8"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.half]
-
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
 
-    @classmethod
-    def get_config_filenames(cls) -> List[str]:
-        return []
-
-    @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
-        quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp8_serialized = "fp8" in quant_method
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        packed_modules_mapping = (
-            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
-        )
-        ignored_layers = cls.get_from_keys_or(
-            config, ["ignored_layers", "modules_to_not_convert"], None
-        )
-        if ignored_layers:
-            # Keep both forms so prefix matching works for models that include
-            # or omit the leading "model." in state-dict names.
-            normalized = []
-            for layer in ignored_layers:
-                base = layer.removeprefix("model.")
-                normalized.append(base)
-                normalized.append(f"model.{base}")
-            ignored_layers = normalized
-        weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
-        return cls(
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
-            activation_scheme=activation_scheme,
-            ignored_layers=ignored_layers,
-            weight_block_size=weight_block_size,
-            packed_modules_mapping=packed_modules_mapping,
-        )
-
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
-
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix,
@@ -186,9 +111,6 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         return None
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
 
 
 class Fp8LinearMethod(LinearMethodBase):

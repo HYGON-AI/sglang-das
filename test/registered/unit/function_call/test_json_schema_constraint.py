@@ -31,12 +31,17 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
+
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: three-pass PR-gate smoke passed.
-register_hcu_ci(est_time=30, suite="stage-b-test-1-hcu-small", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
+register_hcu_ci(
+    est_time=30,
+    suite="stage-b-test-1-hcu-small",
+    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
+)
 
 
 register_cpu_ci(5, "base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):

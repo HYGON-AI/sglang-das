@@ -34,6 +34,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,8 @@ class SamplingBatchInfo:
                     # The mask tensor for the requests that use this custom logit processor
                     torch.zeros(len(reqs), dtype=torch.bool)
                     .scatter_(0, torch.tensor(true_indices), True)
-                    .pin_memory().to(device, non_blocking=True),
+                    .pin_memory()
+                    .to(device, non_blocking=True),
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
@@ -294,7 +296,7 @@ class SamplingBatchInfo:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
+    def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.acc_additive_penalties is not None:
             # Used in the overlap mode
             logits.add_(self.acc_additive_penalties)
@@ -307,11 +309,32 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
+    def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
+        if self.logit_bias is not None:
+            logits.add_(self.logit_bias)
+
+    def apply_logits_bias(self, logits: torch.Tensor):
+        self._apply_pre_grammar_logits_transforms(logits)
+
         if self.grammar_mask is not None:
             self.grammar_mask.apply(logits)
 
-        if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
+        self._apply_post_grammar_logits_transforms(logits)
+
+    def apply_logits_bias_with_observer(
+        self,
+        logits: torch.Tensor,
+        observer: SamplingObserver,
+    ) -> Any:
+        self._apply_pre_grammar_logits_transforms(logits)
+        observer_state = observer.before_grammar(logits, self)
+
+        if self.grammar_mask is not None:
+            self.grammar_mask.apply(logits)
+
+        self._apply_post_grammar_logits_transforms(logits)
+
+        return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)

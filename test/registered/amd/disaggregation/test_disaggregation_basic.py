@@ -21,6 +21,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_hcu_ci
 
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
@@ -254,8 +255,10 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
-        os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
+        # Inject transfer failures so the retry path is actually exercised.
+        # Entered before the servers start so they inherit it.
+        cls._disagg_failure_ctx = envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(0.05)
+        cls._disagg_failure_ctx.__enter__()
 
         cls.model = "Qwen/Qwen3-8B"
 
@@ -271,7 +274,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
+        cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
     @classmethod

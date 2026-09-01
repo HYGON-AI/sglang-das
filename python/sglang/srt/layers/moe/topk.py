@@ -96,7 +96,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
@@ -130,6 +130,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _is_musa = is_musa()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_lightop_topk_ids_postprocess = get_bool_env_var(
@@ -155,78 +156,6 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
-
-# ATOM-style shared-expert fusion for the aiter grouped-topk path: keep a
-# persistent topk buffer whose shared-expert columns are pre-populated once (NOT
-# related to the LLM prefill phase — this applies to both prefill and decode), and
-# let the aiter kernel write only the routed columns (via row stride). This removes
-# the per-layer _fused_append_shared_experts kernel.
-# Auto-enabled (no env) when: non-EP aiter path (moe_ep_size == 1) and
-# num_fused_shared_experts > 0. Bit-identical to the plain append: the shared column
-# is filled with the same constant scale_factor the aiter append writes. The
-# persistent buffer is sized to the max prefill batch (chunked-prefill-size); for
-# token counts above it we fall back to the plain path (condition mirrored in
-# _post_process_topk_ids). Mirrors ATOM's init_aiter_topK_meta_data.
-# Hard upper bound on the persistent buffer (safety cap when chunked prefill is
-# disabled / unexpectedly huge); the buffer only costs ~[MAX, topk+n_shared] * 8B.
-_AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP = 131072
-_aiter_topk_fuse_shared_max_tokens_cache = None
-_aiter_topk_fuse_shared_bufs: dict = {}
-
-
-def _get_aiter_topk_fuse_shared_max_tokens() -> int:
-    """Max per-forward token count the persistent buffer must cover. Sized to the
-    largest prefill batch (chunked-prefill-size / max-prefill-tokens); decode is
-    always tiny (bs * num_tokens_per_bs). Above this we fall back to the plain
-    path, so this only bounds the fast-path coverage, not correctness. Cached
-    (server args are fixed after startup)."""
-    global _aiter_topk_fuse_shared_max_tokens_cache
-    if _aiter_topk_fuse_shared_max_tokens_cache is None:
-        from sglang.srt.runtime_context import get_server_args
-
-        try:
-            sa = get_server_args()
-        except ValueError:
-            # Global server args not published yet (e.g. a unit test or offline
-            # init that reaches the aiter grouped-topk path before startup).
-            # Degrade gracefully instead of crashing -- this value only bounds
-            # the fast-path coverage, not correctness (see docstring). Return the
-            # safety cap WITHOUT caching, so a later call (once args are set)
-            # still computes and caches the real value.
-            return _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
-        cps = getattr(sa, "chunked_prefill_size", None) or 0
-        mpt = getattr(sa, "max_prefill_tokens", None) or 0
-        m = max(int(cps), int(mpt), 8192)  # 8192 floor for tiny configs
-        if int(cps) <= 0 and int(mpt) <= 0:
-            # chunked prefill disabled -> use the safety cap
-            m = _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
-        _aiter_topk_fuse_shared_max_tokens_cache = min(
-            m, _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
-        )
-    return _aiter_topk_fuse_shared_max_tokens_cache
-
-
-def _get_aiter_topk_fuse_shared_buf(
-    topk_routed: int, n_shared: int, num_experts: int, shared_weight: float, device
-):
-    """Persistent [MAX, topk_routed + n_shared] weight/id buffers whose shared
-    columns are pre-filled once (id = num_experts + i, weight = shared_weight).
-    Fixed max size (>= max prefill batch) so the tensor address is stable across
-    CUDA-graph replays."""
-    key = (topk_routed, n_shared, num_experts, float(shared_weight), str(device))
-    buf = _aiter_topk_fuse_shared_bufs.get(key)
-    if buf is None:
-        total = topk_routed + n_shared
-        M = _get_aiter_topk_fuse_shared_max_tokens()
-        w = torch.empty((M, total), dtype=torch.float32, device=device)
-        ids = torch.empty((M, total), dtype=torch.int32, device=device)
-        ids[:, topk_routed:] = torch.arange(
-            num_experts, num_experts + n_shared, dtype=torch.int32, device=device
-        ).unsqueeze(0)
-        w[:, topk_routed:] = shared_weight
-        buf = (w, ids)
-        _aiter_topk_fuse_shared_bufs[key] = buf
-    return buf
 
 
 if _is_cuda:
@@ -1079,7 +1008,7 @@ def fused_topk(
                 num_token_non_padded=num_token_non_padded,
             )
         # ===== END TO BE REFACTORED ====
-        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+        elif _is_cuda:
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -1119,7 +1048,7 @@ def fused_topk(
                 topk_weights *= (
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 )
-        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+        elif _is_cuda:
             # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -1480,6 +1409,10 @@ def biased_topk_jit_kernel_impl(
     else:
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
+        # DeepSeek-V4 stores e_score_correction_bias in bf16 (for the aiter
+        # sqrtsoftplus topk path). moe_fused_gate upcasts the bias to fp32
+        # in-register, so pass it through directly rather than allocating a fresh
+        # fp32 copy of this static routing bias on every MoE invocation.
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
@@ -1546,6 +1479,47 @@ def biased_topk_lightop_impl(
         routed_scaling_factor,
         bool(apply_routed_scaling_factor_on_output),
     )
+
+
+def biased_topk_xpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    num_rows, _ = gating_output.shape
+    device = gating_output.device
+
+    output = torch.empty(num_rows, topk, dtype=torch.float32, device=device)
+    indices = torch.empty(num_rows, topk, dtype=torch.int32, device=device)
+
+    from sgl_kernel import biased_topk
+
+    biased_topk(
+        gating_output,
+        correction_bias,
+        output,
+        indices,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor=(routed_scaling_factor if routed_scaling_factor else 1.0),
+        apply_routed_scaling_factor_on_output=bool(
+            apply_routed_scaling_factor_on_output
+        ),
+    )
+
+    return output, indices
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -1689,10 +1663,23 @@ def _zero_topk_weights_padded_region(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _topk_ids_postprocess_torch(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if _is_hip and num_token_non_padded is not None:
+        # Keep the HIP fallback as plain torch ops inside this compiled region.
+        # Calling _fill_padded_rows here would introduce a separate explicit
+        # Triton launch after the logical-to-physical gather, while Inductor can
+        # fuse this mask with that gather just like the pre-forward-port path.
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    else:
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if output_int64 and topk_ids.dtype != torch.int64:
+        topk_ids = topk_ids.to(torch.int64)
     return topk_ids
 
 
@@ -1747,25 +1734,43 @@ def _topk_ids_postprocess(
     topk_ids: torch.Tensor,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     num_token_non_padded: Optional[torch.Tensor],
+    output_int64: bool = False,
 ) -> torch.Tensor:
-    if expert_location_dispatch_info is None and num_token_non_padded is None:
+    if (
+        expert_location_dispatch_info is None
+        and num_token_non_padded is None
+        and (not output_int64 or topk_ids.dtype == torch.int64)
+    ):
         return topk_ids
 
-    lightop_output = _try_lightop_topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
-    )
-    if lightop_output is not None:
-        return lightop_output
+    # An int32 -> int64 result must stay in the compiled fallback so Inductor
+    # can fuse it with the remap/padding work. If the input is already int64,
+    # the in-place LightOp path still satisfies the requested output dtype.
+    if not output_int64 or topk_ids.dtype == torch.int64:
+        lightop_output = _try_lightop_topk_ids_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
+        if lightop_output is not None:
+            return lightop_output
     return _topk_ids_postprocess_torch(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     return _topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
@@ -1908,48 +1913,34 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
-        _shared_fuse = (
-            num_fused_shared_experts > 0
-            and get_parallel().moe_ep_size == 1
-            and token <= _get_aiter_topk_fuse_shared_max_tokens()
-        )
-        if _shared_fuse:
-            # Persistent buffer with pre-populated shared columns. The weight is the
-            # constant scale_factor the aiter _post_process append writes (default
-            # 1.0), so this is bit-identical for any shared-expert scaling. aiter
-            # writes only the routed columns [:, :topk] via row stride; the shared
-            # column stays intact. If token exceeds the buffer size we drop to the
-            # plain path below (and _post_process appends shared experts as usual) —
-            # the same condition is mirrored there so the two paths stay consistent.
-            _shared_w = (
-                1.0
-                if fused_shared_experts_scaling_factor is None
-                else fused_shared_experts_scaling_factor
-            )
-            full_w, full_ids = _get_aiter_topk_fuse_shared_buf(
-                topk, num_fused_shared_experts, num_experts, _shared_w, device
-            )
-            topk_weights = full_w[:token, :topk]
-            topk_ids = full_ids[:token, :topk]
-        else:
-            topk_weights = torch.empty(
-                (token, topk), dtype=torch.float32, device=device
-            )
-            topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        bias = correction_bias.to(dtype=gating_output.dtype)
+        scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+
+        if envs.SGLANG_K3_RADIX4_TOPK.get():
+            from sglang.kernels.ops.moe import moe_route_radix4
+
+            # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
+            # ungrouped) is the only config covered for now; anything else
+            # falls back to aiter.
+            if moe_route_radix4.available() and moe_route_radix4.covered(
+                gating_output, bias, topk, num_expert_group, topk_group
+            ):
+                return moe_route_radix4.route_radix4(
+                    gating_output, bias, topk, renormalize, scaling
+                )
+
+        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            bias,
             topk_weights,
             topk_ids,
             num_expert_group,
             topk_group,
             renormalize,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            scaling,
         )
-        if _shared_fuse:
-            # Return the full [token, topk + n_shared] view (routed just written,
-            # shared pre-populated). _post_process_topk_ids skips its append.
-            return full_w[:token], full_ids[:token]
         return topk_weights, topk_ids
     elif _is_musa and (
         gating_output.shape[1] // num_expert_group <= 32
@@ -2117,7 +2108,8 @@ def biased_grouped_topk_gpu(
                 topk_indices,
                 gating_output,
                 renormalize,
-                correction_bias,
+                # The XPU topk_sigmoid AOT kernel requires an fp32 correction bias.
+                correction_bias.to(torch.float32),
                 scale,
             )
 
@@ -2214,7 +2206,7 @@ def remap_topk_for_per_rank_shared_slots(
     so tokens route to the correct rank. The layout is ordered by rank:
     [rank0 routed..., rank0 shared, rank1 routed..., rank1 shared, ...].
 
-    Routed IDs:  e -> e + e // num_local_routed
+    Routed IDs:  e -> e + (e // num_local_routed) * num_fused_shared_experts
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
     Shared weight: 1.0 on the aiter path, else 1/routed_scaling_factor (see below).
     """
@@ -2229,9 +2221,15 @@ def remap_topk_for_per_rank_shared_slots(
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
-    # Remap routed IDs: insert gaps for shared expert slots (single fused op)
+    # Remap routed IDs: insert gaps for shared expert slots (single fused op).
+    # Each rank r == e // num_local_routed is preceded by r shared-slot blocks of
+    # width num_fused_shared_experts, so shift by (e // num_local_routed) * S --
+    # a single-slot shift (S == 1) would let routed ids collide with an earlier
+    # rank's shared slots once S > 1.
     routed = topk_ids[:, :-num_fused_shared_experts]
-    topk_ids[:, :-num_fused_shared_experts] = routed + routed // num_local_routed
+    topk_ids[:, :-num_fused_shared_experts] = (
+        routed + (routed // num_local_routed) * num_fused_shared_experts
+    )
 
     # Set shared expert IDs to route to home rank (vectorized)
     topk_ids[:, -num_fused_shared_experts:] = (
@@ -2309,6 +2307,15 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
+    _fold_pad_into_append = False
+    # HCU W8A8 deployments can select DeepGEMM through the legacy env while
+    # the global runner backend remains AUTO, so recognize both selectors.
+    skip_deepep_padded_tokens = (
+        _is_hcu
+        and get_moe_a2a_backend().is_deepep()
+        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+    )
+    hip_deepep_postprocessed = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2349,20 +2356,45 @@ def _post_process_topk_ids(
             )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Always fill the padded
-        # region with 0 so every kernel sees a valid in-range expert id.
-        # Routing weights for padded tokens are zeroed below so their
-        # contribution to the hidden state is still zero regardless of the id.
+        # (negative indices cause illegal memory access). Keep their padded IDs
+        # in range and zero their weights below. HCU DeepEP + DeepGEMM instead
+        # masks the final IDs to -1 after shared-expert remapping so dispatch can
+        # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
+        if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
+            # DeepEP disables shared-expert fusion by default. On that main HCU
+            # path no later operation can introduce another route, so remap and
+            # the final -1 padding mask can be compiled into one kernel. Emit
+            # int64 from that kernel as well because DeepEP requires int64 IDs;
+            # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
+            # the post-shared-expert mask below for the explicitly forced fused
+            # shared-expert configuration.
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids,
+                remap_info,
+                num_token_non_padded,
+                output_int64=True,
+            )
+            hip_deepep_postprocessed = True
+        else:
+            # The fused append+remap kernel can fold the padded fill into its
+            # existing launch on the aiter per-rank shared-slot path.
+            _fold_pad_into_append = (
+                not skip_deepep_padded_tokens
+                and num_fused_shared_experts > 0
+                and _use_aiter
+                and use_per_rank_shared_slots
+                and remap_info is None
+            )
+        if not skip_deepep_padded_tokens and not _fold_pad_into_append:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
-            )
+        if remap_info is not None and not hip_deepep_postprocessed:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
@@ -2410,45 +2442,30 @@ def _post_process_topk_ids(
             1.0,  # shared-expert weight on the aiter path
             shared_id_base,
             num_local_routed,
+            num_token_non_padded=(
+                num_token_non_padded if _fold_pad_into_append else None
+            ),
         )
     elif _aiter_append:
-        # Detect whether the shared experts were already fused/appended in
-        # biased_grouped_topk_gpu via the persistent pre-populated topk buffer.
-        # When fused, topk_ids already has the full width (routed + shared), i.e.
-        # topk_ids.shape[1] == topk_config.top_k; when the fast path fell back to
-        # the plain buffer (e.g. token > MAX during a large prefill), only the
-        # routed columns are present and we must append the shared experts here.
-        # Checking the tensor shape is robust to the exact fast-path conditions
-        # (no fragile mirroring of biased_grouped_topk_gpu's _shared_fuse check).
-        _shared_fused_in_topk = (
-            num_fused_shared_experts > 0
-            and get_parallel().moe_ep_size == 1
-            and topk_ids.shape[1] == topk_config.top_k
+        M, N = router_logits.shape
+        scale_factor = (
+            1.0
+            if fused_shared_experts_scaling_factor is None
+            else fused_shared_experts_scaling_factor
         )
-        if _shared_fused_in_topk:
-            # Shared experts were already appended in biased_grouped_topk_gpu via
-            # the persistent pre-populated topk buffer; nothing to do here.
-            pass
-        else:
-            M, N = router_logits.shape
-            scale_factor = (
-                1.0
-                if fused_shared_experts_scaling_factor is None
-                else fused_shared_experts_scaling_factor
-            )
 
-            # Lazy import to avoid circular-import issues
-            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
-                fused_append_shared_experts,
-            )
+        # Lazy import to avoid circular-import issues
+        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+            fused_append_shared_experts,
+        )
 
-            topk_ids, topk_weights = fused_append_shared_experts(
-                topk_ids,
-                topk_weights,
-                num_fused_shared_experts,
-                scale_factor,
-                N,  # base id for shared experts
-            )
+        topk_ids, topk_weights = fused_append_shared_experts(
+            topk_ids,
+            topk_weights,
+            num_fused_shared_experts,
+            scale_factor,
+            N,  # base id for shared experts
+        )
 
     elif use_per_rank_shared_slots:
         # DeepEP/MegaMOE: remap to per-rank shared-slot layout where each
@@ -2466,7 +2483,11 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if skip_deepep_padded_tokens and not hip_deepep_postprocessed:
+        # Apply this after shared-expert remapping so every padded route,
+        # including appended shared slots, is omitted by DeepEP dispatch.
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
+    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2569,9 +2590,11 @@ def select_experts(
         # Keep sigmoid flag-off byte-identical: only use the JIT gate when the flag is on.
         use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
         if scoring_func == "sqrtsoftplus" or (
-            scoring_func == "sigmoid" and use_jit_fused_gate
+            scoring_func == "sigmoid" and (use_jit_fused_gate or _is_xpu)
         ):
-            if scoring_func == "sqrtsoftplus" and _can_use_lightop_sqrtsoftplus_gate(
+            if _is_xpu:
+                _biased_topk = biased_topk_xpu
+            elif scoring_func == "sqrtsoftplus" and _can_use_lightop_sqrtsoftplus_gate(
                 router_logits,
                 correction_bias,
                 num_routed_topk if _use_aiter else top_k,

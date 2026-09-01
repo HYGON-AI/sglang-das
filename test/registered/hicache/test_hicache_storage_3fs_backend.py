@@ -24,19 +24,23 @@ import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_hcu_ci,
+)
 
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
     suite="nightly-hcu",
     nightly=True,
-    disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
+    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
 )
 
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
 
 

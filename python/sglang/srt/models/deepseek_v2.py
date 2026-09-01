@@ -80,6 +80,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
+    maybe_configure_main_kv_page_plan,
+    maybe_prefetch_full_attention_kv,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -123,7 +125,9 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
+    view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
@@ -184,15 +188,16 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu_amx_available,
     _is_cuda,
     _is_gfx95_supported,
+    _is_hcu,
     _is_hip,
     _is_musa,
     _is_npu,
     _is_xpu,
-    _is_hcu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -307,9 +312,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
-            _is_hip
-            and not _is_hcu
-            and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
+            _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -423,14 +426,19 @@ class DeepseekV2MLP(nn.Module):
             if self._fused_clamp_use_fp8:
                 from aiter import dtypes
 
+                _emit_bpre = emit_transposed_bpreshuffle_scale(
+                    gate_up.shape[0], on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95
+                )
                 x_fp8, x_scale = fused_clamp_act_mul(
                     gate_up,
                     swiglu_limit=self.swiglu_limit,
                     activation="silu",
                     dtype_quant=dtypes.fp8,
-                    transpose_scale=False,
+                    transpose_scale=_emit_bpre,
                 )
-                if _use_aiter_bpreshuffle_gfx95:
+                if _emit_bpre:
+                    x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
+                elif _use_aiter_bpreshuffle_gfx95:
                     x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
                 x = (x_fp8, x_scale)
             else:
@@ -529,11 +537,9 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE(b8zhong): this threshold has been empirically verified
-            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= max_router_gemm_tokens
+                and hidden_states.shape[0] <= 16
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
@@ -766,8 +772,7 @@ class DeepseekV2MoE(nn.Module):
 
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
-                envs.SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION.get()
-                and is_sm100_supported()
+                is_sm100_supported()
                 and isinstance(
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
@@ -806,8 +811,7 @@ class DeepseekV2MoE(nn.Module):
                 config_quantization = getattr(config, "quantization_config", None)
                 is_compressed_tensors = (
                     isinstance(config_quantization, dict)
-                    and config_quantization.get("quant_method")
-                    == "compressed-tensors"
+                    and config_quantization.get("quant_method") == "compressed-tensors"
                 ) or (
                     self.shared_experts.gate_up_proj.quant_method.__class__.__module__.startswith(
                         "sglang.srt.layers.quantization.compressed_tensors"
@@ -1253,7 +1257,9 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1835,27 +1841,8 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
+        self.indexer = None
         if self.use_dsa:
-            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-                config=config,
-            )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1863,13 +1850,30 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = True
                 self.next_skip_topk = True
             else:
-                index_cli_factor = getattr(config, "cli_factor", 1)
-                if index_cli_factor > 1:
-                    self.skip_topk = layer_id % index_cli_factor != 0
-                    self.next_skip_topk = (layer_id + 1) % index_cli_factor != 0
-                else:
-                    self.skip_topk = dsa_layer_skips_topk(config, layer_id)
-                    self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
+                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+
+            if not self.skip_topk or is_nextn:
+                is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+                self.indexer = Indexer(
+                    hidden_size=hidden_size,
+                    index_n_heads=get_dsa_index_n_heads(config),
+                    index_head_dim=get_dsa_index_head_dim(config),
+                    rope_head_dim=qk_rope_head_dim,
+                    index_topk=get_dsa_index_topk(config),
+                    q_lora_rank=q_lora_rank,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    scale_fmt="ue8m0",
+                    block_size=128,
+                    rope_scaling=rope_scaling,
+                    is_neox_style=is_neox_style,
+                    prefix=add_prefix("indexer", prefix),
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    alt_stream=alt_stream,
+                    config=config,
+                )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1921,6 +1925,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Reused DSA TopK indices were already sorted by the producing layer.
+        self.attn_mqa.reuse_topk_indices = bool(self.skip_topk and not self.is_nextn)
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
@@ -2835,6 +2841,17 @@ class DeepseekV2Model(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        if _is_hcu and self.start_layer < self.end_layer:
+            # A non-zero PP stage may start on a skip-topk layer and reuse the
+            # previous stage's indices, so no local indexer would trigger the
+            # first Main-KV prefetch. Start it explicitly on HCU; the normal
+            # indexer path reuses the same pending broadcast on non-skip layers.
+            maybe_prefetch_full_attention_kv(forward_batch, self.start_layer)
+        else:
+            # Install the compact mapping before the first indexer triggers the
+            # existing current-layer Main-KV prefetch.
+            maybe_configure_main_kv_page_plan(forward_batch)
+
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling: Optional[torch.Tensor] = None
@@ -3041,6 +3058,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         ``install_shared_experts_fusion_decision``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
+        # Need to disable if quant precision mismatch, even if
+        # --enforce-shared-experts-fusion is specified
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if get_exec().moe.enforce_shared_experts_fusion:
             return None
         if is_sbo_enabled() or is_tbo_enabled():

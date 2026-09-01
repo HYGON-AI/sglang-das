@@ -35,7 +35,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -45,6 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -54,10 +55,15 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+)
 from sglang.srt.utils import (
-    is_hcu,
+    is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_npu,
     support_triton,
@@ -69,6 +75,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.mem_cache.dsa_cache_layer_split import MainKVPagePlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -78,7 +85,13 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 _is_hcu = is_hcu()
+
+
+def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
+    """Use pinned staging for HCU metadata copied on a busy stream."""
+    return _is_hcu and is_pin_memory_available(device)
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -236,11 +249,12 @@ def register_attn_tp_sequence_sharded_predicate(
     _attn_tp_sequence_sharded_predicate = predicate
 
 
-def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
-    mode = getattr(server_args, "return_hidden_states_mode", None)
+def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
+    features = get_exec().features
+    mode = features.return_hidden_states_mode
     if mode == "last":
         return CaptureHiddenMode.LAST
-    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+    if mode == "full" or features.enable_return_hidden_states:
         return CaptureHiddenMode.FULL
     return CaptureHiddenMode.NULL
 
@@ -306,59 +320,23 @@ def compute_local_num_token_non_padded_cpu(
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
 
-    Bundles slot indices for full/SWA pools, the two compressed-KV pools
-    (c4/c128), and the two compressed-state pools (c4_state/c128_state).
+    Bundles slot indices for full/SWA pools and the two compressed-KV pools
+    (C4/C128). Compressor state uses fixed ring storage and explicit
+    ``state_loc`` metadata, so it is not part of the token-allocation bundle.
     Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
     the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
-    otherwise. CUDA's DSV4 path doesn't construct this bundle (state is
-    derived via translate_kv_loc_to_compress_state_loc there).
+    otherwise.
 
     All fields are token-level slot ids in their respective pools (NOT page
     ids). Attention backends convert to page ids via ``// page_size`` when
     constructing PA_ND block tables.
 
-    State fields default to ``None`` so the bundle is constructible from
-    paths that allocate KV but not state (or vice versa); the NPU allocator
-    fills all six on real alloc, CUDA paths leave state ones None and use
-    the ring-hash translation instead.
     """
 
     out_full_loc: torch.Tensor
     out_swa_loc: torch.Tensor
     out_c4_loc: torch.Tensor
     out_c128_loc: torch.Tensor
-    out_c4_state_loc: Optional[torch.Tensor] = None
-    out_c128_state_loc: Optional[torch.Tensor] = None
-
-
-@dataclass
-class DSV4StateLens:
-    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
-
-    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
-    threaded through ``mem_cache/common.py`` to
-    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
-
-      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
-        state-slot count (the paged allocator's ``prefix`` contract).
-      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
-      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
-
-    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
-    take: scheduler only produces this object, common only forwards it, the
-    allocator only consumes it.
-    """
-
-    c4_prefix_lens: torch.Tensor
-    c4_prefix_lens_cpu: torch.Tensor
-    c4_seq_lens: torch.Tensor
-    c4_seq_lens_cpu: torch.Tensor
-    c4_extend_num_tokens: int
-    c128_prefix_lens: torch.Tensor
-    c128_prefix_lens_cpu: torch.Tensor
-    c128_seq_lens: torch.Tensor
-    c128_seq_lens_cpu: torch.Tensor
-    c128_extend_num_tokens: int
 
 
 @dataclass
@@ -526,6 +504,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    pd_hidden_capture_layer_ids: Optional[List[int]] = None
+
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -541,6 +522,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Built once from the global request table and reused by every DSA layer.
+    # Index-K metadata deliberately remains in the original physical layout.
+    dsa_layer_split_main_kv_page_plan: Optional[MainKVPagePlan] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
@@ -552,7 +536,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -732,11 +715,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
         self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64
+            global_num_tokens,
+            dtype=torch.int64,
+            pin_memory=_pin_host_metadata(device),
         ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob, dtype=torch.int64
+            global_num_tokens_for_logprob,
+            dtype=torch.int64,
+            pin_memory=_pin_host_metadata(device),
         ).to(device, non_blocking=True)
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
@@ -752,6 +739,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
+        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
+        if (
+            model_runner.server_args.disaggregation_mode == "prefill"
+            and get_parallel().attn_cp_size > 1
+        ):
+            gathered_capture_layers = [None] * get_parallel().attn_cp_size
+            torch.distributed.all_gather_object(
+                gathered_capture_layers,
+                pd_hidden_capture_layer_ids,
+                group=get_parallel().attn_cp_group.cpu_group,
+            )
+            nonempty_capture_layers = [
+                [int(x) for x in layer_ids]
+                for layer_ids in gathered_capture_layers
+                if layer_ids
+            ]
+            if nonempty_capture_layers:
+                expected_capture_layers = nonempty_capture_layers[0]
+                if any(
+                    layer_ids != expected_capture_layers
+                    for layer_ids in nonempty_capture_layers[1:]
+                ):
+                    raise RuntimeError(
+                        "PD hidden capture layers disagree across prefill CP ranks: "
+                        f"{gathered_capture_layers}"
+                    )
+                pd_hidden_capture_layer_ids = expected_capture_layers
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
@@ -760,9 +774,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if model_runner.is_draft_worker
                 else max(
                     batch.return_hidden_states_mode,
-                    get_server_return_hidden_states_mode(model_runner.server_args),
+                    get_server_return_hidden_states_mode(),
                 )
             )
+            if pd_hidden_capture_layer_ids:
+                request_capture_hidden_mode = max(
+                    request_capture_hidden_mode, CaptureHiddenMode.FULL
+                )
             capture_hidden_mode = get_required_capture_hidden_mode(
                 request_capture_hidden_mode,
                 batch.spec_info,
@@ -830,6 +848,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -847,6 +866,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        pin_host_metadata = _pin_host_metadata(device)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -868,22 +888,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if batch.extend_input_logprob_token_ids is not None:
-            ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            extend_input_logprob_token_ids = batch.extend_input_logprob_token_ids
+            if (
+                pin_host_metadata
+                and extend_input_logprob_token_ids.device.type == "cpu"
+                and not extend_input_logprob_token_ids.is_pinned()
+            ):
+                extend_input_logprob_token_ids = (
+                    extend_input_logprob_token_ids.pin_memory()
+                )
+            ret.extend_input_logprob_token_ids_gpu = extend_input_logprob_token_ids.to(
+                device, non_blocking=True
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            # A pageable hipMemcpyAsync blocks the host until prior work on the
+            # stream drains on HCU. Draft extend can otherwise stall here every step.
+            ret.num_token_non_padded = torch.tensor(
+                num_tokens,
+                dtype=torch.int32,
+                pin_memory=pin_host_metadata,
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
         ret.init_mlp_sync_metadata(batch, device)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            if model_runner.server_args.enable_lora:
+            if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
@@ -915,10 +948,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32
+                    extend_seq_lens,
+                    dtype=torch.int32,
+                    pin_memory=pin_host_metadata,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
+                    extend_prefix_lens,
+                    dtype=torch.int32,
+                    pin_memory=pin_host_metadata,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
@@ -957,11 +994,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information
-        if model_runner.server_args.enable_lora:
+        # Init lora information (None on a draft runner: it is unadapted)
+        if model_runner.lora_manager is not None:
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
-            if not model_runner.server_args.enable_lora_overlap_loading:
+            if not get_lora().enable_lora_overlap_loading:
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
@@ -1359,7 +1396,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # graph; larger prefills fall back to eager and keep the
         # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
         # (all-gathered), so the decision is consistent cluster-wide.
-        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        prefill_cg = get_exec().graph.cuda_graph_config.prefill
         if (
             self.can_run_dp_breakable_cuda_graph
             and self.is_extend_in_batch
@@ -1497,8 +1534,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        self.use_pin_memory = not _is_cpu
+        global_num_tokens_pinned = torch.tensor(
+            global_num_tokens, pin_memory=self.use_pin_memory
+        )
+        self.global_num_tokens_gpu.copy_(
+            global_num_tokens_pinned, non_blocking=self.use_pin_memory
+        )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -1524,7 +1566,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
-            model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
+            if _is_cpu
+            else model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
         # attention backend over-allocate from an upper bound (see #26738).
@@ -1566,9 +1610,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=1,
             )
 
-        # TODO: check if we need to pad other tensors
+        # Draft-extend padding uses the fixed per-request token width.
+        dummy_extend_len = 0
+        if (
+            self.spec_info is not None
+            and self.forward_mode.is_draft_extend_v2()
+            and self.spec_info.num_tokens_per_req > 0
+        ):
+            dummy_extend_len = self.spec_info.num_tokens_per_req
+
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                self.extend_seq_lens, bs, value=dummy_extend_len
+            )
+        if self.extend_prefix_lens is not None:
+            self.extend_prefix_lens = self._pad_tensor_to_size(
+                self.extend_prefix_lens, bs
+            )
+        if self.extend_seq_lens_cpu is not None:
+            self.extend_seq_lens_cpu.extend(
+                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            )
+        if self.extend_prefix_lens_cpu is not None:
+            self.extend_prefix_lens_cpu.extend(
+                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            )
+        if self.extend_logprob_start_lens_cpu is not None:
+            self.extend_logprob_start_lens_cpu.extend(
+                [0] * (bs - len(self.extend_logprob_start_lens_cpu))
+            )
 
         if self.rids_int is not None:
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)

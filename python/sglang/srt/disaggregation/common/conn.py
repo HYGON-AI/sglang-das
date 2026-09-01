@@ -30,7 +30,11 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    get_dsa_full_indexer_layer_ids,
+    is_deepseek_dsa,
+)
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -51,7 +55,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_disagg,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -60,6 +69,35 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_dsa_state_transfer_abi(
+    src_format: str,
+    dst_format: str,
+    src_item_lens: List[int],
+    dst_item_lens: List[int],
+) -> None:
+    """Validate the page ABI before transferring a DSA index-K cache."""
+    if src_format != dst_format:
+        raise RuntimeError(
+            "DSA index-K cache transfer ABI mismatch between prefill and decode: "
+            f"prefill_format={src_format!r}, decode_format={dst_format!r}. "
+            "Ensure P and D use the same SGLANG_DSA_HCU_INT8_INDEX_K_CACHE "
+            "setting, page size, model, and SGLang revision."
+        )
+
+    src_sizes = {int(item_len) for item_len in src_item_lens}
+    dst_sizes = {int(item_len) for item_len in dst_item_lens}
+    if len(src_sizes) == 1 and src_sizes == dst_sizes:
+        return
+
+    raise RuntimeError(
+        "DSA index-K cache page layout mismatch between prefill and decode: "
+        f"prefill_item_lens={sorted(src_sizes)}, "
+        f"decode_item_lens={sorted(dst_sizes)}. Ensure P and D use the same "
+        "SGLANG_DSA_HCU_INT8_INDEX_K_CACHE setting, page size, model, and "
+        "SGLang revision."
+    )
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -175,10 +213,13 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_deferred_decode_kv_release = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
         # for p/d multi node infer
-        self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
-        self.dist_init_addr = server_args.dist_init_addr
+        self.bootstrap_host = get_serving().host
+        self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        self.dist_init_addr = get_parallel().dist_init_addr
         parallel = get_parallel()
         self.attn_tp_size = parallel.attn_tp_size
         self.attn_tp_rank = parallel.attn_tp_rank
@@ -194,7 +235,7 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
@@ -249,7 +290,11 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
+            # Deferred KV release: aborted room -> (decode_ip, decode_port);
+            # ack held until the transfer drains.
+            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            self.req_to_pd_hidden_meta: Dict[int, dict] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -267,6 +312,10 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Deferred KV release: room -> prefill ranks that acked their transfer
+            # drained. Entry exists only while the room is held, so a stale/late
+            # ack for a reused bootstrap_room is dropped.
+            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -326,6 +375,43 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+    def supports_pd_hidden_streaming(self) -> bool:
+        return False
+
+    def mark_pd_hidden_request_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        """Mark the hidden-transfer portion of a request done.
+
+        Backends that support streaming hidden transfer override this to release
+        their source window independently from KV request completion.
+        """
+        del bootstrap_room, state_indices
+        return None
+
+    def pop_pd_hidden_request_done(self, bootstrap_room: int) -> bool:
+        """Consume a hidden-request-done event for early source-window release."""
+        del bootstrap_room
+        return False
+
+    def _wake_pd_hidden_ack_waiters(self, bootstrap_room: int) -> None:
+        """Wake backend-specific PD hidden ACK waiters after request failure."""
+        del bootstrap_room
+        return None
+
+    # Backward-compatible aliases for backend-specific implementations that have
+    # not yet migrated to the request-level naming.
+    def mark_pd_hidden_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.mark_pd_hidden_request_done(bootstrap_room, state_indices)
+
+    def pop_pd_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_pd_hidden_request_done(bootstrap_room)
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -350,6 +436,102 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
+        """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
+        from a prior request that reused this bootstrap_room."""
+        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+
+    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
+        """Record a prefill rank's drain ack (decode receiver thread). Only counts
+        while the room is held; grabs the set by reference to avoid racing clear."""
+        acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if acks is not None:
+            acks.add(prefill_rank)
+
+    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+        """True once every prefill rank that could still write these pages has acked."""
+        return (
+            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
+            >= required_acks
+        )
+
+    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+        self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+
+    def _prefill_unique_rank(self) -> int:
+        """Stable per-sender id, matching what the transfer worker syncs on Success."""
+        return (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+        """Best-effort ack that this rank's transfer for an aborted room drained."""
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"ABORT_ACK",
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        """Send the deferred ack once an aborted room's chunks have drained
+        (outstanding == 0). pop() makes it fire at most once."""
+        if self._staging_outstanding.get(room, 0) > 0:
+            return
+        target = self._deferred_ack_targets.pop(room, None)
+        if target is not None:
+            self._send_abort_ack(target[0], target[1], room)
+
+    def register_deferred_ack_target(
+        self, room: int, decode_ip: str, decode_port: int
+    ) -> None:
+        """Hold this room's ack until its transfer drains. Callers must mark the
+        room Failed FIRST -- registering while it still accepts chunks lets the
+        worker ack, then a new chunk writes pages the decode already released."""
+        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+
+    def validate_remote_state_transfer_abis(
+        self,
+        dst_state_data_formats: List[str],
+        dst_state_item_lens: List[List[int]],
+    ) -> None:
+        """Validate request-state page layouts advertised by a decode peer."""
+        state_types = getattr(self.kv_args, "state_types", []) or []
+        src_state_data_formats = getattr(self.kv_args, "state_data_formats", []) or []
+        src_state_item_lens = getattr(self.kv_args, "state_item_lens", []) or []
+
+        for i, state_type in enumerate(state_types):
+            if state_type != StateType.DSA:
+                continue
+
+            src_format = (
+                src_state_data_formats[i] if i < len(src_state_data_formats) else ""
+            )
+            dst_format = (
+                dst_state_data_formats[i] if i < len(dst_state_data_formats) else ""
+            )
+            src_item_lens = (
+                src_state_item_lens[i] if i < len(src_state_item_lens) else []
+            )
+            dst_item_lens = (
+                dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
+            )
+            validate_dsa_state_transfer_abi(
+                src_format,
+                dst_format,
+                src_item_lens,
+                dst_item_lens,
+            )
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1103,6 +1285,51 @@ class CommonKVManager(BaseKVManager):
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
             return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
 
+        if state_type == StateType.DSA:
+            hf_config = getattr(self.model_config, "hf_config", None)
+            if hf_config is not None and is_deepseek_dsa(hf_config):
+                end_layer = self.kv_args.prefill_end_layer
+                if end_layer is None:
+                    raise ValueError(
+                        "prefill_end_layer is required for compact DSA state transfer"
+                    )
+
+                compact_indexer_layer_ids = get_dsa_full_indexer_layer_ids(hf_config)
+                total_layers = hf_config.num_hidden_layers
+                # HiCache/HiSparse deliberately retain the dense main layout.
+                # Infer the decode registration layout from its pointer count;
+                # compact GLM layouts are smaller than num_hidden_layers.
+                indexer_layer_ids = (
+                    list(range(total_layers))
+                    if len(dst_kv_ptrs) >= total_layers
+                    else compact_indexer_layer_ids
+                )
+                start_index = sum(
+                    layer_id < self.kv_args.prefill_start_layer
+                    for layer_id in indexer_layer_ids
+                )
+                end_index = sum(layer_id < end_layer for layer_id in indexer_layer_ids)
+                src_main_layers = end_index - start_index
+                src_draft_layers = len(src_kv_ptrs) - src_main_layers
+                if src_draft_layers < 0:
+                    raise ValueError(
+                        "DSA PP state pointer count is smaller than the number of "
+                        "full-indexer layers in this stage"
+                    )
+
+                sliced_dst_kv_ptrs = list(dst_kv_ptrs[start_index:end_index])
+                if src_draft_layers:
+                    draft_start = len(indexer_layer_ids)
+                    sliced_dst_kv_ptrs.extend(
+                        dst_kv_ptrs[draft_start : draft_start + src_draft_layers]
+                    )
+                if len(sliced_dst_kv_ptrs) != len(src_kv_ptrs):
+                    raise ValueError(
+                        "DSA PP state pointer mismatch after compact indexer mapping: "
+                        f"src={len(src_kv_ptrs)}, dst={len(sliced_dst_kv_ptrs)}"
+                    )
+                return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
             # Compressed-MLA (e.g. DeepSeek V4): the flat list is organized
@@ -1491,18 +1718,18 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def poll(self) -> KVPoll:
-        pass
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
-
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_pd_hidden_meta"):
+            self.kv_mgr.req_to_pd_hidden_meta.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
+            # Drop a held ack target if the room concluded without draining
+            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
+            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1642,6 +1869,10 @@ class CommonKVReceiver(BaseKVReceiver):
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 bootstrap_info["pp_rank"] = int(target_pp_rank)
+                # PD hidden-state transfer resolves the source rank from these.
+                bootstrap_info["target_cp_rank"] = int(prefill_cp_rank)
+                bootstrap_info["target_tp_rank"] = int(target_tp_rank)
+                bootstrap_info["target_pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(
@@ -1725,6 +1956,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         raise NotImplementedError
 
@@ -1752,9 +1984,6 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
         return KVPoll.Failed
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)

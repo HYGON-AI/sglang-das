@@ -9,16 +9,19 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda, is_hcu, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
@@ -27,13 +30,46 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
-def sync_fixed_hicache_size(size: int, host_size: int) -> int:
-    """Sync fixed-size HiCache token capacity across PP ranks.
+def ranks_per_host() -> int:
+    """Number of ranks of this job running on the same machine as this one.
+
+    Derived as world_size // nnodes: the launcher slices ranks uniformly
+    across nodes (resolution asserts divisibility), so no hostname collective
+    is needed — a collective here would have to be issued the same number of
+    times on every rank, and ranks build different numbers of host pools.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 1
+    try:
+        world_group = get_world_group()
+    except AssertionError:
+        return 1
+    if world_group.world_size == 1:
+        return 1
+    return max(world_group.world_size // get_parallel().nnodes, 1)
+
+
+def host_memory_budget_bytes() -> int:
+    """Host RAM this rank may claim for a HiCache pool.
+
+    psutil reports the whole machine, so co-located ranks each see the same free
+    memory; without the split every rank sizes its pool against all of it and
+    the host is oversubscribed by the number of ranks it holds.
+    """
+    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    return free // ranks_per_host()
+
+
+def sync_fixed_hicache_size(
+    size: int, host_size: int, *, sync_tp_group: bool = False
+) -> int:
+    """Sync fixed-size HiCache token capacity across model-parallel ranks.
 
     A fixed --hicache-size is specified in GB, but each PP stage may have a
     different bytes/token because it owns different layers. Use the global
     minimum token capacity within the PP group so all stages expose the same
-    host-cache capacity.
+    host-cache capacity. HCU LayerSplit also uses a different bytes/token on
+    uneven CP layer shards, so include the TP group for that configuration.
     Ratio-based sizing already derives from the synced device pool size.
     """
     if host_size <= 0 or not torch.distributed.is_available():
@@ -43,28 +79,31 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_pp_group
+        from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group
 
-        pp_group = get_pp_group()
+        groups = [get_pp_group()]
+        if sync_tp_group:
+            groups.append(get_tp_group())
     except AssertionError:
         return size
 
-    if pp_group.world_size <= 1:
-        return size
-
     tensor = torch.tensor(size, dtype=torch.int64)
-    torch.distributed.all_reduce(
-        tensor,
-        op=torch.distributed.ReduceOp.MIN,
-        group=pp_group.cpu_group,
-    )
+    for group in groups:
+        if group.world_size <= 1:
+            continue
+        torch.distributed.all_reduce(
+            tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=group.cpu_group,
+        )
     synced_size = int(tensor.item())
 
     if synced_size != size:
         logger.info(
-            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            "Sync fixed-size HiCache host token capacity from %d to %d%s.",
             size,
             synced_size,
+            " across PP and TP groups" if sync_tp_group else " across PP ranks",
         )
     return synced_size
 
@@ -116,10 +155,23 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        layer_sharded_on_hcu = _is_hcu and self._is_device_layer_sharded(device_pool)
         if host_size > 0:
-            self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+            # An empty tail shard owns no bytes. Let non-empty ranks determine
+            # the shared capacity instead of dividing by zero or constraining
+            # the group to the device-pool size.
+            local_fixed_size = (
+                int(host_size * 1e9 // self.size_per_token)
+                if self.size_per_token > 0
+                else torch.iinfo(torch.int64).max
             )
+            self.size = sync_fixed_hicache_size(
+                local_fixed_size,
+                host_size,
+                sync_tp_group=layer_sharded_on_hcu,
+            )
+            if self.size == torch.iinfo(torch.int64).max:
+                self.size = device_pool.size
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
@@ -139,9 +191,8 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -221,6 +272,9 @@ class HostKVCache(abc.ABC):
         device_pool = device_pool or self.device_pool
         if not self._is_device_layer_sharded(device_pool):
             return device_pool.layer_num
+        if _is_hcu:
+            start, end = self._device_owned_layer_range(device_pool)
+            return end - start
         shard_size = device_pool.layer_shard_size
         return (device_pool.layer_num + shard_size - 1) // shard_size
 
@@ -340,21 +394,18 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
-    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def maybe_dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Transfer kernels index per-rank rows; callers hold widened logical slots.
 
         Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
         """
         if self.dcp_size == 1:
             return indices
-        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
-        assert owned.numel() * self.dcp_size == indices.numel(), (
-            "HiCache DCP translation expects runs of whole widened pages "
-            f"(every residue class equally represented); got {indices.numel()} "
-            f"logical slots -> {owned.numel()} owned rows with dcp_size="
-            f"{self.dcp_size}."
+        assert indices.numel() % self.dcp_size == 0, (
+            "HiCache DCP translation expects runs of whole widened pages; got "
+            f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
         )
-        return owned
+        return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -15,10 +16,7 @@ def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
     """Ensure the DSV4 prefill budget fits MegaMoE's per-rank buffer."""
-    mega_moe_enabled = (
-        server_args.moe_a2a_backend == "megamoe"
-        or envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
-    )
+    mega_moe_enabled = server_args.moe_a2a_backend == "megamoe"
     if not mega_moe_enabled or server_args.disaggregation_mode == "decode":
         # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size
         return
@@ -122,11 +120,20 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
     if is_hip():
-        logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
-            f"for {model_arch}; set it explicitly to override."
-        )
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+        if (
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+            and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        ):
+            logger.warning(
+                "Keeping explicitly enabled SGLANG_OPT_FLASHMLA_SPARSE_PREFILL "
+                f"on ROCm/HIP for experimental {model_arch} validation."
+            )
+        else:
+            logger.warning(
+                "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on "
+                f"ROCm/HIP for {model_arch}; set it explicitly to override."
+            )
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
 
     # The kv-cache dtype default moved to the resolution pipeline
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
@@ -139,7 +146,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 256
+        declare_resolution(
+            server_args,
+            "apply_deepseek_v4_defaults",
+            max_running_requests=256,
+        )
         logger.warning(
             f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
         )
@@ -166,16 +177,36 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"got {server_args.cp_strategy}"
         )
 
-    # The unified CP flags may have been mirrored to the generic legacy alias
-    # before the model-specific dsv4 attention backend was resolved.  DSV4
-    # uses the DSA runtime alias, so keep the two mutually-exclusive legacy
-    # flags normalized here as well.
-    server_args.enable_dsa_prefill_context_parallel = True
-    server_args.enable_prefill_context_parallel = False
-    server_args.dsa_prefill_cp_mode = "round-robin-split"
-    server_args.enable_dp_attention = True
-    server_args.moe_dense_tp_size = 1
-    server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        enable_dsa_prefill_context_parallel=True,
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        enable_prefill_context_parallel=False,
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        dsa_prefill_cp_mode="round-robin-split",
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        enable_dp_attention=True,
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        moe_dense_tp_size=1,
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        attn_cp_size=server_args.tp_size // server_args.dp_size,
+    )
     assert (
         server_args.dp_size == 1
     ), "For round-robin split mode, dp attention is not supported."
@@ -188,11 +219,20 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "('none', 'deepep', 'megamoe'), "
             f"got {server_args.moe_a2a_backend!r}."
         )
-    logger.warning(
-        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
-        "context parallelism is enabled."
-    )
-    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+    if (
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+        and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    ):
+        logger.warning(
+            "Keeping explicitly enabled SGLANG_OPT_FLASHMLA_SPARSE_PREFILL "
+            "for experimental DeepSeekV4 context-parallel validation."
+        )
+    else:
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+            "context parallelism is enabled."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "

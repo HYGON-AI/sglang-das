@@ -215,8 +215,12 @@ template <bool kPrecise = true, typename DType2>
 SGL_DEVICE fp32x2_t
 situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_beta, float inv_linear_beta) {
   using namespace device;
-  const auto [g0, g1] = cast<fp32x2_t>(gate);
-  const auto [u0, u1] = cast<fp32x2_t>(up);
+  const fp32x2_t g_pair = cast<fp32x2_t>(gate);
+  const fp32x2_t u_pair = cast<fp32x2_t>(up);
+  const float g0 = g_pair.x;
+  const float g1 = g_pair.y;
+  const float u0 = u_pair.x;
+  const float u1 = u_pair.y;
   // kHasLinearBeta=true: this path always softcaps the up operand, as before.
   const float val0 = kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
   const float val1 = kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
@@ -325,7 +329,9 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = situ_and_mul(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
+    const fp32x2_t xy = situ_and_mul(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
+    const float x = xy.x;
+    const float y = xy.y;
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));

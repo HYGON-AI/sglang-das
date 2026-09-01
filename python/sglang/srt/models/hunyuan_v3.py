@@ -83,6 +83,7 @@ _use_fused_hunyuan_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _use_aiter = (
     get_bool_env_var("SGLANG_USE_AITER") and is_hip() and not _is_hcu
 )
+_use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 
 if _is_hcu:
     from lightop import rms_rotary_embedding_fuse_with_kv_store
@@ -206,7 +207,9 @@ class HYV3MoEFused(nn.Module):
             scoring_func=scoring_func,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=self.router_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            apply_routed_scaling_factor_on_output=(
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_lightop
+            ),
         )
 
         if getattr(config, "num_shared_experts", 0) > 0:
@@ -266,7 +269,9 @@ class HYV3MoEFused(nn.Module):
         # apply_routed_scaling_factor_on_output through to moe_fused_gate,
         # lightop no longer bakes rsf when apply is False (Hy3 W8A8+triton).
         scale_already_applied = (
-            self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+            or _use_lightop
+            or _use_aiter
         )
         if scale_already_applied:
             if shared_output is not None:

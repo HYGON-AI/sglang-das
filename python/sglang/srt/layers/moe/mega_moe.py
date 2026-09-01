@@ -317,7 +317,7 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -347,9 +347,9 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"] = None,
+    forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -384,9 +384,9 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
@@ -500,7 +500,7 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    use_fp4_acts = os.getenv("DG_USE_FP4_ACTS") == "1"
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -559,7 +559,7 @@ def _run_deep_gemm_hcu_w8a8_mega_moe(
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     buf,
     num_tokens: int,
     hidden_size: int,
@@ -598,7 +598,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
     hidden_states: torch.Tensor,
     topk_ids: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     buf,
     num_tokens: int,
     hidden_size: int,
@@ -685,7 +685,6 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(sf).copy_(result)
 
 
-
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
@@ -729,7 +728,9 @@ def build_mega_moe_experts_weights(experts) -> None:
         # the deep-ep path consumes the non-transposed interleaved scale and a
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights((w13, w13_sf))
+        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+            (w13, w13_sf)
+        )
         w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
         w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 

@@ -292,6 +292,9 @@ jobs:
     if: needs.validate-config.result == 'success' && needs.probe-hcu-wheels.outputs.wheel_available != 'true'
     runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
     container:
       image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
       options: >
@@ -307,19 +310,30 @@ jobs:
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
-      HCU_RUNNER_HOST_UID: ${{ vars.HCU_RUNNER_HOST_UID || '1000' }}
-      HCU_RUNNER_HOST_GID: ${{ vars.HCU_RUNNER_HOST_GID || '1000' }}
       WHEEL_COMMIT_SHA: ${{ needs.probe-hcu-wheels.outputs.full_sha }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
     steps:
+      - name: Detect runner workspace ownership
+        shell: bash
+        run: |
+          host_uid="$(stat -c '%u' "${RUNNER_TEMP}")"
+          host_gid="$(stat -c '%g' "${RUNNER_TEMP}")"
+          [[ "${host_uid}" =~ ^[0-9]+$ && "${host_gid}" =~ ^[0-9]+$ ]]
+          echo "HCU_RUNNER_HOST_UID=${host_uid}" >> "${GITHUB_ENV}"
+          echo "HCU_RUNNER_HOST_GID=${host_gid}" >> "${GITHUB_ENV}"
+
       - name: Normalize workspace ownership before checkout
         run: |
-          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}" || true
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}"
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.WHEEL_COMMIT_SHA }}
           submodules: 'recursive'
+
+      - name: Trust checked-out workspace
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Install build deps
         run: |
@@ -456,6 +470,11 @@ jobs:
           touch "${STAGING_DIR}/READY"
           chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${STAGING_DIR}" || true
           echo "HCU nightly wheels are staged locally at ${STAGING_DIR}"
+
+      - name: Normalize workspace ownership
+        if: always()
+        run: |
+          chown -R "${HCU_RUNNER_HOST_UID}:${HCU_RUNNER_HOST_GID}" "${GITHUB_WORKSPACE}"
 
   wait-hcu-wheels:
     name: Wait HCU wheels

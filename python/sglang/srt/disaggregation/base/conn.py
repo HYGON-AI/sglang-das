@@ -28,6 +28,13 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
+    # K/V, one component per sub-pool so each carries the index payload of the
+    # KV it describes (whole sequence for full attention, window for SWA).
+    BLOCK_SCALE = "block_scale"
+    BLOCK_SCALE_SWA = "block_scale_swa"
+    # Target aux hidden rows used to bootstrap decode-side draft KV.
+    PD_HIDDEN = "pd_hidden"
 
 
 @dataclasses.dataclass
@@ -53,6 +60,9 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    # Transfer ABI identifier parallel to state_types. It distinguishes state
+    # layouts that have the same item size but different byte semantics.
+    state_data_formats: List[str]
     state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
@@ -64,7 +74,6 @@ class KVArgs:
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
-    ib_traffic_class: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
@@ -163,6 +172,18 @@ class BaseKVSender(ABC):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
+    def set_source_event(self, source_event) -> None:
+        del source_event
+
+    def set_pd_hidden_chunk_meta(
+        self,
+        hidden_start: int,
+        row_len: int,
+        is_last_hidden_chunk: bool,
+        release_indices: Optional[List[int]] = None,
+    ) -> None:
+        del hidden_start, row_len, is_last_hidden_chunk, release_indices
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""
@@ -221,6 +242,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

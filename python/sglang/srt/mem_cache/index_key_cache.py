@@ -26,7 +26,7 @@ class IndexKeyCache:
                     dtype=pool.index_k_with_scale_buffer_dtype,
                     device=pool.device,
                 )
-                for i in range(pool.layer_num)
+                for i in range(pool.indexer_layer_num)
             ]
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
@@ -46,17 +46,43 @@ class IndexKeyCache:
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
+
+        page_size = self.pool.page_size
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        tgt_page = tgt_loc_flat // page_size
+        src_page = src_loc_flat // page_size
+        tgt_offset = tgt_loc_flat % page_size
+        src_offset = src_loc_flat % page_size
+
+        k_bytes_per_token = self.pool.index_head_dim
+        scale_bytes_per_token = (
+            self.pool.index_head_dim // self.pool.quant_block_size * 4
+        )
+        k_bytes_per_page = page_size * k_bytes_per_token
+
         for index_k in self.buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            if index_k.shape[0] == 0:
+                continue
+            k_view = index_k[:, :k_bytes_per_page].view(
+                -1, page_size, k_bytes_per_token
+            )
+            scale_view = index_k[:, k_bytes_per_page:].view(
+                -1, page_size, scale_bytes_per_token
+            )
+            k_view[tgt_page, tgt_offset] = k_view[src_page, src_offset]
+            scale_view[tgt_page, tgt_offset] = scale_view[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.buffer[layer_id - self.pool.start_layer]
+        return self.buffer[self.pool._get_indexer_cache_index(layer_id)]
+
+    def get_write_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return storage that is safe for an in-place fused cache write."""
+        return self.get_local_buffer(layer_id)
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
@@ -100,7 +126,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self.buffer[self.pool._get_indexer_cache_index(layer_id)]
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
@@ -116,8 +142,10 @@ class IndexKeyCache:
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for layer_id in range(self.pool.indexer_layer_num):
             index_k_cpu.append([])
+            if self.buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = self.buffer[layer_id][chunk_page_indices].to(
@@ -132,18 +160,25 @@ class IndexKeyCache:
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for layer_id in range(self.pool.indexer_layer_num):
+            if self.buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(self.buffer[0].device, non_blocking=True)
+                idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
                 self.buffer[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
 
+    def _item_len(self, layer_idx: int) -> int:
+        # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.
+        buf = self.buffer[layer_idx]
+        return 0 if buf.shape[0] == 0 else buf[0].nbytes
+
     def state_buf_infos(self):
-        layer_num = self.pool.layer_num
+        layer_num = self.pool.indexer_layer_num
         data_ptrs = [self.buffer[i].data_ptr() for i in range(layer_num)]
         data_lens = [self.buffer[i].nbytes for i in range(layer_num)]
-        item_lens = [self.buffer[i][0].nbytes for i in range(layer_num)]
+        item_lens = [self._item_len(i) for i in range(layer_num)]
         return data_ptrs, data_lens, item_lens

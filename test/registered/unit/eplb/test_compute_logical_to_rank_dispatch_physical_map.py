@@ -5,15 +5,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
+from collections import Counter
+from random import Random
 
 import torch
 
 from sglang.srt.eplb.expert_location import (
+    _assign_locality_fair_experts,
     _compute_logical_to_all_physical_map,
     append_trivial_expert_slots,
     compute_logical_to_rank_dispatch_physical_map,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -22,6 +26,7 @@ def _published(
     nnodes: int,
     moe_a2a_backend: str = "deepep",
     ep_join_mode=None,
+    ep_static_dispatch_policy: str = "nearest",
 ):
     """Scoped publish of the config the placement functions read.
 
@@ -33,6 +38,7 @@ def _published(
         nnodes=nnodes,
         moe_a2a_backend=moe_a2a_backend,
         ep_join_mode=ep_join_mode,
+        ep_static_dispatch_policy=ep_static_dispatch_policy,
     )
 
 
@@ -222,6 +228,143 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             )
 
         self.assertEqual(logical_to_physical[0, :16, 0].tolist(), list(range(64, 80)))
+
+
+class TestLocalityFairStaticDispatch(CustomTestCase):
+    """The policy builds static bindings; it does not inspect live token load."""
+
+    CANDIDATES = [0, 4, 12]
+    EP_SIZE = 8
+    NUM_LOCAL_GPU_EXPERTS = 2
+    NUM_GPUS_PER_NODE = 2
+    NUM_LOCAL_NODE_EXPERTS = 4
+
+    @classmethod
+    def _assign(cls, seed=42):
+        return _assign_locality_fair_experts(
+            candidate_physical_expert_ids=cls.CANDIDATES,
+            ep_size=cls.EP_SIZE,
+            num_local_gpu_physical_experts=cls.NUM_LOCAL_GPU_EXPERTS,
+            num_gpus_per_node=cls.NUM_GPUS_PER_NODE,
+            num_local_node_physical_experts=cls.NUM_LOCAL_NODE_EXPERTS,
+            r=Random(seed),
+        )
+
+    def test_same_gpu_then_same_node_then_remote(self):
+        assignments = self._assign()
+
+        # Physical experts 0, 4, and 12 are on source GPUs 0, 2, and 6.
+        self.assertEqual(assignments[0], 0)
+        self.assertEqual(assignments[2], 4)
+        self.assertEqual(assignments[6], 12)
+
+        # Their node peers retain node locality even though no replica is on
+        # those peers' own GPUs.
+        self.assertEqual(assignments[1], 0)
+        self.assertEqual(assignments[3], 4)
+        self.assertEqual(assignments[7], 12)
+
+        # Node 2 has no replica, so ranks 4 and 5 use the fair remote fallback.
+        self.assertIn(assignments[4], self.CANDIDATES)
+        self.assertIn(assignments[5], self.CANDIDATES)
+        counts = Counter(assignments)
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+
+    def test_same_seed_is_deterministic(self):
+        self.assertEqual(self._assign(seed=7), self._assign(seed=7))
+
+    def test_flat_topology_skips_same_node_affinity(self):
+        assignments = _assign_locality_fair_experts(
+            candidate_physical_expert_ids=[0, 4],
+            ep_size=4,
+            num_local_gpu_physical_experts=2,
+            num_gpus_per_node=None,
+            num_local_node_physical_experts=None,
+            r=Random(42),
+        )
+
+        self.assertEqual(assignments[0], 0)
+        self.assertEqual(assignments[2], 4)
+        self.assertEqual({assignments[1], assignments[3]}, {0, 4})
+
+    def test_policy_is_wired_through_static_dispatch_map(self):
+        logical_to_all_physical = torch.tensor([[[0, 4, 12]]], dtype=torch.int64)
+        with _published(
+            ep_size=self.EP_SIZE,
+            nnodes=4,
+            ep_static_dispatch_policy="locality_fair",
+        ):
+            actual = [
+                compute_logical_to_rank_dispatch_physical_map(
+                    logical_to_all_physical_map=logical_to_all_physical,
+                    ep_size=self.EP_SIZE,
+                    num_physical_experts=16,
+                    ep_rank=ep_rank,
+                    seed=42,
+                ).item()
+                for ep_rank in range(self.EP_SIZE)
+            ]
+
+        self.assertEqual(actual, self._assign(seed=42))
+
+    def test_server_args_rejects_non_static_opt_in(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            ep_dispatch_algorithm="dynamic",
+            ep_static_dispatch_policy="locality_fair",
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires.*static"):
+            server_args._handle_eplb_and_dispatch()
+
+    def test_server_args_accepts_static_opt_in(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            ep_dispatch_algorithm="static",
+            ep_static_dispatch_policy="locality_fair",
+        )
+
+        server_args._handle_eplb_and_dispatch()
+
+    def test_single_rank_topology(self):
+        assignment = _assign_locality_fair_experts(
+            candidate_physical_expert_ids=[0, 1],
+            ep_size=1,
+            num_local_gpu_physical_experts=2,
+            num_gpus_per_node=1,
+            num_local_node_physical_experts=2,
+            r=Random(42),
+        )
+        self.assertEqual(len(assignment), 1)
+        self.assertIn(assignment[0], [0, 1])
+
+    def test_invalid_topology_is_rejected(self):
+        valid = dict(
+            candidate_physical_expert_ids=[0],
+            ep_size=4,
+            num_local_gpu_physical_experts=2,
+            num_gpus_per_node=2,
+            num_local_node_physical_experts=4,
+            r=Random(42),
+        )
+        invalid_overrides = [
+            {"candidate_physical_expert_ids": []},
+            {"ep_size": 0},
+            {"num_local_gpu_physical_experts": 0},
+            {
+                "num_gpus_per_node": None,
+                "num_local_node_physical_experts": 4,
+            },
+            {"num_gpus_per_node": 3, "num_local_node_physical_experts": 6},
+            {"num_local_node_physical_experts": 5},
+            {"candidate_physical_expert_ids": [8]},
+        ]
+
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                _assign_locality_fair_experts(**(valid | overrides))
 
 
 if __name__ == "__main__":

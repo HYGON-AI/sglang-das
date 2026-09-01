@@ -61,6 +61,12 @@ class FakeKVSender(BaseKVSender):
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        # CP can leave a rank with no complete page in the final local shard.
+        # The fake sender still needs the terminal send to transition out of
+        # WaitingForInput, otherwise the CP-wide poll never reaches Success.
+        return last_chunk or num_pages > 0
+
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
 
@@ -127,6 +133,7 @@ class FakeKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(

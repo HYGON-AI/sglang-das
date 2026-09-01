@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,62 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+W4A8_TPMOE_BACKEND_AUTO = "auto"
+W4A8_TPMOE_BACKEND_LIGHTOP = "lightop"
+W4A8_TPMOE_BACKEND_AITER = "aiter"
+W4A8_TPMOE_BACKEND_TRITON = "triton"
+W4A8_TPMOE_BACKENDS = frozenset(
+    {
+        W4A8_TPMOE_BACKEND_AUTO,
+        W4A8_TPMOE_BACKEND_LIGHTOP,
+        W4A8_TPMOE_BACKEND_AITER,
+        W4A8_TPMOE_BACKEND_TRITON,
+    }
+)
+
+_dspark_w4a8_tpmoe_backend_override = ContextVar(
+    "dspark_w4a8_tpmoe_backend_override", default=None
+)
+
+
+def normalize_w4a8_tpmoe_backend(
+    requested_backend: str, *, env_name: str
+) -> str:
+    backend = requested_backend.strip().lower()
+    if backend not in W4A8_TPMOE_BACKENDS:
+        supported = ", ".join(repr(value) for value in sorted(W4A8_TPMOE_BACKENDS))
+        raise ValueError(
+            f"Unsupported {env_name}={requested_backend!r}. "
+            f"Supported values: {supported}."
+        )
+    return backend
+
+
+def _resolve_dspark_w4a8_tpmoe_backend() -> str | None:
+    requested_backend = envs.SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND.get()
+    if requested_backend is None:
+        return None
+    return normalize_w4a8_tpmoe_backend(
+        requested_backend,
+        env_name="SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND",
+    )
+
+
+def get_dspark_w4a8_tpmoe_backend_override() -> str | None:
+    return _dspark_w4a8_tpmoe_backend_override.get()
+
+
+@contextmanager
+def dspark_w4a8_tpmoe_backend_context():
+    """Apply the DSpark W4A8 TP-MoE backend to one draft build."""
+    token = _dspark_w4a8_tpmoe_backend_override.set(
+        _resolve_dspark_w4a8_tpmoe_backend()
+    )
+    try:
+        yield
+    finally:
+        _dspark_w4a8_tpmoe_backend_override.reset(token)
 
 
 class MoeA2ABackend(Enum):
@@ -658,7 +715,9 @@ def speculative_moe_a2a_backend_context():
     moe = get_flags().moe
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
+    original_scope = moe.in_speculative_a2a_scope
     try:
+        moe.in_speculative_a2a_scope = True
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
@@ -666,6 +725,7 @@ def speculative_moe_a2a_backend_context():
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+        moe.in_speculative_a2a_scope = original_scope
 
 
 # The type of method in top-K routing, for use in torch custom op

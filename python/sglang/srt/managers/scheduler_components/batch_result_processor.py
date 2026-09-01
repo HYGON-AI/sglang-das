@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -34,12 +35,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_memory,
     get_observability,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.sampling.sampling_observer import CommittedTokens
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -68,6 +70,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -158,6 +161,84 @@ class SchedulerBatchResultProcessor:
                 req.routed_experts_start_len,
             )
 
+    def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req):
+        if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
+            return
+
+        # process_batch_result_prebuilt() runs before the first real decode
+        # forward and the batch still references request-owned prompt pages via
+        # out_cache_loc. Insert only after a decode forward completes. For DSV4
+        # we donate the prompt pages to radix cache; protect the prompt snapshot
+        # before insertion so the generic overlap path does not free those pages
+        # again, and later request release skips the donated prefix. Keep the key
+        # bounded to the prefill-committed prompt snapshot so MTP accepted/draft
+        # deltas never enter the tree.
+        req.dsv4_decode_radix_cache_prompt_once = False
+        req.allow_radix_cache_insert_once = True
+        prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
+        if prompt_len is None:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            return
+
+        page_size = self.tree_cache.page_size
+        # prompt-once flag was armed (decode.py), so get_fill_ids() already
+        # returns exactly the committed prompt snapshot.
+        prompt_fill_ids = req.get_fill_ids()
+        tree_core = getattr(self.tree_cache, "tree_core", None)
+        is_eagle = getattr(
+            self.tree_cache, "is_eagle", getattr(tree_core, "is_eagle", False)
+        )
+        radix_key_len = len(
+            RadixKey(
+                prompt_fill_ids,
+                req.extra_key,
+                is_bigram=is_eagle,
+                cache_salt=getattr(req, "cache_salt", None),
+            ).page_aligned(page_size)
+        )
+        if radix_key_len <= 0:
+            req.allow_radix_cache_insert_once = False
+            return
+
+        old_cache_protected_len = req.cache_protected_len
+        old_swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
+
+        # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
+        # whole donated key as SWA-evicted so the SWA component stays tombstoned,
+        # but force full leaf creation so later matches can reuse the full prefix.
+        # Do not pre-protect the whole radix key here: when the prefix already
+        # exists, the generic overlap path must free this request's duplicate
+        # prompt pages and repoint it to the existing radix leaf.
+        req.kv.swa_evicted_seqlen = radix_key_len
+        req.force_radix_leaf_creation = True
+        try:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            protected_len = min(req.cache_protected_len, radix_key_len)
+            if protected_len > 0 and hasattr(
+                self.token_to_kv_pool_allocator, "free_swa"
+            ):
+                donated_full_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :protected_len
+                ]
+                # The donated DSV4 prompt leaf is full-only. Release any
+                # request-private SWA tail mapped from those full indices; the
+                # full pages stay owned by radix cache.
+                self.token_to_kv_pool_allocator.free_swa(donated_full_indices)
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                logger.info(
+                    "DSV4 decode radix prompt inserted: rid=%s "
+                    "prompt_len=%d radix_key_len=%d",
+                    req.rid,
+                    prompt_len,
+                    radix_key_len,
+                )
+        finally:
+            req.kv.swa_evicted_seqlen = old_swa_evicted_seqlen
+            req.force_radix_leaf_creation = old_force_leaf_creation
+            if req.cache_protected_len < old_cache_protected_len:
+                req.cache_protected_len = old_cache_protected_len
+
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:
@@ -190,6 +271,51 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
+    def _visible_output_len(req: Req) -> int:
+        return req.finished_len if req.finished_len is not None else len(req.output_ids)
+
+    @classmethod
+    def snapshot_auxiliary_output_starts(
+        cls,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> Optional[List[int]]:
+        if result.auxiliary_host_output is None:
+            return None
+        return [cls._visible_output_len(req) for req in batch.reqs]
+
+    @classmethod
+    def _build_auxiliary_commits(
+        cls,
+        batch: ScheduleBatch,
+        output_starts: List[int],
+    ) -> List[Optional[CommittedTokens]]:
+        commits: List[Optional[CommittedTokens]] = []
+        for req, output_start in zip(batch.reqs, output_starts, strict=True):
+            output_end = cls._visible_output_len(req)
+            if output_end < output_start:
+                raise RuntimeError("committed output length moved backwards")
+            if output_end == output_start:
+                commits.append(None)
+                continue
+            commits.append(
+                CommittedTokens(
+                    output_index=output_start,
+                    token_ids=tuple(req.output_ids[output_start:output_end]),
+                )
+            )
+        return commits
+
+    @classmethod
+    def consume_auxiliary_output(
+        cls,
+        batch: ScheduleBatch,
+        output: HostAuxiliaryOutput,
+        output_starts: List[int],
+    ) -> None:
+        output.consume(batch, cls._build_auxiliary_commits(batch, output_starts))
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -201,6 +327,10 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
+                batch, result
+            )
+            auxiliary_output = result.auxiliary_host_output
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -324,6 +454,13 @@ class SchedulerBatchResultProcessor:
                         )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            if auxiliary_output is not None:
+                self.consume_auxiliary_output(
+                    batch,
+                    auxiliary_output,
+                    auxiliary_output_starts,
+                )
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -566,7 +703,7 @@ class SchedulerBatchResultProcessor:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
-                get_server_return_hidden_states_mode(server_args),
+                get_server_return_hidden_states_mode(),
             ),
             batch.spec_info,
         )
@@ -635,8 +772,10 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        # A zero-length verify result has no accepted bonus token, so it also
+        # has zero (rather than -1) accepted draft tokens.
+        result.num_correct_drafts_per_req_cpu = [max(x - 1, 0) for x in accept_lens]
+        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
@@ -809,6 +948,8 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -853,6 +994,8 @@ class SchedulerBatchResultProcessor:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
+
+            self._maybe_insert_dsv4_decode_radix_prompt(req)
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
@@ -902,6 +1045,13 @@ class SchedulerBatchResultProcessor:
                     # here; spec already advanced it in _resolve_spec_v2_tokens.
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
+
+        if auxiliary_output is not None:
+            self.consume_auxiliary_output(
+                batch,
+                auxiliary_output,
+                auxiliary_output_starts,
+            )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -1131,7 +1281,7 @@ class SchedulerBatchResultProcessor:
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv_committed_len
-            assert track_seqlen % get_exec().mamba.mamba_track_interval == 0
+            assert track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(
@@ -1191,7 +1341,7 @@ class SchedulerBatchResultProcessor:
                 other_idx
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
-                get_exec().mamba.mamba_track_interval,
+                mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
             )
             if (
@@ -1244,7 +1394,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_exec().mamba.mamba_track_interval
+        interval = mamba_track_grid(self.tree_cache.page_size)
 
         if batch.spec_algorithm.is_none():
             lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]

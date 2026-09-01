@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
-
+from sglang.kernels.npu_kernels.npu_dynamic_quant_triton import npu_dynamic_quant_triton
 
 class BaseHiddenStatesQuant(ABC):
     """Abstract base for NPU hidden state quantisation."""
@@ -27,19 +27,21 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     """
     Dynamic per‑token quantisation of hidden states.
 
-    ``torch.float8_e4m3fn`` selects the MX (block-scaled) op, whose scale is a
-    ``float8_e8m0fnu`` block scale ``[N, K//64, 2]`` rather than one scalar per
-    token; the int8/int4 dtypes keep the plain per-token op.
+    ``torch.float8_e4m3fn`` selects the MX (block-scaled) op. Set
+    ``use_mx_quant`` for other MX dtypes whose NPU op argument is not represented
+    by the matching torch dtype object; the int8/int4 dtypes keep the plain
+    per-token op.
 
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
-    def __init__(self, quant_dtype: torch.dtype) -> None:
+    def __init__(self, quant_dtype: torch.dtype, use_mx_quant: bool = False) -> None:
         super().__init__(quant_dtype)
-        if quant_dtype == torch.float8_e4m3fn:
+        if use_mx_quant or quant_dtype == torch.float8_e4m3fn:
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
-            self._op = torch.ops.npu.npu_dynamic_quant
+            # self._op = torch.ops.npu.npu_dynamic_quant
+            self._op = npu_dynamic_quant_triton
         else:
             raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
 

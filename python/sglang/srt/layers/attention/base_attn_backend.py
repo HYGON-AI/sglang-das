@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -239,7 +239,9 @@ class AttentionBackend(ABC):
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim,dtype=torch.bfloat16)
+            return q.new_empty(
+                q.shape[0], layer.tp_q_head_num * layer.v_head_dim, dtype=torch.bfloat16
+            )
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,

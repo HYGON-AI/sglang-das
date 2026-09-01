@@ -17,6 +17,7 @@ from typing import (
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -55,6 +56,10 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Match only the full-attention component. Decode-side DSV4 prompt
+    # donation intentionally leaves SWA tombstones while retaining reusable
+    # full-attention pages.
+    return_full_match: bool = False
 
 
 @dataclasses.dataclass
@@ -67,9 +72,13 @@ class InsertParams:
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
 
+    # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
+    c128_value: Optional[torch.Tensor] = None
+
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    force_leaf_creation: bool = False
 
     # General
     chunked: bool = False
@@ -235,6 +244,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+    # Set by caches that publish KV placement events; None means they don't.
+    kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args
@@ -374,7 +385,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         raise NotImplementedError()
 
     def take_events(self):
-        return []
+        return [] if self.kv_events is None else self.kv_events.take()
 
     def supports_swa(self) -> bool:
         return False

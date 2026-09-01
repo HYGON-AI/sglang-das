@@ -138,9 +138,39 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _should_use_ascend_tp_dispatcher(moe_runner_config: MoeRunnerConfig) -> bool:
+    """Whether AscendTPDispatcher is required for the effective MoE runner.
+
+    Ascend runner only registers pre/post-permute for ``ascend_tp`` (and
+    deepep_*), not ``standard``. Quant methods such as modelslim /
+    compressed_tensors W4A8 remap ``auto`` → ``ASCEND`` locally in
+    ``create_moe_runner`` (which runs before this helper), so we must not
+    rely solely on ``is_npu()`` / the global ``--moe-runner-backend`` flag.
+    """
+    if get_moe_runner_backend().is_ascend():
+        return True
+
+    layer = moe_runner_config.layer
+    if layer is None:
+        return False
+
+    for obj in (
+        getattr(layer, "quant_method", None),
+        getattr(layer, "scheme", None),
+    ):
+        if obj is None:
+            continue
+        runner = getattr(obj, "runner", None)
+        runner_backend = getattr(runner, "runner_backend", None) if runner else None
+        if runner_backend is not None and runner_backend.is_ascend():
+            return True
+    return False
+
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
+    if a2a_backend.is_none() and (
+        is_npu() or _should_use_ascend_tp_dispatcher(moe_runner_config)
+    ):
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
@@ -358,22 +388,14 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
-        # HCU: upstream dropped `expert_map` from FusedMoE, but DeepEPMoE still
-        # consumes it (see ep_moe/layer.py), so keep deriving it here -- and only
-        # it. `num_local_experts` is already computed above from
-        # `_num_global_routed`, which excludes the fused shared slots; the old
-        # 0.5.12-era block re-derived it from `num_experts` and guarded that with
-        # `assert num_experts % self.moe_ep_size == 0`. That check is on the
-        # wrong quantity: when the fused shared slots are not per-rank (a2a
-        # backend "none", e.g. DSpark standalone) `num_experts` is
-        # routed + n_shared and need not divide by ep_size, so the assert fired
-        # even though the routed count divides cleanly. On the DeepEP path the
-        # two expert counts coincide, so dropping the override is a no-op there.
-        self.expert_map = determine_expert_map(
-            ep_size=self.moe_ep_size,
-            ep_rank=self.moe_ep_rank,
-            global_num_experts=num_experts,
-        )[1]
+        # The routed/shared split above is the source of truth. In particular,
+        # DSpark has 256 routed experts plus one fused shared expert, so the
+        # total 257 is not divisible by EP8 even though the routed experts are,
+        # and determine_expert_map(global_num_experts=num_experts) would hand
+        # the fused shared slot out as if it were a routed expert. The only
+        # remaining consumer is DeepEPMoE -> SlimQuant W4A8 marlin apply_ep(),
+        # which already defaults this to None on its other call sites.
+        self.expert_map = None
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size

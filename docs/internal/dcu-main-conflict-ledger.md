@@ -2489,3 +2489,189 @@ required pure-TP command was subsequently run by the user:
 accuracy is correct, clearing the final functional gate for the local merge
 commit. Detailed score and server log were not supplied to this session, so
 this entry records the result as user-verified rather than agent-observed.
+
+
+## Daily sync 20260824 -- official main `92b1d382c7` .. `c8e1ddc707`
+
+Branch `sync/official-main-daily-20260824`, cut from main `0d49fbb937`
+(local PRs #210 qwen3.8 and #215 minimax-h3 are already in the base).
+`git merge-base` is exactly `92b1d382c7`, the endpoint of the 20260817
+backport, so no `-s ours` anchoring was needed.
+
+**Range** 397 commits / 1777 files / +121101 -34135, **44 conflicted files /
+63 hunks** (43 content + 1 delete/modify).
+
+**Release tag marker.** `v0.5.18` is a release branch, not an ancestor of
+official main:
+
+- tag object `ff4c6e641d9f9bb174d34ff651c01c114aea8e40`
+- **tag's last commit `71de97b264b04dcd514cf904003028aefe9775c8`**
+  ("[Cherry-pick to release/v0.5.18] [Fix] Support 128-aligned hidden sizes in
+  the W4AFP8 DeepEP low-latency requant kernel (#35593) (#35754)", 2026-08-20)
+
+All 8 commits reachable only from the tag are cherry-picks whose originals are
+in main (#35593 `b6dcd393d6`, #35714 `61fa64ae7e`, #35298 `c863760ae1`,
+#34679 `c7e2c08d14`, #35221 `0e4a09480c`, #34881 `307a90f6d3`, #35392
+`b814a7e812`, #35077 `5f12839591`), so this merge contains the whole of
+v0.5.18 even though the tag itself is not an ancestor -- same shape as v0.5.17.
+
+**Official direction adopted (local code superseded)**
+
+- `model_loader/weight_utils.py`: official's `resolve_checkpoint_quant_spec()`
+  replaces the hand-rolled lookup chain. The local kimi_k26
+  `text_config.compression_config` case was added to official's
+  `_select_hf_quant_metadata()` rather than kept as a divergent copy.
+- `model_executor/pool_configurator.py`: official's
+  `_compute_dsa_indexer_cell_size()` helper; the HCU bf16 index-K sizing moved
+  *into* the helper, so all three call sites (target, draft, all-layers) now
+  get it instead of only the inline one.
+- `multimodal_gen/.../quantization/fp8.py`: official made `Fp8Config` inherit
+  `SRTFp8Config`, which already carries the `ignored_layers` "model." prefix
+  normalization the local `__init__`/`from_config` duplicated. Local copies
+  dropped.
+- `kernels/aot/csrc/kvcacheio/transfer.cu`: official's
+  `HIP_VERSION >= 70200000` (ROCm 7.2) gate supersedes the local
+  `>= 70000000` workaround from 20260817. DTK 26.04 (HIP 6.3) stays excluded.
+- `models/deepseek_v4.py`: the local `_is_fused_mhc_post_pre_enabled()` copy was
+  dead (shadowed nothing, never called there). Deleted, and the `not is_hcu()`
+  guard moved into `deepseek_common/amd/deepseek_v4_fused_mhc.py` where the
+  function actually lives now.
+- `arg_groups/deepseek_v4_hook.py`: official's `declare_resolution()` contract;
+  it already sets `attn_cp_size = tp_size // dp_size`.
+- `layers/attention/deepseek_v4_backend.py`: official's q8kv8 sparse-prefill
+  dispatch (`use_dsv4_q8kv8_sparse_prefill` / `_forward_prefill_sparse_q8kv8`)
+  and the `not _is_sm120` guard, re-indented into the existing
+  `if not _is_hcu:` branch.
+
+**HCU behavior preserved (deliberate divergence)**
+
+- `mem_cache/allocator/swa.py`: **kept the local `free_swa` guards**. Upstream
+  (#35773) frees `swa_indices` directly and clears only `mapping_indices`; the
+  local path dedupes, skips pages already on the free list, and clears *every*
+  full index that maps into a freed SWA page. For `page_size > 1` upstream's
+  form can double-free a page shared by several full tokens and leaves stale
+  full->SWA entries -- the C10 `bs>1` suspect. Official's non-blocking
+  `clear_full_to_swa_mapping()` was adopted for the empty-`swa_indices` case.
+- `layers/moe/topk.py`: `biased_topk_lightop_impl` /
+  `_can_use_lightop_sqrtsoftplus_gate` kept beside official's new
+  `biased_topk_xpu`; the dispatch keeps the sigmoid flag-off byte-identical
+  gate and routes XPU to official's kernel. `biased_grouped_topk_gpu` keeps
+  `num_token_non_padded` / `expert_location_dispatch_info` /
+  `fused_shared_experts_scaling_factor`, which upstream dropped but local call
+  sites still pass.
+- `layers/moe/mega_moe.py`: HCU runtime constants, the megamoe/deep_gemm symm
+  buffer factory, and the full `SGLANG_OPT_FIX_MEGA_MOE_MEMORY` if/else
+  (upstream made the interleave unconditional and dropped the `else` arm that
+  the flag-off path still needs).
+- `mem_cache/memory_pool.py`: official's `skip_topk_layers` plus the local
+  `if _is_hip and not _is_hcu:` exclusion from the AITER preshuffle/page-size
+  asserts (HCU uses `page_size == 64`).
+- `layers/attention/dsv4/compressor{,_v2}.py`: the LightOp quantized K-cache
+  store paths and the `is_bf16_attention_kv_cache` branches.
+- `arg_groups/speculative_hook.py`: DSpark device gate still admits HCU, now on
+  official's `startswith(("cuda", "npu"))` form.
+- `managers/data_parallel_controller.py`: official's
+  `get_parallel().enable_dp_attention_local_control_broadcast` with the
+  `SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST` env override kept ahead
+  of it.
+- `environ.py`: symbol-diff rebuild -- the DSV4 section, the three SWA opt
+  knobs and `SGLANG_OPT_FP8_WO_A_GEMM=False  # HCU override` kept, official's
+  new `SGLANG_OPT_USE_AITER_BATCHED_GEMM` added.
+- `mem_cache/hybrid_cache/hybrid_pool_assembler.py`: the `layout_hcu ->
+  page_first` mamba layout mapping kept; the allocator type moved to
+  `get_memory().hicache_storage_backend`.
+- CI: 8 registered tests keep their `register_hcu_ci(...)` blocks on official's
+  widened import lists; `nightly-amd-mi355x-disagg.yml` keeps no `schedule:`
+  (this fork crons only HCU nightlies); `pr-states.yml` keeps the
+  `/rerun-failed-ci` wording and takes official's AMD-not-triggered handling.
+- `test/registered/rl/test_release_memory_occupation.py`: upstream deletion
+  accepted (the local delta was only an HCU registration; upstream keeps
+  `test_multi_instance_release_memory_occupation.py`).
+
+**Semantic audit (auto-merged hunks, not conflicts)**
+
+Ruff `F821/F401/F811` over all 1403 changed files, diffed against *both*
+parents with line numbers normalized, found 5 merge artifacts:
+
+1. `layers/attention/dsv4/compressor.py` and
+   `layers/attention/deepseek_v4_backend.py` both lost the
+   `quant_to_nope_fp8_rope_bf16_pack_triton` import (upstream deleted the block
+   that carried it) while still calling it. Restored.
+2. `mem_cache/memory_pool_host.py` lost `psutil`, `DSATokenToKVPool`,
+   `MLATokenToKVPoolHost` and `HICACHE_HOST_MEMORY_RESERVE_BYTES`, all used by
+   the local `DSAIndexerPoolHost`. Restored.
+3. `layers/moe/mega_moe.py` lost `transform_weights_for_mega_moe` from the
+   `build_mega_moe_experts_weights` local import.
+4. `quantization/compressed_tensors/compressed_tensors.py` gained a duplicate
+   `BaseKVCacheMethod` import and a **second** `CompressedTensorsKVCacheMethod`
+   class. The upstream copy (later in the file, so it would have won) defines
+   `validate_kv_cache_scheme`, but local call sites use
+   `is_supported_scheme`; the upstream duplicate was removed.
+
+After the fixes: **zero findings absent from both parents.**
+
+**Static evidence**
+
+- `git ls-files -u`: 0; conflict-marker scan: empty; `git diff --cached
+  --check`: clean.
+- Changed Python files compile: 1403 / 1403.
+- Ruff `F821,F401,F811` vs both parents: zero new.
+- Key module imports: 30 / 30.
+- `verify_hcu_registration.py`, `check_hcu_runtime_text.py`,
+  `check_hcu_external_api_compat.py`: pass.
+
+**Post-merge fix: 29 dropped `environ.py` declarations (found at runtime).**
+
+The first launch died in decode CUDA-graph capture with
+`AttributeError: 'Envs' object has no attribute 'SGLANG_TOPK_TRANSFORM_512_TORCH'`
+(`dsv4/indexer.py:842`). Root cause: `environ.py` is a declaration list, and a
+plain 3-way merge silently drops every line only one side has. The symbol-diff
+rebuild had been applied to the *conflict region only*; 29 HCU-only knobs
+elsewhere in the class were dropped by the auto-merge, 8 of them still
+referenced (`SGLANG_TOPK_TRANSFORM_512_TORCH`, `SGLANG_OPT_FIX_MEGA_MOE_MEMORY`,
+`SGLANG_OPT_USE_FUSED_STORE_CACHE`, `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK`,
+`SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL`, `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS`,
+`SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND`, `SGLANG_NPU_FUSED_MOE_MODE`).
+No official declaration was lost. All 29 restored as one marked HCU block; three
+resulting duplicates removed.
+
+Ruff cannot see this class of bug -- `envs.X` is an attribute access, not an
+undefined name. **New gate, worth keeping:** diff the set of `envs.SGLANG_*`
+references against the set of `environ.py` declarations, and compare that set
+against *both* parents. After the fix the undeclared set is 7 on the merge and 7
+on each parent, i.e. no new dangling references.
+
+**Runtime validation: passed (agent-observed, 2026-08-24).**
+
+Environment `zz-nmz26` / `rye_sglang_0824`, a fresh container: `sgl-kernel` and
+`sglang` were built from this merge with `install_sglang.sh` (19 hipcc units,
+gfx906/926/928/936/938). The build itself exercised the kernel-side resolutions,
+including official's `kMultiChunk` template on `mega_moe_pre_dispatch.cuh` with
+the HIP-portable `SGL_GRID_CONSTANT` kept in place of `__grid_constant__`.
+
+Preflight: all eight cards idle (2 MiB) after two readings 90 s apart; earlier
+attempts were deferred while `zpc_minimax_0818` held ~56 GB/card.
+
+`bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`
+(pure TP8, `mem_fraction_static=0.929`, `max_total_num_tokens=11830528`):
+
+| Check | Result |
+|---|---|
+| Server ready | yes, 16:17:57 |
+| Greedy sanity | `"The capital of France is **Paris**."` |
+| **GSM8K 100q** | **1.000** |
+| CUDA graph | active on decode (`cuda graph: True`) |
+| Aggregate decode throughput | up to 699.8 tok/s at 23 concurrent |
+| Faults | none -- no VMFault, illegal access, or scheduler exception |
+
+The only tracebacks in the log are four `post-warmup freeze_gc failed`
+`ConnectionRefused` traces: the freeze_gc call races Uvicorn's listener because
+`--skip-server-warmup` is set. Benign, pre-existing, not model-related.
+
+Note on the perf number: evalscope reports a *per-request* average (3.78 tok/s,
+32.2 s latency) that includes first-request JIT compilation in this fresh
+container, so it is not comparable with the 20260817 figure (13.1 tok/s) taken
+on an already-warm build. The server-side aggregate decode throughput above is
+the meaningful signal. A like-for-like perf comparison needs a warm re-run.
+
+All eight cards returned to 2 MiB after shutdown.
