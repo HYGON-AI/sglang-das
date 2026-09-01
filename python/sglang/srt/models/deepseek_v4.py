@@ -295,6 +295,28 @@ def _flashinfer_hc_pre(
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
+
+
+@functools.cache
+def _hcu_arch_supports_tilelang_mmac() -> bool:
+    """Whether the current HCU can JIT-compile tilelang T.gemm (MLS/GEMM_MLS).
+
+    tilelang's ``hcu_mmac_k_dim`` only accepts gfx938 / gfx92a / gfx946; other
+    archs (e.g. gfx936) fatal at LayerInference for any ``T.gemm``. On those
+    archs we must skip sglang's tilelang split-k mhc_pre and go straight to
+    AITER's fully-fused ``mhc_pre_big_fuse`` instead.
+    """
+    if not _is_hcu:
+        return True
+    try:
+        gcn_arch = getattr(
+            torch.cuda.get_device_properties(0), "gcnArchName", ""
+        )
+    except Exception:
+        return True
+    return any(a in gcn_arch for a in ("gfx938", "gfx92a", "gfx946"))
+
+
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
@@ -1896,8 +1918,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
-            if _is_hcu and _use_aiter_tilelang_mhc:
+            if (
+                _is_hcu
+                and _use_aiter_tilelang_mhc
+                and not _hcu_arch_supports_tilelang_mmac()
+            ):
+                # This HCU arch (e.g. gfx936) lacks tilelang T.gemm support, so
+                # sglang's own tilelang split-k mhc_pre fatals in LayoutInference.
+                # Bypass it entirely and use AITER's fully-fused mhc_pre_big_fuse,
+                # which is also what earlier sglang releases dispatched to here.
                 from aiter.ops.tilelang import mhc_pre_big_fuse
+
                 post, comb, y = mhc_pre_big_fuse(
                     residual=x,
                     fn=hc_fn,
@@ -1906,37 +1937,39 @@ class DeepseekV4DecoderLayer(nn.Module):
                     rms_eps=self.rms_norm_eps,
                     mhc_pre_eps=self.hc_eps,
                     mhc_sinkhorn_eps=self.hc_eps,
-                    mhc_post_mult_value=2.0,
+                    mhc_post_mult_value=_MHC_POST_MULT_VALUE,
                     sinkhorn_repeat=self.hc_sinkhorn_iters,
                     n_splits=16,
                 )
-                # AITER MHC pre does not fuse the decoder-layer RMSNorm.
-                norm_fused = False
-            else:
-                from sglang.kernels.ops.layernorm.mhc import mhc_pre
+                # AITER mhc_pre_big_fuse does not fuse the decoder RMSNorm.
+                return y, post.squeeze(-1), comb, False
 
-                norm_kwargs = {}
-                if norm is not None:
-                    norm_kwargs["norm_weight"] = norm.weight.data
-                    norm_kwargs["norm_eps"] = norm.variance_epsilon
+            from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
-                post, comb, y = mhc_pre(
-                    residual=x,
-                    fn=hc_fn,
-                    hc_scale=hc_scale,
-                    hc_base=hc_base,
-                    rms_eps=self.rms_norm_eps,
-                    hc_pre_eps=self.hc_eps,
-                    hc_sinkhorn_eps=self.hc_eps,
-                    hc_post_mult_value=_MHC_POST_MULT_VALUE,
-                    sinkhorn_repeat=self.hc_sinkhorn_iters,
-                    **norm_kwargs,
-                )
-                # The HCU compatibility path inside mhc_pre dispatches to AITER's
-                # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
-                # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
-                # contract so the caller still applies input_layernorm on HCU.
-                norm_fused = norm is not None
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
+            )
+            # The HCU compatibility path inside mhc_pre dispatches to AITER's
+            # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
+            # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
+            # contract so the caller still applies input_layernorm on HCU.
+            norm_fused = norm is not None and not (
+                _is_hcu and _use_aiter_tilelang_mhc
+            )
             return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip:
