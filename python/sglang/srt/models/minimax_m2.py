@@ -32,10 +32,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.communication.all_reduce import (
-    fused_parallel_qknorm,
-    get_fused_parallel_qknorm_max_occupancy,
-)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -114,6 +110,7 @@ from sglang.srt.utils import (
     is_hcu,
     is_non_idle_and_non_empty,
     is_npu,
+    is_xpu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -125,6 +122,13 @@ _is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
+
+if not _is_xpu:
+    from sglang.kernels.ops.communication.all_reduce import (
+        fused_parallel_qknorm,
+        get_fused_parallel_qknorm_max_occupancy,
+    )
 
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 
@@ -498,6 +502,7 @@ class MiniMaxM2QKRMSNorm:
         comm = CustomAllReduceV2(
             group=get_parallel().attn_tp_group.cpu_group,
             device=device,
+            # push-only: no barrier plane and no staging buffer
             max_pull_size=0,
             max_pull_blocks=0,
             max_push_size=max_size,

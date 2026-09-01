@@ -2959,6 +2959,7 @@ def destroy_model_parallel():
     from sglang.srt.layers.moe.mega_moe import destroy_mega_moe_symm_buffers
 
     destroy_mega_moe_symm_buffers()
+    get_parallel().clear_derived_widths()
 
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:

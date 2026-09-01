@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import is_hcu
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_hcu = is_hcu()
 
@@ -27,6 +31,17 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+
+    @classmethod
+    def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
+        """Resolve the DSA top-k backend for one model runner.
+
+        ``--dsa-topk-backend`` selects the target backend, while
+        ``--speculative-dsa-topk-backend`` independently selects the draft.
+        """
+        if model_runner.is_draft_worker:
+            return cls(get_spec().speculative_dsa_topk_backend)
+        return cls(get_exec().kernel.dsa_topk_backend)
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL

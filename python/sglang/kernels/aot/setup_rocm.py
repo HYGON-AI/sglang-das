@@ -91,9 +91,10 @@ fp8_macro = (
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
 # - gfx938 (HCU BW1100): same 64KB per-workgroup LDS budget as gfx942.
-# - gfx95x (MI350) and gfx1250: LDS is larger -> allow the original 128KB dynamic smem.
+# - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
+#   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
 topk_dynamic_smem_bytes = (
-    48 * 1024 if amdgpu_target in ["gfx942", "gfx938"] else 32 * 1024 * 4
+    48 * 1024 if amdgpu_target in ["gfx942", "gfx938"] else 40 * 1024
 )
 
 hipcc_flags = [

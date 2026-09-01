@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+GLM-5-Channel-FP8-w8a8:
+  env:
+    SGLANG_ENABLE_SPEC_V2: 1
+    SGLANG_TORCH_PROFILER_DIR: /workspace/profiling
+    HSA_ENABLE_COREDUMP: 1
+    ALLREDUCE_STREAM_WITH_COMPUTE: 1
+    HIP_KERNEL_EVENT_SYSTENFENCE: 1
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD: 0
+    GLIBC_TUNABLES: glibc.rtld.optional_static_tls=0x40000
+    HIP_KERNEL_BATCH_CEILING: 100
+    GPU_FORCE_BLIT_COPY_SIZE: 16
+    HSA_KERNARG_POOL_SIZE: 8388608
+    ROC_AQL_QUEUE_SIZE: 131072
+    SGLANG_USE_LIGHTOP: 1
+    SGLANG_USE_FP8_W8A8_MOE: 1
+    SGLANG_KVALLOC_KERNEL: 1
+    SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO: 1
+    SGLANG_ASSIGN_EXTEND_CACHE_LOCS: 1
+    SGLANG_ASSIGN_REQ_TO_TOKEN_POOL: 1
+    SGLANG_GET_LAST_LOC: 1
+    SGLANG_CREATE_FLASHMLA_KV_INDICES_TRITON: 1
+    SGLANG_CREATE_CHUNKED_PREFIX_CACHE_KV_INDICES: 1
+    HIP_GRAPH_ACCUMULATE_DISPATCH: 1
+    HIP_GRAPH_USE_CMD_CACHE: 0
+    ROCSHMEM_DISABLE_HDP_FLUSH: 1
+    ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX: 288
+    ROCSHMEM_HEAP_SIZE: 3173741824
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 256
+    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT: 1200
+    AMDGCN_USE_BUFFER_OPS: 0
+    ROCSHMEM_IB_GID_INDEX: 0
+    MC_IB_GID_INDEX: 0
+    MC_ENABLE_DEST_DEVICE_AFFINITY: 1
+    SGLANG_HOST_IP: '$(hostname -I 2>/dev/null | awk ''{print $1}'')'
+    SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH: 1
+    USE_DCU_CUSTOM_ALLREDUCE: 0
+    SGLANG_USE_AITER_AR: 0
+    SGLANG_USE_DEEPGEMM_MOE: 1
+  evalscope:
+    datasets:
+    - swe_bench_lite_agentic
+    - mcp_atlas
+    - ifbench
+    - bfcl_v3
+    - humaneval
+    - gsm8k
+    - math_500
+    limit: 50
+    dataset_args:
+      swe_bench_lite_agentic:
+        limit: 5
+      mcp_atlas:
+        limit: 5
+  model: GLM-5-Channel-FP8-w8a8
+  server: sglang
+  server_args:
+    attn-cp-size: 8
+    chunked-prefill-size: 16384
+    context-length: 140000
+    deepep-mode: auto
+    dist-timeout: 100000
+    dp-size: 1
+    dtype: bfloat16
+    enable-dp-attention: true
+    enable-dp-lm-head: true
+    enable-nsa-prefill-context-parallel: true
+    ep-size: 8
+    kv-cache-dtype: fp8_e4m3
+    mem-fraction-static: 0.85
+    moe-a2a-backend: deepep
+    moe-dense-tp-size: 1
+    nsa-decode-backend: flashmla_kv
+    nsa-prefill-backend: flashmla_auto
+    nsa-prefill-cp-mode: round-robin-split
+    page-size: 64
+    pp-size: 1
+    reasoning-parser: glm45
+    speculative-algorithm: EAGLE
+    speculative-eagle-topk: 1
+    speculative-num-draft-tokens: 4
+    speculative-num-steps: 3
+    tool-call-parser: glm47
+    tp-size: 8
+    trust-remote-code: true
+    watchdog-timeout: 3600
+  type: precision

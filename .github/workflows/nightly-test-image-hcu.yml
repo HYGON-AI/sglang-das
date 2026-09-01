@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: test-docker-image-daily
+
+# 由 release-docker-hcu.yml 推送镜像成功后通过 workflow_call 串行触发,
+# 也可手动 workflow_dispatch 指定镜像重测, 不再使用 schedule, 避免测试到旧镜像
+on:
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      docker_image:
+        description: 要测试的镜像全名, 例如 harbor.site/ns/sglang:0.5.18-xxx
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYPI_URL: ${{ vars.PYPI_URL }}
+
+jobs:
+  citest:
+    runs-on: nmz4
+    container:
+      image: ${{ inputs.docker_image }}
+      options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
+      volumes:
+        - /public/opendas/DL_DATA/llm-models:/models/public:ro
+        - /parastor/opendas/DL_DATA/llm-models:/models/parastor:ro
+        - /usr/bin/docker:/usr/local/bin/docker:ro
+        - /etc/docker/docker_env.conf:/etc/docker/docker_env.conf:ro
+        - /opt/hyhal:/opt/hyhal:ro
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 CItest
+        run: |
+          PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
+          pip install citest[evalscope] cinotificate \
+            -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
+            --trusted-host "${PYPI_HOST}"
+
+      - name: 运行 CItest
+        run: |
+          CItest --test_tool evalscope \
+                 --case_conf docker/image-citest-conf-hcu.yaml \
+                 --models_path /models \
+                 --output_dir "${GITHUB_WORKSPACE}/citest-output"
+
+      - name: 飞书通知
+        run: |
+          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --json_key docker_image_name \
+                       --json_value "${{ inputs.docker_image }}"
+          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --json_key jenkins_url \
+                       --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          CInotificate --notificate_conf "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --notificate_type PrecisionTest \
+                       --group_name 框架发版对接 高性能推理加速部
+
+      - name: 归档测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: citest-output-${{ github.run_id }}
+          path: citest-output/**
+
+      # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true

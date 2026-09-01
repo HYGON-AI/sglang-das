@@ -22,7 +22,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(CMAKE_CXX_STANDARD 17)
+set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
 # CUDA
@@ -127,14 +128,14 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler"
     "-fPIC"
     "-gencode=arch=compute_90,code=sm_90"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-DFLASHINFER_ENABLE_F16"
-    "-HCUTE_USE_PACKED_TUPLE=1"
-    "-HCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
-    "-HCUTLASS_VERSIONS_GENERATED"
-    "-HCUTLASS_TEST_LEVEL=0"
-    "-HCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
-    "-HCUTLASS_DEBUG_TRACE_LEVEL=0"
+    "-DCUTE_USE_PACKED_TUPLE=1"
+    "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
+    "-DCUTLASS_VERSIONS_GENERATED"
+    "-DCUTLASS_TEST_LEVEL=0"
+    "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
 
@@ -403,15 +404,15 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler"
         "-fPIC"
         "-gencode=arch=compute_90a,code=sm_90a"
-        "-std=c++17"
-        "-HCUTE_USE_PACKED_TUPLE=1"
-        "-HCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
-        "-HCUTLASS_VERSIONS_GENERATED"
-        "-HCUTLASS_TEST_LEVEL=0"
-        "-HCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
-        "-HCUTLASS_DEBUG_TRACE_LEVEL=0"
-        "-HCUTLASS_ENABLE_GDC_FOR_SM90"  # For PDL
-        "-HCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"  # Necessary for the WGMMA shapes that we use
+        "-std=c++${SGL_KERNEL_CXX_STANDARD}"
+        "-DCUTE_USE_PACKED_TUPLE=1"
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
+        "-DCUTLASS_VERSIONS_GENERATED"
+        "-DCUTLASS_TEST_LEVEL=0"
+        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90"  # For PDL
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"  # Necessary for the WGMMA shapes that we use
         "--expt-relaxed-constexpr"
         "--expt-extended-lambda"
         "--use_fast_math"
@@ -497,7 +498,7 @@ endif()
 set(INFLLM_FLASH_CUDA_FLAGS
     "-DNDEBUG"
     "-O3"
-    "-std=c++17"
+    "-std=c++${SGL_KERNEL_CXX_STANDARD}"
     "-Xcompiler"
     "-fPIC"
     "-U__CUDA_NO_HALF_OPERATORS__"

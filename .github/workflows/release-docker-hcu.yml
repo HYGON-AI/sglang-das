@@ -8,6 +8,9 @@ on:
   schedule:
     - cron: "0 14 * * *"  # 22:00 Beijing Time daily
 
+permissions:
+  contents: read
+
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: ${{ vars.HARBOR_NAMESPACE || 'jenkins/model_test_env' }}
@@ -20,7 +23,9 @@ env:
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on: [self-hosted, hcu]
+    runs-on: nmz4
+    outputs:
+      docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,10 +49,12 @@ jobs:
           echo "AICC_VERSION=${LATEST_AICC#dtk_llvm_}" >> "$GITHUB_ENV"
 
       - name: 生成镜像 tag
+        id: gen-tag
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
           echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=sglang:${SGLANG_VERSION}-latest" >> "$GITHUB_ENV"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 构建镜像
         run: |
@@ -81,8 +88,15 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-
       # 其他容器 job 会以 root 在共享 workspace 留下文件, 导致下次 checkout 清理失败
       - name: 清理 workspace
         if: always()
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
+
+  # 镜像推送成功后串行运行 nightly 测试, 把本次构建的具体镜像名传给测试 workflow
+  test-image:
+    needs: build
+    uses: ./.github/workflows/nightly-test-image-hcu.yml
+    with:
+      docker_image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit
