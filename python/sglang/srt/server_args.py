@@ -410,7 +410,13 @@ DSV4_PREFILL_BACKEND_CHOICES = [
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
+    "auto",
+    "deepgemm",
+    "cutedsl",
+    "aiter",
+    "lightop",
+]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1888,7 +1894,7 @@ class ServerArgs:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm, LightOp on HCU), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only), 'lightop' (HCU only).",
             choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
@@ -2508,6 +2514,20 @@ class ServerArgs:
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
+    ep_static_dispatch_policy: A[
+        Literal["nearest", "locality_fair"],
+        Arg(
+            help=(
+                "Choose the replica-selection policy for static expert dispatch. "
+                "`nearest` preserves the legacy nearest-replica behavior. "
+                "`locality_fair` builds a deterministic source-rank-to-replica map "
+                "that preserves same-GPU, then same-node locality while balancing "
+                "static bindings among equally local replicas; it does not rebalance "
+                "live token traffic."
+            )
+        ),
+        NS("exec.moe"),
+    ] = "nearest"
     init_expert_location: A[str, "Initial location of EP experts.", NS("exec.moe")] = (
         "trivial"
     )
@@ -5668,6 +5688,7 @@ class ServerArgs:
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
+            dsa_layer_skips_topk,
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
         )
@@ -5774,6 +5795,11 @@ class ServerArgs:
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+                from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+                    validate_hcu_int8_index_k_cache_server_args,
+                )
+
+                validate_hcu_int8_index_k_cache_server_args(self)
                 if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                     logger.warning(
                         f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
@@ -5791,16 +5817,15 @@ class ServerArgs:
                 # The "dsa" attention fill moved to the override registry
                 # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-                if self.enable_two_batch_overlap and (
-                    index_topk_freq > 1
-                    or (index_topk_pattern is not None and "S" in index_topk_pattern)
-                ):
+                has_shared_topk_layers = any(
+                    dsa_layer_skips_topk(hf_config, layer_id)
+                    for layer_id in range(hf_config.num_hidden_layers)
+                )
+                if self.enable_two_batch_overlap and has_shared_topk_layers:
                     raise ValueError(
                         "--enable-two-batch-overlap is not supported with DSA "
-                        "index-topk sharing (index_topk_freq > 1 or an "
-                        "index_topk_pattern containing shared layers): the TBO op "
+                        "index-topk sharing (cli_factor/index_topk_freq/"
+                        "index_topk_pattern): the TBO op "
                         "path does not propagate topk indices across layers, so "
                         "shared layers would run sparse attention without indices."
                     )
@@ -5873,12 +5898,26 @@ class ServerArgs:
                         f"{self.disaggregation_transfer_backend!r}. mori/nixl "
                         "support will be added later by the community."
                     )
-                if self.enable_dsa_cache_layer_split and self.pp_size > 1:
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and self.pp_size > 1
+                    and not is_hcu()
+                ):
                     raise ValueError(
                         "--enable-dsa-cache-layer-split is not supported with "
-                        "pipeline parallelism (pp_size > 1) yet. It requires "
-                        "prefill context parallelism, and CP + PP has not been "
-                        "validated for this feature."
+                        "pipeline parallelism (pp_size > 1) on non-HCU devices "
+                        "yet. The PP + CP LayerSplit path is currently guarded "
+                        "to HCU because it has not been validated elsewhere."
+                    )
+                if (
+                    self.enable_dsa_cache_layer_split
+                    and is_hcu()
+                    and self.hicache_storage_backend is not None
+                ):
+                    raise NotImplementedError(
+                        "HCU --enable-dsa-cache-layer-split currently supports "
+                        "HiCache L1/L2 only. --hicache-storage-backend (L3) is "
+                        "not layer-shard-aware yet."
                     )
 
             else:
@@ -7571,6 +7610,12 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
+            raise ValueError(
+                "--ep-static-dispatch-policy must be one of "
+                "'nearest' or 'locality_fair'."
+            )
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self._declare(
                 "_handle_eplb_and_dispatch",
@@ -7592,6 +7637,16 @@ class ServerArgs:
                 ep_dispatch_algorithm=(
                     "dynamic" if needs_rank_invariant_dispatch else "static"
                 ),
+            )
+
+        if (
+            self.ep_static_dispatch_policy != "nearest"
+            and self.ep_dispatch_algorithm != "static"
+        ):
+            raise ValueError(
+                "--ep-static-dispatch-policy locality_fair requires "
+                "--ep-dispatch-algorithm static. It configures a startup-time "
+                "source-rank-to-replica map, not dynamic token balancing."
             )
 
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
@@ -9929,9 +9984,17 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            pp_dspark_prefill = (
+                (self.speculative_algorithm or "").upper() == "DSPARK"
+                and self.disaggregation_mode == "prefill"
+            )
+            assert self.speculative_algorithm is None or pp_dspark_prefill, (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for DSPARK on a PD prefill server"
+            )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

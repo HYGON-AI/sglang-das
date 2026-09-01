@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -147,6 +148,57 @@ class TestZeroPaddedRegionIdempotent(CustomTestCase):
                     _zero_topk_weights_padded_region(twice, pad)
 
                     self.assertTrue(torch.equal(once, twice))
+
+
+class TestDeepEPPaddedTokenMasking(unittest.TestCase):
+    def _run_post_process(self, skip_deepep_padded_tokens):
+        topk_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+        topk_weights = torch.ones((2, 2), dtype=torch.float32)
+        router_logits = torch.ones((2, 8), dtype=torch.float32)
+        num_token_non_padded = torch.tensor(1, dtype=torch.int32)
+        cfg = TopKConfig(top_k=2, num_fused_shared_experts=0)
+
+        with (
+            patch.object(topk_mod, "_is_cuda", False),
+            patch.object(topk_mod, "_is_hip", True),
+            patch.object(topk_mod, "_is_hcu", skip_deepep_padded_tokens),
+            patch.object(topk_mod, "_eplb_remap_enabled", return_value=False),
+            patch.object(topk_mod, "capture_routed_experts_if_allowed"),
+            patch.object(topk_mod, "get_moe_a2a_backend") as get_a2a,
+            patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
+            patch.object(topk_mod, "_mask_topk_ids_padded_region") as mask_ids,
+            patch.object(topk_mod, "_zero_topk_weights_padded_region") as zero_weights,
+        ):
+            get_a2a.return_value.is_deepep.return_value = skip_deepep_padded_tokens
+            get_runner.return_value.is_deep_gemm.return_value = (
+                skip_deepep_padded_tokens
+            )
+            _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=num_token_non_padded,
+            )
+
+        return mask_ids, zero_weights, topk_ids, num_token_non_padded
+
+    def test_hcu_deepep_deepgemm_masks_ids_to_negative_one(self):
+        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
+            skip_deepep_padded_tokens=True
+        )
+
+        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=-1)
+        zero_weights.assert_not_called()
+
+    def test_other_hip_paths_keep_in_range_ids_and_zero_weights(self):
+        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
+            skip_deepep_padded_tokens=False
+        )
+
+        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=0)
+        zero_weights.assert_called_once()
 
 
 @unittest.skipUnless(

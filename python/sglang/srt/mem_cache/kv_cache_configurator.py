@@ -15,7 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    dsa_layer_skips_topk,
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -1321,6 +1321,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        use_layer_split_pool = False
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -1335,17 +1336,28 @@ class KVCacheConfigurator:
             )
 
             PoolCls = LayerSplitDSATokenToKVPool
+            use_layer_split_pool = True
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        full_indexer_layer_ids = get_dsa_full_indexer_layer_ids(
+            self.model_config.hf_config,
+            self.layer_info.start_layer,
+            self.layer_info.end_layer,
+        )
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
-            pool_kwargs["skip_topk_layers"] = [
-                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-                for layer_id in range(
-                    self.layer_info.start_layer, self.layer_info.end_layer
-                )
-            ]
+            indexer_layer_ids = full_indexer_layer_ids
+        else:
+            indexer_layer_ids = list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
+            )
+        if use_layer_split_pool:
+            # HiCache uses dense storage/transfer metadata, but skip-topk
+            # layers still must not enqueue an Index-K collective.
+            pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
+        if not get_memory().enable_hisparse:
+            pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

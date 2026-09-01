@@ -637,9 +637,12 @@ def compute_logical_to_rank_dispatch_physical_map(
     ep_rank: int,
     seed: int = 42,
 ):
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     r = random.Random(seed)
+    dispatch_policy = get_exec().moe.ep_static_dispatch_policy
+    if dispatch_policy not in ("nearest", "locality_fair"):
+        raise ValueError(f"Unknown static expert dispatch policy: {dispatch_policy}")
 
     device = logical_to_all_physical_map.device
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
@@ -666,6 +669,19 @@ def compute_logical_to_rank_dispatch_physical_map(
             candidate_physical_expert_ids = _logical_to_all_physical_raw(
                 logical_to_all_physical_map, layer_id, logical_expert_id
             )
+
+            if dispatch_policy == "locality_fair":
+                choices = _assign_locality_fair_experts(
+                    candidate_physical_expert_ids=candidate_physical_expert_ids,
+                    ep_size=ep_size,
+                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_local_node_physical_experts=num_local_node_physical_experts,
+                    r=r,
+                )
+                for moe_ep_rank, choice in enumerate(choices):
+                    result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
+                continue
 
             remaining_ranks = []
             for moe_ep_rank in range(ep_size):
@@ -757,6 +773,135 @@ def _find_nearest_expert(
 
     # 4. At last, leave it as -1 to indicate not found.
     return -1
+
+
+def _assign_locality_fair_experts(
+    candidate_physical_expert_ids: List[int],
+    ep_size: int,
+    num_local_gpu_physical_experts: int,
+    num_gpus_per_node: Optional[int],
+    num_local_node_physical_experts: Optional[int],
+    r: random.Random,
+) -> List[int]:
+    """Build one deterministic static source-rank-to-replica assignment.
+
+    Locality is prioritized before fairness: same GPU, then same node when the
+    topology exposes node boundaries, then remote. Assignment counts are local
+    to this logical expert; they balance static source-rank bindings, not live
+    token or queue load.
+    """
+    if ep_size <= 0:
+        raise ValueError(f"ep_size must be positive, got {ep_size}")
+    if num_local_gpu_physical_experts <= 0:
+        raise ValueError(
+            "num_local_gpu_physical_experts must be positive, got "
+            f"{num_local_gpu_physical_experts}"
+        )
+    if not candidate_physical_expert_ids:
+        raise ValueError("locality_fair requires at least one physical replica")
+    if (num_gpus_per_node is None) != (num_local_node_physical_experts is None):
+        raise ValueError(
+            "num_gpus_per_node and num_local_node_physical_experts must either "
+            "both be set or both be None"
+        )
+
+    num_nodes = None
+    if num_gpus_per_node is not None:
+        if num_gpus_per_node <= 0 or ep_size % num_gpus_per_node != 0:
+            raise ValueError(
+                f"ep_size ({ep_size}) must be divisible by positive "
+                f"num_gpus_per_node ({num_gpus_per_node})"
+            )
+        expected_node_experts = num_local_gpu_physical_experts * num_gpus_per_node
+        if num_local_node_physical_experts != expected_node_experts:
+            raise ValueError(
+                "num_local_node_physical_experts must equal "
+                "num_local_gpu_physical_experts * num_gpus_per_node, got "
+                f"{num_local_node_physical_experts} != {expected_node_experts}"
+            )
+        num_nodes = ep_size // num_gpus_per_node
+
+    assignments = [-1] * ep_size
+    assignment_counts = {
+        physical_expert_id: 0 for physical_expert_id in candidate_physical_expert_ids
+    }
+
+    candidates_by_gpu = [[] for _ in range(ep_size)]
+    candidates_by_node = [[] for _ in range(num_nodes or 0)]
+    for physical_expert_id in candidate_physical_expert_ids:
+        gpu_id = _compute_gpu_id_of_physical_expert(
+            physical_expert_id, num_local_gpu_physical_experts
+        )
+        if physical_expert_id < 0 or gpu_id >= ep_size:
+            max_physical_expert_id = ep_size * num_local_gpu_physical_experts - 1
+            raise ValueError(
+                f"physical expert {physical_expert_id} is outside topology "
+                f"range [0, {max_physical_expert_id}]"
+            )
+        candidates_by_gpu[gpu_id].append(physical_expert_id)
+        if num_nodes is not None:
+            node_id = _compute_node_id_of_physical_expert(
+                physical_expert_id, num_local_node_physical_experts
+            )
+            candidates_by_node[node_id].append(physical_expert_id)
+
+    # A same-GPU replica is always the strongest locality choice.
+    for moe_ep_rank in range(ep_size):
+        if candidates_by_gpu[moe_ep_rank]:
+            choice = _choose_least_assigned_expert(
+                candidates_by_gpu[moe_ep_rank], assignment_counts, r
+            )
+            assignments[moe_ep_rank] = choice
+            assignment_counts[choice] += 1
+
+    # Include same-GPU counts while balancing unassigned ranks within a node.
+    if num_gpus_per_node is not None:
+        for node_id, same_node_physical_expert_ids in enumerate(candidates_by_node):
+            if not same_node_physical_expert_ids:
+                continue
+
+            node_rank_begin = node_id * num_gpus_per_node
+            remaining_ranks = [
+                moe_ep_rank
+                for moe_ep_rank in range(
+                    node_rank_begin, node_rank_begin + num_gpus_per_node
+                )
+                if assignments[moe_ep_rank] == -1
+            ]
+            r.shuffle(remaining_ranks)
+            for moe_ep_rank in remaining_ranks:
+                choice = _choose_least_assigned_expert(
+                    same_node_physical_expert_ids, assignment_counts, r
+                )
+                assignments[moe_ep_rank] = choice
+                assignment_counts[choice] += 1
+
+    # Nodes without a replica, or flat topologies without node affinity, fall
+    # back to all replicas while preserving counts from the locality passes.
+    remaining_ranks = [
+        moe_ep_rank
+        for moe_ep_rank, assignment in enumerate(assignments)
+        if assignment == -1
+    ]
+    r.shuffle(remaining_ranks)
+    for moe_ep_rank in remaining_ranks:
+        choice = _choose_least_assigned_expert(
+            candidate_physical_expert_ids, assignment_counts, r
+        )
+        assignments[moe_ep_rank] = choice
+        assignment_counts[choice] += 1
+
+    return assignments
+
+
+def _choose_least_assigned_expert(
+    candidate_physical_expert_ids: List[int],
+    assignment_counts: dict[int, int],
+    r: random.Random,
+) -> int:
+    candidates = candidate_physical_expert_ids.copy()
+    r.shuffle(candidates)
+    return min(candidates, key=assignment_counts.__getitem__)
 
 
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:

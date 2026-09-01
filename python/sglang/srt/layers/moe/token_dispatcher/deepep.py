@@ -225,6 +225,7 @@ class DeepEPBuffer:
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                num_topk=None,
             )
             buffers[state_key] = state
         return state
@@ -238,6 +239,7 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        num_topk: int = -1,
     ):
         state = cls._state()
         if state.buffer is not None:
@@ -268,6 +270,10 @@ class DeepEPBuffer:
                     incompatible.append(
                         f"expert count {state.num_experts} != requested {num_experts}"
                     )
+                if state.num_topk != num_topk:
+                    incompatible.append(
+                        f"topk {state.num_topk} != requested {num_topk}"
+                    )
             if incompatible:
                 raise RuntimeError(
                     "Target and speculative DeepEP cannot create independent "
@@ -283,6 +289,7 @@ class DeepEPBuffer:
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
+        state.num_topk = num_topk
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -304,6 +311,7 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            assert num_topk != -1
             if not _is_npu:
                 _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
             num_rdma_bytes = max(
@@ -312,6 +320,7 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
+                    num_topk=num_topk
                 ),
                 num_rdma_bytes,
             )
@@ -812,6 +821,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.router_topk,
         )
 
 
@@ -1074,6 +1084,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.router_topk,
         )
 
 

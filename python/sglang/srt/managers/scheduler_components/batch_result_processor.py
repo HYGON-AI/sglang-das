@@ -772,8 +772,10 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        # A zero-length verify result has no accepted bonus token, so it also
+        # has zero (rather than -1) accepted draft tokens.
+        result.num_correct_drafts_per_req_cpu = [max(x - 1, 0) for x in accept_lens]
+        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
 
         block_accept_lens = (
             result.block_accept_lens.tolist()

@@ -14,7 +14,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra", "PR Test ROCm 7.2 (AMD)"]
+    workflows: ["PR Test Base", "PR Test Extra"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -60,10 +60,9 @@ jobs:
               prNumber = context.payload.pull_request.number;
             } else if (context.eventName === 'workflow_run') {
               const wr = context.payload.workflow_run;
-              // Only pull_request runs are the PR gate. The AMD workflow also
-              // accepts workflow_dispatch for a single stage, and such a run on
-              // a PR branch is PR-associated; refreshing off it would rewrite
-              // the block from a run the rows below deliberately ignore.
+              // Only pull_request runs are the PR gate. Manual runs on a PR
+              // branch can also be PR-associated, but the rows below
+              // deliberately ignore them.
               if (wr.event !== 'pull_request') {
                 core.info(`Triggering run event '${wr.event}' is not pull_request; skipping.`);
                 return;
@@ -125,8 +124,7 @@ jobs:
                 workflow_id: workflowFile,
                 head_sha: sha,
                 // Every row reports the PR gate, so exclude other events for
-                // this SHA: all three workflows also accept workflow_dispatch,
-                // and for AMD that is a single stage rather than the full gate.
+                // this SHA: both workflows also accept workflow_dispatch.
                 event: 'pull_request',
                 per_page: 1,
               });
@@ -150,20 +148,13 @@ jobs:
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
 
-            // The three lookups are independent, so the added one costs no
-            // wall-clock time. The AMD lookup never spends the retry budget:
-            // that workflow has an on.pull_request.paths filter, so a missing
-            // run is usually legitimate rather than an indexing race, and the
-            // race resolves itself -- `requested` is in the workflow_run
-            // subscription above, so a real dispatch refreshes this block.
-            const [ptRun, peRun, amdRun] = await Promise.all([
+            const [ptRun, peRun] = await Promise.all([
               findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
               // pr-test-extra gates on BOTH labels (see check-changes there).
               findRun(
                 'pr-test-extra.yml',
                 (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
               ),
-              findRun('pr-test-amd-rocm720.yml', labelOffOpts),
             ]);
 
             // Skipped run = "no real run" -- happens when a label is added
@@ -174,11 +165,6 @@ jobs:
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again or use /rerun-failed-ci to dispatch.';
-            // A missing run usually means the paths filter excluded the PR,
-            // but pull_request workflows can also be suppressed by GitHub
-            // (for example, for merge conflicts or skip annotations).
-            const amdNotTriggeredText = ':heavy_minus_sign: **No AMD PR run found for this commit**.';
-
             // Status icon: body otherwise looks uniformly "dispatched" even
             // for gate-failed runs (call-gate exits on missing label).
             function runIcon(run) {
@@ -204,19 +190,12 @@ jobs:
                 : !hasExtra
                   ? notExtraEnabledText
                   : stalePushText;
-            const amdText = isReal(amdRun)
-              ? runLink(amdRun)
-              : amdNotTriggeredText;
-
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
             const ptStart    = '<!-- slot:pr-test:start -->';
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
-            const amdStart   = '<!-- slot:pr-test-amd-rocm720:start -->';
-            const amdEnd     = '<!-- slot:pr-test-amd-rocm720:end -->';
-
             const newBlock = [
               outerStart,
               '---',
@@ -224,7 +203,6 @@ jobs:
               '',
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
-              `Latest PR Test (AMD ROCm 7.2): ${amdStart}${amdText}${amdEnd}`,
               outerEnd,
             ].join('\n');
 

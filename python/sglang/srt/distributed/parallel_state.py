@@ -1221,6 +1221,38 @@ class GroupCoordinator:
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_split_sizes: Optional[List[int]] = None,
+        input_split_sizes: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """All-to-all over dim 0 with (optionally) variable per-rank splits.
+
+        Thin wrapper over ``torch.distributed.all_to_all_single`` on this
+        group's ``device_group``. When ``*_split_sizes`` are None, input/output
+        are split evenly across ranks along dim 0 (requires divisibility).
+
+        Used by the DSV4 compressor RLC (Repartition-Local Compression) path to
+        redistribute round-robin-scattered tokens into per-rank contiguous
+        blocks. Unlike all-gather, each element is sent to exactly one rank, so
+        per-rank traffic is ~1/world_size of an all-gather of the same tensor.
+        """
+        world_size = self.world_size
+        # Bypass if single rank: all-to-all degenerates to a copy.
+        if world_size == 1:
+            output.copy_(input)
+            return output
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.device_group,
+        )
+        return output
+
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
         # Aiter's should_custom_ag still owns shape/layout validation:
@@ -1359,7 +1391,7 @@ class GroupCoordinator:
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
                 torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
+                    output_tensor, input_, group=self.cpu_group
                 )
         else:
             self.all_gather_into_tensor(output_tensor, input_)

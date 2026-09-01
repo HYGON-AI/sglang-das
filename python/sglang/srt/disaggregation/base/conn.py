@@ -60,6 +60,9 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    # Transfer ABI identifier parallel to state_types. It distinguishes state
+    # layouts that have the same item size but different byte semantics.
+    state_data_formats: List[str]
     state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]

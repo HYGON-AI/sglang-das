@@ -15,6 +15,7 @@ from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.utils.hf_transformers.processor as processor_utils
 from sglang.srt.utils import hf_transformers_patches
+from sglang.srt.utils.hf_transformers import config as config_utils
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -30,8 +31,52 @@ from sglang.srt.utils.hf_transformers.common import (
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# GLM MoE DSA config compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestGlmMoeDsaConfigCompatibility(CustomTestCase):
+    @patch.object(config_utils.PretrainedConfig, "get_config_dict")
+    def test_restores_fields_clobbered_by_transformers(self, get_config_dict):
+        get_config_dict.return_value = (
+            {
+                "qk_rope_head_dim": 64,
+                "index_topk_freq": 6,
+            },
+            {},
+        )
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=192,
+            qk_head_dim=384,
+            index_topk_freq=1,
+        )
+
+        config_utils._restore_glm_moe_dsa_raw_config_fields(
+            config, "test-model", revision="test-revision"
+        )
+
+        self.assertEqual(config.qk_rope_head_dim, 64)
+        self.assertEqual(config.qk_head_dim, 256)
+        self.assertEqual(config.index_topk_freq, 6)
+        get_config_dict.assert_called_once_with("test-model", revision="test-revision")
+
+    @patch.object(config_utils.PretrainedConfig, "get_config_dict")
+    def test_ignores_other_architectures(self, get_config_dict):
+        config = SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+
+        config_utils._restore_glm_moe_dsa_raw_config_fields(
+            config, "test-model", revision=None
+        )
+
+        get_config_dict.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

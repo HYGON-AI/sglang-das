@@ -37,9 +37,14 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.mem_cache.dsa_cache_layer_split import build_main_kv_page_plan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hcu
 
 
 def dsa_enable_prefill_cp():
@@ -49,23 +54,86 @@ def dsa_enable_prefill_cp():
     return is_dsa_enable_prefill_cp()
 
 
+def _dsa_prefill_has_history(forward_batch: ForwardBatch) -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if prefix_lens is None:
+        return True
+    return any(int(prefix_len) > 0 for prefix_len in prefix_lens)
+
+
+def maybe_configure_main_kv_page_plan(forward_batch: ForwardBatch) -> None:
+    """Install this batch's compact Main-KV mapping when LayerSplit is active."""
+
+    token_to_kv_pool = get_token_to_kv_pool()
+    use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+    configure_page_plan = getattr(token_to_kv_pool, "configure_main_kv_page_plan", None)
+    if configure_page_plan is not None:
+        page_plan = None
+        can_compact_main_kv = (
+            is_hcu()
+            and getattr(token_to_kv_pool, "layer_shard_enabled", False)
+            and use_prefill_cp
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            # Compact mapping is batch-specific; retain the official full-
+            # scratch path while TBO alternates between two child batches.
+            and not forward_batch.can_run_tbo
+            and forward_batch.tbo_parent_token_range is None
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and forward_batch.out_cache_loc is not None
+        )
+        if can_compact_main_kv:
+            if forward_batch.dsa_layer_split_main_kv_page_plan is None:
+                forward_batch.dsa_layer_split_main_kv_page_plan = (
+                    build_main_kv_page_plan(
+                        req_to_token=get_req_to_token_pool().req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                        current_locs=forward_batch.out_cache_loc,
+                        page_size=token_to_kv_pool.page_size,
+                    )
+                )
+            page_plan = forward_batch.dsa_layer_split_main_kv_page_plan
+        # Explicitly clear a compact layout left by an earlier ForwardBatch
+        # before entering the legacy full-pool path.
+        configure_page_plan(page_plan, forward_batch)
+
+
+def maybe_prefetch_full_attention_kv(
+    forward_batch: ForwardBatch,
+    full_attention_layer_id: Optional[int],
+) -> None:
+    """Configure the batch plan and prefetch one DSA layer's caches."""
+
+    maybe_configure_main_kv_page_plan(forward_batch)
+
+    if full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+        return
+
+    token_to_kv_pool = get_token_to_kv_pool()
+    has_history = _dsa_prefill_has_history(forward_batch)
+    # Index-K and Main-KV share one communicator. Every rank must enqueue
+    # collectives in this order; skip-topk layers make the Index-K call a no-op.
+    prefetch_index_buffer = getattr(token_to_kv_pool, "prefetch_index_buffer", None)
+    if is_hcu() and prefetch_index_buffer is not None:
+        prefetch_index_buffer(
+            full_attention_layer_id,
+            has_history=has_history,
+        )
+    prefetch_kv_buffer = getattr(token_to_kv_pool, "prefetch_kv_buffer", None)
+    if prefetch_kv_buffer is not None:
+        prefetch_kv_buffer(
+            full_attention_layer_id,
+            has_history=has_history,
+        )
+
+
 def maybe_prefetch_next_full_attention_kv(
     forward_batch: ForwardBatch,
     next_full_attention_layer_id: Optional[int],
 ) -> None:
-    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
+    """Prefetch the next layer while the current layer's MLP runs."""
 
-    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
-    """
-    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
-        return
-
-    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
-    if prefetch_kv_buffer is not None:
-        prefetch_kv_buffer(next_full_attention_layer_id)
+    maybe_prefetch_full_attention_kv(forward_batch, next_full_attention_layer_id)
 
 
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):

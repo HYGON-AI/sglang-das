@@ -42,6 +42,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
+  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+
   m.def("l2norm(Tensor input, float eps) -> Tensor");
   m.impl("l2norm", torch::kCUDA, &l2norm);
 

@@ -51,12 +51,18 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_hcu
 
 _is_cuda = is_cuda()
+_use_hcu_concat_mla_absorb_q = (
+    is_hcu() and envs.SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q.get()
+)
 
 if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
+elif _use_hcu_concat_mla_absorb_q:
+    from sgl_kernel import concat_mla_absorb_q
 
 
 # When num_kv_heads=1, we have tensors with degenerate strides,
@@ -193,10 +199,22 @@ def mla_quantize_without_rope_for_fp8(
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):
-    if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
+    can_use_custom_op = (
+        (_is_cuda or _use_hcu_concat_mla_absorb_q)
+        and q_nope.ndim == q_rope.ndim == 3
+        and q_nope.shape[:-1] == q_rope.shape[:-1]
+        and (q_nope.shape[-1], q_rope.shape[-1]) == (512, 64)
+        and q_nope.dtype == q_rope.dtype == torch.bfloat16
+        and q_nope.is_cuda
+        and q_rope.is_cuda
+        and q_nope.device == q_rope.device
+        and q_nope.stride(-1) == q_rope.stride(-1) == 1
+        and all(stride % 8 == 0 for stride in q_nope.stride()[:-1])
+        and all(stride % 8 == 0 for stride in q_rope.stride()[:-1])
+    )
+    if can_use_custom_op:
         return concat_mla_absorb_q(q_nope, q_rope)
-    else:
-        return torch.cat([q_nope, q_rope], dim=-1)
+    return torch.cat([q_nope, q_rope], dim=-1)
 
 
 @triton.jit

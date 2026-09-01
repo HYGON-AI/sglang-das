@@ -82,6 +82,19 @@ def resolve_disagg_metadata_config(
     if mode_value not in ("decode", "prefill"):
         return DSparkDisaggMetadataConfig()
 
+    # The upstream pp_size=1 PD path injects target hidden states into the
+    # prefill-side draft KV cache and transfers that cache to decode. Keep the
+    # HCU hidden-state wire path as an explicit fallback only: setting either
+    # pool variable opts into it, while leaving both unset selects draft-KV
+    # transfer and avoids allocating a hidden row pool on P or D.
+    pool_env_value = os.getenv("SGLANG_PD_HIDDEN_POOL_TOKENS")
+    if mode_value == "decode":
+        pool_env_value = os.getenv("SGLANG_PD_HIDDEN_RECV_POOL_TOKENS")
+        if pool_env_value is None:
+            pool_env_value = os.getenv("SGLANG_PD_HIDDEN_POOL_TOKENS")
+    if pool_env_value is None:
+        return DSparkDisaggMetadataConfig()
+
     should_probe = (
         spec_algorithm.is_dspark()
         or mode_value == "prefill"
@@ -102,19 +115,9 @@ def resolve_disagg_metadata_config(
         )
 
     hidden_size = len(target_layer_ids) * int(model_config.hidden_size)
-    default_pool_rows = max(
-        1,
-        int(server_args.max_prefill_buffer_tokens() or 0),
-        int(max_prefill_tokens or 0),
-    )
-    pool_env_value = os.getenv("SGLANG_PD_HIDDEN_POOL_TOKENS")
-    if mode_value == "decode":
-        pool_env_value = os.getenv("SGLANG_PD_HIDDEN_RECV_POOL_TOKENS")
-        if pool_env_value is None:
-            pool_env_value = os.getenv("SGLANG_PD_HIDDEN_POOL_TOKENS")
     hidden_pool_size = max(
         0,
-        int(pool_env_value if pool_env_value is not None else str(default_pool_rows)),
+        int(pool_env_value),
     )
 
     if mode_value == "prefill" and pp_size > 1:

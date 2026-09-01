@@ -80,6 +80,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
+    maybe_configure_main_kv_page_plan,
+    maybe_prefetch_full_attention_kv,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -1923,6 +1925,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Reused DSA TopK indices were already sorted by the producing layer.
+        self.attn_mqa.reuse_topk_indices = bool(self.skip_topk and not self.is_nextn)
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
@@ -2836,6 +2840,17 @@ class DeepseekV2Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+
+        if _is_hcu and self.start_layer < self.end_layer:
+            # A non-zero PP stage may start on a skip-topk layer and reuse the
+            # previous stage's indices, so no local indexer would trigger the
+            # first Main-KV prefetch. Start it explicitly on HCU; the normal
+            # indexer path reuses the same pending broadcast on non-skip layers.
+            maybe_prefetch_full_attention_kv(forward_batch, self.start_layer)
+        else:
+            # Install the compact mapping before the first indexer triggers the
+            # existing current-layer Main-KV prefetch.
+            maybe_configure_main_kv_page_plan(forward_batch)
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled

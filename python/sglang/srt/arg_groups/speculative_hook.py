@@ -348,7 +348,6 @@ def _is_supported_dspark_pd_prefill_cp(server_args: ServerArgs) -> bool:
     return (
         server_args.disaggregation_mode == "prefill"
         and server_args.disaggregation_transfer_backend == "mooncake"
-        and server_args.pp_size == 1
         and server_args.attn_cp_size > 1
         and attn_tp_size == 1
         and server_args.enable_prefill_cp
@@ -375,7 +374,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if server_args.attn_cp_size > 1 and not pd_prefill_cp:
         raise ValueError(
             "DSpark context parallel is only supported for DeepSeek-V4 PD prefill "
-            "with Mooncake, pp_size == 1, attn_tp_size == 1, and interleave "
+            "with Mooncake, attn_tp_size == 1, and interleave "
             f"(round-robin-split) CP; got disaggregation_mode="
             f"{server_args.disaggregation_mode!r}, pp_size={server_args.pp_size}, "
             f"attn_cp_size={server_args.attn_cp_size}, attn_tp_size="
@@ -443,9 +442,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"runner={draft_runner!r}."
             )
 
-    if server_args.pp_size != 1:
+    if server_args.pp_size != 1 and server_args.disaggregation_mode not in (
+        "prefill",
+        "decode",
+    ):
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "DSpark with pipeline parallelism is only supported in PD "
+            "disaggregation mode."
         )
 
     if server_args.speculative_draft_model_path is None:

@@ -83,6 +83,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    build_cp_sparse_query_metadata,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.verify_mask import (
@@ -174,13 +175,15 @@ T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
 def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+    sparse_prefill_enabled = envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    explicit_cp_override = (
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+        and sparse_prefill_enabled
+    )
     return (
         not _is_sm120
-        and not dsa_use_prefill_cp(forward_batch)
-        and (
-            q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-        )
+        and (not dsa_use_prefill_cp(forward_batch) or explicit_cp_override)
+        and (q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD or sparse_prefill_enabled)
     )
 
 
@@ -673,7 +676,7 @@ class DeepseekV4AttnBackend(
         )
         self._dsv4_lightop_kvcache_op = None
         self._dsv4_bf16_flashmla_workspaces: Dict[
-            Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]
+            str, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
         if self._dsv4_lightop_bf16_gather and not self._dsv4_bf16_flashmla_decode:
             raise RuntimeError(
@@ -1760,11 +1763,17 @@ class DeepseekV4AttnBackend(
     ) -> None:
         if not self._dsv4_bf16_flashmla_decode or capacity <= 0 or topk <= 0:
             return
-        key = (slot, topk)
-        current = self._dsv4_bf16_flashmla_workspaces.get(key)
-        current_capacity = 0 if current is None else current[0].shape[0]
-        if current_capacity >= capacity:
-            return
+        current = self._dsv4_bf16_flashmla_workspaces.get(slot)
+        if current is not None:
+            current_capacity = current[0].shape[0]
+            current_topk = current[0].shape[1]
+            if current_capacity >= capacity and current_topk == topk:
+                return
+            # Drop the previous buffer before reallocating. c128 topk grows
+            # every prefill chunk; keeping one workspace per topk OOMs on
+            # long context with small chunked_prefill_size.
+            del self._dsv4_bf16_flashmla_workspaces[slot]
+            del current
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "DSV4 BF16 FlashMLA gather workspace must be allocated before "
@@ -1780,7 +1789,7 @@ class DeepseekV4AttnBackend(
             dtype=torch.int32,
             device=self.device,
         )
-        self._dsv4_bf16_flashmla_workspaces[key] = (
+        self._dsv4_bf16_flashmla_workspaces[slot] = (
             gathered_kv,
             compact_indices,
         )
@@ -1792,7 +1801,7 @@ class DeepseekV4AttnBackend(
         topk: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._allocate_dsv4_bf16_flashmla_workspace(slot, num_queries, topk)
-        workspace = self._dsv4_bf16_flashmla_workspaces.get((slot, topk))
+        workspace = self._dsv4_bf16_flashmla_workspaces.get(slot)
         if workspace is None:
             raise RuntimeError("DSV4 BF16 FlashMLA gather workspace is unavailable")
         gathered_kv, compact_indices = workspace
@@ -2403,6 +2412,40 @@ class DeepseekV4AttnBackend(
             assert seq_lens_cpu is not None
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert extend_seq_lens_cpu is not None
+
+            query_seq_lens = None
+            real_query_seq_lens = None
+            query_positions = None
+            if dsa_use_prefill_cp(forward_batch):
+                cp_size = get_parallel().attn_cp_size
+                cp_rank = get_parallel().attn_cp_rank
+
+                # Interleave CP owns global flattened rows rank::cp_size. The
+                # sparse-prefill combiner must loop over those local rows, not
+                # the original global extend lengths. Build both real and
+                # physical rank-local geometry on-device: physical padding is
+                # appended to the last request, while C4/C128 source-row
+                # selection must continue to use the real lengths.
+                assert forward_batch.extend_start_loc is not None
+                # Both CP-v2 and legacy DSA round-robin call
+                # DSV4AttnMetadata.apply_cp_reindex() before attention, so
+                # positions_casual is already rank-local in both paths.
+                rank_local_positions = core_attn_metadata.positions_casual[
+                    : q_flat.shape[0]
+                ].contiguous()
+                assert rank_local_positions.shape[0] == q_flat.shape[0]
+                (
+                    query_seq_lens,
+                    real_query_seq_lens,
+                    query_positions,
+                ) = build_cp_sparse_query_metadata(
+                    extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                    extend_start_loc=forward_batch.extend_start_loc.to(torch.int32),
+                    query_positions=rank_local_positions,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                )
+
             total_swa = sum(
                 min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
                 for seq_len, extend_len in zip(
@@ -2422,6 +2465,9 @@ class DeepseekV4AttnBackend(
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
                 total_swa=total_swa,
+                query_seq_lens=query_seq_lens,
+                query_positions=query_positions,
+                real_query_seq_lens=real_query_seq_lens,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 

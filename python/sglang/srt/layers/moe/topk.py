@@ -96,7 +96,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
@@ -130,6 +130,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _is_musa = is_musa()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_lightop_topk_ids_postprocess = get_bool_env_var(
@@ -1662,10 +1663,23 @@ def _zero_topk_weights_padded_region(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _topk_ids_postprocess_torch(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if _is_hip and num_token_non_padded is not None:
+        # Keep the HIP fallback as plain torch ops inside this compiled region.
+        # Calling _fill_padded_rows here would introduce a separate explicit
+        # Triton launch after the logical-to-physical gather, while Inductor can
+        # fuse this mask with that gather just like the pre-forward-port path.
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    else:
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if output_int64 and topk_ids.dtype != torch.int64:
+        topk_ids = topk_ids.to(torch.int64)
     return topk_ids
 
 
@@ -1720,25 +1734,43 @@ def _topk_ids_postprocess(
     topk_ids: torch.Tensor,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     num_token_non_padded: Optional[torch.Tensor],
+    output_int64: bool = False,
 ) -> torch.Tensor:
-    if expert_location_dispatch_info is None and num_token_non_padded is None:
+    if (
+        expert_location_dispatch_info is None
+        and num_token_non_padded is None
+        and (not output_int64 or topk_ids.dtype == torch.int64)
+    ):
         return topk_ids
 
-    lightop_output = _try_lightop_topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
-    )
-    if lightop_output is not None:
-        return lightop_output
+    # An int32 -> int64 result must stay in the compiled fallback so Inductor
+    # can fuse it with the remap/padding work. If the input is already int64,
+    # the in-place LightOp path still satisfies the requested output dtype.
+    if not output_int64 or topk_ids.dtype == torch.int64:
+        lightop_output = _try_lightop_topk_ids_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
+        if lightop_output is not None:
+            return lightop_output
     return _topk_ids_postprocess_torch(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     return _topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
@@ -2276,6 +2308,14 @@ def _post_process_topk_ids(
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
     _fold_pad_into_append = False
+    # HCU W8A8 deployments can select DeepGEMM through the legacy env while
+    # the global runner backend remains AUTO, so recognize both selectors.
+    skip_deepep_padded_tokens = (
+        _is_hcu
+        and get_moe_a2a_backend().is_deepep()
+        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+    )
+    hip_deepep_postprocessed = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2316,32 +2356,45 @@ def _post_process_topk_ids(
             )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Always fill the padded
-        # region with 0 so every kernel sees a valid in-range expert id.
-        # Routing weights for padded tokens are zeroed below so their
-        # contribution to the hidden state is still zero regardless of the id.
+        # (negative indices cause illegal memory access). Keep their padded IDs
+        # in range and zero their weights below. HCU DeepEP + DeepGEMM instead
+        # masks the final IDs to -1 after shared-expert remapping so dispatch can
+        # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        #
-        # Fold: when the fused append+remap kernel runs below (aiter per-rank
-        # shared-slot path, EPLB off) it folds this padded fill itself
-        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
-        # _fill_padded_rows launch here.
-        _fold_pad_into_append = (
-            num_fused_shared_experts > 0
-            and _use_aiter
-            and use_per_rank_shared_slots
-            and not _eplb_remap_enabled()
-        )
-        if not _fold_pad_into_append:
+        remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
+        if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
+            # DeepEP disables shared-expert fusion by default. On that main HCU
+            # path no later operation can introduce another route, so remap and
+            # the final -1 padding mask can be compiled into one kernel. Emit
+            # int64 from that kernel as well because DeepEP requires int64 IDs;
+            # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
+            # the post-shared-expert mask below for the explicitly forced fused
+            # shared-expert configuration.
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids,
+                remap_info,
+                num_token_non_padded,
+                output_int64=True,
+            )
+            hip_deepep_postprocessed = True
+        else:
+            # The fused append+remap kernel can fold the padded fill into its
+            # existing launch on the aiter per-rank shared-slot path.
+            _fold_pad_into_append = (
+                not skip_deepep_padded_tokens
+                and num_fused_shared_experts > 0
+                and _use_aiter
+                and use_per_rank_shared_slots
+                and remap_info is None
+            )
+        if not skip_deepep_padded_tokens and not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
-            )
+        if remap_info is not None and not hip_deepep_postprocessed:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
@@ -2430,7 +2483,11 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if skip_deepep_padded_tokens and not hip_deepep_postprocessed:
+        # Apply this after shared-expert remapping so every padded route,
+        # including appended shared slots, is omitted by DeepEP dispatch.
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
+    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.

@@ -1498,25 +1498,27 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                    max_seqlen_q=max_seqlen_q,
+                result = vllm_flash_attn_varlen_func(
+                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=key_cache.view(-1, layer.tp_k_head_num, self.page_size, layer.head_dim),
+                    v=value_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim, self.page_size),
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    seqused_k=metadata.cache_seqlens_int32,
+                    max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
+                    causal=True,
                     window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    **kwargs,
+                    block_table=metadata.page_table,
+                    fa_version=2,
+                    q_descale=k_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                 )
+            if forward_batch.mha_return_lse:
+                output, lse, *rest = result
+                lse = torch.transpose(lse, 0, 1).contiguous()
+                return output, lse
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result

@@ -5,6 +5,9 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+    effective_forward_mode,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -142,12 +145,12 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
         is_cuda()
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        and forward_batch.forward_mode.is_extend_without_speculative()
+        and effective_forward_mode(forward_batch).is_extend_without_speculative()
     )
 
 
 def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
+    if not effective_forward_mode(forward_batch).is_context_parallel_extend():
         return False
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
@@ -256,7 +259,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     if (
         cp_size <= 1
         or not use_dsa
-        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not effective_forward_mode(forward_batch).is_context_parallel_extend()
         or not is_dsa_enable_prefill_cp()
         or sum(forward_batch.extend_seq_lens_cpu) < cp_size
     ):
@@ -330,7 +333,7 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
     if (
         forward_batch.attn_cp_metadata is not None
         and dsa_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend()
+        and effective_forward_mode(forward_batch).is_context_parallel_extend()
     ):
         return True
     else:

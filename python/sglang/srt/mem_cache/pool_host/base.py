@@ -16,11 +16,12 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hcu, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
@@ -59,13 +60,16 @@ def host_memory_budget_bytes() -> int:
     return free // ranks_per_host()
 
 
-def sync_fixed_hicache_size(size: int, host_size: int) -> int:
-    """Sync fixed-size HiCache token capacity across PP ranks.
+def sync_fixed_hicache_size(
+    size: int, host_size: int, *, sync_tp_group: bool = False
+) -> int:
+    """Sync fixed-size HiCache token capacity across model-parallel ranks.
 
     A fixed --hicache-size is specified in GB, but each PP stage may have a
     different bytes/token because it owns different layers. Use the global
     minimum token capacity within the PP group so all stages expose the same
-    host-cache capacity.
+    host-cache capacity. HCU LayerSplit also uses a different bytes/token on
+    uneven CP layer shards, so include the TP group for that configuration.
     Ratio-based sizing already derives from the synced device pool size.
     """
     if host_size <= 0 or not torch.distributed.is_available():
@@ -75,28 +79,31 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_pp_group
+        from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group
 
-        pp_group = get_pp_group()
+        groups = [get_pp_group()]
+        if sync_tp_group:
+            groups.append(get_tp_group())
     except AssertionError:
         return size
 
-    if pp_group.world_size <= 1:
-        return size
-
     tensor = torch.tensor(size, dtype=torch.int64)
-    torch.distributed.all_reduce(
-        tensor,
-        op=torch.distributed.ReduceOp.MIN,
-        group=pp_group.cpu_group,
-    )
+    for group in groups:
+        if group.world_size <= 1:
+            continue
+        torch.distributed.all_reduce(
+            tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=group.cpu_group,
+        )
     synced_size = int(tensor.item())
 
     if synced_size != size:
         logger.info(
-            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            "Sync fixed-size HiCache host token capacity from %d to %d%s.",
             size,
             synced_size,
+            " across PP and TP groups" if sync_tp_group else " across PP ranks",
         )
     return synced_size
 
@@ -148,10 +155,23 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        layer_sharded_on_hcu = _is_hcu and self._is_device_layer_sharded(device_pool)
         if host_size > 0:
-            self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+            # An empty tail shard owns no bytes. Let non-empty ranks determine
+            # the shared capacity instead of dividing by zero or constraining
+            # the group to the device-pool size.
+            local_fixed_size = (
+                int(host_size * 1e9 // self.size_per_token)
+                if self.size_per_token > 0
+                else torch.iinfo(torch.int64).max
             )
+            self.size = sync_fixed_hicache_size(
+                local_fixed_size,
+                host_size,
+                sync_tp_group=layer_sharded_on_hcu,
+            )
+            if self.size == torch.iinfo(torch.int64).max:
+                self.size = device_pool.size
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
@@ -252,6 +272,9 @@ class HostKVCache(abc.ABC):
         device_pool = device_pool or self.device_pool
         if not self._is_device_layer_sharded(device_pool):
             return device_pool.layer_num
+        if _is_hcu:
+            start, end = self._device_owned_layer_range(device_pool)
+            return end - start
         shard_size = device_pool.layer_shard_size
         return (device_pool.layer_num + shard_size - 1) // shard_size
 
