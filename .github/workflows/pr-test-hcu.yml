@@ -12,6 +12,7 @@ on:
     branches:
       - v0.5.15.post1_dev
       - main
+      - "release/**"
     paths:
       - ".github/workflows/pr-test-hcu.yml"
       - ".github/workflows/pr-gate.yml"
