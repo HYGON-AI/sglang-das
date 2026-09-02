@@ -31,7 +31,6 @@ _is_hcu = is_hcu()
 _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
     "SGLANG_KV_LAYOUT_HCU_FA", default="true"
 )
-_hcu_fa_layout = "bhsd" if _is_hcu and not _kv_layout_hcu_fa else None
 
 if _is_hcu and _use_triton_vllm_fa:
     from sglang.srt.layers.attention.triton_vllm_flash_attn import (
@@ -92,7 +91,67 @@ def flash_attn_with_kvcache(
     sinks=None,
     ver=3,
     out=None,
+    layout=None,
 ):
+    if layout == "bhsd":
+        if not _is_hcu:
+            raise ValueError("bhsd layout is reserved for HCU HND KV cache")
+        if qv is not None:
+            raise NotImplementedError("HND BHSD attention does not support qv")
+        if page_table is None or cu_seqlens_q is None or max_seqlen_q is None:
+            raise ValueError("HND BHSD attention requires paged varlen metadata")
+        if not torch.is_tensor(cache_seqlens):
+            cache_seqlens = torch.full(
+                (cu_seqlens_q.numel() - 1,),
+                int(cache_seqlens),
+                dtype=torch.int32,
+                device=q.device,
+            )
+        cu_seqlens_k = torch.cat(
+            [cache_seqlens.new_zeros(1), torch.cumsum(cache_seqlens, dim=0)]
+        )
+        if _is_hcu and _use_triton_vllm_fa and not return_softmax_lse:
+            result = triton_vllm_flash_attn_varlen_func(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=cache_seqlens,
+                max_seqlen_k=page_table.shape[1] * k_cache.shape[2],
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=page_table,
+                fa_version=ver,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                layout="bhsd",
+            )
+            return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
+
+        result = flash_attn_varlen_func_interface(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=page_table.shape[1] * k_cache.shape[2],
+            seqused_k=cache_seqlens,
+            block_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            return_softmax_lse=return_softmax_lse,
+            fa_version=ver,
+            layout="bhsd",
+        )
+        return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
+
     if _is_hcu and _use_triton_vllm_fa and is_nmz_fp8(k_cache.dtype):
         result = triton_vllm_flash_attn_with_kvcache(
             q=q.contiguous().view(-1, max_seqlen_q, q.shape[-2], q.shape[-1]),
@@ -108,6 +167,7 @@ def flash_attn_with_kvcache(
             v_descale=v_descale,
             softcap=softcap,
             return_softmax_lse=return_softmax_lse,
+            layout=layout,
         )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
@@ -163,6 +223,7 @@ def vllm_flash_attn_with_kvcache(
     return_softmax_lse=False,
     sinks=None,
     ver=3,
+    layout=None,
 ):
     if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_with_kvcache(
@@ -179,6 +240,7 @@ def vllm_flash_attn_with_kvcache(
             v_descale=v_descale,
             softcap=softcap,
             return_softmax_lse=return_softmax_lse,
+            layout=layout,
         )
 
     return vllm_flash_attn_with_kvcache_interface(
@@ -238,9 +300,6 @@ def flash_attn_varlen_func(
     layout=None,
 ):
     global _SERVER_ARGS, IS_SLIMQUANT_W4A8, IS_KVCACHE_FP8_E4M3
-    if layout is None:
-        layout = _hcu_fa_layout
-
     if IS_KVCACHE_FP8_E4M3 is None:
         from sglang.srt.server_args import get_global_server_args
 
@@ -302,6 +361,7 @@ def vllm_flash_attn_varlen_func(
     q_descale,
     k_descale,
     v_descale,
+    layout=None,
 ):
     if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_varlen_func(
@@ -320,6 +380,7 @@ def vllm_flash_attn_varlen_func(
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            layout=layout,
         )
 
     return vllm_flash_attn_varlen_func_interface(
