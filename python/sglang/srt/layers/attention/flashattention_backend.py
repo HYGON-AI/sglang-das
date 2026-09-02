@@ -31,7 +31,7 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_index_translator import KVReadTables
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
@@ -208,6 +208,16 @@ class FlashAttentionBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        # HND is an explicit pool layout. Do not infer it from the HCU FA
+        # compatibility flag: FA=0 must not change the ordinary NHD path.
+        kv_pool = self.token_to_kv_pool
+        while isinstance(kv_pool, (SWAKVPool, HybridLinearKVPool)):
+            kv_pool = kv_pool.full_kv_pool
+        self.use_hnd = bool(getattr(kv_pool, "use_hnd", False))
+        self._use_hcu_bhsd = is_hcu() and self.use_hnd
+        self._use_hcu_legacy_layout = (
+            _is_hcu and _kv_layout_hcu_fa and not self.use_hnd
+        )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -1523,12 +1533,27 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if self._use_hcu_bhsd:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, self.page_size, layer.v_head_dim
+                )
+            elif self._use_hcu_legacy_layout:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim, self.page_size
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -1624,23 +1649,81 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
-            else:
+            elif self._use_hcu_legacy_layout and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
-                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k=key_cache.view(-1, layer.tp_k_head_num, self.page_size, layer.head_dim),
-                    v=value_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim, self.page_size),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=metadata.max_seq_len_q,
-                    seqused_k=metadata.cache_seqlens_int32,
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=cache_seqlens,
                     max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
-                    causal=True,
+                    causal=False if use_cascade_attn else causal,
                     window_size=window_size,
-                    block_table=metadata.page_table,
+                    block_table=page_table,
                     fa_version=2,
-                    q_descale=k_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
+                    q_descale=(
+                        fa_k_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        and layer.k_scale is not None
+                        else None
+                    ),
+                    k_descale=(
+                        fa_k_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        and layer.k_scale is not None
+                        else None
+                    ),
+                    v_descale=(
+                        fa_v_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        and layer.v_scale is not None
+                        else None
+                    ),
+                )
+            elif self._use_hcu_legacy_layout:
+                result = vllm_flash_attn_with_kvcache(
+                    q=q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .unsqueeze(1),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
+                )
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    return_softmax_lse=(
+                        use_cascade_attn or forward_batch.mha_return_lse
+                    ),
+                    num_splits=self.num_splits,
+                    out=_fa_out,
+                    ver=self.fa_impl_ver,
+                    **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
+                    **kwargs,
                 )
             if forward_batch.mha_return_lse:
                 output, lse, *rest = result
@@ -1651,6 +1734,8 @@ class FlashAttentionBackend(AttentionBackend):
                 o, softmax_lse, *rest = result
             if (
                 use_cascade_attn
+                and not self._use_hcu_bhsd
+                and not self._use_hcu_legacy_layout
                 and forward_batch.spec_algorithm.is_uno()
                 and can_use_fused_suffix_attention_merge(
                     layer=layer,
@@ -1672,14 +1757,26 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                 )
             elif use_cascade_attn:
+                if self._use_hcu_bhsd:
+                    # The suffix table indexes physical token slots; expose
+                    # BHSD pages in token order before the page-size-one call.
+                    k_cache_expand = key_cache.permute(0, 2, 1, 3).reshape(
+                        -1, 1, layer.tp_k_head_num, layer.head_dim
+                    )
+                    v_cache_expand = value_cache.permute(0, 2, 1, 3).reshape(
+                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                    )
+                else:
+                    k_cache_expand = key_cache.view(
+                        -1, 1, layer.tp_k_head_num, layer.head_dim
+                    )
+                    v_cache_expand = value_cache.view(
+                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                    )
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # The suffix table stores physical token slots, so expose
-                    # the paged cache as page-size-one blocks.
-                    k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
-                    v_cache=value_cache.view(
-                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
-                    ),
+                    k_cache=k_cache_expand,
+                    v_cache=v_cache_expand,
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
@@ -1692,6 +1789,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    **({"layout": "bshd"} if self._use_hcu_bhsd else {}),
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -2033,7 +2131,7 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
+            q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if fa_k_descale is not None:
@@ -2043,12 +2141,27 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if self._use_hcu_bhsd:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, self.page_size, layer.v_head_dim
+                )
+            elif self._use_hcu_legacy_layout:
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, layer.v_head_dim, self.page_size
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -2067,6 +2180,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
                     **kwargs,
                 )
             elif use_local_attn:
@@ -2086,6 +2200,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
                     **kwargs,
                 )
             else:
@@ -2124,47 +2239,92 @@ class FlashAttentionBackend(AttentionBackend):
                     and not pa_swa_active
                 ):
                     sched_meta = metadata.scheduler_metadata
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
-                )
+                if self._use_hcu_legacy_layout:
+                    result = vllm_flash_attn_with_kvcache(
+                        q=q_reshaped.unsqueeze(1),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
+                    )
+                else:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=self.num_splits,
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        scheduler_metadata=sched_meta,
+                        **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
+                        **kwargs,
+                    )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q_reshaped,
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
-                            ver=self.fa_impl_ver,
-                            **kwargs,
+                    if self._use_hcu_legacy_layout:
+                        o_expand, softmax_lse_expand, *rest_expand = (
+                            vllm_flash_attn_with_kvcache(
+                                q=q_reshaped.unsqueeze(1),
+                                k_cache=key_cache,
+                                v_cache=value_cache,
+                                page_table=self.forward_metadata_spec_decode_expand.page_table,
+                                cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                                cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                                cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                                max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                                softmax_scale=layer.scaling,
+                                causal=False,
+                                window_size=window_size,
+                                softcap=layer.logit_cap,
+                                return_softmax_lse=True,
+                                num_splits=self.num_splits,
+                                ver=self.fa_impl_ver,
+                            )
                         )
-                    )
+                    else:
+                        o_expand, softmax_lse_expand, *rest_expand = (
+                            flash_attn_with_kvcache(
+                                q=q_reshaped,
+                                k_cache=key_cache,
+                                v_cache=value_cache,
+                                page_table=self.forward_metadata_spec_decode_expand.page_table,
+                                cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                                cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                                cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                                max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                                softmax_scale=layer.scaling,
+                                causal=False,
+                                window_size=window_size,
+                                softcap=layer.logit_cap,
+                                return_softmax_lse=True,
+                                num_splits=self.num_splits,
+                                ver=self.fa_impl_ver,
+                                **(
+                                    {"layout": "bhsd"}
+                                    if self._use_hcu_bhsd
+                                    else {}
+                                ),
+                                **kwargs,
+                            )
+                        )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),

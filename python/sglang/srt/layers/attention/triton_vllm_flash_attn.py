@@ -15,10 +15,11 @@
 """Triton reference implementation for vLLM-style paged varlen attention.
 
 This is intentionally written for debuggability and numerical comparison rather
-than peak throughput. It supports both SGLang paged KV layouts:
-  * SGLANG_KV_LAYOUT_HCU_FA=0: k/v are [num_blocks, page_size, Hkv, D]
-  * vLLM/HCU FA layout:        k is [num_blocks, Hkv, page_size, D],
-                               v is [num_blocks, Hkv, D, page_size]
+than peak throughput. It supports SGLang paged KV layouts:
+  * standard/BSHD layout:      k/v are [num_blocks, page_size, Hkv, D]
+  * standard HCU BHSD layout:  k/v are [num_blocks, Hkv, page_size, D]
+  * legacy HCU layout:          k is [num_blocks, Hkv, page_size, D],
+                                v is [num_blocks, Hkv, D, page_size]
 """
 
 from typing import Optional, Tuple
@@ -198,7 +199,10 @@ def triton_vllm_flash_attn_varlen_func(
     q_descale: Optional[torch.Tensor],
     k_descale: Optional[torch.Tensor],
     v_descale: Optional[torch.Tensor],
+    layout: Optional[str] = None,
 ) -> torch.Tensor:
+    if layout is not None and layout not in ("bshd", "bhsd", "legacy_bhsd"):
+        raise ValueError(f"Unsupported attention layout: {layout!r}")
     if window_size != (-1, -1):
         raise NotImplementedError("Triton reference FA only supports full-context attention.")
     if q.dim() != 3:
@@ -212,8 +216,11 @@ def triton_vllm_flash_attn_varlen_func(
         )
 
     total_q, h_q, d = q.shape
-    if k.shape[1] == v.shape[1] and k.shape[2] == v.shape[3]:
-        # vLLM/HCU FA layout: k=[B,H,P,D], v=[B,H,Dv,P].
+    if layout == "legacy_bhsd":
+        if k.shape[0] != v.shape[0] or k.shape[1] != v.shape[1] or k.shape[2] != v.shape[3]:
+            raise ValueError(
+                f"Legacy BHSD k/v layout mismatch: k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
         h_kv = k.shape[1]
         page_size = k.shape[2]
         d_v = v.shape[2]
@@ -229,15 +236,30 @@ def triton_vllm_flash_attn_varlen_func(
             v.stride(1),
             v.stride(2),
         )
-    elif k.shape[1] == v.shape[1] and k.shape[2] == v.shape[2]:
-        # SGLANG_KV_LAYOUT_HCU_FA=0 layout: k/v=[B,P,H,D].
+    elif layout == "bhsd":
+        if k.shape != v.shape:
+            raise ValueError(
+                f"BHSD k/v layout mismatch: k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
+        h_kv = k.shape[1]
+        page_size = k.shape[2]
+        d_v = v.shape[3]
+        k_stride_b, k_stride_p, k_stride_h, k_stride_d = (
+            k.stride(0), k.stride(2), k.stride(1), k.stride(3)
+        )
+        v_stride_b, v_stride_p, v_stride_h, v_stride_d = (
+            v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        )
+    else:
+        if k.shape[:3] != v.shape[:3]:
+            raise ValueError(
+                f"BSHD k/v layout mismatch: k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
         page_size = k.shape[1]
         h_kv = k.shape[2]
         d_v = v.shape[-1]
         k_stride_b, k_stride_p, k_stride_h, k_stride_d = k.stride()
         v_stride_b, v_stride_p, v_stride_h, v_stride_d = v.stride()
-    else:
-        raise ValueError(f"k/v layout mismatch: k={tuple(k.shape)}, v={tuple(v.shape)}")
 
     if h_q % h_kv != 0:
         raise ValueError(f"Hq must be divisible by Hkv, got Hq={h_q}, Hkv={h_kv}")
@@ -290,7 +312,7 @@ def triton_vllm_flash_attn_varlen_func(
 
     out = torch.empty((total_q, h_q, d_v), device=q.device, dtype=out_dtype)
     block_m = 16
-    block_n = 64
+    block_n = 32
     grid = (triton.cdiv(max_seqlen_q, block_m), h_q, batch)
     _paged_varlen_attn_fwd_kernel[grid](
         q,
@@ -359,6 +381,7 @@ def triton_vllm_flash_attn_with_kvcache(
     v_descale: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     return_softmax_lse: bool = False,
+    layout: Optional[str] = None,
 ) -> torch.Tensor:
     """Decode/reference wrapper for vLLM-style paged KV cache attention.
 
@@ -384,14 +407,24 @@ def triton_vllm_flash_attn_with_kvcache(
         raise ValueError(f"q must be [B,H,D] or [B,Sq,H,D], got {tuple(q.shape)}")
 
     batch, q_len, h_q, d = q_4d.shape
-    if k_cache.shape[1] == v_cache.shape[1] and k_cache.shape[2] == v_cache.shape[3]:
+    if layout == "legacy_bhsd":
+        if k_cache.shape[0] != v_cache.shape[0] or k_cache.shape[1] != v_cache.shape[1] or k_cache.shape[2] != v_cache.shape[3]:
+            raise ValueError(
+                f"Legacy BHSD cache mismatch: k={tuple(k_cache.shape)}, v={tuple(v_cache.shape)}"
+            )
         page_size = k_cache.shape[2]
-    elif k_cache.shape[1] == v_cache.shape[1] and k_cache.shape[2] == v_cache.shape[2]:
-        page_size = k_cache.shape[1]
+    elif layout == "bhsd":
+        if k_cache.shape != v_cache.shape:
+            raise ValueError(
+                f"BHSD k/v cache layout mismatch: k={tuple(k_cache.shape)}, v={tuple(v_cache.shape)}"
+            )
+        page_size = k_cache.shape[2]
     else:
-        raise ValueError(
-            f"k/v cache layout mismatch: k={tuple(k_cache.shape)}, v={tuple(v_cache.shape)}"
-        )
+        if k_cache.shape[:3] != v_cache.shape[:3]:
+            raise ValueError(
+                f"BSHD k/v cache layout mismatch: k={tuple(k_cache.shape)}, v={tuple(v_cache.shape)}"
+            )
+        page_size = k_cache.shape[1]
     q_flat = q_4d.contiguous().view(batch * q_len, h_q, d)
     cu_seqlens_q = torch.arange(
         0,
@@ -426,6 +459,7 @@ def triton_vllm_flash_attn_with_kvcache(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        layout=layout,
     )
     out = out.view(batch, q_len, h_q, out.shape[-1])
     if squeeze_q_dim:
