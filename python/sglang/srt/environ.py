@@ -1348,6 +1348,12 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # RLC (Repartition-Local Compression): attention c4 + prefill-CP + round-robin optimization.
+    # Off by default; enable to replace the full-kv_score all-gather with an all-to-all repartition +
+    # local compress + all-gather of the compact output.
+    SGLANG_DSV4_COMPRESS_RLC = EnvBool(False)
+    # Deprecated: DSV4 compressor V2 is always used.
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
@@ -1399,6 +1405,8 @@ class Envs:
     # DeepSeek V4 - model and quantization
     # ===================================================================
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE = EnvBool(False)
+    SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER = EnvBool(False)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
@@ -1410,8 +1418,6 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
-    # Deprecated: DSV4 compressor V2 is always used.
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
@@ -1504,6 +1510,19 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
+    SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"
+    )
+    SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
+    )
+    # gfx936-only: page-planar INT8 K plus one FP32 scale per token.
+    SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
+    )
+    # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
+    SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

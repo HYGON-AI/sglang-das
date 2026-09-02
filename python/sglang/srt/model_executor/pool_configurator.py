@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -22,7 +23,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    dsa_layer_skips_topk,
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -32,6 +33,11 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+    index_k_cache_bytes_per_token,
+    index_k_workspace_bytes_per_token,
+    resolve_index_k_cache_mode,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
@@ -49,12 +55,8 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
-    is_hcu,
-    is_hcu_native_fp8_supported,
     spec_decode_alloc_len_per_request,
 )
-
-_is_hcu = is_hcu()
 
 
 @dataclass
@@ -229,15 +231,30 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size = _dflash_draft_cell_size(kvc) or None
+                if draft_cell_size is None and is_deepseek_dsa(
+                    kvc.model_config.hf_config
+                ):
+                    draft_cell_size = self._compute_cell_size(
+                        kvc,
+                        int(draft_num_layers) * get_parallel().attn_dcp_size,
+                        force_dense_dsa_indexer=True,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
-                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+                    draft_cell_size_per_token=draft_cell_size,
                 )
 
-    def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
+    def _compute_cell_size(
+        self,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+        *,
+        force_dense_dsa_indexer: bool = False,
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
         model_config = kvc.model_config
@@ -249,6 +266,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
             kvc, num_layers
         )
+        if force_dense_dsa_indexer:
+            effective_num_layers = num_layers
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
@@ -285,6 +304,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
+                    allocate_all_layers=force_dense_dsa_indexer,
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -362,20 +382,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+        cache_mode = resolve_index_k_cache_mode(
+            kvc.kv_cache_dtype,
+            kvc.page_size,
+            index_head_dim,
         )
-        element_size = torch._utils._element_size(
-            DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        )
-        if _is_hcu and (
-            kvc.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
-            or not is_hcu_native_fp8_supported()
-        ):
-            # HCU falls back to a bf16 index-K cache whenever the KV cache is not
-            # native FP8: no per-block scale tail, and a bf16 element size.
-            indexer_size_per_token = index_head_dim
-            element_size = torch._utils._element_size(torch.bfloat16)
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -387,18 +398,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if allocate_all_layers or not _should_elide_dsa_index_k(
-            is_draft_worker=kvc.is_draft_worker
-        ):
+        if allocate_all_layers:
             num_indexer_layers = num_layers
         else:
-            active_indexer_layers = [
-                layer_id
-                for layer_id in range(
-                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
+            if _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker):
+                active_indexer_layers = get_dsa_full_indexer_layer_ids(
+                    kvc.model_config.hf_config,
+                    kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer,
                 )
-                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
-            ]
+            else:
+                active_indexer_layers = list(
+                    range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+                )
+
+            num_indexer_layers = len(active_indexer_layers)
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
                 get_layer_shard_range,
@@ -418,12 +432,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         ),
                     )
                 num_indexer_layers = max_owned + 1
-            else:
-                num_indexer_layers = len(active_indexer_layers)
 
-        return int(
-            indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        persistent_bytes = (
+            index_k_cache_bytes_per_token(cache_mode)
+            * num_indexer_layers
+            * indexer_ratio
         )
+        workspace_bytes = index_k_workspace_bytes_per_token(cache_mode)
+        return math.ceil(persistent_bytes + workspace_bytes)
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

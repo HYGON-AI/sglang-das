@@ -1018,6 +1018,24 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
 
+def attn_cp_all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    output_split_sizes: Optional[List[int]] = None,
+    input_split_sizes: Optional[List[int]] = None,
+):
+    """All-to-all over dim 0 within the attention CP group (variable splits ok).
+
+    Used by the DSV4 compressor RLC path to repartition round-robin-scattered
+    tokens into per-rank contiguous blocks.
+    """
+    return get_attn_cp_group().all_to_all_single(
+        output,
+        input,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+    )
+
 
 def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)

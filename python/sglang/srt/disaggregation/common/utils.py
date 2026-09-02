@@ -183,6 +183,14 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
     ]
 
 
+def pack_string_list(values: List[str]) -> bytes:
+    return pack_list_of_buffers([value.encode("utf-8") for value in values])
+
+
+def unpack_string_list(buf: bytes) -> List[str]:
+    return [value.decode("utf-8") for value in unpack_list_of_buffers(buf)]
+
+
 class FastQueue:
     def __init__(self):
         self._buf = deque()

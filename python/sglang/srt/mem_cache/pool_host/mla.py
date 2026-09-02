@@ -23,11 +23,15 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
 )
-from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    kernel_accessible_host_ptr,
+)
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -88,8 +92,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
-        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            element_size=self.kv_cache_dim * self.dtype.itemsize
+        hcu_layer_sharded = _is_hcu and self._is_device_layer_sharded(device_pool)
+        self.can_use_jit = (
+            (_is_cuda or _is_hip)
+            and not hcu_layer_sharded
+            and can_use_hicache_jit_kernel(
+                element_size=self.kv_cache_dim * self.dtype.itemsize
+            )
         )
 
         if self.layout == "page_first":
@@ -100,7 +109,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
+            [kernel_accessible_host_ptr(x) for x in self.data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -250,6 +259,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool):
+            absolute_layer_id = device_pool.start_layer + layer_id
+            device_pool.invalidate_remote_kv_buffer_for_layer(absolute_layer_id)
+            device_pool.invalidate_index_buffer_for_layer(absolute_layer_id)
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
@@ -257,6 +270,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        hcu_layer_split_kwargs = (
+            {"num_warps_per_block": 4}
+            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            else {}
+        )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -275,6 +293,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        **hcu_layer_split_kwargs,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -294,6 +313,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        **hcu_layer_split_kwargs,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -352,6 +372,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        hcu_layer_split_kwargs = (
+            {"num_warps_per_block": 4}
+            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            else {}
+        )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -370,6 +395,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
+                        **hcu_layer_split_kwargs,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -379,6 +405,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=host_indices,
                         indices_src=device_indices,
                         element_dim=self.kv_cache_dim,
+                    )
+                elif _is_hcu:
+                    # There is no per-layer LF->PF AOT kernel. This synchronous
+                    # HCU fallback preserves correctness at lower throughput.
+                    host_layer = self.data_refs[host_layer_id].view(
+                        -1, self.kv_cache_dim
+                    )
+                    device_layer = device_pool.kv_buffer[device_layer_id].view(
+                        -1, self.kv_cache_dim
+                    )
+                    copied_rows = device_layer.index_select(
+                        0, device_indices.to(device_layer.device)
+                    ).to(host_layer.device)
+                    host_layer.index_copy_(
+                        0, host_indices.to(host_layer.device), copied_rows
                     )
                 else:
                     raise ValueError(
@@ -430,7 +471,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    self.target_layer_num + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )

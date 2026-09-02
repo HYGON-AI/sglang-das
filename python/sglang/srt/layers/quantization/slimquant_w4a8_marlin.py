@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import logging
 import os
 from typing import Dict, List, Optional
@@ -51,7 +52,6 @@ from sglang.srt.layers.quantization.w4a8_utils import w4a8_weight_repack_impl
 from sglang.srt.utils import get_bool_env_var, set_weight_attrs
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 # from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
-
 
 logger = logging.getLogger(__name__)
 
@@ -599,8 +599,11 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         return super().__new__(cls)
 
     def __init__(self, quant_config):
+        from lightop.moe import fused_experts_impl_w4a8_marlin
+
         self.quant_config = quant_config
         self.use_deepep = get_moe_a2a_backend().is_deepep()
+        self.fused_experts_impl_w4a8_marlin = fused_experts_impl_w4a8_marlin
 
     def create_weights(
         self,
@@ -815,7 +818,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             if self.moe_runner_config.routed_scaling_factor is not None
             else 1.0
         )
-        output = fused_experts_impl_w4a8_marlin(
+        output = self.fused_experts_impl_w4a8_marlin(
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -891,7 +894,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
             if self.moe_runner_config.routed_scaling_factor is not None
             else 1.0
         )
-        return fused_experts_impl_w4a8_marlin(
+        return self.fused_experts_impl_w4a8_marlin(
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -945,7 +948,7 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
         routed_scaling_factor = (
             1.0 if routed_scaling_factor is None else routed_scaling_factor
         )
-        return fused_experts_impl_w4a8_marlin(
+        return self.fused_experts_impl_w4a8_marlin(
             x,
             w1,
             w2,
@@ -1252,6 +1255,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
+        self.use_deepep = get_moe_a2a_backend().is_deepep()
+        self._ep_use_marlin = False
 
     def create_weights(
         self,
@@ -1310,6 +1315,29 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_deepep:
+            # DeepEP grouped GEMM consumes the HIPC pack + x16 scale, not the
+            # Aiter TP shuffle layout. Matching SlimQuantW4A8Int8MarlinMoEMethod.
+            from deepgemm import pack_w4a8_moe_hipc_weight
+
+            layer.w13_weight = Parameter(
+                pack_w4a8_moe_hipc_weight(layer.w13_weight.data),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
+                requires_grad=False,
+            )
+            scale_mul = 16.0
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data * scale_mul, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data * scale_mul, requires_grad=False
+            )
+            self._ep_use_marlin = False
+            return
+
         E = layer.w13_weight.shape[0]
         layer.w13_weight = Parameter(
             repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False
@@ -1317,6 +1345,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.w2_weight = Parameter(
             repack_and_shuffle_w4a8(layer.w2_weight.data, E), requires_grad=False
         )
+        self._ep_use_marlin = False
 
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data, requires_grad=False
@@ -1337,6 +1366,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer: torch.nn.Module,
         dispatch_output,
     ):
+        from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
+
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1393,3 +1424,220 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
+
+    def _get_ep_expert_map(
+        self,
+        global_num_experts: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        cached = getattr(self, "_ep_expert_map", None)
+        if (
+            cached is not None
+            and cached.numel() == global_num_experts
+            and cached.device == device
+        ):
+            return cached
+        from sglang.srt.distributed import (
+            get_moe_expert_parallel_rank,
+            get_moe_expert_parallel_world_size,
+        )
+        from sglang.srt.layers.moe.fused_moe_triton.layer import determine_expert_map
+
+        _, expert_map = determine_expert_map(
+            get_moe_expert_parallel_world_size(),
+            get_moe_expert_parallel_rank(),
+            global_num_experts,
+        )
+        expert_map = expert_map.to(device=device, dtype=torch.int32)
+        self._ep_expert_map = expert_map
+        return expert_map
+
+    @torch._dynamo.disable()
+    def apply_ep(
+        self,
+        x: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        w1_scale: Optional[torch.Tensor] = None,
+        w2_scale: Optional[torch.Tensor] = None,
+        a1_scale: Optional[torch.Tensor] = None,
+        a2_scale: Optional[torch.Tensor] = None,
+        use_nn_moe: Optional[bool] = False,
+        num_local_tokens: Optional[torch.Tensor] = None,
+        routed_scaling_factor: Optional[float] = 1.0,
+        shared_output: Optional[torch.Tensor] = None,
+        num_recv_tokens_per_expert: List = None,
+        **_,
+    ):
+        if getattr(self, "_ep_use_marlin", False):
+            # Weights were packed into the lightop Marlin layout. Honor the
+            # DeepEP dummy-global-id ABI the same way SlimQuantW4A8Int8MarlinMoEMethod does.
+            _ensure_lightop_w4a8_marlin_available()
+            workspace, global_reduce_buffer = MarlinMoeWorkspace(x.device).get_buffers()
+            routed_scaling_factor = (
+                1.0 if routed_scaling_factor is None else routed_scaling_factor
+            )
+            return fused_experts_impl_w4a8_marlin(
+                x,
+                w1,
+                w2,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                workspace=workspace,
+                global_reduce_buffer=global_reduce_buffer,
+                inplace=True,
+                use_int4_w4a8=True,
+                per_channel_quant=True,
+                activation=activation,
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                use_nn_moe=use_nn_moe,
+                shared_output=shared_output,
+                routed_scaling_factor=float(routed_scaling_factor),
+            )
+
+        # Non-DeepEP / TP path: aiter shuffled [E, N, K/2] weights.
+        _ensure_aiter_w4a8_marlin_available()
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "apply_router_weight_on_input is not supported by AITER W4A8 apply_ep."
+            )
+        if shared_output is not None:
+            raise NotImplementedError(
+                "shared_output is not supported by AITER W4A8 apply_ep."
+            )
+        if x.shape[0] == 0:
+            return x.bfloat16() if x.dtype != torch.bfloat16 else x
+
+        e = w1.size(0)
+        k = x.size(-1)
+        n1 = w1.size(1)
+        n2 = n1 // 2
+        topk_ids = topk_ids.to(torch.int32)
+        topk = topk_ids.size(1)
+        if x.dim() == 2:
+            m = x.size(0)
+        else:
+            assert x.dim() == 3
+            assert x.size(0) == e, f"{x.size(0)} == {e}"
+            m = x.size(1)
+        orig_m = m
+        scatter_idx = None
+
+        if global_num_experts is None or global_num_experts < 0:
+            global_num_experts = e
+        if global_num_experts > e:
+            from sglang.srt.distributed import (
+                get_moe_expert_parallel_rank,
+                get_moe_expert_parallel_world_size,
+            )
+
+            ep_rank = get_moe_expert_parallel_rank()
+            rank_offset = ep_rank * (
+                global_num_experts // get_moe_expert_parallel_world_size()
+            )
+            dummy = global_num_experts - 1 if ep_rank == 0 else 0
+            local_ids = topk_ids - rank_offset
+            invalid = (
+                (topk_ids == dummy)
+                | (topk_ids < 0)
+                | (local_ids < 0)
+                | (local_ids >= e)
+            )
+            valid = ~invalid
+            if not valid.any():
+                return torch.zeros(
+                    orig_m, k, device=x.device, dtype=torch.bfloat16
+                )
+            # DeepEP pads unused top-k slots with a dummy global id. aiter_moe
+            # has no skip mask, so compact to valid (token, expert) pairs with
+            # topk=1 and scatter-add. Dummy traffic must not run as expert 0.
+            scatter_idx, _ = torch.where(valid)
+            x = x.index_select(0, scatter_idx)
+            if a1_scale is not None:
+                scale = a1_scale
+                if scale.dim() == 1:
+                    scale = scale.unsqueeze(-1)
+                a1_scale = scale.index_select(0, scatter_idx)
+            topk_ids = local_ids[valid].to(torch.int32).view(-1, 1)
+            topk_weights = topk_weights[valid].view(-1, 1)
+            m = x.size(0)
+            topk = 1
+            global_num_experts = e
+            expert_map = None
+
+        x = x.contiguous()
+        topk_ids = topk_ids.contiguous()
+        topk_weights = topk_weights.contiguous()
+        if a1_scale is not None:
+            a1_scale = a1_scale.contiguous()
+
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            if a1_scale is None:
+                raise RuntimeError(
+                    "AITER W4A8 apply_ep received non-floating activations "
+                    f"({x.dtype}) without a1_scale."
+                )
+            # Keep INT8 + per-token scale. Dequantizing to BF16 made aiter
+            # pick the wrong W4A8 kernel and produced garbage logits.
+            output_dtype = torch.bfloat16
+            config_dtype = x.dtype
+        else:
+            output_dtype = x.dtype
+            config_dtype = x.dtype
+        status, moe_config = get_aiter_moe_config(
+            M=m,
+            E=e,
+            N1=n1,
+            N2=n2,
+            K=k,
+            top_k=topk,
+            block_size=None,
+            dtype=config_dtype,
+            quant_type=MoeQuantType.W4A8,
+            activation=activation,
+        )
+        if not status:
+            raise RuntimeError(
+                "aiter backend did not find a valid w4a8 tpmoe config for "
+                f"M={m}, E={e}, N1={n1}, N2={n2}, K={k}, topk={topk}, "
+                f"dtype={output_dtype}, activation={activation}."
+            )
+
+        routed_scaling_factor = (
+            1.0 if routed_scaling_factor is None else routed_scaling_factor
+        )
+        output = aiter_moe(
+            x,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights.to(torch.float32),
+            topk_ids=topk_ids,
+            moe_config=moe_config,
+            activation=activation,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            routed_scaling_factor=float(routed_scaling_factor),
+            output_dtype=output_dtype,
+        )
+        if scatter_idx is None:
+            return output
+        combined = torch.zeros(
+            orig_m, k, device=output.device, dtype=output.dtype
+        )
+        combined.index_add_(0, scatter_idx, output)
+        return combined

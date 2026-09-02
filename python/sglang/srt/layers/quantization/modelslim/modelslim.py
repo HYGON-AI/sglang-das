@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import apply_module_patch
+from sglang.srt.utils import apply_module_patch, get_bool_env_var, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -107,17 +107,33 @@ class ModelSlimConfig(QuantizationConfig):
                 for k, v in quant_config.items()
             }
 
-        # Add an mlp.* alias for each block_sparse_moe.* key but KEEP the original,
-        # so both module namings resolve
-        for k in list(quant_config.keys()):
-            if not isinstance(k, str):
-                continue
-            if "block_sparse_moe" in k:
-                quant_config[
-                    k.replace("block_sparse_moe.experts", "mlp.experts").replace(
-                        "block_sparse_moe.shared_experts", "mlp.shared_experts"
-                    )
-                ] = quant_config[k]
+        # Kimi-K3 ModelSlim checkpoints name LM weights under
+        # language_model.model.*.block_sparse_moe.*, but runtime prefixes are
+        # model.*.mlp.* (language_model wrapper prefix is "" at construction).
+        is_kimi_k3 = any(
+            k.startswith("language_model.model.") and "block_sparse_moe" in k
+            for k in keys
+        )
+        if is_kimi_k3:
+            from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+            remap = KimiK3ForConditionalGeneration.remap_quant_name_to_sglang
+            quant_config = {
+                (remap(k) if isinstance(k, str) else k): v
+                for k, v in quant_config.items()
+            }
+        else:
+            # Add an mlp.* alias for each block_sparse_moe.* key but KEEP the
+            # original, so both module namings resolve for non-Kimi checkpoints.
+            for k in list(quant_config.keys()):
+                if not isinstance(k, str):
+                    continue
+                if "block_sparse_moe" in k:
+                    quant_config[
+                        k.replace("block_sparse_moe.experts", "mlp.experts").replace(
+                            "block_sparse_moe.shared_experts", "mlp.shared_experts"
+                        )
+                    ] = quant_config[k]
 
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
@@ -254,6 +270,53 @@ class ModelSlimConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelSlimConfig:
         return cls(config)
 
+    def _resolve_fused_mapping(self, prefix: str) -> Dict[str, List[str]]:
+        """Return fused→shard mapping for ``prefix``.
+
+        Supports both nested NPU-style maps
+        (``{"model": {"gate_up_proj": [...]}}``) and flat model-declared maps
+        (``{"gate_up_proj": [...]}``). Flat entries fill gaps left by the
+        nested subset so Kimi fused names like ``fused_qkvg_proj`` resolve.
+        """
+        key = "model"
+        if "vision_model" in prefix:
+            key = "vision_model"
+        elif "visual" in prefix:
+            key = "visual"
+
+        nested = self.packed_modules_mapping.get(key, {})
+        fused: Dict[str, List[str]] = dict(nested) if isinstance(nested, dict) else {}
+        for name, shards in self.packed_modules_mapping.items():
+            if isinstance(shards, list) and name not in fused:
+                fused[name] = shards
+        return fused
+
+    def _prefix_in_quant_config(
+        self, prefix: str, fused_mapping: Mapping[str, List[str]]
+    ) -> str:
+        """Map a fused runtime prefix onto a checkpoint/quant shard prefix.
+
+        Prefer the first shard that has a non-FLOAT scheme so mixed fused
+        modules (e.g. Kimi ``fused_qkvg_proj`` with FLOAT ``g_proj``) still
+        pick up the quantized scheme used by q/k/v.
+        """
+        proj_name = prefix.split(".")[-1]
+        shard_names = fused_mapping.get(proj_name)
+        if not shard_names:
+            return prefix
+
+        first_existing = None
+        for shard_name in shard_names:
+            candidate = prefix.replace(proj_name, shard_name)
+            scheme = self.quant_description.get(candidate + ".weight", "")
+            if not scheme:
+                continue
+            if first_existing is None:
+                first_existing = candidate
+            if scheme != "FLOAT":
+                return candidate
+        return first_existing if first_existing is not None else prefix
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -264,25 +327,14 @@ class ModelSlimConfig(QuantizationConfig):
 
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
-            key = "model"
-            if "vision_model" in prefix:
-                key = "vision_model"
-            elif "visual" in prefix:
-                key = "visual"
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
-            prefix_in_quant_config = prefix
-            proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
-            prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
-            if self.is_layer_skipped(
-                prefix, packed_modules_mapping_subset
-            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
+            fused_mapping = self._resolve_fused_mapping(prefix)
+            prefix_in_quant_config = self._prefix_in_quant_config(
+                prefix, fused_mapping
+            )
+            if self.is_layer_skipped(prefix, fused_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
@@ -527,16 +579,40 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
 
 class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     """
-    Fused MoE method for ModelSlim quantization on Ascend NPU.
+    Fused MoE method for ModelSlim quantization.
 
-    Delegates routing, activation, and finalization to the modular NPU MoE
-    components introduced in the hardware backend refactoring.
+    Default (Ascend NPU): modular Ascend MoE runner.
+    Optional (HCU Plan A): ``MoeRunnerBackend.AITER`` for W4A8 — converts
+    AscendV1 checkpoint layout to aiter MOE_C at load time and runs
+    ``aiter_moe`` with ``activation=situ``.
+
+    Enable aiter MoE via ``--moe-runner-backend aiter`` or
+    ``SGLANG_MODELSLIM_MOE_USE_AITER=1`` (auto backend on HCU).
+    Shared-expert W8A8 Linear layers keep the existing ModelSlim linear path.
     """
 
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
+        self._use_aiter_w4a8 = False
+
+    @staticmethod
+    def _is_w4a8_moe(layer: torch.nn.Module) -> bool:
+        return isinstance(getattr(layer, "w13_scheme", None), ModelSlimW4A8Int8MoE)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._use_aiter_w4a8:
+            from sglang.srt.layers.quantization.modelslim.aiter_w4a8 import (
+                convert_modelslim_moe_weights_to_aiter,
+            )
+
+            # Match serving default: aiter fused MoE does not apply scale_bias.
+            skip_scale_bias = get_bool_env_var(
+                "SGLANG_W4A8_MOE_SKIP_SCALE_BIAS", default="true"
+            )
+            convert_modelslim_moe_weights_to_aiter(
+                layer, skip_scale_bias=skip_scale_bias
+            )
+            return
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
 
@@ -574,9 +650,45 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.quantization.modelslim.aiter_w4a8 import (
+            is_aiter_w4a8_available,
+            modelslim_moe_use_aiter_requested,
+        )
+
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
+        want_aiter = backend.is_aiter() or (
+            backend.is_auto() and modelslim_moe_use_aiter_requested()
+        )
+        self._use_aiter_w4a8 = False
+
+        if want_aiter and self._is_w4a8_moe(layer):
+            if not is_hcu():
+                raise RuntimeError(
+                    "ModelSlim W4A8 aiter MoE requires HCU "
+                    "(--moe-runner-backend aiter / SGLANG_MODELSLIM_MOE_USE_AITER)."
+                )
+            if not is_aiter_w4a8_available():
+                raise ImportError(
+                    "aiter is required for ModelSlim W4A8 aiter MoE. "
+                    "Install the pip aiter wheel in the HCU container."
+                )
+            self._use_aiter_w4a8 = True
+            self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+            logger.info_once(
+                "ModelSlim W4A8 MoE using MoeRunnerBackend.AITER "
+                "(AscendV1 → aiter layout at load; aiter_moe + situ)."
+            )
+            return
+
+        if want_aiter and not self._is_w4a8_moe(layer):
+            raise ValueError(
+                "ModelSlim --moe-runner-backend aiter / SGLANG_MODELSLIM_MOE_USE_AITER "
+                "currently supports only W4A8_DYNAMIC MoE; "
+                f"got w13_scheme={type(getattr(layer, 'w13_scheme', None)).__name__}."
+            )
+
         if backend.is_auto():
             backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
@@ -589,6 +701,9 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         layer,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if self._use_aiter_w4a8:
+            return self._apply_aiter_w4a8(layer, dispatch_output)
+
         from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
         quant_info = AscendQuantInfo(
@@ -604,3 +719,41 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight_bias=getattr(layer, "w2_weight_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)
+
+    @torch._dynamo.disable()
+    def _apply_aiter_w4a8(
+        self,
+        layer,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+        from sglang.srt.layers.quantization.modelslim.aiter_w4a8 import (
+            _normalize_moe_activation,
+            apply_modelslim_aiter_moe,
+        )
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        if x.shape[0] == 0:
+            return StandardCombineInput(hidden_states=x)
+
+        cfg = self.moe_runner_config
+        activation = _normalize_moe_activation(cfg.activation)
+        output = apply_modelslim_aiter_moe(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            gemm1_alpha=cfg.gemm1_alpha,
+            gemm1_limit=cfg.gemm1_clamp_limit,
+            routed_scaling_factor=(
+                float(cfg.routed_scaling_factor)
+                if cfg.routed_scaling_factor is not None
+                else 1.0
+            ),
+            global_num_experts=cfg.num_experts or -1,
+            expert_map=getattr(layer, "expert_map", None),
+            borrow_tuned_config_experts=cfg.num_experts or 0,
+        )
+        return StandardCombineInput(hidden_states=output)

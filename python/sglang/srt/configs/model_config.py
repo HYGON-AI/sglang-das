@@ -245,6 +245,24 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def get_dsa_full_indexer_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
+) -> List[int]:
+    """Return DSA layers that run an indexer instead of reusing top-k."""
+    if end_layer is None:
+        end_layer = config.num_hidden_layers
+    assert 0 <= start_layer <= end_layer
+    if not is_deepseek_dsa(config):
+        return list(range(start_layer, end_layer))
+    return [
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    ]
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads

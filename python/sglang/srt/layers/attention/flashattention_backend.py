@@ -1589,13 +1589,19 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=(
+                        use_cascade_attn or forward_batch.mha_return_lse
+                    ),
                     num_splits=self.num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     **({"layout": "bhsd"} if self._use_hcu_bhsd else {}),
                     **kwargs,
                 )
+            if forward_batch.mha_return_lse:
+                output, lse, *rest = result
+                lse = torch.transpose(lse, 0, 1).contiguous()
+                return output, lse
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result

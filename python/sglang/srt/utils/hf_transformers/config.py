@@ -63,6 +63,28 @@ _LONGCAT_ARCHS = {
     "LongcatFlashNgramForCausalLM",
 }
 
+_GLM_MOE_DSA_ARCHS = {
+    "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
+}
+
+
+def _restore_glm_moe_dsa_raw_config_fields(
+    config, model, revision: Optional[str], **kwargs
+):
+    """Restore GLM DSA fields clobbered by incompatible Transformers versions."""
+    architectures = getattr(config, "architectures", None) or []
+    if not any(arch in _GLM_MOE_DSA_ARCHS for arch in architectures):
+        return
+
+    raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision, **kwargs)
+    for key in ("qk_rope_head_dim", "index_topk_freq"):
+        if key in raw_config and getattr(config, key, None) != raw_config[key]:
+            setattr(config, key, raw_config[key])
+
+    if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
+        config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
 
 def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     config_dict, _ = PretrainedConfig.get_config_dict(
@@ -94,6 +116,10 @@ class HfModelConfigParser(ModelConfigParserBase):
                 revision=revision,
                 **kwargs,
             )
+
+        _restore_glm_moe_dsa_raw_config_fields(
+            config, model, revision=revision, **kwargs
+        )
 
         if (
             config.architectures is not None

@@ -121,12 +121,16 @@ from deepgemm import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_masked,
-    m_grouped_w4a8_gemm_nt_contiguous_hipc,
     m_grouped_w4a8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked_hipc,
 )
+try:
+    from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
+except ImportError:
+    m_grouped_w4a8_gemm_nt_contiguous_hipc = None
+
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import moe as lightop_op
+from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -146,6 +150,7 @@ _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_w4a8_contiguous_hipc = get_bool_env_var(
     "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
 )
+_use_w4a8_masked_hipc = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -1166,6 +1171,11 @@ class DeepEPMoE(FusedMoE):
         assert self.moe_runner_config.activation in ("silu", "situ")
 
         if _use_w4a8_contiguous_hipc:
+            if m_grouped_w4a8_gemm_nt_contiguous_hipc is None:
+                raise RuntimeError(
+                    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC requires a deepgemm build "
+                    "with m_grouped_w4a8_gemm_nt_contiguous_hipc support."
+                )
             if num_recv_tokens_per_expert is None:
                 return hidden_states.bfloat16()
             all_tokens = sum(num_recv_tokens_per_expert)
@@ -1245,7 +1255,18 @@ class DeepEPMoE(FusedMoE):
                     self.moe_runner_config.gemm1_clamp_limit,
                 )
             else:
-                q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+                # Apply the model-declared SwiGLU clamp when present. Models
+                # without swiglu_limit retain the original unclamped path.
+                swiglu_limit = getattr(
+                    self.moe_runner_config, "swiglu_limit", None
+                )
+                if swiglu_limit is None:
+                    q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+                else:
+                    q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                        gateup_output,
+                        float(swiglu_limit),
+                    )
             del gateup_output
 
             down_output = torch.empty(
@@ -1979,8 +2000,16 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
         )
 
+        # The HIPC kernel requires a separately shuffled int8 weight layout.
+        # Keep the existing packed-weight kernel as the compatibility default.
+        grouped_w4a8_op = (
+            torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc
+            if _use_w4a8_masked_hipc
+            else torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked
+        )
+
         # ---- first GEMM ----
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc(
+        grouped_w4a8_op(
             hidden_states,
             hidden_states_scale,
             w13_weight,
@@ -2000,9 +2029,19 @@ class DeepEPMoE(FusedMoE):
                 self.moe_runner_config.gemm1_clamp_limit,
             )
         else:
-            q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
-                gateup_output, masked_m
-            )
+            # Only models that declare a SwiGLU clamp limit use the clamp kernel.
+            swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
+            if swiglu_limit is None:
+                q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+                    gateup_output, masked_m
+                )
+            else:
+                q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                    gateup_output,
+                    float(swiglu_limit),
+                    mask_m=masked_m,
+                    expect_m=expected_m,
+                )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
@@ -2013,7 +2052,7 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
         )
 
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc(
+        grouped_w4a8_op(
             q_a2_all,
             q_a2_scale,
             w2_weight,

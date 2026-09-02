@@ -1047,6 +1047,48 @@ def get_kv_class(
     return class_mapping.get(class_type)
 
 
+def pack_state_types(state_types) -> bytes:
+    return ",".join(state_type.value for state_type in (state_types or [])).encode(
+        "ascii"
+    )
+
+
+def unpack_state_types(data: bytes):
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if not data:
+        return []
+    return [StateType(value) for value in data.decode("ascii").split(",") if value]
+
+
+def resolve_state_component_dst_index(src_state_types, dst_state_types, src_index: int):
+    if not dst_state_types:
+        return src_index
+    if not src_state_types:
+        raise RuntimeError(
+            "Destination state_types are present but source state_types are empty."
+        )
+    if src_index >= len(src_state_types):
+        raise RuntimeError(
+            f"Source state component index {src_index} exceeds "
+            f"state_types length {len(src_state_types)}."
+        )
+    state_type = src_state_types[src_index]
+    occurrence = sum(
+        1 for item in src_state_types[: src_index + 1] if item == state_type
+    )
+    seen = 0
+    for dst_index, dst_state_type in enumerate(dst_state_types):
+        if dst_state_type == state_type:
+            seen += 1
+            if seen == occurrence:
+                return dst_index
+    raise RuntimeError(
+        f"Decode peer is missing state component {state_type!s} "
+        f"occurrence {occurrence}."
+    )
+
+
 def _get_cp_rank_page_bounds(
     total_pages: int, cp_rank: int, cp_size: int
 ) -> Tuple[int, int]:
@@ -1267,6 +1309,58 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def build_kv_layer_ids(
+    *,
+    token_to_kv_pool,
+    draft_token_to_kv_pool,
+    num_draft_entries: int,
+    num_hidden_layers: int,
+) -> List[int]:
+    """Return a global layer id for every target and draft KV entry."""
+    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
+        return []
+    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    if not layer_ids:
+        return []
+    num_target_entries = len(token_to_kv_pool.get_contiguous_buf_infos()[0])
+    if len(layer_ids) == num_target_entries:
+        target_layer_ids = layer_ids
+    elif len(layer_ids) * 2 == num_target_entries:
+        target_layer_ids = layer_ids * 2
+    else:
+        return []
+    if draft_token_to_kv_pool is None:
+        return target_layer_ids
+
+    draft_ids = _draft_entry_layer_ids(
+        pool=draft_token_to_kv_pool, num_entries=num_draft_entries
+    )
+    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
+    return target_layer_ids + [
+        num_hidden_layers + band_index[lid] for lid in draft_ids
+    ]
+
+
+def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if isinstance(pool, HybridLinearKVPool):
+        ids = pool.get_kv_layer_ids()
+    else:
+        if pool.layer_num <= 0 or num_entries % pool.layer_num != 0:
+            raise RuntimeError(
+                "Draft KV buffers must register a whole number of per-layer "
+                f"groups: entries={num_entries}, layers={pool.layer_num}"
+            )
+        ids = list(range(pool.layer_num)) * (num_entries // pool.layer_num)
+    if len(ids) != num_entries:
+        raise RuntimeError(
+            "Draft KV layer ids must cover every registered entry: "
+            f"ids={len(ids)}, entries={num_entries}"
+        )
+    return ids
+
+
 def resolve_dcp_dst_entry_indices(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
@@ -1302,13 +1396,13 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    data_format: str = "",
 ) -> None:
-    """Append one state component. Caller orders state_types consistently
-    on prefill and decode sides."""
     kv_args.state_types.append(state_type)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
+    kv_args.state_data_formats.append(data_format)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
@@ -1343,6 +1437,7 @@ def setup_state_kv_args(
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
+    kv_args.state_data_formats = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
@@ -1453,6 +1548,15 @@ def setup_state_kv_args(
                 layer_ids,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
+            data_format = (
+                token_to_kv_pool.get_index_k_cache_transfer_abi()
+                if isinstance(token_to_kv_pool, DSATokenToKVPool)
+                else ""
+            )
+            has_state_layer_ids = hasattr(token_to_kv_pool, "get_state_layer_ids")
+            state_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids() if has_state_layer_ids else []
+            )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1464,14 +1568,36 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
+                if has_state_layer_ids:
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "total_kv_layers is required for DSA draft state metadata"
+                        )
+                    state_layer_ids += [
+                        total_kv_layers + i for i in range(len(draft_data_ptrs))
+                    ]
+                draft_data_format = (
+                    draft_token_to_kv_pool.get_index_k_cache_transfer_abi()
+                )
+                if draft_data_format != data_format:
+                    raise ValueError(
+                        "Target and draft DSA index-K cache transfer ABIs differ: "
+                        f"target={data_format!r}, draft={draft_data_format!r}"
+                    )
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
                 kv_args.total_kv_layers = total_kv_layers
-            else:
+            elif data_ptrs:
                 append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                    kv_args,
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    layer_ids=state_layer_ids,
+                    data_format=data_format,
                 )
 
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):

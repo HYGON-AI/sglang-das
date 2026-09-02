@@ -36,7 +36,16 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.distributed.parallel_state import get_attn_cp_group
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsv4.rlc import compute_rlc_metadata
+from sglang.srt.layers.dp_attention import (
+    attn_cp_all_gather_into_tensor,
+    attn_cp_all_to_all_single,
+)
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_fp8_rope_bf16_pack_lightop,
+)
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -392,6 +401,127 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
+# RLC (Repartition-Local Compression) run-time cache: data-independent metadata + derived GPU tensors +
+# local compress plan depend only on (ratio, extend_lens, prefix_lens, cp_rank, device), not on the
+# layer. One forward's c4 layers reuse the same bundle; rebuilt only when the lengths change.
+_rlc_bundle_cache: dict = {}
+
+
+def _rlc_prefix_aligned(forward_batch: ForwardBatch, ratio: int) -> bool:
+    """RLC's prefix-overlap patch assumes each sequence's prefix is a multiple of `ratio`, so the
+    extend-first block reads exactly the prefix's last block via the load_normal page. This holds for
+    page-aligned chunked prefill (chunks are page_size-aligned, a multiple of ratio); guard the rare
+    non-aligned-prefix case by falling back to the base path (which handles any prefix)."""
+    seq = forward_batch.seq_lens_cpu
+    ext = forward_batch.extend_seq_lens_cpu
+    if seq is None or ext is None:
+        return False
+    return all((int(s) - int(e)) % ratio == 0 for s, e in zip(seq, ext))
+
+
+def _get_rlc_bundle(extend_lens, prefix_lens, ratio, cp_size, cp_rank, device, write_plan):
+    """Build (and cache) the data-independent RLC metadata for one prefill chunk: routing tensors, the
+    local compress plan (v1) with PER-SEGMENT PREFIX, expansion rows, the per-segment global sequence
+    indices (used to gather load pages from the global paged metadata), and the state-pool WRITE
+    indices (compact/remap gather -- pure geometry from `write_plan`). Cached by
+    (ratio, cp_size, cp_rank, device, extend_lens, prefix_lens) -> reused across all c4 layers of a
+    forward."""
+    key = (ratio, cp_size, cp_rank, str(device),
+           tuple(int(x) for x in extend_lens), tuple(int(x) for x in prefix_lens))
+    bundle = _rlc_bundle_cache.get(key)
+    if bundle is not None:
+        return bundle
+
+    R = ratio
+    meta = compute_rlc_metadata(extend_lens, ratio, cp_size, cp_rank)
+    send_idx = torch.tensor(meta.send_idx, dtype=torch.long, device=device)
+    recv_perm = torch.tensor(meta.recv_perm, dtype=torch.long, device=device)
+    ev = torch.tensor(meta.ev, dtype=torch.long, device=device)
+
+    n_recv = int(sum(meta.out_splits))
+    local_plan_c = None
+    local_ev = torch.empty(0, dtype=torch.long, device=device)
+    if n_recv > 0 and meta.local_extend_lens:
+        segs = meta.local_extend_lens
+        prefix_local = [int(prefix_lens[meta.local_seg_seqs[i]]) if meta.local_seg_boundary[i] else 0
+                        for i in range(len(segs))]
+        seq_local = [prefix_local[i] + segs[i] for i in range(len(segs))]
+        seq_t = torch.tensor(seq_local, dtype=torch.int64, device=device)
+        ext_t = torch.tensor(segs, dtype=torch.int64, device=device)
+        local_plan = CompressorPrefillPlan.generate(
+            compress_ratio=R, num_q_tokens=n_recv, seq_lens=seq_t, extend_lens=ext_t, device=device)
+        lev = local_plan.compress_plan.detach().cpu().contiguous().view(torch.int32)[:, 0]
+        local_ev = lev[(lev >= 0) & (lev < n_recv)].sort().values.long().to(device)
+        empty16 = torch.zeros((0, 16), dtype=torch.uint8, device=device)
+        local_plan_c = local_plan._replace(write_plan=empty16)
+
+    seg_seqs = torch.tensor(meta.local_seg_seqs, dtype=torch.long, device=device)
+
+    empty16 = torch.zeros((0, 16), dtype=torch.uint8, device=device)
+    write_W = 0
+    write_mine_idx = torch.empty(0, dtype=torch.long, device=device)
+    write_src = torch.empty(0, dtype=torch.long, device=device)
+    write_remap = empty16
+    if write_plan is not None and write_plan.numel() > 0:
+        num_q = int(sum(int(x) for x in extend_lens))
+        wpi = write_plan.contiguous().view(torch.int32)
+        g_all = wpi[:, 0].long()
+        wpi = wpi[(g_all >= 0) & (g_all < num_q)]
+        write_W = int(wpi.shape[0])
+        if write_W > 0:
+            wg = wpi[:, 0].long()
+            write_mine_idx = (wg % cp_size == cp_rank).nonzero().flatten()
+            write_src = (wg[write_mine_idx] // cp_size).contiguous()
+            remap = wpi.clone()
+            remap[:, 0] = torch.arange(write_W, dtype=torch.int32, device=device)
+            write_remap = remap.view(torch.uint8)
+
+    local_ev_kept = local_ev[meta.n_halo:]
+
+    compact_rows = []
+    for r in range(cp_size):
+        base = r * meta.max_c
+        compact_rows.extend(range(base, base + meta.counts[r]))
+    compact_idx = torch.tensor(compact_rows, dtype=torch.long, device=device)
+
+    bundle = dict(
+        meta=meta, send_idx=send_idx, recv_perm=recv_perm, ev=ev,
+        local_plan_c=local_plan_c, local_ev_kept=local_ev_kept, seg_seqs=seg_seqs,
+        compact_idx=compact_idx,
+        write_W=write_W, write_mine_idx=write_mine_idx, write_src=write_src,
+        write_remap=write_remap, empty16=empty16,
+    )
+    if len(_rlc_bundle_cache) > 8:
+        _rlc_bundle_cache.clear()
+    _rlc_bundle_cache[key] = bundle
+    return bundle
+
+
+def _rlc_write_state(state_pool, kv_score_local, ape, paged, bundle, ratio, head_dim):
+    """Persist this chunk's trailing block(s) into the (replicated) state pool so the NEXT chunk reads
+    the correct overlap, using compress_forward's WRITE kernel. All index math is precomputed once per
+    forward in `_get_rlc_bundle` (pure geometry). Here we only: fill this rank's owned write rows into
+    a compact [W, 4H] buffer, all_reduce(SUM) so every rank holds the full write-set, then run the
+    write kernel with the cached remapped plan -- reusing the global write_loc/extra_data so it writes
+    the SAME (page, slot) as base. An empty compress plan makes only the write kernel run."""
+    W = bundle["write_W"]
+    if W == 0:
+        return
+    write_buf = kv_score_local.new_zeros((W, kv_score_local.shape[1]))
+    write_src = bundle["write_src"]
+    if write_src.numel():
+        write_buf[bundle["write_mine_idx"]] = kv_score_local[write_src]
+    write_buf = get_attn_cp_group().all_reduce(write_buf)
+    write_plan_c = paged.plan._replace(
+        compress_plan=bundle["empty16"], write_plan=bundle["write_remap"]
+    )
+    compress_forward(
+        kv_score_buffer=state_pool, kv_score_input=write_buf, ape=ape,
+        indices=paged.write_loc, plan=write_plan_c, compress_ratio=ratio,
+        head_dim=head_dim, extra_data=paged.extra_data,
+    )
+
+
 class Compressor(BaseFusedOp):
     def __init__(
         self,
@@ -469,6 +599,49 @@ class Compressor(BaseFusedOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
+    def store_rlc_output(
+        self,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        layer_id: int,
+        out_loc: torch.Tensor,
+        new_compressed_kv: torch.Tensor,
+    ) -> None:
+        """Write the (already normed/roped) RLC output into the extra-key cache.
+
+        Mirrors the store block of ``forward_core_compressor`` so the RLC path
+        lands in the exact same cache layout as the base path.
+        """
+        if out_loc.shape[0] > new_compressed_kv.shape[0]:
+            out_loc = out_loc[: new_compressed_kv.shape[0]]
+        if token_to_kv_pool.is_bf16_attention_kv_cache or (
+            envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+        ):
+            token_to_kv_pool.set_extra_key_buffer_fused(
+                layer_id=layer_id,
+                loc=out_loc,
+                cache_k=new_compressed_kv,
+            )
+            return
+        if (
+            _is_hcu
+            and _use_dpskv4_lightop_quant_k_cache
+            and hasattr(op, "quantize_nope_fp8_rope_bf16_pack_store")
+        ):
+            token_to_kv_pool.set_extra_key_buffer_lightop_fused(
+                layer_id=layer_id,
+                loc=out_loc,
+                cache_k=new_compressed_kv.bfloat16(),
+            )
+            return
+        if _is_hcu and _use_dpskv4_lightop_quant_k_cache:
+            pack = quant_to_nope_fp8_rope_bf16_pack_lightop(
+                new_compressed_kv.bfloat16(), 1e-8
+            )
+        else:
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(
+                new_compressed_kv.bfloat16()
+            )
+        token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
     def _pending_key(self):
         return ("kv_score", self.layer_id, self.is_in_indexer)
 
@@ -539,6 +712,95 @@ class Compressor(BaseFusedOp):
             forward_batch=forward_batch,
             is_paged=True,
         )
+
+    def _forward_rlc(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+        paged: FusedCompressMetadata,
+    ) -> torch.Tensor:
+        """Repartition-Local Compression path (attention c4, prefill-CP, round-robin).
+
+        Round-robin-scattered kv_score is all-to-all'd into per-rank contiguous block-runs (+halo),
+        each rank compresses its blocks locally with the real v1 kernel, and an all-gather recovers
+        the compact output in global block order. For chunked prefill (prefix>0) each sequence's
+        extend-first block reads its overlap from the (replicated) state pool -- patched locally on
+        the owning rank -- and the chunk's trailing block is persisted back for the next chunk.
+        Produces the same per-token output + state pool as the base path.
+
+        ``paged`` is the v1 ``(write_loc, extra_data, plan)`` metadata for the current batch,
+        built and passed by the caller (kept explicit so this method does not depend on the
+        backend's paged-metadata storage).
+        """
+        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+
+        cp_group = get_attn_cp_group()
+        cp_size = cp_group.world_size
+        cp_rank = cp_group.rank_in_group
+        R, H = self.ratio, self.head_dim
+        last_dim = 2 * (1 + self.overlap) * H
+        device = x.device
+
+        extend_lens = list(forward_batch.extend_seq_lens_cpu)
+        seq_lens = list(forward_batch.seq_lens_cpu)
+        prefix_lens = [int(s) - int(e) for s, e in zip(seq_lens, extend_lens)]
+
+        bundle = _get_rlc_bundle(
+            extend_lens, prefix_lens, R, cp_size, cp_rank, device, paged.plan.write_plan
+        )
+        meta = bundle["meta"]
+
+        state_pool = self.get_state_pool(attn_backend).kv_score_buffer.kv_score.view(-1, R, last_dim)
+        core_meta = attn_backend.forward_metadata.core_metadata
+        out_loc = core_meta.c4_out_loc if R == 4 else core_meta.c128_out_loc
+        num_q_out = out_loc.shape[0]
+
+        kv_score_local = linear_bf16_fp32(x, self.wkv_gate.weight)
+
+        assert kv_score_local.shape[0] * cp_size == num_q_out, (
+            f"RLC expects an equal-length round-robin shard: n_local({kv_score_local.shape[0]}) "
+            f"* cp({cp_size}) != out_loc({num_q_out})"
+        )
+
+        send = (kv_score_local[bundle["send_idx"]].contiguous()
+                if bundle["send_idx"].numel() else kv_score_local.new_empty((0, last_dim)))
+        recv = kv_score_local.new_empty((sum(meta.out_splits), last_dim))
+        attn_cp_all_to_all_single(recv, send, meta.out_splits, meta.in_splits)
+        local_kv = recv[bundle["recv_perm"]].contiguous() if bundle["recv_perm"].numel() else recv
+
+        ape = self.ape.view(-1, H)
+        if local_kv.shape[0] > 0 and bundle["local_plan_c"] is not None:
+            seg_seqs = bundle["seg_seqs"]
+            local_sparse = compress_forward(
+                kv_score_buffer=state_pool, kv_score_input=local_kv, ape=ape,
+                indices=paged.write_loc[seg_seqs], plan=bundle["local_plan_c"],
+                compress_ratio=R, head_dim=H, extra_data=paged.extra_data[seg_seqs])
+            local_out = local_sparse[bundle["local_ev_kept"]].clone()
+        else:
+            local_out = kv_score_local.new_empty((0, H))
+
+        padded = local_out.new_zeros((meta.max_c, H))
+        if local_out.shape[0] > 0:
+            padded[:local_out.shape[0]] = local_out
+        gathered = local_out.new_empty((cp_size * meta.max_c, H))
+        attn_cp_all_gather_into_tensor(gathered, padded)
+        compact = gathered[bundle["compact_idx"]]
+
+        full = kv_score_local.new_zeros((num_q_out, H))
+        full[bundle["ev"]] = compact.to(full.dtype)
+
+        compress_fused_norm_rope_inplace(
+            full,
+            self.norm.weight,
+            getattr(self.norm, "eps", self.norm.variance_epsilon),
+            self.freqs_cis,
+            paged.plan,
+        )
+
+        _rlc_write_state(state_pool, kv_score_local, ape, paged, bundle, R, H)
+
+        return rotate_activation(full) if self.rotate else full
 
     def forward_npu(
         self,

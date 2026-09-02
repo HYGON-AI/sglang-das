@@ -854,7 +854,7 @@ class HCUMLABackend(AttentionBackend):
     ):
         if ((
             forward_batch.forward_mode == ForwardMode.EXTEND
-            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
             )
         ):
             if not self.skip_prefill:

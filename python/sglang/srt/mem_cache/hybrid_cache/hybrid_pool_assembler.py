@@ -65,11 +65,11 @@ def _with_mtp_layer_mapping(
     layer_mapping: dict[int, int],
     *,
     transfer_layer_start: int,
-    target_device_layer_num: int,
+    target_host_layer_num: int,
     draft_layer_num: int,
 ) -> dict[int, int]:
     return layer_mapping | {
-        transfer_layer_start + depth: target_device_layer_num + depth
+        transfer_layer_start + depth: target_host_layer_num + depth
         for depth in range(draft_layer_num)
     }
 
@@ -183,7 +183,7 @@ def build_kv_only_group(
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_num,
-            target_device_layer_num=kv_pool.layer_num,
+            target_host_layer_num=kv_host_pool.target_layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
     return HostPoolGroup(
@@ -239,7 +239,7 @@ def build_hybrid_swa_group(
         swa_layer_mapping = _with_mtp_layer_mapping(
             swa_layer_mapping,
             transfer_layer_start=transfer_layer_num,
-            target_device_layer_num=swa_kv_pool.layer_num,
+            target_host_layer_num=swa_host_pool.target_layer_num,
             draft_layer_num=len(mtp_swa_device_pools),
         )
     return HostPoolGroup(
@@ -471,7 +471,7 @@ def build_deepseek_v4_hicache_stack(
         swa_layer_mapping = _with_mtp_layer_mapping(
             swa_layer_mapping,
             transfer_layer_start=transfer_layer_num,
-            target_device_layer_num=transfer_layer_num,
+            target_host_layer_num=transfer_layer_num,
             draft_layer_num=len(mtp_swa_device_buffers),
         )
 
@@ -719,7 +719,7 @@ def build_hybrid_mamba_stack(
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_num,
-            target_device_layer_num=kv_pool.layer_num,
+            target_host_layer_num=kv_host_pool.target_layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
     # MambaPoolHost only supports page_first/page_first_direct/layer_first.
@@ -918,7 +918,9 @@ def build_anchor_sidecar_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     mtp_draft_device_pools = tuple(
-        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+        pool
+        for pool in params.mtp_draft_device_pools
+        if pool.index_k_with_scale_buffer is not None or pool.index_k_buffer is not None
     )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -934,7 +936,7 @@ def build_anchor_sidecar_stack(
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_num,
-            target_device_layer_num=kv_pool.layer_num,
+            target_host_layer_num=kv_host_pool.target_layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
     entries = [
@@ -1057,7 +1059,9 @@ def build_full_draft_pools(
         )
     ]
 
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
+    if isinstance(pool, DSATokenToKVPool) and (
+        pool.index_k_with_scale_buffer is not None or pool.index_k_buffer is not None
+    ):
         indexer_host_pool = DSAIndexerPoolHost(
             pool,
             draft_host_pool,
@@ -1966,6 +1970,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
+        kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
         logger.info(
             "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
             "transfer_layer_num=%s",

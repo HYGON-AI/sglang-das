@@ -8,8 +8,12 @@ from collections import defaultdict
 import torch
 
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.utils import is_hcu
 
 logger = logging.getLogger(__name__)
+
+_is_hcu = is_hcu()
+_HIP_RUNTIME = None
 
 
 class HostTensorAllocator:
@@ -120,7 +124,10 @@ def get_allocator_type(server_args) -> str:
 def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    # HCU transfer kernels dereference host memory from the device. Register
+    # those pages as mapped so hipHostGetDevicePointer can translate them.
+    flags = 2 if _is_hcu else 0
+    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, flags)
     if int(rc) != 0:
         raise RuntimeError(
             f"cudaHostRegister failed (rc={int(rc)}, "
@@ -128,6 +135,46 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
             f"size={n_bytes}; host buffer is not pinned and device transfers "
             f"may silently return stale data."
         )
+
+
+def _hip_host_get_device_pointer(host_ptr: int) -> int:
+    """Translate a mapped HCU host pointer into the device address space."""
+
+    import ctypes
+
+    global _HIP_RUNTIME
+    if _HIP_RUNTIME is None:
+        last_error = None
+        for library in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+            try:
+                _HIP_RUNTIME = ctypes.CDLL(library)
+                break
+            except OSError as error:  # noqa: PERF203
+                last_error = error
+        if _HIP_RUNTIME is None:
+            raise RuntimeError(
+                "Failed to load the HIP runtime for hipHostGetDevicePointer: "
+                f"{last_error}"
+            )
+
+    device_ptr = ctypes.c_void_p()
+    rc = _HIP_RUNTIME.hipHostGetDevicePointer(
+        ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
+    )
+    if int(rc) != 0 or device_ptr.value is None:
+        raise RuntimeError(
+            "hipHostGetDevicePointer failed "
+            f"(rc={int(rc)}) for mapped host ptr={host_ptr:#x}."
+        )
+    return int(device_ptr.value)
+
+
+def kernel_accessible_host_ptr(tensor: torch.Tensor) -> int:
+    """Return the address a GPU transfer kernel can dereference."""
+
+    if not _is_hcu or tensor.is_cuda:
+        return tensor.data_ptr()
+    return _hip_host_get_device_pointer(tensor.data_ptr())
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
