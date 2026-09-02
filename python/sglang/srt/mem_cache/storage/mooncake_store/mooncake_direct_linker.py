@@ -608,7 +608,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     rids = batch_rids.get(name, [None] * len(keys))
-                    logger.info(
+                    logger.debug(
                         "00 Mooncake range get start: counter=%d rids=%s rids_size=%d pool=%s "
                         "layer=%d objects=%d",
                         counter_index,
@@ -810,7 +810,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             str(name): len(keys) for name, (keys, _) in batches.items()
         }
         unique_rids = sorted({rid for rid in all_rids if rid is not None})
-        logger.info(
+        logger.debug(
             "01 Mooncake range get start: counter=%d rids=%s rids_size=%d "
             "pools=%s complete_page objects=%d",
             counter_index,
