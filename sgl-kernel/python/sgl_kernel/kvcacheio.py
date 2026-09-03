@@ -425,6 +425,16 @@ def transfer_kv_per_layer_mla_pf_lf(
     )
 
 
+def build_kernel_accessible_pointer_table(
+    base: torch.Tensor,
+    views: List[torch.Tensor],
+    device_ref: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.build_kernel_accessible_pointer_table.default(
+        base, views, device_ref
+    )
+
+
 def transfer_kv_all_layer_mla(
     src_layers: torch.Tensor,
     dst_layers: torch.Tensor,
