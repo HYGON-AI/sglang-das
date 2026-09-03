@@ -1992,6 +1992,32 @@ class Scheduler(
             prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
             req.skip_radix_cache_insert = True
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # This batch failed before the PD prefill result path could
+                # enqueue/send it. Retire bootstrap and metadata state here so
+                # request-scoped recovery does not leak resources.
+                self.clear_pending_chunk_send(req)
+                sender = getattr(req, "disagg_kv_sender", None)
+                if sender is not None and hasattr(sender, "abort"):
+                    try:
+                        sender.abort()
+                    except BaseException:
+                        logger.warning(
+                            "Failed to abort PD sender after Mooncake load "
+                            "failure: rid=%s",
+                            req.rid,
+                            exc_info=True,
+                        )
+                maybe_release_metadata_buffer(
+                    req,
+                    self.req_to_metadata_buffer_idx_allocator,
+                    getattr(
+                        getattr(self, "disagg_metadata_buffers", None),
+                        "pd_hidden_pool",
+                        None,
+                    ),
+                )
+                req.pending_bootstrap = False
             self._release_aborted_request(req.rid)
             if req.req_pool_idx is not None:
                 release_kv_cache(req, self.tree_cache, is_insert=False)

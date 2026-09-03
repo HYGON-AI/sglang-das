@@ -2913,7 +2913,7 @@ class ServerArgs:
         "Minimum number of Mooncake direct-linker keys that switches loading "
         "from the layer-wise flow to the complete-page flow.",
         NS("memory"),
-    ] = 10
+    ] = 1
     mooncake_page_wise_load_batch_size: A[
         int,
         "Deprecated compatibility option. Complete-page Mooncake direct-linker "

@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.unified_cache_linker import ExternalLinkerLoadError
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1137,7 +1138,12 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                try:
+                    result = self.run_batch(batch)
+                except ExternalLinkerLoadError as error:
+                    self._abort_external_linker_failed_batch(batch, error)
+                    self.last_batch = None
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
@@ -1176,7 +1182,17 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
+                try:
+                    batch_result = self.run_batch(batch)
+                except ExternalLinkerLoadError as error:
+                    # The previous result can share Req objects with this batch.
+                    # Resolve it before the failed batch releases request/KV slots.
+                    while self.result_queue:
+                        tmp_batch, tmp_result = self.result_queue.popleft()
+                        self.process_batch_result(tmp_batch, tmp_result)
+                    self._abort_external_linker_failed_batch(batch, error)
+                    self.last_batch = None
+                    continue
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
