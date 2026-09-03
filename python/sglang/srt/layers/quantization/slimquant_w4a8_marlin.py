@@ -525,6 +525,8 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         )
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+        # ChannelWise W4A8/W4A16 ckpts quantize MoE experts only; attn / linear_attn /
+        # router / lm_head stay BF16 and must not use the int8 Linear path.
         if isinstance(layer, LinearBase):
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
@@ -538,7 +540,12 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            return SlimQuantW4A8Int8LinearMethod(self)
+            if self.ignore:
+                return SlimQuantW4A8Int8LinearMethod(self)
+            # ChannelWise W4A8/W4A16 ckpts quantize MoE experts only and often
+            # have no ignore list; attn / linear_attn / router / lm_head stay
+            # BF16 and must not use the int8 Linear path.
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()
             if dspark_backend_override is None:
