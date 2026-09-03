@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
+    free_swa_out_of_window_slots,
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
@@ -214,17 +215,33 @@ class SchedulerBatchResultProcessor:
         req.force_radix_leaf_creation = True
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
-            protected_len = min(req.cache_protected_len, radix_key_len)
-            if protected_len > 0 and hasattr(
-                self.token_to_kv_pool_allocator, "free_swa"
-            ):
-                donated_full_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :protected_len
-                ]
-                # The donated DSV4 prompt leaf is full-only. Release any
-                # request-private SWA tail mapped from those full indices; the
-                # full pages stay owned by radix cache.
-                self.token_to_kv_pool_allocator.free_swa(donated_full_indices)
+            # The donated leaf is full-only, so this request's SWA tail is
+            # private and looks free to release outright. It is not: the request
+            # keeps decoding and its sliding window still reaches back into the
+            # donated range, so an untracked free hands live slots to another
+            # request (silent wrong tokens) while leaving the rest unaccounted
+            # for (pool leak). Use the tracked window-aware helper, which stops
+            # at max(window, page) and records swa_evicted_seqlen so the
+            # end-of-request path releases the remainder.
+            window_size = int(
+                getattr(self.model_config, "sliding_window_size", 0) or 0
+            )
+            if window_size > 0 and prompt_len > 0:
+                free_swa_out_of_window_slots(
+                    req,
+                    prompt_len - 1,
+                    sliding_window_size=window_size,
+                    page_size=page_size,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    retain_floor=self.tree_cache.swa_retain_floor(req),
+                )
+            # The tree keeps the donated full pages but tombstones their SWA,
+            # so no owner remains for the SWA under [0, radix_key_len). Hand the
+            # range to release_kv_cache, which runs after the last decode step.
+            req.dsv4_donated_swa_len = max(
+                int(getattr(req, "dsv4_donated_swa_len", 0) or 0), radix_key_len
+            )
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "

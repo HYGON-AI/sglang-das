@@ -422,12 +422,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        params = DecLockRefParams(
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            skip_lock_node_ids=req.skip_lock_node_ids,
+        )
         if req.swa_prefix_lock_released:
             self.tree_cache.dec_lock_ref(req.last_node, params, skip_swa=True)
             req.swa_prefix_lock_released = False
         else:
             self.tree_cache.dec_lock_ref(req.last_node, params)
+
+        # Capacity backpressure releases the match but keeps the request queued
+        # for a later retry, which does not re-match. Anything that later walks
+        # this request's lock (cache_unfinished_req, incl. the DSV4 prompt
+        # donation) would then drop a lock the request no longer owns. Repoint
+        # it at the root -- the same node a miss yields -- so that dec is a
+        # no-op, and clear the lock metadata that described the released node.
+        if not self.tree_cache.is_chunk_cache():
+            req.last_node = self.tree_cache.root_node_handle(
+                extra_key=getattr(req, "extra_key", None)
+            )
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {}
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
@@ -789,6 +805,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # matching dec_lock_ref stops there instead of underflowing toward root.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # Release must mirror the exact nodes skipped at acquire time: the FULL
+        # component skips the evicted bottom segment, and a later insert (e.g.
+        # the DSV4 prompt donation) can revive those values before the matching
+        # dec, which would then decrement a lock_ref this request never took.
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
