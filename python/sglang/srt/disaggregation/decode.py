@@ -539,6 +539,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         else:
             self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
 
+        # Capacity backpressure releases the match but keeps the request queued
+        # for a later retry, which does not re-match. Anything that later walks
+        # this request's lock (cache_unfinished_req, incl. the DSV4 prompt
+        # donation) would then drop a lock the request no longer owns. Repoint
+        # it at the root -- the same node a miss yields -- so that dec is a
+        # no-op, and clear the lock metadata that described the released node.
+        if not self.tree_cache.is_chunk_cache():
+            req.last_node = self.tree_cache.root_node_handle(
+                extra_key=getattr(req, "extra_key", None)
+            )
+        # The target branch stores the exact acquire receipt on the request.
+        # A later cache path must not try to release the old matched node again.
+        req.lock_receipt = DecLockRefParams()
+
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str, *, full_len: int = 0
     ) -> Optional[str]:
