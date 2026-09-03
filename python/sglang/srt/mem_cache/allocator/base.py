@@ -39,6 +39,8 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    _kvcache = None
+
     @abc.abstractmethod
     def __init__(
         self,

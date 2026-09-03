@@ -32,13 +32,14 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_kv_extraction_compact_hcu_fa_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hcu, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -1536,8 +1537,15 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        hcu_fa_layout = (
+            is_hcu()
+            and k_buffer.ndim == 4
+            and v_buffer.ndim == 4
+            and k_buffer.shape[2] == v_buffer.shape[3]
+            and k_buffer.shape[3] == v_buffer.shape[2]
+        )
         trtllm_decode = _resolve_trtllm_sparse_decode()
-        if trtllm_decode is not None:
+        if trtllm_decode is not None and not hcu_fa_layout:
             return self._forward_trtllm_sparse(
                 q,
                 k_buffer,
@@ -1577,11 +1585,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         packed_k, packed_v = self._get_fa2_scratch(
             scratch_capacity,
             k_buffer.shape[1],
-            k_buffer.shape[2],
+            k_buffer.shape[3] if hcu_fa_layout else k_buffer.shape[2],
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
+        compact_kv = (
+            qwen_sparse_kv_extraction_compact_hcu_fa_triton
+            if hcu_fa_layout
+            else qwen_sparse_kv_extraction_compact_triton
+        )
+        compact_args = (
             k_buffer,
             v_buffer,
             self.req_to_token_pool.req_to_token,
@@ -1598,6 +1611,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
+        if hcu_fa_layout:
+            compact_kv(*compact_args, int(k_buffer.shape[2]))
+        else:
+            compact_kv(*compact_args)
         if is_hip():
             relative_indices = torch.arange(
                 topk, dtype=torch.int32, device=q.device

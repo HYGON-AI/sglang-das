@@ -564,10 +564,147 @@ def qwen_sparse_kv_extraction_compact_triton(
     )
 
 
+@triton.jit
+def _compact_kv_hcu_fa(
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    topk: tl.constexpr,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    page_size: tl.constexpr,
+    req_stride: tl.constexpr,
+    idx_stride: tl.constexpr,
+    k_sp,
+    k_sh,
+    k_so,
+    k_sd,
+    v_sp,
+    v_sh,
+    v_so,
+    v_sd,
+    ok0,
+    ok1,
+    ok2,
+    ov0,
+    ov1,
+    ov2,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather selected tokens from HCU FA paged KV into packed NHD rows.
+
+    K is (pages, heads, page, dim); V is (pages, heads, dim, page). Physical
+    slots are page * page_size + offset, matching MHATokenToKVPool.set_kv_buffer
+    under SGLANG_KV_LAYOUT_HCU_FA. This does not change the pool layout.
+    """
+    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    dims = tl.arange(0, BLOCK_D)
+    length = tl.load(seq_lens + batch)
+    req = tl.load(req_indices + batch)
+    pack_start = tl.load(cu_k + batch)
+    valid_count = tl.load(cu_k + batch + 1) - pack_start
+    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
+    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
+    slots = tl.load(
+        req_to_token + req * req_stride + tl.where(valid, positions, 0),
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    page = slots // page_size
+    off = slots % page_size
+    k_ptrs = (
+        k
+        + page[:, None] * k_sp
+        + head * k_sh
+        + off[:, None] * k_so
+        + dims[None, :] * k_sd
+    )
+    v_ptrs = (
+        v
+        + page[:, None] * v_sp
+        + head * v_sh
+        + off[:, None] * v_so
+        + dims[None, :] * v_sd
+    )
+    dst = (pack_start + cols)[:, None]
+    mask = valid[:, None] & (dims[None, :] < dim)
+    k_dst = out_k + dst * ok0 + head * ok1 + dims[None, :] * ok2
+    v_dst = out_v + dst * ov0 + head * ov1 + dims[None, :] * ov2
+    k_values = tl.load(k_ptrs, mask=mask, other=0.0)
+    v_values = tl.load(v_ptrs, mask=mask, other=0.0)
+    tl.store(k_dst, k_values.to(out_k.dtype.element_ty), mask=mask)
+    tl.store(v_dst, v_values.to(out_v.dtype.element_ty), mask=mask)
+
+
+def qwen_sparse_kv_extraction_compact_hcu_fa_triton(
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    batch,
+    topk,
+    page_size: int,
+):
+    """QSA-only compact from HCU FA paged KV. Pool layout is left unchanged."""
+    if k.dtype != v.dtype or out_k.dtype != out_v.dtype:
+        raise ValueError("QSA compact K/V input and output dtype pairs must match")
+    heads = k.shape[1]
+    dim = k.shape[3]
+    block_topk = 16
+    _compact_kv_hcu_fa[(batch, heads, triton.cdiv(topk, block_topk))](
+        k,
+        v,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        cu_k,
+        out_k,
+        out_v,
+        topk,
+        heads,
+        dim,
+        page_size,
+        req_to_token.stride(0),
+        indices.stride(0),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(3),
+        v.stride(2),
+        out_k.stride(0),
+        out_k.stride(1),
+        out_k.stride(2),
+        out_v.stride(0),
+        out_v.stride(1),
+        out_v.stride(2),
+        BLOCK_TOPK=block_topk,
+        BLOCK_D=triton.next_power_of_2(dim),
+        num_warps=8,
+    )
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
+    "qwen_sparse_kv_extraction_compact_hcu_fa_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
     "sparse_gqa_packed_decode_triton",
