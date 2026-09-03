@@ -246,7 +246,6 @@ class FlashAttentionBackend(AttentionBackend):
             # Static verify width; NOTE: overwrites the config-named attr in place.
             self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=model_runner.server_args,
                 spec_algorithm=SpeculativeAlgorithm.from_string(
                     model_runner.server_args.speculative_algorithm
                 ),
