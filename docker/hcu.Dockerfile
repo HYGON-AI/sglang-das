@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir ninja wheel setuptools \
 
 ARG TORCH_VERSION
 RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
-    && pip install --no-cache-dir torch==${TORCH_VERSION} torchvision \
+    && pip install --no-cache-dir torch==${TORCH_VERSION} torchvision torchaudio \
     && das-install flash_attn ${TORCH_TAG} \
     && das-install lightop ${TORCH_TAG} \
     && das-install lmslim ${TORCH_TAG} \
@@ -67,18 +67,17 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install flash_kda ${TORCH_TAG} \
     && das-install fastsafetensors ${TORCH_TAG} \
     && das-install triton==3.6.0 ${TORCH_TAG} \
+    && das-install nixl ${TORCH_TAG} \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip cache purge
 
 ARG SGLANG_VERSION
 RUN pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator \
     && pip install --no-cache-dir "fastapi==0.115.12" "starlette==0.46.2" "prometheus-fastapi-instrumentator==7.1.0" \
-    && pip install --no-cache-dir torchaudio==2.11.0 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir nvidia-cutlass-dsl==4.4.2 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    && pip install --no-cache-dir sgl-deep-gemm==0.1.0 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir sglang[diffusion]==${SGLANG_VERSION} sglang-router \
     && pip install --no-cache-dir numpy==1.25.0 \
-    && pip install --no-cache-dir setuptools==79.0.1 
+    && pip install --no-cache-dir setuptools==79.0.1
 
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
