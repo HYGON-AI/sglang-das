@@ -42,12 +42,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -76,7 +71,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend, get_toke
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, make_layers
 from sglang.srt.utils.common import LazyValue
@@ -797,7 +792,7 @@ class HYV3Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        attn_tp_group = get_attention_tp_group()
+        attn_tp_group = get_parallel().attn_tp_group
         attn_tp_size = attn_tp_group.world_size
         tokens_per_rank = hidden_states.shape[0]
 
@@ -1082,7 +1077,7 @@ class HYV3Model(nn.Module):
 
         use_hy3_sp = get_global_server_args().hy3_sp
         if use_hy3_sp:
-            attn_tp_group = get_attention_tp_group()
+            attn_tp_group = get_parallel().attn_tp_group
             attn_tp_size = attn_tp_group.world_size
             attn_tp_rank = attn_tp_group.rank_in_group
             if hidden_states.shape[0] % attn_tp_size != 0:
@@ -1116,7 +1111,7 @@ class HYV3Model(nn.Module):
             hidden_states, _ = self.norm(hidden_states, residual)
 
         if use_hy3_sp:
-            attn_tp_group = get_attention_tp_group()
+            attn_tp_group = get_parallel().attn_tp_group
             hidden_states_gathered = hidden_states.new_empty(
                 hidden_states.shape[0] * attn_tp_group.world_size,
                 hidden_states.shape[1],
