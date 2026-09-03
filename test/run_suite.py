@@ -666,6 +666,17 @@ def main():
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
     parser.add_argument(
+        "--include-file",
+        action="append",
+        default=[],
+        help="Restrict execution to a registered file. May be repeated.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Only list selected tests; do not execute them.",
+    )
+    parser.add_argument(
         "--fork-worker-batch-size",
         type=int,
         default=1,

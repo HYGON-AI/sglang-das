@@ -36,7 +36,7 @@ declare -A ENV_MAP=(
 # by sglang.test.test_utils and keep broad registered tests from falling back
 # to gated or remote Hugging Face model names. A caller can still override any
 # value with -e KEY=VALUE.
-ENV_MAP[SGLANG_TEST_DEFAULT_MODEL_NAME]="${SGLANG_TEST_DEFAULT_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct}"
+ENV_MAP[SGLANG_TEST_DEFAULT_MODEL_NAME]="${SGLANG_TEST_DEFAULT_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/vllm-optest-models/llama3.2/Llama-3.2-1B-Instruct}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_BASE]="${SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_BASE:-/public/opendas/DL_DATA/llm-models/vllm-optest-models/llama3.2/Llama-3.2-1B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE]="${SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE:-/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B}"
