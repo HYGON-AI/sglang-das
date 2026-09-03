@@ -1132,7 +1132,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 pool,
                 layer_id,
                 block_tables,
-                metadata.get_seqlens_int32(),
+                seqlens_32,
             )
             if use_bf16_index_cache:
                 active_weights = weights[:q_offset].to(torch.float32)
