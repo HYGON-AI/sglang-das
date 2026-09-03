@@ -71,7 +71,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_stream
+from sglang.srt.runtime_context import get_forward, get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, make_layers
 from sglang.srt.utils.common import LazyValue
@@ -127,16 +127,10 @@ class HYV3FeedForward(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(
-        self,
-        x,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ):
-        skip_all_reduce = should_allreduce_fusion or use_reduce_scatter
+    def forward(self, x, forward_batch: Optional[ForwardBatch] = None):
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out, skip_all_reduce=skip_all_reduce)
+        out, _ = self.down_proj(out)
         return out
 
 
@@ -287,17 +281,11 @@ class HYV3MoEFused(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        return self.forward_normal(
-            hidden_states,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-        )
+        return self.forward_normal(hidden_states)
 
     def _forward_deepep(
         self,
@@ -342,35 +330,17 @@ class HYV3MoEFused(nn.Module):
 
         return final_hidden_states.view(orig_shape)
 
-    def forward_normal(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if (
             self.alt_stream is not None
             and self.shared_mlp is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
-            return self._forward_dual_stream(
-                hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
-        return self._forward_single_stream(
-            hidden_states,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-        )
+            return self._forward_dual_stream(hidden_states)
+        return self._forward_single_stream(hidden_states)
 
-    def _forward_single_stream(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def _forward_single_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -404,15 +374,11 @@ class HYV3MoEFused(nn.Module):
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
@@ -420,12 +386,7 @@ class HYV3MoEFused(nn.Module):
 
         return final_hidden_states.view(orig_shape)
 
-    def _forward_dual_stream(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def _forward_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Shared experts on main stream, routed experts on alt stream."""
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -465,15 +426,11 @@ class HYV3MoEFused(nn.Module):
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
@@ -799,19 +756,11 @@ class HYV3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self.block_type == "moe":
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states,
-                should_allreduce_fusion=should_allreduce_fusion,
-                use_reduce_scatter=use_reduce_scatter,
-            )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=should_allreduce_fusion,
+            mlp_reduce_scatter=use_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
