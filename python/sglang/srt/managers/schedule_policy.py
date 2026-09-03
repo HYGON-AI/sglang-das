@@ -183,7 +183,9 @@ def match_prefix_for_req(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
-            return_full_match=return_full_match,
+            # unified_kv's SWA is request-private and absent from the tree, so
+            # match by full-attention residency and re-prefill one SWA window.
+            return_full_match=return_full_match or bool(reprefill_tail),
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

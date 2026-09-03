@@ -1282,7 +1282,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_layout": getattr(self.kv_mgr, "kv_cache_layout", None),
+            "kv_cache_layout": self.kv_cache_layout,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
