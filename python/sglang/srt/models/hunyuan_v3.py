@@ -67,7 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend, get_token_to_kv_pool
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -598,7 +598,7 @@ class HYV3Attention(nn.Module):
                 )
                 self.rotary_emb.cos_sin_cache = cos_sin_cache
 
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+            k_buffer, v_buffer = get_token_to_kv_pool().get_kv_buffer(
                 self.attn.layer_id
             )
             kv_cache_dtype = self.kv_cache_dtype or k_buffer.dtype
