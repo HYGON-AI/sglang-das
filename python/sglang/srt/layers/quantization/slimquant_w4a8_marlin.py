@@ -476,15 +476,36 @@ def fused_experts_impl_w4a8_triton(
     return output
 
 
+_QWEN4_EXP_ARCHS = (
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLMMTP",
+)
+
+
+def _hf_architectures(hf_config) -> list[str]:
+    if hf_config is None:
+        return []
+    if isinstance(hf_config, dict):
+        return list(hf_config.get("architectures") or [])
+    return list(getattr(hf_config, "architectures", None) or [])
+
+
 class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
     """Config class for W4A8 Int8 Quantization.
     - Weight: static, per-channel, symmetric
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self, ignore: Optional[list[str]] = None):
+    def __init__(
+        self,
+        ignore: Optional[list[str]] = None,
+        experts_only_linear: bool = False,
+    ):
         super().__init__()
         self.ignore = ignore
+        # Qwen3.8 Flash-Next ChannelWise W4A8 quantizes MoE experts only;
+        # DeepSeek / Kimi still quantize dense Linear unless listed in ignore.
+        self.experts_only_linear = experts_only_linear
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -504,7 +525,12 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, any]) -> "SlimQuantW4A8Int8MarlinConfig":
-        return cls(ignore=config.get("ignore"))
+        archs = _hf_architectures(config.get("hf_config"))
+        experts_only_linear = any(arch in _QWEN4_EXP_ARCHS for arch in archs)
+        return cls(
+            ignore=config.get("ignore"),
+            experts_only_linear=experts_only_linear,
+        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -525,8 +551,6 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         )
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-        # ChannelWise W4A8/W4A16 ckpts quantize MoE experts only; attn / linear_attn /
-        # router / lm_head stay BF16 and must not use the int8 Linear path.
         if isinstance(layer, LinearBase):
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
@@ -537,15 +561,15 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
             if self.ignore and should_ignore_layer(
                 layer_name=prefix,
                 ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
+                fused_mapping=getattr(self, "packed_modules_mapping", {}),
             ):
                 return UnquantizedLinearMethod()
-            if self.ignore:
-                return SlimQuantW4A8Int8LinearMethod(self)
-            # ChannelWise W4A8/W4A16 ckpts quantize MoE experts only and often
-            # have no ignore list; attn / linear_attn / router / lm_head stay
-            # BF16 and must not use the int8 Linear path.
-            return UnquantizedLinearMethod()
+            # Qwen3.8 Flash-Next ChannelWise W4A8/W4A16: MoE experts only.
+            # DeepSeek W4A8 has no ignore list but still quantizes attn Linear
+            # (e.g. self_attn.wqkv_a.weight_scale_inv).
+            if self.experts_only_linear:
+                return UnquantizedLinearMethod()
+            return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()
             if dspark_backend_override is None:
