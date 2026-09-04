@@ -54,6 +54,8 @@ _is_hcu = is_hcu()
 _use_aiter_moe = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_USE_AITER_MOE", default="true"
 )
+_HCU_AITER_INT8_NOSHUFFLE_ATTR = "_sglang_hcu_aiter_int8_noshuffle"
+_hcu_aiter_int8_noshuffle_logged: set[tuple[int, ...]] = set()
 
 
 class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
@@ -301,7 +303,9 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
 
     @staticmethod
     def _normalize_weight_scales(layer: torch.nn.Module) -> None:
-        """Qwen3.8-Flash-Next INT8 checkpoints store scales as bf16."""
+        """Cast non-fp32 scales to fp32. Kernels require fp32; some INT8
+        checkpoints (Qwen3.8-Flash-Next) store bf16. fp32 checkpoints are a no-op.
+        """
         for name in ("w13_weight_scale", "w2_weight_scale"):
             scale = getattr(layer, name)
             if scale.dtype != torch.float32:
@@ -317,16 +321,151 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
                     torch.nn.Parameter(scale.data, requires_grad=False),
                 )
 
+    def _int8_moe_lookup_shape(
+        self, layer: torch.nn.Module
+    ) -> Optional[tuple[int, int, int, int, int]]:
+        w13 = getattr(layer, "w13_weight", None)
+        w2 = getattr(layer, "w2_weight", None)
+        if w13 is None or w2 is None or w13.ndim != 3 or w2.ndim != 3:
+            return None
+        E, N1, K = (int(dim) for dim in w13.shape)
+        E2, N2, n = (int(dim) for dim in w2.shape)
+        if E != E2 or N2 != K or N1 != 2 * n:
+            return None
+        top_k = getattr(layer, "top_k", None)
+        if top_k is None:
+            cfg = getattr(layer, "moe_runner_config", None) or getattr(
+                self, "moe_runner_config", None
+            )
+            top_k = getattr(cfg, "top_k", None) if cfg is not None else None
+        if not top_k:
+            return None
+        return E, N1, N2, K, int(top_k)
+
+    def _probe_hcu_aiter_int8_noshuffle(self, layer: torch.nn.Module) -> bool:
+        """Return True only for HCU + AITER + a matching no-shuffle INT8 ASM table.
+
+        This is the Qwen3.8-Flash-Next path. Other INT8 MoE shapes (for example
+        GLM-5.2) keep the legacy shuffle + aiter_moe / Triton behavior.
+        """
+        if not _is_hcu:
+            return False
+        if not will_use_aiter_moe():
+            return False
+        if not get_moe_a2a_backend().supports_aiter():
+            return False
+        if self.weight_quant.strategy != QuantizationStrategy.CHANNEL:
+            return False
+        if self.input_quant.strategy != QuantizationStrategy.TOKEN:
+            return False
+        if getattr(self, "static_input_scales", False):
+            return False
+
+        shape = self._int8_moe_lookup_shape(layer)
+        if shape is None:
+            return False
+        E, N1, N2, K, top_k = shape
+
+        try:
+            from aiter.moe import MoeQuantType, MoeSolutionType, get_aiter_moe_config
+
+            kwargs = dict(
+                M=1,
+                E=E,
+                N1=N1,
+                N2=N2,
+                K=K,
+                top_k=top_k,
+                block_size=0,
+                dtype=torch.bfloat16,
+                quant_type=MoeQuantType.W8A8,
+                activation="silu",
+                spec_sol_type=MoeSolutionType.ASM,
+                use_shuffle=0,
+            )
+            try:
+                status, config = get_aiter_moe_config(**kwargs)
+            except TypeError:
+                kwargs.pop("spec_sol_type", None)
+                try:
+                    status, config = get_aiter_moe_config(**kwargs)
+                except TypeError:
+                    kwargs.pop("use_shuffle", None)
+                    kwargs.pop("activation", None)
+                    status, config = get_aiter_moe_config(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "HCU AITER INT8 no-shuffle probe failed for "
+                "E=%s N1=%s N2=%s K=%s topk=%s (%s); using legacy INT8 MoE path",
+                E,
+                N1,
+                N2,
+                K,
+                top_k,
+                exc,
+            )
+            return False
+
+        matched = bool(status and config is not None)
+        if matched:
+            need_shuffle = bool(getattr(config, "need_shuffle", False))
+            solution_type = getattr(config, "solution_type", None)
+            if need_shuffle:
+                matched = False
+            elif solution_type is not None:
+                from aiter.moe import MoeSolutionType
+
+                if solution_type != MoeSolutionType.ASM:
+                    matched = False
+
+        if shape not in _hcu_aiter_int8_noshuffle_logged:
+            _hcu_aiter_int8_noshuffle_logged.add(shape)
+            if matched:
+                logger.info(
+                    "Using HCU AITER INT8 no-shuffle MoE: "
+                    "E=%s N1=%s N2=%s K=%s topk=%s",
+                    E,
+                    N1,
+                    N2,
+                    K,
+                    top_k,
+                )
+            else:
+                logger.info(
+                    "No matching HCU AITER INT8 no-shuffle ASM config for "
+                    "E=%s N1=%s N2=%s K=%s topk=%s; using legacy INT8 MoE path",
+                    E,
+                    N1,
+                    N2,
+                    K,
+                    top_k,
+                )
+        return matched
+
+    def _should_use_hcu_aiter_int8_noshuffle(self, layer: torch.nn.Module) -> bool:
+        cached = getattr(layer, _HCU_AITER_INT8_NOSHUFFLE_ATTR, None)
+        if cached is True:
+            return True
+        matched = self._probe_hcu_aiter_int8_noshuffle(layer)
+        if matched:
+            setattr(layer, _HCU_AITER_INT8_NOSHUFFLE_ATTR, True)
+            return True
+        # Only cache a negative result when the MoE shape is complete, so an
+        # early call without top_k can still probe later.
+        if self._int8_moe_lookup_shape(layer) is not None:
+            setattr(layer, _HCU_AITER_INT8_NOSHUFFLE_ATTR, False)
+        return False
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self._normalize_weight_scales(layer)
-        if _is_hcu and will_use_aiter_moe():
+        if self._should_use_hcu_aiter_int8_noshuffle(layer):
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 process_weights_after_loading_aiter_w8a8_int8,
             )
 
             process_weights_after_loading_aiter_w8a8_int8(layer)
             return
-        if not _use_aiter_moe or _is_hcu:
+        if not _use_aiter_moe:
             return
         shuffled_w13 = self._shuffle_w8a8_gemm1(layer.w13_weight)
         layer.w13_weight = torch.nn.Parameter(
@@ -342,11 +481,16 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
+        use_noshuffle = self._should_use_hcu_aiter_int8_noshuffle(layer)
         if moe_runner_backend.is_auto():
-            if will_use_aiter_moe() and get_moe_a2a_backend().supports_aiter():
-                moe_runner_backend = MoeRunnerBackend.AITER
-            else:
-                moe_runner_backend = MoeRunnerBackend.TRITON
+            moe_runner_backend = (
+                MoeRunnerBackend.AITER if use_noshuffle else MoeRunnerBackend.TRITON
+            )
+        elif moe_runner_backend.is_aiter() and not use_noshuffle:
+            # Explicit aiter without a matching no-shuffle table: keep the
+            # legacy apply path (aiter_moe + shuffled weights), which uses a
+            # Triton MoeRunner placeholder like the pre-Flash-Next INT8 code.
+            moe_runner_backend = MoeRunnerBackend.TRITON
         if moe_runner_backend.is_aiter() or moe_runner_backend.is_triton():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -368,7 +512,10 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, router_logits = dispatch_output.topk_output
 
-        if _is_hcu and self.runner.runner_backend.is_aiter():
+        if (
+            self._should_use_hcu_aiter_int8_noshuffle(layer)
+            and self.runner.runner_backend.is_aiter()
+        ):
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 get_aiter_w8a8_int8_quant_info,
             )
@@ -381,7 +528,7 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
                 )
             return combine_input
 
-        if _use_aiter_moe and not _is_hcu:
+        if _use_aiter_moe:
             from aiter.moe import get_aiter_moe_config, aiter_moe, MoeQuantType
 
             E = layer.w13_weight.size(0)
