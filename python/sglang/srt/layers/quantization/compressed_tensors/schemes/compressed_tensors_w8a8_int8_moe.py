@@ -25,7 +25,12 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    will_use_aiter_moe,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -294,14 +299,34 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+    @staticmethod
+    def _normalize_weight_scales(layer: torch.nn.Module) -> None:
+        """Qwen3.8-Flash-Next INT8 checkpoints store scales as bf16."""
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            scale = getattr(layer, name)
+            if scale.dtype != torch.float32:
+                setattr(
+                    layer,
+                    name,
+                    torch.nn.Parameter(scale.to(torch.float32), requires_grad=False),
+                )
+            else:
+                setattr(
+                    layer,
+                    name,
+                    torch.nn.Parameter(scale.data, requires_grad=False),
+                )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
-        if not _use_aiter_moe:
+        self._normalize_weight_scales(layer)
+        if _is_hcu and will_use_aiter_moe():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                process_weights_after_loading_aiter_w8a8_int8,
+            )
+
+            process_weights_after_loading_aiter_w8a8_int8(layer)
+            return
+        if not _use_aiter_moe or _is_hcu:
             return
         shuffled_w13 = self._shuffle_w8a8_gemm1(layer.w13_weight)
         layer.w13_weight = torch.nn.Parameter(
@@ -316,7 +341,19 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            if will_use_aiter_moe() and get_moe_a2a_backend().supports_aiter():
+                moe_runner_backend = MoeRunnerBackend.AITER
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+        if moe_runner_backend.is_aiter() or moe_runner_backend.is_triton():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            raise ValueError(
+                f"CompressedTensorsW8A8Int8MoE does not support "
+                f"moe_runner_backend={moe_runner_backend}."
+            )
 
     def apply_weights(
         self,
@@ -331,7 +368,20 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, router_logits = dispatch_output.topk_output
 
-        if _use_aiter_moe:
+        if _is_hcu and self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_int8_quant_info,
+            )
+
+            quant_info = get_aiter_w8a8_int8_quant_info(layer)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            if bias is not None:
+                return StandardCombineInput(
+                    hidden_states=combine_input.hidden_states + bias
+                )
+            return combine_input
+
+        if _use_aiter_moe and not _is_hcu:
             from aiter.moe import get_aiter_moe_config, aiter_moe, MoeQuantType
 
             E = layer.w13_weight.size(0)
