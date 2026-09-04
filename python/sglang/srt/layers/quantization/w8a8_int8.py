@@ -21,14 +21,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -40,6 +39,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignor
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hcu,
@@ -59,9 +59,12 @@ _is_hcu = is_hcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 
-if _is_hcu:
+if _is_hcu and _use_lightop:
     from lightop.quant import per_token_quant_int8
+else:
+    from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm  # noqa: F401 -- registers the custom op
@@ -243,6 +246,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        input_quant_args: Optional[List[torch.Tensor]] = None,
     ):
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
@@ -253,7 +257,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        x_q, x_scale = per_token_quant_int8(x)
+        if input_quant_args is not None:
+            assert len(input_quant_args) == 2
+            x_q, x_scale = input_quant_args
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
@@ -348,6 +356,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_hcu and get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_hcu_w8a8_int8_mega_moe_experts_weights,
+            )
+
+            build_hcu_w8a8_int8_mega_moe_experts_weights(layer)
+            return
         if _is_hcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,

@@ -26,7 +26,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import is_hcu, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,34 @@ def handle_a2a_moe(server_args: Any):
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
         )
         logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+
+    if a2a_backend == "megamoe":
+        if (
+            is_hcu()
+            and envs.SGLANG_HCU_MEGA_MOE_RUNTIME.get().strip().lower()
+            == "megamoe"
+            and cfg.quantization == "w8a8_int8"
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                enforce_shared_experts_fusion=False,
+                cuda_graph_config=with_phase(
+                    with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        backend=Backend.DISABLED,
+                    ),
+                    Phase.PREFILL,
+                    backend=Backend.DISABLED,
+                ),
+            )
+            logger.info(
+                "HCU INT8 MegaMoE disables shared-expert fusion and CUDA "
+                "graph because the standalone INT8 normal backend is eager-only."
+            )
+        if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
+            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
 
     if a2a_backend == "deepep":
         if cfg.moe_runner_backend == "flashinfer_cutedsl":

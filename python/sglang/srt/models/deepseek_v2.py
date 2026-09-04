@@ -926,7 +926,7 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
-        if should_use_mega_moe(self, hidden_states):
+        if should_use_mega_moe(self, hidden_states, forward_batch):
             return forward_mega_moe(
                 self,
                 hidden_states,

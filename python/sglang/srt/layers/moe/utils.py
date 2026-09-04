@@ -242,6 +242,9 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
     tma_aligned: bool
     ue8m0: bool
 
+    def is_lightop(self):
+        return self == MoeRunnerBackend.LIGHTOP
+
 
 class DeepEPMode(Enum):
 

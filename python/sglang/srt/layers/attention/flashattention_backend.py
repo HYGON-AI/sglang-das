@@ -72,6 +72,7 @@ _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
 )
 
 
+
 def is_nmz_fp8(dtype: torch.dtype) -> bool:
     if is_hcu():
         props = torch.cuda.get_device_properties(0)
@@ -1601,7 +1602,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif _kv_layout_hcu_fa and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
                     k=key_cache,
                     v=value_cache,
                     cu_seqlens_q=cu_seqlens_q,
@@ -1619,9 +1622,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif _kv_layout_hcu_fa:
                 result = vllm_flash_attn_with_kvcache(
-                    q=q.contiguous()
-                    .view(-1, layer.tp_q_head_num, layer.head_dim)
-                    .unsqueeze(1),
+                    q=q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ).unsqueeze(1),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
