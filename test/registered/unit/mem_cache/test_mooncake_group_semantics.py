@@ -452,6 +452,53 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
 
+    def test_v2_aggregates_all_pool_writes_into_one_put(self):
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.register_mem_host_pool_v2(
+            FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4
+        )
+        fake_store.existing_keys.add("tag_page0__indexer")
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                ),
+            ]
+        )
+
+        self.assertEqual(result[PoolName.INDEXER], [True, True])
+        self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [True, True])
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from_multi_buffers")
+        self.assertEqual(
+            call["keys"],
+            [
+                "tag_page1__indexer",
+                "tag_page0__deepseek_v4_c4",
+                "tag_page1__deepseek_v4_c4",
+            ],
+        )
+        self.assertEqual(call["ptrs"], [[3001], [4000, 4001], [4010, 4011]])
+        self.assertEqual(call["sizes"], [[8], [8, 16], [8, 16]])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            [
+                "sglang-hicache:tag_page1",
+                "sglang-hicache:tag_page0",
+                "sglang-hicache:tag_page1",
+            ],
+        )
+
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(
             enable_group_semantics=False, model_name="org/model-a"
