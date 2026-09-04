@@ -669,10 +669,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     # compatibility path.
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
-        from sglang.srt.utils.common import is_hcu
+    from sglang.srt.utils.common import is_hcu
 
-        if not is_hcu():
+    _is_hcu_device = is_hcu()
+    if not cfg.device.startswith(("cuda", "npu")):
+        if not _is_hcu_device:
             raise ValueError(
                 "DSpark speculative decoding only supports CUDA, NPU and HCU devices."
             )
@@ -696,7 +697,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "none", "megamoe", "mori"
         ) or (
             cfg.moe_a2a_backend == "deepep"
-            and cfg.moe_runner_backend == "deep_gemm"
+            # HCU serves DeepEP with its own runners (marlin/aiter/...).
+            and (_is_hcu_device or cfg.moe_runner_backend == "deep_gemm")
         )
         if not _is_npu and not supports_target_moe:
             raise ValueError(
@@ -725,9 +727,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             if cfg.speculative_moe_runner_backend is not None
             else cfg.moe_runner_backend
         )
-        supports_draft_moe = draft_a2a in (
-            "none", "megamoe", "mori"
-        ) or (draft_a2a == "deepep" and draft_runner == "deep_gemm")
+        supports_draft_moe = draft_a2a in ("none", "megamoe", "mori") or (
+            draft_a2a == "deepep"
+            and (_is_hcu_device or draft_runner == "deep_gemm")
+        )
         if not supports_draft_moe:
             raise ValueError(
                 "DSpark draft MoE A2A only supports 'none', 'megamoe', 'mori', "
