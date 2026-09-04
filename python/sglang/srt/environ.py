@@ -509,6 +509,8 @@ class Envs:
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
+    # Use the LightOp kernel for paged KV-cache extend allocation.
+    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
