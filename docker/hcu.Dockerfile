@@ -77,7 +77,9 @@ RUN pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator \
     && pip install --no-cache-dir nvidia-cutlass-dsl==4.4.2 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir sglang[diffusion]==${SGLANG_VERSION} sglang-router \
     && pip install --no-cache-dir numpy==1.25.0 \
-    && pip install --no-cache-dir setuptools==79.0.1
+    && pip install --no-cache-dir setuptools==79.0.1 \
+    && pip install --no-cache-dir ai-dynamo==1.4.1 \
+    && pip install --no-cache-dir ai-dynamo-runtime==1.4.1
 
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
