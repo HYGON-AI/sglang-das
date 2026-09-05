@@ -661,6 +661,7 @@ jobs:
               --hw hcu \
               --suite stage-a-test-1-hcu-small \
               --include-file registered/hcu/interface/test_hcu_smoke.py \
+              --include-file registered/hcu/kernels/test_dsv4_compressor_dispatch_hcu.py \
               --timeout-per-file 120 \
               ${{ needs.validate-config.outputs.continue_on_error_flag }}
 
