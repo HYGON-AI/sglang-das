@@ -604,6 +604,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
+        self.use_deepep = get_moe_a2a_backend().is_deepep()
 
     def create_weights(
         self,
@@ -662,6 +663,15 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_deepep:
+            from sglang.kernels.ops.moe.w4a8_deepep_aiter import (
+                preload_w4a8_deepep_aiter,
+            )
+
+            # Compile before graph capture. All ranks share torch's extension
+            # cache and its build lock, so only one process performs the build.
+            preload_w4a8_deepep_aiter()
+
         E = layer.w13_weight.shape[0]
         layer.w13_weight = Parameter(
             repack_and_shuffle_w4a8(layer.w13_weight.data, E), requires_grad=False
@@ -682,6 +692,20 @@ class SlimQuantW4A8Int8AiterMoEMethod:
     ):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def apply_deepep_normal(self, layer: torch.nn.Module, dispatch_output):
+        from sglang.srt.layers.moe.ep_moe.w4a8_deepep_aiter import (
+            forward_w4a8_deepep_normal,
+        )
+
+        return forward_w4a8_deepep_normal(layer, dispatch_output)
+
+    def apply_deepep_low_latency(self, layer: torch.nn.Module, dispatch_output):
+        from sglang.srt.layers.moe.ep_moe.w4a8_deepep_aiter import (
+            forward_w4a8_deepep_low_latency,
+        )
+
+        return forward_w4a8_deepep_low_latency(layer, dispatch_output)
 
     @torch._dynamo.disable()
     def apply(
