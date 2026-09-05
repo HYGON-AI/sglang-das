@@ -55,9 +55,37 @@ def topk_transform_512(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     if is_hip_runtime():
-        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        # Some HCU images ship an older sgl-kernel package without this DSV4
+        # AOT op. LightOp provides the same fused top-k + page-table transform
+        # ABI, avoiding the much slower vectorized PyTorch path.
+        sgl_kernel = getattr(torch.ops, "sgl_kernel", None)
+        sgl_topk = (
+            getattr(sgl_kernel, "deepseek_v4_topk_transform_512", None)
+            if sgl_kernel is not None
+            else None
         )
+        if sgl_topk is not None:
+            sgl_topk(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+        else:
+            from lightop.fuse_topk_transform import (
+                topk_transform_512 as lightop_topk_transform_512,
+            )
+
+            lightop_topk_transform_512(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
     else:
         module = _jit_topk_v1_module()
         module.topk_transform(
