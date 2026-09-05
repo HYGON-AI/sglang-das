@@ -71,6 +71,16 @@ install_with_retry() {
   done
 }
 
+install_eval_dependency() {
+  # The required sampling suite invokes this CLI even in image/wheel mode.
+  # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
+  echo "[hcu-ci] Installing sgl-eval at ${SGL_EVAL_REF}"
+  install_with_retry docker exec "${CONTAINER}" \
+    python3 -m pip install --cache-dir=/sgl-data/pip-cache "${SGL_EVAL_SPEC}"
+  run_in_container "sgl-eval --help >/dev/null"
+}
+
 if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_COMPAT_INSTALL=${SKIP_COMPAT_INSTALL}; skipping HCU compatibility pins"
 else
@@ -97,6 +107,7 @@ fi
 
 if [[ "${SKIP_DEPENDENCY_INSTALL}" == "1" || "${SKIP_DEPENDENCY_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_DEPENDENCY_INSTALL=${SKIP_DEPENDENCY_INSTALL}; skipping regular dependency installation"
+  install_eval_dependency
   print_python_status
   exit 0
 fi
@@ -135,6 +146,8 @@ else
   install_with_retry docker exec -w /sglang-checkout "${CONTAINER}" \
     pip install --cache-dir=/sgl-data/pip-cache --no-deps -e "python[srt]"
 fi
+
+install_eval_dependency
 
 echo "[hcu-ci] Installed sglang version:"
 run_in_container "python -c 'import sglang, sys; print(sglang.__version__); sys.exit(0)' || true"
