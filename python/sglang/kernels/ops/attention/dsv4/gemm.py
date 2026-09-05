@@ -5,15 +5,18 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+_linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
+_use_aiter_bf16_fp32_gemm = _is_hip and (
+    _use_aiter or _linear_bf16_fp32_algo == "aiter"
+)
 
-if _use_aiter:
+if _use_aiter_bf16_fp32_gemm:
     from aiter.tuned_gemm import tgemm
 
-_linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
 # The HPC-Ops bf16xfp32 GEMM consumes the fp32 weight decomposed into two
 # bf16 halves: w_high = w.bf16 and w_low = ((w - w_high) / scale).bf16 with
@@ -147,7 +150,16 @@ def linear_bf16_fp32(
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
-    if _use_aiter and y.dtype == torch.bfloat16:
+    if (
+        _use_aiter_bf16_fp32_gemm
+        and x.is_cuda
+        and y.is_cuda
+        and x.dtype == torch.bfloat16
+        and y.dtype == torch.bfloat16
+    ):
+        # AITER's tuned BF16 GEMM is much faster for DSV4's narrow decode
+        # matrices. It returns BF16-rounded values; convert back to the FP32
+        # tensor contract expected by the compressor's downstream operators.
         return tgemm.mm(x, y, otype=x.dtype).float()
     elif hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
