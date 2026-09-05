@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+    from sgl_kernel.kvcacheio import (
+        build_kernel_accessible_pointer_table,
+        transfer_kv_all_layer_mla,
+    )
 else:
 
     def transfer_kv_all_layer_mla(*args, **kwargs):
@@ -417,6 +420,9 @@ class DeepSeekV4SingleKVPoolHost:
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self.kernel_data_ptrs = build_kernel_accessible_pointer_table(
+            self.kv_buffer, self.data_refs, self.device_pool.data_ptrs
+        )
         self.clear()
 
     def clear(self):
@@ -478,7 +484,7 @@ class DeepSeekV4SingleKVPoolHost:
         )
         hisparse_offload_to_host(
             gpu_ptrs=device_pool.data_ptrs,
-            cpu_ptrs=self.data_ptrs,
+            cpu_ptrs=self.kernel_data_ptrs,
             gpu_indices=device_indices_i64,
             cpu_indices=host_indices_i64,
         )
