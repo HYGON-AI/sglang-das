@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
+    MarkovGreedyStep,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -501,6 +502,39 @@ class DSparkV4MarkovHead(nn.Module):
             sampler=sampler,
             collect_corrected=collect_corrected,
         )
+
+    def sample_block_greedy_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Generate a greedy block without materializing Markov bias logits.
+
+        The fused kernel consumes a full vocabulary row. DP attention with a
+        DP LM head has a one-rank vocabulary group and is therefore eligible;
+        retain the existing implementation for genuinely TP-sharded heads.
+        """
+        if not base_logits.is_cuda:
+            return None
+        if self._tp_shard is not None and self._tp_shard.tp_size > 1:
+            return None
+        batch_size, proposal_len = base_logits.shape[:2]
+        if proposal_len == 0:
+            return torch.empty(
+                batch_size, 0, dtype=torch.long, device=base_logits.device
+            )
+        sampled_tokens = []
+        prev_tokens = first_prev_tokens.long()
+        for step_idx in range(proposal_len):
+            prev_embeds = self.get_prev_embeddings(prev_tokens)
+            prev_tokens = MarkovGreedyStep.execute(
+                base_logits=base_logits[:, step_idx, : self.vocab_size],
+                prev_embeds=prev_embeds,
+                w2_weight=self.markov_w2.weight,
+            )
+            sampled_tokens.append(prev_tokens)
+        return torch.stack(sampled_tokens, dim=1)
 
 
 def build_dspark_v4_confidence_head(

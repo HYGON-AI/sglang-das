@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -8,6 +10,9 @@ from sglang.srt.arg_groups.speculative_hook import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    DsparkDraftSampler,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -118,6 +123,49 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
+
+
+class _DuckTypedMarkovHead:
+    def __init__(self):
+        self.called = False
+
+    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+        self.called = True
+        return first_prev_tokens[:, None].expand(-1, base_logits.shape[1]).clone()
+
+    def sample_block(self, *args, **kwargs):
+        raise AssertionError("the eager fallback must not run")
+
+
+class _DuckTypedDraftModel:
+    sample_from_anchor = True
+
+    def __init__(self):
+        self.markov_head = _DuckTypedMarkovHead()
+
+    def compute_base_logits(self, hidden_states):
+        return hidden_states.new_zeros(hidden_states.shape[0], 7), None
+
+
+class TestDsparkFusedGreedyRouting(CustomTestCase):
+    def test_custom_markov_head_can_provide_fused_greedy_sampler(self):
+        model = _DuckTypedDraftModel()
+        with envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.override(True):
+            sampler = DsparkDraftSampler(
+                model=model,
+                gamma=2,
+                max_bs=2,
+                device="cpu",
+                tp_sync=None,
+                folded_sampling=False,
+            )
+
+        hidden_states = torch.zeros(4, 3)
+        input_ids = torch.tensor([11, 12, 21, 22])
+        sampler(hidden_states, input_ids)
+
+        self.assertTrue(model.markov_head.called)
+        self.assertEqual(sampler.out[:4].tolist(), [11, 11, 21, 21])
 
 
 if __name__ == "__main__":
