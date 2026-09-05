@@ -29,7 +29,9 @@ def _device() -> torch.device:
 def _to_device(t: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
     if t is None:
         return None
-    return t.detach().to(device=device).contiguous()
+    # Do not .contiguous() here: TN int8 weights (stride 1, K) would be
+    # full-copied. Callers that need a dense layout contiguous() locally.
+    return t.detach().to(device=device)
 
 
 def _null_ptr(device: torch.device) -> torch.Tensor:
@@ -162,8 +164,10 @@ def _triton_quant_matmul_2d(
         raise ValueError(f"K mismatch: x1 K={k}, x2 K={k2}")
 
     device = x1.device
-    x1_c = x1.contiguous()
-    x2_c = x2.contiguous()
+    x1_c = x1 if x1.is_contiguous() else x1.contiguous()
+    # Keep x2 strides. A TN packed weight is non-contiguous on purpose;
+    # .contiguous() would transpose-copy the whole int8 matrix.
+    x2_c = x2
     y = torch.empty((m, n), device=device, dtype=torch.float32)
 
     use_int32_bias = bias is not None and bias.dtype == torch.int32
@@ -347,8 +351,15 @@ def npu_quant_matmul_triton(
 
     # Expand to broadcasted batch, then flatten tokens for a single 2D launch
     # when bias is not 3D (or batch is empty).
-    a = x1.broadcast_to(batch + (m, k)).contiguous()
-    b = x2.broadcast_to(batch + (k, n)).contiguous()
+    a = x1.broadcast_to(batch + (m, k))
+    if not a.is_contiguous():
+        a = a.contiguous()
+    # 2D TN packed weights must keep stride (1, K). broadcast+contiguous
+    # would materialize NN and recopy the whole int8 matrix.
+    if not batch and x2.dim() == 2:
+        b = x2
+    else:
+        b = x2.broadcast_to(batch + (k, n)).contiguous()
     bsz = int(torch.tensor(batch).prod().item()) if batch else 1
     a2 = a.reshape(bsz * m, k)
     b2 = b.reshape(bsz, k, n) if bsz > 1 else b.reshape(k, n)
@@ -404,7 +415,7 @@ def npu_quant_matmul_triton(
 
     # Shared 2D weight across batches (x2 originally 2D): one GEMM on flat x1.
     if len(batch2) == 0 or all(s == 1 for s in batch2):
-        x2_2d = x2.reshape(k, n).contiguous()
+        x2_2d = x2 if x2.dim() == 2 else x2.reshape(k, n).contiguous()
         pts = (
             pertoken_scale.reshape(bsz * m)
             if pertoken_scale is not None

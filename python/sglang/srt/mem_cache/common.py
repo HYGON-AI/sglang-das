@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -155,6 +155,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
+
 def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -254,8 +255,32 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
+    _release_donated_swa_slots(req, tree_cache)
     tree_cache.req_to_token_pool.free(req)
     req.kv = None
+
+
+def _release_donated_swa_slots(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Free SWA left ownerless by a DSV4 decode-radix prompt donation.
+
+    The donated radix leaf is full-only: it keeps the full pages and tombstones
+    their SWA, and the request's own release treats that prefix as tree-owned.
+    Nobody frees the SWA underneath, so return it here, after the last decode
+    step. swa_evicted_seqlen marks what the window-aware path already took.
+    """
+    donated = int(getattr(req, "dsv4_donated_swa_len", 0) or 0)
+    if donated <= 0 or req.kv is None or req.req_pool_idx is None:
+        return
+    # Clear first: this must run once even if the free below is a no-op.
+    req.dsv4_donated_swa_len = 0
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if not hasattr(allocator, "free_swa"):
+        return
+    # Deliberately not bounded by swa_evicted_seqlen: free_swa_out_of_window_slots
+    # raises that watermark to cache_protected_len without freeing anything, so
+    # for the donated prefix it reads as evicted while the slots are still held.
+    indices = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, :donated]
+    allocator.free_swa(indices)
 
 
 def _release_overallocated_kv_indices(

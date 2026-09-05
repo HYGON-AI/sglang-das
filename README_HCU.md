@@ -63,7 +63,7 @@ pip install -e "python[all_hip]" --no-deps --no-build-isolation --no-index
 
 使用方式：进入 GitHub Actions，选择 `Manual HCU Unattended Model Test`，点击 `Run workflow`。GitHub 页面上的分支下拉框决定默认测试 ref；也可以通过 `test_branch` 输入分支、tag、ref 或 SHA 覆盖。默认 suite 为 `nightly-hcu-accuracy`，可通过 `suite` 改成 `nightly-hcu`、`nightly-hcu-vlm`、`nightly-hcu-4-gpu` 等已注册 HCU suite。若只跑单个文件，填写 `include_file`，例如 `test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py`。
 
-常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 HCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 会传给 `SGLANG_HCU_GSM8K_MODEL`、`SGLANG_HCU_MMLU_MODEL` 和 `SGLANG_TEST_DEFAULT_MODEL_NAME`，可用于测试其它本地模型路径，例如 `/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct`。`run_suite.py` 尚无 `--model-name` 过滤参数，因此这里通过测试文件已支持的环境变量选择模型。
+常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 HCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 会传给 `SGLANG_HCU_GSM8K_MODEL`、`SGLANG_HCU_MMLU_MODEL` 和 `SGLANG_TEST_DEFAULT_MODEL_NAME`，可用于测试其它本地模型路径，例如 `/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B`。`run_suite.py` 尚无 `--model-name` 过滤参数，因此这里通过测试文件已支持的环境变量选择模型。
 
 快速验证其它模型时，可填写 `model_name`，并将 `eval_num_examples` 设为较小值（例如 `10`）；也可用 `include_file` 只跑 `test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py` 或 `test/registered/hcu/accuracy/bw1100/test_mmlu_eval_hcu.py`。如模型精度阈值不同，可通过 `gsm8k_threshold`、`mmlu_threshold` 临时覆盖。`mmlu_num_threads` 默认 128，这是在 HCU runner 上手动验证过的稳定配置。
 

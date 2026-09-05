@@ -222,7 +222,11 @@ def _prepare_standalone_megamoe_inputs(
             quant_input,
             dtype=buf.x.dtype,
             out_q=buf.x[:num_tokens],
-            out_scale=buf.x_sf[:num_tokens],
+            # MegaMoE stores one FP32 scale per token as a flat buffer, while
+            # the public LightOp wrapper validates the per-token scale output
+            # as [num_tokens, 1]. The view preserves the underlying symmetric
+            # buffer layout expected by MegaMoE.
+            out_scale=buf.x_sf[:num_tokens].view(num_tokens, 1),
         )
     else:
         import megamoe
@@ -424,7 +428,14 @@ def _run_mega_routed(
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
     global_num_tokens = get_dp_global_num_tokens()
-    dispatch_num_tokens = max(global_num_tokens) if global_num_tokens else num_tokens
+    # CP has already split the padded prefill batch across attention ranks at
+    # this point. Using the DP-global token count here would size and select
+    # the MegaMoE dispatch as if every CP rank still owned the full batch.
+    dispatch_num_tokens = (
+        max(global_num_tokens)
+        if global_num_tokens and not is_dsa_enable_prefill_cp()
+        else num_tokens
+    )
     assert dispatch_num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="

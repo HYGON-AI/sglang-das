@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -408,7 +409,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_aiter
+            and not _is_hcu
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -546,7 +551,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             if (
-                _use_aiter
+                will_use_aiter_moe()
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 and get_moe_a2a_backend().supports_aiter()
             ):

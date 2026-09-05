@@ -71,9 +71,16 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hcu
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+_is_hcu = is_hcu()
+_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
+    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
+)
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -1272,12 +1279,70 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
-        src_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
+        kv_cache_layout = getattr(self, "kv_cache_layout", None)
+        if kv_cache_layout is None:
+            # Compatibility with older CommonKVManager versions that do not
+            # propagate the pool layout through KVArgs yet.
+            kv_cache_layout = "hnd" if envs.SGLANG_USE_HND_KVCACHE.get() else "nhd"
+        is_hnd = kv_cache_layout == "hnd"
+        is_hcu_legacy = (
+            _kv_layout_hcu_fa
+            and not is_hnd
+            and not envs.SGLANG_USE_HND_KVCACHE.get()
         )
-        dst_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
-        )
+        if is_hnd:
+            # HND/BHSD pages are laid out as [page, head, token, dim]. Heads
+            # belonging to one token are therefore not contiguous: adjacent
+            # heads are page_size * head_bytes apart. Build one contiguous
+            # dim-slice per (page, head, token) instead of treating the page as
+            # token-major, which would silently corrupt asymmetric-TP KV data.
+            src_head_indices = np.arange(
+                src_head_start_offset,
+                src_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1, 1)
+            dst_head_indices = np.arange(
+                dst_head_start_offset,
+                dst_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1, 1)
+            token_offsets = np.arange(page_size, dtype=np.int64).reshape(1, 1, -1)
+            src_token_slot_offsets = (
+                src_head_indices * page_size + token_offsets
+            ) * bytes_per_head_slice_to_send
+            dst_token_slot_offsets = (
+                dst_head_indices * page_size + token_offsets
+            ) * bytes_per_head_slice_to_send
+            transfer_slice_len = bytes_per_head_slice_to_send
+        elif is_hcu_legacy:
+            # The legacy HCU FA cache is head-major within each page:
+            # K is [page, head, token, dim] and V is [page, head, dim, token].
+            # Although K and V differ inside a head, one whole head remains a
+            # contiguous page-sized byte range in both buffers. Transfer each
+            # selected head as one slice so asymmetric TP preserves the exact
+            # physical layout without assuming token-major NHD storage.
+            src_head_indices = np.arange(
+                src_head_start_offset,
+                src_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1)
+            dst_head_indices = np.arange(
+                dst_head_start_offset,
+                dst_head_start_offset + num_heads_to_send,
+                dtype=np.int64,
+            ).reshape(1, -1)
+            head_page_bytes = page_size * bytes_per_head_slice_to_send
+            src_token_slot_offsets = src_head_indices * head_page_bytes
+            dst_token_slot_offsets = dst_head_indices * head_page_bytes
+            transfer_slice_len = head_page_bytes
+        else:
+            src_token_slot_offsets = (
+                tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
+            )
+            dst_token_slot_offsets = (
+                tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
+            )
+            transfer_slice_len = heads_bytes_per_token_to_send
 
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
@@ -1291,7 +1356,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 return 0
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_slices
+            length_list = [transfer_slice_len] * total_slices
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )

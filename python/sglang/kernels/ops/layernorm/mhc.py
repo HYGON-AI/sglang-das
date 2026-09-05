@@ -73,41 +73,6 @@ def _resolve_lazy_tilelang_value(value):
         return tuple(_resolve_lazy_tilelang_value(v) for v in value)
     return value
 
-
-def _patch_tilelang_decouple_type_cast_for_rocm() -> None:
-    if torch.version.hip is None:
-        return
-    try:
-        from tilelang.transform import decouple_type_cast as _dtc
-    except Exception:
-        return
-    if getattr(_dtc, "_sglang_rocm_bool_alloc_patch", False):
-        return
-
-    original_allocate = _dtc.Allocate
-
-    def _is_bool_expr(expr) -> bool:
-        try:
-            dtype = expr.dtype
-            if callable(dtype):
-                dtype = dtype()
-            return str(dtype) == "bool8"
-        except Exception:
-            return False
-
-    def _allocate(data, dtype, extents, condition, body, annotations=None, span=None):
-        if not _is_bool_expr(condition):
-            condition = _dtc.tir.const(1) == _dtc.tir.const(1)
-        if annotations is None:
-            return original_allocate(data, dtype, extents, condition, body)
-        if span is None:
-            return original_allocate(data, dtype, extents, condition, body, annotations)
-        return original_allocate(data, dtype, extents, condition, body, annotations, span)
-
-    _dtc.Allocate = _allocate
-    _dtc._sglang_rocm_bool_alloc_patch = True
-
-
 def _load_tilelang():
     global _real_tilelang, _real_T, tilelang, T
     if _real_tilelang is None:
@@ -121,7 +86,6 @@ def _load_tilelang():
                         "tilelang is not installed; this kernel cannot run on the current platform"
                     ) from exc
                 new_tilelang.set_log_level("WARNING")
-                _patch_tilelang_decouple_type_cast_for_rocm()
                 tilelang = new_tilelang
                 T = new_T
                 _real_T = new_T

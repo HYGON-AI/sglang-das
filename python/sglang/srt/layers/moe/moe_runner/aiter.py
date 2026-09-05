@@ -384,7 +384,10 @@ def _get_aiter_w8a8_weights_for_solution(
     moe_config,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.moe import MoeSolutionType
-    from aiter.ops.shuffle import moe_layout_shuffle_gemm2
+    from aiter.ops.shuffle import (
+        moe_layout_shuffle_gemm1,
+        moe_layout_shuffle_gemm2,
+    )
 
     solution_type = moe_config.solution_type
     need_shuffle = getattr(
@@ -407,7 +410,7 @@ def _get_aiter_w8a8_weights_for_solution(
     layer = quant_info.layer
 
     with torch.no_grad():
-        w1_moe_c = moe_layout_shuffle_gemm2(quant_info.w13_weight).view(
+        w1_moe_c = moe_layout_shuffle_gemm1(quant_info.w13_weight).view(
             *quant_info.w13_weight.shape
         )
         w2_moe_c = moe_layout_shuffle_gemm2(quant_info.w2_weight).view(
@@ -666,6 +669,7 @@ def pre_permute_standard_to_aiter(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     return AiterRunnerInput(
         hidden_states=hidden_states,
+        topk_ids=topk_ids,
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
     )

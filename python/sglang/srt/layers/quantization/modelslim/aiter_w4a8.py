@@ -543,8 +543,6 @@ def _aiter_supports_activation(activation: str) -> bool:
         return act in {str(x).lower() for x in _SUPPORTED_ACTIVATIONS}
     except Exception:
         return False
-
-
 def _is_gated_activation(activation: str) -> bool:
     return _normalize_moe_activation(activation) in {
         "silu",
@@ -969,4 +967,3 @@ def apply_modelslim_aiter_moe(
 def modelslim_moe_use_aiter_requested() -> bool:
     """Env opt-in when ``--moe-runner-backend`` is auto."""
     return get_bool_env_var("SGLANG_MODELSLIM_MOE_USE_AITER", default="false")
-

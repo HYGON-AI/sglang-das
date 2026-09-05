@@ -1347,6 +1347,7 @@ class Req(ReqDllmMixin):
         # stored in the radix tree, so a reused prefix carries stale SWA. Cap the
         # match by the trailing sliding window so it gets re-prefilled, rewriting
         # this request's SWA ring. No-op for other layouts.
+        reprefill_tail = 0
         if tree_cache is not None:
             reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
             if reprefill_tail:
@@ -1362,14 +1363,6 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            # unified_kv SWA lives in a per-request ring that is not content-stable
-            # and never cached in the radix tree, so a reused prefix carries stale
-            # SWA. Cap the match by the trailing sliding window so it is re-prefilled
-            # into this request's ring. No-op for other layouts (returns 0).
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1380,6 +1373,11 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    # unified_kv's SWA is request-private and intentionally
+                    # absent from the tree. Match the reusable full-attention
+                    # prefix; the key_limit above leaves one SWA window to
+                    # re-prefill into this request's ring.
+                    return_full_match=bool(reprefill_tail),
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():

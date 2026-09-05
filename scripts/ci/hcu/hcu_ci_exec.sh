@@ -36,17 +36,17 @@ declare -A ENV_MAP=(
 # by sglang.test.test_utils and keep broad registered tests from falling back
 # to gated or remote Hugging Face model names. A caller can still override any
 # value with -e KEY=VALUE.
-ENV_MAP[SGLANG_TEST_DEFAULT_MODEL_NAME]="${SGLANG_TEST_DEFAULT_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct}"
+ENV_MAP[SGLANG_TEST_DEFAULT_MODEL_NAME]="${SGLANG_TEST_DEFAULT_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/vllm-optest-models/llama3.2/Llama-3.2-1B-Instruct}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_BASE]="${SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_BASE:-/public/opendas/DL_DATA/llm-models/vllm-optest-models/llama3.2/Llama-3.2-1B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE]="${SGLANG_TEST_DEFAULT_SMALL_MODEL_NAME_SCORE:-/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_QWEN_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_QWEN_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-1.5B-Instruct}"
 ENV_MAP[SGLANG_HCU_QWEN25_0P5B_MODEL]="${SGLANG_HCU_QWEN25_0P5B_MODEL:-/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-0.5B-Instruct}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_VLM_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_VLM_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-VL-3B-Instruct}"
-ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/vllm-optest-models/Alibaba-NLP/gte-Qwen2-1.5B-instruct}"
+ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_EMBEDDING_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/iic/gte-Qwen2-1.5B-instruct}"
 ENV_MAP[SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME]="${SGLANG_TEST_DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/vllm-optest-models/BAAI/bge-reranker-base}"
 ENV_MAP[SGLANG_TEST_DETERMINISTIC_MODEL_NAME]="${SGLANG_TEST_DETERMINISTIC_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-8B}"
-ENV_MAP[SGLANG_TEST_DEFAULT_REASONING_MODEL_NAME]="${SGLANG_TEST_DEFAULT_REASONING_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/deepseek-r1/DeepSeek-R1-Distill-Qwen-7B}"
+ENV_MAP[SGLANG_TEST_DEFAULT_REASONING_MODEL_NAME]="${SGLANG_TEST_DEFAULT_REASONING_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_ENABLE_THINKING_MODEL_NAME]="${SGLANG_TEST_DEFAULT_ENABLE_THINKING_MODEL_NAME:-/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B}"
 ENV_MAP[SGLANG_TEST_PRIORITY_METRICS_MODEL]="${SGLANG_TEST_PRIORITY_METRICS_MODEL:-/public/opendas/DL_DATA/llm-models/qwen3/Qwen3-0.6B}"
 ENV_MAP[SGLANG_TEST_DEFAULT_DEEPSEEK_V32_MODEL]="${SGLANG_TEST_DEFAULT_DEEPSEEK_V32_MODEL:-/public/opendas/DL_DATA/llm-models/deepseek-v3.2/DeepSeek-V3.2}"

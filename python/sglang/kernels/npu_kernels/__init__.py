@@ -19,6 +19,7 @@ from typing import Any
 __all__ = [
     "grouped_matmul_triton",
     "npu_quant_matmul_triton",
+    "npu_quant_matmul_w8a8",
     "npu_dynamic_quant_triton",
     "npu_dequant_swiglu_quant_triton",
     "npu_moe_init_routing_v2_triton",
@@ -33,6 +34,10 @@ _LAZY_ATTRS = {
     "npu_quant_matmul_triton": (
         "sglang.kernels.npu_kernels.npu_quant_matmul_triton",
         "npu_quant_matmul_triton",
+    ),
+    "npu_quant_matmul_w8a8": (
+        "sglang.kernels.npu_kernels.npu_quant_matmul_w8a8",
+        "npu_quant_matmul_w8a8",
     ),
     "npu_dynamic_quant_triton": (
         "sglang.kernels.npu_kernels.npu_dynamic_quant_triton",

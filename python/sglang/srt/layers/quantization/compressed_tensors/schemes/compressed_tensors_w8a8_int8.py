@@ -124,7 +124,16 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # ampere and up
         return 80
 
+    @staticmethod
+    def _normalize_weight_scale(layer: torch.nn.Module) -> None:
+        """Qwen3.8-Flash-Next INT8 checkpoints store scales as bf16."""
+        if layer.weight_scale.dtype != torch.float32:
+            layer.weight_scale = Parameter(
+                layer.weight_scale.to(torch.float32), requires_grad=False
+            )
+
     def process_weights_after_loading(self, layer) -> None:
+        self._normalize_weight_scale(layer)
         n = layer.weight.shape[0]
         k = layer.weight.shape[1]
         use_kme_hipblaslt = self.w8a8_strategy == 3 and _use_kme_hipblaslt(

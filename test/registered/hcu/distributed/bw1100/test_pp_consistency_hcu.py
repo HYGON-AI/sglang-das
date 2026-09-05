@@ -22,7 +22,7 @@ register_hcu_ci(
 )
 
 DEFAULT_MODEL = (
-    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+    "/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B"
 )
 PROMPTS = (
     ("The capital of France is", "paris"),

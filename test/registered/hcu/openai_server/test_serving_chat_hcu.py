@@ -87,6 +87,10 @@ class _MockTokenizerManager:
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
 
+    def config_value(self, key):
+        """Support TokenizerManager API used by installed CI wheels."""
+        return getattr(self.server_args, key, None)
+
 
 class _MockTemplateManager:
     """Minimal mock for TemplateManager."""
