@@ -8,6 +8,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from sglang.kernels.ops.moe import w4a8_deepep_aiter
+from sglang.test.ci.ci_register import register_hcu_ci
+
+register_hcu_ci(est_time=20, suite="stage-a-test-1-hcu-small")
 
 
 class TestW4A8DeepEPAiterLoader(unittest.TestCase):
