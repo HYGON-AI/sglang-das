@@ -1283,7 +1283,10 @@ class DeepEPMoE(FusedMoE):
 
             # This gather restores the normal-dispatch row order and applies
             # top-k weights exactly as the existing FP8/W8A8 paths do.
-            gather_out = torch.zeros(
+            # Both the LightOp and Triton EP gather kernels initialize their
+            # accumulators to zero and overwrite every output element. Avoid a
+            # redundant full-buffer fill before the gather.
+            gather_out = torch.empty(
                 hidden_states_shape,
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
