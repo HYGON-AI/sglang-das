@@ -1,7 +1,12 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Licensed under the Apache License, Version 2.0.
 
+import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 from sglang.srt.models.hunyuan_v3 import (
     _apply_hy3_qk_norm,
@@ -151,3 +156,7 @@ def test_reshape_hy3_sp_attention_output_rejects_invalid_token_count():
         assert "token count must be divisible" in str(exc)
     else:
         raise AssertionError("Expected an invalid SP token count to be rejected")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
