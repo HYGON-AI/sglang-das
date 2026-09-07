@@ -126,6 +126,7 @@ class CompressorBackendMixin:
         kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
+        int8_store: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -191,6 +192,7 @@ class CompressorBackendMixin:
             ),
             fp8_2buff=fp8_2buff,
             kvcache_rope=kv_cache_rope,
+            int8_store=int8_store,
         )
 
     def forward_unified(
@@ -302,6 +304,12 @@ class CompressorBackendMixin:
             fp8_2buff=fp8_2buff,
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
+            ),
+            # HCU INT8 index-K cache: the indexer store quantizes K in-kernel.
+            int8_store=(
+                is_hcu()
+                and compressor.is_in_indexer
+                and token_to_kv_pool.use_int8_index_k_cache
             ),
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)

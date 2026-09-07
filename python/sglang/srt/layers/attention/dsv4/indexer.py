@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4 import (
+    fused_q_indexer_rope_hadamard,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
@@ -1073,7 +1074,7 @@ class C4IndexerBackendMixin:
                         slice(start, min(start + rows_per_chunk, query_rows))
                     )
         elif use_int8_index_k_cache:
-            from lightop.quant import per_token_dynamic_quant_int8
+            from lightop.quant import per_token_quant_int8
 
             packed_cache = token_to_kv_pool.get_index_k_int8_packed_buffer(
                 layer_id=c4_indexer.layer_id,
@@ -1081,19 +1082,12 @@ class C4IndexerBackendMixin:
             packed_cache = packed_cache.view(torch.int8).view(
                 packed_cache.shape[0], 64, 1, 132
             )
-            q_bf16 = q.to(torch.bfloat16).contiguous()
+            # gfx936 produces BF16 Q directly after RoPE/Hadamard.
+            # Other HCU architectures retain their existing FP8 route.
+            q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
+            q_bf16 = q_bf16.contiguous()
             q_flat = q_bf16.view(-1, q_bf16.shape[-1])
-            smooth_scale = getattr(self, "_dsv4_int8_query_smooth_scale", None)
-            if (
-                smooth_scale is None
-                or smooth_scale.device != q.device
-                or smooth_scale.shape[0] != q_bf16.shape[-1]
-            ):
-                smooth_scale = torch.ones(
-                    q_bf16.shape[-1], dtype=torch.float32, device=q.device
-                )
-                self._dsv4_int8_query_smooth_scale = smooth_scale
-            q_int8, q_scales = per_token_dynamic_quant_int8(q_flat, smooth_scale)
+            q_int8, q_scales = per_token_quant_int8(q_flat)
             q_int8 = q_int8.view_as(q_bf16)
             adjusted_weights = (
                 weights.to(torch.float32) * q_scales.view(query_rows, -1)
@@ -1122,6 +1116,12 @@ class C4IndexerBackendMixin:
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
 
+            # LightOp's dense paged ABI takes [B] int32 lengths and int32
+            # block tables, with no DeepGEMM scheduler metadata.
+            use_lightop = _is_hcu and not (
+                use_fp4_indexer or _use_tilelang or _use_aiter
+            )
+
             def run_paged_indexer(
                 rows: slice,
                 metadata: torch.Tensor,
@@ -1132,9 +1132,17 @@ class C4IndexerBackendMixin:
                     row_q,
                     c4_indexer_kv_cache,
                     weights[rows],
-                    _c4sl[rows],
-                    page_table[rows],
-                    metadata,
+                    (
+                        _c4sl[rows].reshape(-1).to(torch.int32).contiguous()
+                        if use_lightop
+                        else _c4sl[rows]
+                    ),
+                    (
+                        page_table[rows].to(torch.int32).contiguous()
+                        if use_lightop
+                        else page_table[rows]
+                    ),
+                    None if use_lightop else metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
                 )
@@ -1217,6 +1225,16 @@ class C4Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        # Only gfx936 defaults to BF16 Q for LightOp's FP8-cache path.
+        # Enabling INT8 cache quantizes this BF16 Q at the consumer boundary.
+        self.use_bf16_indexer_q = (
+            _is_hcu
+            and not self.use_fp4_indexer
+            and torch.cuda.get_device_properties().gcnArchName.split(":")[0]
+            == "gfx936"
+        )
+        if self.use_bf16_indexer_q and envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            raise ValueError("gfx936 BF16 C4 indexer Q requires the LightOp backend")
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1278,6 +1296,10 @@ class C4Indexer(nn.Module):
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
+        if self.use_bf16_indexer_q:
+            return fused_q_indexer_rope_hadamard(
+                q, weight, self.weight_scale, self.freqs_cis, positions
             )
         return fused_q_indexer_rope_hadamard_quant(
             q, weight, self.weight_scale, self.freqs_cis, positions
