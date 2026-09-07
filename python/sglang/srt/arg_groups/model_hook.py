@@ -191,6 +191,33 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
             )
 
+    if cfg.hy3_sp:
+        if model_arch != "HYV3ForCausalLM":
+            raise ValueError(
+                "--hy3-sp is only supported for HYV3ForCausalLM, "
+                f"but the loaded architecture is {model_arch}."
+            )
+        if cfg.dp_size != 1 or cfg.enable_dp_attention:
+            raise ValueError(
+                "--hy3-sp requires pure tensor parallelism: set --dp-size 1 "
+                "and remove --enable-dp-attention."
+            )
+        if cfg.pp_size != 1:
+            raise ValueError("--hy3-sp does not support pipeline parallelism.")
+        if cfg.moe_a2a_backend != "deepep":
+            raise ValueError(
+                "--hy3-sp requires --moe-a2a-backend deepep so routed experts "
+                "can process sequence-sharded tokens."
+            )
+        if cfg.moe_dense_tp_size not in (None, 1):
+            raise ValueError("--hy3-sp requires --moe-dense-tp-size 1.")
+        if cfg.moe_dense_tp_size is None:
+            declare_resolution(
+                server_args,
+                "_handle_model_specific_adjustments",
+                moe_dense_tp_size=1,
+            )
+
     _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
         handle_mamba_radix_cache(server_args, model_arch)

@@ -1702,8 +1702,23 @@ class FlashAttentionBackend(AttentionBackend):
                     ver=self.fa_impl_ver,
                 )
             else:
+                # SP (hy3_sp / minimax_opt) shards the sequence across TP ranks and
+                # pads q; trim the padding back to the metadata token count so the
+                # kernel does not attend over padding rows.
+                q_for_attn = q
+                if (
+                    (get_parallel().minimax_opt or get_parallel().hy3_sp)
+                    and q.shape[0] != 0
+                    and cu_seqlens_q is not None
+                    and q.shape[0] > max_seqlen_q * (cu_seqlens_q.shape[0] - 1)
+                ):
+                    q_metadata_num_tokens = int(cu_seqlens_q[-1].item())
+                    if q.shape[0] > q_metadata_num_tokens:
+                        q_for_attn = q[:q_metadata_num_tokens]
                 result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q_for_attn.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,

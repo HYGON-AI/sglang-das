@@ -59,6 +59,12 @@ class FakeKVSender(BaseKVSender):
         self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         self.inited = False
         self.waiting_since: Optional[float] = None
+        self._source_event = None
+
+    def set_source_event(self, source_event) -> None:
+        # Fake transfers never read device memory, so no sync event is needed.
+        # The attribute must still exist: send_kv_chunk reads it directly.
+        del source_event
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:

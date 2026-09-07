@@ -3076,6 +3076,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
                         else:
+                            # Asymmetric attn TP (prefill != decode) without staging:
+                            # fall back to the per-slice path.  This is the chain's
+                            # catch-all -- without it `ret` stays unbound below.
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,

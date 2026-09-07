@@ -284,6 +284,10 @@ class Parallel(msgspec.Struct):
         bool,
         "Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
     ] = False
+    hy3_sp: A[
+        bool,
+        "Enable Hunyuan V3 sequence parallelism over TP ranks.",
+    ] = False
 
     # Derived fields are computed at publication and are not stored in ServerArgs.
     attn_tp_size = Derived(

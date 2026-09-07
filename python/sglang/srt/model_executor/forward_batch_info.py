@@ -1976,9 +1976,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
-        if not input_scattered:
+        model_sp = get_parallel().minimax_opt or get_parallel().hy3_sp
+
+        if not input_scattered and not model_sp:
             return
-        assert self.forward_mode.is_extend()
+
+        if model_sp and not self.forward_mode.is_extend():
+            return
+
+        if input_scattered:
+            assert self.forward_mode.is_extend()
+
         tokens = self.input_ids.shape[0]
         rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
