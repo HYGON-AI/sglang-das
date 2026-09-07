@@ -53,6 +53,11 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+    pack_aux_hidden_states,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -290,6 +295,30 @@ def _flashinfer_hc_pre(
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
+
+
+@functools.cache
+def _hcu_arch_supports_tilelang_mmac() -> bool:
+    """Whether the current HCU can JIT-compile tilelang T.gemm (MLS/GEMM_MLS).
+
+    tilelang's ``hcu_mmac_k_dim`` only accepts gfx938 / gfx92a / gfx946; other
+    archs (e.g. gfx936) fatal at LayerInference for any ``T.gemm``. On those
+    archs we must skip sglang's tilelang split-k mhc_pre and go straight to
+    AITER's fully-fused ``mhc_pre_big_fuse`` instead.
+    """
+    if not _is_hcu:
+        return True
+    try:
+        gcn_arch = getattr(
+            torch.cuda.get_device_properties(0), "gcnArchName", ""
+        )
+    except Exception:
+        # Fail closed: an unreadable arch must not take the tilelang path,
+        # which fatals at LayerInference on unsupported HCUs.
+        return False
+    return any(a in gcn_arch for a in ("gfx938", "gfx92a", "gfx946"))
+
+
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
@@ -1891,6 +1920,32 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            if (
+                _is_hcu
+                and _use_aiter_tilelang_mhc
+                and not _hcu_arch_supports_tilelang_mmac()
+            ):
+                # This HCU arch (e.g. gfx936) lacks tilelang T.gemm support, so
+                # sglang's own tilelang split-k mhc_pre fatals in LayoutInference.
+                # Bypass it entirely and use AITER's fully-fused mhc_pre_big_fuse,
+                # which is also what earlier sglang releases dispatched to here.
+                from aiter.ops.tilelang import mhc_pre_big_fuse
+
+                post, comb, y = mhc_pre_big_fuse(
+                    residual=x,
+                    fn=hc_fn,
+                    mhc_scale=hc_scale,
+                    mhc_base=hc_base,
+                    rms_eps=self.rms_norm_eps,
+                    mhc_pre_eps=self.hc_eps,
+                    mhc_sinkhorn_eps=self.hc_eps,
+                    mhc_post_mult_value=_MHC_POST_MULT_VALUE,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                    n_splits=16,
+                )
+                # AITER mhc_pre_big_fuse does not fuse the decoder RMSNorm.
+                return y, post.squeeze(-1), comb, False
+
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -1914,7 +1969,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
             # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
             # contract so the caller still applies input_layernorm on HCU.
-            norm_fused = norm is not None and not (_is_hcu and _use_aiter_tilelang_mhc)
+            norm_fused = norm is not None and not (
+                _is_hcu and _use_aiter_tilelang_mhc
+            )
             return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip:
@@ -3043,6 +3100,8 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        incoming_pd_aux_hidden_states: List[torch.Tensor] = []
+        local_dspark_aux_hidden_states: List[torch.Tensor] = []
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -3052,6 +3111,14 @@ class DeepseekV4Model(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
+            incoming_pd_aux_hidden_states = [
+                pp_proxy_tensors[key]
+                for key in sorted(
+                    key
+                    for key in pp_proxy_tensors.tensors
+                    if key.startswith("pd_aux_hidden_states_")
+                )
+            ]
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
@@ -3074,8 +3141,25 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # PD disaggregation drives the capture set per batch; fall back to the
+        # model-level set for the non-disaggregated path.
+        dspark_layers_to_capture = getattr(
+            forward_batch, "pd_hidden_capture_layer_ids", None
+        )
+        if dspark_layers_to_capture is None:
+            dspark_layers_to_capture = self.dspark_layers_to_capture
+        capture_dspark = dspark_layers_to_capture is not None
+        if capture_dspark and use_prefill_cp and cp_v2_active:
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture does not yet support DeepSeek-V4 "
+                "CP-v2. Use the legacy prefill-CP path."
+            )
+        use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
+        pd_aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker(len(dspark_layers_to_capture))
+            if use_packed_pd_aux
+            else list(incoming_pd_aux_hidden_states)
+        )
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
@@ -3127,55 +3211,103 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
-                if capture_dspark and i in self.dspark_layers_to_capture:
+                if capture_dspark and i in dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
                             hidden_states, prev_residual, prev_post, prev_comb
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    captured_hidden = completed.mean(dim=1)
+                    pd_aux_hidden_states.append(captured_hidden)
+                    local_dspark_aux_hidden_states.append(captured_hidden)
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if (
-            self.pp_group.is_last_rank
-            and use_prefill_cp
+        # CP v2 partitions the output per rank, so it needs no output re-gather,
+        # and TBO never applied the CP split in the first place.
+        cp_gather_output = (
+            use_prefill_cp
             and not cp_v2_active
             and not run_tbo
+            and self.pp_group.is_last_rank
+        )
+
+        # With PP+D-Spark, each stage projects only its own capture features.
+        # The final stage receives the prior projected accumulator separately,
+        # so its logits output must contain local features rather than the old
+        # concatenated raw-hidden relay.
+        if (
+            capture_dspark
+            and self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
         ):
-            stream = torch.cuda.current_stream()
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                stream,
-            )
-            # Gather DSpark aux tensors on the same CP token split.
-            if capture_dspark:
-                dspark_aux_hidden_states = [
-                    cp_all_gather_rerange_output(
-                        aux, self.cp_size, forward_batch, stream
-                    )
-                    for aux in dspark_aux_hidden_states
-                ]
+            pd_aux_hidden_states = local_dspark_aux_hidden_states
+
+        if isinstance(pd_aux_hidden_states, AuxHiddenStatePacker):
+            pd_aux_hidden = pd_aux_hidden_states.finalize()
+        else:
+            pd_aux_hidden = pd_aux_hidden_states
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                for idx, aux_hidden in enumerate(pd_aux_hidden_states):
+                    proxy_tensors[f"pd_aux_hidden_states_{idx}"] = (
+                        aux_hidden.flatten(1) if aux_hidden.ndim == 3 else aux_hidden
+                    )
+                if local_dspark_aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        local_dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = (
+                        hidden_states.new_empty(hidden_states.shape[0], 0)
+                    )
+            return PPProxyTensors(proxy_tensors)
 
-        pre_hc_head = hidden_states.flatten(1)
-
-        hidden_states = self.hc_head(
-            hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-        )
-        hidden_states = self.norm(hidden_states)
+        if cp_gather_output:
+            stream = torch.cuda.current_stream()
+            # hc_head and norm are token-wise, so run them on the local CP shard
+            # and all-gather the 2D result: hc_mult x less traffic than gathering
+            # the 3D tensor first, and numerically identical.
+            pre_hc_head = cp_all_gather_rerange_output(
+                hidden_states.flatten(1), self.cp_size, forward_batch, stream
+            )
+            # Gather DSpark aux tensors on the same CP token split.
+            if capture_dspark:
+                pd_aux_hidden = (
+                    [
+                        cp_all_gather_rerange_output(
+                            aux, self.cp_size, forward_batch, stream
+                        )
+                        for aux in pd_aux_hidden
+                    ]
+                    if isinstance(pd_aux_hidden, list)
+                    else cp_all_gather_rerange_output(
+                        pd_aux_hidden, self.cp_size, forward_batch, stream
+                    )
+                )
+            hidden_states = self.hc_head(
+                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            )
+            hidden_states = self.norm(hidden_states)
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states, self.cp_size, forward_batch, stream
+            )
+        else:
+            pre_hc_head = hidden_states.flatten(1)
+            hidden_states = self.hc_head(
+                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            )
+            hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            return (hidden_states, pre_hc_head), pd_aux_hidden
 
         return hidden_states, pre_hc_head
 
@@ -3254,14 +3386,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
@@ -3328,11 +3463,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        pd_aux_hidden_states = None
+        has_pd_hidden_capture = (
+            getattr(forward_batch, "pd_hidden_capture_layer_ids", None) is not None
+        )
+        if has_pd_hidden_capture:
+            hidden_states, pd_aux_hidden_states = hidden_states
+            if self.capture_aux_hidden_states:
+                aux_hidden_states = pack_aux_hidden_states(pd_aux_hidden_states)
+        elif self.capture_aux_hidden_states:
+            hidden_states, captured_aux_hidden_states = hidden_states
+            aux_hidden_states = pack_aux_hidden_states(captured_aux_hidden_states)
+            # Eager/static forward-batch wrappers can preserve the global
+            # DSpark capture plan while omitting the per-request PD marker.
+            # A PD prefill target still has to expose those captured layers to
+            # the transfer path instead of relying on LogitsProcessor's request
+            # capture mode to retain them.
+            if self.model.dspark_layers_to_capture is not None:
+                pd_aux_hidden_states = captured_aux_hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -3342,6 +3493,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        if pd_aux_hidden_states is not None and (
+            has_pd_hidden_capture
+            or self.model.dspark_layers_to_capture is not None
+        ):
+            # PD hidden transfer must use the requested target-layer captures,
+            # even when CaptureHiddenMode.FULL also populated final-layer state.
+            packed_pd_aux_hidden = pack_aux_hidden_states(pd_aux_hidden_states)
+            logits_output.hidden_states = (
+                packed_pd_aux_hidden.flatten(1)
+                if packed_pd_aux_hidden.ndim == 3
+                else packed_pd_aux_hidden
+            )
+        return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper

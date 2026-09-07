@@ -36,6 +36,9 @@ jobs:
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
     runs-on: [self-hosted, hcu, nmz4]
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
 
     container:
       image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
@@ -87,6 +90,10 @@ jobs:
           submodules: 'recursive'
           persist-credentials: false
           allow-unsafe-pr-checkout: true
+
+      - name: Trust checked-out workspace
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       # 容器内已预装 Python 3.10 + DTK/ROCm + gcc + cmake
       - name: Install build deps
@@ -176,8 +183,8 @@ jobs:
           source $HOME/.cargo/env
           export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
           export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
-          cd sgl-model-gateway && cargo build --release
-          cd bindings/python && maturin build --release --skip-auditwheel
+          cd sgl-model-gateway && cargo build --release --features vendored-openssl
+          cd bindings/python && maturin build --release --skip-auditwheel --features vendored-openssl
           echo "=== sgl-model-gateway wheel ==="
           ls -lh target/wheels/*.whl
 

@@ -43,6 +43,19 @@ def _make_dspark_server_args(
     return server_args
 
 
+def _enable_pd_prefill_cp(server_args: ServerArgs) -> None:
+    server_args.disaggregation_mode = "prefill"
+    server_args.disaggregation_transfer_backend = "mooncake"
+    server_args.tp_size = 4
+    server_args.dp_size = 1
+    server_args.pp_size = 1
+    server_args.attn_cp_size = 4
+    server_args.enable_prefill_cp = True
+    server_args.cp_strategy = "interleave"
+    server_args.enable_dp_attention = True
+    server_args.enable_dp_lm_head = False
+
+
 class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
     def test_bundled_dsv4_config_is_detected(self):
         server_args = _make_dspark_server_args(
@@ -83,6 +96,40 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
+
+    def test_pd_prefill_cp_does_not_require_dp_lm_head(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        _enable_pd_prefill_cp(server_args)
+
+        _handle_dspark(server_args)
+
+        self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
+
+    def test_context_parallel_remains_rejected_outside_pd_prefill(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        _enable_pd_prefill_cp(server_args)
+        server_args.disaggregation_mode = "decode"
+
+        with self.assertRaisesRegex(
+            ValueError, "only supported for DeepSeek-V4 PD prefill"
+        ):
+            _handle_dspark(server_args)
+
+    def test_decode_target_deepep_allows_draft_none(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.moe_a2a_backend = "deepep"
+        server_args.moe_runner_backend = "deep_gemm"
+        server_args.speculative_moe_a2a_backend = "none"
+
+        _handle_dspark(server_args)
 
 
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):

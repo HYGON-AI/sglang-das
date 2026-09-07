@@ -1867,7 +1867,11 @@ def ep_gather(
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     if use_groupgemm:
-        BLOCK_D = min(hidden_size, 1024)
+        # The kernel has no tail mask, so BLOCK_D must divide hidden_size.
+        # Use the largest power-of-two divisor up to 1024. For example, Kimi
+        # K3 routed hidden size 3584 selects 512 instead of the invalid 1024.
+        largest_pow2_divisor = hidden_size & -hidden_size
+        BLOCK_D = min(largest_pow2_divisor, 1024)
     else:
         BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
     assert hidden_size % BLOCK_D == 0

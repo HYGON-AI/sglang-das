@@ -992,6 +992,48 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             False,
         )
 
+    def _get_hcu_int8_paged_index_k_cache(
+        self,
+        pool,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Return the packed INT8 K+scale pages for native LightOp MQA."""
+        packed_cache = self._get_index_k_read_buffer(pool, layer_id)
+        assert packed_cache.dtype == torch.uint8
+        assert packed_cache.dim() == 2
+        assert packed_cache.shape[1] == pool.page_size * (self.head_dim + 4)
+        return packed_cache.view(torch.int8).view(
+            packed_cache.shape[0], pool.page_size, 1, self.head_dim + 4
+        )
+
+    def _prepare_hcu_int8_paged_query(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize Q to INT8 and fold its per-head scale into gate weights."""
+        from lightop.quant import per_token_dynamic_quant_int8
+
+        q_bf16 = q.to(torch.bfloat16).contiguous()
+        q_flat = q_bf16.view(-1, q_bf16.shape[-1])
+        smooth_scale = getattr(self, "_hcu_int8_query_smooth_scale", None)
+        if (
+            smooth_scale is None
+            or smooth_scale.device != q.device
+            or smooth_scale.shape[0] != q_bf16.shape[-1]
+        ):
+            smooth_scale = torch.ones(
+                q_bf16.shape[-1], dtype=torch.float32, device=q.device
+            )
+            self._hcu_int8_query_smooth_scale = smooth_scale
+
+        q_int8, q_scales = per_token_dynamic_quant_int8(q_flat, smooth_scale)
+        q_int8 = q_int8.view_as(q_bf16)
+        adjusted_weights = (
+            weights.to(torch.float32) * q_scales.view(q.shape[0], -1)
+        ).contiguous()
+        return q_int8, adjusted_weights
+
     @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
         """Pad q and weights to 32 heads when num_heads < 32,
@@ -1128,21 +1170,44 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         sparse_mask: Optional[torch.Tensor] = None
 
         if self.paged_mqa_logits_backend.is_lightop():
-            kv_cache, use_bf16_index_cache = self._get_hcu_paged_index_k_cache(
-                pool,
-                layer_id,
-                block_tables,
-                seqlens_32,
-            )
-            if use_bf16_index_cache:
-                active_weights = weights[:q_offset].to(torch.float32)
+            use_int8_index_cache = self._use_hcu_int8_index_cache(pool)
+            if use_int8_index_cache:
+                kv_cache = self._get_hcu_int8_paged_index_k_cache(pool, layer_id)
+                use_bf16_index_cache = False
             else:
+                kv_cache, use_bf16_index_cache = self._get_hcu_paged_index_k_cache(
+                    pool,
+                    layer_id,
+                    block_tables,
+                    # Target verify and draft extend expand the page table to one row
+                    # per speculative token, so use the matching expanded lengths.
+                    seqlens_32,
+                )
+            if use_int8_index_cache:
+                paged_q, active_weights = self._prepare_hcu_int8_paged_query(
+                    q_fp8[:q_offset], weights[:q_offset]
+                )
+                paged_seqlens = seqlens_32.reshape(-1).to(torch.int32).contiguous()
+                paged_block_tables = block_tables.to(torch.int32).contiguous()
+                paged_schedule_metadata = None
+            elif use_bf16_index_cache:
+                paged_q = q_fp8[:q_offset]
+                active_weights = weights[:q_offset].to(torch.float32)
+                paged_seqlens = seqlens_32
+                paged_block_tables = block_tables
+                paged_schedule_metadata = schedule_metadata
+            else:
+                paged_q = q_fp8[:q_offset]
                 active_weights = weights[:q_offset]
-            active_q = q_fp8[:q_offset].unsqueeze(1)
+                paged_seqlens = seqlens_32
+                paged_block_tables = block_tables
+                paged_schedule_metadata = schedule_metadata
+            active_q = paged_q.unsqueeze(1)
             use_mask_topk = envs.SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK.get()
             sparse_route = select_lightop_sparse_mqa_route(
                 enabled=(
                     use_mask_topk
+                    and not use_int8_index_cache
                     and not use_bf16_index_cache
                     and metadata.topk_backend.is_sgl_kernel()
                     and metadata.attn_metadata.page_table_1 is not None
@@ -1180,12 +1245,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             if sparse_route is None:
                 logits = _hcu_paged_mqa_logits(
-                    q_fp8[:q_offset],
+                    paged_q,
                     kv_cache,
                     active_weights,
-                    seqlens_32,
-                    block_tables,
-                    schedule_metadata,
+                    paged_seqlens,
+                    paged_block_tables,
+                    paged_schedule_metadata,
                     max_seq_len,
                 )
             elif sparse_route.group_size == 1:
@@ -1217,6 +1282,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     num_warps=4,
                     group_size=sparse_route.group_size,
                 )
+            if use_int8_index_cache and not hasattr(
+                self, "_hcu_int8_indexer_path_logged"
+            ):
+                logger.info(
+                    "DSA INT8 index-K consumer=LightOp dense INT8 Paged MQA"
+                )
+                self._hcu_int8_indexer_path_logged = True
         else:
             kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
             assert len(kv_cache_fp8.shape) == 2

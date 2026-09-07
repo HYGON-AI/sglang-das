@@ -103,7 +103,9 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     auto packed = load_as<float2>(s_acc[0], tx);
 #pragma unroll
     for (uint32_t i = 1; i < kNumWarps; ++i) {
-      const auto [lo, hi] = load_as<float2>(s_acc[i], tx);
+      const float2 lo_hi = load_as<float2>(s_acc[i], tx);
+      const float lo = lo_hi.x;
+      const float hi = lo_hi.y;
       packed.x += lo;
       packed.y += hi;
     }

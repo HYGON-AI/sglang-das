@@ -133,6 +133,21 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         self.assertEqual(predict_tokens, [[201, 202, 203]])
         self.assertEqual(req.kv_committed_len, 3)
 
+    def test_resolve_zero_accept_len_records_zero_correct_drafts(self):
+        req = _make_req(terminate_after=99)
+        req.grammar = None
+        proc = _make_processor()
+        result = _make_result(4, [0], [0, 0, 0, 0])
+
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        self.assertEqual(predict_tokens, [[]])
+        self.assertEqual(result.num_correct_drafts, 0)
+        self.assertEqual(result.num_correct_drafts_per_req_cpu, [0])
+        self.assertEqual(req.spec_num_correct_drafts, 0)
+        self.assertEqual(req.spec_correct_drafts_histogram, [1])
+        self.assertEqual(req.kv_committed_len, 0)
+
 
 class TestReasoningTokenAccounting(CustomTestCase):
     def test_multi_token_end_can_span_decode_steps(self):

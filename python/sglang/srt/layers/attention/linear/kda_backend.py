@@ -15,11 +15,24 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import rank0_log
 
-# KDA always uses the triton causal_conv1d_fn (no CUDA override).
-# Only causal_conv1d_update needs platform-specific overrides for decode.
+# HCU: use the operator-library causal_conv1d (DAS/DTK build) for the plain
+# extend/decode paths. The spec-decode verify path keeps the triton
+# implementation because it needs extended kwargs (intermediate_conv_window /
+# retrieve_*) that the library's causal_conv1d_update does not provide.
+_hcu_causal_conv1d_fn = None
+_hcu_causal_conv1d_update = None
+_use_hcu_cc1d = is_hcu() and get_bool_env_var(
+    "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU", default="true"
+)
+if _use_hcu_cc1d:
+    from causal_conv1d import (
+        causal_conv1d_fn_hcu as _hcu_causal_conv1d_fn,
+        causal_conv1d_update as _hcu_causal_conv1d_update,
+    )
+
 if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
@@ -28,6 +41,75 @@ elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 
     causal_conv1d_update = causal_conv1d_update_cpu
+
+
+def _run_causal_conv1d_fn(
+    x,
+    weight,
+    bias,
+    *,
+    conv_states,
+    query_start_loc,
+    seq_lens_cpu,
+    cache_indices=None,
+    has_initial_state=None,
+    activation="silu",
+):
+    """HCU uses the operator-library varlen causal conv; other platforms keep
+    the sglang triton implementation."""
+    if _hcu_causal_conv1d_fn is not None:
+        return _hcu_causal_conv1d_fn(
+            x,
+            weight,
+            bias,
+            initial_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            seq_lens_cpu=seq_lens_cpu,
+            activation=activation,
+        )
+    return causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        seq_lens_cpu=seq_lens_cpu,
+        activation=activation,
+    )
+
+
+def _run_causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    *,
+    activation="silu",
+    conv_state_indices=None,
+):
+    """HCU uses the operator-library single-step causal conv; other platforms
+    keep the sglang triton implementation (or its NPU/CPU overrides)."""
+    if _hcu_causal_conv1d_update is not None:
+        return _hcu_causal_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+        )
+    return causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=conv_state_indices,
+    )
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -523,7 +605,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
                     )
 
-        qkv = causal_conv1d_update(
+        qkv = _run_causal_conv1d_update(
             mixed_qkv,
             conv_states.transpose(-1, -2),
             layer.conv_weights,
@@ -637,7 +719,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         else:
             q_bias, k_bias, v_bias = None, None, None
 
-        q = causal_conv1d_fn(
+        q = _run_causal_conv1d_fn(
             q,
             q_conv_weight,
             q_bias,
@@ -648,7 +730,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
-        k = causal_conv1d_fn(
+        k = _run_causal_conv1d_fn(
             k,
             k_conv_weight,
             k_bias,
@@ -659,7 +741,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
-        v = causal_conv1d_fn(
+        v = _run_causal_conv1d_fn(
             v,
             v_conv_weight,
             v_bias,

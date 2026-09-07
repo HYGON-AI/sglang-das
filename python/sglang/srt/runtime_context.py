@@ -395,6 +395,10 @@ class MoeFlags(_FlagGroupBase):
     # speculative_moe_backend_context is active, so a draft gate's write also
     # lands on the speculative leaf.
     in_speculative_scope: bool = False
+    # Set while the draft model is using its speculative A2A backend. Target
+    # and draft DeepEP instances can have different expert layouts, so their
+    # process-level communication buffers must not be shared.
+    in_speculative_a2a_scope: bool = False
 
 
 @dataclasses.dataclass

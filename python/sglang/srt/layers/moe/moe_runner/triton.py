@@ -61,6 +61,9 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     use_int8_w8a8: bool = False
     use_int8_w8a16: bool = False
     use_int4_w4a16: bool = False
+    use_int4_w4a8: bool = False
+    use_mxfp4_w4a16: bool = False
+    use_mxfp4_w4a8: bool = False
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
@@ -148,6 +151,9 @@ class TritonRunnerCore(MoeRunnerCore):
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
             use_int4_w4a16=quant_info.use_int4_w4a16,
+            use_int4_w4a8=quant_info.use_int4_w4a8,
+            use_mxfp4_w4a16=quant_info.use_mxfp4_w4a16,
+            use_mxfp4_w4a8=quant_info.use_mxfp4_w4a8,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
@@ -243,6 +249,9 @@ def fused_experts_none_to_triton(
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
             use_int4_w4a16=quant_info.use_int4_w4a16,
+            use_int4_w4a8=quant_info.use_int4_w4a8,
+            use_mxfp4_w4a16=quant_info.use_mxfp4_w4a16,
+            use_mxfp4_w4a8=quant_info.use_mxfp4_w4a8,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
@@ -299,6 +308,9 @@ def pre_permute_standard_to_triton(
         use_int8_w8a8=quant_info.use_int8_w8a8,
         use_int8_w8a16=quant_info.use_int8_w8a16,
         use_int4_w4a16=quant_info.use_int4_w4a16,
+        use_int4_w4a8=quant_info.use_int4_w4a8,
+        use_mxfp4_w4a16=quant_info.use_mxfp4_w4a16,
+        use_mxfp4_w4a8=quant_info.use_mxfp4_w4a8,
         per_channel_quant=quant_info.per_channel_quant,
         block_shape=quant_info.block_shape,
     )

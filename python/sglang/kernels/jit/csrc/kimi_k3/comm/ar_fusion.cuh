@@ -217,10 +217,12 @@ SGL_DEVICE float reduce_sqr(device::AlignedVector<T2, N>& out_vec, device::Align
   for (size_t i = 0; i < M; ++i) {
 #pragma unroll
     for (size_t j = 0; j < N; ++j) {
-      const auto [x, y] = device::cast<fp32x2_t>(vec[i][j]);
-      auto& [acc_x, acc_y] = acc_vec[j];
-      acc_x = i == 0 ? x : acc_x + x;
-      acc_y = i == 0 ? y : acc_y + y;
+      const fp32x2_t xy = device::cast<fp32x2_t>(vec[i][j]);
+      const float x = xy.x;
+      const float y = xy.y;
+      fp32x2_t& acc = acc_vec[j];
+      acc.x = i == 0 ? x : acc.x + x;
+      acc.y = i == 0 ? y : acc.y + y;
     }
   }
   float sum_eq = 0.0f;
@@ -364,9 +366,9 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
       const auto norm_factor = math::rsqrt(total / kNormDim + params.norm_eps);
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
-        const auto [a, b] = cast<fp32x2_t>(out_vec[j]);
-        const auto [wa, wb] = cast<fp32x2_t>(w[j]);
-        out_vec[j] = cast<bf16x2_t>(fp32x2_t{a * norm_factor * wa, b * norm_factor * wb});
+        const fp32x2_t ab = cast<fp32x2_t>(out_vec[j]);
+        const fp32x2_t wab = cast<fp32x2_t>(w[j]);
+        out_vec[j] = cast<bf16x2_t>(fp32x2_t{ab.x * norm_factor * wab.x, ab.y * norm_factor * wab.y});
       }
     } else {
       out_vec = reduce(vec);
@@ -581,8 +583,8 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
         float sum_of_squares = 0.0f;
 #pragma unroll
         for (uint32_t j = 0; j < 4; ++j) {
-          const auto [a, b] = cast<fp32x2_t>(vec[u][j]);
-          sum_of_squares += a * a + b * b;
+          const fp32x2_t ab = cast<fp32x2_t>(vec[u][j]);
+          sum_of_squares += ab.x * ab.x + ab.y * ab.y;
         }
         sum_of_squares = warp::reduce_sum(sum_of_squares);
         if (lane == 0) sm[u][warp] = sum_of_squares;
@@ -602,9 +604,9 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
       const auto norm_factor = math::rsqrt(total / kNormDim + params.norm_eps);
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
-        const auto [a, b] = cast<fp32x2_t>(vec[u][j]);
-        const auto [wa, wb] = cast<fp32x2_t>(wvec[j]);
-        vec[u][j] = cast<bf16x2_t>(fp32x2_t{a * norm_factor * wa, b * norm_factor * wb});
+        const fp32x2_t ab = cast<fp32x2_t>(vec[u][j]);
+        const fp32x2_t wab = cast<fp32x2_t>(wvec[j]);
+        vec[u][j] = cast<bf16x2_t>(fp32x2_t{ab.x * norm_factor * wab.x, ab.y * norm_factor * wab.y});
       }
       st_multimem_16B(vec[u], params.input_mc, vid0 + u * kNormRowVecs);
     }

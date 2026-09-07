@@ -41,7 +41,9 @@ register_hcu_ci(
     ),
 )
 
-DEFAULT_HCU_NGRAM_MODEL = "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+DEFAULT_HCU_NGRAM_MODEL = (
+    "/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B"
+)
 
 
 class TestNgramSpeculativeDecodingHCU(unittest.TestCase):

@@ -99,6 +99,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    resolve_disagg_metadata_config,
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -1357,7 +1358,7 @@ class Scheduler(
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.ps.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
+                self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
@@ -1425,6 +1426,29 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # DSpark PD hidden-state transfer widens the metadata buffers and adds
+        # its own receive pool. NULL mode has no PD wire to size, and resolving
+        # it there would inspect speculative workers that need not exist.
+        metadata_buffer_kwargs = {}
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            disagg_metadata_config = resolve_disagg_metadata_config(
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                disaggregation_mode=self.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+                spec_algorithm=self.spec_algorithm,
+                model_config=self.model_config,
+                server_args=self.server_args,
+                model_runner=self.tp_worker.model_runner,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                gpu_id=self.ps.gpu_id,
+                max_prefill_tokens=self.max_prefill_tokens,
+            )
+            disagg_hidden_size = disagg_metadata_config.hidden_size
+            disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+            metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1447,6 +1471,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
             )
 
             # The decode requests polling kv cache
@@ -1493,6 +1518,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                **metadata_buffer_kwargs,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -2963,8 +2989,6 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
-                elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -4764,33 +4788,11 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    receiver = decode_req.kv_receiver
-                    receiver.abort()
-                    # Arm drain-ack accounting once the ABORT is sent, so acks
-                    # arriving before this req is deferred (e.g. during the next
-                    # forward step) are captured. A fresh set also drops stale acks
-                    # from a prior request that reused this bootstrap_room. A
-                    # redundant abort only re-wipes -- holds longer, never releases
-                    # early -- so no transition guard is needed.
-                    if (
-                        receiver.kv_mgr.enable_deferred_decode_kv_release
-                        and receiver.abort_notified
-                    ):
-                        receiver.kv_mgr.register_deferred_abort_room(
-                            decode_req.req.bootstrap_room
-                        )
+            # Mark Failed and record the rid for PP failed-union. Do not free
+            # KV until all PP ranks process the same consensus drop, otherwise
+            # PP0 can reuse pages while PP1 still maps the aborted request.
+            self.disagg_decode_prealloc_queue.abort_matching(recv_req)
+            self.disagg_decode_transfer_queue.abort_matching(recv_req)
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:

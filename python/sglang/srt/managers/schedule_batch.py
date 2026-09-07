@@ -1181,7 +1181,6 @@ class Req(ReqDllmMixin):
         # kv_send(req.input_ids[req.start_send_idx:req.extend_range.end])
         # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
-        self.disagg_decode_prefix_len: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
@@ -1189,10 +1188,17 @@ class Req(ReqDllmMixin):
         self.tmp_end_idx: int = -1
         # Decode-side cached-prefix length; base of the staging chunk grid
         # (start_send_idx starts here but advances with every send).
-        self.disagg_decode_prefix_len: int = 0
+        # None until bootstrap pops it off the sender: the prefill bootstrap
+        # treats None as "not resolved yet", so a 0 here silently pins every
+        # request's decode prefix to 0.
+        self.disagg_decode_prefix_len: Optional[int] = None
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        # Upper bound on radix prefix reuse for DSpark PD-hidden requests.
+        # Set at bootstrap to the decode-committed prefix; see
+        # _compute_max_prefix_len.
+        self.pd_hidden_max_prefix_len: Optional[int] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -1339,6 +1345,7 @@ class Req(ReqDllmMixin):
         # stored in the radix tree, so a reused prefix carries stale SWA. Cap the
         # match by the trailing sliding window so it gets re-prefilled, rewriting
         # this request's SWA ring. No-op for other layouts.
+        reprefill_tail = 0
         if tree_cache is not None:
             reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
             if reprefill_tail:
@@ -1354,14 +1361,6 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            # unified_kv SWA lives in a per-request ring that is not content-stable
-            # and never cached in the radix tree, so a reused prefix carries stale
-            # SWA. Cap the match by the trailing sliding window so it is re-prefilled
-            # into this request's ring. No-op for other layouts (returns 0).
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1372,6 +1371,11 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    # unified_kv's SWA is request-private and intentionally
+                    # absent from the tree. Match the reusable full-attention
+                    # prefix; the key_limit above leaves one SWA window to
+                    # re-prefill into this request's ring.
+                    return_full_match=bool(reprefill_tail),
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -1425,6 +1429,11 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        # DSpark PD ships hidden states for [decode prefix, end). A reused
+        # prefix is never forwarded, so it yields no hidden rows; matching past
+        # the decode-committed prefix would leave holes that abort the transfer.
+        if self.pd_hidden_max_prefix_len is not None:
+            max_prefix_len = min(max_prefix_len, self.pd_hidden_max_prefix_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

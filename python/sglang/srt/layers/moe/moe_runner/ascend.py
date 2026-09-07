@@ -11,6 +11,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
     NPUSitu,
+    NPUSituQuant,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
@@ -102,30 +103,26 @@ class AscendRunnerCore(MoeRunnerCore):
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
-            if config.activation == "situ":
-                self.activation = NPUSitu(
-                    need_quant=is_quant_kernel,
-                    beta=(
-                        config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
-                    ),
-                    linear_beta=config.gemm1_clamp_limit,
-                )
-            else:
-                self.activation = NPUSwigluDeepEPKernel(
-                    need_quant=is_quant_kernel,
-                    alpha=config.gemm1_alpha,
-                    limit=config.gemm1_clamp_limit,
-                )
+            self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+                # Kimi-K3 uses SiTU; do not force SiLU SwiGLU+quant.
+                if isinstance(config.activation, str) and config.activation.lower() == "situ":
+                    inner = NPUSituQuant(moe_runner_config=config)
+                else:
+                    inner = NPUSwigluQuant()
             else:
                 if config.activation == "npu_swiglu_oai":
                     # NPUSwigluOAI requires the runner config to pass
                     # gemm1_alpha and gemm1_clamp_limit to the triton kernel.
                     inner = NPUSwigluOAI(moe_runner_config=config)
+                elif (
+                    isinstance(config.activation, str)
+                    and config.activation.lower() == "situ"
+                ):
+                    inner = NPUSitu(moe_runner_config=config)
                 elif config.activation == "silu":
                     if config.gemm1_clamp_limit is not None:
                         inner = NPUSwigluStepAndMul(
@@ -183,11 +180,8 @@ class AscendRunnerCore(MoeRunnerCore):
             )
 
             # --- Activation ---
-            # Grouped-row activations require dispatch metadata.
-            if isinstance(
-                self.activation,
-                (NPUSwigluDeepEPKernel, NPUSitu),
-            ):
+            # The DeepEP kernel expects extra dispatch metadata
+            if isinstance(self.activation, NPUSwigluDeepEPKernel):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
                     group_list=expert_tokens,

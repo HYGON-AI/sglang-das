@@ -87,6 +87,18 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
         # Check if the layer is skipped for quantization.
         if isinstance(layer, RadixAttention):
+            if self.kv_cache_scheme is None:
+                return None
+            if not CompressedTensorsKVCacheMethod.is_supported_scheme(
+                self.kv_cache_scheme
+            ):
+                # Degrade, don't refuse to boot: unquantized-scale KV serves fine.
+                logger.warning_once(
+                    f"Ignoring compressed-tensors kv_cache_scheme "
+                    f"{self.kv_cache_scheme}: only static symmetric "
+                    f"per-tensor FP8 scales are supported."
+                )
+                return None
             return CompressedTensorsKVCacheMethod(self)
         if should_ignore_layer(prefix,
                                ignore=self.ignore,

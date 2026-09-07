@@ -202,6 +202,21 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def is_supported_dsv4_decode_radix_mtp(
+    *, spec_algorithm: SpeculativeAlgorithm, server_args: ServerArgs
+) -> bool:
+    if spec_algorithm.is_dspark():
+        return True
+    return (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and not spec_algorithm.is_frozen_kv_mtp()
+        and server_args.speculative_eagle_topk == 1
+        and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+    )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -283,11 +298,33 @@ def build_kv_cache(
                     "device-resident cache and is incompatible with "
                     "--enable-hierarchical-cache."
                 )
+            # Compressed-KV SWA variants need model-specific sidecar guarantees.
+            # DSV4 has a conservative experimental L1-only path below.
             if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
-                )
+                if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache with "
+                        "DeepSeek-V4 (DSA compressed KV) is experimental. Set "
+                        "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1 to enable "
+                        "the conservative L1-only path."
+                    )
+                if enable_hierarchical_cache:
+                    raise ValueError(
+                        "DeepSeek-V4 decode-side radix cache currently supports "
+                        "only device-resident L1 cache. Disable hierarchical "
+                        "cache / HiCache storage for this experimental path."
+                    )
+                if not spec_algorithm.is_none():
+                    if not is_supported_dsv4_decode_radix_mtp(
+                        spec_algorithm=spec_algorithm, server_args=server_args
+                    ):
+                        raise ValueError(
+                            "DeepSeek-V4 decode-side radix cache currently supports "
+                            "only DSpark or the experimental EAGLE topk=1 online "
+                            "c128 MTP path. EAGLE additionally requires "
+                            "SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
+                            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+                        )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache does not support "

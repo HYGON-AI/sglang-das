@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -17,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4 import (
+    fused_q_indexer_rope_hadamard,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
@@ -65,6 +67,8 @@ if TYPE_CHECKING:
 _is_hcu = is_hcu()
 _is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+logger = logging.getLogger(__name__)
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -701,6 +705,9 @@ class C4IndexerBackendMixin:
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
+        use_int8_index_k_cache = _is_hcu and getattr(
+            token_to_kv_pool, "use_int8_index_k_cache", False
+        )
 
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
@@ -730,7 +737,9 @@ class C4IndexerBackendMixin:
         elif _is_hcu:
             # HCU's LightOp implementation avoids materializing the large
             # [batch, max_c4_seq_len] FP32 Torch fallback during graph capture.
-            from lightop.gemmopt import paged_mqa_logits as fn
+            import lightop.gemmopt as gemmopt
+
+            fn = gemmopt.paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if is_sm120_supported():
                 fn = fp8_paged_mqa_logits_torch_sm120
@@ -789,24 +798,88 @@ class C4IndexerBackendMixin:
                 plan=nonpaged_plan,
             )
         else:
-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=c4_indexer.layer_id,
-            )
-            assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            if use_int8_index_k_cache:
+                from lightop.quant import per_token_quant_int8
+
+                packed_cache = token_to_kv_pool.get_index_k_int8_packed_buffer(
+                    layer_id=c4_indexer.layer_id,
+                )
+                # LightOp's dense INT8 ABI uses a signed tensor even though
+                # the physical page is allocated as raw uint8 storage.
+                packed_cache = packed_cache.view(torch.int8).view(
+                    packed_cache.shape[0], 64, 1, 132
+                )
+
+                # The native dense kernel consumes INT8 Q/K and applies only
+                # the per-token K scale. Quantize each query head separately
+                # and fold its scale into the existing per-head weight:
+                #   relu((Qi8 * Qs) dot (Ki8 * Ks)) * W
+                # = relu(Qi8 dot Ki8) * (W * Qs) * Ks.
+                # gfx936 produces BF16 Q directly after RoPE/Hadamard.
+                # Other HCU architectures retain their existing FP8 route.
+                q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
+                q_bf16 = q_bf16.contiguous()
+                q_flat = q_bf16.view(-1, q_bf16.shape[-1])
+                q_int8, q_scales = per_token_quant_int8(q_flat)
+                q_int8 = q_int8.view_as(q_bf16)
+                adjusted_weights = (
+                    weights.to(torch.float32)
+                    * q_scales.view(query_rows, -1)
+                ).contiguous()
+
+                logits = fn(
+                    q_int8,
+                    packed_cache,
+                    adjusted_weights,
+                    c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
+                    page_table.to(torch.int32).contiguous(),
+                    None,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+            else:
+                c4_indexer_kv_cache = (
+                    token_to_kv_pool.get_index_k_with_scale_buffer(
+                        layer_id=c4_indexer.layer_id,
+                    )
+                )
+                assert c4_indexer_kv_cache.dim() == 2
+                head_dim_with_sf = 68 if use_fp4_indexer else 132
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                    c4_indexer_kv_cache.shape[0],
+                    64,
+                    1,
+                    head_dim_with_sf,
+                )
+                # LightOp's dense paged ABI takes [B] int32 lengths and
+                # int32 block tables, with no DeepGEMM scheduler metadata.
+                use_lightop = _is_hcu and not (
+                    use_fp4_indexer or _use_tilelang or _use_aiter
+                )
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    (
+                        _c4sl.reshape(-1).to(torch.int32).contiguous()
+                        if use_lightop
+                        else _c4sl
+                    ),
+                    (
+                        page_table.to(torch.int32).contiguous()
+                        if use_lightop
+                        else page_table
+                    ),
+                    None if use_lightop else indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+
+            if use_int8_index_k_cache and not hasattr(
+                self, "_dsv4_int8_indexer_path_logged"
+            ):
+                logger.info("DSV4 INT8 index-K consumer=LightOp dense INT8 Paged MQA")
+                self._dsv4_int8_indexer_path_logged = True
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -869,6 +942,17 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+            )
+        elif envs.SGLANG_LIGHTOP_TOPK.get():
+            from lightop import topk_transform_512 as lightop_topk_transform_512
+
+            lightop_topk_transform_512(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
             )
         else:
             topk_transform_512(
@@ -960,6 +1044,16 @@ class C4Indexer(nn.Module):
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
 
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        # Only gfx936 defaults to BF16 Q for LightOp's FP8-cache path.
+        # Enabling INT8 cache quantizes this BF16 Q at the consumer boundary.
+        self.use_bf16_indexer_q = (
+            _is_hcu
+            and not self.use_fp4_indexer
+            and torch.cuda.get_device_properties().gcnArchName.split(":")[0]
+            == "gfx936"
+        )
+        if self.use_bf16_indexer_q and envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            raise ValueError("gfx936 BF16 C4 indexer Q requires the LightOp backend")
         self.alt_streams = alt_streams
 
     def compute_q(
@@ -973,6 +1067,10 @@ class C4Indexer(nn.Module):
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
+        if self.use_bf16_indexer_q:
+            return fused_q_indexer_rope_hadamard(
+                q, weight, self.weight_scale, self.freqs_cis, positions
             )
         return fused_q_indexer_rope_hadamard_quant(
             q, weight, self.weight_scale, self.freqs_cis, positions

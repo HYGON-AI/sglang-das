@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import functools
-import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -30,6 +29,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.hcu_dspark_aiter_moe_fallback import (
     is_triton_forced_for_dspark_aiter_fallback,
@@ -90,6 +90,8 @@ elif _is_hip:
                 MoeSolutionType,
                 aiter_moe,
                 get_aiter_moe_config,
+                aiter_moe_shfl_weight,
+                aiter_moe_shfl_scale
             )
         except ImportError:
             raise ImportError(
@@ -123,8 +125,6 @@ num_cus = torch.cuda.get_device_properties(
 
 padding_size = get_moe_padding_size(_use_aiter)
 
-logger = logging.getLogger(__name__)
-
 
 class _CodePathChecker:
     def __init__(self):
@@ -147,13 +147,15 @@ def inplace_fused_experts(
     topk_ids: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    activation: int = 0,  # 0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu 2 situ
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -169,10 +171,16 @@ def inplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
 ) -> None:
     if isinstance(activation, int):
-        activation = "silu" if activation == 0 else "gelu"
+        if activation == 0:
+            activation = "silu" 
+        elif activation == 2:
+            activation = "situ"
+        else:
+            activation = "gelu"
     fused_experts_impl(
         hidden_states,
         w1,
@@ -189,6 +197,8 @@ def inplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_mxfp4_w4a16,
+        use_mxfp4_w4a8,
         per_channel_quant,
         w1_scale,
         w2_scale,
@@ -205,6 +215,7 @@ def inplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
@@ -224,6 +235,8 @@ def inplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -236,6 +249,9 @@ def inplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -264,6 +280,8 @@ def outplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -280,10 +298,16 @@ def outplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
 ) -> torch.Tensor:
     if isinstance(activation, int):
-        activation = "silu" if activation == 0 else "gelu"
+        if activation == 0:
+            activation = "silu"
+        elif activation == 2:
+            activation = "situ"
+        else:
+            activation = "gelu"
     return fused_experts_impl(
         hidden_states,
         w1,
@@ -300,6 +324,8 @@ def outplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_mxfp4_w4a16,
+        use_mxfp4_w4a8,
         per_channel_quant,
         w1_scale,
         w2_scale,
@@ -316,6 +342,7 @@ def outplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
@@ -335,6 +362,8 @@ def outplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -348,6 +377,9 @@ def outplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -372,6 +404,8 @@ def fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -381,6 +415,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
@@ -399,6 +434,8 @@ def fused_experts(
         )
         else 1
     )
+    if isinstance(moe_runner_config.activation, str) and moe_runner_config.activation.lower() == "situ":
+        act_id = 2
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -416,6 +453,8 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_mxfp4_w4a16,
+            use_mxfp4_w4a8,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -431,6 +470,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_int4_w4a8=use_int4_w4a8,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
         return hidden_states
@@ -450,6 +490,8 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_mxfp4_w4a16,
+            use_mxfp4_w4a8,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -466,6 +508,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_int4_w4a8=use_int4_w4a8,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
 
@@ -504,7 +547,7 @@ def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
 
 
 @functools.lru_cache()
-def _moe_support_tma():
+def _down_moe_use_tma():
     return support_tensor_descriptor()
 
 
@@ -608,14 +651,21 @@ def fused_experts_impl_aiter(
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
     quant_type: Optional[MoeQuantType] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ):
     M, K = hidden_states.shape
     E, N1, _ = w1.shape
     _, N2, _ = w2.shape
     if isinstance(activation, int):
-        activation = "silu" if activation == 0 else "gelu"
-    is_channelwise_w8a8 = quant_type == MoeQuantType.FP8_W8A8 and block_shape is None
-    if not is_channelwise_w8a8 and (block_shape is None or len(block_shape) < 2):
+        if activation == 0:
+            activation = "silu"
+        elif activation == 2:
+            activation = "situ"
+        else:
+            activation = "gelu"
+    is_channelwise_w4a8_w8a8 = (quant_type == MoeQuantType.FP8_W8A8 or quant_type == MoeQuantType.W4A8) and block_shape is None
+    if not is_channelwise_w4a8_w8a8 and (block_shape is None or len(block_shape) < 2):
         raise ValueError(
             "AITER MoE requires block_shape with two dimensions for this "
             "quantization mode, but got "
@@ -630,7 +680,7 @@ def fused_experts_impl_aiter(
             f"a1_scale_shape={_shape_str(a1_scale)}, "
             f"a2_scale_shape={_shape_str(a2_scale)}"
         )
-    block_size = 0 if is_channelwise_w8a8 else block_shape[1]
+    block_size = 0 if is_channelwise_w4a8_w8a8 else block_shape[1]
     config_kwargs = dict(
         M=M,
         E=E,
@@ -658,6 +708,8 @@ def fused_experts_impl_aiter(
         assert moe_cfg.quant_type in (
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
+            MoeQuantType.WFP4A16,
+            MoeQuantType.W4A8,
         ), f"Unexpected quant_type: {moe_cfg.quant_type}"
         # print(
         #     f"[get_config_w4a16] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_shape[1]}, dtype={hidden_states.dtype} "
@@ -675,7 +727,7 @@ def fused_experts_impl_aiter(
         )
 
     if (
-        quant_type == MoeQuantType.W4A16
+        (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
         and status
         and _aiter_moec_solution_type(moe_cfg)
         and getattr(moe_cfg, "need_shuffle_scale", False)
@@ -683,6 +735,11 @@ def fused_experts_impl_aiter(
         w1_scale, w2_scale = _get_aiter_w4a16_moec_shuffled_scales(
             w1_scale, w2_scale, w1, w2, moe_cfg
         )
+    # if status and quant_type != MoeQuantType.W4A8 and getattr(moe_cfg, "need_shuffle", False):
+    #     w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
+    # if status and getattr(moe_cfg, "need_shuffle_scale", False):
+    #     w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
+    
     return aiter_moe(
         hidden_states,
         w1,
@@ -703,6 +760,8 @@ def fused_experts_impl_aiter(
         None,
         routed_scaling_factor,
         output_dtype=hidden_states.dtype,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
     )
 
 
@@ -716,6 +775,9 @@ def _prepare_fused_moe_run(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool = False,
+    use_mxfp4_w4a16: bool,
+    use_mxfp4_w4a8: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
 ):
@@ -734,7 +796,12 @@ def _prepare_fused_moe_run(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a16=(
+            use_int4_w4a16
+            or use_int4_w4a8
+            or use_mxfp4_w4a16
+            or use_mxfp4_w4a8
+        ),
         dtype=hidden_states.dtype,
     )
 
@@ -748,26 +815,11 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
-    # Copy config to avoid mutating the lru_cached dict returned by
-    # get_moe_configs; we pop USE_TMA below.
-    config = dict(config)
-    # Up-projection TMA is opt-in: only enabled when the up config file
-    # explicitly carries "USE_TMA": true (produced by tuning). By default the
-    # existing up config files do not contain this key, so existing users are
-    # unaffected unless they re-tune with the updated script.
-    up_tma_requested = config.pop("USE_TMA", False)
-    up_moe_use_tma = _moe_support_tma() and up_tma_requested
-    if up_moe_use_tma:
-        logger.warning_once(
-            "Up MoE TMA is enabled (USE_TMA=true in the up-projection config). "
-            "This requires a config produced by the updated tuning script. "
-        )
-    down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
-    down_moe_use_tma = _moe_support_tma() and down_tma_requested
-    if down_moe_use_tma:
-        logger.warning_once(
-            "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
-        )
+    down_moe_use_tma = (
+        _down_moe_use_tma()
+        and down_config is not None
+        and down_config.pop("USE_TMA", False)
+    )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], E
@@ -777,7 +829,6 @@ def _prepare_fused_moe_run(
         config,
         down_config,
         down_moe_use_tma,
-        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -796,7 +847,6 @@ def _fused_moe_kernel_sequence(
     config: Dict[str, Any],
     down_config: Optional[Dict[str, Any]],
     down_moe_use_tma: bool,
-    up_moe_use_tma: bool,
     *,
     b1: Optional[torch.Tensor],
     b2: Optional[torch.Tensor],
@@ -804,6 +854,9 @@ def _fused_moe_kernel_sequence(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool = False,
+    use_mxfp4_w4a16: bool,
+    use_mxfp4_w4a8: bool,
     per_channel_quant: bool,
     w1_scale: Optional[torch.Tensor],
     w2_scale: Optional[torch.Tensor],
@@ -893,6 +946,9 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not use_int4_w4a8)
+        and (not use_mxfp4_w4a16)
+        and (not use_mxfp4_w4a8)
     )
 
     if fuse_swiglu_interleaved:
@@ -951,10 +1007,12 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
+        use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
-        b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
         fuse_swiglu=fuse_swiglu_interleaved,
     )
@@ -1011,20 +1069,25 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert (
-                _is_cuda or _is_hip or _is_xpu
-            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
-            if filter_expert:
-                swiglu_limit_for_triton = swiglu_limit
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
+                else:
+                    assert (
+                        _is_cuda
+                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
-                assert (
-                    _is_cuda or _is_xpu
-                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
-                swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+                half = N // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
@@ -1162,6 +1225,9 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
+        use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         a_use_tma=down_moe_use_tma,
@@ -1267,13 +1333,15 @@ def fused_experts_impl(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
-    activation: int = 0,  # 0 silu 1 gelu
+    activation: int = 0,  # 0 silu 1 gelu 2 gelu
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1290,19 +1358,35 @@ def fused_experts_impl(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
 ):
     if (
         _use_aiter_moe
         and not is_triton_forced_for_dspark_aiter_fallback()
-        # AITER expects a complete expert weight set. EP-local shards keep
-        # global expert ids and require Triton's filter_expert path.
-        and not filter_expert
-        and (use_int4_w4a16 or use_int8_w8a8 or use_fp8_w8a8)
+        and (
+            use_int4_w4a16
+            or use_int4_w4a8
+            or use_mxfp4_w4a16
+            or use_mxfp4_w4a8
+            or use_int8_w8a8
+            or use_fp8_w8a8
+        )
         and hidden_states.dtype == torch.bfloat16
     ):
-        if use_int4_w4a16:
+        if use_mxfp4_w4a8:
+            if not hasattr(MoeQuantType, "WFP4A8"):
+                raise RuntimeError(
+                    "The installed AITER package does not support "
+                    "MoeQuantType.WFP4A8."
+                )
+            quant_type = MoeQuantType.WFP4A8
+        elif use_mxfp4_w4a16:
+            quant_type = MoeQuantType.WFP4A16
+        elif use_int4_w4a16:
             quant_type = MoeQuantType.W4A16
+        elif use_int4_w4a8:
+            quant_type = MoeQuantType.W4A8
         else:
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(
@@ -1322,6 +1406,8 @@ def fused_experts_impl(
             block_shape,
             routed_scaling_factor,
             quant_type,
+            gemm1_alpha,
+            gemm1_limit
         )
 
     if isinstance(activation, int):
@@ -1331,7 +1417,12 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16:
+    if (
+        use_int4_w4a16
+        or use_int4_w4a8
+        or use_mxfp4_w4a16
+        or use_mxfp4_w4a8
+    ):
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -1347,7 +1438,6 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
-        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -1360,6 +1450,9 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
+        use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
@@ -1376,13 +1469,15 @@ def fused_experts_impl(
         config,
         down_config,
         down_moe_use_tma,
-        up_moe_use_tma,
         b1=b1,
         b2=b2,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
+        use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -1420,6 +1515,8 @@ def fused_moe(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1449,6 +1546,11 @@ def fused_moe(
         products for w1 and w2. Defaults to False.
     - use_int4_w4a16 (bool): If True, use matmul of int4 weight and bf16/fp16
         activation to compute the inner products for w1 and w2.
+        Defaults to False.
+    - use_mxfp4_w4a16 (bool): If True, decode packed MXFP4 E2M1 weights and
+        use bf16/fp16 activations. Defaults to False.
+    - use_mxfp4_w4a8 (bool): If True, decode packed MXFP4 E2M1 weights and
+        quantize each activation tile to fp8 for tensor-core MMAC.
         Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
@@ -1502,6 +1604,8 @@ def fused_moe(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
+        use_mxfp4_w4a8=use_mxfp4_w4a8,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,

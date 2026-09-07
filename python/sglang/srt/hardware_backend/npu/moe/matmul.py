@@ -1,7 +1,108 @@
 from abc import ABC, abstractmethod
 from typing import Tuple
-
+from typing import Any, Optional
 import torch
+
+from sglang.srt.environ import envs
+
+from sglang.kernels.npu_kernels.npu_grouped_matmul_triton import grouped_matmul_triton
+
+
+def _unwrap(v: Any) -> Optional[torch.Tensor]:
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return v[0] if len(v) > 0 else None
+    return v
+
+
+def _to_cumsum(
+    group_list: torch.Tensor, group_list_type: int
+) -> torch.Tensor:
+    """Triton grouped matmul expects cumsum (group_list_type=0)."""
+    gl = group_list.to(torch.int64).reshape(-1)
+    if group_list_type == 1:
+        return torch.cumsum(gl, dim=0)
+    return gl
+
+
+def _row_expert_ids_from_cumsum(group_list: torch.Tensor, m: int) -> torch.Tensor:
+    """Map each of ``M`` token rows to its expert id from cumsum ends.
+
+    Fully on-device (no host sync). ``group_list[e]`` is the exclusive end
+    index of expert ``e``; empty experts appear as duplicate ends and are
+    skipped by ``searchsorted(..., right=True)``.
+    """
+    gl = group_list.to(torch.int64).reshape(-1)
+    rows = torch.arange(m, device=gl.device, dtype=gl.dtype)
+    return torch.searchsorted(gl, rows, right=True)
+
+
+def _scale_n_dim(scale: Optional[torch.Tensor]) -> Optional[int]:
+    if scale is None:
+        return None
+    return int(scale.reshape(scale.shape[0], -1).shape[-1])
+
+
+def _unpack_int4_along_last_dim(w_int8: torch.Tensor) -> torch.Tensor:
+    """Inverse of ``NPUW4A4Int4MoEMethod._pack_int4`` along the last dim.
+
+    Packing stores even-index int4 in the low nibble and odd-index int4 in the
+    high nibble of each int8.
+    """
+    wu = w_int8.to(torch.int32) & 0xFF
+    low = wu & 0x0F
+    high = (wu >> 4) & 0x0F
+    low = torch.where(low >= 8, low - 16, low).to(torch.int8)
+    high = torch.where(high >= 8, high - 16, high).to(torch.int8)
+    out = torch.empty(
+        *w_int8.shape[:-1],
+        w_int8.shape[-1] * 2,
+        dtype=torch.int8,
+        device=w_int8.device,
+    )
+    out[..., 0::2] = low
+    out[..., 1::2] = high
+    return out
+
+
+def _prepare_triton_weight(
+    weight: torch.Tensor, scale: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Unpack NPU W4A8 packed weights so Triton sees logical ``[E, K, N]``.
+
+    ``NPUW4A8Int8MoEMethod.process_weights_after_loading`` does:
+      [E, N_packed, K] int8 → transpose → [E, K, N_packed]
+      → view int32 → [E, K, N_packed/4]
+
+    where ``N_packed = logical_N / 2`` (two int4 values per int8). Triton has no
+    int4-pack semantics, so restore int8 with logical N before the GEMM.
+    """
+    w = weight
+    if w.dtype == torch.int32:
+        # 4 int8 (8 int4) per int32 on the last dim.
+        w = w.contiguous().view(torch.int8)
+
+    scale_n = _scale_n_dim(scale)
+    if (
+        w.dtype == torch.int8
+        and scale_n is not None
+        and scale_n == w.shape[-1] * 2
+    ):
+        w = _unpack_int4_along_last_dim(w)
+    return w
+
+
+def _scale_to_float32(scale: torch.Tensor) -> torch.Tensor:
+    """Restore float32 scales from NPU int64 bit-containers if needed."""
+    if scale.dtype == torch.float32:
+        return scale
+    if scale.dtype in (torch.float16, torch.bfloat16):
+        return scale.to(torch.float32)
+    if scale.dtype == torch.int64:
+        # Per-channel W4A8 path stores fp32 bits zero-extended into int64.
+        return (scale & 0xFFFFFFFF).to(torch.int32).view(torch.float32)
+    return scale.to(torch.float32)
 
 
 class BaseMatmul(ABC):
@@ -38,16 +139,94 @@ class GroupedMatmul(BaseMatmul):
             raise AttributeError(
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
             )
-        return torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[weight] if transposed else [weight.transpose(1, 2)],
-            **scale_args,
+
+        device = hidden_states.device
+        scale = _unwrap(scale_args.get("scale"))
+        per_token_scale = _unwrap(scale_args.get("per_token_scale"))
+        bias = _unwrap(scale_args.get("bias"))
+        antiquant_scale = _unwrap(scale_args.get("antiquant_scale"))
+        antiquant_offset = _unwrap(scale_args.get("antiquant_offset"))
+
+        # Defense-in-depth for SGLANG_W4A8_MOE_SKIP_SCALE_BIAS: drop float
+        # scale_bias even if a caller still passes it (int32 bias kept).
+        if (
+            envs.SGLANG_W4A8_MOE_SKIP_SCALE_BIAS.get()
+            and bias is not None
+            and bias.dtype != torch.int32
+        ):
+            global _SKIP_SCALE_BIAS_LOGGED
+            if not _SKIP_SCALE_BIAS_LOGGED:
+                logger.warning(
+                    "SGLANG_W4A8_MOE_SKIP_SCALE_BIAS=1: skipping float "
+                    "scale_bias in GroupedMatmul dequant (ablation)."
+                )
+                _SKIP_SCALE_BIAS_LOGGED = True
+            bias = None
+
+        w = weight
+        if antiquant_scale is not None:
+            # Formula 4: y = x @ ((w + offset) * antiquant_scale) + bias
+            w_f = w.to(torch.float32)
+            if antiquant_offset is not None:
+                w_f = w_f + antiquant_offset.to(torch.float32)
+            w = w_f * antiquant_scale.to(torch.float32)
+        else:
+            # W4A8 NPU packing is opaque to the Triton float/int GEMM.
+            w = _prepare_triton_weight(w, scale)
+
+        group_list = _to_cumsum(expert_tokens, group_list_type)
+        has_quant = scale is not None or per_token_scale is not None
+        # Float bias after scale (formula 3-2); int32 bias before scale (3-1).
+        kernel_bias = None if has_quant else bias
+        y = grouped_matmul_triton(
+            hidden_states,
+            w,
+            bias=kernel_bias,
+            group_list=group_list,
             split_item=2,
-            group_list_type=group_list_type,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=output_dtype,
+            # NPU ``transposed=True`` means weight is already in op layout
+            # (no further transpose). Triton ``transpose_weight=True`` means
+            # weight is [E, N, K] and needs an internal transpose.
+            transpose_weight=not transposed,
         )[0]
+        if has_quant:
+            # Triton runs on CUDA/HCU; keep scale/bias on the same device as y.
+            # Vectorized per-row expert gather — no ``.cpu().tolist()`` sync.
+            compute_device = y.device
+            y = y.to(torch.float32)
+            m_rows = int(y.shape[0])
+            eid = (
+                _row_expert_ids_from_cumsum(group_list.to(device=compute_device), m_rows)
+                if m_rows > 0
+                else None
+            )
+
+            if bias is not None and bias.dtype == torch.int32 and eid is not None:
+                b = bias.to(device=compute_device, dtype=torch.float32)
+                b = b.reshape(b.shape[0], -1)
+                y = y + b[eid]
+
+            if scale is not None and eid is not None:
+                sc = _scale_to_float32(scale).to(device=compute_device)
+                # Match previous ``sc[e].reshape(1, -1)``: flatten trailing dims.
+                sc = sc.reshape(sc.shape[0], -1)
+                y = y * sc[eid]
+
+            if per_token_scale is not None:
+                y = y * per_token_scale.to(
+                    device=compute_device, dtype=torch.float32
+                ).reshape(-1, 1)
+
+            if bias is not None and bias.dtype != torch.int32 and eid is not None:
+                b = bias.to(device=compute_device, dtype=torch.float32)
+                b = b.reshape(b.shape[0], -1)
+                y = y + b[eid]
+
+            y = y.to(output_dtype)
+        elif output_dtype is not None and y.dtype != output_dtype:
+            y = y.to(output_dtype)
+
+        return y.to(device=device)
 
 
 class GroupedMatmulSwigluQuant(BaseMatmul):

@@ -179,6 +179,12 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
     def _get_bias_args(
         quant_info: "AscendQuantInfo", weight_prefix: str
     ) -> Dict[str, Any]:
+        # Ablation: drop ModelSlim W4A8 ``*_scale_bias`` (float bias after
+        # dequant). Still allow a separate ``*_weight_bias`` if present.
+        if envs.SGLANG_W4A8_MOE_SKIP_SCALE_BIAS.get():
+            bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
+            return {"bias": [bias]} if bias is not None else {}
+
         bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
@@ -673,7 +679,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         if is_per_channel:
             scale_np = scale.cpu().contiguous().numpy()
             scale_np.dtype = np.uint32
-            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
+            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).cuda()
             return scale_uint64_tensor
 
         # Per‑group: multiply channel and group scales, then pack into uint64

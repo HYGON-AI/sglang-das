@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -71,12 +72,20 @@ def build_draft_tp_worker(
     )
     from sglang.srt.layers.moe.utils import draft_model_build_scope
 
+    draft_w4a8_context = nullcontext()
+    if algo_label == "DSPARK":
+        from sglang.srt.layers.moe.utils import (
+            dspark_w4a8_tpmoe_backend_context,
+        )
+
+        draft_w4a8_context = dspark_w4a8_tpmoe_backend_context()
+
     # The draft's model construction runs its own MoE gates; the scope routes
     # their fusion decision to the speculative leaf and gives the target its
     # ACTIVE value back. It deliberately does not swap runner_backend: these
     # workers run the draft outside speculative_moe_backend_context, so a
     # construction-only swap would build and execute under different backends.
-    with draft_model_build_scope():
+    with draft_model_build_scope(), draft_w4a8_context:
         draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -106,6 +115,10 @@ def make_draft_input_v2(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    prefill_tail_hidden_states: torch.Tensor | None = None,
+    prefill_tail_valid_mask: torch.Tensor | None = None,
+    prefill_tail_start_positions: torch.Tensor | None = None,
+    prefill_tail_hidden_projected: bool = True,
 ) -> DFlashDraftInputV2:
     bs = int(new_seq_lens.numel())
     device = bonus_tokens.device
@@ -115,6 +128,10 @@ def make_draft_input_v2(
         bonus_tokens=bonus_tokens.to(dtype=torch.int64),
         new_seq_lens=new_seq_lens.to(dtype=torch.int64),
         hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
+        prefill_tail_hidden_states=prefill_tail_hidden_states,
+        prefill_tail_valid_mask=prefill_tail_valid_mask,
+        prefill_tail_start_positions=prefill_tail_start_positions,
+        prefill_tail_hidden_projected=prefill_tail_hidden_projected,
     )
 
 

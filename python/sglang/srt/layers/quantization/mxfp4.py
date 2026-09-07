@@ -200,6 +200,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_hcu = is_hcu()
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_mxfp4_w4a8 = get_bool_env_var("SGLANG_USE_MXFP4_W4A8") and _is_hcu
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -381,6 +382,53 @@ class Mxfp4Config(QuantizationConfig):
         return []
 
 
+def _read_mxfp4_group_size() -> int:
+    """从模型 config 读取 MXFP4 group_size。
+
+    Kimi-K3 config.json 里路径为
+    text_config.quantization_config.config_groups.<group>.weights.group_size
+    （也兼容 group_size 直接出现在顶层 quantization_config 的情况）。
+    读取失败回退 32。
+    """
+    try:
+        from sglang.srt.runtime_context import process_model_config
+
+        hf = process_model_config().hf_config
+    except Exception:
+        return 32
+    qc = getattr(hf, "quantization_config", None)
+    if qc is None:
+        text_cfg = getattr(hf, "text_config", None)
+        qc = (
+            getattr(text_cfg, "quantization_config", None)
+            if text_cfg is not None
+            else None
+        )
+    if qc is None:
+        return 32
+    groups = (
+        qc.get("config_groups", {})
+        if isinstance(qc, dict)
+        else getattr(qc, "config_groups", {})
+    )
+    for g in groups.values():
+        w = (
+            g.get("weights", {})
+            if isinstance(g, dict)
+            else getattr(g, "weights", None)
+        )
+        if w is None:
+            continue
+        gs = (
+            w.get("group_size")
+            if isinstance(w, dict)
+            else getattr(w, "group_size", None)
+        )
+        if gs is not None:
+            return int(gs)
+    return 32
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(
@@ -432,6 +480,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
                     "or SM120."
                 )
+        self.group_size = _read_mxfp4_group_size()
 
     def create_weights(
         self,
@@ -614,12 +663,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if (
-                not is_sm90_supported()
-                and not is_sm100_supported()
-                and not is_sm120_supported()
-            ):
-                raise RuntimeError("MXFP4 Marlin requires SM90+.")
+            # if (
+            #     not is_sm90_supported()
+            #     and not is_sm100_supported()
+            #     and not is_sm120_supported()
+            # ):
+            #     raise RuntimeError("MXFP4 Marlin requires SM90+.")
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
@@ -1046,27 +1095,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
-        else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+        # else:
+        #     from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+        #     w13_weight = upcast_from_mxfp(
+        #         layer.w13_weight,
+        #         layer.w13_weight_scale,
+        #         target_dtype=torch.bfloat16,
+        #         axis=-1,
+        #     )
+        #     w2_weight = upcast_from_mxfp(
+        #         layer.w2_weight,
+        #         layer.w2_weight_scale,
+        #         target_dtype=torch.bfloat16,
+        #         axis=-1,
+        #     )
+        #     del layer.w13_weight
+        #     del layer.w2_weight
+        #     del layer.w13_weight_scale
+        #     del layer.w2_weight_scale
+        #     layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+        #     layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1812,6 +1861,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                use_mxfp4_w4a16=not _use_mxfp4_w4a8,
+                use_mxfp4_w4a8=_use_mxfp4_w4a8,
+                block_shape=[0, self.group_size],
             )
         return self.runner.run(dispatch_output, quant_info)
 

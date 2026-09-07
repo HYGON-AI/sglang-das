@@ -288,6 +288,15 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
+    # path is ported, so setting this fails loudly instead of degrading.
+    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -441,6 +450,8 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Use the LightOp kernel for paged KV-cache extend allocation.
+    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -496,6 +507,12 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Force the DSpark draft's SlimQuant W4A8 MoE method to a selected backend
+    # without changing the target model's W4A8 or generic MoE backend.
+    SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND = EnvStr(None)
+    # PD hidden-state receive pool size, in tokens (-1 = derive from the
+    # decode-side chunk budget).
+    SGLANG_PD_HIDDEN_RECV_POOL_TOKENS = EnvInt(-1)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -902,8 +919,15 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
+    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
+    # MLA path this covers ordinary prefill as well as decode-family forwards.
+    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # Use the native LightOp single/dual-cache gather+upconvert kernels instead
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
-    SGLANG_LIGHTOP_TOPK = EnvBool(True)
+    SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
     SGLANG_HCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
 
@@ -919,6 +943,8 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Global SlimQuant W4A8 TP-MoE backend selection.
+    SGLANG_W4A8_TPMOE_BACKEND = EnvStr("auto")
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1026,6 +1052,16 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
+    # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
+    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
+    # Route decode-size HC mix through the fused CuTe split-K GEMM pair
+    # instead of the persistent Triton mix.
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # Log each distinct (m, n, k) the BF16 GEMM dispatch sees (allowlist tuning).
+    SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
+    # Split the HC combine gate dot across CTAs instead of one CTA per row.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1320,6 +1356,11 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
+    # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
+    # Enabling this also requires the native LightOp INT8 Paged MQA consumer;
+    # there is intentionally no BF16 dequantization fallback.
+    SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
@@ -1328,6 +1369,12 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # RLC (Repartition-Local Compression): attention c4 + prefill-CP + round-robin optimization.
+    # Off by default; enable to replace the full-kv_score all-gather with an all-to-all repartition +
+    # local compress + all-gather of the compact output.
+    SGLANG_DSV4_COMPRESS_RLC = EnvBool(False)
+    # Deprecated: DSV4 compressor V2 is always used.
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
@@ -1379,6 +1426,8 @@ class Envs:
     # DeepSeek V4 - model and quantization
     # ===================================================================
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE = EnvBool(False)
+    SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER = EnvBool(False)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
@@ -1390,8 +1439,6 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
-    # Deprecated: DSV4 compressor V2 is always used.
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)

@@ -2,8 +2,9 @@
 
 The persistent packed ABI is shared with the scaled FP8 indexer cache: every
 physical page stores 64 K vectors followed by 64 FP32 token scales.  In INT8
-mode the K bytes are signed INT8 values.  Referenced pages are dequantized into
-one reusable BF16 workspace before they are consumed by LightOp.
+mode the K bytes are signed INT8 values.  LightOp's paged MQA consumes this
+layout directly; non-paged/ragged paths still dequantize referenced pages into
+one reusable BF16 workspace.
 """
 
 from __future__ import annotations

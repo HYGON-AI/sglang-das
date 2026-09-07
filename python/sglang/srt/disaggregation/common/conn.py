@@ -151,6 +151,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    kv_cache_layout: Optional[str] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -174,6 +175,9 @@ class PrefillServerInfo:
         self.page_size = int(self.page_size) if self.page_size is not None else None
         self.kv_cache_dtype = (
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
+        )
+        self.kv_cache_layout = (
+            str(self.kv_cache_layout) if self.kv_cache_layout is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
@@ -201,6 +205,7 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.kv_cache_layout = getattr(args, "kv_cache_layout", None)
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -294,6 +299,7 @@ class CommonKVManager(BaseKVManager):
             # ack held until the transfer drains.
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            self.req_to_pd_hidden_meta: Dict[int, dict] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -374,6 +380,43 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+    def supports_pd_hidden_streaming(self) -> bool:
+        return False
+
+    def mark_pd_hidden_request_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        """Mark the hidden-transfer portion of a request done.
+
+        Backends that support streaming hidden transfer override this to release
+        their source window independently from KV request completion.
+        """
+        del bootstrap_room, state_indices
+        return None
+
+    def pop_pd_hidden_request_done(self, bootstrap_room: int) -> bool:
+        """Consume a hidden-request-done event for early source-window release."""
+        del bootstrap_room
+        return False
+
+    def _wake_pd_hidden_ack_waiters(self, bootstrap_room: int) -> None:
+        """Wake backend-specific PD hidden ACK waiters after request failure."""
+        del bootstrap_room
+        return None
+
+    # Backward-compatible aliases for backend-specific implementations that have
+    # not yet migrated to the request-level naming.
+    def mark_pd_hidden_done(
+        self,
+        bootstrap_room: int,
+        state_indices: Optional[List] = None,
+    ) -> None:
+        self.mark_pd_hidden_request_done(bootstrap_room, state_indices)
+
+    def pop_pd_hidden_done(self, bootstrap_room: int) -> bool:
+        return self.pop_pd_hidden_request_done(bootstrap_room)
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -699,6 +742,15 @@ class CommonKVManager(BaseKVManager):
             )
 
         if (
+            info.kv_cache_layout is not None
+            and info.kv_cache_layout != self.kv_cache_layout
+        ):
+            raise RuntimeError(
+                f"KV cache layout mismatch: prefill server has kv_cache_layout={info.kv_cache_layout}, "
+                f"but decode server has kv_cache_layout={self.kv_cache_layout}."
+            )
+
+        if (
             info.kv_cache_dtype is not None
             and info.kv_cache_dtype != self.kv_cache_dtype_str
         ):
@@ -868,6 +920,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
+            "kv_cache_layout": self.kv_cache_layout,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
@@ -1684,6 +1737,8 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_pd_hidden_meta"):
+            self.kv_mgr.req_to_pd_hidden_meta.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
@@ -1829,6 +1884,10 @@ class CommonKVReceiver(BaseKVReceiver):
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 bootstrap_info["pp_rank"] = int(target_pp_rank)
+                # PD hidden-state transfer resolves the source rank from these.
+                bootstrap_info["target_cp_rank"] = int(prefill_cp_rank)
+                bootstrap_info["target_tp_rank"] = int(target_tp_rank)
+                bootstrap_info["target_pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(
@@ -1912,6 +1971,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         raise NotImplementedError
 
@@ -1998,6 +2058,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.kv_cache_layout: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2067,6 +2128,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        kv_cache_layout = data.get("kv_cache_layout")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -2086,6 +2148,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.kv_cache_layout is None and kv_cache_layout is not None:
+            self.kv_cache_layout = kv_cache_layout
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -2159,6 +2224,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_layout=self.kv_cache_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None

@@ -45,6 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -58,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -431,6 +433,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
 
+    # Trailing synthetic request rows of a padded CUDA-graph replay. Stamped by
+    # the graph runners for backends whose seq-len fill value is ambiguous
+    # (QSA's fill is 1, a legal real length); None outside replay.
+    num_padding: Optional[int] = None
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
@@ -502,6 +509,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    pd_hidden_capture_layer_ids: Optional[List[int]] = None
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
@@ -735,6 +745,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
+        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
+        if (
+            model_runner.server_args.disaggregation_mode == "prefill"
+            and get_parallel().attn_cp_size > 1
+        ):
+            gathered_capture_layers = [None] * get_parallel().attn_cp_size
+            torch.distributed.all_gather_object(
+                gathered_capture_layers,
+                pd_hidden_capture_layer_ids,
+                group=get_parallel().attn_cp_group.cpu_group,
+            )
+            nonempty_capture_layers = [
+                [int(x) for x in layer_ids]
+                for layer_ids in gathered_capture_layers
+                if layer_ids
+            ]
+            if nonempty_capture_layers:
+                expected_capture_layers = nonempty_capture_layers[0]
+                if any(
+                    layer_ids != expected_capture_layers
+                    for layer_ids in nonempty_capture_layers[1:]
+                ):
+                    raise RuntimeError(
+                        "PD hidden capture layers disagree across prefill CP ranks: "
+                        f"{gathered_capture_layers}"
+                    )
+                pd_hidden_capture_layer_ids = expected_capture_layers
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
@@ -746,6 +783,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     get_server_return_hidden_states_mode(),
                 )
             )
+            if pd_hidden_capture_layer_ids:
+                request_capture_hidden_mode = max(
+                    request_capture_hidden_mode, CaptureHiddenMode.FULL
+                )
             capture_hidden_mode = get_required_capture_hidden_mode(
                 request_capture_hidden_mode,
                 batch.spec_info,
@@ -813,6 +854,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -1038,6 +1080,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
+
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of THIS extend chunk covered by the tracked (extra-buffer) state.
+
+        The extra-buffer scheduler parks its snapshot at a `mamba_cache_chunk_size`
+        boundary, not at the current position, so anything snapshotting alongside it
+        needs the same boundary. Sole home of this math: `_init_track_conv_indices`
+        and the Qwen4-Exp PLE side states all call it so they cannot drift apart. The
+        `+1` that `_force_track_h` adds cancels under the floor division, which is
+        why one expression serves both.
+
+        None when tracking metadata is absent (no mask, or a prefill CUDA-graph
+        replay that does not carry `mamba_track_seqlens` — mamba skips tracking there
+        too). Masked-off rows hold garbage and are the caller's mask to handle.
+        """
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
+            return None
+
+        chunk_size = mamba_cache_chunk_size()
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
@@ -1648,9 +1715,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
-        if not input_scattered:
+        model_sp = (
+            model_runner.server_args.minimax_opt or model_runner.server_args.hy3_sp
+        )
+
+        if not input_scattered and not model_sp:
             return
-        assert self.forward_mode.is_extend()
+
+        if model_sp and not self.forward_mode.is_extend():
+            return
+
+        if input_scattered:
+            assert self.forward_mode.is_extend()
+
         tokens = self.input_ids.shape[0]
         rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size

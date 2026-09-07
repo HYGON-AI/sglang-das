@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hcu,
@@ -32,6 +33,7 @@ from sglang.srt.utils.common import rank0_log
 
 _is_hcu = is_hcu()
 _is_hip = is_hip()
+_use_hcu_causal_conv1d = False
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -72,6 +74,24 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
+    try:
+        from causal_conv1d import causal_conv1d_fn_hcu
+        from causal_conv1d.causal_conv1d_interface import (
+            causal_conv1d_update as causal_conv1d_update_hcu,
+        )
+
+        _use_hcu_causal_conv1d = True
+        rank0_log(
+            "Using HCU causal_conv1d for GDN decode/prefill "
+            "(target_verify still uses Triton for MTP intermediate window)."
+        )
+    except ImportError as exc:
+        rank0_log(
+            "SGLANG_USE_CAUSAL_CONV1D=1 but HCU causal_conv1d import failed "
+            f"({exc}); falling back to Triton."
+        )
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -468,14 +488,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_g = layer_cache.replayssm_g
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
+        if _use_hcu_causal_conv1d:
+            mixed_qkv = causal_conv1d_update_hcu(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
@@ -628,17 +658,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            if _use_hcu_causal_conv1d:
+                mixed_qkv = causal_conv1d_fn_hcu(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    initial_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim

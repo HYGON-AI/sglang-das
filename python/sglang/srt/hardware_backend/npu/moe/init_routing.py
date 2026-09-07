@@ -11,6 +11,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.npu_kernels.npu_moe_init_routing_v2_triton import npu_moe_init_routing_v2_triton
+
 # ``npu_moe_init_routing_v2`` quant_mode selecting MXFP8: the op emits an
 # float8_e4m3fn payload plus an e8m0 block scale, fusing the activation quant
 # that would otherwise need a separate ``npu_dynamic_mx_quant`` pass.
@@ -100,7 +102,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
+            npu_moe_init_routing_v2_triton(
                 hidden_states,
                 topk_ids,
                 active_num=num_tokens * top_k,
