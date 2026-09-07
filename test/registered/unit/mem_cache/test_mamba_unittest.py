@@ -44,7 +44,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 register_hcu_ci(est_time=9, suite="stage-b-test-1-hcu-small", disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
