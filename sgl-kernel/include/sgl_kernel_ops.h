@@ -680,6 +680,11 @@ void transfer_kv_per_layer_mla_pf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+at::Tensor build_kernel_accessible_pointer_table(
+    const at::Tensor& base,
+    const std::vector<at::Tensor>& views,
+    const at::Tensor& device_ref);
+
 void transfer_kv_all_layer_mla(
     const at::Tensor src_layers,
     const at::Tensor dst_layers,

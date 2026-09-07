@@ -59,6 +59,7 @@ _is_xpu = is_xpu()
 _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
     from sgl_kernel.kvcacheio import (
+        build_kernel_accessible_pointer_table,
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
@@ -355,6 +356,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self.k_kernel_data_ptrs = build_kernel_accessible_pointer_table(
+            self.k_buffer, self.k_data_refs, self.device_pool.k_data_ptrs
+        )
+        self.v_kernel_data_ptrs = build_kernel_accessible_pointer_table(
+            self.v_buffer, self.v_data_refs, self.device_pool.v_data_ptrs
+        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -536,8 +543,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer(
-                        k_ptr_dst=self.k_data_ptrs,
-                        v_ptr_dst=self.v_data_ptrs,
+                        k_ptr_dst=self.k_kernel_data_ptrs,
+                        v_ptr_dst=self.v_kernel_data_ptrs,
                         indices_dst=host_indices,
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
@@ -549,9 +556,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                 else:
                     transfer_kv_all_layer(
                         src_k_layers=device_pool.k_data_ptrs,
-                        dst_k_layers=self.k_data_ptrs,
+                        dst_k_layers=self.k_kernel_data_ptrs,
                         src_v_layers=device_pool.v_data_ptrs,
-                        dst_v_layers=self.v_data_ptrs,
+                        dst_v_layers=self.v_kernel_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
@@ -562,8 +569,8 @@ class MHATokenToKVPoolHost(HostKVCache):
                     # Use transposed data ptrs so the kernel writes to
                     # [layer, page, item] view with stride layout_dim per token.
                     jit_transfer_hicache_all_layer(
-                        k_ptr_dst=self.k_data_ptrs,
-                        v_ptr_dst=self.v_data_ptrs,
+                        k_ptr_dst=self.k_kernel_data_ptrs,
+                        v_ptr_dst=self.v_kernel_data_ptrs,
                         indices_dst=host_indices,
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
@@ -1141,6 +1148,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        self.kernel_data_ptrs = build_kernel_accessible_pointer_table(
+            self.kv_buffer, self.data_refs, self.device_pool.data_ptrs
+        )
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -1326,7 +1336,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
-                        ptr_dst=self.data_ptrs,
+                        ptr_dst=self.kernel_data_ptrs,
                         indices_dst=host_indices,
                         ptr_src=device_pool.data_ptrs,
                         indices_src=device_indices,
@@ -1337,7 +1347,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 else:
                     transfer_kv_all_layer_mla(
                         src_layers=device_pool.data_ptrs,
-                        dst_layers=self.data_ptrs,
+                        dst_layers=self.kernel_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
@@ -1346,7 +1356,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
-                        ptr_dst=self.data_ptrs,
+                        ptr_dst=self.kernel_data_ptrs,
                         indices_dst=host_indices,
                         ptr_src=device_pool.data_ptrs,
                         indices_src=device_indices,
@@ -2728,6 +2738,11 @@ class NSAIndexerPoolHost(HostKVCache):
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
+            self.index_k_kernel_data_ptrs = build_kernel_accessible_pointer_table(
+                self.index_k_with_scale_buffer,
+                self.index_k_data_refs,
+                self.index_k_device_ptrs,
+            )
         elif self.layout in ["page_first", "page_first_direct"]:
             self.index_k_with_scale_buffer = alloc_func(
                 (
@@ -2826,7 +2841,7 @@ class NSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(
                     src_layers=self.index_k_device_ptrs,
-                    dst_layers=self.index_k_data_ptrs,
+                    dst_layers=self.index_k_kernel_data_ptrs,
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     item_size=self.indexer_page_stride_size,
