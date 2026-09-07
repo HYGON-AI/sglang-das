@@ -152,6 +152,78 @@ def flash_attn_with_kvcache(
         )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
+    # The ordinary HCU/NHD path also receives flattened variable-length
+    # queries when multiple requests are scheduled together.  Do not reshape
+    # them to ``(-1, max_seqlen_q, ...)``: the sum of sequence lengths is not
+    # generally divisible by the batch maximum.  Use the paged varlen
+    # interface directly, which consumes ``cu_seqlens_q`` and the page table.
+    if (
+        q.dim() == 3
+        and cu_seqlens_q is not None
+        and max_seqlen_q is not None
+        and page_table is not None
+        and cache_seqlens is not None
+    ):
+        if not torch.is_tensor(cache_seqlens):
+            cache_seqlens = torch.full(
+                (cu_seqlens_q.numel() - 1,),
+                int(cache_seqlens),
+                dtype=torch.int32,
+                device=q.device,
+            )
+        cu_seqlens_k = torch.cat(
+            [cache_seqlens.new_zeros(1), torch.cumsum(cache_seqlens, dim=0)]
+        )
+        k_cache = k_cache.to(q.dtype) if not is_nmz_fp8(k_cache.dtype) else k_cache
+        v_cache = v_cache.to(q.dtype) if not is_nmz_fp8(v_cache.dtype) else v_cache
+        # BSHD paged caches are [pages, page_size, heads, head_dim], whereas
+        # the HND/BHSD layout is [pages, heads, page_size, head_dim].
+        page_size = k_cache.shape[1] if layout != "bhsd" else k_cache.shape[2]
+        if (
+            _is_hcu
+            and _use_triton_vllm_fa
+            and is_nmz_fp8(k_cache.dtype)
+            and not return_softmax_lse
+        ):
+            result = triton_vllm_flash_attn_varlen_func(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=cache_seqlens,
+                max_seqlen_k=page_table.shape[1] * page_size,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=page_table,
+                fa_version=ver,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                layout="bshd" if layout is None else layout,
+            )
+            return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
+        result = flash_attn_varlen_func_interface(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=page_table.shape[1] * page_size,
+            seqused_k=cache_seqlens,
+            block_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            return_softmax_lse=return_softmax_lse,
+            fa_version=ver,
+        )
+        return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
+
     if _is_hcu and _use_triton_vllm_fa and is_nmz_fp8(k_cache.dtype):
         result = triton_vllm_flash_attn_with_kvcache(
             q=q.contiguous().view(-1, max_seqlen_q, q.shape[-2], q.shape[-1]),

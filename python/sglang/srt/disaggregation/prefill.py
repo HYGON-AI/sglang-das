@@ -533,14 +533,25 @@ class PrefillBootstrapQueue:
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
-        # Cap this request's radix prefix reuse at the prefix decode already
-        # holds: a reused prefix is never forwarded, so it yields no hidden rows
-        # for DSpark's PD hidden transfer. Gated on the server-level algorithm so
-        # every rank computes the same cap -- gating on per-request metadata lets
-        # ranks disagree and deadlocks the MoE dispatch collective.
-        if self.scheduler.server_args.speculative_algorithm is not None and str(
-            self.scheduler.server_args.speculative_algorithm
-        ).upper().endswith("DSPARK"):
+        # The optional raw-hidden fallback cannot reconstruct hidden rows for a
+        # radix hit, so it must not let prefill reuse past the prefix decode
+        # already owns. The default DSpark PD path transfers the prefill-side
+        # draft KV instead: those cached target/draft rows stay addressable
+        # through req_to_token and are shipped by _send_cached_prefix_early, so
+        # decode missing the prefix costs transfer, not a prefill recompute.
+        #
+        # Gate on the server-level state ABI, never on per-request bootstrap
+        # metadata: req_to_pd_hidden_meta is filled only on the rank hosting the
+        # bootstrap server (same block as req_to_decode_prefix_len, which needs
+        # an all_reduce backfill for exactly that reason), so a per-request gate
+        # makes ranks derive different caps and deadlocks the MoE dispatch.
+        if (
+            self.scheduler.server_args.speculative_algorithm is not None
+            and str(self.scheduler.server_args.speculative_algorithm)
+            .upper()
+            .endswith("DSPARK")
+            and StateType.PD_HIDDEN in self.kv_manager.kv_args.state_types
+        ):
             req.pd_hidden_max_prefix_len = int(decode_prefix_len)
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
@@ -2232,7 +2243,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if streaming_pd_hidden
                     else pd_hidden_state(req).src_indices,
                 )
-            elif req.disagg_kv_sender._source_event is None:
+            elif getattr(req.disagg_kv_sender, "_source_event", None) is None:
                 # PP + chunked prefill (overlap off) sends intermediate chunks
                 # from process_prefill_chunk while the writer is still on
                 # forward_stream. Record the barrier here so source_event is

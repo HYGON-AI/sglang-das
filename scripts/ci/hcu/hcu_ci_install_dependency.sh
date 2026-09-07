@@ -79,6 +79,11 @@ else
     pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.9" tabulate
 fi
 
+echo "[hcu-ci] Installing llguidance==1.7.6"
+install_with_retry docker exec "${CONTAINER}" \
+  python3 -m pip install --cache-dir=/sgl-data/pip-cache --no-deps "llguidance==1.7.6"
+run_in_container "python3 -c 'import importlib.metadata as metadata; print(\"llguidance:\", metadata.version(\"llguidance\"))'"
+
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
   echo "[hcu-ci] Installing HCU wheels from explicit URLs or local paths"
   echo "[hcu-ci] HCU_CI_INSTALL_WHEEL_URLS=${INSTALL_WHEEL_URLS}"
