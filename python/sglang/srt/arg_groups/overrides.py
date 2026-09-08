@@ -950,7 +950,7 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
-    if not get_platform().is_hip:
+    if not get_platform().is_hip or is_hcu():
         return {}
     if not (
         view.quantization == "modelopt_fp4"
@@ -1600,7 +1600,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if view.quantization == "mxfp8" and not get_platform().is_npu:
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
-        is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
+        is_gfx95_mxfp8 = (
+            get_platform().is_hip and not is_hcu() and is_gfx95_supported()
+        )
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         # Every other entry is CUDA-only. Honor an explicit triton request on ROCm
         # instead of sending it back to flashinfer_trtllm, whose MoE apply path

@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
+from sglang.srt.utils.common import is_hcu, is_mps, is_no_spec_infer_or_topk_one
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +292,10 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             if model_config.has_asymmetric_kv:
                 return "fa4"
             return "trtllm_mha"
+        elif is_hcu():
+            # HCU is detected as HIP at the PyTorch level, but it uses its
+            # own kernels (LightOp/flashattention) rather than aiter.
+            return "fa3"
         elif get_platform().is_hip:
             return "aiter"
         elif is_mps():
@@ -307,6 +311,10 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "fa3"
         elif get_platform().is_sm100:
             return "flashinfer"
+        elif is_hcu():
+            # HCU is detected as HIP at the PyTorch level, but it uses its
+            # own MLA kernels rather than aiter.
+            return "hcu_mla"
         elif get_platform().is_hip:
             head_num = model_config.get_num_kv_heads(cfg.tp_size)
             # TODO current aiter only support head number 16 or 128 head number
