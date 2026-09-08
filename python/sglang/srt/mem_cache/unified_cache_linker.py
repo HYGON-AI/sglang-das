@@ -21,9 +21,10 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -48,6 +49,36 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.utils import get_hash_str
 
 logger = logging.getLogger(__name__)
+
+
+def _source_debug_enabled() -> bool:
+    return os.getenv("SGLANG_MOONCAKE_SOURCE_DEBUG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+# Keep the SGLang source contract aligned with Mooncake's
+# SelectBestReplica(): MEMORY/NOF_SSD are reported as ``memory``, followed by
+# LOCAL_DISK and then DFS. The same order is used for page attribution and
+# the cross-rank source code below.
+MOONCAKE_SOURCE_PRIORITY = ("memory", "local_disk", "dfs")
+MOONCAKE_SOURCE_CODES = {
+    source: code
+    for code, source in enumerate(MOONCAKE_SOURCE_PRIORITY, start=3)
+}
+MOONCAKE_SOURCES_BY_CODE = {
+    code: source for source, code in MOONCAKE_SOURCE_CODES.items()
+}
+
+
+def select_mooncake_source(sources: Iterable[str | None]) -> str | None:
+    """Return the highest-priority source selected by Mooncake."""
+    for source in MOONCAKE_SOURCE_PRIORITY:
+        if source in sources:
+            return source
+    return None
 
 
 class ExternalLinkerLoadError(RuntimeError):
@@ -549,18 +580,18 @@ class UnifiedCacheLinkerWrapper:
             )
         source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
         local_source = source_getter(req.rid) if prepared and source_getter else None
-        source_code = (
-            0 if local_source == "dfs" else 1 if local_source == "local_disk" else 2
-        )
-        # MIN makes a failed preparation (0) win globally.  For successful
-        # ranks, the encoding preserves the prior DFS-over-local precedence.
+        source_code = MOONCAKE_SOURCE_CODES.get(local_source, 1)
+        # MIN makes a failed preparation (0) win globally. Unknown sources
+        # use 1, so they also propagate instead of being hidden by a known
+        # source on another rank. Among known sources, the encoding matches
+        # Mooncake's memory-over-local-disk-over-DFS precedence.
         prepared_and_source = torch.tensor(
-            0 if not prepared else 3 + source_code, dtype=torch.int
+            0 if not prepared else source_code, dtype=torch.int
         )
         cache._all_reduce_attn_groups(
             prepared_and_source, torch.distributed.ReduceOp.MIN
         )
-        if int(prepared_and_source.item()) < 3:
+        if int(prepared_and_source.item()) == 0:
             if time_stats is not None:
                 time_stats.set_direct_load_prepare_finish_time()
             self.cache_linker.abort_prepared_load(req.rid)
@@ -575,6 +606,12 @@ class UnifiedCacheLinkerWrapper:
             req.mamba_host_hit_length = 0
             req.storage_hit_length = 0
             req.cached_tokens_storage_source = None
+            req.cached_tokens_by_source = {
+                "l1_device": int(getattr(req, "cached_tokens_device", 0)),
+                "l3_mooncake_memory": 0,
+                "l4_mooncake_dfs": 0,
+                "l4_mooncake_local_disk": 0,
+            }
             logger.warning(
                 "External linker load is no longer restorable for rid=%s; "
                 "falling back to normal prefill.",
@@ -582,10 +619,17 @@ class UnifiedCacheLinkerWrapper:
             )
             return empty_indices, req.last_node
 
-        source = {0: "dfs", 1: "local_disk"}.get(int(prepared_and_source.item()) - 3)
+        source = MOONCAKE_SOURCES_BY_CODE.get(int(prepared_and_source.item()))
         if source is not None:
             req.storage_hit_length = len(tail_hashes) * cache.page_size
             req.cached_tokens_storage_source = f"mooncake_{source}"
+
+        req.cached_tokens_by_source = {
+            "l1_device": int(getattr(req, "cached_tokens_device", 0)),
+            "l3_mooncake_memory": 0,
+            "l4_mooncake_dfs": 0,
+            "l4_mooncake_local_disk": 0,
+        }
 
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
@@ -641,6 +685,58 @@ class UnifiedCacheLinkerWrapper:
             insert_result=insert_result,
             canonical_full=canonical_tail,
         )
+
+        counts_getter = getattr(
+            self.cache_linker, "get_prepared_load_source_counts", None
+        )
+        source_counts = (
+            counts_getter(req.rid, load_transfers)
+            if prepared and counts_getter
+            else {}
+        )
+        kv_load_tokens = sum(
+            len(transfer.keys or []) * cache.page_size
+            for transfer in load_transfers
+            if transfer.name == PoolName.KV
+        )
+        # The prepare phase describes all remotely restorable pages, while
+        # COMMIT may retain only the pages actually adopted by this request.
+        # Make scheduler accounting follow that final transfer set; otherwise
+        # pages adopted concurrently can be reported as Mooncake hits even
+        # though they are already resident in L1.
+        req.host_hit_length = kv_load_tokens
+        req.storage_hit_length = kv_load_tokens
+        req.cached_tokens_storage_source = None
+        if kv_load_tokens > 0:
+            sources = {
+                source_name
+                for source_name, tokens in source_counts.items()
+                if int(tokens) > 0
+            }
+            if len(sources) == 1:
+                req.cached_tokens_storage_source = f"mooncake_{next(iter(sources))}"
+            elif len(sources) > 1:
+                req.cached_tokens_storage_source = "mooncake_mixed"
+            elif source is not None:
+                # Keep the request-level source for older linker adapters that
+                # do not expose per-page source counts.
+                req.cached_tokens_storage_source = f"mooncake_{source}"
+        req.cached_tokens_by_source.update(
+            {
+                "l3_mooncake_memory": source_counts.get("memory", 0),
+                "l4_mooncake_dfs": source_counts.get("dfs", 0),
+                "l4_mooncake_local_disk": source_counts.get("local_disk", 0),
+            }
+        )
+        if _source_debug_enabled():
+            logger.info(
+                "Mooncake source debug scheduler rid=%s kv_load_tokens=%d "
+                "source_counts=%s cached_tokens_by_source=%s",
+                req.rid,
+                kv_load_tokens,
+                source_counts,
+                req.cached_tokens_by_source,
+            )
 
         if load_transfers:
             timing_setter = getattr(

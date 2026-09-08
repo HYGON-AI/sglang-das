@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from concurrent.futures import Future
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache_linker import (
     ExternalLinkerLoadError,
     UnifiedCacheLinker,
+    select_mooncake_source,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -33,6 +35,15 @@ from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+def _source_debug_enabled() -> bool:
+    """Enable bounded per-request source diagnostics when explicitly requested."""
+    return os.getenv("SGLANG_MOONCAKE_SOURCE_DEBUG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
@@ -312,17 +323,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         logical_page_sources: dict[str, set[str | None]] = {}
         for transfer in expanded:
+            logical_pool_name = self.pool_group.sources.get(
+                transfer.name, transfer.name
+            )
             for page_key in transfer.keys:
                 logical_page_sources.setdefault(page_key, set()).add(
-                    prepared_page_sources.get((transfer.name, page_key))
+                    prepared_page_sources.get((logical_pool_name, page_key))
                 )
         source_tokens: dict[str, int] = {}
         for sources in logical_page_sources.values():
-            if "dfs" in sources:
-                source = "dfs"
-            elif "local_disk" in sources:
-                source = "local_disk"
-            else:
+            source = select_mooncake_source(sources)
+            if source is None:
                 continue
             source_tokens[source] = source_tokens.get(source, 0) + self.page_size
         self.pending_load_metrics[rid] = (
@@ -345,6 +356,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         seen = set()
         pool_page_components: dict[tuple[PoolName, str], list[str]] = {}
         for transfer in expanded:
+            logical_pool_name = self.pool_group.sources.get(
+                transfer.name, transfer.name
+            )
             component_keys, key_multiplier = (
                 self.storage._get_hybrid_page_component_keys(
                     list(transfer.keys), transfer
@@ -353,9 +367,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tagged_component_keys = self.storage._tag_keys(component_keys)
             for page_index, page_key in enumerate(transfer.keys):
                 start = page_index * key_multiplier
-                pool_page_components.setdefault((transfer.name, page_key), []).extend(
-                    tagged_component_keys[start : start + key_multiplier]
-                )
+                pool_page_components.setdefault(
+                    (logical_pool_name, page_key), []
+                ).extend(tagged_component_keys[start : start + key_multiplier])
             for key in tagged_component_keys:
                 if key not in seen:
                     seen.add(key)
@@ -447,13 +461,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
             self.prepared_load_sessions[rid] = acquired
             acquired_sources = {session_sources.get(key) for key in acquired}
-            source = (
-                "dfs"
-                if "dfs" in acquired_sources
-                else "local_disk"
-                if "local_disk" in acquired_sources
-                else None
-            )
+            source = select_mooncake_source(acquired_sources)
             prepared_sources = getattr(self, "prepared_load_sources", None)
             if prepared_sources is None:
                 prepared_sources = self.prepared_load_sources = {}
@@ -464,23 +472,78 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     session_sources.get(component_key)
                     for component_key in component_keys
                 }
-                if "dfs" in component_sources:
-                    page_source = "dfs"
-                elif "local_disk" in component_sources:
-                    page_source = "local_disk"
-                elif "memory" in component_sources:
-                    page_source = "memory"
-                else:
-                    page_source = None
+                page_source = select_mooncake_source(component_sources)
                 page_sources[pool_page] = page_source
             prepared_page_sources = getattr(self, "prepared_load_page_sources", None)
             if prepared_page_sources is None:
                 prepared_page_sources = self.prepared_load_page_sources = {}
             prepared_page_sources[rid] = page_sources
+            if _source_debug_enabled():
+                raw_key_sources: dict[str, int] = {}
+                for key in acquired:
+                    key_source = session_sources.get(key) or "unknown"
+                    raw_key_sources[key_source] = raw_key_sources.get(key_source, 0) + 1
+                raw_kv_page_sources: dict[str, int] = {}
+                for (pool_name, _), page_source in page_sources.items():
+                    if pool_name != PoolName.KV:
+                        continue
+                    page_source = page_source or "unknown"
+                    raw_kv_page_sources[page_source] = (
+                        raw_kv_page_sources.get(page_source, 0) + 1
+                    )
+                logger.info(
+                    "Mooncake source debug prepare rid=%s raw_key_sources=%s "
+                    "raw_kv_page_sources=%s raw_kv_pages=%d",
+                    rid,
+                    raw_key_sources,
+                    raw_kv_page_sources,
+                    sum(raw_kv_page_sources.values()),
+                )
         return True
 
     def get_prepared_load_source(self, rid: str) -> str | None:
         return getattr(self, "prepared_load_sources", {}).get(rid)
+
+    def get_prepared_load_source_counts(
+        self, rid: str, transfers: list[PoolTransfer] | None = None
+    ) -> dict[str, int]:
+        """Return loaded KV token counts split by the selected page source.
+
+        When transfers are provided, count only the pages that survived the
+        radix-cache adoption step. This avoids reporting a source for a page
+        that a concurrent request adopted before the Mooncake load was queued.
+        """
+        page_sources = getattr(self, "prepared_load_page_sources", {}).get(rid, {})
+        if transfers is None:
+            selected_pages = {
+                pool_page
+                for pool_page in page_sources
+                if pool_page[0] == PoolName.KV
+            }
+        else:
+            selected_keys = {
+                key
+                for transfer in transfers
+                if transfer.name == PoolName.KV
+                for key in transfer.keys or []
+            }
+            selected_pages = {(PoolName.KV, key) for key in selected_keys}
+
+        counts: dict[str, int] = {}
+        for pool_page in selected_pages:
+            source = page_sources.get(pool_page)
+            if source in ("memory", "dfs", "local_disk"):
+                counts[source] = counts.get(source, 0) + self.page_size
+        if _source_debug_enabled():
+            logger.info(
+                "Mooncake source debug commit rid=%s selected_kv_pages=%d "
+                "source_counts=%s selected_kv_tokens=%d",
+                rid,
+                len(selected_pages),
+                counts,
+                sum(counts.values()),
+            )
+        return counts
 
     def set_request_time_stats(self, rid: str, time_stats) -> None:
         self.request_time_stats[rid] = time_stats

@@ -432,7 +432,7 @@ def test_session_start_negative_result_falls_back_and_logs_key(caplog):
     assert "-702" in caplog.text
 
 
-def test_prepare_load_reports_dfs_source():
+def test_prepare_load_reports_local_disk_source():
     ended = []
     calls = []
 
@@ -473,7 +473,7 @@ def test_prepare_load_reports_dfs_source():
         device_indices=torch.tensor([1, 2]),
     )
     assert linker.prepare_load("rid", [transfer])
-    assert linker.get_prepared_load_source("rid") == "dfs"
+    assert linker.get_prepared_load_source("rid") == "local_disk"
     assert calls == ["combined"]
 
     linker.abort_prepared_load("rid")
@@ -726,20 +726,20 @@ def test_prepare_load_attributes_component_sources_once_per_logical_page():
         def batch_get_session_end(self, keys):
             pass
 
-    kv_pool = SimpleNamespace(
-        name=PoolName.KV,
+    c4_pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
         indices_from_pool=PoolName.KV,
         translate_indices=lambda indices: indices,
     )
-    draft_pool = SimpleNamespace(
-        name=PoolName.DRAFT,
-        indices_from_pool=PoolName.DRAFT,
+    c4_indexer_pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+        indices_from_pool=PoolName.KV,
         translate_indices=lambda indices: indices,
     )
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.page_size = 16
     linker.pool_group = DevicePoolGroup(
-        [kv_pool, draft_pool], num_layers=1, page_size=16
+        [c4_pool, c4_indexer_pool], num_layers=1, page_size=16
     )
     linker.storage = SimpleNamespace(
         store=_Store(),
@@ -763,27 +763,22 @@ def test_prepare_load_attributes_component_sources_once_per_logical_page():
     linker.session_sources = {}
     linker.session_lock = threading.Lock()
     linker.pending_loads = {}
+    linker.pending_load_metrics = {}
     linker.stats = {"load_fallback": 0}
     transfer = PoolTransfer(
         name=PoolName.KV,
         keys=["page-a"],
         device_indices=torch.tensor([1]),
     )
-    draft_transfer = PoolTransfer(
-        name=PoolName.DRAFT,
-        keys=["page-a"],
-        device_indices=torch.tensor([1]),
-    )
-
-    assert linker.prepare_load("rid", [transfer, draft_transfer])
+    assert linker.prepare_load("rid", [transfer])
     assert linker.prepared_load_page_sources["rid"] == {
         (PoolName.KV, "page-a"): "memory",
-        (PoolName.DRAFT, "page-a"): "dfs",
     }
-    # DFS wins across actual components/pools and the shared logical page is
-    # counted once.
-    assert linker.load("rid", [transfer, draft_transfer])
-    assert linker.pending_load_metrics["rid"][:2] == (16, {"dfs": 16})
+    assert linker.get_prepared_load_source("rid") == "memory"
+    # The shared logical page is counted once using Mooncake's source
+    # precedence: memory, local disk, then DFS.
+    assert linker.load("rid", [transfer])
+    assert linker.pending_load_metrics["rid"][:2] == (16, {"memory": 16})
 
 
 def test_load_counts_only_adopted_pages_and_uses_actual_pool_sources():
@@ -824,6 +819,7 @@ def test_load_counts_only_adopted_pages_and_uses_actual_pool_sources():
     linker.session_sources = {}
     linker.session_lock = threading.Lock()
     linker.pending_loads = {}
+    linker.pending_load_metrics = {}
     linker.stats = {"load_fallback": 0}
     kv_transfer = PoolTransfer(
         name=PoolName.KV,
@@ -839,14 +835,21 @@ def test_load_counts_only_adopted_pages_and_uses_actual_pool_sources():
     # prepare sees three logical pages, but the adopted load only includes KV.
     assert linker.prepare_load("rid", [kv_transfer, draft_transfer])
     assert linker.load("rid", [kv_transfer])
-    assert linker.pending_load_metrics["rid"][:2] == (32, {"local_disk": 16})
+    assert linker.pending_load_metrics["rid"][:2] == (
+        32,
+        {"local_disk": 16, "memory": 16},
+    )
 
     linker.cancel_queued_load("rid")
     assert linker.prepare_load("rid-all", [kv_transfer, draft_transfer])
     assert linker.load("rid-all", [kv_transfer, draft_transfer])
     total_tokens, source_tokens, _ = linker.pending_load_metrics["rid-all"]
-    # Actual overlapping and distinct pool pages are unioned: a, b, c.
-    assert (total_tokens, source_tokens) == (48, {"dfs": 32})
+    # Actual overlapping and distinct pool pages are unioned: a, b, c. The
+    # shared page-a uses local_disk over DFS under Mooncake's priority order.
+    assert (total_tokens, source_tokens) == (
+        48,
+        {"local_disk": 16, "memory": 16, "dfs": 16},
+    )
     assert sum(source_tokens.values()) <= total_tokens
 
 
@@ -1413,7 +1416,7 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
 
     def reduce_source(value, op):
         collectives.append((value.item(), op))
-        value.fill_(3)  # A peer selected DFS; it wins over local_disk under MIN.
+        value.fill_(3)  # A peer selected memory; it wins under the shared order.
 
     cache = SimpleNamespace(
         page_size=1,
@@ -1461,7 +1464,7 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
     wrapper.load_back(req)
 
     assert len(collectives) == 1
-    assert req.cached_tokens_storage_source == "mooncake_dfs"
+    assert req.cached_tokens_storage_source == "mooncake_memory"
 
 
 def test_offload_runs_on_background_thread(monkeypatch):
