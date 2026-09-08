@@ -46,11 +46,12 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import is_hcu, is_hip, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -59,12 +60,20 @@ try:
     from flashinfer import top_k as _flashinfer_top_k
 except ImportError:
     _flashinfer_top_k = None
+# flashinfer.top_k JIT-compiles a CUDA kernel via nvcc, which is unavailable on
+# HIP/ROCm images. Force the torch.topk fallback there.
+if _flashinfer_top_k is not None and is_hip():
+    _flashinfer_top_k = None
 
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    if _is_hcu:
+        from lightop import topk
+
+        return topk(scores, k, dim=-1)
     return torch.topk(scores, k, dim=-1)
 
 
