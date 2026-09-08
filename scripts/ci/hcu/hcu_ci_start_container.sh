@@ -33,6 +33,7 @@ set -euo pipefail
 #   HCU_WHEEL_STAGING_CONTAINER_ROOT        Container mount point for PR wheel staging.
 #   HCU_MODEL_EXTRA_HOST_PATHS              Colon-separated host model roots to mount read-only
 #                                           at the same path inside the container.
+#   HCU_CI_MMLU_CACHE_HOST                  Host cache root containing <sgl-eval-ref>/test.jsonl.
 #   HCU_CI_NETWORK_MODE                     Docker network mode: host (default) or bridge.
 #   HCU_CI_SHM_SIZE                         Docker shared-memory size. Defaults to 32g.
 #   HCU_CI_ENABLE_RDMA                      Set to 1 to expose RDMA devices, lock memory,
@@ -165,6 +166,19 @@ if [[ -n "${HCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
   done
 fi
 
+MMLU_CACHE_ARGS=()
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
+MMLU_CACHE_ROOT="${HCU_CI_MMLU_CACHE_HOST:-/home/github/sglang-ci-data/mmlu}"
+MMLU_CACHE_PATH="${MMLU_CACHE_ROOT}/${SGL_EVAL_REF}"
+if [[ -s "${MMLU_CACHE_PATH}/test.jsonl" ]]; then
+  MMLU_CACHE_ARGS+=(
+    --mount "type=bind,source=${MMLU_CACHE_PATH},target=/root/.cache/sgl_eval/mmlu,readonly"
+  )
+  echo "[hcu-ci] Using offline MMLU cache: ${MMLU_CACHE_PATH}"
+else
+  echo "[hcu-ci] Offline MMLU cache unavailable at ${MMLU_CACHE_PATH}; using sgl-eval defaults"
+fi
+
 # Remove any leftover container from a previous run.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
@@ -181,6 +195,7 @@ docker run -dt --user root --privileged \
   ${MODEL_VOLUME} \
   ${WHEEL_STAGING_VOLUME} \
   "${EXTRA_MODEL_VOLUMES[@]}" \
+  "${MMLU_CACHE_ARGS[@]}" \
   --group-add video \
   --shm-size "${SHM_SIZE}" \
   --cap-add=SYS_PTRACE \
