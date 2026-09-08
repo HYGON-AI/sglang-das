@@ -175,7 +175,6 @@ def test_mooncake_direct_linker_storage_metrics_dp_rank(
         mooncake_page_wise_load_batch_size=1,
         mooncake_enable_page_wise_load=False,
         hicache_storage_backend_extra_config=None,
-        mooncake_dfs_replica_num=0,
         tp_size=1,
         model_path="test-model",
         enable_dp_attention=enable_dp_attention,
@@ -457,7 +456,6 @@ def test_prepare_load_reports_dfs_source():
     linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=1)
     linker.storage = SimpleNamespace(
         store=_Store(),
-        dfs_replica_num=1,
         _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
         _tag_keys=lambda keys: keys,
     )
@@ -553,7 +551,6 @@ def test_prepare_load_legacy_start_does_not_lookup_source():
     linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=1)
     linker.storage = SimpleNamespace(
         store=_Store(),
-        dfs_replica_num=1,
         _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
         _tag_keys=lambda keys: keys,
     )
@@ -593,7 +590,6 @@ def test_prepare_load_source_mismatch_does_not_guess_dfs():
     linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=16)
     linker.storage = SimpleNamespace(
         store=_Store(),
-        dfs_replica_num=1,
         _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
         _tag_keys=lambda keys: keys,
     )
