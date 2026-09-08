@@ -71,6 +71,33 @@ install_with_retry() {
   done
 }
 
+install_required_test_dependencies() {
+  # PR wheels use --no-deps. These test dependencies must also be installed
+  # when regular requirements are skipped in favor of the HCU base image.
+  source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
+  local numpy_version
+  numpy_version="$(docker exec "${CONTAINER}" python3 -c 'import importlib.metadata; print(importlib.metadata.version("numpy"))')"
+  echo "[hcu-ci] Preserving installed NumPy ${numpy_version}"
+  echo "[hcu-ci] Installing llguidance==1.7.6 and sgl-eval at ${SGL_EVAL_REF}"
+  install_with_retry docker exec "${CONTAINER}" \
+    python3 -m pip install --cache-dir=/sgl-data/pip-cache --no-deps "llguidance==1.7.6"
+  install_with_retry docker exec "${CONTAINER}" \
+    python3 -m pip install --cache-dir=/sgl-data/pip-cache \
+      "${SGL_EVAL_SPEC}" "antlr4-python3-runtime==4.9.3" "numpy==${numpy_version}"
+
+  # Check the actual API and CLI used by the tests, not just package metadata.
+  docker exec -i "${CONTAINER}" python3 - <<'PY_TEST_DEPS'
+import importlib.metadata
+import tvm_ffi
+from llguidance.torch import fill_next_token_bitmask_par_with_draft_tokens
+
+print("[hcu-ci] numpy:", importlib.metadata.version("numpy"))
+print("[hcu-ci] llguidance:", importlib.metadata.version("llguidance"))
+print("[hcu-ci] sgl-eval:", importlib.metadata.version("sgl-eval"))
+PY_TEST_DEPS
+  run_in_container "command -v sgl-eval && sgl-eval --help >/dev/null"
+}
+
 if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_COMPAT_INSTALL=${SKIP_COMPAT_INSTALL}; skipping HCU compatibility pins"
 else
@@ -78,11 +105,6 @@ else
   install_with_retry docker exec "${CONTAINER}" \
     pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.9" tabulate
 fi
-
-echo "[hcu-ci] Installing llguidance==1.7.6"
-install_with_retry docker exec "${CONTAINER}" \
-  python3 -m pip install --cache-dir=/sgl-data/pip-cache --no-deps "llguidance==1.7.6"
-run_in_container "python3 -c 'import importlib.metadata as metadata; print(\"llguidance:\", metadata.version(\"llguidance\"))'"
 
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
   echo "[hcu-ci] Installing HCU wheels from explicit URLs or local paths"
@@ -97,6 +119,7 @@ fi
 
 if [[ "${SKIP_DEPENDENCY_INSTALL}" == "1" || "${SKIP_DEPENDENCY_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_DEPENDENCY_INSTALL=${SKIP_DEPENDENCY_INSTALL}; skipping regular dependency installation"
+  install_required_test_dependencies
   print_python_status
   exit 0
 fi
@@ -138,4 +161,5 @@ fi
 
 echo "[hcu-ci] Installed sglang version:"
 run_in_container "python -c 'import sglang, sys; print(sglang.__version__); sys.exit(0)' || true"
+install_required_test_dependencies
 print_python_status
