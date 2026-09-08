@@ -53,7 +53,10 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        # topk_v2 has no DCU kernel; HCU stays on the paged transform.
+        return (
+            self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_hcu
+        )
 
     def topk_func(
         self,
@@ -315,7 +318,7 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
 
     num_rows = logits.shape[0]
 
@@ -328,7 +331,9 @@ def _topk_transform_v2_paged(
         logits.dtype == torch.float32
         and logits.stride(1) == 1
         and logits.stride(0) % 4 == 0
-    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    ), (
+        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
@@ -338,13 +343,13 @@ def _topk_transform_v2_paged(
     # mismatched plan means the caller skipped that preprocessing -- fail loudly
     # rather than silently recompute it per layer.
     plan = attn_metadata.topk_v2_plan
-    assert (
-        plan is not None and plan.shape[0] == num_rows + 1
-    ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    assert plan is not None and plan.shape[0] == num_rows + 1, (
+        "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    )
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
+    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
     return out
 
 

@@ -22,6 +22,9 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    # DSA kpool-compress tail: one per-request ring row. The indices encode
+    # only the live subrange of that row for the current open pool.
+    DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
@@ -114,6 +117,8 @@ class KVPoll:
 
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
+
+    enable_deferred_decode_kv_release: bool = False
 
     @abstractmethod
     def __init__(

@@ -44,7 +44,6 @@ logger = logging.getLogger(__name__)
 
 
 class HYV3ModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -122,7 +121,6 @@ class HYV3ModelNextN(nn.Module):
 
 
 class HYV3ForCausalLMNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

@@ -47,7 +47,6 @@ W8A8_TRITONJSON = W8a8GetCacheJSON()
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
-
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
@@ -367,7 +366,6 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
 
 class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
-
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):

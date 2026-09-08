@@ -25,7 +25,7 @@ register_hcu_ci(
 )
 
 
-register_cuda_ci(est_time=32, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
 
 NUM_GPUS = 2
 
@@ -50,9 +50,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")
 
-    assert (
-        get_device_count() >= NUM_GPUS
-    ), f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    assert get_device_count() >= NUM_GPUS, (
+        f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    )
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS

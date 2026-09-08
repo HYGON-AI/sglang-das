@@ -197,6 +197,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     req_to_token_ptr_stride=self.req_to_token.stride(0),
                     kv_indices_ptr_stride=block_kv_indices.stride(0),
                 )
+            elif self.kv_index_translator.is_translating:
+                assert self.page_size == PAGE_SIZE
+                self.kv_index_translator.fill_read_table(
+                    out=block_kv_indices,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                )
             else:
                 create_flashmla_kv_indices_triton[
                     (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
@@ -375,22 +382,30 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
-            create_flashmla_kv_indices_triton[
-                (
-                    bs,
-                    get_num_kv_index_blocks_flashmla(
-                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
-                    ),
+            if self.kv_index_translator.is_translating:
+                assert self.page_size == PAGE_SIZE
+                self.kv_index_translator.fill_read_table(
+                    out=self.cuda_graph_kv_indices,
+                    req_pool_indices=req_pool_indices[:bs],
+                    seq_lens=seq_lens,
                 )
-            ](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-            )
+            else:
+                create_flashmla_kv_indices_triton[
+                    (
+                        bs,
+                        get_num_kv_index_blocks_flashmla(
+                            self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                        ),
+                    )
+                ](
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    seq_lens,
+                    None,
+                    self.cuda_graph_kv_indices,
+                    self.req_to_token.stride(0),
+                    self.cuda_graph_kv_indices.stride(0),
+                )
 
             q_head_mult = (
                 self.num_draft_tokens
@@ -471,9 +486,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
-            assert (
-                self.dcp_world_size == 1
-            ), "FlashMLA does not support DCP for FP8 kv cache"
+            assert self.dcp_world_size == 1, (
+                "FlashMLA does not support DCP for FP8 kv cache"
+            )
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)

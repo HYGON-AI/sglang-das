@@ -21,7 +21,7 @@ register_hcu_ci(
 )
 
 
-register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=534, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
@@ -31,7 +31,7 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import is_hcu, is_hip, kill_process_tree
+from sglang.srt.utils import is_hcu, is_hip
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -42,6 +42,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
@@ -72,7 +73,7 @@ class HiCacheBaseServer(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
 
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):

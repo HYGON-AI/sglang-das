@@ -23,6 +23,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -32,7 +33,17 @@ from sglang.test.ci.ci_register import (
 
 register_hcu_ci(est_time=30, suite="nightly-hcu-1", nightly=True)
 register_amd_ci(est_time=30, suite="nightly-amd-1-gpu", nightly=True)
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-b-test-cpu-intel")
+
+
+def publish_config(case):
+    """`OpenAIServingBase.__init__` reads `get_observability()`, so a case that
+    builds one needs a published config. The mock manager cannot stand in for
+    it: `MagicMock(spec=ServerArgs)` passes the `isinstance` guard, so the read
+    happens and there is no bag to answer from."""
+    reset_context()
+    case.addCleanup(reset_context)
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
 
 class MockTokenizerManager:
@@ -41,7 +52,6 @@ class MockTokenizerManager:
     def __init__(self, enable_lora=False):
         self.server_args = MagicMock(spec=ServerArgs)
         self.server_args.enable_lora = enable_lora
-        self.server_args.tokenizer_metrics_allowed_custom_labels = None
 
 
 class ConcreteServingBase(OpenAIServingBase):
@@ -61,6 +71,7 @@ class TestParseModelParameter(unittest.TestCase):
     """Test _parse_model_parameter method."""
 
     def setUp(self):
+        publish_config(self)
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 
@@ -117,6 +128,7 @@ class TestResolveLoraPath(unittest.TestCase):
     """Test _resolve_lora_path method."""
 
     def setUp(self):
+        publish_config(self)
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 
@@ -165,6 +177,7 @@ class TestIntegrationScenarios(unittest.TestCase):
     """Integration tests for common usage scenarios."""
 
     def setUp(self):
+        publish_config(self)
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 
@@ -216,6 +229,7 @@ class TestEdgeCases(unittest.TestCase):
     """Test edge cases and error conditions."""
 
     def setUp(self):
+        publish_config(self)
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 

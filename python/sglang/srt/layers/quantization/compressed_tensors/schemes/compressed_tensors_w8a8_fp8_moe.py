@@ -82,7 +82,6 @@ def is_moe_prefill_or_normal():
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
-
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -254,9 +253,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         # INPUT_SCALES
         if self.static_input_scales:
-            assert (
-                self.input_quant.strategy == QuantizationStrategy.TENSOR
-            ), "Only per-tensor quantization is supported for static input scales"
+            assert self.input_quant.strategy == QuantizationStrategy.TENSOR, (
+                "Only per-tensor quantization is supported for static input scales"
+            )
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )

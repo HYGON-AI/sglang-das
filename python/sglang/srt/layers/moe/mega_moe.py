@@ -39,6 +39,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.utils import is_hcu
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -264,6 +265,10 @@ def _apply_mega_moe_dg_env() -> None:
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
+def _mega_moe_mma_type() -> str:
+    return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
+
+
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
     if _device_sm < 100:
@@ -325,6 +330,7 @@ def _get_mega_moe_symm_buffer(
         factory = deep_gemm.get_symm_buffer_for_mega_moe
         cuda_graph_max_tokens_per_rank = None
 
+    mma_type = _mega_moe_mma_type()
     key = (
         package_key,
         id(group),
@@ -334,6 +340,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        mma_type,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -347,7 +354,7 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
-            use_fp8_dispatch=True,
+            mma_type=mma_type,
             activation="swiglu",
             **kwargs,
         )
@@ -538,8 +545,8 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = os.getenv("DG_USE_FP4_ACTS") == "1"
-    if use_fp4_acts:
+    mma_type = _mega_moe_mma_type()
+    if mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
@@ -553,7 +560,7 @@ def _run_mega_routed(
             buf.topk_weights,
             num_tokens=num_tokens,
             group_size=32,
-            use_fp4_acts=True,
+            mma_type=mma_type,
         )
     else:
         mega_moe_pre_dispatch(
@@ -694,22 +701,30 @@ def _run_standalone_hcu_w8a8_mega_moe(
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
-    # Match DeepGEMM's L1 gate/up layout:
-    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
+    # Match DeepGEMM's L1 gate/up layouts. FP8 activations use contiguous
+    # gran-8 chunks; packed MXFP4 activations use even/odd gran-16 chunks.
     num_groups, n, *rest = t.shape
     half = n // 2
     gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
     up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
-    result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    if gran == 16:
+        result = torch.cat(
+            [gate[:, :, 0::2], up[:, :, 0::2], gate[:, :, 1::2], up[:, :, 1::2]],
+            dim=2,
+        ).reshape(num_groups, n, *rest)
+    else:
+        result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
     return torch.empty_like(t).copy_(result)
 
 
 def _interleave_mega_moe_l1_weights(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
+    mma_type: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    gran = 16 if mma_type == "mxf4xmxf4" else 8
     return (
-        _interleave_mega_moe_gate_up(l1_weights[0]),
-        _interleave_mega_moe_gate_up(l1_weights[1]),
+        _interleave_mega_moe_gate_up(l1_weights[0], gran=gran),
+        _interleave_mega_moe_gate_up(l1_weights[1], gran=gran),
     )
 
 
@@ -733,6 +748,7 @@ def build_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
+    mma_type = _mega_moe_mma_type()
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
@@ -768,7 +784,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
         w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
-            (w13, w13_sf)
+            (w13, w13_sf), mma_type
         )
         w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
         w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)

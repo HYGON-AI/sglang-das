@@ -31,9 +31,7 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_hcu_ci
-
 # HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
 register_hcu_ci(
     est_time=120,
@@ -41,7 +39,6 @@ register_hcu_ci(
     nightly=True,
     disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.',
 )
-
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -51,10 +48,11 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=191, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -86,7 +84,7 @@ class HiCacheStorageBaseMixin:
     def tearDownClass(cls):
         """Clean up test environment"""
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
         import shutil
 
