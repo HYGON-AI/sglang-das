@@ -379,7 +379,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             # split back to SCATTERED.
             # DP attention with attn_tp_size == 1: o_proj has tp_size == 1 and
             # skips the reduction either way.
-            reduce_results=not hyv4_dp_attn_scattered(),
+            reduce_results=not is_dp_attention_enabled(),
             layer_id=layer_id,
             prefix=prefix,
             alt_stream=alt_stream,
