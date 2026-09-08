@@ -843,6 +843,8 @@ class Envs:
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")  # HCU override
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 
+    SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
+
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
@@ -1356,6 +1358,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
