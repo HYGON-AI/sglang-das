@@ -143,7 +143,7 @@ concurrency:
   # Manual dispatch and scheduled runs also get unique groups so a version bump
   # or the next daily run cannot cancel an in-progress three-version nightly.
   group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.event_name == 'schedule' && format('scheduled-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
+  cancel-in-progress: ${{ inputs.ref == '' && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule' }}
 
 jobs:
   # ============================================== MI30x ROCm 7.2 Unit Tests ==============================================
