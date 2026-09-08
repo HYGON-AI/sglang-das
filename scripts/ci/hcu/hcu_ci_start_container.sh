@@ -152,6 +152,11 @@ else
 fi
 
 EXTRA_MODEL_VOLUMES=()
+# Public CI models supplement the existing model root. Avoid duplicate mounts
+# when a caller already includes this directory in the extra model paths.
+if [[ -d /ci_public/sglang-das/models && ":${HCU_MODEL_EXTRA_HOST_PATHS:-}:" != *":/ci_public/sglang-das/models:"* ]]; then
+  EXTRA_MODEL_VOLUMES+=(-v /ci_public/sglang-das/models:/ci_public/sglang-das/models:ro)
+fi
 if [[ -n "${HCU_MODEL_EXTRA_HOST_PATHS:-}" ]]; then
   IFS=':' read -r -a EXTRA_MODEL_HOST_PATHS <<< "${HCU_MODEL_EXTRA_HOST_PATHS}"
   for extra_model_path in "${EXTRA_MODEL_HOST_PATHS[@]}"; do
