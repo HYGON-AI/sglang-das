@@ -269,9 +269,6 @@ def _repeat_mhc_input_on_cp_rank(
     if repeat_ops is not None and repeat_ops[0](
         hidden_states, hc_mult, cp_size, cp_rank
     ):
-        # LightOp owns target size/layout/architecture dispatch. The existing
-        # outer environment flag owns feature enablement; no role/size gate or
-        # host tensor-value read is introduced here.
         return repeat_ops[1](hidden_states, hc_mult, cp_size, cp_rank)
     # Slice is a view; repeat is the only output materialization.
     return hidden_states[cp_rank::cp_size].unsqueeze(1).repeat(1, hc_mult, 1)
@@ -279,17 +276,16 @@ def _repeat_mhc_input_on_cp_rank(
 
 @functools.cache
 def _get_mhc_repeat_cp_ops():
-    """Optional metadata-only LightOp ABI resolved once per process."""
+    """Resolve the categorized LightOp attention APIs once per process."""
     try:
-        from lightop import op as lightop_op
+        from lightop.attention import (
+            mhc_repeat_cp_sglang,
+            supports_mhc_repeat_cp_sglang,
+        )
     except (ImportError, OSError) as exc:
         logger.warning("DSV4 mHC repeat+CP unavailable; using torch repeat: %s", exc)
         return None
-    supports = getattr(lightop_op, "supports_mhc_repeat_cp_sglang", None)
-    kernel = getattr(lightop_op, "mhc_repeat_cp_sglang", None)
-    if not callable(supports) or not callable(kernel):
-        return None
-    return supports, kernel
+    return supports_mhc_repeat_cp_sglang, mhc_repeat_cp_sglang
 
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
