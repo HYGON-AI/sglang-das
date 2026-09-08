@@ -1212,6 +1212,10 @@ def fastsafetensors_weights_iterator(
                 fb.close()
         finally:
             loader.close()
+        # Return fully free segments before the next batch can split and pin them.
+        # Keep post-load reclamation for buffers still held by temporary tensors.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         if drop_cache_after_load:
             for loaded_file in rank_file_map.get(rank, []):
                 _drop_file_cache_after_load(loaded_file)

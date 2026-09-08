@@ -2493,17 +2493,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
-                            else:
-                                ret = self.send_kvcache_slice(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    target_rank_registration_info.dst_tp_rank,
-                                    target_rank_registration_info.dst_attn_tp_size,
-                                    target_rank_registration_info.dst_kv_item_len,
-                                    executor,
-                                )
+                        else:
+                            # Asymmetric attn TP (prefill != decode) without staging:
+                            # fall back to the per-slice path.  This is the chain's
+                            # catch-all -- without it `ret` stays unbound below.
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.dst_tp_rank,
+                                target_rank_registration_info.dst_attn_tp_size,
+                                target_rank_registration_info.dst_kv_item_len,
+                                executor,
+                            )
                         if ret != 0:
                             self._mark_session_failed_and_sync(
                                 kv_chunk=kv_chunk,

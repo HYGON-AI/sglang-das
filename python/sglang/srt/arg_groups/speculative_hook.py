@@ -397,7 +397,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "megamoe",
         ) or (
             server_args.moe_a2a_backend == "deepep"
-            and server_args.moe_runner_backend == "deep_gemm"
+            # and server_args.moe_runner_backend == "deep_gemm"
         )
         if not _is_npu and not supports_dspark_dp_moe:
             raise ValueError(
@@ -433,7 +433,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
         # 'megamoe' is official's DSpark-under-DP-attention draft path (#34844).
         supports_dspark_draft_moe = draft_a2a in ("none", "megamoe") or (
-            draft_a2a == "deepep" and draft_runner == "deep_gemm"
+            draft_a2a == "deepep" # and draft_runner == "deep_gemm"
         )
         if not supports_dspark_draft_moe:
             raise ValueError(
@@ -772,6 +772,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        # Qwen4-Exp MTP: the NEXTN draft layer ships inside the target
+        # checkpoint (model.mtp.*), so the draft model path defaults to
+        # the target model path.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if server_args.speculative_draft_model_path is None:
             declare_resolution(

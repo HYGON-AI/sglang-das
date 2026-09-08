@@ -170,6 +170,10 @@ QUANTIZATION_CHOICES = [
     "auto-round-int8",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    # ChannelWise W4A8 (experts-only INT4); registered in QUANTIZATION_METHODS
+    "slimquant_w4a8",
+    "slimquant_w4a8_marlin",
+    "slimquant_marlin",
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
@@ -191,6 +195,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -1267,6 +1272,11 @@ class ServerArgs:
     minimax_opt: A[
         bool,
         "Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
+        NS("parallel"),
+    ] = False
+    hy3_sp: A[
+        bool,
+        "Enable Hunyuan V3 sequence parallelism over TP ranks.",
         NS("parallel"),
     ] = False
     enable_p2p_check: A[
@@ -2750,6 +2760,17 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+        NS("exec.offload"),
+    ] = None
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -4039,6 +4060,17 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._handle_offload_compatibility()
+
+    def _handle_offload_compatibility(self):
+        if self.ple_offload_embedding and (
+            self.cpu_offload_gb > 0 or self.offload_group_size > 0
+        ):
+            raise ValueError(
+                "--ple-offload-embedding cannot be combined with "
+                "--cpu-offload-gb or --offload-group-size: generic layer offload "
+                "would stage the pinned PLE embedding back to the device."
+            )
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -5700,6 +5732,28 @@ class ServerArgs:
                     f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
                 )
 
+        if self.hy3_sp:
+            if model_arch != "HYV3ForCausalLM":
+                raise ValueError(
+                    "--hy3-sp is only supported for HYV3ForCausalLM, "
+                    f"but the loaded architecture is {model_arch}."
+                )
+            if self.dp_size != 1 or self.enable_dp_attention:
+                raise ValueError(
+                    "--hy3-sp requires pure tensor parallelism: set --dp-size 1 "
+                    "and remove --enable-dp-attention."
+                )
+            if self.pp_size != 1:
+                raise ValueError("--hy3-sp does not support pipeline parallelism.")
+            if self.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "--hy3-sp requires --moe-a2a-backend deepep so routed experts "
+                    "can process sequence-sharded tokens."
+                )
+            if self.moe_dense_tp_size not in (None, 1):
+                raise ValueError("--hy3-sp requires --moe-dense-tp-size 1.")
+            self.moe_dense_tp_size = 1
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -6157,6 +6211,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ]:
             # The quantization/moe_runner_backend resolution moved to the
             # override registry (arg_groups/overrides.py:
@@ -8365,7 +8420,10 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:
@@ -8452,6 +8510,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
