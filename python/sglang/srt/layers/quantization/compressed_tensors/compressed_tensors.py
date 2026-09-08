@@ -1066,12 +1066,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+                try:
+                    matched_target = find_matched_target(
+                        layer_name=layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                except ValueError:
+                    # Mixed checkpoints (e.g. Qwen3.8-Flash-Next Channelwise
+                    # FP8) only list MoE experts in config_groups.targets;
+                    # unmatched linears stay BF16 via UnquantizedLinearMethod.
+                    return None
 
             return self.target_scheme_map[matched_target]
 

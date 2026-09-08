@@ -166,7 +166,52 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
+    _enable_bf16_splitk_gemm = False
+    if (
+        envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+        and is_sm100_supported()
+        and not server_args.enable_deterministic_inference
+    ):
+        from sglang.kernels.ops.gemm.flashinfer_pr4266_dense_bf16_gemm_sm100_splitk import (
+            SplitKTactic,
+            run_splitk_dense,
+        )
+
+        _flashinfer_pr4266_splitk_tactic = SplitKTactic
+        _flashinfer_pr4266_run_splitk_dense = run_splitk_dense
+        _enable_bf16_splitk_gemm = True
+        _precompile_splitk_tactics()
+
     _BF16_GEMM_BACKEND = backend
+
+
+def _precompile_splitk_tactics() -> None:
+    """JIT-compile every allowlisted tactic before CUDA graph capture."""
+    device = torch.cuda.current_device()
+    for (m, n, k), tactic_args in _FLASHINFER_PR4266_TUNED_TACTICS.items():
+        a = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+        w = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+        _flashinfer_pr4266_run_splitk_dense(
+            a, w.T, None, out, True, _flashinfer_pr4266_splitk_tactic(*tactic_args)
+        )
+    torch.cuda.synchronize()
+
+
+def _flashinfer_pr4266_bf16_gemm(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    out = torch.empty(
+        (x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
+    )
+    tactic = _flashinfer_pr4266_splitk_tactic(
+        *_FLASHINFER_PR4266_TUNED_TACTICS[
+            (x_2d.shape[0], weight.shape[0], weight.shape[1])
+        ]
+    )
+    _flashinfer_pr4266_run_splitk_dense(x_2d, weight.T, None, out, True, tactic)
+    return out.view(*x.shape[:-1], weight.shape[0])
 
 
 def _bf16_gemm_dispatch_fake(
@@ -310,8 +355,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # opaque op resolves it at runtime with concrete shapes,
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
+            m = x.numel() // x.shape[-1]
+            if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get():
+                _log_bf16_gemm_shape(m, layer.weight.shape[0], layer.weight.shape[1])
+            if (
+                _enable_bf16_splitk_gemm
+                and bias is None
+                and use_flashinfer_pr4266_bf16_gemm(
+                    m, layer.weight.shape[0], layer.weight.shape[1]
+                )
+            ):
+                return _flashinfer_pr4266_bf16_gemm(x, layer.weight)
             if _use_cutedsl_bf16_gemm(
-                x.numel() // x.shape[-1],
+                m,
                 layer.weight.shape[0],
                 layer.weight.shape[1],
             ):
@@ -334,6 +390,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get() and x.ndim == 2:
+            _log_bf16_gemm_shape(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        if (
+            _enable_bf16_splitk_gemm
+            and bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and use_flashinfer_pr4266_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            tactic = _flashinfer_pr4266_splitk_tactic(
+                *_FLASHINFER_PR4266_TUNED_TACTICS[
+                    (x.shape[0], layer.weight.shape[0], layer.weight.shape[1])
+                ]
+            )
+            return _flashinfer_pr4266_run_splitk_dense(
+                x, layer.weight.T, None, output, True, tactic
+            )
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda
