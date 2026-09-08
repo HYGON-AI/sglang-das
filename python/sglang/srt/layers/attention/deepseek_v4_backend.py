@@ -4193,21 +4193,48 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+        extra_k_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
+        swa_k_layout = token_to_kv_pool.get_swa_key_layout()
+        # HCU LightOp reads the packed V4 page bytes directly; the V4.1 layouts
+        # keep the generic dequantizer.
+        if (
+            _is_hcu
+            and envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get()
+            and extra_k_layout is KVLayout.V4
+            and swa_k_layout is KVLayout.V4
+        ):
+            from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
+
+            # Match the original wrapper's byte view; keep the caller's slices.
+            if compressed_slice is not None:
+                dsv4_dequantize_k_cache_paged_out(
+                    extra_k_cache.view(torch.uint8),
+                    flat_token_ids,
+                    compressed_slice,
+                    extra_page_size,
+                )
+            dsv4_dequantize_k_cache_paged_out(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id).view(torch.uint8),
+                cache.swa_token_ids,
+                swa_slice,
+                cache.swa_page_size,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-            layout=token_to_kv_pool.get_swa_key_layout(),
-        )
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=extra_k_layout,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+                layout=swa_k_layout,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(
