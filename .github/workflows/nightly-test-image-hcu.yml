@@ -68,7 +68,7 @@ jobs:
                        --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           CInotificate --notificate_conf "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
                        --notificate_type PrecisionTest \
-                       --group_name 框架发版对接 高性能推理加速部
+                       --group_name 框架发版对接 高性能推理加速部 --record
 
       - name: 归档测试结果
         if: always()
