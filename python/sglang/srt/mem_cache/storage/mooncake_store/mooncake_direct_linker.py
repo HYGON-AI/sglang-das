@@ -154,7 +154,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
-        extra_config["dfs_replica_num"] = server_args.mooncake_dfs_replica_num
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
@@ -927,9 +926,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.freeze_gc_once()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        source = (
-            "dfs" if getattr(self.storage, "dfs_replica_num", 0) > 0 else "local_disk"
-        )
+        # Replication and persistence are selected by Mooncake's own
+        # configuration now that SGLang no longer overrides DFS replication.
+        # The put API does not report the selected destination, so keep this
+        # metric backend-neutral instead of guessing DFS versus local disk.
+        source = "mooncake"
         ready_event = device_module.Event()
         ready_event.record()
         self.offload_queue.put(
