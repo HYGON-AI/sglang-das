@@ -195,6 +195,22 @@ def sparse_gqa_fwd_interface_triton(
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
+    device_arch = getattr(
+        torch.cuda.get_device_properties(q.device), "gcnArchName", ""
+    ).split(":", 1)[0]
+    if (
+        device_arch == "gfx936"
+        and head_dim == 256
+        and not kv_is_fp8
+        and block_n == 64
+        and stages == 2
+    ):
+        # The non-chunked prefill path has the same gfx936 LDS requirement as
+        # chunk prefill, so apply the same measured size-dependent fallback.
+        if total_q <= 64:
+            stages = 1
+        else:
+            block_n = 32
     out = torch.empty_like(q)
     _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
         q,
