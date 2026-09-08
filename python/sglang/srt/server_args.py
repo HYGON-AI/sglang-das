@@ -6341,6 +6341,10 @@ class ServerArgs:
                 if model_config.has_asymmetric_kv:
                     return "fa4"
                 return "trtllm_mha"
+            elif is_hcu():
+                # HCU is detected as HIP at the PyTorch level, but it uses its
+                # own kernels (LightOp/flashattention) rather than aiter.
+                return "fa3"
             elif is_hip():
                 return "aiter"
             elif is_mps():
@@ -6356,6 +6360,10 @@ class ServerArgs:
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
+            elif is_hcu():
+                # HCU is detected as HIP at the PyTorch level, but it uses its
+                # own MLA kernels rather than aiter.
+                return "hcu_mla"
             elif is_hip():
                 head_num = model_config.get_num_kv_heads(self.tp_size)
                 # TODO current aiter only support head number 16 or 128 head number
