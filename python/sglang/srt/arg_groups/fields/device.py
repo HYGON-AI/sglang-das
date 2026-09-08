@@ -10,13 +10,12 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import dataclasses
+from typing import Annotated as A
 from typing import (
     Callable,
     List,
     Optional,
 )
-
-from sglang.srt.arg_groups.arg_utils import A
 
 
 @dataclasses.dataclass

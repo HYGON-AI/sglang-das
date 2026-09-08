@@ -290,7 +290,7 @@ add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.exte
 # --------------------------------------------------------------------------
 
 
-# --- HCU (Hygon DCU) supported subsets ---
+# --- HCU supported subsets ---
 # Declared beside the upstream choice lists they narrow. Kept as sets: they are
 # membership tests for validation, not CLI choice lists.
 HCU_ATTENTION_BACKEND_CHOICES = {

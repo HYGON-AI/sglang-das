@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+from typing import Annotated as A
 from typing import (
     Any,
     Dict,
@@ -20,7 +21,6 @@ from typing import (
 )
 
 from sglang.srt.arg_groups.arg_utils import (
-    A,
     Arg,
 )
 from sglang.srt.utils.common import json_list_type

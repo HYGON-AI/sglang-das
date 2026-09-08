@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from typing import Annotated as A
 from typing import (
     List,
     Literal,
@@ -18,11 +19,9 @@ from typing import (
 )
 
 from sglang.srt.arg_groups.arg_utils import (
-    A,
     Arg,
     Derived,
 )
-from sglang.srt.utils import is_hcu
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -37,6 +36,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     parse_cuda_graph_config_arg,
 )
+from sglang.srt.utils import is_hcu
 
 
 @dataclasses.dataclass
@@ -288,7 +288,6 @@ class ExecKernel:
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
-
 
     pack_paged_kv_to_varlen: A[
         Literal["auto", "on", "off"],
@@ -833,7 +832,6 @@ class ExecMoe:
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
     ] = None
-
 
     record_nolora_graph: A[bool, "Record no-lora graph."] = True
 

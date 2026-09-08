@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from typing import Annotated as A
 from typing import (
     List,
     Optional,
@@ -18,7 +19,6 @@ from typing import (
 )
 
 from sglang.srt.arg_groups.arg_utils import (
-    A,
     Arg,
 )
 from sglang.srt.arg_groups.argparse_actions import LoRAPathAction

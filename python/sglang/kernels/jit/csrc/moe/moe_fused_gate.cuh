@@ -16,7 +16,7 @@
 
 // Upstream mask width fix, kept for parity. This fork does not use it: the
 // shuffles below go through device::warp::shfl_down (sgl_kernel/warp.cuh),
-// which drops the mask entirely under ROCm and so is correct on DCU wave64 --
+// which drops the mask entirely under ROCm and so is correct on HCU wave64 --
 // the branch below would still hand a 32-bit mask to __shfl_down_sync there.
 // gfx1250 needs a 64-bit __shfl_*_sync mask (static_assert sizeof == 8); it's
 // masked to wave32 internally, so 64-bit is fine everywhere. __gfx1250__ is

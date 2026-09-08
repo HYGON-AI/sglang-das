@@ -10,6 +10,7 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import dataclasses
+from typing import Annotated as A
 from typing import (
     List,
     Literal,
@@ -17,7 +18,6 @@ from typing import (
 )
 
 from sglang.srt.arg_groups.arg_utils import (
-    A,
     Arg,
 )
 from sglang.srt.arg_groups.choices import DISAGG_TRANSFER_BACKEND_CHOICES

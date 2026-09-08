@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from typing import Annotated as A
 from typing import (
     Any,
     Dict,
@@ -19,7 +20,6 @@ from typing import (
 )
 
 from sglang.srt.arg_groups.arg_utils import (
-    A,
     Arg,
 )
 from sglang.srt.utils.common import json_list_type
@@ -120,7 +120,9 @@ class Serving:
         int,
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
-    ] = 1024 * 1024
+    ] = (
+        1024 * 1024
+    )
 
     # -------------------------------------------------------------------------
     # SSL/TLS

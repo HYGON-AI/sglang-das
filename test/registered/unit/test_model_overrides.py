@@ -12,12 +12,13 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from typing import Annotated as A
 from typing import Optional
 from unittest.mock import patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
-from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
+from sglang.srt.arg_groups.arg_utils import Arg, resolvable_fields
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.overrides import (

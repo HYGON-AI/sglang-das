@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from typing import Annotated as A
 from typing import Optional
 
 from sglang.srt.arg_groups.arg_utils import (
-    A,
     Arg,
     Derived,
 )
