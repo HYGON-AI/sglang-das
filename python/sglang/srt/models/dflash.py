@@ -40,11 +40,12 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hcu, is_hip, is_npu
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -63,6 +64,10 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    if _is_hcu:
+        from lightop import topk
+
+        return topk(scores, k, dim=-1)
     return torch.topk(scores, k, dim=-1)
 
 
