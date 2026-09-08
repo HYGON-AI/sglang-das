@@ -28,7 +28,6 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -36,38 +35,12 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
-from sgl_kernel.kvcacheio import (
-    hcu_alloc_decode_kernel,
-    hcu_alloc_extend_kernel as sgl_kernel_alloc_extend_kernel,
-)
+from sgl_kernel.kvcacheio import hcu_alloc_decode_kernel, hcu_alloc_extend_kernel
 
 _is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
-
-
-_LIGHTOP_ALLOC_EXTEND_KERNEL = None
-_LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED = False
-
-
-def _get_lightop_alloc_extend_kernel():
-    global _LIGHTOP_ALLOC_EXTEND_KERNEL, _LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED
-
-    if _LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED:
-        return _LIGHTOP_ALLOC_EXTEND_KERNEL
-
-    _LIGHTOP_ALLOC_EXTEND_KERNEL_CHECKED = True
-    try:
-        from lightop import op as lightop_op
-
-        _LIGHTOP_ALLOC_EXTEND_KERNEL = getattr(
-            lightop_op, "hcu_alloc_extend_kernel", None
-        )
-    except Exception:
-        _LIGHTOP_ALLOC_EXTEND_KERNEL = None
-
-    return _LIGHTOP_ALLOC_EXTEND_KERNEL
 
 
 def alloc_extend_naive(
@@ -155,7 +128,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.sglang_kvalloc_kernel = get_bool_env_var(
             "SGLANG_KVALLOC_KERNEL", default="true"
         )
-        self.lightop_kvalloc_kernel = envs.SGLANG_LIGHTOP_KVALLOC_KERNEL.get()
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
@@ -227,22 +199,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
         if self.sglang_kvalloc_kernel:
-            alloc_extend_kernel_impl = (
-                _get_lightop_alloc_extend_kernel()
-                if self.lightop_kvalloc_kernel
-                else None
-            )
-            if alloc_extend_kernel_impl is None:
-                alloc_extend_kernel_impl = sgl_kernel_alloc_extend_kernel
-
-            alloc_extend_kernel_impl(
-                pre_lens_ptr=prefix_lens.to(torch.int64),
-                seq_lens_ptr=seq_lens.to(torch.int64),
-                last_loc_ptr=last_loc.to(torch.int64),
-                free_page_ptr=self.free_pages.to(torch.int64),
-                out_indices=out_indices,
-                bs=bs,
-                page_size=self.page_size,
+            hcu_alloc_extend_kernel(
+                pre_lens_ptr = prefix_lens.to(torch.int64),
+                seq_lens_ptr = seq_lens.to(torch.int64),
+                last_loc_ptr = last_loc.to(torch.int64),
+                free_page_ptr = self.free_pages.to(torch.int64),
+                out_indices = out_indices,
+                bs = bs,
+                page_size = self.page_size,
             )
         else:
             alloc_extend_kernel[(bs,)](

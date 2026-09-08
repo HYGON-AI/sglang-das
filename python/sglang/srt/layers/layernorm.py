@@ -1189,7 +1189,7 @@ class GemmaRMSNorm(BaseFusedOp):
                     )
                     return out, residual_out
             out = torch.empty_like(x)
-            op.rms_norm_opt(out, x, w, self.variance_epsilon)
+            rms_norm(out, x, w, self.variance_epsilon)
             return out
 
     def forward_cpu(

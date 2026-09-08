@@ -29,7 +29,6 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
-from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -301,7 +300,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
-        Qwen4ExpForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -313,7 +311,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
-            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
         ):
@@ -524,7 +521,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
-            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
         ):
@@ -661,7 +657,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_vl_moe",
                 "qwen3_5",
                 "qwen3_5_moe",
-                "qwen4_exp",
                 "intern_s2_preview",
             ]
             and video_timestamps is not None
@@ -770,7 +765,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
-            "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
         ):
