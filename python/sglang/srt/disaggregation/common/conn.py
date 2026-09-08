@@ -741,7 +741,10 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --page-size value."
             )
 
-        if info.kv_cache_layout != self.kv_cache_layout:
+        if (
+            info.kv_cache_layout is not None
+            and info.kv_cache_layout != self.kv_cache_layout
+        ):
             raise RuntimeError(
                 f"KV cache layout mismatch: prefill server has kv_cache_layout={info.kv_cache_layout}, "
                 f"but decode server has kv_cache_layout={self.kv_cache_layout}."
@@ -2055,6 +2058,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.kv_cache_layout: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2124,6 +2128,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        kv_cache_layout = data.get("kv_cache_layout")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -2143,6 +2148,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.kv_cache_layout is None and kv_cache_layout is not None:
+            self.kv_cache_layout = kv_cache_layout
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -2216,6 +2224,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_layout=self.kv_cache_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None

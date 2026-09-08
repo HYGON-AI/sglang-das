@@ -216,6 +216,82 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
+_FUSE_MHC_REPEAT_CP_SPLIT = envs.SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT.get()
+
+
+def _can_defer_mhc_repeat_cp_split(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hc_mult: int,
+    cp_size: int,
+    cp_rank: int,
+) -> bool:
+    """Require an unpadded, equal-sized legacy RR split without device reads."""
+    if (
+        hidden_states.ndim != 2
+        or hidden_states.shape[1] == 0
+        or hc_mult <= 0
+        or cp_size <= 1
+        or not 0 <= cp_rank < cp_size
+    ):
+        return False
+    num_tokens = hidden_states.shape[0]
+    if num_tokens == 0 or num_tokens % cp_size != 0:
+        return False
+    # Existing CPU batch metadata proves logical rows; no device-value reads.
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if not isinstance(extend_lens, (list, tuple)) or not all(
+        isinstance(length, int) and not isinstance(length, bool) and length >= 0
+        for length in extend_lens
+    ):
+        return False
+    if sum(extend_lens) != num_tokens:
+        return False
+    # None is the real ForwardBatch default, set only when padding is applied.
+    original_num_tokens = getattr(forward_batch, "_original_num_tokens", None)
+    if original_num_tokens is not None and original_num_tokens != num_tokens:
+        return False
+    return all(
+        tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_tokens
+        for tensor in (
+            getattr(forward_batch, "input_ids", None),
+            getattr(forward_batch, "positions", None),
+            getattr(forward_batch, "out_cache_loc", None),
+        )
+    )
+
+
+def _repeat_mhc_input_on_cp_rank(
+    hidden_states: torch.Tensor, hc_mult: int, cp_size: int, cp_rank: int
+) -> torch.Tensor:
+    """Copy directly to local [tokens / CP, hc_mult, hidden] mHC storage."""
+    repeat_ops = _get_mhc_repeat_cp_ops()
+    if repeat_ops is not None and repeat_ops[0](
+        hidden_states, hc_mult, cp_size, cp_rank
+    ):
+        # LightOp owns target size/layout/architecture dispatch. The existing
+        # outer environment flag owns feature enablement; no role/size gate or
+        # host tensor-value read is introduced here.
+        return repeat_ops[1](hidden_states, hc_mult, cp_size, cp_rank)
+    # Slice is a view; repeat is the only output materialization.
+    return hidden_states[cp_rank::cp_size].unsqueeze(1).repeat(1, hc_mult, 1)
+
+
+@functools.cache
+def _get_mhc_repeat_cp_ops():
+    """Optional metadata-only LightOp ABI resolved once per process."""
+    try:
+        from lightop import op as lightop_op
+    except (ImportError, OSError) as exc:
+        logger.warning("DSV4 mHC repeat+CP unavailable; using torch repeat: %s", exc)
+        return None
+    supports = getattr(lightop_op, "supports_mhc_repeat_cp_sglang", None)
+    kernel = getattr(lightop_op, "mhc_repeat_cp_sglang", None)
+    if not callable(supports) or not callable(kernel):
+        return None
+    return supports, kernel
+
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -3102,12 +3178,33 @@ class DeepseekV4Model(nn.Module):
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         incoming_pd_aux_hidden_states: List[torch.Tensor] = []
         local_dspark_aux_hidden_states: List[torch.Tensor] = []
+        deferred_mhc_input = None
+        mhc_cp_split_done = False
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            if (
+                _FUSE_MHC_REPEAT_CP_SPLIT
+                and _is_hcu
+                and use_prefill_cp
+                and not cp_v2_active
+                and is_dsa_prefill_cp_round_robin_split()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and _can_defer_mhc_repeat_cp_split(
+                    hidden_states,
+                    forward_batch,
+                    self.hc_mult,
+                    get_parallel().attn_cp_size,
+                    get_parallel().attn_cp_rank,
+                )
+            ):
+                # The intervening DP gather consumes input_ids, not hidden
+                # states. Defer until run_tbo decides whether full rows are needed.
+                deferred_mhc_input = hidden_states
+            else:
+                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -3164,11 +3261,26 @@ class DeepseekV4Model(nn.Module):
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        if deferred_mhc_input is not None:
+            if not run_tbo:
+                hidden_states = _repeat_mhc_input_on_cp_rank(
+                    deferred_mhc_input,
+                    self.hc_mult,
+                    get_parallel().attn_cp_size,
+                    get_parallel().attn_cp_rank,
+                )
+                mhc_cp_split_done = True
+            else:
+                # TBO partitions full rows into children before their CP split.
+                hidden_states = deferred_mhc_input.unsqueeze(1).repeat(
+                    1, self.hc_mult, 1
+                )
+            deferred_mhc_input = None
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
             else:
-                if self.pp_group.is_first_rank:
+                if self.pp_group.is_first_rank and not mhc_cp_split_done:
                     hidden_states = cp_split_and_rebuild_data(
                         forward_batch, hidden_states
                     )
