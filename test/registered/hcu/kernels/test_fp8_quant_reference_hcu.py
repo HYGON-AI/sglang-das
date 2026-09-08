@@ -3,6 +3,7 @@
 
 """HCU FP8 per-token-group quantization numeric reference tests."""
 
+import math
 import unittest
 
 import torch
@@ -18,8 +19,6 @@ register_hcu_ci(
     nightly=True,
 )
 register_hcu_ci(est_time=60, suite="stage-b-test-1-hcu-small")
-
-HCU_FP8_QUANT_MAX = 224.0
 
 
 class TestBW1100FP8QuantReferenceHCU(unittest.TestCase):
@@ -46,15 +45,22 @@ class TestBW1100FP8QuantReferenceHCU(unittest.TestCase):
                     source,
                     group_size=group_size,
                 )
+                # E4M3FN and E4M3FNUZ have different finite ranges.
+                quant_info = torch.finfo(quantized.dtype)
+                quant_max = quant_info.max
+                # Preserve a one-ULP rounding allowance at the largest exponent:
+                # 16 for E4M3FNUZ, 32 for E4M3FN.
+                max_quant_step = math.ldexp(
+                    quant_info.eps, math.frexp(quant_max)[1] - 1
+                )
 
                 grouped = source.float().reshape(tokens, -1, group_size)
                 reference_scales = (
-                    grouped.abs().amax(dim=-1).clamp_min(1e-10)
-                    / HCU_FP8_QUANT_MAX
+                    grouped.abs().amax(dim=-1).clamp_min(1e-10) / quant_max
                 )
                 reference_quantized = (
                     (grouped / reference_scales.unsqueeze(-1))
-                    .clamp(-HCU_FP8_QUANT_MAX, HCU_FP8_QUANT_MAX)
+                    .clamp(-quant_max, quant_max)
                     .to(quantized.dtype)
                     .reshape_as(quantized)
                 )
@@ -65,16 +71,14 @@ class TestBW1100FP8QuantReferenceHCU(unittest.TestCase):
                     rtol=1e-4,
                     atol=1e-6,
                 )
-                quant_diff = (
-                    quantized.float() - reference_quantized.float()
-                ).abs()
+                quant_diff = (quantized.float() - reference_quantized.float()).abs()
                 self.assertLess(
                     quant_diff.count_nonzero().item() / quant_diff.numel(),
                     0.005,
                 )
                 self.assertLessEqual(
                     quant_diff.max().item(),
-                    16.0,
+                    max_quant_step,
                 )
 
 

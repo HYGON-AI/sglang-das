@@ -802,7 +802,14 @@ class DeepEPMoE(FusedMoE):
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
                 output = self.forward_deepgemm_contiguous(dispatch_output)
             elif self.use_w4a8_marlin:
-                output = self.forward_deepgemm_w4a8_marlin_contiguous(dispatch_output)
+                apply_deepep_normal = getattr(
+                    self.quant_method, "apply_deepep_normal", None
+                )
+                output = (
+                    apply_deepep_normal(layer=self, dispatch_output=dispatch_output)
+                    if callable(apply_deepep_normal)
+                    else self.forward_deepgemm_w4a8_marlin_contiguous(dispatch_output)
+                )
             elif self.use_w8a8_marlin:
                 output = self.forward_groupgemm_w8a8_marlin_contiguous(dispatch_output)
             elif self.use_fp8_w8a8:
@@ -825,7 +832,16 @@ class DeepEPMoE(FusedMoE):
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             elif self.use_w4a8_marlin:
-                output = self.forward_groupgemm_w4a8_marlin_masked(dispatch_output)
+                apply_deepep_low_latency = getattr(
+                    self.quant_method, "apply_deepep_low_latency", None
+                )
+                output = (
+                    apply_deepep_low_latency(
+                        layer=self, dispatch_output=dispatch_output
+                    )
+                    if callable(apply_deepep_low_latency)
+                    else self.forward_groupgemm_w4a8_marlin_masked(dispatch_output)
+                )
             elif self.use_w8a8_marlin:
                 output = self.forward_groupgemm_w8a8_marlin_masked(dispatch_output)
             elif self.use_fp8_w8a8:

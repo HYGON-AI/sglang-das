@@ -101,6 +101,7 @@ def _pre_warm_nccl_help() -> str:
         "for NVIDIA/CUDA (NCCL)."
     )
 
+
 # --------------------------------------------------------------------------
 # Extension points: out-of-tree platforms and plugins extend these lists
 # before ServerArgs is constructed. Each list owns its adder on the line
@@ -170,6 +171,9 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
+    "slimquant_w4a8",
+    "slimquant_w4a8_marlin",
+    "slimquant_marlin",
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
     "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
