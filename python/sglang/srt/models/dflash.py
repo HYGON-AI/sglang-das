@@ -40,7 +40,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 try:
     from flashinfer import top_k as _flashinfer_top_k
 except ImportError:
+    _flashinfer_top_k = None
+# flashinfer.top_k JIT-compiles a CUDA kernel via nvcc, which is unavailable on
+# HIP/ROCm images. Force the torch.topk fallback there.
+if _flashinfer_top_k is not None and is_hip():
     _flashinfer_top_k = None
 
 
