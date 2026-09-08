@@ -196,6 +196,7 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        int8_store: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -237,6 +238,7 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
+            int8_store=int8_store,
         )
 
     def forward_unified(
@@ -271,7 +273,10 @@ class CompressorBackendMixin:
         use_fp4_indexer = (
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
         )
-        bf16_store = False
+        bf16_store = (
+            token_to_kv_pool.is_bf16_attention_kv_cache
+            and not compressor.is_in_indexer
+        )
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
@@ -284,50 +289,35 @@ class CompressorBackendMixin:
             )
             bf16_store = True
         else:
-            out_loc = self._get_out_loc(compressor.ratio)
-            use_fp4_indexer = (
-                compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
-            )
-            bf16_store = (
-                token_to_kv_pool.is_bf16_attention_kv_cache
-                and not compressor.is_in_indexer
-            )
-            if compressor.is_in_indexer:
-                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-                page_size = token_to_kv_pool.get_index_k_page_size()
-            elif is_unified_kv_triton():
-                kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
-                page_size = 1
-                out_loc = getattr(
-                    self.forward_metadata.core_metadata.unified,
-                    f"c{compressor.ratio}_out_loc",
+            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
+            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
+                out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
+                    out_loc
                 )
-                bf16_store = True
-            else:
-                _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
-                assert compress_kv_pool is not None
-                kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
-                if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                    out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
-                        out_loc
-                    )
-            self._forward_compress_all_in_one(
-                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-                kv_score_input=kv_score_input,
-                ape=compressor.ape,
-                head_dim=compressor.head_dim,
-                norm=compressor.norm,
-                freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=kv_cache.view(dtype=torch.uint8),
-                is_indexer=compressor.is_in_indexer,
-                rotate=compressor.rotate,
-                compress_ratio=compressor.ratio,
-                page_size=page_size,
-                out_loc=out_loc,
-                use_fp4_indexer=use_fp4_indexer,
-                bf16_store=bf16_store,
-            )
+        # All cache modes must execute compression and store. Select the
+        # Indexer encoding without changing the native plan validity checks.
+        self._forward_compress_all_in_one(
+            kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape,
+            head_dim=compressor.head_dim,
+            norm=compressor.norm,
+            freqs_cis_cache=compressor.freqs_cis,
+            kv_cache=kv_cache.view(dtype=torch.uint8),
+            is_indexer=compressor.is_in_indexer,
+            rotate=compressor.rotate,
+            compress_ratio=compressor.ratio,
+            page_size=page_size,
+            out_loc=out_loc,
+            use_fp4_indexer=use_fp4_indexer,
+            bf16_store=bf16_store,
+            int8_store=(
+                compressor.is_in_indexer and token_to_kv_pool.use_int8_index_k_cache
+            ),
+        )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(
