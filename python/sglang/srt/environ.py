@@ -792,6 +792,9 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Opt HCU CUDA graph DP padding into MAX_LEN, enabling all-gather and
+    # fused reduce-scatter for the pure TP-MoE DP-attention path.
+    SGLANG_DP_USE_MAX_LEN = EnvBool(False)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine
