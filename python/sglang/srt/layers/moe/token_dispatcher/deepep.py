@@ -204,18 +204,13 @@ class DeepEPBuffer:
     def _state(cls):
         from types import SimpleNamespace
 
-        from sglang.srt.runtime_context import get_flags, get_resources
+        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
-        # DSpark's draft and target can use different expert layouts (257 vs
-        # 256 for DSV4). DeepEP's low-latency RDMA size depends on that layout,
-        # so each runtime scope needs its own process-level buffer.
-        state_key = (
-            "deepep_ep_state_speculative"
-            if get_flags().moe.in_speculative_a2a_scope
-            else "deepep_ep_state"
-        )
-        state = buffers.get(state_key)
+        # DeepEP's low-latency runtime is process-wide. Creating a second LL
+        # Buffer for the speculative model invalidates/hangs the first runtime
+        # on HCU, so target and draft must share one compatible allocation.
+        state = buffers.get("deepep_ep_state")
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
@@ -227,7 +222,7 @@ class DeepEPBuffer:
                 num_experts=None,
                 num_topk=None,
             )
-            buffers[state_key] = state
+            buffers["deepep_ep_state"] = state
         return state
 
     @classmethod
