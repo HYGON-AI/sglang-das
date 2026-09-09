@@ -173,6 +173,13 @@ class DeepseekMLAForwardMixin:
             return False
         if is_kv_b_lora_active(self):
             return False
+        # HYV4's learnable attention sink and gated-MLA output gate are only
+        # wired through the non-fused attn_mqa path; the fused bmm+attention
+        # split op has no slot for either, so it must stay off for HYV4.
+        if getattr(self, "learnable_sink_param", None) is not None or hasattr(
+            self, "prepare_attention_output_gate"
+        ):
+            return False
         # The isolated 1-kernel graph is the bf16 fallback BMM. The fp8 and
         # DeepGEMM branches already use different fused paths.
         if self.w_kc.dtype == torch.float8_e4m3fn:
@@ -668,6 +675,13 @@ class DeepseekMLAForwardMixin:
             topk_indices,
             llama_4_scaling,
             fusion_plan,
+            # Only models that own the MLA output gate (currently HYV4) emit
+            # this extra slot, so every other caller keeps the 10-tuple.
+            *(
+                (self.prepare_attention_output_gate(hidden_states),)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_core(
@@ -682,8 +696,16 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        attention_output_gate=None,
     ):
         save_kv_cache = True
+        # HYV4 carries a per-head learnable attention sink logit that the
+        # sparse backend folds into the softmax denominator.
+        sink_args = (
+            dict(attn_sink=self.learnable_sink_param)
+            if getattr(self, "learnable_sink_param", None) is not None
+            else {}
+        )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -741,6 +763,7 @@ class DeepseekMLAForwardMixin:
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
+                    **sink_args,
                     **(
                         dict(topk_indices=topk_indices)
                         if topk_indices is not None
@@ -761,6 +784,7 @@ class DeepseekMLAForwardMixin:
                 k_nope,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **sink_args,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
@@ -897,6 +921,10 @@ class DeepseekMLAForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if attention_output_gate is not None:
+            attn_bmm_output = self.apply_attention_output_gate(
+                attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 

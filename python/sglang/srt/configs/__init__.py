@@ -9,6 +9,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.hy_v4 import HYV4Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.inkling import (
     InklingAudioConfig,
@@ -56,7 +57,6 @@ from sglang.srt.configs.qwen3_5 import (
 )
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -74,6 +74,7 @@ __all__ = [
     "ChatGLMConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
+    "HYV4Config",
     "LongcatFlashConfig",
     "MultiModalityConfig",
     "KimiVLConfig",
@@ -89,8 +90,6 @@ __all__ = [
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
-    "Qwen4ExpConfig",
-    "Qwen4ExpTextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
     "Qwen3_5TextConfig",
