@@ -211,6 +211,20 @@ def _prepare_standalone_megamoe_inputs(
     buf,
     num_tokens: int,
 ) -> None:
+    if getattr(buf, "quant_mode", "fp8") == "int8":
+        import megamoe
+
+        megamoe.mega_moe_pre_dispatch_int8(
+            hidden_states.contiguous(),
+            topk_ids,
+            topk_weights,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens,
+        )
+        return
     quant = _get_hcu_w8a8_pre_dispatch_quant()
     if quant is not None:
         quant_input = (
@@ -345,6 +359,7 @@ def _get_mega_moe_symm_buffer(
     *,
     runtime: str = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
+    quant_mode: str = "fp8",
 ) -> SymmBuffer:
     if mma_type is None:
         mma_type = _mega_moe_mma_type()
@@ -371,6 +386,7 @@ def _get_mega_moe_symm_buffer(
     with num_sms_ctx:
         key = (
             package_key,
+            quant_mode,
             id(group),
             num_max_tokens_per_rank,
             cuda_graph_max_tokens_per_rank,
@@ -384,6 +400,8 @@ def _get_mega_moe_symm_buffer(
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
             kwargs = {}
+            if quant_mode != "fp8":
+                kwargs["quant_mode"] = quant_mode
             if cuda_graph_max_tokens_per_rank is not None:
                 kwargs["cuda_graph_max_tokens_per_rank"] = (
                     cuda_graph_max_tokens_per_rank
@@ -438,6 +456,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
                 "server after changing SGLANG_HCU_MEGA_MOE_RUNTIME."
             )
     if get_is_capture_mode():
+        if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
+            raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
         return not _IS_HCU or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
@@ -616,6 +636,11 @@ def run_mega_routed_experts(
         mma_type=mma_type,
         runtime=runtime,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
+        quant_mode=(
+            "int8"
+            if getattr(experts, "_mega_moe_hcu_int4_weights", False)
+            else "fp8"
+        ),
     )
 
     if _IS_HCU:
@@ -817,13 +842,26 @@ def _run_standalone_hcu_w8a8_mega_moe(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    api_kwargs = {"megamoe_backend": _select_hcu_megamoe_backend(dispatch_num_tokens)}
+    int4_weights = getattr(experts, "_mega_moe_hcu_int4_weights", False)
+    api_kwargs = {
+        "megamoe_backend": (
+            "normal"
+            if int4_weights
+            else _select_hcu_megamoe_backend(dispatch_num_tokens)
+        )
+    }
     if is_graph_capture:
         api_kwargs["graph"] = True
     else:
         api_kwargs["capacity_num_tokens"] = dispatch_num_tokens
 
-    megamoe.fp8_w8a8_mega_moe(
+    if int4_weights:
+        from sglang.srt.layers.moe.hcu_int4_megamoe import int4_w4a8_mega_moe
+
+        run_moe = int4_w4a8_mega_moe
+    else:
+        run_moe = megamoe.fp8_w8a8_mega_moe
+    run_moe(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
@@ -969,6 +1007,42 @@ def _hcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tenso
     raise ValueError(
         "HCU W8A8 MegaMoE requires channelwise FP32 scales shaped "
         f"[expert,row] for {label}; checked {', '.join(names)}"
+    )
+
+
+def build_hcu_int4_mega_moe_experts_weights(experts) -> None:
+    """Build from raw SlimQuant weights before fallback-specific repacking."""
+    if not _IS_HCU or not get_moe_a2a_backend().is_megamoe():
+        return
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if get_hcu_mega_moe_runtime() != _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+        raise ValueError("INT4 requires SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
+    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
+    if tuple(w13.shape) != (32, 4096, 2048) or tuple(w2.shape) != (32, 4096, 1024):
+        raise ValueError("INT4 MegaMoE currently supports DSV4-Flash EP8 only")
+    from sglang.srt.layers.moe.hcu_int4_megamoe import (
+        transform_int4_weights_for_mega_moe_normal,
+        validate_megamoe_int8_runtime,
+    )
+
+    validate_megamoe_int8_runtime()
+
+    experts.mega_l1_weights, experts.mega_l2_weights = (
+        transform_int4_weights_for_mega_moe_normal(
+            w13,
+            w2,
+            l1_scale=experts.w13_weight_scale.data,
+            l2_scale=experts.w2_weight_scale.data,
+            scale_multiplier=16.0,
+        )
+    )
+    experts._mega_moe_hcu_runtime = _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+    experts._mega_moe_hcu_int4_weights = True
+    experts._mega_moe_weights_built = True
+    logger.info(
+        "INT4 MegaMoE enabled: packed INT4 -> reusable INT8 PACK5 scratch; "
+        "HCU normal dispatch/GEMM/combine (no AITER fallback)"
     )
 
 
