@@ -45,18 +45,39 @@ _is_cuda = is_cuda()
 
 
 def _mtp_quant_config(quant_config):
-    """Re-point the checkpoint's ``mtp_layers.0`` ignore list at ``model.decoder``."""
+    """Re-point the checkpoint's MTP ignore entries at the draft decoder."""
     if quant_config is None:
         return None
+
     quant_config = copy.deepcopy(quant_config)
+    decoder_prefix = "model.decoder"
+
+    def normalize_name(name):
+        for mtp_prefix in (
+            "model.mtp.layers.0",
+            "model.mtp_layers.0",
+            "mtp.layers.0",
+            "mtp_layers.0",
+        ):
+            name = name.replace(mtp_prefix, decoder_prefix)
+        return name
+
     ignored_layers = getattr(quant_config, "ignored_layers", None)
     if ignored_layers is not None:
-        quant_config.ignored_layers = [
-            name.replace("model.mtp_layers.0", "model.decoder").replace(
-                "mtp_layers.0", "model.decoder"
-            )
-            for name in ignored_layers
-        ]
+        quant_config.ignored_layers = list(
+            dict.fromkeys(normalize_name(name) for name in ignored_layers)
+        )
+
+    ignored_modules = getattr(quant_config, "ignore", None)
+    if ignored_modules is not None:
+        quant_config.ignore = list(
+            dict.fromkeys(normalize_name(name) for name in ignored_modules)
+        )
+
+    # Compressed-tensors applies this override before consulting its ignore list.
+    if hasattr(quant_config, "linear_fp8_config"):
+        quant_config.linear_fp8_config = None
+
     return quant_config
 
 

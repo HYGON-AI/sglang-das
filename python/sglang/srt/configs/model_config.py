@@ -165,6 +165,17 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def resolve_spec_hidden_size(
+    hf_config, hidden_size: int, hc_mult: int
+) -> tuple[int, Optional[int]]:
+    # Only DSV4 carries the hc-flattened stream across the target->draft
+    # boundary; HYV4 collapses to hidden_size before its MTP layer.
+    if hc_mult <= 1 or not is_deepseek_v4(hf_config):
+        return hidden_size, None
+    hc_hidden_size = hidden_size * hc_mult
+    return hc_hidden_size, hc_hidden_size
+
+
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -1104,12 +1115,9 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        self.spec_hidden_size = (
-            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
+        self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
+            self.hf_config, self.hidden_size, hc_mult
         )
-        # mHC-flattened hidden size; None when not running an mHC model
-        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
-        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
