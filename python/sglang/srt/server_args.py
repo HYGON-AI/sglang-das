@@ -5959,15 +5959,9 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
-                if is_deepseek_dsa(hf_config):
-                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
-                    # CUDA/Hopper-only path: its JIT source includes
-                    # <cooperative_groups.h> and uses cg::this_cluster()
-                    # (thread-block clusters), neither of which exists on ROCm,
-                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                    # here for the rest of the DSA family (DeepSeek-V3.2 /
-                    # GLM-5.x) that shares the same decode top-k path.
+                if is_deepseek_dsa(hf_config) and not is_hcu():
+                    # Generic ROCm keeps the registered top-k path; HCU uses
+                    # the HIP-compatible non-cluster TopK v2 implementation.
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
@@ -6017,7 +6011,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                if not is_hcu():
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
