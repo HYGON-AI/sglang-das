@@ -47,6 +47,11 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.hy4_ihc_tilelang import (
+    try_tilelang_ihc_head,
+    try_tilelang_ihc_post,
+    try_tilelang_ihc_pre,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -222,28 +227,38 @@ class HYV4HCPreLayer(nn.Module):
         rms_eps: float = 0.0,
     ):
         shape = hidden_states.shape
-        flat = hidden_states.flatten(1).float()
-        scale = torch.rsqrt(
-            flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
-        )
-        gates = self.hc_fn(flat)[0] * scale
-        pre = (
-            torch.sigmoid(
-                gates[..., : self.hc_mult] * self.hc_scale[0]
-                + self.hc_base[: self.hc_mult]
+        use_tilelang = envs.SGLANG_OPT_HY4_IHC_TILELANG.get()
+        fused = None
+        if use_tilelang:
+            fused = try_tilelang_ihc_pre(
+                hidden_states, self.hc_fn.weight, self.hc_scale, self.hc_base,
+                self.rms_norm_eps, self.hc_eps, self.magnitude,
             )
-            + self.hc_eps
-        )
-        post = (
-            self.magnitude
-            * torch.sigmoid(
-                gates[..., self.hc_mult :] * self.hc_scale[1]
-                + self.hc_base[self.hc_mult :]
+        if fused is not None:
+            reduced, post = fused
+        else:
+            flat = hidden_states.flatten(1).float()
+            scale = torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
             )
-            + self.hc_eps
-        )
-        reduced = torch.sum(pre.unsqueeze(-1) * hidden_states.reshape(shape), dim=1)
-        reduced = reduced.to(hidden_states.dtype)
+            gates = self.hc_fn(flat)[0] * scale
+            pre = (
+                torch.sigmoid(
+                    gates[..., : self.hc_mult] * self.hc_scale[0]
+                    + self.hc_base[: self.hc_mult]
+                )
+                + self.hc_eps
+            )
+            post = (
+                self.magnitude
+                * torch.sigmoid(
+                    gates[..., self.hc_mult :] * self.hc_scale[1]
+                    + self.hc_base[self.hc_mult :]
+                )
+                + self.hc_eps
+            )
+            reduced = torch.sum(pre.unsqueeze(-1) * hidden_states.reshape(shape), dim=1)
+            reduced = reduced.to(hidden_states.dtype)
         if rms_weight is not None:
             reduced_float = reduced.float()
             reduced = (
@@ -298,6 +313,9 @@ class HYV4HCLayer(nn.Module):
         return reduced, post, hidden_states
 
     def post(self, output, residual, post):
+        fused = try_tilelang_ihc_post(output, residual, post)
+        if fused is not None:
+            return fused
         result = post.float().unsqueeze(-1) * output.float().unsqueeze(1)
         return (result + residual.float()).to(output.dtype)
 
@@ -326,6 +344,16 @@ class HYV4HCHeadLayer(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, norm: Optional[RMSNorm] = None):
+        fused = try_tilelang_ihc_head(
+            hidden_states,
+            self.hc_head_fn.weight,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+        )
+        if fused is not None:
+            return fused if norm is None else norm(fused)
         shape = hidden_states.shape
         flat = hidden_states.flatten(1).float()
         scale = torch.rsqrt(
