@@ -886,7 +886,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["quantization"] = quant_method
         quant_resolved = quant_method
 
-    if is_hip():
+    if is_hip() and not is_hcu():
         if server_args.is_attention_backend_not_set():
             overrides["attention_backend"] = "triton"
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
@@ -1054,7 +1054,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_amx"
         elif is_xpu():
             overrides["attention_backend"] = "intel_xpu"
-        elif is_hip():
+        elif is_hip() and not is_hcu():
             overrides["attention_backend"] = "aiter"
         elif not (is_mps() and use_mlx()):
             # Exempt MLX only -- it owns attention in its own runner.  macOS
@@ -1153,7 +1153,7 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
             backend, platform = "trtllm_mha", "sm100"
         elif is_sm90_supported():
             backend, platform = "fa3", "sm90"
-        elif is_hip():
+        elif is_hip() and not is_hcu():
             backend, platform = "aiter", "hip"
         elif server_args.device == "xpu":
             backend, platform = "intel_xpu", "xpu"
@@ -2052,7 +2052,7 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
-    if not is_hip():
+    if not is_hip() or is_hcu():
         return {}
     if not (
         view.quantization == "modelopt_fp4"
@@ -2683,7 +2683,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if view.quantization == "mxfp8" and not is_npu():
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
-        is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
+        is_gfx95_mxfp8 = is_hip() and not is_hcu() and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")

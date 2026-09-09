@@ -1200,7 +1200,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     moe_config=moe_cfg,
-                    inplace=True,
+                    inplace=moe_runner_config.inplace,
                     w1_scale=None,
                     w2_scale=None,
                     activation=activation,
