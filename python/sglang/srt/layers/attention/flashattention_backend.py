@@ -1554,6 +1554,8 @@ class FlashAttentionBackend(AttentionBackend):
                         and layer.v_scale is not None
                         else None
                     ),
+                    layout="legacy_bhsd",
+                    out=_fa_out,
                 )
             elif self._use_hcu_legacy_layout:
                 result = vllm_flash_attn_with_kvcache(

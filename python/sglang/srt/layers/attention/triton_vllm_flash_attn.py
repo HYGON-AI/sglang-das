@@ -62,6 +62,8 @@ def _paged_varlen_attn_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     Q_STRIDE_T: tl.constexpr,
     Q_STRIDE_H: tl.constexpr,
     Q_STRIDE_D: tl.constexpr,
@@ -159,6 +161,18 @@ def _paged_varlen_attn_fwd_kernel(
         qk = tl.where(q_mask[:, None] & kv_mask[None, :], qk, -float("inf"))
         if CAUSAL:
             qk = tl.where(offs_n[None, :] <= q_abs_pos[:, None], qk, -float("inf"))
+        if WINDOW_LEFT >= 0:
+            qk = tl.where(
+                offs_n[None, :] >= q_abs_pos[:, None] - WINDOW_LEFT,
+                qk,
+                -float("inf"),
+            )
+        if WINDOW_RIGHT >= 0:
+            qk = tl.where(
+                offs_n[None, :] <= q_abs_pos[:, None] + WINDOW_RIGHT,
+                qk,
+                -float("inf"),
+            )
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp(qk - m_new[:, None])
@@ -200,11 +214,12 @@ def triton_vllm_flash_attn_varlen_func(
     k_descale: Optional[torch.Tensor],
     v_descale: Optional[torch.Tensor],
     layout: Optional[str] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if layout is not None and layout not in ("bshd", "bhsd", "legacy_bhsd"):
         raise ValueError(f"Unsupported attention layout: {layout!r}")
-    if window_size != (-1, -1):
-        raise NotImplementedError("Triton reference FA only supports full-context attention.")
+    if len(window_size) != 2 or any(size < -1 for size in window_size):
+        raise ValueError(f"Invalid attention window: {window_size!r}")
     if q.dim() != 3:
         raise ValueError(f"q must be [total_q, Hq, D], got {tuple(q.shape)}")
     if k.dim() != 4 or v.dim() != 4:
@@ -281,8 +296,7 @@ def triton_vllm_flash_attn_varlen_func(
 
     def _normalize_descale(descale: Optional[torch.Tensor], name: str, valid_heads):
         if descale is None:
-            dummy = torch.empty((1, 1), device=q.device, dtype=torch.float32)
-            return dummy, False, 1
+            return q, False, 1
         descale = descale.to(device=q.device, dtype=torch.float32)
         if descale.dim() == 0:
             descale = descale.view(1, 1)
@@ -310,7 +324,13 @@ def triton_vllm_flash_attn_varlen_func(
         v_descale, "v_descale", {1, h_kv}
     )
 
-    out = torch.empty((total_q, h_q, d_v), device=q.device, dtype=out_dtype)
+    if out is None:
+        out = torch.empty((total_q, h_q, d_v), device=q.device, dtype=out_dtype)
+    elif out.shape != (total_q, h_q, d_v) or out.dtype != out_dtype:
+        raise ValueError(
+            f"out must have shape {(total_q, h_q, d_v)} and dtype {out_dtype}, "
+            f"got shape={tuple(out.shape)}, dtype={out.dtype}"
+        )
     block_m = 16
     block_n = 32
     grid = (triton.cdiv(max_seqlen_q, block_m), h_q, batch)
@@ -334,6 +354,8 @@ def triton_vllm_flash_attn_varlen_func(
         block_m,
         block_n,
         causal,
+        window_size[0],
+        window_size[1],
         q.stride(0),
         q.stride(1),
         q.stride(2),
