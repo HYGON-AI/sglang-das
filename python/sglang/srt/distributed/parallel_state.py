@@ -1275,8 +1275,6 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    # HCU's registered graph path corrupts replay output; see the
-                    # retirement gate in docs/internal/dcu-main-conflict-ledger.md.
                     if _is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
