@@ -161,6 +161,7 @@ class KVIndexTranslator:
             self._swa_write_loc_from_full = (
                 token_to_kv_pool.translate_loc_from_full_to_swa
                 if isinstance(token_to_kv_pool, BaseSWAKVPool)
+                and not get_exec().features.enable_encoder_swa_bounded_replay
                 else None
             )
 

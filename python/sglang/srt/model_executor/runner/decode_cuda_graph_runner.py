@@ -253,10 +253,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
-        if self.use_ngram_embedding:
-            hf_config = model_runner.model_config.hf_config
-            self.ngram_embedding_n = hf_config.ngram_embedding_n
-            self.ngram_embedding_k = hf_config.ngram_embedding_k
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
@@ -1090,6 +1086,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)
         )
+        if getattr(self, "candidate_filter_span", None) is not None:
+            dsa_variants = [variant for variant, _ in self.candidate_graph_limits]
+            dsa_variants.append("candidate_filtered")
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
