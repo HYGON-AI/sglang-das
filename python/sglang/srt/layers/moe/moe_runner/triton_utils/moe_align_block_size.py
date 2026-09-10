@@ -34,7 +34,7 @@ if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
 
 if _is_hcu:
-    from lightop import op
+    from lightop import moe as op
 
 if _is_cuda:
     from sglang.kernels.ops.moe.moe_align_small_numel import (
