@@ -76,7 +76,7 @@ jobs:
           INPUT_REF: ${{ inputs.ref || '' }}
           INPUT_JOB_FILTER: ${{ inputs.job_filter || 'all' }}
           VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
-          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE_0518 || '' }}
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
         run: |
@@ -109,7 +109,7 @@ jobs:
           fi
 
           if [[ -z "${image}" ]]; then
-            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE or workflow input image."
+            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE_0518 or workflow input image."
             exit 1
           fi
 

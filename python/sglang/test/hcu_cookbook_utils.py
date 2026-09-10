@@ -619,7 +619,9 @@ QWEN3_32B_4GPU = HcuCookbookModelConfig(
 QWEN3_30B_A3B_W8A8_4GPU = HcuCookbookModelConfig(
     name="Qwen3-30B-A3B-w8a8",
     env_name="SGLANG_HCU_QWEN3_30B_A3B_W8A8_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/Qwen3-30B-A3B-w8a8",
+    default_path=(
+        "/public/opendas/DL_DATA/llm-models/vllm-w8a8-models/Qwen3-30B-A3B.w8a8"
+    ),
     tp_size=4,
     timeout=3600,
     dtype_or_quant="w8a8",
@@ -657,7 +659,7 @@ QWEN35_397B_A17B_CHANNEL_FP8_4GPU = HcuCookbookModelConfig(
     name="Qwen3.5-397B-A17B-Channel-FP8",
     env_name="SGLANG_HCU_QWEN35_397B_A17B_CHANNEL_FP8_MODEL",
     default_path=(
-        "/public/opendas/DL_DATA/llm-models/qwen3.5/Qwen3.5-397B-A17B-Channel-FP8"
+        "/public/opendas/DL_DATA/llm-models/Qwen3.5-397B-A17B-Channel-FP8-w8a8"
     ),
     tp_size=4,
     timeout=7200,
@@ -669,7 +671,10 @@ QWEN35_397B_A17B_CHANNEL_FP8_4GPU = HcuCookbookModelConfig(
 GLM51_CHANNEL_FP8_8GPU = HcuCookbookModelConfig(
     name="GLM-5.1-Channel-FP8",
     env_name="SGLANG_HCU_GLM51_CHANNEL_FP8_MODEL",
-    default_path="/public4/share/GLM-5.1-Channel-fp8",
+    default_path=(
+        "/public/opendas/DL_DATA/llm-models/glm5.1/models/hygon/"
+        "GLM-5.1-Channel-FP8-w8a8"
+    ),
     tp_size=8,
     timeout=7200,
     dtype_or_quant="w8a8_fp8",
@@ -713,7 +718,7 @@ DEEPSEEK_V32_CHANNEL_INT8_8GPU = HcuCookbookModelConfig(
 MINIMAX_M25_FP8_8GPU = HcuCookbookModelConfig(
     name="MiniMax-M2.5",
     env_name="SGLANG_HCU_MINIMAX_M25_FP8_MODEL",
-    default_path="/public/opendas/DL_DATA/llm-models/MiniMax-M2.5",
+    default_path="/public/opendas/DL_DATA/llm-models/MiniMax-M2.5-Channel-FP8-w8a8",
     tp_size=8,
     timeout=7200,
     dtype_or_quant="fp8",
@@ -735,7 +740,7 @@ MINIMAX_M25_W8A8_8GPU = HcuCookbookModelConfig(
 KIMI_K26_8GPU = HcuCookbookModelConfig(
     name="Kimi-K2.6",
     env_name="SGLANG_HCU_KIMI_K26_MODEL",
-    default_path="/public4/opendas/DL_DATA/llm-models/Kimi-K2.6",
+    default_path="/public/opendas/DL_DATA/llm-models/Kimi-K2.6",
     tp_size=8,
     timeout=7200,
     dtype_or_quant="w4a16",

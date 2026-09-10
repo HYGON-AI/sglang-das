@@ -1,4 +1,9 @@
-# <div align="center"><strong>SGLang</strong></div>
+# <div align="center"><strong>SGLang HCU 0.5.18</strong></div>
+
+> 本文档适用于 `release/20260825_v0.5.18` 分支及其 HCU 适配版本。
+> 模型部署示例和硬件适配说明请参考 [HYGON-AI/inference-cookbook-das](https://github.com/HYGON-AI/inference-cookbook-das)。
+
+> 已验证镜像：`42.228.13.241:5000/jenkins/model_test_env/sglang:0.5.18-ubuntu22.04-dtk2604-py3.10-sf_b075-20260831-0154`。该镜像使用 Torch 2.11.0、`sglang 0.5.18` 和 `sglang-kernel 0.4.6.post1`；BW1000/天龙网卡环境应优先使用带 `sf` 标识的镜像。
 
 ## sglang_hcu简介
 SGLang是一个用于大型语言模型和多模态模型的高性能服务框架，旨在在从单个GPU到大型分布式集群的各种设置中提供低延迟和高吞吐量的推理，我们基于开源社区做了HCU平台的适配和针对性的优化。
@@ -9,45 +14,50 @@ SGLang是一个用于大型语言模型和多模态模型的高性能服务框�
 ## 使用源码编译方式安装
 提供2种环境准备方式:
 
-1. 基于光源pytorch2.5.1基础镜像环境:根据pytorch2.5.1、python、dtk及系统下载对应的镜像版本。
+1. 使用 0.5.18 HCU 基础镜像，正式镜像当前基线为 Python 3.10、PyTorch 2.11.0 和 DTK 26.04（`DTK-26.04-rc4`）。如果要复现 PR HCU wheel CI，则按 workflow 使用 PyTorch 2.10.0。
 
-2. 基于现有python环境:安装pytorch2.5.1,pytorch whl包下载目录:[https://cancon.hpccube.com:65024/4/main/pytorch](https://cancon.hpccube.com:65024/4/main/pytorch),根据python、dtk版本,下载对应pytorch2.5.1的whl包。安装命令如下:
+2. 如果使用现有 Python 环境，请先安装与 Python、DTK 和系统架构匹配的 PyTorch 2.11.0 HCU wheel；复现 PR wheel CI 时使用 2.10.0。HCU PyTorch wheel 可从 [OpenDAS PyTorch 仓库](https://cancon.hpccube.com:65024/4/main/pytorch) 获取。安装示例：
 ```shell
-pip install torch* (下载的torch的whl包)
+pip install <匹配的torch-2.11.0 HCU wheel>
 pip install setuptools wheel
 ```
 
 ### 源码编译安装
 ```shell
-git clone  https://developer.sourcefind.cn/codes/OpenDAS/sglang.git #根据需要的分支进行切换
+git clone https://github.com/HYGON-AI/sglang-das.git
+cd sglang-das
+git checkout release/20260825_v0.5.18
 ```
 安装依赖:
 ```shell
 pip install -r requirements_hcu.txt
 ```
 
-- 提供2种源码编译方式(进入sglang目录):
-```
-编译安装sgl_kernel
-cd sgl-kernel
+### 源码编译安装
+进入仓库根目录后：
+```shell
+# 编译并安装 HCU sgl-kernel
+cd python/sglang/kernels/aot
 python setup_hip.py install
+cd ../../../..
 
-1. 编译whl包并安装
-python setup.py bdist_wheel
-cd dist
-pip install sglang*
+# 方式一：构建并安装 sglang wheel
+cd python
+python -m build --wheel --no-isolation -Cfeatures=all_hip
+pip install dist/sglang-*.whl --no-deps
+cd ..
 
-2. 源码编译sglang
-pip install -e "python[all_hip]" --no-deps --no-build-isolation --no-index
+# 方式二：以 editable 模式安装源码
+pip install -e "python[srt]" --no-deps --no-build-isolation
 ```
-### 运行基础环境准备
-1、使用上面基于光源pytorch2.5.1基础镜像环境
 
-2、根据pytorch2.5.1、python、dtk及系统下载对应的依赖包:
+### 运行基础环境准备
+1、使用上面所选的 Python 3.10、PyTorch 版本和 DTK 26.04 HCU 基础环境。
+
+2、根据上面所选的 PyTorch 版本（正式 0.5.18 镜像使用 2.11.0，PR wheel CI 使用 2.10.0）、Python 3.10、DTK 26.04 和系统架构下载对应的 HCU 依赖包:
 - flash_attn: [https://cancon.hpccube.com:65024/4/main/flash_attn](https://cancon.hpccube.com:65024/4/main/flash_attn)
 - flash_mla: [https://download.sourcefind.cn:65024/4/main/flash_mla](https://download.sourcefind.cn:65024/4/main/flash_mla)
 - lightop: [https://download.sourcefind.cn:65024/4/main/lightop](https://download.sourcefind.cn:65024/4/main/lightop)
-- lmslim: [https://cancon.hpccube.com:65024/4/main/lmslim](https://cancon.hpccube.com:65024/4/main/lmslim)
 - triton: [https://cancon.hpccube.com:65024/4/main/triton](https://cancon.hpccube.com:65024/4/main/triton)
 - vllm: [https://download.sourcefind.cn:65024/4/main/vllm](https://download.sourcefind.cn:65024/4/main/vllm)
 
@@ -63,7 +73,7 @@ pip install -e "python[all_hip]" --no-deps --no-build-isolation --no-index
 
 使用方式：进入 GitHub Actions，选择 `Manual HCU Unattended Model Test`，点击 `Run workflow`。GitHub 页面上的分支下拉框决定默认测试 ref；也可以通过 `test_branch` 输入分支、tag、ref 或 SHA 覆盖。默认 suite 为 `nightly-hcu-accuracy`，可通过 `suite` 改成 `nightly-hcu`、`nightly-hcu-vlm`、`nightly-hcu-4-gpu` 等已注册 HCU suite。若只跑单个文件，填写 `include_file`，例如 `test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py`。
 
-常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 HCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 会传给 `SGLANG_HCU_GSM8K_MODEL`、`SGLANG_HCU_MMLU_MODEL` 和 `SGLANG_TEST_DEFAULT_MODEL_NAME`，可用于测试其它本地模型路径，例如 `/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct`。`run_suite.py` 尚无 `--model-name` 过滤参数，因此这里通过测试文件已支持的环境变量选择模型。
+常用输入包括：`timeout_per_file`（默认 4200 秒，沿用现有 HCU accuracy 长测配置）、`auto_partition_id` 和 `auto_partition_size`（必须成对填写）、`continue_on_error`（默认 true，表示 `run_suite.py` 内部尽量继续跑后续文件，但 workflow 仍会在最终失败时显示失败）、`runner_label`、`container_name` 和 `image`。`model_name` 会传给 `SGLANG_HCU_GSM8K_MODEL`、`SGLANG_HCU_MMLU_MODEL` 和 `SGLANG_TEST_DEFAULT_MODEL_NAME`，可用于测试其它本地模型路径，例如 `/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B`。`run_suite.py` 尚无 `--model-name` 过滤参数，因此这里通过测试文件已支持的环境变量选择模型。
 
 快速验证其它模型时，可填写 `model_name`，并将 `eval_num_examples` 设为较小值（例如 `10`）；也可用 `include_file` 只跑 `test/registered/hcu/accuracy/bw1100/test_gsm8k_eval_hcu.py` 或 `test/registered/hcu/accuracy/bw1100/test_mmlu_eval_hcu.py`。如模型精度阈值不同，可通过 `gsm8k_threshold`、`mmlu_threshold` 临时覆盖。`mmlu_num_threads` 默认 128，这是在 HCU runner 上手动验证过的稳定配置。
 
@@ -245,12 +255,13 @@ curl -X POST http://localhost:30002/v1/completions \
 - 无
 
 ## 参考资料
+- [HCU 模型部署 Cookbook](https://github.com/HYGON-AI/inference-cookbook-das)
 - [README_ORIGIN](README_ORIGIN.md)
-- [https://github.com/sgl-project/sglang](https://github.com/sgl-project/sglang)
+- [SGLang 上游项目](https://github.com/sgl-project/sglang)
 
 ## License
 
-本仓库基于 [SGLang](https://github.com/sgl-project/sglang) `v0.5.12` 版本进行 HCU 平台适配和优化，上游项目采用 Apache License, Version 2.0。
+本仓库基于 [SGLang](https://github.com/sgl-project/sglang) `release/20260825_v0.5.18` 版本进行 HCU 平台适配和优化，上游项目采用 Apache License, Version 2.0。
 
 Hygon Information Technology Co., Ltd. 对 HCU 适配、修改和新增贡献部分同样采用 Apache License, Version 2.0。
 
