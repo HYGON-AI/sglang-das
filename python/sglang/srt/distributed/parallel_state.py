@@ -1132,6 +1132,9 @@ class GroupCoordinator:
         # generic RCCL kernel for the small, latency-bound decode collective.
         # Gated by SGLANG_DP_USE_REDUCE_SCATTER. Falls back (returns False)
         # for HCU, non-ROCm, or unsupported shape/size/topology so the caller uses RCCL.
+        # HCU stays excluded here on purpose; the DP-attention MAX_LEN combine
+        # re-enables the aiter IPC kernel narrowly in dp_attention.py's
+        # `_aiter_reduce_scatter_tensor` so no other reduce_scatter caller is affected.
         if not (
             is_hip()
             and not _is_hcu
@@ -1258,9 +1261,8 @@ class GroupCoordinator:
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
         # size <= max_size/(world*2).
-        # On a hit, writes directly into the caller's pre-allocated `output` via
-        # all_gather_reg during CUDA-graph capture, and all_gather_unreg
-        # under torch_memory_saver and other paths.
+        # On a hit, writes directly into the caller's pre-allocated `output`.
+        # HCU and torch_memory_saver use the unregistered graph path.
         ca_comm = self.ca_comm
         if (
             is_hip()
@@ -1273,7 +1275,7 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    if _is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
