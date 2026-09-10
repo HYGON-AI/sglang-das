@@ -463,6 +463,58 @@ def vllm_flash_attn_varlen_func(
             out=out,
         )
 
+    # HCU paged MTP folds query tokens into heads and supports at most
+    # 64 query heads per KV head. Split uniform causal verification blocks
+    # without changing their bottom-right causal alignment or the KV cache.
+    if (
+        _is_hcu
+        and layout == "legacy_bhsd"
+        and k.shape[2] == 64
+        and q.shape[2] == v.shape[2]
+        and causal
+        and window_size == (-1, -1)
+        and 1 < max_seqlen_q <= 16
+        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
+        and q.shape[1] * max_seqlen_q > k.shape[1] * 64
+        and q.shape[1] <= k.shape[1] * 64
+    ):
+        batch_size = cu_seqlens_q.numel() - 1
+        chunk_size = min(16, k.shape[1] * 64 // q.shape[1])
+        queries = q.reshape(batch_size, max_seqlen_q, *q.shape[1:])
+        chunks = []
+        for begin in range(0, max_seqlen_q, chunk_size):
+            end = min(begin + chunk_size, max_seqlen_q)
+            chunk_q = queries[:, begin:end].contiguous().flatten(0, 1)
+            chunk_cu = torch.arange(
+                batch_size + 1, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype
+            ) * (end - begin)
+            chunk_lengths = (seqused_k - (max_seqlen_q - end)).clamp_min(0)
+            chunk_out = vllm_flash_attn_varlen_func_interface(
+                q=chunk_q,
+                k=k,
+                v=v,
+                cu_seqlens_q=chunk_cu,
+                max_seqlen_q=end - begin,
+                seqused_k=chunk_lengths,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_table,
+                fa_version=fa_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            chunks.append(
+                chunk_out.reshape(batch_size, end - begin, *chunk_out.shape[1:])
+            )
+        result = torch.cat(chunks, dim=1).flatten(0, 1)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
     return vllm_flash_attn_varlen_func_interface(
         q=q,
         k=k,
