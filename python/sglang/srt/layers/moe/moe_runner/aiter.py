@@ -461,8 +461,36 @@ def _run_aiter_w8a8(
         if runner_config.routed_scaling_factor is not None
         else 1.0
     )
+    expert_map_arg = None
     if quant_info.expert_map is not None:
-        global_num_experts = quant_info.global_num_experts or w1.shape[0]
+        # EP: the AITER ck sorting operator (moe_sorting_fwd) does not support
+        # the expert_map format the framework passes down.  Remap global
+        # topk_ids to the local expert space here (triton-style python-layer
+        # conversion) and pass a binary all-ones mask to aiter_moe.
+        #
+        # Non-local expert assignments become -1 after mapping; AITER cannot
+        # accept negative ids, so reroute them to expert 0 and zero their
+        # topk_weights.  The zeroed slots contribute nothing on this rank; the
+        # post-MoE all-reduce combines the partial results from every EP rank
+        # to produce the correct output.
+        #
+        # We pass a binary all-ones mask (instead of None) so that
+        # fused_experts_asm_impl takes the EP code path that zero-initializes
+        # d_w2_out via torch.zeros, avoiding reads of uninitialized memory in
+        # triton_moe_sum.
+        expert_map = quant_info.expert_map
+        topk_ids_local = expert_map[topk_ids.to(torch.int64)].to(torch.int32)
+        non_local_mask = topk_ids_local < 0
+        topk_ids = torch.where(
+            non_local_mask, torch.zeros_like(topk_ids_local), topk_ids_local
+        )
+        topk_weights = torch.where(
+            non_local_mask, torch.zeros_like(topk_weights), topk_weights
+        )
+        global_num_experts = w1.shape[0]
+        expert_map_arg = torch.ones(
+            global_num_experts, dtype=torch.int32, device=hidden_states.device
+        )
     else:
         global_num_experts = w1.shape[0]
 
@@ -483,7 +511,7 @@ def _run_aiter_w8a8(
         a2_scale=quant_info.a2_scale,
         block_shape=None,
         global_num_experts=global_num_experts,
-        expert_map=quant_info.expert_map,
+        expert_map=expert_map_arg,
         routed_scaling_factor=float(routed_scaling_factor),
         output_dtype=hidden_states.dtype,
         gemm1_alpha=runner_config.gemm1_alpha,
