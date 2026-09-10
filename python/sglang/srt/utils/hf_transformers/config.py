@@ -22,6 +22,7 @@ from typing import Optional
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.dspark import normalize_dspark_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -99,6 +100,19 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_dspark_config(model, revision: Optional[str], **kwargs):
+    raw_config, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    config_dict = normalize_dspark_config(raw_config)
+    if config_dict is None:
+        return None
+    model_type = config_dict.pop("model_type")
+    config = AutoConfig.for_model(model_type, **config_dict)
+    config._name_or_path = str(model)
+    return config
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -108,7 +122,9 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_dspark_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
