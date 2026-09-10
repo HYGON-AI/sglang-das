@@ -898,8 +898,7 @@ def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> b
     HCU to RCCL and misses the aiter IPC kernel. This narrow wrapper re-enables the
     aiter kernel ONLY for the HCU DP-attention combine under MAX_LEN, leaving every
     other reduce_scatter_tensor caller on HCU untouched. Mirrors the upstream 0518
-    `_aiter_reduce_scatter_tensor`, plus our should_custom_ar / equal-chunk guards
-    (see dp-max-len-merge-notes.md §6.2).
+    `_aiter_reduce_scatter_tensor`, plus our should_custom_ar / equal-chunk guards.
 
     Opt-in: needs SGLANG_DP_USE_MAX_LEN=1 (this wrapper) AND SGLANG_USE_AITER_AR=1
     (so ca_comm is the aiter CustomAllreduce that actually has reduce_scatter).
@@ -908,8 +907,10 @@ def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> b
     """
     if not (_is_hcu and _dp_use_max_len()):
         return False
-    # aiter custom comm is float-only.
-    if not input.dtype.is_floating_point:
+    # aiter custom comm only supports fp16/bf16/fp32.
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if output.dtype != input.dtype:
         return False
     if not (input.is_contiguous() and output.is_contiguous()):
         return False
