@@ -563,9 +563,9 @@ class DeepEPMoE(FusedMoE):
             and not _is_npu
             and not _is_hip
         ):
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), "Unquantized DeepEP low-latency MoE requires DeepGEMM BF16"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                "Unquantized DeepEP MoE requires DeepGEMM BF16"
+            )
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
@@ -652,33 +652,16 @@ class DeepEPMoE(FusedMoE):
 
         if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
             self.dispatcher.set_quant_config({"bf16_dispatch": True})
-        # if (
-        #     self.deepep_mode.enable_low_latency()
-        #     and not _is_npu
-        #     and not _is_hip
-        #     and not (
-        #         get_moe_runner_backend().is_flashinfer_cutedsl()
-        #         and self.quant_config.get_name() == "modelopt_fp4"
-        #     )
-        # ):
-        #     # AMD HIP, NPU supports low_latency deepep without deepgemm
-        #     # NV FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
-        #     assert (
-        #         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        #     ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
-        if _use_aiter:
-            # expert_mask is of size (self.num_local_experts + 1),
-            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
-            # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
-            #     self.expert_mask = [1, 1, 1, 1, 0]
-            # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
-            self.expert_mask = torch.zeros(
-                (self.num_local_experts + 1),
-                device=torch.cuda.current_device(),
-                dtype=torch.int,
+        if (
+            self.deepep_mode.enable_low_latency()
+            and not _is_npu
+            and not _is_hip
+            and quant_config is not None
+        ):
+            # AMD HIP and NPU support low_latency DeepEP without DeepGEMM.
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+                f"DeepEP {self.deepep_mode} mode requires deep_gemm"
             )
-            # the last one is invalid rank_id
-            self.expert_mask[:-1] = 1
 
     def _a2a_forward_with_output_impl(
         self,
@@ -726,9 +709,9 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for breakable cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for breakable cuda graph"
+            )
             output = torch.empty_like(hidden_states)
             self.a2a_forward_with_output(
                 hidden_states,
@@ -739,9 +722,9 @@ class DeepEPMoE(FusedMoE):
             )
             return output
         if is_in_tc_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "Only standard topk output is supported for piecewise cuda graph"
+            )
             return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,

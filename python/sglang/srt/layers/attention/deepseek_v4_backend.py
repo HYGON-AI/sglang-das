@@ -92,6 +92,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
     get_spec,
@@ -343,9 +344,9 @@ class DSV4AttnMetadata:
         # length; legacy paths use the metadata length.
         if num_tokens is None:
             num_tokens = self.seq_lens_casual.shape[0]
-        assert (
-            self.raw_out_loc.shape[0] == num_tokens
-        ), f"{self.raw_out_loc.shape=}, {num_tokens=}"
+        assert self.raw_out_loc.shape[0] == num_tokens, (
+            f"{self.raw_out_loc.shape=}, {num_tokens=}"
+        )
 
         (
             self.c4_out_loc,
@@ -403,9 +404,9 @@ class DSV4AttnMetadata:
             num_tokens = pre_global_len
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
-            assert isinstance(
-                val, torch.Tensor
-            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            assert isinstance(val, torch.Tensor), (
+                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            )
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
@@ -591,9 +592,9 @@ class DeepseekV4AttnBackend(
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
-        assert (
-            head_dim == 512
-        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        assert head_dim == 512, (
+            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -614,13 +615,10 @@ class DeepseekV4AttnBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
 
-        self.enable_deepseek_v4_fp4_indexer: bool = (
-            model_runner.server_args.enable_deepseek_v4_fp4_indexer
-        )
+        kernel = get_exec().kernel
+        self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
-        self.dsv4_prefill_backend: str = getattr(
-            model_runner.server_args, "dsv4_prefill_backend", "auto"
-        )
+        self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:
                 raise ValueError(
@@ -753,6 +751,7 @@ class DeepseekV4AttnBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
@@ -2013,13 +2012,13 @@ class DeepseekV4AttnBackend(
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert (
-                swa_page_indices.shape[-1] % 64 == 0
-            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
+            assert swa_page_indices.shape[-1] % 64 == 0, (
+                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
+            )
             if extra_indices is not None:
-                assert (
-                    extra_indices.shape[-1] % 64 == 0
-                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                assert extra_indices.shape[-1] % 64 == 0, (
+                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                )
 
             if not _is_hcu:
                 if q.ndim == 3:
@@ -2058,10 +2057,22 @@ class DeepseekV4AttnBackend(
                         attn_sink=attn_sink,
                     )
 
-                if _is_sm120:
+                if get_platform().is_sm120:
                     from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                        SM120_DECODE_MAX_TOKENS,
                         flash_mla_with_kvcache_sm120,
                     )
+
+                    # The pad to 64 heads only serves the decode kernel's h_q
+                    # specialization; the prefill kernel takes arbitrary h_q, so
+                    # drop it instead of attending on garbage heads (4x the work
+                    # at attn-TP 4).
+                    real_heads = layer.tp_q_head_num
+                    if q.shape[0] > SM120_DECODE_MAX_TOKENS:
+                        if q.shape[-2] > real_heads:
+                            q = q[..., :real_heads, :].contiguous()
+                        if attn_sink is not None and attn_sink.shape[0] > real_heads:
+                            attn_sink = attn_sink[:real_heads]
 
                     output = flash_mla_with_kvcache_sm120(
                         q=q,
@@ -2076,9 +2087,12 @@ class DeepseekV4AttnBackend(
                         extra_topk_length=extra_topk_lengths,
                     )[0]
                 else:
-                    import sgl_kernel.flash_mla as flash_mla
+                    if _is_xpu:
+                        from sgl_kernel import flash_mla_with_kvcache
+                    else:
+                        from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                    output = flash_mla.flash_mla_with_kvcache(
+                    output = flash_mla_with_kvcache(
                         q=q,
                         k_cache=swa_k_cache,
                         head_dim_v=self.head_dim_v,

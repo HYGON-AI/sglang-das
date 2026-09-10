@@ -58,7 +58,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_hcu_ci(est_time=8, suite="nightly-hcu-1", nightly=True)
 
 # Import the actual parallel_state module
@@ -138,7 +138,6 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
 
@@ -159,7 +158,6 @@ def test_parallel_group_construction_tp8_attn_cp2():
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-
             # Mock world group
             mock_world = Mock()
             mock_world.device_group = Mock()
@@ -189,18 +187,18 @@ def test_parallel_group_construction_tp8_attn_cp2():
 
             # Verify ATTN_CP groups
             attn_cp_groups = created_groups.get("attn_cp", [])
-            assert (
-                len(attn_cp_groups) == 4
-            ), f"Expected 4 ATTN_CP groups, got {len(attn_cp_groups)}"
+            assert len(attn_cp_groups) == 4, (
+                f"Expected 4 ATTN_CP groups, got {len(attn_cp_groups)}"
+            )
             expected_attn_cp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
-            assert (
-                attn_cp_groups == expected_attn_cp
-            ), f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            assert attn_cp_groups == expected_attn_cp, (
+                f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            )
 
             print("TP=8, Attn CP=2 group construction verified")
 
@@ -238,7 +236,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
 
@@ -259,7 +256,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-
             # Mock world group
             mock_world = Mock()
             mock_world.device_group = Mock()
@@ -290,31 +286,31 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
 
             # Verify MOE_EP groups
             moe_ep_groups = created_groups.get("moe_ep", [])
-            assert (
-                len(moe_ep_groups) == 2
-            ), f"Expected 2 MOE_EP groups, got {len(moe_ep_groups)}"
+            assert len(moe_ep_groups) == 2, (
+                f"Expected 2 MOE_EP groups, got {len(moe_ep_groups)}"
+            )
             expected_moe_ep = [
                 [0, 1, 2, 3],
                 [4, 5, 6, 7],
             ]
-            assert (
-                moe_ep_groups == expected_moe_ep
-            ), f"Wrong MOE_EP groups: {moe_ep_groups}"
+            assert moe_ep_groups == expected_moe_ep, (
+                f"Wrong MOE_EP groups: {moe_ep_groups}"
+            )
 
             # Verify MOE_DP groups
             moe_dp_groups = created_groups.get("moe_dp", [])
-            assert (
-                len(moe_dp_groups) == 4
-            ), f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            assert len(moe_dp_groups) == 4, (
+                f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            )
             expected_moe_dp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
-            assert (
-                moe_dp_groups == expected_moe_dp
-            ), f"Wrong MOE_DP groups: {moe_dp_groups}"
+            assert moe_dp_groups == expected_moe_dp, (
+                f"Wrong MOE_DP groups: {moe_dp_groups}"
+            )
 
             print("TP=8, MoE EP=4, MoE CP=2 group construction verified")
 

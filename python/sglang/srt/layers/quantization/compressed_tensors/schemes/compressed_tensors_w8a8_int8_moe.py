@@ -52,7 +52,6 @@ _use_aiter_moe = _is_hip and get_bool_env_var(
 
 
 class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
-
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant

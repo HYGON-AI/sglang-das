@@ -6,7 +6,6 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from __future__ import annotations
 
-import builtins
 from typing import Dict, Type
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
@@ -70,7 +69,6 @@ from sglang.srt.utils import (
 
 _is_gfx95_supported = is_gfx95_supported()
 
-
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
@@ -109,7 +107,11 @@ if QuarkConfig is not None:
     BASE_QUANTIZATION_METHODS["quark"] = QuarkConfig
     BASE_QUANTIZATION_METHODS["quark_mxfp4"] = QuarkConfig
 
-if is_cpu() or is_cuda() or _is_gfx95_supported:
+# On XPU the OCP-MoE `Mxfp4Config` path is served by the sgl-kernel-xpu grouped
+# GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
+# Other backends without that kernel keep the existing "unknown quantization
+# method" error rather than falling through to a bf16 upcast.
+if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
@@ -194,6 +196,3 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             return config
 
     return QUANTIZATION_METHODS[quantization]
-
-
-original_isinstance = builtins.isinstance
