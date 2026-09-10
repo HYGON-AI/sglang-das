@@ -163,6 +163,7 @@ def match_prefix_for_req(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            return_full_match=bool(reprefill_tail),
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
