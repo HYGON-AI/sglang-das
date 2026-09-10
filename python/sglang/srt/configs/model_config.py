@@ -129,9 +129,15 @@ def is_deepseek_dsa(config) -> bool:
             "LongcatFlashForCausalLMNextN",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
+            "HYV4ForCausalLM",
+            "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
+
+
+def is_hy_v4(config) -> bool:
+    return _hf_arch(config) in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
 
 
 def is_kimi_k3(config) -> bool:
@@ -157,6 +163,17 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
     )
+
+
+def resolve_spec_hidden_size(
+    hf_config, hidden_size: int, hc_mult: int
+) -> tuple[int, Optional[int]]:
+    # Only DSV4 carries the hc-flattened stream across the target->draft
+    # boundary; HYV4 collapses to hidden_size before its MTP layer.
+    if hc_mult <= 1 or not is_deepseek_v4(hf_config):
+        return hidden_size, None
+    hc_hidden_size = hidden_size * hc_mult
+    return hc_hidden_size, hc_hidden_size
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
@@ -217,6 +234,13 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
+
+    # HYV4 declares indexer sharing per layer instead of via a frequency or
+    # pattern: "full" layers own indexer weights and run the indexer,
+    # "shared" layers reuse the previous layer's top-k.
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
 
     # LongCat computes fresh top-k indices every cli_factor layers.
     cli_factor = getattr(config, "cli_factor", 1)
@@ -745,24 +769,6 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
-        ):
-            # The target's ModelConfig shares this hf_config object; deep-copy
-            # before the MTP rewrites below so the target keeps its full depth.
-            self.hf_config = copy.deepcopy(self.hf_config)
-            self.hf_text_config = get_hf_text_config(self.hf_config)
-            self.hf_config.architectures[0] = "Qwen4ExpForCausalLMMTP"
-            text_config = self.hf_text_config
-            text_config.num_nextn_predict_layers = 1
-            # Collapse to a single full_attention layer so the draft's
-            # full_attention_layer_ids is [0]. Qwen4ExpTextConfig.layers_block_type
-            # bypasses num_hidden_layers when layer_types is set.
-            text_config.num_hidden_layers = 1
-            text_config.layer_types = ["full_attention"]
-            text_config.full_attention_interval = 1
-
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.hf_config.architectures[0] = "Qwen3MoeForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -804,6 +810,10 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
+            self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self):
@@ -962,6 +972,8 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "HYV4ForCausalLM" in self.hf_config.architectures
+            or "HYV4ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1103,12 +1115,9 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        self.spec_hidden_size = (
-            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
+        self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
+            self.hf_config, self.hidden_size, hc_mult
         )
-        # mHC-flattened hidden size; None when not running an mHC model
-        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
-        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -1942,7 +1951,6 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
-    "Qwen4ExpForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",

@@ -82,6 +82,59 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _resolve_weight_param_name(
+    name: str, params_dict: Dict[str, torch.Tensor]
+) -> Optional[str]:
+    if name in params_dict:
+        return name
+    if name.endswith("weight_scale"):
+        alternate_name = name + "_inv"
+    elif name.endswith("weight_scale_inv"):
+        alternate_name = name.removesuffix("_inv")
+    else:
+        return None
+    return alternate_name if alternate_name in params_dict else None
+
+
+def _load_fused_expert_tensor(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+) -> bool:
+    mappings = (
+        (".experts.gate_up_proj_scale", ".experts.w13_weight_scale", "w13"),
+        (".experts.down_proj_scale", ".experts.w2_weight_scale", "w2"),
+        (".experts.gate_up_proj", ".experts.w13_weight", "w13"),
+        (".experts.down_proj", ".experts.w2_weight", "w2"),
+    )
+    for source, target, shard_id in mappings:
+        if not name.endswith(source):
+            continue
+        target_name = name[: -len(source)] + target
+        param_name = _resolve_weight_param_name(target_name, params_dict)
+        if param_name is None:
+            return False
+        param = params_dict[param_name]
+        weight_loader = param.weight_loader
+        for expert_id, expert_weight in enumerate(loaded_weight):
+            if shard_id == "w13":
+                gate, up = expert_weight.chunk(2, dim=0)
+                weight_loader(
+                    param, gate, param_name, shard_id="w1", expert_id=expert_id
+                )
+                weight_loader(param, up, param_name, shard_id="w3", expert_id=expert_id)
+            else:
+                weight_loader(
+                    param,
+                    expert_weight,
+                    param_name,
+                    shard_id="w2",
+                    expert_id=expert_id,
+                )
+        return True
+    return False
+
+
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -111,7 +164,7 @@ def _load_fused_indexer_wk(
         return False
 
     if ".indexer.weights_proj." in name:
-        is_scale = name.endswith(".weight_scale_inv")
+        is_scale = name.endswith((".weight_scale", ".weight_scale_inv"))
         if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
             w = _clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
@@ -131,7 +184,7 @@ def _load_fused_indexer_wk(
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
+    is_scale = name.endswith((".weight_scale", ".weight_scale_inv"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
@@ -285,6 +338,9 @@ class DeepseekV2WeightLoaderMixin:
                                 ):
                                     continue
 
+                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                    continue
+
                 if "rotary_emb.inv_freq" in name:
                     continue
 
@@ -320,11 +376,14 @@ class DeepseekV2WeightLoaderMixin:
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                     if ("mlp.experts." in name) and name not in params_dict:
                         continue
-                    name = name.replace(weight_name, param_name)
+                    mapped_name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    resolved_name = _resolve_weight_param_name(mapped_name, params_dict)
+                    if resolved_name is None:
+                        continue
+                    param = params_dict[resolved_name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
                         executor=executor,
@@ -341,10 +400,13 @@ class DeepseekV2WeightLoaderMixin:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
+                        mapped_name = name.replace(weight_name, param_name)
+                        resolved_name = _resolve_weight_param_name(
+                            mapped_name, params_dict
+                        )
+                        if resolved_name is None:
                             continue
-                        param = params_dict[name]
+                        param = params_dict[resolved_name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
                             executor=executor,
@@ -354,7 +416,7 @@ class DeepseekV2WeightLoaderMixin:
                             func_args=(
                                 param,
                                 loaded_weight,
-                                name,
+                                resolved_name,
                             ),
                             func_kwargs={
                                 "shard_id": shard_id,
@@ -449,13 +511,16 @@ class DeepseekV2WeightLoaderMixin:
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
-                            if name not in params_dict:
+                            resolved_name = _resolve_weight_param_name(
+                                name, params_dict
+                            )
+                            if resolved_name is None:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
-                            param = params_dict[name]
+                            param = params_dict[resolved_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
