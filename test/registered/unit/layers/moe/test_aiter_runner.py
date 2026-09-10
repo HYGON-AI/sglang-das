@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterQuantType,
     AiterRunnerCore,
     AiterRunnerInput,
+    _remap_aiter_ep_topk,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -113,6 +114,24 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_remap_aiter_ep_topk_masks_nonlocal_and_invalid_global_ids():
+    expert_map = torch.full((8,), -1, dtype=torch.int32)
+    expert_map[2:4] = torch.arange(2, dtype=torch.int32)
+    topk_ids = torch.tensor([[2, 3, 1, -1, 8]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.5, 0.4, 0.3, 0.2, 0.1]])
+
+    local_ids, local_weights = _remap_aiter_ep_topk(
+        topk_ids, topk_weights, expert_map
+    )
+
+    torch.testing.assert_close(
+        local_ids, torch.tensor([[0, 1, 0, 0, 0]], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        local_weights, torch.tensor([[0.5, 0.4, 0.0, 0.0, 0.0]])
+    )
 
 
 if __name__ == "__main__":
