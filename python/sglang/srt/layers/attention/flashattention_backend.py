@@ -2159,7 +2159,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
                     result = varlen_fwd_unified(
-                        q=q,
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=key_cache,
                         v=value_cache,
                         cu_seqlens_q=metadata.cu_seqlens_q,
