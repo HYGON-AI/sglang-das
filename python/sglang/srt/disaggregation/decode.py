@@ -966,7 +966,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
+            # Fake transfer has no prefill endpoint; do not resolve a missing host.
+            # bootstrap_addr=_bootstrap_addr(req),
+            bootstrap_addr=(
+                "" if backend == TransferBackend.FAKE else _bootstrap_addr(req)
+            ),
             bootstrap_room=req.bootstrap_room,
         )
 
