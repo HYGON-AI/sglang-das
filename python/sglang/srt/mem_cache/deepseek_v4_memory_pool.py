@@ -757,6 +757,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         num_req_slots: Optional[int] = None,
         kv_source_layers: Sequence[int] = (),
         full_size: Optional[int] = None,
+        is_draft_worker: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -859,7 +860,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
-        if get_exec().features.enable_encoder_swa_bounded_replay:
+        encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+        # Note(Oasis-Git): Keep DSpark's paged SWA cache because removing its
+        # history hurts speculative decoding acceptance length. The draft shares
+        # the target's full-to-SWA mapping, so the target still needs the allocator.
+        self.needs_paged_swa_allocator = (
+            not encoder_replay
+            or is_draft_worker
+            or get_spec().speculative_algorithm is not None
+        )
+        if encoder_replay and not is_draft_worker:
             from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
 
             def make_window_pool(size, layers):
@@ -885,7 +895,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 page_size=swa_page_size,
                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
-                + max(chunk, self.num_req_slots + 1),
+                + max(
+                    chunk,
+                    (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
+                ),
             )
         elif self._unified_kv:
             self.swa_kv_pool = None

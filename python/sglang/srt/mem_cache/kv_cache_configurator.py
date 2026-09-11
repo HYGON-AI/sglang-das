@@ -1380,6 +1380,7 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
             kv_source_layers=kv_source_layers,
             full_size=full_max_total_num_tokens,
+            **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
             # The draft pool has no C4 layers and shares this req pool, so only
@@ -2047,7 +2048,10 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
             else:
-                if get_exec().features.enable_encoder_swa_bounded_replay:
+                if (
+                    isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and not token_to_kv_pool.needs_paged_swa_allocator
+                ):
                     token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2126,9 +2130,9 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
-            if (
-                self.is_hybrid_swa
-                and not get_exec().features.enable_encoder_swa_bounded_replay
+            if self.is_hybrid_swa and (
+                not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                or token_to_kv_pool.needs_paged_swa_allocator
             ):
                 if isinstance(
                     token_to_kv_pool_allocator,
