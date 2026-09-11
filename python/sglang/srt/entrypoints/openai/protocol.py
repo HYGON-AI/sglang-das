@@ -162,6 +162,22 @@ class ChoiceLogprobs(BaseModel):
     content: List[ChatCompletionTokenLogprob]
 
 
+class CacheHitRates(BaseModel):
+    """Cache hit counts and rates split across SGLang/Mooncake tiers."""
+
+    prompt_tokens: int = 0
+    l1_device_tokens: int = 0
+    l3_mooncake_memory_tokens: int = 0
+    l4_mooncake_dfs_tokens: int = 0
+    l4_mooncake_local_disk_tokens: int = 0
+    uncached_tokens: int = 0
+    l1_device_rate: float = 0.0
+    l3_mooncake_memory_rate: float = 0.0
+    l4_mooncake_dfs_rate: float = 0.0
+    l4_mooncake_local_disk_rate: float = 0.0
+    overall_hit_rate: float = 0.0
+
+
 class CachedTokensDetails(BaseModel):
     """Detailed breakdown of cached tokens by cache source."""
 
@@ -354,6 +370,7 @@ class CompletionRequest(BaseModel):
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
+    return_cache_hit_rates: bool = False
     return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -441,6 +458,7 @@ class SglExt(BaseModel):
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None
     )
+    cache_hit_rates: Optional[CacheHitRates] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -862,6 +880,7 @@ class ChatCompletionRequest(BaseModel):
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
+    return_cache_hit_rates: bool = False
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
