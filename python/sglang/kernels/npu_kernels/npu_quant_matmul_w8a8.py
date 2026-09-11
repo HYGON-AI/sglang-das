@@ -19,11 +19,6 @@ Falls back to ``npu_quant_matmul_triton`` when W8A8 cannot run.
 load with ``pack_int8_weight_as_tn`` so CUDA-graph replay does not recopy
 every int8 weight. Prefill still goes through the same ``smooth()`` call
 and keeps the large-M Tensile I8II kernel.
-
-Decode (M<=16) uses ``gemm_w8_a8_smooth_colmajor``. The tuned dict is an
-exact ``M{m}N{n}K{k}`` lookup; missing keys used to return False and fall
-back to Triton (~10 ms/token on Kimi-K3). Untuned shapes now get a legal
-default tile (still colmajor, not I8II).
 """
 
 from __future__ import annotations
@@ -50,7 +45,6 @@ _TN_CACHE_MAX = int(os.environ.get("NPU_QUANT_MATMUL_TN_CACHE_MAX", "8192"))
 
 # Per-device cached ones column for scale_a when pertoken is absent.
 _ONES_A: Dict[Tuple[str, int], torch.Tensor] = {}
-_LOGGED_SMOOTH_SHAPES: set = set()
 
 
 def last_backend() -> str:
@@ -147,84 +141,6 @@ def _make_tn_b(x2: torch.Tensor) -> torch.Tensor:
         _TN_CACHE.pop(next(iter(_TN_CACHE)))
     _TN_CACHE[key] = b
     return b
-
-
-def _maybe_log_smooth_shape(tag: str, m: int, n: int, k: int) -> None:
-    if os.environ.get("NPU_QUANT_MATMUL_LOG_SMOOTH", "0") != "1":
-        return
-    key = (tag, m, n, k)
-    if key in _LOGGED_SMOOTH_SHAPES:
-        return
-    _LOGGED_SMOOTH_SHAPES.add(key)
-    print(f"[npu_quant_matmul_w8a8] {tag} M{m}N{n}K{k}", flush=True)
-
-
-def _smooth_quant_config_ok(
-    m: int, n: int, k: int, warps: int, nperblock: int, kperwarp: int, splitk: int, use_n_warps: bool
-) -> bool:
-    if m > 16 or kperwarp <= 0 or (k % kperwarp) != 0:
-        return False
-    if warps not in (1, 2, 4, 8, 16) or nperblock not in (16, 32, 64):
-        return False
-    if kperwarp not in (32, 64, 128, 256) or splitk < 1:
-        return False
-    if use_n_warps:
-        lds_size = warps * nperblock * m * 4
-    else:
-        lds_size = (
-            (warps / 2) * nperblock * m * 4 if warps > 1 else nperblock * m * 4
-        )
-    if lds_size > 64 * 1024:
-        return False
-    part_k = ((k // kperwarp - 1) // splitk + 1) * kperwarp
-    return part_k * (splitk - 1) < k
-
-
-def _heuristic_colmajor_config(m: int, n: int, k: int) -> Optional[Tuple[int, int, int, int, bool]]:
-    """Legal gemm_w8_a8_smooth_colmajor tile when the tuned dict misses M/N/K."""
-    if m > 16:
-        return None
-    for kperwarp in (256, 128, 64, 32):
-        if k % kperwarp != 0:
-            continue
-        for warps, nper, splitk, use_n in (
-            (4, 32, 1, False),
-            (2, 16, 1, True),
-            (2, 16, 1, False),
-            (1, 32, 1, False),
-            (1, 16, 1, False),
-        ):
-            if _smooth_quant_config_ok(m, n, k, warps, nper, kperwarp, splitk, use_n):
-                return warps, nper, kperwarp, splitk, use_n
-    return None
-
-
-def _colmajor_heuristic(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    out_dtype: torch.dtype,
-    m: int,
-    n: int,
-    k: int,
-) -> Optional[torch.Tensor]:
-    """Launch colmajor directly if lightop.gemm_w8a8_smooth rejected an untuned shape."""
-    cfg = _heuristic_colmajor_config(m, n, k)
-    if cfg is None:
-        return None
-    try:
-        import lightop  # type: ignore
-
-        fn = getattr(getattr(lightop, "op", None), "gemm_w8_a8_smooth_colmajor", None)
-        if fn is None:
-            return None
-        warps, nper, kper, splitk, use_n = cfg
-        return fn(
-            a, b, scale_a, scale_b, None, out_dtype, warps, nper, kper, splitk, use_n
-        )
-    except Exception:
-        return None
 
 
 def _ones_scale_a(M: int, device: torch.device) -> torch.Tensor:
@@ -357,18 +273,8 @@ def _w8a8_2d(
     scale_a, scale_b = _prepare_scales(M, N, a.device, scale, pertoken_scale)
 
     status, out = smooth(a, b, scale_a, scale_b, None, out_dtype)
-    src = smooth_src
     if (not status) or out is None:
-        # Tuned dict miss (typical for Kimi-K3 tp8 M=1): still run colmajor
-        # instead of Triton _quant_matmul (~10 ms/token).
-        out = _colmajor_heuristic(a, b, scale_a, scale_b, out_dtype, M, N, K)
-        if out is None:
-            _maybe_log_smooth_shape("fallback_triton", M, N, K)
-            return None
-        src = "lightop.gemm_w8_a8_smooth_colmajor+heuristic"
-        _maybe_log_smooth_shape("heuristic_colmajor", M, N, K)
-    else:
-        _maybe_log_smooth_shape("smooth_dict", M, N, K)
+        return None
 
     out = _apply_epilogue(
         out,
@@ -378,9 +284,9 @@ def _w8a8_2d(
         offset=offset,
         out_dtype=out_dtype,
     )
-    tag = src
+    tag = smooth_src
     if bias is not None or offset is not None:
-        tag = f"{src}+epilogue"
+        tag = f"{smooth_src}+epilogue"
     _LAST_BACKEND = tag
     return out
 

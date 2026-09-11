@@ -131,8 +131,6 @@ except ImportError:
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
-from lightop import fuse_situ_mul_quant_ep
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -480,12 +478,158 @@ def fuse_silu_mul_quant_ep_fake(
     scales = torch.empty((E, T, 1), device=input.device, dtype=torch.float32)
     return output, scales
 
+
+@triton.jit
+def _fuse_situ_mul_quant_contiguous_kernel(
+    input_ptr,
+    output_ptr,
+    scales_ptr,
+    hidden: tl.constexpr,
+    situ_beta: tl.constexpr,
+    situ_linear_beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden
+    row_input = input_ptr + row * (2 * hidden)
+    gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+    up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+    activated = (
+        situ_beta
+        * gate_tanh
+        * tl.sigmoid(gate)
+        * situ_linear_beta
+        * up_tanh
+    )
+    amax = tl.max(tl.abs(activated), axis=0)
+    scale = tl.where(amax > 0.0, amax / 127.0, 1.0)
+    quantized = libdevice.rint(activated / scale)
+    quantized = tl.maximum(-127.0, tl.minimum(127.0, quantized)).to(tl.int8)
+    tl.store(output_ptr + row * hidden + offsets, quantized, mask=mask)
+    tl.store(scales_ptr + row, scale)
+
+
+def fuse_situ_mul_quant_contiguous(
+    input: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input.ndim != 2 or input.shape[-1] % 2 != 0:
+        raise ValueError("input must have shape [tokens, 2 * hidden]")
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError("SiTU beta and linear_beta must be positive")
+    tokens, doubled_hidden = input.shape
+    hidden = doubled_hidden // 2
+    output = torch.empty(
+        (tokens, hidden), dtype=torch.int8, device=input.device
+    )
+    scales = torch.empty((tokens, 1), dtype=torch.float32, device=input.device)
+    _fuse_situ_mul_quant_contiguous_kernel[(tokens,)](
+        input,
+        output,
+        scales,
+        hidden=hidden,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
+        BLOCK_SIZE=triton.next_power_of_2(hidden),
+    )
+    return output, scales
+
+
+@triton.jit
+def _fuse_situ_mul_quant_ep_kernel(
+    input_ptr,
+    output_ptr,
+    scales_ptr,
+    masked_m_ptr,
+    tokens: tl.constexpr,
+    hidden: tl.constexpr,
+    situ_beta: tl.constexpr,
+    situ_linear_beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    expert = row // tokens
+    token = row - expert * tokens
+    valid_row = token < tl.load(masked_m_ptr + expert)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = (offsets < hidden) & valid_row
+    row_input = input_ptr + row * (2 * hidden)
+    gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+    # SiTU / SoftCap-GLU used by Kimi K3. Express tanh via sigmoid because
+    # that is supported consistently by the CUDA and HIP Triton backends.
+    gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+    up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+    activated = (
+        situ_beta
+        * gate_tanh
+        * tl.sigmoid(gate)
+        * situ_linear_beta
+        * up_tanh
+    )
+
+    amax = tl.max(tl.abs(activated), axis=0)
+    # A scale of one gives an exact, finite representation for an all-zero or
+    # padded row. Valid nonzero rows use symmetric per-token INT8 quantization.
+    scale = tl.where(valid_row & (amax > 0.0), amax / 127.0, 1.0)
+    quantized = libdevice.rint(activated / scale)
+    quantized = tl.maximum(-127.0, tl.minimum(127.0, quantized)).to(tl.int8)
+    tl.store(output_ptr + row * hidden + offsets, quantized, mask=offsets < hidden)
+    tl.store(scales_ptr + row, scale)
+
+
+def fuse_situ_mul_quant_ep(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input.ndim != 3 or input.shape[-1] % 2 != 0:
+        raise ValueError("input must have shape [experts, tokens, 2 * hidden]")
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+    experts, tokens, doubled_hidden = input.shape
+    if masked_m.shape != (experts,):
+        raise ValueError(f"masked_m must have shape ({experts},)")
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError("SiTU beta and linear_beta must be positive")
+    hidden = doubled_hidden // 2
+    output = torch.empty(
+        (experts, tokens, hidden), dtype=torch.int8, device=input.device
+    )
+    scales = torch.empty(
+        (experts, tokens, 1), dtype=torch.float32, device=input.device
+    )
+    _fuse_situ_mul_quant_ep_kernel[(experts * tokens,)](
+        input,
+        output,
+        scales,
+        masked_m,
+        tokens=tokens,
+        hidden=hidden,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
+        BLOCK_SIZE=triton.next_power_of_2(hidden),
+    )
+    return output, scales
+
+
 def fuse_situ_mul_quant_ep_fake(
     input: torch.Tensor,
     masked_m: torch.Tensor,
     situ_beta: float,
     situ_linear_beta: float,
-    expect_m: int = -1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     experts, tokens, doubled_hidden = input.shape
     output = torch.empty(
@@ -495,6 +639,7 @@ def fuse_situ_mul_quant_ep_fake(
         (experts, tokens, 1), dtype=torch.float32, device=input.device
     )
     return output, scales
+
 
 direct_register_custom_op(
     op_name="m_grouped_w4a8_gemm_nt_masked",
@@ -1104,7 +1249,7 @@ class DeepEPMoE(FusedMoE):
             del a_int8, a_scale
 
             if self.moe_runner_config.activation == "situ":
-                q_a2_all, q_a2_scale = fuse_situ_mul_quant(
+                q_a2_all, q_a2_scale = fuse_situ_mul_quant_contiguous(
                     gateup_output,
                     self.moe_runner_config.gemm1_alpha,
                     self.moe_runner_config.gemm1_clamp_limit,
@@ -1138,10 +1283,7 @@ class DeepEPMoE(FusedMoE):
 
             # This gather restores the normal-dispatch row order and applies
             # top-k weights exactly as the existing FP8/W8A8 paths do.
-            # Both the LightOp and Triton EP gather kernels initialize their
-            # accumulators to zero and overwrite every output element. Avoid a
-            # redundant full-buffer fill before the gather.
-            gather_out = torch.empty(
+            gather_out = torch.zeros(
                 hidden_states_shape,
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
@@ -1885,7 +2027,6 @@ class DeepEPMoE(FusedMoE):
                 masked_m,
                 self.moe_runner_config.gemm1_alpha,
                 self.moe_runner_config.gemm1_clamp_limit,
-                expect_m=expected_m,
             )
         else:
             # Only models that declare a SwiGLU clamp limit use the clamp kernel.

@@ -88,7 +88,6 @@ class VanillaMarkov(nn.Module):
             raise ValueError(
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
-        self.register_buffer("draft_token_ids", None)
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
@@ -96,13 +95,7 @@ class VanillaMarkov(nn.Module):
         return self.markov_w1(token_ids.long())
 
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
-        bias = self.markov_w2(latent_states)
-        if self.draft_token_ids is None:
-            return bias
-        # Previous tokens and verification use target IDs. Expand only the
-        # output bias; the checkpoint's input embedding already spans that vocab.
-        full = bias.new_zeros((*bias.shape[:-1], self.vocab_size))
-        return full.index_copy_(-1, self.draft_token_ids, bias)
+        return self.markov_w2(latent_states)
 
     def compute_step_bias(
         self,
@@ -395,15 +388,10 @@ class DSparkDraftMixin:
         self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
-        self.draft_lm_head: Optional[nn.Module] = None
-        self.register_buffer("draft_token_ids", None)
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        if self.draft_token_ids is not None:
-            if int(lm_head.org_vocab_size) != self.markov_head.vocab_size:
-                raise ValueError("DSpark reduced-vocab checkpoint does not match target vocabulary.")
         self.embed_tokens = embed_tokens
         self.lm_head = lm_head
 
@@ -430,82 +418,18 @@ class DSparkDraftMixin:
                 "DSpark dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
-        if self.draft_lm_head is not None:
-            # d2t is an offset table: target_id = draft_id + d2t[draft_id].
-            # Keep the worker/sampler interface in target vocabulary space,
-            # including zero probability for tokens outside the draft shortlist.
-            logits = self.draft_lm_head(hidden.to(self.draft_lm_head.weight.dtype))
-            full = logits.new_full(
-                (*logits.shape[:-1], self.markov_head.vocab_size), float("-inf")
-            )
-            return full.index_copy_(-1, self.draft_token_ids, logits), None
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 
-    def _init_reduced_vocab(self, offsets, lm_weight, markov_weights) -> None:
-        if lm_weight is None:
-            raise ValueError("DSpark d2t requires checkpoint lm_head.weight.")
-        w1 = markov_weights.get("markov_head.markov_w1.weight")
-        w2 = markov_weights.get("markov_head.markov_w2.weight")
-        if w1 is None or w2 is None:
-            raise ValueError("DSpark d2t requires both Markov weight matrices.")
-        draft_vocab = int(offsets.numel())
-        rank = self.markov_head.markov_rank
-        if offsets.ndim != 1 or offsets.dtype not in (torch.int32, torch.int64):
-            raise ValueError("DSpark d2t must be a one-dimensional integer offset table.")
-        if w1.ndim != 2 or w1.shape[1] != rank:
-            raise ValueError("DSpark reduced-vocab Markov input shape is invalid.")
-        if tuple(w2.shape) != (draft_vocab, rank):
-            raise ValueError("DSpark reduced-vocab Markov output shape is invalid.")
-        if tuple(lm_weight.shape) != (draft_vocab, int(self.config.hidden_size)):
-            raise ValueError("DSpark reduced-vocab lm_head shape is invalid.")
-        if self.markov_head.markov_w2.out_features != draft_vocab:
-            raise ValueError("DSpark config vocabulary does not match d2t.")
-        target_vocab = int(w1.shape[0])
-        ids = offsets.to(dtype=torch.long) + torch.arange(
-            draft_vocab, device=offsets.device
-        )
-        if (
-            draft_vocab == 0
-            or bool((ids < 0).any())
-            or bool((ids >= target_vocab).any())
-            or ids.unique().numel() != draft_vocab
-        ):
-            raise ValueError("DSpark d2t contains duplicate or out-of-range target IDs.")
-        old = self.markov_head.markov_w1.weight
-        self.markov_head.markov_w1 = nn.Embedding(
-            target_vocab, rank, device=old.device, dtype=old.dtype
-        )
-        self.markov_head.vocab_size = target_vocab
-        self.draft_token_ids = ids.to(device=old.device)
-        self.markov_head.draft_token_ids = self.draft_token_ids
-        self.draft_lm_head = nn.Linear(
-            int(self.config.hidden_size), draft_vocab, bias=False,
-            device=old.device, dtype=old.dtype,
-        )
-        default_weight_loader(self.draft_lm_head.weight, lm_weight)
-        logger.info(
-            "DSpark reduced vocabulary: draft=%d target=%d; loaded d2t and draft lm_head.",
-            draft_vocab, target_vocab,
-        )
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        offsets = None
-        lm_weight = None
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if name == "d2t":
-                offsets = loaded_weight
-                continue
-            if name == "lm_head.weight":
-                lm_weight = loaded_weight
-                continue
             if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
                 continue
             if name.startswith("confidence_head."):
@@ -517,9 +441,6 @@ class DSparkDraftMixin:
             else:
                 backbone_weights.append((name, loaded_weight))
 
-        if offsets is not None:
-            self._init_reduced_vocab(offsets, lm_weight, dict(markov_weights))
-            params_dict = dict(self.named_parameters())
         super().load_weights(backbone_weights)
 
         for name, loaded_weight in markov_weights:

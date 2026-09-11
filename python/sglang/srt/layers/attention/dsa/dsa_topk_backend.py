@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, is_hcu
+from sglang.srt.utils import is_hip,is_hcu
 
 _is_hip = is_hip()
 _is_hcu = is_hcu()

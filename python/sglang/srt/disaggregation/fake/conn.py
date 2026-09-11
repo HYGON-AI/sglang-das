@@ -48,12 +48,6 @@ class FakeKVSender(BaseKVSender):
         self.kv_mgr = mgr
         self.has_sent = False
         self.conclude_state: Optional[KVPoll] = None
-        self._source_event = None
-
-    def set_source_event(self, source_event) -> None:
-        # Fake transfers never read device memory, so no sync event is needed.
-        # The attribute must still exist: send_kv_chunk reads it directly.
-        del source_event
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:

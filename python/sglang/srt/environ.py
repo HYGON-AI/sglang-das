@@ -450,8 +450,6 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
-    # Use the LightOp kernel for paged KV-cache extend allocation.
-    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -792,9 +790,6 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
-    # Opt HCU CUDA graph DP padding into MAX_LEN, enabling all-gather and
-    # fused reduce-scatter for the pure TP-MoE DP-attention path.
-    SGLANG_DP_USE_MAX_LEN = EnvBool(False)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine
@@ -844,8 +839,6 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")  # HCU override
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
-
-    SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1342,6 +1335,15 @@ class Envs:
     # ===================================================================
     # Hunyuan V4
     # ===================================================================
+
+    # Opt in after validating N=8 on the installed HCU DeepGEMM backend.
+    # Fuses only the coefficient prenorm GEMM; gates/reduction stay in torch.
+    SGLANG_OPT_HY4_IHC_PRENORM = EnvBool(False)
+
+    # Opt in to the boltops TileLang iHC kernels (ihc_pre/ihc_post/ihc_head),
+    # which fuse the full iHC junction (prenorm GEMM + gates + weighted
+    # reduction) in one launch. Independent of SGLANG_OPT_HY4_IHC_PRENORM;
+    # when both are set the TileLang path wins and eager is the fallback.
     SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
 
     # ===================================================================
@@ -1365,7 +1367,6 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
-    SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.

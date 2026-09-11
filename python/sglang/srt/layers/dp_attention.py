@@ -93,13 +93,6 @@ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 _is_cpu = is_cpu()
 
 
-@functools.lru_cache(maxsize=1)
-def _dp_use_max_len() -> bool:
-    from sglang.srt.environ import envs
-
-    return envs.SGLANG_DP_USE_MAX_LEN.get()
-
-
 class DpPaddingMode(IntEnum):
 
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
@@ -152,13 +145,10 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
+        if _USE_ROCM700A_WA or _is_hcu:
             return cls.SUM_LEN
-        # HCU keeps SUM_LEN until the aiter graph all-gather is validated; opt
-        # into MAX_LEN for all-gather plus fused reduce-scatter.
-        if _is_hcu and not _dp_use_max_len():
-            return cls.SUM_LEN
-        return cls.MAX_LEN
+        else:
+            return cls.MAX_LEN
 
 
 class _DpGatheredBufferWrapper:
@@ -888,47 +878,6 @@ def dp_scatter(
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
-def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> bool:
-    """HCU-only: run the DP-attention MAX_LEN combine over aiter's custom (IPC)
-    reduce_scatter. Returns True if it handled the op, False to let the caller
-    fall back to `get_tp_group().reduce_scatter_tensor` (RCCL on HCU).
-
-    `GroupCoordinator._maybe_aiter_reduce_scatter` deliberately excludes HCU
-    (`and not _is_hcu`) as a historical precision guard, so the generic path sends
-    HCU to RCCL and misses the aiter IPC kernel. This narrow wrapper re-enables the
-    aiter kernel ONLY for the HCU DP-attention combine under MAX_LEN, leaving every
-    other reduce_scatter_tensor caller on HCU untouched. Mirrors the upstream 0518
-    `_aiter_reduce_scatter_tensor`, plus our should_custom_ar / equal-chunk guards.
-
-    Opt-in: needs SGLANG_DP_USE_MAX_LEN=1 (this wrapper) AND SGLANG_USE_AITER_AR=1
-    (so ca_comm is the aiter CustomAllreduce that actually has reduce_scatter).
-    registered=False is forced: HCU's registered graph-replay path corrupts output
-    (same root cause as all_gather_reg; see merge notes §7).
-    """
-    if not (_is_hcu and _dp_use_max_len()):
-        return False
-    # aiter custom comm only supports fp16/bf16/fp32.
-    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        return False
-    if output.dtype != input.dtype:
-        return False
-    if not (input.is_contiguous() and output.is_contiguous()):
-        return False
-    ca = getattr(get_tp_group(), "ca_comm", None)
-    if ca is None or getattr(ca, "disabled", True):
-        return False
-    if not (hasattr(ca, "reduce_scatter") and hasattr(ca, "should_custom_ar")):
-        return False
-    # should_custom_ar bounds the pre-reduce buffer size and validates topology.
-    if not ca.should_custom_ar(input):
-        return False
-    # Equal-chunk only: the global buffer must split evenly into per-rank output.
-    if input.shape[0] != output.shape[0] * get_tensor_model_parallel_world_size():
-        return False
-    ca.reduce_scatter(input, output, registered=False)
-    return True
-
-
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
@@ -939,8 +888,6 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
             return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
-        if _aiter_reduce_scatter_tensor(output, input):
-            return
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(

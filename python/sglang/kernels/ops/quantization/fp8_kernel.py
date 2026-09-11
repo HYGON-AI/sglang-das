@@ -401,7 +401,7 @@ def vllm_triton_scaled_mm_fp8(
 
 @lru_cache()
 def is_fp8_fnuz() -> bool:
-    if _is_hip and not _is_hcu:
+    if _is_hip:
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
         return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
     return False

@@ -3,7 +3,7 @@
 # Ported from an internal fork's ``models/hunyuan_v4.py`` (itself adapted
 # from upstream sgl-project/sglang PR #36805 "Support Hy4-preview"), adjusted
 # to this fork's API surface:
-#   * fork-specific fused iHC backends are dropped; iHC runs the eager torch path.
+#   * iHC uses eager torch, with an opt-in HCU fused coefficient prenorm.
 #   * a custom vocab embedding -> upstream ``VocabParallelEmbedding`` with
 #     ``get_embedding_tp_kwargs()``.
 #   * The CP helpers live in ``layers/attention/dsa/utils`` and
@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import (
@@ -47,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.hy4_ihc_prenorm import try_hcu_ihc_prenorm
 from sglang.srt.layers.hy4_ihc_tilelang import (
     try_tilelang_ihc_head,
     try_tilelang_ihc_post,
@@ -194,11 +194,8 @@ def hyv4_linear_scale_suffix(model: nn.Module) -> str:
 class HYV4HCPreLayer(nn.Module):
     """Produce the iHC pre/post gates and reduce the (T, hc_mult, H) stream.
 
-    Runs the eager torch path: the gate projection is a float32
-    ``[2 * hc_mult, hc_mult * hidden]`` GEMM over the flattened stream with an
-    RMS scale, and the reduce is a per-token weighted sum. (The internal fork fused
-    both into MHC kernels; a similar fusion could reuse this fork's DeepSeek-V4
-    MHC kernels with an identity comb later.)
+    The coefficient projection and RMS scale can use the opt-in HCU prenorm
+    kernel. Pre/post gates and the weighted stream reduction stay in torch.
     """
 
     def __init__(self, config: PretrainedConfig, prefix: str):
@@ -226,39 +223,45 @@ class HYV4HCPreLayer(nn.Module):
         rms_weight: Optional[torch.Tensor] = None,
         rms_eps: float = 0.0,
     ):
-        shape = hidden_states.shape
-        use_tilelang = envs.SGLANG_OPT_HY4_IHC_TILELANG.get()
-        fused = None
-        if use_tilelang:
+        if rms_weight is None:
             fused = try_tilelang_ihc_pre(
-                hidden_states, self.hc_fn.weight, self.hc_scale, self.hc_base,
-                self.rms_norm_eps, self.hc_eps, self.magnitude,
+                hidden_states,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.magnitude,
             )
-        if fused is not None:
-            reduced, post = fused
-        else:
+            if fused is not None:
+                return fused
+        shape = hidden_states.shape
+        gates = try_hcu_ihc_prenorm(
+            hidden_states, self.hc_fn.weight, self.rms_norm_eps
+        )
+        if gates is None:
             flat = hidden_states.flatten(1).float()
             scale = torch.rsqrt(
                 flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
             )
             gates = self.hc_fn(flat)[0] * scale
-            pre = (
-                torch.sigmoid(
-                    gates[..., : self.hc_mult] * self.hc_scale[0]
-                    + self.hc_base[: self.hc_mult]
-                )
-                + self.hc_eps
+        pre = (
+            torch.sigmoid(
+                gates[..., : self.hc_mult] * self.hc_scale[0]
+                + self.hc_base[: self.hc_mult]
             )
-            post = (
-                self.magnitude
-                * torch.sigmoid(
-                    gates[..., self.hc_mult :] * self.hc_scale[1]
-                    + self.hc_base[self.hc_mult :]
-                )
-                + self.hc_eps
+            + self.hc_eps
+        )
+        post = (
+            self.magnitude
+            * torch.sigmoid(
+                gates[..., self.hc_mult :] * self.hc_scale[1]
+                + self.hc_base[self.hc_mult :]
             )
-            reduced = torch.sum(pre.unsqueeze(-1) * hidden_states.reshape(shape), dim=1)
-            reduced = reduced.to(hidden_states.dtype)
+            + self.hc_eps
+        )
+        reduced = torch.sum(pre.unsqueeze(-1) * hidden_states.reshape(shape), dim=1)
+        reduced = reduced.to(hidden_states.dtype)
         if rms_weight is not None:
             reduced_float = reduced.float()
             reduced = (
@@ -344,7 +347,7 @@ class HYV4HCHeadLayer(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, norm: Optional[RMSNorm] = None):
-        fused = try_tilelang_ihc_head(
+        output = try_tilelang_ihc_head(
             hidden_states,
             self.hc_head_fn.weight,
             self.hc_head_scale,
@@ -352,20 +355,19 @@ class HYV4HCHeadLayer(nn.Module):
             self.config.rms_norm_eps,
             self.config.hc_eps,
         )
-        if fused is not None:
-            return fused if norm is None else norm(fused)
-        shape = hidden_states.shape
-        flat = hidden_states.flatten(1).float()
-        scale = torch.rsqrt(
-            flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps
-        )
-        gates = self.hc_head_fn(flat)[0] * scale
-        gates = (
-            torch.sigmoid(gates * self.hc_head_scale + self.hc_head_base)
-            + self.config.hc_eps
-        )
-        output = torch.sum(gates.unsqueeze(-1) * flat.reshape(shape), dim=1)
-        output = output.to(hidden_states.dtype)
+        if output is None:
+            shape = hidden_states.shape
+            flat = hidden_states.flatten(1).float()
+            scale = torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + self.config.rms_norm_eps
+            )
+            gates = self.hc_head_fn(flat)[0] * scale
+            gates = (
+                torch.sigmoid(gates * self.hc_head_scale + self.hc_head_base)
+                + self.config.hc_eps
+            )
+            output = torch.sum(gates.unsqueeze(-1) * flat.reshape(shape), dim=1)
+            output = output.to(hidden_states.dtype)
         return output if norm is None else norm(output)
 
 
@@ -412,6 +414,13 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             prefix=prefix,
             alt_stream=alt_stream,
             is_nextn=is_nextn,
+            # HYV4 is DSA-only; forward the prefill-CP flag so the parent
+            # (DeepseekV2AttentionMLA) sets self.cp_size and
+            # self.dsa_enable_prefill_cp on the attention module. Both are read
+            # on the CP KV-gather path (rebuild_cp_kv_cache -> self.cp_size) and
+            # the per-module CP decision; without this they are missing and the
+            # DSA prefill-CP forward raises AttributeError: no attribute 'cp_size'.
+            dsa_enable_prefill_cp=is_dsa_enable_prefill_cp(),
         )
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -540,13 +549,16 @@ class HYV4DecoderLayer(nn.Module):
                 hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
             )
         )
-        hidden_states = self.self_attn(
-            positions,
-            hidden_states,
-            forward_batch,
-            zero_allocator,
-            prev_topk_indices=prev_topk_indices,
-        )
+        try:
+            hidden_states = self.self_attn(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -645,12 +657,21 @@ class HYV4Model(nn.Module):
         self.cp_size = get_parallel().attn_cp_size
 
     def _maybe_prepare_prefill_cp(self, input_ids, forward_batch):
-        """Build the DSA CP metadata for this batch, mirroring DeepseekV4Model.
+        """Set ``attn_cp_metadata`` so the prefill-CP data split can run.
 
-        The metadata has no producer outside the model: every CP-capable model
-        sets it itself before its layer loop, and ``dsa_use_prefill_cp``
-        returns False while it is None. Without this the CP split below is
-        silently skipped.
+        ``dsa_use_prefill_cp`` returns False while ``attn_cp_metadata`` is None,
+        so ``forward``'s ``cp_split_and_rebuild_data`` (the token/data split) is
+        gated on this being set here, before the layer loop.
+
+        Unlike DeepseekV4Model we do NOT reindex attention/indexer metadata
+        here: HYV4 uses the DSA backend, whose ``init_forward_metadata`` already
+        builds rank-local metadata for round-robin-split (see
+        ``can_dsa_prefill_cp_round_robin_split``). DeepseekV4's backend splits at
+        build only under CP-v2 and otherwise defers to a model-side
+        ``core_attn_metadata.apply_cp_reindex()``; copying that call here would
+        both hit ``DSAMetadata`` (which has no ``core_attn_metadata``) and
+        double-split metadata the backend already sharded. The backend owns the
+        metadata split; the model owns only the data split below.
         """
         if not (
             self.dsa_enable_prefill_cp
@@ -666,19 +687,6 @@ class HYV4Model(nn.Module):
             forward_batch.seq_lens_cpu.tolist(),
             extend_seqs_len=forward_batch.extend_seq_lens_cpu,
         )
-        if is_dsa_prefill_cp_round_robin_split():
-            # In round-robin-split mode the CP metadata decides the local token
-            # order, so the attention/indexer metadata built before
-            # model.forward() must be rebuilt to match.
-            attn_backend = get_attn_backend()
-            metadata = attn_backend.forward_metadata
-            core_meta = metadata.core_attn_metadata
-            core_meta.apply_cp_reindex()
-            core_meta.init_flashmla_related(is_prefill=True)
-            if metadata.indexer_metadata is not None:
-                metadata.indexer_metadata = (
-                    attn_backend.init_forward_metadata_indexer(core_meta)
-                )
         return True
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
