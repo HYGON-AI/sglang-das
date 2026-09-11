@@ -389,10 +389,12 @@ jobs:
           INPUT_IMAGE: ${{ inputs.image || '' }}
           VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
           VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+          DEFAULT_RUNNER_LABEL: bw1100
+          DEFAULT_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:latest
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || false }}
         run: |
-          runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
-          image="${INPUT_IMAGE:-${VAR_IMAGE}}"
+          runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL:-${DEFAULT_RUNNER_LABEL}}}"
+          image="${INPUT_IMAGE:-${VAR_IMAGE:-${DEFAULT_IMAGE}}}"
 
           if [[ -z "${runner_label}" ]]; then
             echo "::error::HCU runner label is required. Set vars.HCU_CI_RUNNER_LABEL or workflow input runner_label."
@@ -420,7 +422,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         run: |
           cd "${HCU_CI_CHECKOUT_DIR}"
-          python3.9 scripts/ci/hcu/verify_hcu_registration.py
+          python3 scripts/ci/hcu/verify_hcu_registration.py
 
       - name: Setup HCU validation container
         if: github.event_name == 'workflow_dispatch'
@@ -603,14 +605,14 @@ jobs:
       HCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_stage_a
       HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
-      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '1' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '1' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '1' }}
       HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
-      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+      HCU_CI_USE_INSTALLED_WHEELS: "1"
     steps:
       - name: Checkout code
         env:
@@ -699,14 +701,14 @@ jobs:
       HCU_CI_IMAGE: ${{ needs.validate-config.outputs.image }}
       HCU_CI_CONTAINER_NAME: ci_sglang_hcu_${{ github.run_id }}_stage_b_${{ matrix.part }}
       HCU_CI_SKIP_PULL: ${{ vars.HCU_CI_SKIP_PULL || '' }}
-      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '' }}
-      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '' }}
-      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '' }}
+      HCU_CI_SKIP_DEPENDENCY_INSTALL: ${{ vars.HCU_CI_SKIP_DEPENDENCY_INSTALL || '1' }}
+      HCU_CI_SKIP_REQUIREMENTS_INSTALL: ${{ vars.HCU_CI_SKIP_REQUIREMENTS_INSTALL || '1' }}
+      HCU_CI_SKIP_SGLANG_BUILD: ${{ vars.HCU_CI_SKIP_SGLANG_BUILD || '1' }}
       HCU_CI_VISIBLE_DEVICES: ${{ vars.HCU_CI_VISIBLE_DEVICES || '' }}
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
-      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
+      HCU_CI_USE_INSTALLED_WHEELS: "1"
       SGLANG_HCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
     steps:
       - name: Checkout code
