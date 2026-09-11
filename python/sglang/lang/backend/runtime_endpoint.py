@@ -133,14 +133,18 @@ class RuntimeEndpoint(BaseBackend):
 
         dtype_regex = None
         if sampling_params.dtype in ["int", int]:
+
             dtype_regex = REGEX_INT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["float", float]:
+
             dtype_regex = REGEX_FLOAT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["str", str]:
+
             dtype_regex = REGEX_STR
         elif sampling_params.dtype in ["bool", bool]:
+
             dtype_regex = REGEX_BOOL
         else:
             raise RuntimeError(f"Invalid dtype: {sampling_params.dtype}")
@@ -439,9 +443,7 @@ class Runtime:
         from sglang.srt.utils import kill_process_tree
 
         if self.pid is not None:
-            # Note(kpham-sgl): __del__ routes here, so the reap wait has to stay
-            # off -- blocking inside GC stalls whichever thread is allocating.
-            kill_process_tree(self.pid, wait_timeout=None)
+            kill_process_tree(self.pid)
             self.pid = None
 
     def start_profile(self):
@@ -454,15 +456,13 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-        cfg = resolving_view(self.server_args)
         return get_tokenizer(
-            cfg.tokenizer_path or cfg.model_path,
-            tokenizer_mode=cfg.tokenizer_mode,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.revision,
+            self.server_args.tokenizer_path or self.server_args.model_path,
+            tokenizer_mode=self.server_args.tokenizer_mode,
+            trust_remote_code=self.server_args.trust_remote_code,
+            revision=self.server_args.revision,
         )
 
     async def async_generate(

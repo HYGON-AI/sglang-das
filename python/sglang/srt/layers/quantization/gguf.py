@@ -71,17 +71,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _ordered_gguf_shard_ids(shard_ids: list) -> list:
-    """Return checkpoint shards in the fused layer's logical output order."""
-    if len(shard_ids) == 3 and set(shard_ids) == {"q", "k", "v"}:
-        return ["q", "k", "v"]
-    if all(isinstance(shard_id, int) for shard_id in shard_ids) and set(
-        shard_ids
-    ) == set(range(len(shard_ids))):
-        return sorted(shard_ids)
-    return list(shard_ids)
-
-
 class GGUFConfig(QuantizationConfig):
     """Config class for GGUF."""
 
@@ -435,20 +424,16 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             # (dim0_start, dim0_end, dim1_size)
             shard_offset_map = dict[str, tuple[int, int, int]]()
-            ordered_shard_ids = _ordered_gguf_shard_ids(shard_id)
-            cursor = 0
-            for idx in ordered_shard_ids:
+            for idx in shard_id:
                 id_in_container = shard_id_map[idx]
-                start = cursor
+                start = sum(x.size(0) for x in data_container[:id_in_container])
                 end = start + data_container[id_in_container].size(0)
                 size = data_container[id_in_container].size(1)
                 padded_data[start:end, :size] = data_container[id_in_container]
                 shard_offset_map[idx] = (start, end, size)
-                cursor = end
             qweight.data_container.clear()
             padded_param = Parameter(padded_data, requires_grad=False)
             set_weight_attrs(padded_param, vars(qweight))
-            padded_param.shard_id = ordered_shard_ids
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
@@ -462,7 +447,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = _ordered_gguf_shard_ids(shard_id)
+            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
             qweight = layer.qweight
             result = []
             for idx in shard_id:
@@ -569,9 +554,9 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

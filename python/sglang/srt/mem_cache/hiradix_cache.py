@@ -72,7 +72,6 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
-    get_parallel,
     get_serving,
 )
 
@@ -90,7 +89,7 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        allocator_type = get_allocator_type()
+        allocator_type = get_allocator_type(server_args)
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(
@@ -110,6 +109,8 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            from sglang.srt.runtime_context import get_parallel
+
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -152,6 +153,7 @@ class HiRadixCache(RadixCache):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
+                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -165,6 +167,7 @@ class HiRadixCache(RadixCache):
             attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
+                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -346,7 +349,10 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
+                from sglang.srt.runtime_context import get_server_args
+
                 storage_cls = resolve_collector_class(
+                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
@@ -1187,9 +1193,9 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             if node.parent is None:
-                assert node is self.root_node, (
-                    f"This request holds the node from another tree"
-                )
+                assert (
+                    node is self.root_node
+                ), f"This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1400,9 +1406,9 @@ class HiRadixCache(RadixCache):
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
-            assert node.backuped, (
-                "No backup available on evicted nodes, should not happen"
-            )
+            assert (
+                node.backuped
+            ), "No backup available on evicted nodes, should not happen"
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -1732,11 +1738,6 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
-    def pop_storage_prefetch_miss(self, req_id: str) -> bool:
-        """Storage prefetch miss markers are not tracked on the dense path;
-        the scheduler's paced availability-check retry is inert here."""
-        return False
-
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
             return self._empty_match_result
@@ -1779,10 +1780,6 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
-        # Cache mode write-through keeps the anchor on the request's own path,
-        # so the namespace is already carried by ``last_host_node.key``.
-        extra_key: Optional[str] = None,
-        cache_salt: Optional[str] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Collection, Dict, Tuple
+from typing import Dict, Tuple
 
 import torch
 
@@ -90,6 +90,7 @@ def get_pp_proxy_hidden_states_shape(
 
 @dataclass
 class ForwardInputBuffers:
+
     def reset_index_buffers(self) -> None:
         """Zero the index-semantic buffers this set declares."""
         for f in fields(self):
@@ -99,15 +100,13 @@ class ForwardInputBuffers:
             if buffer is not None:
                 buffer.zero_()
 
-    def share_buffers(self, *, exclude: Collection[str] = ()):
+    def share_buffers(self):
         # disable share input buffer on npu due to accuracy issue
         if is_npu():
             return
 
         for f in fields(self):
             name = f.name
-            if name in exclude:
-                continue
             buffer = getattr(self, name)
 
             if buffer is None:
@@ -118,14 +117,14 @@ class ForwardInputBuffers:
 
             if isinstance(buffer, dict):
                 for sub_name, sub_buffer in buffer.items():
-                    assert isinstance(sub_buffer, torch.Tensor), (
-                        f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
-                    )
+                    assert isinstance(
+                        sub_buffer, torch.Tensor
+                    ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
                     buffer[sub_name] = share_input_buffer(
                         f"{name}.{sub_name}", sub_buffer
                     )
             else:
-                assert isinstance(buffer, torch.Tensor), (
-                    f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
-                )
+                assert isinstance(
+                    buffer, torch.Tensor
+                ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
                 setattr(self, name, share_input_buffer(name, buffer))

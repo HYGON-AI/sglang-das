@@ -18,10 +18,9 @@
 
 from __future__ import annotations
 
-import functools
 import logging
 import os
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -39,7 +38,6 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.utils import is_hcu
-from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -213,6 +211,20 @@ def _prepare_standalone_megamoe_inputs(
     buf,
     num_tokens: int,
 ) -> None:
+    if getattr(buf, "quant_mode", "fp8") == "int8":
+        import megamoe
+
+        megamoe.mega_moe_pre_dispatch_int8(
+            hidden_states.contiguous(),
+            topk_ids,
+            topk_weights,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens,
+        )
+        return
     quant = _get_hcu_w8a8_pre_dispatch_quant()
     if quant is not None:
         quant_input = (
@@ -224,7 +236,11 @@ def _prepare_standalone_megamoe_inputs(
             quant_input,
             dtype=buf.x.dtype,
             out_q=buf.x[:num_tokens],
-            out_scale=buf.x_sf[:num_tokens],
+            # MegaMoE stores one FP32 scale per token as a flat buffer, while
+            # the public LightOp wrapper validates the per-token scale output
+            # as [num_tokens, 1]. The view preserves the underlying symmetric
+            # buffer layout expected by MegaMoE.
+            out_scale=buf.x_sf[:num_tokens].view(num_tokens, 1),
         )
     else:
         import megamoe
@@ -265,47 +281,6 @@ def _apply_mega_moe_dg_env() -> None:
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
-def _mega_moe_mma_type() -> str:
-    return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
-
-
-@functools.lru_cache(maxsize=1)
-def _mega_moe_max_num_sms() -> Optional[int]:
-    if _device_sm < 100:
-        # The SM90 MegaMoE implementation does not use the whole-grid clustered
-        # launch that needs a residency margin.
-        return None
-
-    # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
-    # indexer reconfigure that process-wide, so reserving on top would compound.
-    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
-    return max(2, num_sms - reserved_num_sms)
-
-
-@contextmanager
-def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-    max_num_sms = _mega_moe_max_num_sms()
-    if max_num_sms is None:
-        yield
-        return
-
-    current_num_sms = deep_gemm.get_num_sms()
-    # Stay under an outer context's budget instead of claiming SMs back from it.
-    target_num_sms = min(max_num_sms, current_num_sms)
-    # Round down: the clustered launch needs an even CTA count.
-    target_num_sms -= target_num_sms % 2
-    if target_num_sms == current_num_sms:
-        yield
-        return
-
-    deep_gemm.set_num_sms(target_num_sms)
-    try:
-        yield
-    finally:
-        deep_gemm.set_num_sms(current_num_sms)
-
-
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -316,6 +291,7 @@ def _get_mega_moe_symm_buffer(
     *,
     runtime: str,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
+    quant_mode: str = "fp8",
 ) -> SymmBuffer:
     if _IS_HCU and runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
         import megamoe
@@ -330,9 +306,9 @@ def _get_mega_moe_symm_buffer(
         factory = deep_gemm.get_symm_buffer_for_mega_moe
         cuda_graph_max_tokens_per_rank = None
 
-    mma_type = _mega_moe_mma_type()
     key = (
         package_key,
+        quant_mode,
         id(group),
         num_max_tokens_per_rank,
         cuda_graph_max_tokens_per_rank,
@@ -340,11 +316,12 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
-        mma_type,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
         kwargs = {}
+        if quant_mode != "fp8":
+            kwargs["quant_mode"] = quant_mode
         if cuda_graph_max_tokens_per_rank is not None:
             kwargs["cuda_graph_max_tokens_per_rank"] = cuda_graph_max_tokens_per_rank
         buf = factory(
@@ -354,7 +331,7 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
-            mma_type=mma_type,
+            use_fp8_dispatch=True,
             activation="swiglu",
             **kwargs,
         )
@@ -380,6 +357,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         if not is_sm90_fp8_mega_moe_available(moe.experts):
             return False
     if get_is_capture_mode():
+        if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
+            raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
         return not _IS_HCU or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
@@ -469,7 +448,14 @@ def _run_mega_routed(
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
     global_num_tokens = get_dp_global_num_tokens()
-    dispatch_num_tokens = max(global_num_tokens) if global_num_tokens else num_tokens
+    # CP has already split the padded prefill batch across attention ranks at
+    # this point. Using the DP-global token count here would size and select
+    # the MegaMoE dispatch as if every CP rank still owned the full batch.
+    dispatch_num_tokens = (
+        max(global_num_tokens)
+        if global_num_tokens and not is_dsa_enable_prefill_cp()
+        else num_tokens
+    )
     assert dispatch_num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
@@ -497,6 +483,11 @@ def _run_mega_routed(
         intermediate_hidden=intermediate_size,
         runtime=runtime,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
+        quant_mode=(
+            "int8"
+            if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False)
+            else "fp8"
+        ),
     )
 
     if _IS_HCU:
@@ -545,8 +536,8 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    mma_type = _mega_moe_mma_type()
-    if mma_type == "mxf4xmxf4":
+    use_fp4_acts = os.getenv("DG_USE_FP4_ACTS") == "1"
+    if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
@@ -560,7 +551,7 @@ def _run_mega_routed(
             buf.topk_weights,
             num_tokens=num_tokens,
             group_size=32,
-            mma_type=mma_type,
+            use_fp4_acts=True,
         )
     else:
         mega_moe_pre_dispatch(
@@ -582,17 +573,16 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
+    deep_gemm.fp8_fp4_mega_moe(
+        y,
+        moe.experts.mega_l1_weights,
+        moe.experts.mega_l2_weights,
+        buf,
+        recipe=(1, 1, 32),
+        activation="swiglu",
+        activation_clamp=swiglu_limit,
+        fast_math=True,
+    )
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -677,13 +667,26 @@ def _run_standalone_hcu_w8a8_mega_moe(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    api_kwargs = {"megamoe_backend": _select_hcu_megamoe_backend(dispatch_num_tokens)}
+    int4_weights = getattr(moe.experts, "_mega_moe_hcu_int4_weights", False)
+    api_kwargs = {
+        "megamoe_backend": (
+            "normal"
+            if int4_weights
+            else _select_hcu_megamoe_backend(dispatch_num_tokens)
+        )
+    }
     if is_graph_capture:
         api_kwargs["graph"] = True
     else:
         api_kwargs["capacity_num_tokens"] = dispatch_num_tokens
 
-    megamoe.fp8_w8a8_mega_moe(
+    if int4_weights:
+        from sglang.srt.layers.moe.hcu_int4_megamoe import int4_w4a8_mega_moe
+
+        run_moe = int4_w4a8_mega_moe
+    else:
+        run_moe = megamoe.fp8_w8a8_mega_moe
+    run_moe(
         y,
         moe.experts.mega_l1_weights,
         moe.experts.mega_l2_weights,
@@ -701,30 +704,22 @@ def _run_standalone_hcu_w8a8_mega_moe(
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
-    # Match DeepGEMM's L1 gate/up layouts. FP8 activations use contiguous
-    # gran-8 chunks; packed MXFP4 activations use even/odd gran-16 chunks.
+    # Match DeepGEMM's L1 gate/up layout:
+    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...].
     num_groups, n, *rest = t.shape
     half = n // 2
     gate = t[:, :half].reshape(num_groups, half // gran, gran, *rest)
     up = t[:, half:].reshape(num_groups, half // gran, gran, *rest)
-    if gran == 16:
-        result = torch.cat(
-            [gate[:, :, 0::2], up[:, :, 0::2], gate[:, :, 1::2], up[:, :, 1::2]],
-            dim=2,
-        ).reshape(num_groups, n, *rest)
-    else:
-        result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
+    result = torch.stack([gate, up], dim=2).reshape(num_groups, n, *rest)
     return torch.empty_like(t).copy_(result)
 
 
 def _interleave_mega_moe_l1_weights(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
-    mma_type: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    gran = 16 if mma_type == "mxf4xmxf4" else 8
     return (
-        _interleave_mega_moe_gate_up(l1_weights[0], gran=gran),
-        _interleave_mega_moe_gate_up(l1_weights[1], gran=gran),
+        _interleave_mega_moe_gate_up(l1_weights[0]),
+        _interleave_mega_moe_gate_up(l1_weights[1]),
     )
 
 
@@ -748,7 +743,6 @@ def build_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
-    mma_type = _mega_moe_mma_type()
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
@@ -784,7 +778,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         # swizzle-aware activation kernel. L2 weight is untouched by the mega
         # transform, so the existing `w2_weight.data` is shared directly.
         w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
-            (w13, w13_sf), mma_type
+            (w13, w13_sf)
         )
         w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
         w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
@@ -820,6 +814,42 @@ def _hcu_channelwise_scale(experts, names, rows: int, label: str) -> torch.Tenso
     raise ValueError(
         "HCU W8A8 MegaMoE requires channelwise FP32 scales shaped "
         f"[expert,row] for {label}; checked {', '.join(names)}"
+    )
+
+
+def build_hcu_int4_mega_moe_experts_weights(experts) -> None:
+    """Build from raw SlimQuant weights before fallback-specific repacking."""
+    if not _IS_HCU or not get_moe_a2a_backend().is_megamoe():
+        return
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if get_hcu_mega_moe_runtime() != _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
+        raise ValueError("INT4 requires SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
+    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
+    if tuple(w13.shape) != (32, 4096, 2048) or tuple(w2.shape) != (32, 4096, 1024):
+        raise ValueError("INT4 MegaMoE currently supports DSV4-Flash EP8 only")
+    from sglang.srt.layers.moe.hcu_int4_megamoe import (
+        transform_int4_weights_for_mega_moe_normal,
+        validate_megamoe_int8_runtime,
+    )
+
+    validate_megamoe_int8_runtime()
+
+    experts.mega_l1_weights, experts.mega_l2_weights = (
+        transform_int4_weights_for_mega_moe_normal(
+            w13,
+            w2,
+            l1_scale=experts.w13_weight_scale.data,
+            l2_scale=experts.w2_weight_scale.data,
+            scale_multiplier=16.0,
+        )
+    )
+    experts._mega_moe_hcu_runtime = _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+    experts._mega_moe_hcu_int4_weights = True
+    experts._mega_moe_weights_built = True
+    logger.info(
+        "INT4 MegaMoE enabled: packed INT4 -> reusable INT8 PACK5 scratch; "
+        "HCU normal dispatch/GEMM/combine (no AITER fallback)"
     )
 
 

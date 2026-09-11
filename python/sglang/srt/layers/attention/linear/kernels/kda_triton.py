@@ -5,12 +5,20 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hcu, is_npu
+
+_USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
 if not is_cpu():
-    from sglang.kernels.ops.attention.fla.fused_recurrent import (
-        fused_recurrent_kda_packed_decode,
-    )
+    if is_hcu() and _USE_KDA_HCU:
+        # HCU: use the stable boltops packed-decode implementation directly.
+        # Its API consumes raw gate/beta tensors; packed_decode reshapes them
+        # below without copying and returns the boltops output layout directly.
+        from boltops.fla.kda.triton import fused_recurrent_kda_packed_decode
+    else:
+        from sglang.kernels.ops.attention.fla.fused_recurrent import (
+            fused_recurrent_kda_packed_decode,
+        )
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
@@ -23,11 +31,7 @@ if not is_cpu():
 class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
-    # XPU has no tvm_ffi CUDA JIT kernel for KDA packed decode; route XPU to the
-    # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
-    # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
-    supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
-    supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
+    supports_packed_decode: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -67,8 +71,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            lower_bound is None
-            and replayssm_d is not None
+            replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
@@ -105,6 +108,21 @@ class TritonKDAKernel(LinearAttnKernelBase):
             a = a.reshape(B, -1)
         if b.dim() != 2:
             b = b.reshape(B, -1)
+        if _USE_KDA_HCU:
+            K = ssm_states.shape[-1]
+            out, _ = fused_recurrent_kda_packed_decode(
+                mixed_qkv=mixed_qkv,
+                raw_g=a.reshape(1, B, num_v_heads, K),
+                raw_beta=b.reshape(1, B, num_v_heads),
+                A_log=A_log.reshape(-1),
+                dt_bias=dt_bias.reshape(-1),
+                lower_bound=lower_bound,
+                initial_state=ssm_states,
+                state_indices=cache_indices,
+                scale=scale,
+            )
+            return out
+
         fused_recurrent_kda_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -171,7 +189,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: Optional[torch.Tensor],
+        retrieve_parent_token: torch.Tensor,
         lower_bound: Optional[float] = None,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
@@ -229,10 +247,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
-        beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         return chunk_kda(
             q=q,
             k=k,
@@ -246,6 +263,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
-            beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
         )

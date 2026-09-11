@@ -172,6 +172,7 @@ class Projector(nn.Module):
 
 
 class SiglipVisionEmbeddings(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -297,6 +298,7 @@ class SiglipVisionEmbeddings(nn.Module):
 
 
 class SigLIPRotaryEmbedding(nn.Module):
+
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -320,6 +322,7 @@ class SigLIPRotaryEmbedding(nn.Module):
 
 
 class SiglipMLP(nn.Module):
+
     def __init__(
         self,
         config,
@@ -357,6 +360,7 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
+
     def __init__(
         self,
         config,
@@ -414,6 +418,7 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
+
     def __init__(
         self,
         config,
@@ -476,6 +481,7 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipVisionTransformer(nn.Module):
+
     def __init__(
         self,
         config,
@@ -568,6 +574,7 @@ class SiglipVisionModel(nn.Module):
 
 
 class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
+
     def __init__(self, *, config, quant_config=None, prefix: str = ""):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         config = self.config

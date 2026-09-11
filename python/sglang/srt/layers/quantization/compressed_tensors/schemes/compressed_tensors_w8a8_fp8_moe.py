@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -40,7 +41,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, set_weight_attrs
 
@@ -82,6 +83,7 @@ def is_moe_prefill_or_normal():
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
+
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -103,6 +105,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_block_size = None
         self.block_quant = self.weight_block_size is not None
         self.use_deepep = get_moe_a2a_backend().is_deepep()
+        # The target and DSpark draft share process-wide HCU env flags, but
+        # may intentionally use different MoE backends.  Keep the standalone
+        # draft on its canonical/AITER-fallback layout.
+        self.use_hcu_fp8_w8a8_moe = _use_fp8_w8a8_moe and not (
+            get_flags().moe.in_speculative_a2a_scope and not self.use_deepep
+        )
 
         self.static_input_scales = not self.input_quant.dynamic
         if self.static_input_scales and per_channel:
@@ -253,9 +261,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         # INPUT_SCALES
         if self.static_input_scales:
-            assert self.input_quant.strategy == QuantizationStrategy.TENSOR, (
-                "Only per-tensor quantization is supported for static input scales"
-            )
+            assert (
+                self.input_quant.strategy == QuantizationStrategy.TENSOR
+            ), "Only per-tensor quantization is supported for static input scales"
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
@@ -401,7 +409,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_aiter
+            and not _is_hcu
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -418,12 +430,17 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _use_deepgemm_moe
             and _is_hcu
+            and self.use_deepep
         ):
+            # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
+            # standalone draft MoE alongside a DeepEP target MoE.  Repacking
+            # the standalone layer here deletes its canonical w13/w2 weights,
+            # which are still required by the draft Triton runner.
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
 
         elif (
             _is_hcu
-            and not _use_fp8_w8a8_moe
+            and not self.use_hcu_fp8_w8a8_moe
             and _use_aiter_fp8_w8a8_moe
             and _use_shuffle
         ):
@@ -435,7 +452,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             del w2_weight
 
         elif (
-            _use_fp8_w8a8_moe
+            self.use_hcu_fp8_w8a8_moe
             and _is_hcu
             and not getattr(layer, "_w8a8_fp8_packed", False)
         ):
@@ -534,7 +551,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             if (
-                _use_aiter
+                will_use_aiter_moe()
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 and get_moe_a2a_backend().supports_aiter()
             ):
@@ -641,7 +658,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     block_shape=self.weight_block_size,
                 )
             return self.runner.run(dispatch_output, quant_info)
-        elif _is_hcu and _use_fp8_w8a8_moe:
+        elif _is_hcu and self.use_hcu_fp8_w8a8_moe:
             if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
                 layer.w2_weight, "_w8a8_fp8_packed", False
             ):
@@ -687,7 +704,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 return StandardCombineInput(hidden_states=output)
         elif (
             _is_hcu
-            and not _use_fp8_w8a8_moe
+            and not self.use_hcu_fp8_w8a8_moe
             and _use_aiter_fp8_w8a8_moe
             # The native AITER path cannot consume EP-local weight shards with
             # global expert ids. Let the Triton runner filter local experts.

@@ -17,8 +17,6 @@ from sglang.srt.layers.sampler import (
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
-from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -257,7 +255,8 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -449,8 +448,6 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
-    if sliding_window is None and is_nemotron_35_draft_config(config):
-        sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -499,46 +496,6 @@ def _get_dflash_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
-
-
-def is_nemotron_35_draft_config(config: Any) -> bool:
-    """Identify the published Nemotron 3.5 DFlash/DSpark draft layout.
-
-    Keep the non-anchor query layout and checkpoint-local vocabulary modules
-    scoped to this structurally distinct family instead of changing every
-    DFlash/DSpark checkpoint that happens to expose one of these fields.
-    """
-    architectures = _cfg_get(config, "architectures", None) or []
-    if not {"DFlashDraftModel", "Qwen3DSparkModel"}.intersection(architectures):
-        return False
-    if not bool(_cfg_get(config, "has_embed_tokens", False)):
-        return False
-    if bool(_cfg_get(config, "has_lm_head", False)):
-        return False
-
-    quant_config = _cfg_get(config, "quantization_config", None) or {}
-    if _cfg_get(quant_config, "quant_algo", None) != "W4A16_NVFP4":
-        return False
-
-    dflash_config = _get_dflash_config(config)
-    target_layer_ids = dflash_config.get(
-        "target_layer_ids", _cfg_get(config, "target_layer_ids", None)
-    )
-    aux_layer_ids = _cfg_get(config, "eagle_aux_hidden_state_layer_ids", None)
-    if not target_layer_ids or not aux_layer_ids:
-        return False
-    if len(target_layer_ids) != len(aux_layer_ids):
-        return False
-    if any(
-        int(target) + 1 != int(aux)
-        for target, aux in zip(target_layer_ids, aux_layer_ids)
-    ):
-        return False
-
-    sample_from_anchor = dflash_config.get(
-        "sample_from_anchor", _cfg_get(config, "sample_from_anchor", True)
-    )
-    return sample_from_anchor is False
 
 
 def _parse_optional_int(
@@ -690,6 +647,15 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
+    # Compact DSPARK exports name the same ordered target-layer selection
+    # aux_hidden_state_layer_ids. Never replace it with evenly spaced layers.
+    aux_layer_ids = _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None)
+    if aux_layer_ids is not None:
+        if layer_ids is not None and layer_ids != aux_layer_ids:
+            raise ValueError(
+                "Conflicting target_layer_ids and aux_hidden_state_layer_ids."
+            )
+        layer_ids = aux_layer_ids
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:
         parsed_target_layer_ids = None
@@ -928,7 +894,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape
@@ -948,30 +915,56 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
+        from sglang.srt.runtime_context import get_spec
+
         threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
+        from sglang.srt.runtime_context import get_spec
+
         threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
     device = next_token_logits.device
 
-    if uniform_samples is not None and uniform_samples.shape != (bs, draft_token_num):
-        raise ValueError(
-            "uniform_samples shape mismatch. "
-            f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
+    if uniform_samples is None:
+        uniform_samples = torch.rand(
+            (bs, draft_token_num), dtype=torch.float32, device=device
         )
-    if (
-        uniform_samples_for_final_sampling is not None
-        and uniform_samples_for_final_sampling.shape != (bs,)
-    ):
-        raise ValueError(
-            "uniform_samples_for_final_sampling shape mismatch. "
-            f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+    else:
+        if uniform_samples.shape != (bs, draft_token_num):
+            raise ValueError(
+                "uniform_samples shape mismatch. "
+                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
+            )
+        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
+
+    if uniform_samples_for_final_sampling is None:
+        uniform_samples_for_final_sampling = torch.rand(
+            (bs,), dtype=torch.float32, device=device
+        )
+    else:
+        if uniform_samples_for_final_sampling.shape != (bs,):
+            raise ValueError(
+                "uniform_samples_for_final_sampling shape mismatch. "
+                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+            )
+        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
+            device=device,
+            dtype=torch.float32,
         )
 
-    # Cached across steps, and `correct_len` below aliases `accept_token_num`,
-    # so these must predate the borrow scope the next replay reclaims.
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        use_sparse_topk=use_sparse_topk,
+    )
+    draft_probs = torch.zeros_like(target_probs)
+
     (
         retrieve_index,
         retrieve_next_token,
@@ -984,59 +977,25 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         draft_token_num=draft_token_num,
         device=device,
     )
-
-    # The full-vocabulary matrices die with this step, so their bytes may come
-    # from the graph pool's idle storage. Anything outliving the scope is not.
-    with borrow_graph_pool(user="DFLASH verify probabilities"):
-        if uniform_samples is None:
-            coins = torch.rand(
-                (bs, draft_token_num), dtype=torch.float32, device=device
-            )
-        else:
-            coins = uniform_samples.to(device=device, dtype=torch.float32)
-        if uniform_samples_for_final_sampling is None:
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=device
-            )
-        else:
-            coins_for_final_sampling = uniform_samples_for_final_sampling.to(
-                device=device,
-                dtype=torch.float32,
-            )
-
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            draft_token_num=draft_token_num,
-            bs=bs,
-            max_top_k=max_top_k,
-            uniform_top_k_value=uniform_top_k_value,
-            use_sparse_topk=use_sparse_topk,
-        )
-        draft_probs = torch.zeros_like(target_probs)
-        candidates_i64 = (
-            candidates
-            if candidates.dtype == torch.int64
-            else candidates.to(torch.int64)
-        )
-        tree_speculative_sampling_target_only(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates_i64,
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=threshold_single,
-            threshold_acc=threshold_acc,
-            deterministic=True,
-        )
-        del target_probs, draft_probs, candidates_i64
-        del coins, coins_for_final_sampling
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates_i64,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=True,
+    )
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)

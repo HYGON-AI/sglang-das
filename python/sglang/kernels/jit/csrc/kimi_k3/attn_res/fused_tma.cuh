@@ -9,12 +9,9 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/distributed/communicator.cuh>
-#include <sgl_kernel/distributed/ptx.cuh>
-
 #include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/extra/stl.h>
 
+#include "../../distributed/custom_all_reduce.cuh"
 #include <algorithm>
 #include <array>
 #include <cfloat>
@@ -25,14 +22,14 @@
 
 namespace sglang {
 
-namespace device::ptx {
+namespace ptx {
 
 // ---- bulk 1D TMA (PTX ISA §9.7.9.25) ---------------------------------------
 
 // global -> shared::cluster, completed by an smem mbarrier. Arm `bar` with
 // `mbar_arrive_expect_tx(bar, bytes)` before issuing; `bytes` and both
 // endpoints must be 16-byte aligned.
-SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
+static SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
   asm volatile(
       "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
       " [%0], [%1], %2, [%3];" ::"r"(to_shared(smem_dst)),
@@ -44,21 +41,21 @@ SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint
 
 // Publish mbarrier initialization from the generic proxy before an async engine
 // uses the barrier.
-SGL_DEVICE void fence_mbarrier_init() {
+static SGL_DEVICE void fence_mbarrier_init() {
   asm volatile("fence.mbarrier_init.release.cluster;");
 }
 
 // ---- warp / warp-group sync (PTX ISA §9.7.4, §9.7.12.6, §9.7.13) -----------
 
-// Partial-CTA rendezvous. `id` must be in [1, 15]; pull 0 is reserved for
-// the full-CTA pull behind __syncthreads().
-SGL_DEVICE void named_barrier_sync(uint32_t id, uint32_t num_threads) {
+// Partial-CTA rendezvous. `id` must be in [1, 15]; barrier 0 is reserved for
+// the full-CTA barrier behind __syncthreads().
+static SGL_DEVICE void named_barrier_sync(uint32_t id, uint32_t num_threads) {
   asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
 }
 
 // True on exactly one lane of the issuing warp — guards single-issuer sites
 // (mbar init, TMA issue, MMA issue, TMEM alloc) without gating on lane_id.
-SGL_DEVICE bool elect_one() {
+static SGL_DEVICE bool elect_one() {
   uint32_t pred;
   asm volatile(
       "{\n\t.reg .pred p;\n\t"
@@ -84,14 +81,14 @@ SGL_DEVICE bool elect_one() {
 // source. For a symmetric cap, `__launch_bounds__(NUM_THREADS, 1)` is cleaner
 // and measured faster on B100/B300.
 template <int N>
-SGL_DEVICE void setmaxnreg_dec() {
+static SGL_DEVICE void setmaxnreg_dec() {
   static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
   static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
   asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(N));
 }
 
 template <int N>
-SGL_DEVICE void setmaxnreg_inc() {
+static SGL_DEVICE void setmaxnreg_inc() {
   static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
   static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N));
@@ -106,23 +103,23 @@ SGL_DEVICE void setmaxnreg_inc() {
 // Each warp can only touch its own 32-lane TMEM band (§9.7.16.8.1): warp 0 ->
 // lanes 0-31, warp 1 -> 32-63, and so on. Use `tcgen05_wait_st` /
 // `tcgen05_wait_ld` before consuming the other side of a store / drain.
-SGL_DEVICE void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
+static SGL_DEVICE void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
   asm volatile(
       "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(smem_addr_for_taddr), "r"(n_cols));
 }
 
-SGL_DEVICE void tcgen05_dealloc(uint32_t taddr, uint32_t n_cols) {
+static SGL_DEVICE void tcgen05_dealloc(uint32_t taddr, uint32_t n_cols) {
   asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(taddr), "r"(n_cols));
 }
 
-SGL_DEVICE void tcgen05_relinquish() {
+static SGL_DEVICE void tcgen05_relinquish() {
   asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
 }
 
 // .32x32b.x8: 8 b32 per lane = 8 TMEM columns. Per-lane 8 FP32 -> 4 bf16x2
 // packs = one int4, the natural fit for a BF16 epilogue moving a column band
 // with 16-byte smem accesses.
-SGL_DEVICE void tcgen05_ld_32x32b_x8(
+static SGL_DEVICE void tcgen05_ld_32x32b_x8(
     uint32_t taddr,
     uint32_t& r0,
     uint32_t& r1,
@@ -139,11 +136,11 @@ SGL_DEVICE void tcgen05_ld_32x32b_x8(
       : "r"(taddr));
 }
 
-SGL_DEVICE void tcgen05_ld_32x32b_x8(uint32_t taddr, uint32_t* dst) {
+static SGL_DEVICE void tcgen05_ld_32x32b_x8(uint32_t taddr, uint32_t* dst) {
   tcgen05_ld_32x32b_x8(taddr, dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
 }
 
-SGL_DEVICE void tcgen05_st_32x32b_x8(uint32_t taddr, const uint32_t* src) {
+static SGL_DEVICE void tcgen05_st_32x32b_x8(uint32_t taddr, const uint32_t* src) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x8.b32 "
       " [%8], {%0, %1, %2, %3, %4, %5, %6, %7};"
@@ -159,11 +156,11 @@ SGL_DEVICE void tcgen05_st_32x32b_x8(uint32_t taddr, const uint32_t* src) {
         "r"(taddr));
 }
 
-SGL_DEVICE void tcgen05_wait_st() {
+static SGL_DEVICE void tcgen05_wait_st() {
   asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
-}  // namespace device::ptx
+}  // namespace ptx
 
 struct AttnResTMAParams {
   const bf16_t* __restrict__ prefix_sum;  // [T, H]
@@ -182,7 +179,7 @@ struct AttnResTMAParams {
   const bf16_t* residual;
   bf16_t* prefix_out;
   device::distributed::Semaphore* sem_local;
-  device::distributed::Semaphore* sem_mc;
+  uint8_t* sem_mc;
   uint8_t* output_mc;
   uint32_t world_size;
   uint32_t rank;
@@ -197,7 +194,7 @@ struct KimiK3AttnResTrait {
   static constexpr int64_t kDim = kDim_;
   static constexpr int64_t kTile = 1024;               // one warp-group-wide 16B sweep
   static constexpr uint32_t kNumRows = kNumBankRows_;  // bank rows; +1 prefix row
-  static constexpr uint32_t kChunkRows = kChunkRows_;  // rows per chunk (one pull pair per chunk)
+  static constexpr uint32_t kChunkRows = kChunkRows_;  // rows per chunk (one barrier pair per chunk)
   // Chunk slots in the smem ring. Frozen at 2 (double buffering): 1 stalls
   // the producer behind the consumers (~10% slower), >2 gains nothing and
   // costs smem at small T.
@@ -227,7 +224,7 @@ struct KimiK3AttnResTrait {
   // TMEM: per group, kTmemColsPerGroup columns of cw then of ow.
   static constexpr uint32_t kTmemColsPerGroup = 32;
   static constexpr uint32_t kTmemCols = 2 * kNumGroups * kTmemColsPerGroup;
-  static constexpr uint32_t kConsumerBarId = 1;  // pull 0 stays __syncthreads'
+  static constexpr uint32_t kConsumerBarId = 1;  // barrier 0 stays __syncthreads'
 
   static_assert(kDim % kTile == 0, "kDim must be a whole number of tiles");
   static_assert(kTile == kGroupThreads * kVecElems, "a tile is one group-wide 16B sweep");
@@ -303,7 +300,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           if (global_chunks >= kNumStages) {
             ptx::mbar_wait_parity(&smem->bar_free[slot], phase ^ 1);
           }
-          // One pull per chunk; each row still gets its own bulk copy.
+          // One barrier per chunk; each row still gets its own bulk copy.
           ptx::mbar_arrive_expect_tx(&smem->bar_full[slot], an * kRowBytes);
 #pragma unroll
           for (uint32_t r = 0; r < an; ++r) {
@@ -547,7 +544,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         if (params.output_mc != nullptr) {
           const auto global_token = static_cast<int64_t>(params.rank) * params.num_tokens + token;
           const auto global_vid = global_token * (kDim / kVecElems) + row_vid;
-          ptx::st_multimem_16B(out_vec, params.output_mc, global_vid);
+          st_multimem_16B(out_vec, params.output_mc, global_vid);
         } else {
           out_vec.store(out_ptr, row_vid);
         }
@@ -569,6 +566,27 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 }
 
+SGL_DEVICE uint32_t* attn_res_sem_mc_flag(uint8_t* sem_mc, uint32_t block) {
+  static_assert(sizeof(device::distributed::Semaphore) == 128);
+  return reinterpret_cast<uint32_t*>(sem_mc + block * sizeof(device::distributed::Semaphore));
+}
+
+SGL_DEVICE void attn_res_sem_arrive_relaxed(uint32_t* flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.relaxed.sys.global.add.u32 [%0], 1;" ::"l"(flag) : "memory");
+#else
+  assert(false && "multimem red requires Hopper or later");
+#endif
+}
+
+SGL_DEVICE void attn_res_sem_arrive_release(uint32_t* flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.release.sys.global.add.u32 [%0], 1;" ::"l"(flag) : "memory");
+#else
+  assert(false && "multimem red requires Hopper or later");
+#endif
+}
+
 // Fused NVLS pull RS + local residual + attention-residual aggregation.
 // The entry/exit barriers make local o_proj writes visible before the
 // producer's multimem reduction and preserve the shared pull-semaphore
@@ -576,16 +594,15 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
     attn_res_fused_pull_rs_kernel(const __grid_constant__ AttnResTMAParams params) {
-  // The window base lives in shared memory, not in the barrier object: this
-  // kernel's body is register-budgeted (see kConsumerRegs / setmaxnreg), so
-  // keeping the object live across Trait::forward would spill.
   __shared__ uint32_t exit_base;
-  {
-    const auto barrier =
-        device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size, /*num_arrives=*/2);
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    const auto reserved = semaphore->counter_ptr()->inc(2 * params.world_size);
+    exit_base = reserved + params.world_size;
     device::PDLWaitPrimary<true>();
-    barrier.arrive_relaxed(/*n=*/0);
-    if (threadIdx.x == 0) exit_base = barrier.window() + params.world_size;
+    attn_res_sem_arrive_relaxed(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_relaxed() - reserved < params.world_size)
+      ;
   }
   __syncthreads();
 
@@ -602,7 +619,7 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
         params.residual == nullptr ? nullptr : params.residual + static_cast<int64_t>(token) * Trait::kDim;
     for (uint32_t vid = threadIdx.x; vid < kRowVecs; vid += blockDim.x) {
       pull_vec_t vec;
-      device::ptx::ld_multimem_16B(vec, input_mc, vid);
+      ld_multimem_16B(vec, input_mc, vid);
       if (residual != nullptr) {
         pull_vec_t res;
         res.load(residual, vid);
@@ -621,7 +638,12 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 
   __syncthreads();
-  device::distributed::McBarrier::arrive_at<true>(params.sem_local, params.sem_mc, params.world_size, exit_base);
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    attn_res_sem_arrive_release(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_acquire() - exit_base < params.world_size)
+      ;
+  }
 }
 
 // Local attention-residual aggregation + direct AG epilogue. The consumer
@@ -631,12 +653,14 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
     attn_res_fused_direct_ag_kernel(const __grid_constant__ AttnResTMAParams params) {
-  __shared__ uint32_t exit_base;  // see the note in the pull-RS kernel above
-  {
-    const auto barrier =
-        device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size, /*num_arrives=*/2);
-    barrier.arrive_relaxed(/*n=*/0);
-    if (threadIdx.x == 0) exit_base = barrier.window() + params.world_size;
+  __shared__ uint32_t exit_base;
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    const auto reserved = semaphore->counter_ptr()->inc(2 * params.world_size);
+    exit_base = reserved + params.world_size;
+    attn_res_sem_arrive_relaxed(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_relaxed() - reserved < params.world_size)
+      ;
   }
   __syncthreads();
 
@@ -644,7 +668,12 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 
   __syncthreads();
-  device::distributed::McBarrier::arrive_at<true>(params.sem_local, params.sem_mc, params.world_size, exit_base);
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    attn_res_sem_arrive_release(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_acquire() - exit_base < params.world_size)
+      ;
+  }
 }
 using host::distributed::CommunicatorRef;
 
@@ -763,9 +792,10 @@ struct AttnResFusedTmaKernel {
       int64_t nvb,
       double eps,
       int64_t input_mc_ptr,
+      int64_t sem_mc_ptr,
       int64_t max_blocks) {
     using namespace host;
-    const auto& pull = ref.get()->get_pull_obj();
+    const auto& data = *ref.get();
     auto GT_ = SymbolicSize{"global_tokens"};
     auto T_ = SymbolicSize{"local_tokens"};
     auto H_ = SymbolicSize{"hidden_size"};
@@ -785,12 +815,12 @@ struct AttnResFusedTmaKernel {
     const auto num_tokens = static_cast<int64_t>(T_.unwrap());
     const auto H = static_cast<int64_t>(H_.unwrap());
     const auto NB = static_cast<int64_t>(NB_.unwrap());
-    RuntimeCheck(pull.world_size > 1, "fused pull RS requires world_size > 1");
-    RuntimeCheck(global_tokens == num_tokens * pull.world_size, "global tokens must equal local tokens * world size");
+    RuntimeCheck(data.world_size > 1, "fused pull RS requires world_size > 1");
+    RuntimeCheck(global_tokens == num_tokens * data.world_size, "global tokens must equal local tokens * world size");
     RuntimeCheck(H == kDim, "fused pull RS: H must be ", kDim, ", got ", H);
     RuntimeCheck(1 <= nvb && nvb <= kMaxBankRows && nvb <= NB, "fused pull RS: invalid nvb=", nvb, " NB=", NB);
     RuntimeCheck(input_mc_ptr != 0, "fused pull RS requires multicast input");
-    RuntimeCheck(pull.mc_semaphore != nullptr, "fused pull RS requires a multicast-capable pull plane");
+    RuntimeCheck(sem_mc_ptr != 0, "fused pull RS requires multicast semaphores");
     RuntimeCheck(max_blocks > 0, "fused pull RS requires max_blocks > 0");
     if (num_tokens == 0) return;
 
@@ -807,7 +837,7 @@ struct AttnResFusedTmaKernel {
         {static_cast<int64_t>(num_sm) * kOccupancy,
          num_tokens,
          max_blocks,
-         static_cast<int64_t>(ref.get()->get_pull_blocks())});
+         static_cast<int64_t>(data.num_pull_blocks)});
     const auto local_elems = num_tokens * H;
     const auto params = AttnResTMAParams{
         .prefix_sum = static_cast<const bf16_t*>(prefix_out.data_ptr()),
@@ -817,14 +847,14 @@ struct AttnResFusedTmaKernel {
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .prefix_dst = nullptr,
         .input_mc = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(input_mc_ptr)) +
-                    pull.rank * local_elems * sizeof(bf16_t),
+                    data.rank * local_elems * sizeof(bf16_t),
         .residual = residual.has_value() ? static_cast<const bf16_t*>(residual.value().data_ptr()) : nullptr,
         .prefix_out = static_cast<bf16_t*>(prefix_out.data_ptr()),
-        .sem_local = pull.semaphores[pull.rank],
-        .sem_mc = pull.mc_semaphore,
+        .sem_local = data.pull_semaphores[data.rank],
+        .sem_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(sem_mc_ptr)),
         .output_mc = nullptr,
-        .world_size = pull.world_size,
-        .rank = pull.rank,
+        .world_size = data.world_size,
+        .rank = data.rank,
         .stride_bm = NB * H,
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),
@@ -842,10 +872,11 @@ struct AttnResFusedTmaKernel {
       int64_t nvb,
       double eps,
       int64_t output_mc_ptr,
+      int64_t sem_mc_ptr,
       int64_t max_blocks,
       bool write_prefix) {
     using namespace host;
-    const auto& pull = ref.get()->get_pull_obj();
+    const auto& data = *ref.get();
     auto T_ = SymbolicSize{"local_tokens"};
     auto GT_ = SymbolicSize{"global_tokens"};
     auto H_ = SymbolicSize{"hidden_size"};
@@ -862,13 +893,13 @@ struct AttnResFusedTmaKernel {
     const auto global_tokens = static_cast<int64_t>(GT_.unwrap());
     const auto H = static_cast<int64_t>(H_.unwrap());
     const auto NB = static_cast<int64_t>(NB_.unwrap());
-    RuntimeCheck(pull.world_size > 1, "fused direct AG requires world_size > 1");
-    RuntimeCheck(global_tokens == num_tokens * pull.world_size, "global tokens must equal local tokens * world size");
+    RuntimeCheck(data.world_size > 1, "fused direct AG requires world_size > 1");
+    RuntimeCheck(global_tokens == num_tokens * data.world_size, "global tokens must equal local tokens * world size");
     RuntimeCheck(H == kDim, "fused direct AG: H must be ", kDim, ", got ", H);
     RuntimeCheck(1 <= nvb && nvb <= kMaxBankRows && nvb <= NB, "fused direct AG: invalid nvb=", nvb, " NB=", NB);
     RuntimeCheck(!write_prefix || nvb < NB, "fused direct AG: write_prefix targets bank row nvb, needs nvb < NB");
     RuntimeCheck(output_mc_ptr != 0, "fused direct AG requires multicast output");
-    RuntimeCheck(pull.mc_semaphore != nullptr, "fused direct AG requires a multicast-capable pull plane");
+    RuntimeCheck(sem_mc_ptr != 0, "fused direct AG requires multicast semaphores");
     RuntimeCheck(max_blocks > 0, "fused direct AG requires max_blocks > 0");
     if (num_tokens == 0) return;
 
@@ -884,7 +915,7 @@ struct AttnResFusedTmaKernel {
         {static_cast<int64_t>(num_sm) * kOccupancy,
          num_tokens,
          max_blocks,
-         static_cast<int64_t>(ref.get()->get_pull_blocks())});
+         static_cast<int64_t>(data.num_pull_blocks)});
     const auto params = AttnResTMAParams{
         .prefix_sum = static_cast<const bf16_t*>(prefix_sum.data_ptr()),
         .bank = static_cast<const bf16_t*>(bank.data_ptr()),
@@ -895,11 +926,11 @@ struct AttnResFusedTmaKernel {
         .input_mc = nullptr,
         .residual = nullptr,
         .prefix_out = nullptr,
-        .sem_local = pull.semaphores[pull.rank],
-        .sem_mc = pull.mc_semaphore,
+        .sem_local = data.pull_semaphores[data.rank],
+        .sem_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(sem_mc_ptr)),
         .output_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(output_mc_ptr)),
-        .world_size = pull.world_size,
-        .rank = pull.rank,
+        .world_size = data.world_size,
+        .rank = data.rank,
         .stride_bm = NB * H,
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),

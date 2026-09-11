@@ -6,6 +6,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
@@ -14,15 +15,18 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
+from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -41,6 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
@@ -48,6 +53,15 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+
+lightop_top_k_top_p_sampling_from_probs = None
+if _is_hcu:
+    try:
+        from lightop.sampling import (
+            top_k_top_p_sampling_from_probs as lightop_top_k_top_p_sampling_from_probs,
+        )
+    except (ImportError, AttributeError):
+        pass
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -58,6 +72,60 @@ elif _is_cpu:
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
     )
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
+
+
+def sample_mtp_target_ids(
+    next_token_logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    draft_token_num: int,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Sample linear MTP target tokens on HCU before tree verification."""
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    target_probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
+    expanded_top_ks = torch.repeat_interleave(
+        sampling_info.top_ks, draft_token_num, dim=0
+    )
+    expanded_top_ps = torch.repeat_interleave(
+        sampling_info.top_ps, draft_token_num, dim=0
+    )
+
+    # LightOp implements the common top-k-first/top-p path. Keep the PyTorch
+    # path for min-p and request-specific seeds.
+    if (
+        lightop_top_k_top_p_sampling_from_probs is None
+        or sampling_info.sampling_seed is not None
+        or sampling_info.need_min_p_sampling
+    ):
+        expanded_min_ps = torch.repeat_interleave(
+            sampling_info.min_ps, draft_token_num, dim=0
+        )
+        expanded_sampling_seed = (
+            None
+            if sampling_info.sampling_seed is None
+            else torch.repeat_interleave(
+                sampling_info.sampling_seed, draft_token_num, dim=0
+            )
+        )
+        return top_k_top_p_min_p_sampling_from_probs_torch(
+            target_probs,
+            expanded_top_ks,
+            expanded_top_ps,
+            expanded_min_ps,
+            sampling_info.need_min_p_sampling,
+            expanded_sampling_seed,
+            positions,
+        ).to(torch.long)
+
+    return lightop_top_k_top_p_sampling_from_probs(
+        target_probs.contiguous(),
+        expanded_top_ks,
+        expanded_top_ps,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+    ).to(torch.long)
 
 
 def per_step_draft_out_cache_loc(
@@ -484,30 +552,13 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     return target_hidden * num_aux
 
 
-def get_draft_recurrent_hidden_state_spec_from_config(
-    model_config, spec_algorithm
-) -> tuple[Optional[int], Optional[torch.dtype]]:
-    """Return hidden_states width/dtype carried between draft decode steps.
-
-    Config-only so callers without a draft runner can reach it: prefill-side PP
-    builds the draft on the last stage alone, but the PD metadata wire schema it
-    feeds has to come out identical on every rank.
-    """
-    if spec_algorithm.is_standalone():
-        return None, None
-    return model_config.spec_hidden_size, model_config.dtype
-
-
 def get_draft_recurrent_hidden_state_spec(
     model_runner: ModelRunner,
 ) -> tuple[Optional[int], Optional[torch.dtype]]:
     """Return hidden_states width/dtype carried between draft decode steps."""
-    return get_draft_recurrent_hidden_state_spec_from_config(
-        model_runner.model_config, model_runner.spec_algorithm
-    )
-
-
-_PREPARE_FOR_VERIFY_DEPS = None
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
 
 
 def eagle_prepare_for_verify(
@@ -516,34 +567,15 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
-    # Imports must stay lazy (import-cycle safety) but only need to resolve
-    # once, not on every decode cycle of this hot path.
-    global _PREPARE_FOR_VERIFY_DEPS
-    if _PREPARE_FOR_VERIFY_DEPS is None:
-        from sglang.kernels.ops.speculative.cache_locs import (
-            assign_extend_cache_locs_uniform_func,
-        )
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-        )
-        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-
-        _PREPARE_FOR_VERIFY_DEPS = (
-            assign_extend_cache_locs_uniform_func,
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-            prepare_mamba_track_for_verify,
-        )
-    (
+    from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
+    )
+    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-        prepare_mamba_track_for_verify,
-    ) = _PREPARE_FOR_VERIFY_DEPS
+    )
+    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -685,30 +717,11 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
-def _can_use_sparse_uno_tree_target_sampling(
-    max_top_k: Optional[int],
-    sampling_info: SamplingBatchInfo,
-) -> bool:
-    if max_top_k is None:
-        return False
-
-    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
-
-    return bool(
-        _is_cuda
-        and max_top_k <= _SPARSE_TOP_K_LIMIT
-        and sampling_info.sampling_seed is None
-        and not sampling_info.need_min_p_sampling
-        and not get_spec().speculative_use_rejection_sampling
-    )
-
-
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
-    uno_target_max_top_k: Optional[int] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -779,10 +792,33 @@ def eagle_sample(
     )
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
-    # Sample tokens
+    # Sample tokens. HCU has no target-only tree-sampling kernel yet, so for
+    # linear MTP sample the target rows before reusing the greedy tree walk.
+    # This mirrors the target-only kernel's output for topk=1 while retaining
+    # the existing TP rank-0 broadcast below.
+    sampled_target_ids = None
+    if not sampling_info.is_all_greedy and _is_hcu and verify_input.tree_topk == 1:
+        sampled_target_ids = sample_mtp_target_ids(
+            next_token_logits,
+            sampling_info,
+            verify_input.draft_token_num,
+            verify_input.positions,
+        )
+
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+    if (
+        sampling_info.is_all_greedy
+        or _is_cpu
+        or _is_npu
+        or (_is_hip and not _is_hcu)
+        or _is_xpu
+        or sampled_target_ids is not None
+    ):
+        target_predict = (
+            torch.argmax(next_token_logits, dim=-1)
+            if sampled_target_ids is None
+            else sampled_target_ids
+        )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
@@ -810,42 +846,6 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif _can_use_sparse_uno_tree_target_sampling(
-        uno_target_max_top_k,
-        sampling_info,
-    ):
-        from sglang.srt.speculative.uno_utils import (
-            sample_uno_tree_target_tokens,
-        )
-
-        target_predict = sample_uno_tree_target_tokens(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            batch_size=bs,
-            verify_width=verify_input.draft_token_num,
-            max_top_k=uno_target_max_top_k,
-        )
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=num_correct_drafts,
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
-        )
-
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -865,78 +865,86 @@ def eagle_sample(
             else tree_speculative_sampling_target_only
         )
 
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
+        # These full-vocabulary matrices are consumed by the sampling kernel
+        # within this step. Returned tensors were allocated before the scope,
+        # so the next CUDA graph replay may safely reclaim these borrowed bytes.
+        with borrow_graph_pool(user="EAGLE probability borrow"):
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+            )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
+            target_probs = F.softmax(
+                next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
+            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+            draft_probs = (
+                verify_input.draft_probs
+                if use_rejection_sampling
+                else torch.zeros_like(target_probs)
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
+            # Defense-in-depth behind the spec_hook startup allowlist: validate
+            # the actual kernel inputs before the Triton kernel.
+            if use_rejection_sampling and (
+                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            ):
+                raise ValueError(
+                    "Rejection sampling requires a target-vocab draft proposal "
+                    "distribution; the current speculative algorithm/draft worker "
+                    "does not produce one (draft_probs missing or vocab-mismatched)."
+                )
 
-        coins, coins_for_final_sampling = _verify_coins(
-            sampling_info=sampling_info,
-            seq_lens=batch.seq_lens,
-            draft_token_num=verify_input.draft_token_num,
-            candidates=candidates,
-            device=device,
-        )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
-        del (
-            expanded_temperature,
-            target_probs,
-            draft_probs,
-            coins,
-            coins_for_final_sampling,
-        )
+            coins, coins_for_final_sampling = _verify_coins(
+                sampling_info=sampling_info,
+                seq_lens=batch.seq_lens,
+                draft_token_num=verify_input.draft_token_num,
+                candidates=candidates,
+                device=device,
+            )
+            sampling_fn(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
+            del (
+                expanded_temperature,
+                target_probs,
+                draft_probs,
+                coins,
+                coins_for_final_sampling,
+            )
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

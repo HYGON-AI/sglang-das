@@ -99,6 +99,7 @@ class SolAttnBackend(AttentionBackend):
 
 
 class SolAttnImpl(AttentionImpl):
+
     def __init__(
         self,
         num_heads: int,

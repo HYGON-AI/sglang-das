@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 
 
 class LlamaMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -85,7 +86,8 @@ class LlamaMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -97,6 +99,7 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaAttention(nn.Module):
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -215,6 +218,7 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -292,6 +296,7 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(TextEncoder):
+
     def __init__(
         self,
         config: LlamaConfig,

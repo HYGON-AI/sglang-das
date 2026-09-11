@@ -37,6 +37,7 @@ def _kwargs_to_cpu(d: Any) -> Any:
 
 
 class RolloutDenoisingMixin:
+
     def _maybe_prepare_rollout(self, batch: Req):
         """Prepare denoising loop for rollout."""
         scheduler = batch.scheduler

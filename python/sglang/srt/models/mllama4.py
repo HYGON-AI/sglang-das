@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4VisionMLP(nn.Module):
+
     def __init__(
         self,
         input_size: int,
@@ -114,6 +115,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
 
 
 class Llama4VisionPixelShuffleMLP(nn.Module):
+
     def __init__(
         self,
         config,
@@ -153,6 +155,7 @@ def apply_position_embedding(q, k, freqs_ci, shape):
 
 
 class Llama4VisionEncoderLayer(nn.Module):
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -223,6 +226,7 @@ class Llama4VisionEncoderLayer(nn.Module):
 
 
 class Llama4VisionEncoder(nn.Module):
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -268,6 +272,7 @@ class Llama4VisionEncoder(nn.Module):
 
 
 class Llama4UnfoldConvolution(nn.Module):
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -345,6 +350,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
 
 
 class Llama4VisionModel(nn.Module):
+
     def __init__(
         self,
         config: Llama4VisionConfig,

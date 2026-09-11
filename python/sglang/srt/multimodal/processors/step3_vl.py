@@ -27,6 +27,7 @@ ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
 
 
 class GPUToTensor(torch.nn.Module):
+
     def forward(
         self, raw_image: Union[np.ndarray, Image.Image, torch.Tensor]
     ) -> torch.Tensor:
@@ -562,7 +563,7 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
 

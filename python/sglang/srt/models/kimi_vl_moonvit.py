@@ -103,6 +103,7 @@ def apply_rope(
 
 
 class Learnable2DInterpPosEmb(nn.Module):
+
     def __init__(
         self, height: int, width: int, dim: int, interpolation_mode: str = "bicubic"
     ) -> None:
@@ -158,6 +159,7 @@ class Learnable2DInterpPosEmb(nn.Module):
 
 
 class MoonVisionPatchEmbed(nn.Module):
+
     def __init__(
         self,
         out_dim: int,
@@ -167,14 +169,14 @@ class MoonVisionPatchEmbed(nn.Module):
         pos_emb_width: int = 14,
     ):
         super().__init__()
-        assert isinstance(patch_size, (int, Sequence)), (
-            f"Invalid patch_size type: {type(patch_size)}"
-        )
+        assert isinstance(
+            patch_size, (int, Sequence)
+        ), f"Invalid patch_size type: {type(patch_size)}"
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert len(patch_size) == 2, (
-            f"Expected patch_size to be a tuple of 2, got {patch_size}"
-        )
+        assert (
+            len(patch_size) == 2
+        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -400,6 +402,7 @@ class MLP2(nn.Module):
 
 
 class MoonVitEncoderLayer(nn.Module):
+
     def __init__(
         self,
         num_heads: int,
@@ -472,6 +475,7 @@ class MoonVitEncoderLayer(nn.Module):
 
 
 class MoonVitEncoder(nn.Module):
+
     def __init__(
         self,
         hidden_dim: int,
@@ -600,6 +604,7 @@ def tpool_patch_merger(
 
 
 class MoonVitVLProjector(nn.Module):
+
     def __init__(
         self,
         in_channels: int,

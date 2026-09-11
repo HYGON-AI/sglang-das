@@ -34,6 +34,7 @@ SERVER_HOST: str = "127.0.0.1"
 
 
 class ScriptedHttpServer:
+
     def __init__(
         self,
         *,

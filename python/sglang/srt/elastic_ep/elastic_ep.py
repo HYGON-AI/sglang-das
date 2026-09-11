@@ -10,11 +10,12 @@ import torch
 from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
+from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.runtime_context import (
+    configured_tp_size,
     get_exec,
     get_parallel,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
 
 if TYPE_CHECKING:
@@ -110,15 +111,15 @@ class ElasticEPStateManager:
                 cls._on_scale = cls._on_scale_nixl
 
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
-            if get_exec().moe.is_ep_joiner:
-                cls._init_joiner_state(inst)
+            if server_args.is_ep_joiner:
+                cls._init_joiner_state(inst, server_args)
 
             cls._instance = inst
 
         return cls._instance
 
     @classmethod
-    def _init_joiner_state(cls, inst: ElasticEPState) -> None:
+    def _init_joiner_state(cls, inst: ElasticEPState, server_args: ServerArgs) -> None:
         global_rank = torch.distributed.get_rank()
         inst.active_ranks.zero_()
         inst.active_ranks[global_rank] = 1
@@ -127,7 +128,7 @@ class ElasticEPStateManager:
 
         if get_exec().moe.ep_join_mode == "scale":
             inst.effective_ep_size = (
-                get_parallel().ep_join_rank_offset + get_parallel().tp_size
+                get_parallel().ep_join_rank_offset + configured_tp_size()
             )
             inst.original_ep_size = (
                 get_parallel().elastic_ep_initial_size

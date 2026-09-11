@@ -131,7 +131,6 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor] = None,
-        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
@@ -160,18 +159,11 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + verify_lens
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        if kv_indices_buf is not None:
-            # Sync-free fast-plan path: write straight into the attention
-            # backend's cuda-graph kv_indices buffer (the captured kernels read
-            # it), skipping both the fresh allocation and the wrapper plan()'s
-            # device-to-device refresh copy.
-            kv_indices = kv_indices_buf
-        else:
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + kv_indices_extra,
-                dtype=torch.int32,
-                device=device,
-            )
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum + kv_indices_extra,
+            dtype=torch.int32,
+            device=device,
+        )
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,

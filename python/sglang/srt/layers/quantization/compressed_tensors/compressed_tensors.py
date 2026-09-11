@@ -73,7 +73,6 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -616,16 +615,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         # checkpoints carry a weight zero-point.
         return is_channel_group and input_quant_none and is_static
 
-    def _is_wna16_triton_moe_supported(self, weight_quant: BaseModel) -> bool:
-        return (
-            weight_quant.num_bits == 4
-            and weight_quant.type == QuantizationType.INT
-            and weight_quant.strategy == QuantizationStrategy.GROUP.value
-            and weight_quant.group_size in (32, 128)
-            and weight_quant.symmetric
-            and not weight_quant.actorder
-        )
-
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
         is_symmetric = weight_quant.symmetric
@@ -715,7 +704,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if is_activation_quantization_format(quant_format):
             # HCU: the w4a4 nvfp4 scheme is intentionally not selected here; see
-            # the DSV4 compressed-tensors notes in the HCU conflict ledger.
+            # the DSV4 compressed-tensors notes in the DCU conflict ledger.
             # if self._is_fp4a4_nvfp4(weight_quant, input_quant):
             #     is_fp4a4_nvfp4_supported = self._check_scheme_supported(
             #         CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -863,26 +852,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
                 else:
                     moe_backend = get_moe_runner_backend()
-                    triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
-                    use_blackwell_triton = (
-                        moe_backend.is_auto()
-                        and get_platform().is_sm100
-                        and triton_supported
-                    )
-                    if moe_backend.is_triton() and not triton_supported:
-                        raise ValueError(
-                            "The Triton WNA16 MoE backend only supports symmetric "
-                            "INT4 group quantization with group_size=32 or 128 and no "
-                            "actorder."
-                        )
-                    if moe_backend.is_triton() or use_blackwell_triton:
-                        reason = (
-                            "SM100/SM103 auto default"
-                            if use_blackwell_triton
-                            else "moe_runner_backend=triton"
-                        )
+                    if moe_backend.is_triton():
                         logger.info_once(
-                            f"Using CompressedTensorsWNA16TritonMoE ({reason})"
+                            "Using CompressedTensorsWNA16TritonMoE "
+                            "(moe_runner_backend=triton)"
                         )
                         return CompressedTensorsWNA16TritonMoE(
                             self, weight_quant=weight_quant
@@ -922,7 +895,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
             else:
                 raise NotImplementedError(
-                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         else:
             raise RuntimeError(
@@ -1093,12 +1066,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+                try:
+                    matched_target = find_matched_target(
+                        layer_name=layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                except ValueError:
+                    # Mixed checkpoints (e.g. Qwen3.8-Flash-Next Channelwise
+                    # FP8) only list MoE experts in config_groups.targets;
+                    # unmatched linears stay BF16 via UnquantizedLinearMethod.
+                    return None
 
             return self.target_scheme_map[matched_target]
 
@@ -1209,6 +1188,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):
+
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
@@ -1282,6 +1262,7 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
 
 class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
+
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config

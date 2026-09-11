@@ -209,7 +209,25 @@ inline PlanResult plan_prefill(
 
 }  // namespace host::compress
 
-[[maybe_unused]]
-constexpr auto& plan_compress_prefill = host::compress::plan_prefill;
+// Expose the binding for the JIT wrapper. A plain constexpr reference alias
+// breaks DTK's amdgcn device link (undefined hidden symbol); a forwarding
+// inline function keeps the target host-side and device-compilable.
+inline host::compress::PlanResult plan_compress_prefill(
+    const tvm::ffi::TensorView extend_lens,
+    const tvm::ffi::TensorView seq_lens,
+    const tvm::ffi::TensorView compress_plan,
+    const tvm::ffi::TensorView write_plan,
+    const uint32_t compress_ratio,
+    const bool is_overlap,
+    const bool use_cuda_graph) {
+  return host::compress::plan_prefill(
+      extend_lens,
+      seq_lens,
+      compress_plan,
+      write_plan,
+      compress_ratio,
+      is_overlap,
+      use_cuda_graph);
+}
 
 }  // namespace sglang

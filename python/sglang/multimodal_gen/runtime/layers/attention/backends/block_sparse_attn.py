@@ -21,6 +21,7 @@ BSA_BLOCK_SIZE = 128
 
 
 class BlockSparseAttentionBackend(AttentionBackend):
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -125,6 +126,7 @@ class BlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class BlockSparseAttentionImpl(AttentionImpl):
+
     def __init__(
         self,
         num_heads: int,

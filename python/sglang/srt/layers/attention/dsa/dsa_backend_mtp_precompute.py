@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.utils import seqlens_expand_triton
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
@@ -35,7 +37,6 @@ class PrecomputedMetadata:
     # Basic seqlens
     cache_seqlens: torch.Tensor  # int32, [bs]
     cu_seqlens_k: torch.Tensor  # int32, [bs+1]
-    req_pool_indices: torch.Tensor  # int64, [bs]
 
     # Page table
     page_indices: torch.Tensor  # int32, [bs, max_len] or [expanded_bs, max_len]
@@ -60,6 +61,59 @@ def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     assert seqlens.dtype == torch.int32
     return torch.nn.functional.pad(
         torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0)
+    )
+
+
+@triton.jit
+def _fill_decode_page_table_kernel(
+    req_to_token,
+    req_pool_indices,
+    seq_lens,
+    page_table,
+    req_to_token_stride: tl.constexpr,
+    page_table_stride: tl.constexpr,
+    max_len: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    req_idx = tl.load(req_pool_indices + row)
+    seq_len = tl.load(seq_lens + row)
+    in_bounds = cols < max_len
+    valid = in_bounds & (cols < seq_len)
+    vals = tl.load(
+        req_to_token + req_idx * req_to_token_stride + cols,
+        mask=valid,
+        other=0,
+    ).to(tl.int32)
+    tl.store(page_table + row * page_table_stride + cols, vals, mask=in_bounds)
+
+
+def fill_decode_page_table_gpu(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    bs: int,
+) -> None:
+    """Fill active decode entries and clear the captured table's stale tail."""
+    if bs == 0:
+        return
+    max_len = page_table.shape[1]
+    if max_len == 0:
+        return
+    block = 1024
+    _fill_decode_page_table_kernel[(bs, triton.cdiv(max_len, block))](
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        page_table,
+        req_to_token.shape[1],
+        page_table.stride(0),
+        max_len,
+        BLOCK=block,
+        num_warps=8,
     )
 
 
@@ -122,7 +176,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
-        if (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1:
+        if _is_cuda and not _is_hip:
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
             )
@@ -174,7 +228,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_k=cu_seqlens_k,
-                req_pool_indices=req_pool_indices,
                 page_indices=page_indices,
                 real_page_table=real_page_table,
                 seqlens_expanded=seqlens_expanded,
@@ -190,14 +243,23 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         cache_seqlens = seq_lens.to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
-        # Get page indices from cache
-        page_indices = self.req_to_token[req_pool_indices, :max_len].contiguous()
+        # Request-pool rows are reused without clearing. Copy the active prefix
+        # on device and zero the captured-width tail before it is transformed
+        # and replayed by every draft backend.
+        page_indices = torch.empty(
+            (bs, max_len), dtype=torch.int32, device=seq_lens.device
+        )
+        fill_decode_page_table_gpu(
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_indices,
+            bs,
+        )
 
         # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(
-            cache_seqlens,
-            dsa_index_topk=self.dsa_index_topk,
-            index_kpool=self.dsa_index_kpool,
+            cache_seqlens, dsa_index_topk=self.dsa_index_topk
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
@@ -222,7 +284,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
-            req_pool_indices=req_pool_indices,
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,
@@ -245,7 +306,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
-        if (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1:
+        if _is_cuda and not _is_hip:
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_target_verify_metadata,
             )
@@ -310,7 +371,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_k=cu_seqlens_k,
-                req_pool_indices=req_pool_indices,
                 page_indices=page_indices,
                 real_page_table=real_page_table,
                 seqlens_expanded=seqlens_expanded,
@@ -329,17 +389,17 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         # Page indices (repeated for each draft token)
         page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
         page_indices = torch.repeat_interleave(
-            page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+            page_indices,
+            repeats=self.speculative_num_draft_tokens,
+            dim=0,
+            output_size=seqlens_expanded_size,
         ).contiguous()
 
-        # Generate expanded seqlens on device. seq_lens_cpu is optional for DSA
-        # CUDA graph replay, so this fallback must not require a host mirror.
-        extend_seq_lens = torch.full(
-            (bs,),
-            self.speculative_num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        # seq_lens_cpu is optional for DSA CUDA graph replay, so this fallback
+        # reuses the graph-state tensor and does not require a host mirror.
+        extend_seq_lens = self.decode_cuda_graph_metadata[
+            "target_verify_extend_seq_lens"
+        ][:bs]
         seqlens_expanded = seqlens_expand_triton(
             extend_seq_lens,
             cache_seqlens,
@@ -348,11 +408,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         )
 
         # Compute DSA seqlens
-        dsa_cache_seqlens = compute_dsa_seqlens(
-            seqlens_expanded,
-            self.dsa_index_topk,
-            index_kpool=self.dsa_index_kpool,
-        )
+        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # DSA cumsum
@@ -375,7 +431,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
-            req_pool_indices=req_pool_indices,
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,

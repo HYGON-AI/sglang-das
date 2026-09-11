@@ -28,6 +28,7 @@ class Olmo3LayerType(enum.Enum):
 
 
 class Olmo3Config(PretrainedConfig):
+
     model_type = "olmo3"
     keys_to_ignore_at_inference = ["past_key_values"]
 

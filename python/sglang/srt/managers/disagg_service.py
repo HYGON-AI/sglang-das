@@ -13,9 +13,12 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
+from sglang.srt.server_args import ServerArgs
 
 
-def start_disagg_service():
+def start_disagg_service(
+    server_args: ServerArgs,
+):
     # Start kv bootstrap server on prefill
     disagg_mode = DisaggregationMode(get_disagg().disaggregation_mode)
     transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
@@ -29,12 +32,16 @@ def start_disagg_service():
             host=get_serving().host,
             port=get_disagg().disaggregation_bootstrap_port,
         )
-        maybe_create_ascend_config_store(transfer_backend=transfer_backend)
+        maybe_create_ascend_config_store(
+            server_args=server_args, transfer_backend=transfer_backend
+        )
 
         return bootstrap_server
 
 
-def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
+def maybe_create_ascend_config_store(
+    server_args: ServerArgs, transfer_backend: TransferBackend
+) -> None:
     """Also called directly by the rust-server scheduler: there the KV
     bootstrap registry is served by the embedded rust server's api listener
     (one rust implementation covers every transfer backend — their

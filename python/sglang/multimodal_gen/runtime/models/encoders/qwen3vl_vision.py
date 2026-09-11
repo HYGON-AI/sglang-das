@@ -45,30 +45,22 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
 
 
 class Qwen3VLVisionBlock(nn.Module):
-    def __init__(
-        self,
-        config: Any,
-        layer_idx: int,
-        quant_config: Any = None,
-        prefix: str = "visual",
-    ) -> None:
+    def __init__(self, config: Any, layer_idx: int) -> None:
         super().__init__()
         parallel = get_parallel()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.attn = QwenVLVisionAttention(
             config,
-            prefix=f"{prefix}.blocks.{layer_idx}.attn",
+            prefix=f"visual.blocks.{layer_idx}.attn",
             model_name="Qwen3-VL",
-            quant_config=quant_config,
         )
         self.mlp = Qwen3_VisionMLP(
             config.hidden_size,
             config.intermediate_size,
             bias=True,
             hidden_act=config.hidden_act,
-            prefix=f"{prefix}.blocks.{layer_idx}.mlp",
-            quant_config=quant_config,
+            prefix=f"visual.blocks.{layer_idx}.mlp",
             tp_rank=parallel.tp_rank,
             tp_size=parallel.tp_size,
         )
@@ -184,12 +176,7 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3VLVisionTransformer(nn.Module):
-    def __init__(
-        self,
-        config: Any,
-        quant_config: Any = None,
-        prefix: str = "visual",
-    ) -> None:
+    def __init__(self, config: Any) -> None:
         super().__init__()
         parallel = get_parallel()
         self.config = config
@@ -204,8 +191,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
-            Qwen3VLVisionBlock(config, layer_idx, quant_config, prefix)
-            for layer_idx in range(config.depth)
+            Qwen3VLVisionBlock(config, layer_idx) for layer_idx in range(config.depth)
         )
         self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=config.out_hidden_size,

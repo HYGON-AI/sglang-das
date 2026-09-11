@@ -72,6 +72,7 @@ def get_activation(name="relu"):
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
+
     def __init__(self, num_embeddings: int, embedding_dim: int):
         # OPT is set up so that if padding_idx is specified then offset the
         # embedding ids by 2 and adjust num_embeddings appropriately. Other
@@ -84,6 +85,7 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
 
 
 class OPTAttention(nn.Module):
+
     def __init__(
         self,
         embed_dim: int,
@@ -141,6 +143,7 @@ class OPTAttention(nn.Module):
 
 
 class OPTDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: OPTConfig,
@@ -217,6 +220,7 @@ class OPTDecoderLayer(nn.Module):
 
 
 class OPTDecoder(nn.Module):
+
     def __init__(
         self,
         config: OPTConfig,
@@ -320,6 +324,7 @@ class OPTDecoder(nn.Module):
 
 
 class OPTModel(nn.Module):
+
     def __init__(
         self,
         config: OPTConfig,
@@ -375,7 +380,7 @@ class OPTModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling factor attribute!"
+                    "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
 

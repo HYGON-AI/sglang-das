@@ -9,6 +9,16 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.srt.utils import get_bool_env_var, is_hcu
+
+
+_is_hcu = is_hcu()
+_use_bolt_recompute_w_u = get_bool_env_var("SGLANG_USE_BOLT_RECOMPUTE_W_U")
+
+if _is_hcu and _use_bolt_recompute_w_u:
+    from boltops.fla.gdn.triton.recompute_w_u import (
+        recompute_w_u_fwd_gdn as _bolt_recompute_w_u_fwd,
+    )
 
 
 # @triton.autotune(
@@ -43,14 +53,12 @@ def recompute_w_u_fwd_kernel(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
-        )
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int32),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
-        )
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -154,5 +162,8 @@ def recompute_w_u_fwd(
     )
     return w, u
 
+
+if _is_hcu and _use_bolt_recompute_w_u:
+    recompute_w_u_fwd = _bolt_recompute_w_u_fwd
 
 fwd_recompute_w_u = recompute_w_u_fwd

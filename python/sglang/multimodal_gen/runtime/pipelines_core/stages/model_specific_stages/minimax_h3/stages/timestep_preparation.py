@@ -120,7 +120,8 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         ) -> float:
             value = request_value
             source = (
-                f"request {'flow_shift' if modality == 'video' else 'audio_flow_shift'}"
+                "request "
+                f"{'flow_shift' if modality == 'video' else 'audio_flow_shift'}"
             )
             if value is None and model_scales is not None:
                 value = model_scales.get(modality)

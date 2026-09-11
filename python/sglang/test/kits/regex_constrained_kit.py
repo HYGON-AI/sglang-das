@@ -4,6 +4,7 @@ import requests
 
 
 class RegexConstrainedMixin:
+
     def _run_decode_regex(
         self,
         regex,

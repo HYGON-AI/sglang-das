@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
+from sglang.srt.utils import get_bool_env_var, is_hcu
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
@@ -29,6 +30,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
     is_intel,
     is_nvidia,
+    is_tf32_supported,
 )
 
 if is_intel:
@@ -42,6 +44,15 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 # Convert natural-log gates to log2 space before the exp2-based chunk kernels.
 # log2(e) rounded to fp32, matching flash-linear-attention.
 RCP_LN2 = 1.4426950216293335
+
+_USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
+
+if is_hcu():
+    from boltops.fla.kda.triton import (
+        chunk_gla_fwd_o_gk as chunk_gla_fwd_o_gk_hcu,
+        fused_kda_gate_chunk_cumsum as fused_kda_gate_chunk_cumsum_hcu,
+        recompute_w_u_fwd as recompute_w_u_fwd_hcu,
+    )
 
 
 def cdiv(a: int, b: int) -> int:
@@ -714,6 +725,21 @@ def recompute_w_u_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
+    if _USE_KDA_HCU:
+        # boltops recompute selects the K3 beta-factored head-first kernel
+        # internally.  Returns (w, u, None, kg); fold to the native
+        # 3-tuple contract.
+        w, u, _, kg = recompute_w_u_fwd_hcu(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            gk=gk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        return w, u, kg
+
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
@@ -741,7 +767,7 @@ def recompute_w_u_fwd(
         BT=BT,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="ieee",
+        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
         **(static_config or {}),
     )
     return w, u, kg
@@ -750,8 +776,8 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
+        for BK in [64]
+        for BV in [64]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
@@ -862,7 +888,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v, allow_tf32=False)
+    b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -884,6 +910,20 @@ def chunk_gla_fwd_o_gk(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    if _USE_KDA_HCU:
+        return chunk_gla_fwd_o_gk_hcu(
+            q=q,
+            v=v,
+            g=g,
+            A=A,
+            h=h,
+            o=o,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=BT,
+        )
 
     def grid(meta):
         return (cdiv(V, meta["BV"]), NT, B * H)
@@ -1045,18 +1085,18 @@ def kda_gate_chunk_cumsum(
         Cumulative-summed gated tensor of shape [B, T, H, K].
     """
     if cu_seqlens is not None:
-        assert g.shape[0] == 1, (
-            "Only batch size 1 is supported when cu_seqlens are provided"
-        )
+        assert (
+            g.shape[0] == 1
+        ), "Only batch size 1 is supported when cu_seqlens are provided"
     assert len(g.shape) == 4
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
-        "chunk_size must be a power of 2"
-    )
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
@@ -1078,6 +1118,7 @@ def kda_gate_chunk_cumsum(
         BT=BT,
     )
     return g
+
 
 
 def chunk_kda_fwd(
@@ -1105,18 +1146,34 @@ def chunk_kda_fwd(
     )
 
     if A_log is not None:
-        # Fused: gate activation + chunk-local cumsum in one kernel.
-        # g is raw gate (before activation); A_log, dt_bias drive the activation.
-        g = kda_gate_chunk_cumsum(
-            g,
-            A_log=A_log,
-            chunk_size=chunk_size,
-            scale=RCP_LN2,
-            dt_bias=dt_bias,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            lower_bound=lower_bound,
-        )
+        if _USE_KDA_HCU:
+            # boltops fused gate activation + chunk-local cumsum (also computes
+            # beta, which we ignore: downstream keeps the model's post-sigmoid
+            # beta).
+            g = fused_kda_gate_chunk_cumsum_hcu(
+                g,
+                beta,
+                A_log=A_log,
+                g_bias=dt_bias,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_size=chunk_size,
+            )[0]
+        else:
+            # Fused: gate activation + chunk-local cumsum in one kernel.
+            # g is raw gate (before activation); A_log, dt_bias drive the
+            # activation.
+            g = kda_gate_chunk_cumsum(
+                g,
+                A_log=A_log,
+                chunk_size=chunk_size,
+                scale=RCP_LN2,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                lower_bound=lower_bound,
+            )
     else:
         # g is already gate-activated by caller; just do cumsum.
         g = chunk_local_cumsum(
@@ -1154,7 +1211,6 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        safe_gate=lower_bound is not None,
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
     )
@@ -1210,7 +1266,6 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
-    beta_is_raw: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -1219,9 +1274,6 @@ def chunk_kda(
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
-
-    if beta_is_raw:
-        beta = beta.float().sigmoid()
 
     # Returns o [B, T, H, V] when output_intermediate_states=False, or (o, h [B, NT, H, V, K]) when output_intermediate_states=True.
     return chunk_kda_fwd(

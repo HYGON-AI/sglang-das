@@ -10,7 +10,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -375,8 +374,8 @@ class MinimaxM3Detector(BaseFormatDetector):
         if self._schema_has_type(parent_schema, ("array",)) and child_tag == "item":
             return self._get_array_item_schema(parent_schema, parent_value)
 
-        properties = get_schema_properties(parent_schema)
-        if child_tag in properties:
+        properties = parent_schema.get("properties")
+        if isinstance(properties, dict) and child_tag in properties:
             child_schema = properties[child_tag]
             return child_schema if isinstance(child_schema, dict) else None
 

@@ -29,6 +29,7 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 class PhiAttention(nn.Module):
+
     def __init__(
         self,
         config: PhiConfig,
@@ -98,6 +99,7 @@ class PhiAttention(nn.Module):
 
 
 class PhiMLP(nn.Module):
+
     def __init__(
         self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -126,6 +128,7 @@ class PhiMLP(nn.Module):
 
 
 class PhiLayer(nn.Module):
+
     def __init__(
         self,
         config: PhiConfig,
@@ -164,6 +167,7 @@ class PhiLayer(nn.Module):
 
 
 class PhiModel(nn.Module):
+
     def __init__(
         self,
         config: PhiConfig,

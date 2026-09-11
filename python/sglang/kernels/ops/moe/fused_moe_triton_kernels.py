@@ -21,8 +21,8 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -161,6 +161,9 @@ def fused_moe_kernel_gptq_awq(
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
+    use_int4_w4a8: tl.constexpr,
+    use_mxfp4_w4a8: tl.constexpr,
+    use_mxfp4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
@@ -241,7 +244,7 @@ def fused_moe_kernel_gptq_awq(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -257,7 +260,7 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bn
         )
 
-    if not has_zp and use_int4_w4a16:
+    if not has_zp and (use_int4_w4a16 or use_int4_w4a8):
         b_zp_num = 8
     if not has_zp and use_int8_w8a16:
         b_zp_num = 128
@@ -287,8 +290,33 @@ def fused_moe_kernel_gptq_awq(
             other=0.0,
         )
         b = tl.load(b_ptrs)
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
             b = (b >> b_shifter) & 0xF
+            if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+                # MXFP4 stores two E2M1 values per byte.  Its nibble is not a
+                # signed/zero-point INT4 value:
+                #   magnitude codes 0..7 -> 0, .5, 1, 1.5, 2, 3, 4, 6
+                #   bit 3                   -> sign
+                # Decode only the current GEMM tile so packed weights remain
+                # resident and no model-wide BF16 expansion is needed.  Every
+                # magnitude is exactly representable in BF16 (and FP8), so the
+                # lookup runs directly in BF16 without an FP32 intermediate.
+                b_magnitude_code = b & 0x7
+                b_magnitude = tl.where(
+                    b_magnitude_code <= 4,
+                    b_magnitude_code.to(tl.bfloat16)
+                    * tl.full((), 0.5, tl.bfloat16),
+                    tl.where(
+                        b_magnitude_code == 5,
+                        tl.full((), 3.0, tl.bfloat16),
+                        tl.where(
+                            b_magnitude_code == 6,
+                            tl.full((), 4.0, tl.bfloat16),
+                            tl.full((), 6.0, tl.bfloat16),
+                        ),
+                    ),
+                )
+                b = tl.where((b & 0x8) == 0, b_magnitude, -b_magnitude)
 
         b_scale_ptrs = (
             b_scale_ptr
@@ -297,7 +325,17 @@ def fused_moe_kernel_gptq_awq(
             + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
         )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+            # The checkpoint scale byte is OCP UE8M0 with exponent bias 127.
+            # 2^(E-127) is exactly the BF16 bit pattern E << 7 (sign 0,
+            # exponent E, mantissa 0), so a single shift + bitcast replaces
+            # exp2 without an FP32 intermediate.  Scale code 255 is reserved
+            # and does not occur in valid weights.
+            b_scale = (
+                (b_scale.to(tl.uint16) << 7).to(tl.bfloat16, bitcast=True)
+            )
+        else:
+            b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
@@ -324,13 +362,68 @@ def fused_moe_kernel_gptq_awq(
         # We accumulate along the K dimension.
         if has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        elif use_mxfp4_w4a16:
+            # WFP4 A16: dequantize E2M1 x UE8M0 directly in BF16.
+            b = b * b_scale
+        elif use_mxfp4_w4a8:
+            # WFP4 A8: keep the BF16 E2M1 magnitude; the UE8M0 group scale is
+            # applied after the FP8 MMAC below.
+            pass
+        elif use_int4_w4a8:
+            # INT4 W4A8 route: keep the raw signed INT4 tile (offset-8 is
+            # already applied by the checkpoint layout transform); the
+            # per-channel weight scale is applied after the int8 MMAC.
+            b = (b - b_zp_num).to(tl.int8)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+
+        if use_int4_w4a8:
+            # INT4 W4A8: per-token int8 activation quant, int8 x int8 tensor
+            # core, then per-token activation scale and per-channel weight
+            # scale on the fp32 accumulator.  Activation quantization runs in
+            # BF16 (no FP32 intermediate).
+            a_absmax = tl.maximum(
+                tl.max(tl.abs(a), axis=1), 1.0e-10
+            )
+            a_qscale = a_absmax / 127.0
+            a_int8 = libdevice.round(a / a_qscale[:, None]).to(tl.int8)
+            # b_scale is repeated along K for the per-channel layout; reduce
+            # it to the per-output-column scale.
+            b_channel_scale = tl.max(b_scale, axis=0)
+            accumulator += (
+                tl.dot(a_int8, b) * a_qscale[:, None] * b_channel_scale[None, :]
+            )
+        elif use_mxfp4_w4a8:
+            # WFP4 A8: quantize the BF16 activation tile per token to FP8
+            # (E4M3) in BF16 arithmetic, cast the decoded E2M1 magnitude to
+            # FP8 (exact), run FP8 x FP8 tensor core, then apply the per-token
+            # activation scale and the UE8M0 weight group scale on the FP32
+            # accumulator.  One FP8 MMAC covers exactly one MXFP4 scale group
+            # (BLOCK_SIZE_K == group_size is enforced at launch).
+            fp8_max: tl.constexpr = 448.0
+            a_absmax = tl.maximum(
+                tl.max(tl.abs(a), axis=1), 1.0e-10
+            )
+            a_qscale = a_absmax / fp8_max
+            a_fp8 = tl.clamp(
+                a / a_qscale[:, None], -fp8_max, fp8_max
+            ).to(tl.float8e4nv)
+            b_fp8 = b.to(tl.float8e4nv)
+            # b_scale is repeated along the K rows within one MXFP4 group.
+            # Reduce that repeated view to the per-output-column group scale.
+            b_group_scale = tl.max(b_scale, axis=0)
+            accumulator += (
+                tl.dot(a_fp8, b_fp8)
+                * a_qscale[:, None]
+                * b_group_scale[None, :]
+            )
+        else:
+            # Original WFP4A16 route: decoded weights and activations use BF16.
+            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -412,8 +505,6 @@ def fused_moe_kernel(
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
-    USE_GDC: tl.constexpr = False,
-    GDC_EARLY: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -442,11 +533,6 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        if GDC_EARLY:
-            tl.extra.cuda.gdc_launch_dependents()
-
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -741,9 +827,6 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
-    if USE_GDC and not GDC_EARLY:
-        tl.extra.cuda.gdc_launch_dependents()
-
 
 # -----------------------------------------------------------------------------
 # TMA allocator: set once per process (avoid per-call triton.set_allocator)
@@ -840,6 +923,9 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    use_int4_w4a8: bool = False,
+    use_mxfp4_w4a16: bool = False,
+    use_mxfp4_w4a8: bool = False,
     fuse_swiglu: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
@@ -893,9 +979,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert per_channel_quant, (
-                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
-            )
+            assert (
+                per_channel_quant
+            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -908,7 +994,13 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif (
+        use_int8_w8a16
+        or use_int4_w4a16
+        or use_int4_w4a8
+        or use_mxfp4_w4a16
+        or use_mxfp4_w4a8
+    ):
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
@@ -929,33 +1021,62 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert not fuse_sum_all_reduce, (
-            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        )
-        assert add_output_mask is not None, (
-            "add_output_mask required when fuse_add_to_output=True"
-        )
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when fuse_add_to_output=True"
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert not fuse_add_to_output, (
-            "mask_output and fuse_add_to_output are mutually exclusive"
-        )
-        assert not fuse_sum_all_reduce, (
-            "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        )
-        assert add_output_mask is not None, (
-            "add_output_mask required when mask_output=True"
-        )
+        assert (
+            not fuse_add_to_output
+        ), "mask_output and fuse_add_to_output are mutually exclusive"
+        assert (
+            not fuse_sum_all_reduce
+        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when mask_output=True"
     # ===== END TO BE REFACTORED ====
 
     if (
-        (use_int8_w8a16 or use_int4_w4a16)
+        (
+            use_int8_w8a16
+            or use_int4_w4a16
+            or use_int4_w4a8
+            or use_mxfp4_w4a16
+            or use_mxfp4_w4a8
+        )
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert not fuse_sum_all_reduce, (
-            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
-        )
+        # Kimi-K3 checkpoint weights use packed E2M1 values plus uint8 UE8M0
+        # group scales.  On HCU, keep the packed tensors resident and select
+        # native tile-wise decode instead of treating them as affine INT4.
+        # Other platforms and ordinary INT4 checkpoints preserve the existing
+        # GPTQ/AWQ behavior.
+        if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+            assert _is_hcu, "MXFP4 Triton MoE is only supported on HCU"
+            assert not use_int4_w4a16 and not use_int4_w4a8, (
+                "MXFP4 and affine INT4 modes are exclusive"
+            )
+            assert B_scale is not None and B_scale.dtype == torch.uint8, (
+                "MXFP4 requires uint8 UE8M0 scales"
+            )
+            assert B_zp is None, "MXFP4 E2M1 does not use an affine zero point"
+        if use_int4_w4a8:
+            assert B_zp is None, "INT4 W4A8 does not use an affine zero point"
+        if use_mxfp4_w4a8:
+            # One FP8 MMAC must cover exactly one MXFP4 scale group so that
+            # its UE8M0 scale can be applied after the MMAC.  Copy the config
+            # to keep the caller's cached/default config immutable.
+            config = dict(config)
+            config["BLOCK_SIZE_K"] = block_shape[1]
+            even_Ks = K % config["BLOCK_SIZE_K"] == 0
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -992,6 +1113,9 @@ def invoke_fused_moe_kernel(
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
+            use_mxfp4_w4a8=use_mxfp4_w4a8,
+            use_mxfp4_w4a16=use_mxfp4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,
@@ -1018,11 +1142,6 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
-            if is_arch_support_pdl()
-            else {}
-        )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -1071,13 +1190,11 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
+            FUSE_SWIGLU=fuse_swiglu,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
-            FUSE_SWIGLU=fuse_swiglu,
-            **pdl_kwargs,
             **config,
         )
-
 
 @triton.jit
 def tanh(x):
@@ -1206,102 +1323,6 @@ def act_and_mul_triton(
     )
 
 
-# ============================================================
-# Fused silu_and_mul + per_token_group_quant_fp8 kernel
-# ============================================================
-
-_fp8_type = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
-_FP8_MAX = torch.finfo(_fp8_type).max
-
-
-@triton.jit
-def _fused_silu_mul_quant_fp8_kernel(
-    input_ptr,
-    output_ptr,
-    scale_ptr,
-    num_tokens,
-    hidden_dim,
-    FP8_MAX: tl.constexpr,
-    EPS: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    SWIGLU_LIMIT: tl.constexpr = 0.0,
-    HAS_SWIGLU_LIMIT: tl.constexpr = False,
-):
-    """Fused kernel: silu(gate) * up -> fp8 quantize with block-wise scales."""
-    pid_m = tl.program_id(0)
-    pid_g = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-    mask_m = offs_m < num_tokens
-    mask_k = offs_k < hidden_dim
-    mask = mask_m[:, None] & mask_k[None, :]
-    two_d = hidden_dim * 2
-    base_ptrs = input_ptr + offs_m[:, None] * two_d + offs_k[None, :]
-    gate = tl.load(base_ptrs, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(base_ptrs + hidden_dim, mask=mask, other=0.0).to(tl.float32)
-    # DeepSeek-V4 SwiGLU clamp: gate clamped to [-inf, L], up clamped to [-L, L]
-    if HAS_SWIGLU_LIMIT:
-        gate = tl.minimum(gate, SWIGLU_LIMIT)
-        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-    result = (gate * tl.sigmoid(gate)) * up
-    group_max = tl.max(tl.abs(result), axis=1)
-    scale = group_max / FP8_MAX
-    scale = tl.where(scale > EPS, scale, EPS)
-    result_scaled = result / scale[:, None]
-    result_fp8 = tl.clamp(result_scaled, -FP8_MAX, FP8_MAX).to(
-        output_ptr.dtype.element_ty
-    )
-    out_ptrs = output_ptr + offs_m[:, None] * hidden_dim + offs_k[None, :]
-    tl.store(out_ptrs, result_fp8, mask=mask)
-    num_groups = hidden_dim // GROUP_SIZE
-    scale_mask = mask_m & (pid_g < num_groups)
-    scale_ptrs = scale_ptr + offs_m * num_groups + pid_g
-    tl.store(scale_ptrs, scale, mask=scale_mask)
-
-
-def fused_silu_mul_quant_fp8(x, group_size, swiglu_limit=0.0):
-    """Fused Triton kernel: silu_and_mul + per_token_group_quant_fp8 in one launch.
-
-    Args:
-        x: [num_tokens, 2 * hidden_dim], bf16/fp16, contiguous row-major
-        group_size: quantization group size (e.g. 128 for DeepSeek-V4 block-wise FP8)
-        swiglu_limit: SwiGLU clamp limit (0 = no clamp, 10.0 for DeepSeek-V4).
-            When > 0, gate is clamped to [-inf, L] and up to [-L, L] before
-            silu(gate) * up, matching the DeepSeek-V4 activation contract.
-
-    Returns:
-        (x_fp8, x_scale):
-            x_fp8: [num_tokens, hidden_dim], fp8
-            x_scale: [num_tokens, hidden_dim // group_size], float32, row-major
-    """
-    assert x.is_contiguous(), "Input must be contiguous"
-    num_tokens = x.shape[0]
-    hidden_dim = x.shape[1] // 2
-    num_groups = hidden_dim // group_size
-    assert hidden_dim % group_size == 0
-    x_fp8 = torch.empty(num_tokens, hidden_dim, device=x.device, dtype=_fp8_type)
-    x_scale = torch.empty(num_tokens, num_groups, device=x.device, dtype=torch.float32)
-    BLOCK_M = 128
-    grid = (triton.cdiv(num_tokens, BLOCK_M), num_groups)
-    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
-    _fused_silu_mul_quant_fp8_kernel[grid](
-        x,
-        x_fp8,
-        x_scale,
-        num_tokens,
-        hidden_dim,
-        FP8_MAX=_FP8_MAX,
-        EPS=1e-10,
-        GROUP_SIZE=group_size,
-        BLOCK_M=BLOCK_M,
-        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
-        HAS_SWIGLU_LIMIT=has_swiglu_limit,
-        num_warps=4,
-    )
-    return x_fp8, x_scale
-
-
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
@@ -1319,7 +1340,6 @@ def _moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
-    USE_GDC: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -1337,10 +1357,6 @@ def _moe_sum_reduce_kernel(
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
@@ -1379,7 +1395,6 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
@@ -1393,7 +1408,6 @@ def moe_sum_reduce_triton(
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
         num_warps=num_warps,
-        **pdl_kwargs,
     )
     return
 
@@ -1408,8 +1422,6 @@ def _fused_append_shared_experts_kernel(
     scale_factor,  # runtime scalar
     K: tl.constexpr,
     S: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_S: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1427,25 +1439,20 @@ def _fused_append_shared_experts_kernel(
     out_ids_row_ptr = pid * (K + S)
     out_w_row_ptr = pid * (K + S)
 
-    # tl.arange requires a power-of-2 range, but K (topk) and S (num shared
-    # experts) need not be pow2 -- DeepSeek-V4 uses top-6. Iterate over the
-    # next-pow2 block and mask the tail (mirrors the _with_weights sibling).
-    offs_k = tl.arange(0, BLOCK_K)
-    mask_k = offs_k < K
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
-    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
+    offs_k = tl.arange(0, K)
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws)
 
-    offs_s = tl.arange(0, BLOCK_S)
-    mask_s = offs_s < S
+    offs_s = tl.arange(0, S)
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
-    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
-    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws)
 
 
 def fused_append_shared_experts(
@@ -1471,8 +1478,6 @@ def fused_append_shared_experts(
         scale_factor=scale_factor,
         K=k,
         S=s,
-        BLOCK_K=triton.next_power_of_2(k),
-        BLOCK_S=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1487,13 +1492,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     shared_id_base,  # runtime scalar: ep_rank * num_local_experts + num_local_routed
     num_local_routed,  # runtime scalar: routed experts per rank (for gap-insertion)
     scale_factor,  # runtime scalar: shared-expert weight
-    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
-    pad_fill_id,  # runtime scalar: routed-id fill for padded rows
     K: tl.constexpr,
     S: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_S: tl.constexpr,
-    HAS_PADDING: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1502,8 +1502,7 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
-    Routed IDs:   e -> e + (e // num_local_routed) * S  (insert S-wide gaps for
-                  the shared slots that precede this id's rank)
+    Routed IDs:   e -> e + e // num_local_routed   (insert gaps for shared slots)
     Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
     Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
     """
@@ -1512,43 +1511,23 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     ids_row_ptr = pid * K
     out_ids_row_ptr = pid * (K + S)
 
-    # tl.arange requires a power-of-2 range, but K (topk) and S (num shared
-    # experts) need not be pow2 -- DeepSeek-V4 uses top-6. Iterate over the
-    # next-pow2 block and mask the tail (mirrors the _append/_with_weights
-    # siblings), otherwise K=6 fails with "arange's range must be a power of 2".
-    offs_k = tl.arange(0, BLOCK_K)
-    mask_k = offs_k < K
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
-    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    offs_k = tl.arange(0, K)
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k)
 
-    # DeepEP interleaved layout: shift each routed id past ALL shared slots that
-    # precede its rank. Rank r == id // num_local_routed contributes r*S shared
-    # slots ahead of the id, so the gap is (id // num_local_routed) * S -- not a
-    # single slot. With S == 1 this reduces to the old `id // num_local_routed`,
-    # but S > 1 (e.g. multiple fused shared experts) needs the full S-wide gap or
-    # routed ids collide with an earlier rank's shared slots.
-    ids = ids + (ids // num_local_routed) * S
+    # DeepEP interleaved layout: shift each routed id past the shared slots that
+    # precede it. Matches `routed + routed // num_local_routed` exactly.
+    ids = ids + ids // num_local_routed
 
-    if HAS_PADDING:
-        # Fold the padded-topk_ids fill (previously a separate _fill_padded_rows
-        # launch): rows >= num_token_non_padded get pad_fill_id in every routed
-        # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
-        # ids is a BLOCK_K-wide register tile (K need not be pow2), so fill the
-        # whole tile and let the masked store below drop the tail.
-        n_valid = tl.load(num_token_non_padded_ptr)
-        if pid >= n_valid:
-            ids = tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
+    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
-
-    offs_s = tl.arange(0, BLOCK_S)
-    mask_s = offs_s < S
+    offs_s = tl.arange(0, S)
     shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
-    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
-    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws, mask=mask_s)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
+    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws)
 
 
 def fused_append_remap_shared_experts_deepep(
@@ -1558,8 +1537,6 @@ def fused_append_remap_shared_experts_deepep(
     scale_factor,
     shared_id_base,
     num_local_routed,
-    num_token_non_padded=None,
-    pad_fill_id=0,
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
@@ -1577,9 +1554,6 @@ def fused_append_remap_shared_experts_deepep(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
-    has_padding = num_token_non_padded is not None
-    # Placeholder pointer when no padding (never dereferenced: HAS_PADDING False).
-    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_remap_shared_experts_deepep_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1588,13 +1562,8 @@ def fused_append_remap_shared_experts_deepep(
         shared_id_base,
         num_local_routed,
         scale_factor,
-        ntnp_ptr,
-        pad_fill_id,
         K=k,
         S=s,
-        BLOCK_K=triton.next_power_of_2(k),
-        BLOCK_S=triton.next_power_of_2(s),
-        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1607,8 +1576,6 @@ def _fused_append_shared_experts_with_weights_kernel(
     shared_weights_ptr,
     out_ids_ptr,
     out_weights_ptr,
-    hidden_ptr,
-    wgate_ptr,
     N_BASE,
     scale,
     K: tl.constexpr,
@@ -1616,9 +1583,6 @@ def _fused_append_shared_experts_with_weights_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
     APPLY_SIGMOID: tl.constexpr,
-    FUSE_GATE: tl.constexpr,
-    HIDDEN: tl.constexpr,
-    BLOCK_H: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -1636,20 +1600,12 @@ def _fused_append_shared_experts_with_weights_kernel(
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
-    if FUSE_GATE:
-        offs_h = tl.arange(0, BLOCK_H)
-        mask_h = offs_h < HIDDEN
-        h = tl.load(hidden_ptr + pid * HIDDEN + offs_h, mask=mask_h, other=0.0).to(
-            tl.float32
-        )
-        w = tl.load(wgate_ptr + offs_h, mask=mask_h, other=0.0).to(tl.float32)
-        logit = tl.sum(h * w)
-        shared_val = tl.sigmoid(logit) * scale
-        shared_ws = tl.zeros((BLOCK_S,), dtype=tl.float32) + shared_val
-    else:
-        shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
-        if APPLY_SIGMOID:
-            shared_ws = tl.sigmoid(shared_ws.to(tl.float32)) * scale
+    shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
+    if APPLY_SIGMOID:
+        # Fuse sigmoid(shared_gate) + dtype upcast (+ optional 1/ep_size scale)
+        # in-register so the raw bf16 logits stream straight into the fp32
+        # output, eliminating the standalone sigmoid and bf16->fp32 copy kernels.
+        shared_ws = tl.sigmoid(shared_ws.to(tl.float32)) * scale
 
     tl.store(out_ids_ptr + out_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_row_ptr + K + offs_s, shared_ws, mask=mask_s)
@@ -1662,65 +1618,31 @@ def fused_append_shared_experts_with_weights(
     num_fused_shared_experts,
     N=None,
     apply_sigmoid=False,
-    fuse_gate=False,
-    hidden_states=None,
-    gate_weight=None,
     scale=1.0,
 ):
     """Like fused_append_shared_experts but accepts per-token shared weights tensor.
 
-    Two optional in-kernel fusions are supported (both default off → legacy
-    behavior is preserved byte-for-byte):
-
-    - ``apply_sigmoid=True``: ``shared_weights`` are treated as raw gate logits;
-      the kernel applies ``sigmoid`` (in fp32) and the optional ``scale``
-      in-register, so the caller can skip the separate ``sigmoid`` activation
-      and the bf16->fp32 cast.
-    - ``fuse_gate=True``: the shared_expert_gate GEMV
-      (``hidden_states @ gate_weight.T``) + sigmoid + ``scale`` are computed
-      *inside* the kernel, eliminating the standalone gate GEMM launch.
-      ``shared_weights`` is ignored; ``hidden_states`` ([M, HIDDEN]) and
-      ``gate_weight`` ([1, HIDDEN] or [HIDDEN]) must be provided. This subsumes
-      ``apply_sigmoid`` (the sigmoid is intrinsic), so the two are mutually
-      exclusive.
+    When ``apply_sigmoid`` is True, ``shared_weights`` are treated as raw gate
+    logits: the kernel applies ``sigmoid`` (in fp32) and the optional ``scale``
+    in-register, so the caller can skip the separate ``sigmoid`` activation and
+    the bf16->fp32 cast. When False the legacy behavior is preserved exactly.
     """
-    assert not (fuse_gate and apply_sigmoid), (
-        "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
-    )
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
     if s <= 0:
         return topk_ids, topk_weights
 
-    if fuse_gate:
-        assert hidden_states is not None and gate_weight is not None, (
-            "fuse_gate=True requires hidden_states and gate_weight"
-        )
-        hidden_arg = hidden_states.contiguous()
-        wgate_arg = gate_weight.reshape(-1).contiguous()
-        hidden_dim = hidden_arg.shape[1]
-        block_h = triton.next_power_of_2(hidden_dim)
-        shared_arg = topk_weights
-        num_warps = 8
-    else:
-        # When fusing sigmoid in-kernel (apply_sigmoid), keep the raw logits
-        # dtype (the kernel emits fp32 directly); otherwise match the output
-        # weight dtype as before.
-        shared_weights_2d = (
-            shared_weights if apply_sigmoid else shared_weights.to(topk_weights.dtype)
-        )
-        if shared_weights_2d.ndim == 1:
-            shared_weights_2d = shared_weights_2d.unsqueeze(-1)
-        if shared_weights_2d.shape[1] < s:
-            shared_weights_2d = shared_weights_2d.expand(m, s)
-        shared_arg = shared_weights_2d.contiguous()
-        # hidden_ptr / wgate_ptr are unused; pass placeholders.
-        hidden_arg = topk_weights
-        wgate_arg = topk_weights
-        hidden_dim = 1
-        block_h = 1
-        num_warps = 1
+    # When fusing sigmoid in-kernel, keep the raw logits dtype (the kernel emits
+    # fp32 directly); otherwise match the output weight dtype as before.
+    shared_weights_2d = (
+        shared_weights if apply_sigmoid else shared_weights.to(topk_weights.dtype)
+    )
+    if shared_weights_2d.ndim == 1:
+        shared_weights_2d = shared_weights_2d.unsqueeze(-1)
+    if shared_weights_2d.shape[1] < s:
+        shared_weights_2d = shared_weights_2d.expand(m, s)
+    shared_weights_2d = shared_weights_2d.contiguous()
 
     out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
     out_weights = torch.empty(
@@ -1733,11 +1655,9 @@ def fused_append_shared_experts_with_weights(
     _fused_append_shared_experts_with_weights_kernel[(m,)](
         topk_ids,
         topk_weights,
-        shared_arg,
+        shared_weights_2d,
         out_ids,
         out_weights,
-        hidden_arg,
-        wgate_arg,
         N_BASE=N,
         scale=scale,
         K=k,
@@ -1745,9 +1665,6 @@ def fused_append_shared_experts_with_weights(
         BLOCK_K=block_k,
         BLOCK_S=block_s,
         APPLY_SIGMOID=apply_sigmoid,
-        FUSE_GATE=fuse_gate,
-        HIDDEN=hidden_dim,
-        BLOCK_H=block_h,
-        num_warps=num_warps,
+        num_warps=1,
     )
     return out_ids, out_weights

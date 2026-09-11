@@ -315,7 +315,8 @@ def _print_diagnostics(unkillable_pids):
             print(f"  {line}")
     else:
         print(
-            "\n[killall] Diagnostic — no sglang/python/gpu processes in this container"
+            "\n[killall] Diagnostic — no sglang/python/gpu processes "
+            "in this container"
         )
 
 

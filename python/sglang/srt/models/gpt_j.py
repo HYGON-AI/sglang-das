@@ -49,6 +49,7 @@ from sglang.srt.utils import add_prefix
 
 
 class GPTJAttention(nn.Module):
+
     def __init__(
         self,
         layer_id: int,
@@ -117,6 +118,7 @@ class GPTJAttention(nn.Module):
 
 
 class GPTJMLP(nn.Module):
+
     def __init__(
         self,
         intermediate_size: int,
@@ -149,6 +151,7 @@ class GPTJMLP(nn.Module):
 
 
 class GPTJBlock(nn.Module):
+
     def __init__(
         self,
         layer_id: int,
@@ -191,6 +194,7 @@ class GPTJBlock(nn.Module):
 
 
 class GPTJModel(nn.Module):
+
     def __init__(
         self,
         config: GPTJConfig,
@@ -238,6 +242,7 @@ class GPTJModel(nn.Module):
 
 
 class GPTJForCausalLM(nn.Module):
+
     def __init__(
         self,
         config: GPTJConfig,

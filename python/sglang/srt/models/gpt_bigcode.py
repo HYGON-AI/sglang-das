@@ -42,6 +42,7 @@ from sglang.srt.utils import add_prefix
 
 
 class GPTBigCodeAttention(nn.Module):
+
     def __init__(
         self,
         layer_id: int,
@@ -113,6 +114,7 @@ class GPTBigCodeAttention(nn.Module):
 
 
 class GPTBigMLP(nn.Module):
+
     def __init__(
         self,
         intermediate_size: int,
@@ -148,6 +150,7 @@ class GPTBigMLP(nn.Module):
 
 
 class GPTBigCodeBlock(nn.Module):
+
     def __init__(
         self,
         layer_id: int,
@@ -190,6 +193,7 @@ class GPTBigCodeBlock(nn.Module):
 
 
 class GPTBigCodeModel(nn.Module):
+
     def __init__(
         self,
         config: GPTBigCodeConfig,

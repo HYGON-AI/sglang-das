@@ -195,10 +195,10 @@ def tail_attn_meta(
         return None
     seq = shard.sp_size * (shard.local_len + image_seq_len)
     valid = seq - shard.num_pad
-    row_starts = torch.arange(batch_size, dtype=torch.int32, device=device) * seq
+    row = torch.tensor([valid, shard.num_pad], dtype=torch.int32, device=device)
+    seglens = row.repeat(batch_size)
     cu_seqlens = torch.zeros(2 * batch_size + 1, dtype=torch.int32, device=device)
-    cu_seqlens[1::2] = row_starts + valid
-    cu_seqlens[2::2] = row_starts + seq
+    cu_seqlens[1:] = torch.cumsum(seglens, dim=0)
     return {
         "pad_start": valid,
         "pad_end": seq,

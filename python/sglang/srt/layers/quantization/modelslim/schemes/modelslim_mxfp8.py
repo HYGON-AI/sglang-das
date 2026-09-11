@@ -24,6 +24,7 @@ MXFP8_BLOCK_SIZE = 32
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
+
     def __init__(
         self,
         quant_config: Optional[Dict[str, any]] = None,

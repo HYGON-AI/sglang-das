@@ -10,10 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import (
-    get_schema_properties,
-    safe_literal_eval,
-)
+from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +22,7 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -
         return None
     tool = name2tool[func_name]
     parameters = tool.function.parameters or {}
-    properties = get_schema_properties(parameters)
+    properties = parameters.get("properties", {})
     if arg_key not in properties:
         return None
     return properties[arg_key].get("type", None)

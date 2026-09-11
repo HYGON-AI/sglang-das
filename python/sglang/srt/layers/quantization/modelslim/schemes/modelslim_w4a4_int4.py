@@ -16,6 +16,7 @@ from sglang.srt.utils import set_weight_attrs
 
 
 class ModelSlimW4A4Int4(ModelSlimLinearScheme):
+
     def __init__(
         self,
         quant_config: Dict[str, any],

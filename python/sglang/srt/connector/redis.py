@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class RedisConnector(BaseKVConnector):
+
     def __init__(self, url: str):
         import redis
 

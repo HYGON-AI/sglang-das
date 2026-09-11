@@ -342,9 +342,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-        hidden_states, hidden_scales, topk_ids, _, masked_m, expected_m = (
-            dispatch_output
-        )
+        hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
 
         if hidden_scales is None:
             raise RuntimeError(
@@ -378,7 +376,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
-            expected_m=expected_m,
         )
 
         return output

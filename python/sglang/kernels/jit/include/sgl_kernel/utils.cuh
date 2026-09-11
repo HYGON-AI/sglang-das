@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -86,7 +87,7 @@ using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 using fp32x4_t = float4;
 #else
 // HCU: native HIP FP8 vector types instead of the uint-backed aliases used by
-// generic ROCm, so the HCU elementwise/quantization kernels keep their typed
+// generic ROCm, so the DCU elementwise/quantization kernels keep their typed
 // conversions.
 using fp32_t = float;
 using fp16_t = __half;
@@ -186,10 +187,7 @@ template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
 #if SGL_ARCH_HOPPER_OR_GREATER
   if constexpr (kUsePDL) {
-    // The "memory" clobber is load-bearing: without it the compiler may sink
-    // this kernel's stores past the trigger, and the dependent grid's
-    // griddepcontrol.wait only covers writes issued BEFORE launch_dependents.
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" :::);
   }
 #endif
 }
@@ -272,6 +270,11 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
 
 struct LaunchKernel {
  public:
+  struct KernelConfig {
+    bool use_pdl = false;
+    std::optional<dim3> cluster_dim = std::nullopt;
+  };
+
   explicit LaunchKernel(
       dim3 grid_dim,
       dim3 block_dim,
@@ -310,6 +313,13 @@ struct LaunchKernel {
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
     // Cluster not supported in HIP
+    (void)cluster_dim;
+    return *this;
+  }
+
+  auto config(const KernelConfig& config) -> LaunchKernel& {
+    // PDL and clusters are not supported in HIP.
+    (void)config;
     return *this;
   }
 
@@ -325,6 +335,11 @@ struct LaunchKernel {
             m_dynamic_shared_mem_bytes,
             m_stream),
         m_location);
+  }
+
+  template <typename T, typename... Args>
+  auto launch(T&& kernel, Args&&... args) const -> void {
+    return (*this)(std::forward<T>(kernel), std::forward<Args>(args)...);
   }
 
  private:
@@ -345,6 +360,13 @@ inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
+}
+
+inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
+  if (required_bytes == 0) return {};
+  DLDataType u8 = {kDLUInt, 8, 1};
+  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
+  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
 }
 
 /**

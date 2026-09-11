@@ -15,6 +15,7 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -54,9 +55,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         NOTE: `dst` is the local rank of the destination rank.
         """
         world_size = self.world_size
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -106,6 +107,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
 
 class _CPUSHMDistributed:
+
     def __init__(self, communicator: CpuCommunicator):
         instance_identifier = os.environ["VLLM_DIST_IDENT"]
         unique_name = communicator.unique_name

@@ -78,6 +78,7 @@ def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]
 
 
 class AfmoeMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -117,6 +118,7 @@ class AfmoeMLP(nn.Module):
 
 
 class AfmoeMoE(nn.Module):
+
     @staticmethod
     def _custom_routing_function(
         hidden_states: torch.Tensor,
@@ -298,6 +300,7 @@ class AfmoeMoE(nn.Module):
 
 
 class AfmoeAttention(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -418,6 +421,7 @@ class AfmoeAttention(nn.Module):
 
 
 class AfmoeDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -495,6 +499,7 @@ class AfmoeDecoderLayer(nn.Module):
 
 
 class AfmoeModel(nn.Module):
+
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -550,6 +555,7 @@ class AfmoeModel(nn.Module):
 
 
 class AfmoeForCausalLM(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,

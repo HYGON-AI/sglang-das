@@ -33,7 +33,6 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn",
-  "flashinfer_python[cu13]==0.6.17", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "humming-kernels[cu13]==0.1.10",
   "interegular",

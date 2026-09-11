@@ -62,6 +62,7 @@ def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
 
 
 class XPUAttentionImpl(AttentionImpl):
+
     def __init__(
         self,
         num_heads: int,

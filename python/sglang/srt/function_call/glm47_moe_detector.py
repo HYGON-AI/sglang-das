@@ -17,7 +17,6 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
-    get_schema_properties,
     infer_type_from_json_schema,
     safe_literal_eval,
 )
@@ -80,8 +79,15 @@ def get_argument_type(
 
     # Get parameters safely using getattr
     params = getattr(tool.function, "parameters", None)
+    if not isinstance(params, dict):
+        return None
 
-    arg_spec = get_schema_properties(params).get(arg_key)
+    # Navigate to the type using dict.get() for safe access
+    properties = params.get("properties")
+    if not isinstance(properties, dict):
+        return None
+
+    arg_spec = properties.get(arg_key)
     if isinstance(arg_spec, dict):
         # Use the new type inference function for complex JSON Schema support
         return infer_type_from_json_schema(arg_spec)
@@ -607,9 +613,8 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._is_first_param and not self._sent_empty_object:
-            # The streamed outer `{` is only closed here; a trailing "}" in
-            # _last_arguments may belong to a nested object value.
+        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
+            # Need to close brace
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
@@ -627,9 +632,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                 pairs = self.func_arg_regex.findall(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
-                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
-                        arguments
-                    )
+                    self.prev_tool_call_arr[self.current_tool_id][
+                        "arguments"
+                    ] = arguments
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 

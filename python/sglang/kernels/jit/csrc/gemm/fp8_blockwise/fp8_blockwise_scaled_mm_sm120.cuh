@@ -15,7 +15,6 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -161,7 +160,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     }
 
     size_t workspace_size = gemm_op.get_workspace_size(args);
-    auto workspace_tensor = host::ffi::alloc_workspace_tensor(workspace_size, a.device());
+    auto workspace_tensor = alloc_workspace_tensor(workspace_size, a.device());
     void* workspace = (workspace_size == 0) ? nullptr : workspace_tensor.data_ptr();
 
     auto init_status = gemm_op.initialize(args, workspace, stream);
@@ -380,7 +379,7 @@ void launch_sm120_fp8_blockwise_scaled_mm_swapab(
     }
 
     size_t workspace_size = gemm_op.get_workspace_size(args);
-    auto workspace_tensor = host::ffi::alloc_workspace_tensor(workspace_size, a.device());
+    auto workspace_tensor = alloc_workspace_tensor(workspace_size, a.device());
     void* workspace = (workspace_size == 0) ? nullptr : workspace_tensor.data_ptr();
 
     auto init_status = gemm_op.initialize(args, workspace, stream);

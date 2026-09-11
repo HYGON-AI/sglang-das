@@ -1,4 +1,3 @@
-import types
 from typing import List, Union
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
@@ -7,43 +6,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-
-# Sarashina2Vision's remote-code `_preprocess` takes a narrow kwarg set, while
-# transformers' `preprocess` forwards its full one, so the extras have to be
-# dropped.
-_PREPROCESS_PARAMS = frozenset(
-    {
-        "do_resize",
-        "resample",
-        "do_rescale",
-        "rescale_factor",
-        "do_normalize",
-        "image_mean",
-        "image_std",
-        "do_convert_rgb",
-        "data_format",
-        "input_data_format",
-    }
-)
-
-
-def _install_preprocess_kwarg_filter(image_processor) -> None:
-    """Drop the kwargs Sarashina2Vision's `_preprocess` cannot accept.
-
-    Bound with `types.MethodType` rather than closing over `image_processor`, so
-    that a preprocessing worker's `copy.deepcopy` rebinds `__self__` to its own
-    clone instead of routing every thread back into this one.
-    """
-    unfiltered_preprocess = type(image_processor)._preprocess
-
-    def _preprocess(self, *args, **kwargs):
-        return unfiltered_preprocess(
-            self,
-            *args,
-            **{k: v for k, v in kwargs.items() if k in _PREPROCESS_PARAMS},
-        )
-
-    image_processor._preprocess = types.MethodType(_preprocess, image_processor)
 
 
 class Sarashina2VisionProcessor(BaseMultimodalProcessor):
@@ -63,10 +25,33 @@ class Sarashina2VisionProcessor(BaseMultimodalProcessor):
             image_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
+        # Patch the processor's image processor to handle parameter compatibility
         if hasattr(_processor, "image_processor") and hasattr(
-            type(_processor.image_processor), "_preprocess"
+            _processor.image_processor, "_preprocess"
         ):
-            _install_preprocess_kwarg_filter(_processor.image_processor)
+            original_preprocess = _processor.image_processor._preprocess
+
+            def patched_preprocess(*args, **kwargs):
+                # Filter kwargs to only include parameters that the custom _preprocess method accepts
+                # Based on Sarashina2VisionImageProcessor._preprocess signature
+                allowed_params = {
+                    "do_resize",
+                    "resample",
+                    "do_rescale",
+                    "rescale_factor",
+                    "do_normalize",
+                    "image_mean",
+                    "image_std",
+                    "do_convert_rgb",
+                    "data_format",
+                    "input_data_format",
+                }
+                filtered_kwargs = {
+                    k: v for k, v in kwargs.items() if k in allowed_params
+                }
+                return original_preprocess(*args, **filtered_kwargs)
+
+            _processor.image_processor._preprocess = patched_preprocess
 
     async def process_mm_data_async(
         self,
@@ -83,7 +68,7 @@ class Sarashina2VisionProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output=base_output,
             mm_tokens=self.mm_tokens,
         )

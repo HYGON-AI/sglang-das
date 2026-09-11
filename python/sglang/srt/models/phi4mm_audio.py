@@ -383,9 +383,9 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             if nemo_conv_settings:
                 default_nemo_conv_settings.update(nemo_conv_settings)
                 for i in ["subsampling_factor", "feat_in", "feat_out"]:
-                    assert i not in nemo_conv_settings, (
-                        "{i} should be specified outside of the NeMo dictionary"
-                    )
+                    assert (
+                        i not in nemo_conv_settings
+                    ), "{i} should be specified outside of the NeMo dictionary"
 
             self.embed = NemoConvSubsampling(
                 **default_nemo_conv_settings,
@@ -403,9 +403,9 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             else None
         )
         if self.relative_attention_bias_type == "t5":
-            assert self.num_heads % self.attention_group_size == 0, (
-                "attention_group_size must divide n_head"
-            )
+            assert (
+                self.num_heads % self.attention_group_size == 0
+            ), "attention_group_size must divide n_head"
             self.relative_attention_bias_layer = T5RelativeAttentionLogitBias(
                 self.num_heads // self.attention_group_size,
                 max_distance=relative_attention_bias_args.get(
@@ -477,7 +477,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
                 )
             if len(left_chunk) != len(chunk_size):
                 raise ValueError(
-                    "The length of left_chunk must be the same as length of chunk_size."
+                    "The length of left_chunk must be the same as length of "
+                    "chunk_size."
                 )
             left_chunk_train_eff = left_chunk[chunk_size_index]
         else:
@@ -560,7 +561,9 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             seq_len, batch_size, self.chunk_size, self.left_chunk
         )
 
-        enc_streaming_mask = enc_streaming_mask.to(xs_pad.device)
+        if xs_pad.is_cuda:
+            enc_streaming_mask = enc_streaming_mask.cuda()
+            xs_pad = xs_pad.cuda()
 
         input_tensor = xs_pad
         input_tensor, masks = self._forward_embeddings_core(input_tensor, masks)
@@ -577,7 +580,8 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             enc_streaming_mask_nc = self._streaming_mask(
                 seq_len, batch_size, chunk_size_nc, left_chunk_nc
             )
-            enc_streaming_mask_nc = enc_streaming_mask_nc.to(xs_pad.device)
+            if xs_pad.is_cuda:
+                enc_streaming_mask_nc = enc_streaming_mask_nc.cuda()
             if masks is not None:
                 hs_mask_nc = masks & enc_streaming_mask_nc
             else:
@@ -836,9 +840,9 @@ class ConformerEncoder(TransformerEncoderBase):
         self.replication_pad_for_subsample_embedding: bool = (
             replication_pad_for_subsample_embedding
         )
-        assert self.num_heads % attention_group_size == 0, (
-            "attention_group_size must divide n_head"
-        )
+        assert (
+            self.num_heads % attention_group_size == 0
+        ), "attention_group_size must divide n_head"
         self.num_heads_k = self.num_heads // attention_group_size
 
         self.encoders = MultiSequential(
@@ -1113,9 +1117,9 @@ class AudioEmbedding(nn.Module):
             self.qformer = None
 
         if kwargs.get("use_conv_downsample", False):
-            assert self.qformer is None, (
-                "don't support use qformer and conv downsample together"
-            )
+            assert (
+                self.qformer is None
+            ), "don't support use qformer and conv downsample together"
             nemo_conv_settings = kwargs.get("nemo_conv_settings", {})
             default_nemo_conv_settings = {
                 "subsampling": "dw_striding",
@@ -1131,9 +1135,9 @@ class AudioEmbedding(nn.Module):
             if nemo_conv_settings:
                 default_nemo_conv_settings.update(nemo_conv_settings)
                 for i in ["subsampling_factor", "feat_in", "feat_out"]:
-                    assert i not in nemo_conv_settings, (
-                        "{i} should be specified outside of the NeMo dictionary"
-                    )
+                    assert (
+                        i not in nemo_conv_settings
+                    ), "{i} should be specified outside of the NeMo dictionary"
 
             self.conv_ds = NemoConvSubsampling(
                 **default_nemo_conv_settings,
@@ -1230,7 +1234,7 @@ class AudioEmbedding(nn.Module):
             audio_set_tensor = self.audio_projection_for_vision(audio_features)
         else:
             raise ValueError(
-                f"audio_projection_mode = {audio_projection_mode} not implemented"
+                f"audio_projection_mode = {audio_projection_mode} not " "implemented"
             )
 
         return audio_set_tensor

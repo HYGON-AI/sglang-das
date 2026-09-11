@@ -179,6 +179,7 @@ class GraniteMoeHybridAttention(nn.Module):
         )
 
         if config.position_embedding_type == "rope":
+
             self.rotary_emb = get_rope(
                 head_size=self.head_dim,
                 rotary_dim=self.head_dim,  # its not in the config

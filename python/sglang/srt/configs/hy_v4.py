@@ -1,7 +1,13 @@
-from transformers.configuration_utils import PreTrainedConfig
+# Hunyuan-V4 (Hy4-preview) model configuration.
+#
+# Ported from an internal fork's ``configs/hy_v4.py`` (itself adapted from
+# upstream sgl-project/sglang PR #36805 "Support Hy4-preview"). The schema is
+# unchanged: MLA + DSA/NSA sparse attention + sigmoid-gated MoE + iHC
+# (interleaved hyper-connection) + gated MLA + learnable attention sinks.
+from transformers.configuration_utils import PretrainedConfig
 
 
-class HYV4Config(PreTrainedConfig):
+class HYV4Config(PretrainedConfig):
     model_type = "hy_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_local_experts": "n_routed_experts"}

@@ -110,6 +110,7 @@ class FluxArchConfig(DiTArchConfig):
 
 @dataclass
 class FluxConfig(DiTConfig):
+
     arch_config: DiTArchConfig = field(default_factory=FluxArchConfig)
 
     prefix: str = "Flux"

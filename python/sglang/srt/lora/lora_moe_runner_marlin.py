@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import DispatchMoeRunnerCore, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -38,7 +37,7 @@ if _is_cuda:
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 
-class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
+class MarlinLoraRunnerCore:
     """
     MoE runner using Marlin kernels for base projections, with hooks for LoRA.
 
@@ -53,10 +52,6 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
 
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
-
-    @property
-    def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.MARLIN
 
     def run_from_dispatch(
         self,
@@ -75,9 +70,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         topk_ids = topk_output.topk_ids
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
-        assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
-            "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
-        )
+        assert (
+            torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
         routed_scaling_factor = runner_config.routed_scaling_factor
 
         M, K = hidden_states.shape

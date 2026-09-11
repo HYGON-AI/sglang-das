@@ -67,11 +67,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend, get_token_to_kv_pool
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_stream
+from sglang.srt.runtime_context import get_parallel, get_forward,get_stream
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, make_layers
 from sglang.srt.utils.common import LazyValue
@@ -83,9 +83,81 @@ _use_fused_hunyuan_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _use_aiter = (
     get_bool_env_var("SGLANG_USE_AITER") and is_hip() and not _is_hcu
 )
+_use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 
 if _is_hcu:
     from lightop import rms_rotary_embedding_fuse_with_kv_store
+
+
+def _pack_hy3_sp_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tp_size: int,
+    q_size: int,
+    kv_size: int,
+    total_num_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Pack sequence-sharded full QKV into equal head shards for all-to-all."""
+    tokens_per_rank = q.shape[0]
+    q = q.view(tokens_per_rank, tp_size, q_size)
+    if total_num_kv_heads >= tp_size:
+        k = k.view(tokens_per_rank, tp_size, kv_size)
+        v = v.view(tokens_per_rank, tp_size, kv_size)
+    else:
+        kv_replicas = tp_size // total_num_kv_heads
+        k = k.view(tokens_per_rank, total_num_kv_heads, head_dim)
+        v = v.view(tokens_per_rank, total_num_kv_heads, head_dim)
+        k = k.repeat_interleave(kv_replicas, dim=1)
+        v = v.repeat_interleave(kv_replicas, dim=1)
+    return torch.cat([q, k, v], dim=-1).permute(1, 0, 2).contiguous()
+
+
+def _merge_hy3_sp_attention_output(
+    attn_output_by_source_rank: torch.Tensor,
+) -> torch.Tensor:
+    """Merge all-to-all output back into a local sequence shard with all Q heads."""
+    return (
+        attn_output_by_source_rank.permute(1, 0, 2)
+        .contiguous()
+        .flatten(start_dim=1)
+    )
+
+
+def _apply_hy3_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply HY3's shared per-head Q/K RMSNorm and preserve packed widths."""
+    q_shape = q.shape
+    k_shape = k.shape
+    q = q_norm(q.reshape(-1, head_dim)).view(q_shape)
+    k = k_norm(k.reshape(-1, head_dim)).view(k_shape)
+    return q, k
+
+
+def _reshape_hy3_sp_attention_output(
+    attn_output: torch.Tensor,
+    tp_size: int,
+    q_size: int,
+) -> torch.Tensor:
+    """Split global-sequence attention output by its source sequence rank."""
+    if attn_output.ndim != 2 or attn_output.shape[1] != q_size:
+        raise ValueError(
+            "HY3 SP attention output must have shape [num_tokens, q_size], "
+            f"got {tuple(attn_output.shape)} with q_size={q_size}."
+        )
+    if attn_output.shape[0] % tp_size != 0:
+        raise ValueError(
+            "HY3 SP attention output token count must be divisible by the "
+            f"attention TP size, got {attn_output.shape[0]} and {tp_size}."
+        )
+    tokens_per_rank = attn_output.shape[0] // tp_size
+    return attn_output.view(tp_size, tokens_per_rank, q_size)
 
 
 class HYV3FeedForward(nn.Module):
@@ -126,16 +198,10 @@ class HYV3FeedForward(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(
-        self,
-        x,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ):
-        skip_all_reduce = should_allreduce_fusion or use_reduce_scatter
+    def forward(self, x, forward_batch: Optional[ForwardBatch] = None):
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out, skip_all_reduce=skip_all_reduce)
+        out, _ = self.down_proj(out)
         return out
 
 
@@ -206,7 +272,9 @@ class HYV3MoEFused(nn.Module):
             scoring_func=scoring_func,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=self.router_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            apply_routed_scaling_factor_on_output=(
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_lightop
+            ),
         )
 
         if getattr(config, "num_shared_experts", 0) > 0:
@@ -266,7 +334,9 @@ class HYV3MoEFused(nn.Module):
         # apply_routed_scaling_factor_on_output through to moe_fused_gate,
         # lightop no longer bakes rsf when apply is False (Hy3 W8A8+triton).
         scale_already_applied = (
-            self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+            or _use_lightop
+            or _use_aiter
         )
         if scale_already_applied:
             if shared_output is not None:
@@ -282,17 +352,11 @@ class HYV3MoEFused(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        return self.forward_normal(
-            hidden_states,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-        )
+        return self.forward_normal(hidden_states)
 
     def _forward_deepep(
         self,
@@ -337,35 +401,17 @@ class HYV3MoEFused(nn.Module):
 
         return final_hidden_states.view(orig_shape)
 
-    def forward_normal(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if (
             self.alt_stream is not None
             and self.shared_mlp is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
-            return self._forward_dual_stream(
-                hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
-        return self._forward_single_stream(
-            hidden_states,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-        )
+            return self._forward_dual_stream(hidden_states)
+        return self._forward_single_stream(hidden_states)
 
-    def _forward_single_stream(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def _forward_single_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -399,15 +445,11 @@ class HYV3MoEFused(nn.Module):
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
@@ -415,12 +457,7 @@ class HYV3MoEFused(nn.Module):
 
         return final_hidden_states.view(orig_shape)
 
-    def _forward_dual_stream(
-        self,
-        hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    def _forward_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Shared experts on main stream, routed experts on alt stream."""
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -460,15 +497,11 @@ class HYV3MoEFused(nn.Module):
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
@@ -508,32 +541,55 @@ class HYV3Attention(nn.Module):
         self.head_dim = getattr(config, "head_dim", hidden_size // self.total_num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.q_size_full = self.total_num_heads * self.head_dim
+        self.kv_size_full = self.total_num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.use_qk_norm = getattr(
             config, "use_qk_norm", getattr(config, "qk_norm", False)
         )
+        self.hy3_sp = get_global_server_args().hy3_sp
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            reduce_results=False,
-            prefix=f"{prefix}.o_proj",
-        )
+        if self.hy3_sp:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=0,
+                tp_size=1,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = ReplicatedLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                reduce_results=False,
+                prefix=f"{prefix}.o_proj",
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -553,6 +609,9 @@ class HYV3Attention(nn.Module):
         )
         if self.use_qk_norm:
             rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
+            # HY3 stores one [head_dim] Q/K norm weight shared by all heads.
+            # MiniMax's per-layer Q/K norm instead stores weights spanning all
+            # heads, so its TP norm implementation is not interchangeable here.
             self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
         self.page_size = 64
@@ -597,6 +656,9 @@ class HYV3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.hy3_sp:
+            return self.forward_sp(positions, hidden_states, forward_batch)
+
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_hpc_ops_fp8_attn is None:
             self.use_hpc_ops_fp8_attn = self._resolve_hpc_ops_fp8_attn()
@@ -636,7 +698,7 @@ class HYV3Attention(nn.Module):
                 )
                 self.rotary_emb.cos_sin_cache = cos_sin_cache
 
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+            k_buffer, v_buffer = get_token_to_kv_pool().get_kv_buffer(
                 self.attn.layer_id
             )
             kv_cache_dtype = self.kv_cache_dtype or k_buffer.dtype
@@ -662,11 +724,11 @@ class HYV3Attention(nn.Module):
                 epsilon=self.q_norm.variance_epsilon,
             )
             used_fused_hunyuan_rotary_kv_store = True
-        elif self.use_qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim))
-            q = q.view(-1, self.q_size)
-            k = self.k_norm(k.reshape(-1, self.head_dim))
-            k = k.view(-1, self.kv_size)
+        else:
+            if self.use_qk_norm:
+                q, k = _apply_hy3_qk_norm(
+                    q, k, self.q_norm, self.k_norm, self.head_dim
+                )
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(
             q,
@@ -674,6 +736,61 @@ class HYV3Attention(nn.Module):
             v,
             forward_batch,
             save_kv_cache=not used_fused_hunyuan_rotary_kv_store,
+        )
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        attn_tp_group = get_parallel().attn_tp_group
+        attn_tp_size = attn_tp_group.world_size
+        tokens_per_rank = hidden_states.shape[0]
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split(
+            [self.q_size_full, self.kv_size_full, self.kv_size_full], dim=-1
+        )
+        if self.use_qk_norm:
+            q, k = _apply_hy3_qk_norm(
+                q, k, self.q_norm, self.k_norm, self.head_dim
+            )
+        q, k = self.rotary_emb.forward_native(positions, q, k)
+
+        qkv_by_head_rank = _pack_hy3_sp_qkv(
+            q,
+            k,
+            v,
+            attn_tp_size,
+            self.q_size,
+            self.kv_size,
+            self.total_num_kv_heads,
+            self.head_dim,
+        )
+        qkv_by_source_rank = torch.empty_like(qkv_by_head_rank)
+        attn_tp_group.all_to_all_single(qkv_by_source_rank, qkv_by_head_rank)
+        qkv_by_source_rank = qkv_by_source_rank.view(
+            tokens_per_rank * attn_tp_size, self.q_size + 2 * self.kv_size
+        )
+        q, k, v = qkv_by_source_rank.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output_by_head_rank = _reshape_hy3_sp_attention_output(
+            attn_output, attn_tp_size, self.q_size
+        )
+        attn_output_by_source_rank = torch.empty_like(attn_output_by_head_rank)
+        attn_tp_group.all_to_all_single(
+            attn_output_by_source_rank, attn_output_by_head_rank
+        )
+        attn_output = _merge_hy3_sp_attention_output(
+            attn_output_by_source_rank
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -766,6 +883,11 @@ class HYV3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if get_global_server_args().hy3_sp:
+            return self.forward_sp(
+                positions, hidden_states, forward_batch, residual
+            )
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -794,19 +916,11 @@ class HYV3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self.block_type == "moe":
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states,
-                should_allreduce_fusion=should_allreduce_fusion,
-                use_reduce_scatter=use_reduce_scatter,
-            )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=should_allreduce_fusion,
+            mlp_reduce_scatter=use_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -817,6 +931,32 @@ class HYV3DecoderLayer(nn.Module):
                 forward_batch,
             )
 
+        return hidden_states, residual
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+        if self.block_type == "moe":
+            hidden_states = self.mlp(hidden_states, forward_batch)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
@@ -884,6 +1024,24 @@ class HYV3Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        use_hy3_sp = get_global_server_args().hy3_sp
+        if use_hy3_sp:
+            attn_tp_group = get_parallel().attn_tp_group
+            attn_tp_size = attn_tp_group.world_size
+            attn_tp_rank = attn_tp_group.rank_in_group
+            if hidden_states.shape[0] % attn_tp_size != 0:
+                raise ValueError(
+                    "HY3 SP requires the token count to be divisible by the attention "
+                    f"TP size, got {hidden_states.shape[0]} and {attn_tp_size}."
+                )
+            tokens_per_rank = hidden_states.shape[0] // attn_tp_size
+            token_start = attn_tp_rank * tokens_per_rank
+            token_end = token_start + tokens_per_rank
+            hidden_states = hidden_states[token_start:token_end]
+            positions = positions[token_start:token_end]
+            if residual is not None:
+                residual = residual[token_start:token_end]
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -900,6 +1058,17 @@ class HYV3Model(nn.Module):
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
+
+        if use_hy3_sp:
+            attn_tp_group = get_parallel().attn_tp_group
+            hidden_states_gathered = hidden_states.new_empty(
+                hidden_states.shape[0] * attn_tp_group.world_size,
+                hidden_states.shape[1],
+            )
+            attn_tp_group.all_gather_into_tensor(
+                hidden_states_gathered, hidden_states
+            )
+            hidden_states = hidden_states_gathered
 
         return hidden_states
 

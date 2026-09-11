@@ -51,7 +51,8 @@ class WarmupGate:
             return
 
         logger.info(
-            "kv_canary perturb: disabled during warmup window (first %d forward steps)",
+            "kv_canary perturb: disabled during warmup window "
+            "(first %d forward steps)",
             warmup_steps,
         )
         self._warmup_disable_logged = True

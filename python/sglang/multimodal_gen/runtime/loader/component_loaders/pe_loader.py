@@ -92,6 +92,7 @@ class PEModelWrapper(nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 class SGLangPEModelWrapper:
+
     def __init__(self, model_url):
         self.model_url = model_url.rstrip("/")
         # Tokenizer is initialized separately during pipeline setup

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 
 class DeepseekMLACpuForwardMixin:
+
     def init_mla_fused_rope_cpu_forward(self: DeepseekV2AttentionMLA):
         assert hasattr(self, "has_fused_proj") and hasattr(self, "is_packed_weight")
 
@@ -28,22 +29,15 @@ class DeepseekMLACpuForwardMixin:
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
-        fused_qkv_weight = (
-            getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
-            if self.has_fused_proj
-            else None
-        )
         self.qkv_proj_with_rope_is_int8 = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and fused_qkv_weight is not None
-            and fused_qkv_weight.dtype == torch.int8
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
         )
         self.qkv_proj_with_rope_is_fp8 = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and fused_qkv_weight is not None
-            and fused_qkv_weight.dtype == torch.float8_e4m3fn
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
         )
 
         self.weight_block_size = None
@@ -60,7 +54,9 @@ class DeepseekMLACpuForwardMixin:
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                     == self.q_b_proj.quant_method.quant_config.weight_block_size
                 )
-                self.weight_block_size = self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                self.weight_block_size = (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                )
 
     def forward_absorb_fused_mla_rope_cpu_prepare(
         self: DeepseekV2AttentionMLA,
@@ -69,9 +65,9 @@ class DeepseekMLACpuForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
-            "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
-        )
+        assert self.q_lora_rank is not None and use_intel_amx_backend(
+            self
+        ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
         q_input, k_input, v_input = (
             torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
@@ -121,11 +117,10 @@ class DeepseekMLACpuForwardMixin:
         v_input,
         forward_batch,
         zero_allocator,
-        gate=None,
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
-            "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
-        )
+        assert self.q_lora_rank is not None and use_intel_amx_backend(
+            self
+        ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -153,8 +148,6 @@ class DeepseekMLACpuForwardMixin:
             self.w_scale if self.qkv_proj_with_rope_is_fp8 else None,  # scale
         )
         attn_output = output
-        if gate is not None:
-            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
 
         return output

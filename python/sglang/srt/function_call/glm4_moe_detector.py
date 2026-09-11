@@ -12,7 +12,6 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
-    get_schema_properties,
     infer_type_from_json_schema,
     safe_literal_eval,
 )
@@ -55,7 +54,9 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    properties = get_schema_properties(tool.function.parameters)
+    properties = (tool.function.parameters or {}).get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
     if arg_key not in properties:
         return None
 
@@ -160,10 +161,6 @@ class Glm4MoeDetector(BaseFormatDetector):
 
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
-
-    _STREAMING_PARTIAL_PATTERN = re.compile(
-        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
-    )
 
     def __init__(self):
         super().__init__()
@@ -477,7 +474,11 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
+            partial_match = re.search(
+                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+                string=current_text,
+                flags=re.DOTALL,
+            )
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)
@@ -524,10 +525,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-
-                # The name and final tool-call marker can arrive in the same
-                # parse call, so continue into argument/finalization handling.
-                if self.current_tool_name_sent:
+                else:
                     # Process XML to JSON streaming
                     current_raw_length = len(func_args_raw)
 
@@ -553,9 +551,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += json_increment
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                json_increment
-                            )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += json_increment
 
                     if is_tool_end == self.eot_token:
                         if self._is_first_param:
@@ -568,12 +566,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                empty_object
-                            )
-                        else:
-                            # The streamed outer `{` is only closed here; a
-                            # trailing "}" may belong to a nested object value.
+                        elif not self._last_arguments.endswith("}"):
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(
@@ -583,9 +576,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += closing_brace
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                closing_brace
-                            )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += closing_brace
 
                         try:
                             pairs = self.func_arg_regex.findall(func_args_raw)

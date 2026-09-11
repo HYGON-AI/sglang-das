@@ -173,6 +173,7 @@ class AscendFAMetadataBuilder(AttentionMetadataBuilder):
 
 
 class AscendFABackend(AttentionBackend):
+
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.FA
@@ -197,6 +198,7 @@ class AscendFABackend(AttentionBackend):
 
 
 class AscendFAImpl(AttentionImpl):
+
     def __init__(
         self,
         num_heads: int,

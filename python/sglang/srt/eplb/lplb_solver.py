@@ -23,8 +23,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_resources
-
 logger = logging.getLogger(__name__)
 
 # Global per-layer LPLB solvers
@@ -60,16 +58,19 @@ def assert_lplb_supported_model(architecture: str) -> None:
 
 
 def get_global_lplb_solver(layer_id: int) -> Optional[LPLBSolver]:
+    from sglang.srt.runtime_context import get_resources
 
     return get_resources().lplb_solvers.get(layer_id)
 
 
 def set_global_lplb_solver(layer_id: int, solver: LPLBSolver):
+    from sglang.srt.runtime_context import get_resources
 
     get_resources().lplb_solvers[layer_id] = solver
 
 
 def clear_global_lplb_solvers():
+    from sglang.srt.runtime_context import get_resources
 
     get_resources().lplb_solvers.clear()
 

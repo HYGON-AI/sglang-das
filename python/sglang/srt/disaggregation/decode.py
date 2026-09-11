@@ -24,14 +24,14 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
-import hashlib
 import logging
+import math
 import time
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -42,6 +42,10 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.utils import (
+    PDHiddenChunk,
+    PDHiddenRequestState,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -56,9 +60,6 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
-    build_kv_layer_ids,
-    build_staging_slot_metadata,
-    get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -69,10 +70,12 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
+    ReqKvInfo,
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
@@ -82,6 +85,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
     EvictParams,
+    MatchPrefixParams,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -96,28 +101,26 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
-)
-from sglang.srt.observability.scheduler_stage_metrics import (
-    SCHEDULER_STAGE_GET_NEXT_BATCH,
-    SCHEDULER_STAGE_PROCESS_QUEUE,
-    scheduler_stage_method,
 )
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_hcu, is_npu
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -131,7 +134,11 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
-class DecodeReqToTokenPool:
+def _matches_abort_rid(recv_req, rid: str) -> bool:
+    return bool(getattr(recv_req, "abort_all", False) or rid.startswith(recv_req.rid))
+
+
+class DecodeReqToTokenPool(ReqToTokenPool):
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
     DecodeReqToTokenPool subscribes memory for pre-allocated requests.
@@ -149,18 +156,18 @@ class DecodeReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        pre_alloc_size: int,
+        pre_alloc_size: Optional[int],
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self.size = size
+        self.pre_alloc_size = pre_alloc_size if pre_alloc_size is not None else 0
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
-        self._alloc_size = size + pre_alloc_size + 1
+        self._alloc_size = size + self.pre_alloc_size + 1
         self.max_context_len = max_context_len
         self.device = device
-        self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len),
@@ -173,7 +180,6 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
-        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -181,27 +187,17 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def reset_aux_cache_allocator(self) -> None:
-        pass
-
-    def schedulable_token_capacity(self, physical_capacity: int) -> int:
-        return physical_capacity
-
-    def alloc_aux_to_lengths(
-        self,
-        *,
-        req_pool_indices_cpu: torch.Tensor,
-        target_seq_lens_cpu: torch.Tensor,
-    ) -> None:
-        pass
-
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
-            "a reused row must carry allocated KV"
-        )
+        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        assert (
+            len(reusing) <= 1
+        ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert all(
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            for i in reusing
+        ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -210,16 +206,16 @@ class DecodeReqToTokenPool:
         self.free_slots = self.free_slots[need_size:]
         offset = 0
         for r in reqs:
-            if not r.kv.holds_kv:
-                r.kv.req_pool_idx = select_index[offset]
-                self.req_generation[r.kv.req_pool_idx] += 1
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
-        return [r.kv.req_pool_idx for r in reqs]
+        return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
-        assert req.kv.holds_kv, "request must have req_pool_idx"
-        self.free_slots.append(req.kv.req_pool_idx)
-        req.kv.req_pool_idx = None
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
@@ -237,7 +233,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_layer_ids: List[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
-        pre_alloc_size: int,
+        pre_alloc_size: Optional[int],
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
@@ -258,12 +254,13 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        _pre_alloc = pre_alloc_size if pre_alloc_size is not None else 0
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
         slots_per_req = 1 + (
             self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
         )
-        max_slots_needed = (size + pre_alloc_size) * slots_per_req
+        max_slots_needed = (size + _pre_alloc) * slots_per_req
         if mamba_size is not None:
             effective_mamba_size = max(mamba_size, max_slots_needed)
             if mamba_size < max_slots_needed:
@@ -272,7 +269,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
                     "raising effective_mamba_size to %d",
                     mamba_size,
                     max_slots_needed,
-                    size + pre_alloc_size,
+                    size + _pre_alloc,
                     slots_per_req,
                     effective_mamba_size,
                 )
@@ -282,7 +279,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.layer_transfer_counter = None
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=size + _pre_alloc,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
@@ -299,6 +296,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_allocator.clear()
 
 
+
 @dataclass
 class DecodeRequest:
     req: Req
@@ -306,6 +304,13 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    pd_hidden_dst_indices: Optional[List[int]] = None
+    pd_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
+    pd_hidden_pp_slices: Optional[Dict[int, dict]] = None
+    pd_hidden_start: int = 0
+    pd_hidden_state: PDHiddenRequestState = field(
+        default_factory=PDHiddenRequestState.disabled
+    )
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -376,6 +381,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        self.locally_aborted_rids: Set[str] = set()
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
@@ -384,6 +390,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self._last_pd_hidden_recv_credit_warning_time = 0.0
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -398,6 +405,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.transfer_queue.kv_manager = self.kv_manager
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -420,12 +428,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        params = DecLockRefParams(
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            skip_lock_node_ids=req.skip_lock_node_ids,
+        )
         if req.swa_prefix_lock_released:
             self.tree_cache.dec_lock_ref(req.last_node, params, skip_swa=True)
             req.swa_prefix_lock_released = False
         else:
             self.tree_cache.dec_lock_ref(req.last_node, params)
+
+        # Capacity backpressure releases the match but keeps the request queued
+        # for a later retry, which does not re-match. Anything that later walks
+        # this request's lock (cache_unfinished_req, incl. the DSV4 prompt
+        # donation) would then drop a lock the request no longer owns. Repoint
+        # it at the root -- the same node a miss yields -- so that dec is a
+        # no-op, and clear the lock metadata that described the released node.
+        if not self.tree_cache.is_chunk_cache():
+            req.last_node = self.tree_cache.root_node_handle(
+                extra_key=getattr(req, "extra_key", None)
+            )
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {}
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
@@ -434,9 +458,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required = ceil_align(swa_tail_len, page_size)
         available = self.token_to_kv_pool_allocator.swa_available_size()
         if available < required:
-            self.tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=required - available)
-            )
+            self.tree_cache.evict(EvictParams(swa_num_tokens=required - available))
             available = self.token_to_kv_pool_allocator.swa_available_size()
 
         if available < required:
@@ -472,7 +494,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return seq_len
 
         page_size = self.token_to_kv_pool_allocator.page_size
-        if get_disagg().disaggregation_decode_enable_radix_cache:
+        if getattr(
+            self.scheduler.server_args,
+            "disaggregation_decode_enable_radix_cache",
+            False,
+        ):
             # Keep enough SWA before the page-aligned radix-cache insert
             # boundary for the cached key to contain a complete window.
             # `seq_len - 1` is the last committed position.
@@ -492,6 +518,85 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
+
+    def _uses_dsv4_decode_radix_cache(self) -> bool:
+        return (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        )
+
+    def _dsv4_safe_prefix_len(self, prefix_len: int) -> int:
+        """Avoid splitting reused prefixes through compressed DSV4 blocks."""
+        if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
+            return prefix_len
+
+        compression_ratios = self.token_to_kv_pool.compression_ratios
+        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        alignment = math.lcm(page_size, max_compression_ratio)
+        return (prefix_len // alignment) * alignment
+
+    def _dsv4_singleflight_min_prefix_len(self) -> int:
+        compression_ratios = self.token_to_kv_pool.compression_ratios
+        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
+        alignment = math.lcm(
+            self.token_to_kv_pool_allocator.page_size, max_compression_ratio
+        )
+        return max(4096, alignment)
+
+    @staticmethod
+    def _common_prefix_len(lhs: List[int], rhs: List[int], limit: int) -> int:
+        for prefix_len in range(limit):
+            if lhs[prefix_len] != rhs[prefix_len]:
+                return prefix_len
+        return min(len(lhs), len(rhs), limit)
+
+    def _dsv4_inflight_prompt_reqs(
+        self, preallocated_reqs: List[DecodeRequest]
+    ) -> List[Req]:
+        if not self._uses_dsv4_decode_radix_cache():
+            return []
+
+        inflight_reqs = [
+            decode_req.req
+            for decode_req in self.transfer_queue.queue
+            if getattr(decode_req.req, "dsv4_decode_radix_cache_prompt_once", False)
+        ]
+        inflight_reqs.extend(
+            req
+            for req in self.scheduler.running_batch.reqs
+            if getattr(req, "dsv4_decode_radix_cache_prompt_once", False)
+        )
+        inflight_reqs.extend(
+            decode_req.req
+            for decode_req in preallocated_reqs
+            if getattr(decode_req.req, "dsv4_decode_radix_cache_prompt_once", False)
+        )
+        return inflight_reqs
+
+    def _should_wait_for_dsv4_inflight_prompt(
+        self,
+        req: Req,
+        *,
+        prefix_len: int,
+        preallocated_reqs: List[DecodeRequest],
+    ) -> bool:
+        min_prefix_len = self._dsv4_singleflight_min_prefix_len()
+        for inflight_req in self._dsv4_inflight_prompt_reqs(preallocated_reqs):
+            if inflight_req is req:
+                continue
+            common_len = self._common_prefix_len(
+                req.origin_input_ids,
+                inflight_req.origin_input_ids,
+                min(len(req.origin_input_ids), len(inflight_req.origin_input_ids)),
+            )
+            safe_common_len = self._dsv4_safe_prefix_len(common_len)
+            if safe_common_len - prefix_len >= min_prefix_len:
+                return True
+        return False
+
+    def _release_decode_radix_match(self, req: Req) -> None:
+        self._release_matched_prefix_lock(req)
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
@@ -520,6 +625,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
+        kv_args.kv_cache_layout = getattr(self.token_to_kv_pool, "kv_cache_layout", None)
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
             if self.scheduler.enable_hisparse
@@ -527,6 +633,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
+        )
+        has_kv_layer_ids = hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+        kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids() if has_kv_layer_ids else []
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -544,7 +654,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
-        num_draft_entries = 0
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -555,17 +664,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
-            num_draft_entries = len(draft_kv_data_ptrs)
+            if has_kv_layer_ids:
+                target_layer_num = self.scheduler.model_config.num_hidden_layers
+                kv_layer_ids += [
+                    target_layer_num + i for i in range(len(draft_kv_data_ptrs))
+                ]
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = build_kv_layer_ids(
-            token_to_kv_pool=self.token_to_kv_pool,
-            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
-            num_draft_entries=num_draft_entries,
-            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
-        )
+        kv_args.kv_layer_ids = kv_layer_ids
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -580,6 +688,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
@@ -604,19 +713,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             if hasattr(kv_manager, "set_kv_buffer_tensors"):
                 kv_pool = kv_pool_for_heads
-                staging_slots = build_staging_slot_metadata(
-                    kv_layer_ids=kv_args.kv_layer_ids,
-                    num_draft_entries=num_draft_entries,
-                    kv_pool=kv_pool,
-                    draft_kv_pool=self.draft_token_to_kv_pool,
-                )
-                if staging_slots is not None:
-                    k_buffers, v_buffers, slot_layer_ids = staging_slots
+                if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
                     kv_manager.set_kv_buffer_tensors(
-                        k_buffers,
-                        v_buffers,
-                        kv_pool.page_size,
-                        slot_layer_ids=slot_layer_ids,
+                        kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
                     )
         return kv_manager
 
@@ -657,22 +756,184 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
+    def _abort_one_prealloc(
+        self, decode_req: DecodeRequest, *, handshake_failed: bool = False
+    ) -> None:
+        rid = decode_req.req.rid
+        receiver = decode_req.kv_receiver
+        if handshake_failed:
+            error_message = (
+                f"Decode handshake failed for request rank={self.tp_rank} "
+                f"{rid=} {decode_req.req.bootstrap_room=}"
+            )
+            if receiver is not None:
+                try:
+                    receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+            logger.error(error_message)
+            prepare_abort(
+                decode_req.req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.scheduler.output_streamer.stream_output(
+                [decode_req.req], decode_req.req.return_logprob
+            )
+            if self.scheduler.metrics_reporter.enable_metrics:
+                self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+        else:
+            logger.warning("Abort decode prealloc queue immediately. rid=%s", rid)
+        if receiver is not None:
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning("kv_receiver.abort failed for rid=%s: %s", rid, e)
+            try:
+                receiver.clear()
+            except Exception:
+                pass
+        req = decode_req.req
+        if req.req_pool_idx is not None or getattr(req, "mamba_pool_idx", None) is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        transfer_queue = getattr(self, "transfer_queue", None)
+        if transfer_queue is not None:
+            transfer_queue._release_pd_hidden_rows(decode_req)
+        idx = decode_req.metadata_buffer_index
+        if idx is not None and idx != -1:
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.metadata_buffer_index = -1
+
+    def drop_by_rids(self, rids: List[str]) -> List[str]:
+        rid_set = set(rids)
+        if not rid_set:
+            return []
+        dropped: List[str] = []
+        remaining: List[DecodeRequest] = []
+        for decode_req in self.queue:
+            if decode_req.req.rid in rid_set:
+                poll = (
+                    int(decode_req.kv_receiver.poll())
+                    if decode_req.kv_receiver is not None
+                    else int(KVPoll.Failed)
+                )
+                handshake_failed = (
+                    poll == int(KVPoll.Failed)
+                    and decode_req.req.rid not in self.locally_aborted_rids
+                )
+                self._abort_one_prealloc(
+                    decode_req, handshake_failed=handshake_failed
+                )
+                dropped.append(decode_req.req.rid)
+            else:
+                remaining.append(decode_req)
+        self.queue = remaining
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if decode_req.req.rid not in rid_set
+        ]
+        return dropped
+
+    def abort_matching(self, recv_req) -> List[str]:
+        rids = [
+            decode_req.req.rid
+            for decode_req in self.queue
+            if _matches_abort_rid(recv_req, decode_req.req.rid)
+        ]
+        rids.extend(
+            decode_req.req.rid
+            for decode_req in self.pending_reqs
+            if _matches_abort_rid(recv_req, decode_req.req.rid)
+            and decode_req.req.rid not in rids
+        )
+        if not rids:
+            return []
+        rid_set = set(rids)
+        self.locally_aborted_rids.update(rid_set)
+        # Only mark Failed. Freeing KV here lets PP0 reuse pages before PP1
+        # sees the abort and causes cross-rank page mix / garbled decode.
+        for decode_req in list(self.queue) + list(self.pending_reqs):
+            if decode_req.req.rid not in rid_set:
+                continue
+            receiver = decode_req.kv_receiver
+            if receiver is None:
+                continue
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning(
+                    "kv_receiver.abort failed for prealloc rid=%s: %s",
+                    decode_req.req.rid,
+                    e,
+                )
+        logger.warning(
+            "Abort decode prealloc marked Failed; KV released after PP consensus. rids=%s",
+            rids,
+        )
+        return rids
+
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
-        result = match_prefix_for_req(
-            self.tree_cache,
-            req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
-            include_req=True,
-        )
-        # Keep aggregated scheduling semantics while preserving the SWA lock
-        # boundary needed for the matching dec_lock_ref.
+        if self._uses_dsv4_decode_radix_cache():
+            # DSV4 prompt donation creates full-only leaves: the SWA component is
+            # intentionally tombstoned because decode only needs the long full
+            # prefix while the SWA tail is recomputed/transferred. Use the full
+            # match here; the generic SWA-window-safe match would truncate these
+            # full-only leaves to zero and force full KV transfer again.
+            tree_core = getattr(self.tree_cache, "tree_core", None)
+            is_eagle = getattr(
+                self.tree_cache, "is_eagle", getattr(tree_core, "is_eagle", False)
+            )
+            result = self.tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        req.origin_input_ids,
+                        req.extra_key,
+                        is_bigram=is_eagle,
+                        cache_salt=getattr(req, "cache_salt", None),
+                    ),
+                    cow_mamba=self.tree_cache.supports_mamba(),
+                    req=req,
+                    return_full_match=True,
+                )
+            )
+            if envs.SGLANG_RADIX_FORCE_MISS.get():
+                result = zero_match_result(self.tree_cache, result)
+            (
+                req.prefix_indices,
+                req.last_node,
+                req.last_host_node,
+                req.best_match_node,
+                req.host_hit_length,
+            ) = (
+                result.device_indices,
+                result.last_device_node,
+                result.last_host_node,
+                result.best_match_node,
+                result.host_hit_length,
+            )
+        else:
+            result = match_prefix_for_req(
+                self.tree_cache,
+                req,
+                req.origin_input_ids,
+                cow_mamba=self.tree_cache.supports_mamba(),
+                include_req=True,
+            )
+        # Always lock to match aggregated scheduling behavior. SWA locks only
+        # span the sliding window and return a boundary uuid; store it so the
+        # matching dec_lock_ref stops there instead of underflowing toward root.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # Release must mirror the exact nodes skipped at acquire time: the FULL
+        # component skips the evicted bottom segment, and a later insert (e.g.
+        # the DSV4 prompt donation) can revive those values before the matching
+        # dec, which would then decrement a lock_ref this request never took.
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -874,8 +1135,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self.queue:
             return
 
-        # Receiver polling observes asynchronous failures while KV allocation
-        # is blocked.
+        # Still poll if any receiver was aborted, otherwise it stays stuck.
+        if (
+            self.pp_size <= 1
+            and all(decode_req.waiting_for_input for decode_req in self.queue)
+            and not any(
+                decode_req.kv_receiver.conclude_state == KVPoll.Failed
+                for decode_req in self.queue
+            )
+        ):
+            return
+
         if self.pp_size > 1:
             polls = poll_and_all_reduce_pp(
                 (decode_req.req.rid for decode_req in self.queue),
@@ -1143,6 +1413,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
+                transfer_queue = getattr(self, "transfer_queue", None)
+                if transfer_queue is not None:
+                    transfer_queue._release_pd_hidden_rows(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1194,7 +1467,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
-                get_disagg().disaggregation_decode_enable_radix_cache
+                self.scheduler.server_args.disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
             )
             if use_decode_radix_cache:
@@ -1208,6 +1481,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
+                locked_prefix_len = prefix_len
+                # Align prefix_len down to page boundary so both prefill and
+                # decode agree on the page-aligned split point for KV transfer.
+                page_size = self.token_to_kv_pool_allocator.page_size
+                if page_size > 1 and prefix_len % page_size != 0:
+                    prefix_len = page_align_floor(prefix_len, page_size)
+                    prefix_indices = prefix_indices[:prefix_len]
+                    total_prefix_len = min(total_prefix_len, prefix_len)
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
 
@@ -1223,10 +1504,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         # Cap the prefill-committed prefix too: tokens past the
                         # cap are not device-resident, so prefill must transfer
                         # them.
-                        total_prefix_len = prefix_len
+                        total_prefix_len = min(total_prefix_len, prefix_len)
 
                 # Decode transfers the SWA tail fresh, so retain only the
-                # full-attention prefix lock needed for reuse.
+                # full-attention prefix lock needed for reuse. If a later
+                # alignment/cap drops the match, _release_decode_radix_match
+                # releases the remaining full lock with skip_swa=True.
                 if (
                     uses_swa_tail_prealloc
                     and prefix_match.l1_prefix_len > 0
@@ -1237,6 +1520,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         decode_req.req.swa_uuid_for_lock,
                     )
                     decode_req.req.swa_prefix_lock_released = True
+
+                dsv4_safe_prefix_len = self._dsv4_safe_prefix_len(prefix_len)
+                if dsv4_safe_prefix_len < prefix_len:
+                    prefix_len = dsv4_safe_prefix_len
+                    prefix_indices = prefix_indices[:prefix_len]
+                    total_prefix_len = min(total_prefix_len, prefix_len)
+
+                if self._should_wait_for_dsv4_inflight_prompt(
+                    decode_req.req,
+                    prefix_len=prefix_len,
+                    preallocated_reqs=preallocated_reqs,
+                ):
+                    if locked_prefix_len > 0:
+                        self._release_decode_radix_match(decode_req.req)
+                    continue
+
+                decode_req.req.cache_protected_len = prefix_len
+                if locked_prefix_len > 0 and prefix_len == 0:
+                    self._release_decode_radix_match(decode_req.req)
+                    prefix_match = None
 
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
@@ -1326,12 +1629,249 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+
+            pd_hidden_dst_indices = None
+            pd_hidden_dst_indices_by_pp = None
+            pd_hidden_pp_slices = None
+            pd_hidden_start = total_prefix_len
+            pd_hidden_len = origin_input_len - total_prefix_len
+            state_types = self.kv_manager.kv_args.state_types
+            if (
+                self.scheduler.spec_algorithm.is_dspark()
+                and not _is_fake_transfer(decode_req.req)
+                and StateType.PD_HIDDEN in state_types
+                and pd_hidden_len > 0
+            ):
+                dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+                if dspark_pool is None:
+                    message = (
+                        "PD decode requires a hidden row pool for hidden metadata "
+                        "transfer, but none was initialized."
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                model_runner = self.scheduler.tp_worker.model_runner
+                spec_aux_config = getattr(model_runner, "spec_aux_config", None)
+                target_layer_ids = (
+                    getattr(model_runner, "dflash_or_dspark_target_layer_ids", None)
+                    or getattr(spec_aux_config, "dflash_target_layer_ids", None)
+                    or []
+                )
+                target_layer_ids = [int(x) for x in target_layer_ids]
+                if not target_layer_ids:
+                    message = (
+                        "PD decode could not infer target layer ids for hidden "
+                        "hidden transfer."
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                target_pp_ranks = list(
+                    getattr(decode_req.kv_receiver, "target_pp_ranks", None) or [0]
+                )
+                pp_size = max(target_pp_ranks) + 1 if target_pp_ranks else 1
+                pp_slices = {}
+                slice_start = 0
+                for pp_rank in range(pp_size):
+                    pp_start, pp_end = get_pp_indices(
+                        self.scheduler.model_config.num_hidden_layers,
+                        pp_rank,
+                        pp_size,
+                    )
+                    local_layer_ids = [
+                        layer_id
+                        for layer_id in target_layer_ids
+                        if pp_start <= layer_id < pp_end
+                    ]
+                    slice_len = len(local_layer_ids) * int(
+                        self.scheduler.model_config.hidden_size
+                    )
+                    pp_slices[pp_rank] = {
+                        "pp_rank": int(pp_rank),
+                        "layer_ids": [int(x) for x in local_layer_ids],
+                        "slice_start": int(slice_start),
+                        "slice_len": int(slice_len),
+                        "dst_indices": [],
+                    }
+                    slice_start += slice_len
+                if slice_start != len(target_layer_ids) * int(
+                    self.scheduler.model_config.hidden_size
+                ):
+                    message = (
+                        "PD hidden PP slice layout does not cover all target layers: "
+                        f"target_layer_ids={target_layer_ids}, pp_size={pp_size}"
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                non_empty_slices = [
+                    (int(pp_rank), pp_slice)
+                    for pp_rank, pp_slice in pp_slices.items()
+                    if int(pp_slice.get("slice_len", 0)) > 0
+                ]
+                full_hidden_size = int(dspark_pool.hidden_size)
+                fixed_pool_supported = (
+                    len(non_empty_slices) == 1
+                    and int(non_empty_slices[0][1].get("slice_start", 0)) == 0
+                    and int(non_empty_slices[0][1].get("slice_len", 0))
+                    == full_hidden_size
+                )
+                if not fixed_pool_supported:
+                    message = (
+                        "PD fixed decode hidden row pool requires the current "
+                        "PP layout to have exactly one non-empty slice covering the "
+                        "full hidden width. Split target layers across PP ranks are "
+                        "not supported yet: "
+                        f"rid={decode_req.req.rid}, pp_slices={pp_slices}"
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                pd_hidden_streaming = (
+                    not _is_hcu
+                    and self.kv_manager.supports_pd_hidden_streaming()
+                    and hasattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk")
+                )
+                # Mooncake's streaming READY/ACK protocol is not available on
+                # HCU yet.  Keep the upstream streaming path on CUDA, and use
+                # the existing full hidden-row transfer representation on HCU.
+                # The full rows are injected into the draft cache after the KV
+                # receiver reports success (see _inject_full_pd_hidden).
+                pd_hidden_window_rows = (
+                    min(pd_hidden_len, dspark_pool.size)
+                    if pd_hidden_streaming
+                    else pd_hidden_len
+                )
+                if pd_hidden_window_rows <= 0:
+                    message = (
+                        "PD decode hidden receive pool has no streaming rows: "
+                        f"rid={decode_req.req.rid}, hidden_len={pd_hidden_len}, "
+                        f"pool_size={dspark_pool.size}. Increase "
+                        "SGLANG_PD_HIDDEN_RECV_POOL_TOKENS."
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+                allocated_hidden_indices = dspark_pool.alloc(pd_hidden_window_rows)
+                if allocated_hidden_indices is None:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    now = time.monotonic()
+                    if (
+                        now - self._last_pd_hidden_recv_credit_warning_time
+                        > 30
+                    ):
+                        logger.warning(
+                            "PD decode hidden pool blocked prealloc: "
+                            "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
+                            "prealloc_queue=%d transfer_queue=%d",
+                            decode_req.req.rid,
+                            pd_hidden_window_rows,
+                            pd_hidden_len,
+                            dspark_pool.available_size(),
+                            dspark_pool.size,
+                            len(self.queue),
+                            len(self.transfer_queue.queue),
+                        )
+                        self._last_pd_hidden_recv_credit_warning_time = now
+                    continue
+
+                pd_hidden_dst_indices_by_pp = {}
+                for pp_rank, pp_slice in pp_slices.items():
+                    if int(pp_slice.get("slice_len", 0)) <= 0:
+                        pp_slice["dst_indices"] = []
+                        pd_hidden_dst_indices_by_pp[int(pp_rank)] = []
+                        continue
+                    pp_slice["dst_indices"] = [
+                        int(x) for x in allocated_hidden_indices
+                    ]
+                    pd_hidden_dst_indices_by_pp[int(pp_rank)] = [
+                        int(x) for x in allocated_hidden_indices
+                    ]
+                pd_hidden_pp_slices = pp_slices
+                hidden_end = int(pd_hidden_start + pd_hidden_len)
+                decode_req.pd_hidden_state = (
+                    PDHiddenRequestState.streaming_state(
+                        int(pd_hidden_start), hidden_end
+                    )
+                    if pd_hidden_streaming
+                    else PDHiddenRequestState.full(
+                        int(pd_hidden_start), hidden_end
+                    )
+                )
+                if pp_size == 1:
+                    pd_hidden_dst_indices = pd_hidden_dst_indices_by_pp.get(0)
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            decode_req.pd_hidden_dst_indices = pd_hidden_dst_indices
+            decode_req.pd_hidden_dst_indices_by_pp = pd_hidden_dst_indices_by_pp
+            decode_req.pd_hidden_pp_slices = pd_hidden_pp_slices
+            decode_req.pd_hidden_start = pd_hidden_start
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1353,7 +1893,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs) + 1,
                 )
-            decode_req.req.kv.cache_protected_len = total_prefix_len
+            decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -1369,7 +1909,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx
+                    decode_req.req.req_pool_idx
                 ][total_prefix_len:origin_input_len]
                 kv_indices = (
                     self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
@@ -1383,7 +1923,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.kv.req_pool_idx
+                            decode_req.req.req_pool_idx
                         ]
                     )
                     .cpu()
@@ -1395,7 +1935,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_start = max(total_prefix_len, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, window_start:seq_len
+                    decode_req.req.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1406,18 +1946,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, :seq_len
+                    decode_req.req.req_pool_idx, :seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
-
-            def _dsa_tail_payload():
-                return get_dsa_tail_state_indices(
-                    self.token_to_kv_pool,
-                    decode_req.req.kv.req_pool_idx,
-                    seq_len,
-                )
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1426,7 +1959,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_size = self.token_to_kv_pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(decode_req.req.kv.req_pool_idx)
+                state_slot = int(decode_req.req.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
@@ -1434,7 +1967,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 online = is_dsv4_c128_online_enabled()
                 ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
                 return get_dsv4_c128_state_indices(
-                    int(decode_req.req.kv.req_pool_idx),
+                    int(decode_req.req.req_pool_idx),
                     seq_len,
                     online=online,
                     ring_size=ring_size,
@@ -1446,18 +1979,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
                 if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.kv.req_pool_idx))
+                    clear_c128_state(int(decode_req.req.req_pool_idx))
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
-                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
+
+            def _pd_hidden_payload():
+                if not pd_hidden_dst_indices_by_pp:
+                    return None
+                first_slice_indices = next(
+                    iter(pd_hidden_dst_indices_by_pp.values())
+                )
+                return np.asarray(first_slice_indices, dtype=np.int32)
+
+            payloads[StateType.PD_HIDDEN] = _pd_hidden_payload
+            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # DSV4 on NPU: per-pool dst page indices, produced by the same
+                # shared builder prefill uses so src/dst line up positionally.
+                if total_prefix_len != 0:
+                    raise RuntimeError(
+                        "DSV4 NPU PD disaggregation does not support decode-side "
+                        "prefix cache yet; disable disaggregation decode radix/HiCache "
+                        "for PD + chunked prefill."
+                    )
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
@@ -1466,7 +2017,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 payloads.update(
                     dsv4_state_payloads(
                         self.req_to_token_pool,
-                        decode_req.req.kv.req_pool_idx,
+                        decode_req.req.req_pool_idx,
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
                         prefix_len=total_prefix_len,
@@ -1475,6 +2026,58 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+            if state_indices and not any(
+                idx is not None and len(idx) > 0 for idx in state_indices
+            ):
+                state_indices = None
+
+            spec_metadata = None
+            if pd_hidden_dst_indices_by_pp is not None:
+                model_runner = self.scheduler.tp_worker.model_runner
+                spec_aux_config = getattr(model_runner, "spec_aux_config", None)
+                target_layer_ids = (
+                    getattr(model_runner, "dflash_or_dspark_target_layer_ids", None)
+                    or getattr(spec_aux_config, "dflash_target_layer_ids", None)
+                    or []
+                )
+                spec_metadata = {
+                    "pd_hidden": True,
+                    "streaming_hidden": bool(decode_req.pd_hidden_state.streaming),
+                    "streaming_window_rows": int(
+                        max(
+                            (
+                                len(indices)
+                                for indices in (
+                                    pd_hidden_dst_indices_by_pp or {}
+                                ).values()
+                            ),
+                            default=0,
+                        )
+                    ),
+                    "decode_radix_cache_enabled": bool(
+                        self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+                    ),
+                    "hidden_start": int(pd_hidden_start),
+                    "hidden_len": int(pd_hidden_len),
+                    "dst_indices": (
+                        [int(x) for x in pd_hidden_dst_indices]
+                        if pd_hidden_dst_indices is not None
+                        else []
+                    ),
+                    "pp_slices": {
+                        str(pp_rank): {
+                            **pp_slice,
+                            "dst_indices": [
+                                int(x) for x in pp_slice.get("dst_indices", [])
+                            ],
+                        }
+                        for pp_rank, pp_slice in (
+                            pd_hidden_pp_slices or {}
+                        ).items()
+                    },
+                    "hidden_size": int(self.metadata_buffers.pd_hidden_pool.hidden_size),
+                    "target_layer_ids": [int(x) for x in target_layer_ids],
+                }
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1495,7 +2098,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # the C4 sparse physical-slot mapping; carry their logical page IDs
                 # alongside the independently allocated C4 host page IDs.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx,
+                    decode_req.req.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
                 device_page_indices = kv_to_page_indices(
@@ -1507,9 +2110,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "DSV4 HiSparse direct PD transfer currently requires "
                         "the Mooncake backend"
                     )
-            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            metadata_kwargs = {}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
+            if (
+                self._uses_dsv4_decode_radix_cache()
+                and envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get()
+            ):
+                logger.info(
+                    "DSV4 decode radix transfer stats: rid=%s "
+                    "origin_input_len=%d decode_prefix_len=%d "
+                    "transfer_tokens=%d transfer_pages=%d page_size=%d",
+                    decode_req.req.rid,
+                    origin_input_len,
+                    total_prefix_len,
+                    origin_input_len - total_prefix_len,
+                    len(page_indices),
+                    kv_transfer_page_size,
+                )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1525,6 +2143,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 **metadata_kwargs,
+                decode_prefix_len=total_prefix_len,
+                spec_metadata=spec_metadata,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
@@ -1648,13 +2268,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 available_size = logical_allocator.available_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
-            if get_disagg().disaggregation_decode_enable_radix_cache:
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self._radix_full_evictable()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
-            if get_disagg().disaggregation_decode_enable_radix_cache:
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self._radix_full_evictable()
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
@@ -1779,16 +2399,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
-        req.kv.kv_committed_len = fill_len
+        req.kv_committed_len = fill_len
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
-                (req.kv.req_pool_idx, slice(0, prefix_len)), prefix_indices
+                (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
 
         # TODO(retraction): when retraction is implemented with radix cache
@@ -1801,13 +2421,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
-            get_disagg().disaggregation_decode_enable_radix_cache
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
-            result = self.tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_to_evict)
-            )
+            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
@@ -1824,6 +2442,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
+        if uses_swa_tail:
+            reclaim_error = self._reclaim_swa_tail_capacity(swa_tail_len, req.rid)
+            if reclaim_error is not None:
+                raise RuntimeError(reclaim_error)
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -1843,7 +2465,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
-                req.kv.req_pool_idx,
+                req.req_pool_idx,
                 0,
                 coordinator.host_token_len(fill_len),
             )
@@ -1873,7 +2495,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         self.req_to_token_pool.write(
             (
-                req.kv.req_pool_idx,
+                req.req_pool_idx,
                 slice(total_prefix_len, total_prefix_len + len(kv_loc)),
             ),
             kv_loc,
@@ -1883,6 +2505,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        if self._uses_dsv4_decode_radix_cache():
+            # DSV4 compressed sidecars are not yet safe to reinsert from decode
+            # workers after generation starts. Defer the one prompt insert
+            # until the prebuilt forward has finished; process_prebuilt() runs
+            # before forward and must not free duplicate prompt pages still
+            # referenced by the current batch's out_cache_loc.
+            req.dsv4_decode_radix_cache_prompt_len = req.kv_committed_len
+            req.dsv4_decode_radix_cache_prompt_once = True
+            req.skip_radix_cache_insert = True
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1890,7 +2521,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
+        req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1906,7 +2537,10 @@ def alloc_for_decode_prealloc_hisparse(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    req.kv.kv_allocated_len = fill_len
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
     device = allocator.device
     prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
     prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
@@ -1951,7 +2585,10 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
     req_to_token_pool: Optional[ReqToTokenPool] = None,
 ) -> torch.Tensor:
-    req.kv.kv_allocated_len = fill_len
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     else:
@@ -2017,26 +2654,15 @@ def alloc_for_decode_prealloc(
     return kv_loc
 
 
-def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
-    """Generate a deterministic synthetic handoff token for fake-PD requests.
-
-    Fake-PD skips prefill and KV transfer, so its allocated prompt KV has no
-    request-specific state and its metadata output token remains zero. Reusing
-    token 0 for every request can unrealistically correlate decode workloads.
-    Hash the request ID so every TP rank gets the same request-diverse token.
-    """
-    if req.vocab_size is None or req.vocab_size <= 0:
-        raise ValueError("Fake-PD requests require a positive vocabulary size")
-    digest = hashlib.blake2b(
-        req.rid.encode(), digest_size=8, person=b"fake-pd"
-    ).digest()
-    return int.from_bytes(digest, byteorder="little") % req.vocab_size
-
-
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
     """
+
+    # Class-level default: the prealloc queue wires this up after construction,
+    # so the PD-hidden hooks must tolerate it being unset -- getattr(None, ...)
+    # short-circuits them into a no-op instead of raising AttributeError.
+    kv_manager = None
 
     def __init__(
         self,
@@ -2066,6 +2692,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        self.kv_manager = None
+        self.locally_aborted_rids: Set[str] = set()
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2077,8 +2705,252 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
+    def is_commit_ready(self, decode_req: DecodeRequest) -> bool:
+        """Validate metadata before this PP rank votes for transfer success."""
+        if decode_req.kv_receiver is None:
+            return False
+        if _is_fake_transfer(decode_req.req):
+            return True
+        idx = decode_req.metadata_buffer_index
+        if idx is None or idx < 0:
+            return False
+        output_bootstrap_room = self.metadata_buffers.get_buf(idx)[-1]
+        actual_room = int(output_bootstrap_room[0].item())
+        if actual_room == 0:
+            return False
+
+        expected_room = int(
+            decode_req.req.bootstrap_room
+            if decode_req.req.bootstrap_room is not None
+            else 0
+        )
+        if actual_room == expected_room:
+            return True
+
+        rid = decode_req.req.rid
+        if rid not in self.locally_aborted_rids:
+            self.locally_aborted_rids.add(rid)
+            logger.error(
+                "V2 metadata room mismatch before PP consensus: rid=%s "
+                "expected_room=%s actual_room=%s metadata_buffer_index=%s "
+                "tp_rank=%s",
+                rid,
+                expected_room,
+                actual_room,
+                idx,
+                self.tp_rank,
+            )
+            try:
+                decode_req.kv_receiver.abort()
+            except Exception as e:
+                logger.warning(
+                    "kv_receiver.abort failed for V2 metadata mismatch "
+                    "rid=%s: %s",
+                    rid,
+                    e,
+                )
+        return False
+
+    def filter_commit_ready_rids(self, rids: List[str]) -> List[str]:
+        rid_set = set(rids)
+        ready = {
+            decode_req.req.rid
+            for decode_req in self.queue
+            if decode_req.req.rid in rid_set and self.is_commit_ready(decode_req)
+        }
+        return [rid for rid in rids if rid in ready]
+
+    def _free_metadata_buffer(self, decode_req: DecodeRequest) -> None:
+        if (
+            self.enable_staging
+            and self.staging_handler is not None
+            and decode_req.req.bootstrap_room is not None
+            and self.staging_handler.is_staging_room(decode_req.req.bootstrap_room)
+        ):
+            self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+        idx = decode_req.metadata_buffer_index
+        if idx is not None and idx != -1:
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.metadata_buffer_index = -1
+
+    def _drop_uncommitted(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        stream_error: bool,
+        error_prefix: str = "Decode transfer failed",
+    ) -> None:
+        rid = decode_req.req.rid
+        receiver = decode_req.kv_receiver
+        if receiver is not None:
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning("kv_receiver.abort failed for rid=%s: %s", rid, e)
+        if stream_error:
+            error_message = (
+                f"{error_prefix} for request rank={self.tp_rank} {rid=} "
+                f"{decode_req.req.bootstrap_room=}"
+            )
+            is_propagated = False
+            if receiver is not None:
+                try:
+                    receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+            if is_propagated:
+                logger.debug(error_message)
+            else:
+                logger.error(error_message)
+            prepare_abort(
+                decode_req.req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.scheduler.output_streamer.stream_output(
+                [decode_req.req], decode_req.req.return_logprob
+            )
+            if self.scheduler.enable_hisparse:
+                self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+            if self.scheduler.metrics_reporter.enable_metrics:
+                self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+        self._clean_hicache_prefetch_resources(decode_req)
+        if (
+            stream_error
+            and self.enable_deferred_kv_release
+            and receiver is not None
+            and receiver.abort_notified
+        ):
+            self._defer_release(decode_req)
+            if receiver is not None:
+                decode_req.kv_receiver = None
+            return
+        if receiver is not None:
+            try:
+                receiver.clear()
+            except Exception:
+                pass
+            decode_req.kv_receiver = None
+        req = decode_req.req
+        if req.req_pool_idx is not None or getattr(req, "mamba_pool_idx", None) is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_pd_hidden_rows(decode_req)
+        self._free_metadata_buffer(decode_req)
+
+    def drop_by_rids(
+        self,
+        rids: List[str],
+        *,
+        stream_error: bool = False,
+    ) -> List[str]:
+        rid_set = set(rids)
+        if not rid_set:
+            return []
+        dropped: List[str] = []
+        remaining: List[DecodeRequest] = []
+        for decode_req in self.queue:
+            if decode_req.req.rid in rid_set:
+                self._drop_uncommitted(decode_req, stream_error=stream_error)
+                dropped.append(decode_req.req.rid)
+            else:
+                remaining.append(decode_req)
+        self.queue = remaining
+        return dropped
+
+    def abort_matching(self, recv_req) -> List[str]:
+        rids = [
+            decode_req.req.rid
+            for decode_req in self.queue
+            if _matches_abort_rid(recv_req, decode_req.req.rid)
+        ]
+        if not rids:
+            return []
+        rid_set = set(rids)
+        self.locally_aborted_rids.update(rid_set)
+        for decode_req in self.queue:
+            if decode_req.req.rid not in rid_set:
+                continue
+            receiver = decode_req.kv_receiver
+            if receiver is None:
+                continue
+            try:
+                receiver.abort()
+            except Exception as e:
+                logger.warning(
+                    "kv_receiver.abort failed for transfer rid=%s: %s",
+                    decode_req.req.rid,
+                    e,
+                )
+            if (
+                receiver.kv_mgr.enable_deferred_decode_kv_release
+                and receiver.abort_notified
+            ):
+                receiver.kv_mgr.register_deferred_abort_room(
+                    decode_req.req.bootstrap_room
+                )
+        logger.warning(
+            "Abort decode transfer marked Failed; KV released after PP consensus. rids=%s tp_rank=%s",
+            rids,
+            self.tp_rank,
+        )
+        return rids
+
+    def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        if getattr(self, "kv_manager", None) is None:
+            # PD hidden transfer was never wired up on this queue; nothing to
+            # release, and decode_req carries no pd_hidden_* bookkeeping.
+            return
+        wait_ack_completions = getattr(
+            self.kv_manager, "wait_pd_hidden_ack_completions", None
+        )
+        if wait_ack_completions is not None and not wait_ack_completions(
+            decode_req.req.bootstrap_room
+        ):
+            logger.error(
+                "Timed out waiting for PD hidden ACK completion before "
+                "releasing receive rows: rid=%s room=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+            )
+            return
+        pop_acked_chunks = getattr(
+            self.kv_manager, "pop_pd_hidden_acked_chunks", None
+        )
+        if pop_acked_chunks is not None:
+            pop_acked_chunks(decode_req.req.bootstrap_room)
+        indices_by_pp = decode_req.pd_hidden_dst_indices_by_pp
+        indices = decode_req.pd_hidden_dst_indices
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        if pool is not None:
+            if indices_by_pp is not None:
+                seen = set()
+                for pp_indices in indices_by_pp.values():
+                    key = tuple(int(idx) for idx in pp_indices)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pool.free(pp_indices)
+            elif indices is not None:
+                pool.free(indices)
+        decode_req.pd_hidden_dst_indices = None
+        decode_req.pd_hidden_dst_indices_by_pp = None
+        decode_req.pd_hidden_pp_slices = None
+        decode_req.pd_hidden_state.reset()
+
+    def _consume_pd_hidden_acked_chunks(self, decode_req: DecodeRequest) -> None:
+        pop_acked_chunks = getattr(
+            self.kv_manager, "pop_pd_hidden_acked_chunks", None
+        )
+        if pop_acked_chunks is None:
+            return
+        for chunk in pop_acked_chunks(decode_req.req.bootstrap_room):
+            if chunk.get("is_last_hidden_chunk"):
+                decode_req.pd_hidden_state.mark_hidden_done()
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
+        metadata = self.metadata_buffers.get_buf(idx)
         (
             output_id,
             cached_tokens,
@@ -2094,8 +2966,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_hidden_states,
             output_dsa_topk_indices,
             output_bootstrap_room,
-        ) = self.metadata_buffers.get_buf(idx)
-
+        ) = metadata[:14]
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
         expected_room = (
@@ -2123,6 +2994,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            self._release_pd_hidden_rows(decode_req)
             return
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
@@ -2142,6 +3014,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            self._release_pd_hidden_rows(decode_req)
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
@@ -2163,23 +3036,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
-        elif _is_fake_transfer(decode_req.req):
-            committed_output_id = _generate_fake_prefill_handoff_output_id(
-                decode_req.req
-            )
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
-        if not replayed_boundary:
-            # The handoff token is generated on the prefill worker, so it does
-            # not pass through the decode worker's normal batch-result path.
-            # Account for it here using the same request-selected reasoning
-            # terminator matcher as subsequent decode tokens.  A rebootstrap
-            # boundary has already been accounted for before retraction and
-            # must not be consumed twice.
-            self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
-                decode_req.req, committed_output_id
-            )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2225,9 +3084,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)
@@ -2266,6 +3125,123 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             metadata_buffers=self.metadata_buffers,
         )
 
+    def _drain_pd_hidden_ready_chunks(self, decode_req: DecodeRequest) -> None:
+        # Requests that never entered the PD-hidden path carry no state object.
+        hidden_state = getattr(decode_req, "pd_hidden_state", None)
+        if hidden_state is None or not hidden_state.streaming:
+            return
+        pop_chunks = getattr(self.kv_manager, "pop_pd_hidden_ready_chunks", None)
+        if pop_chunks is None:
+            raise RuntimeError(
+                "PD streaming hidden backend is missing ready chunk API."
+            )
+        chunks = pop_chunks(decode_req.req.bootstrap_room)
+        if not chunks:
+            return
+        dspark_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        if dspark_pool is None:
+            raise RuntimeError("PD hidden row pool disappeared on decode.")
+        inject_chunk = getattr(
+            self.scheduler.draft_worker, "inject_pd_hidden_chunk", None
+        )
+        if inject_chunk is None:
+            raise RuntimeError(
+                "PD streaming hidden requires draft_worker.inject_pd_hidden_chunk."
+            )
+        sorted_chunks = sorted(chunks, key=lambda item: int(item["hidden_start"]))
+        for chunk in sorted_chunks:
+            hidden_chunk = PDHiddenChunk(
+                room=int(chunk["room"]),
+                prefill_rank=int(chunk["prefill_rank"]),
+                hidden_start=int(chunk["hidden_start"]),
+                row_len=int(chunk.get("row_len", len(chunk.get("dst_indices", [])))),
+                is_last_hidden_chunk=bool(chunk.get("is_last_hidden_chunk", False)),
+                dst_indices=[int(x) for x in chunk.get("dst_indices", [])],
+                ack_host=chunk.get("ack_host"),
+                ack_port=int(chunk["ack_port"]) if "ack_port" in chunk else None,
+            )
+            if hidden_chunk.row_len <= 0:
+                continue
+            if len(hidden_chunk.dst_indices) != hidden_chunk.row_len:
+                raise RuntimeError(
+                    "PD hidden chunk dst index length mismatch: "
+                    f"rid={decode_req.req.rid}, row_len={hidden_chunk.row_len}, "
+                    f"dst_indices={len(hidden_chunk.dst_indices)}"
+                )
+            chunk_status = hidden_state.accept_chunk(
+                hidden_chunk, defer_hidden_done=True
+            )
+            if chunk_status == "future":
+                raise RuntimeError(
+                    "PD streaming hidden chunk arrived out of order: "
+                    f"rid={decode_req.req.rid}, "
+                    f"expected_start={hidden_state.next_start}, "
+                    f"chunk_start={hidden_chunk.hidden_start}, "
+                    f"row_len={hidden_chunk.row_len}"
+                )
+            if chunk_status == "stale":
+                raise RuntimeError(
+                    "PD streaming hidden chunk arrived out of order: "
+                    f"rid={decode_req.req.rid}, "
+                    f"expected_start={hidden_state.next_start}, "
+                    f"chunk_start={hidden_chunk.hidden_start}, "
+                    f"row_len={hidden_chunk.row_len}"
+                )
+            read_hidden = getattr(dspark_pool, "read_view", dspark_pool.read)
+            hidden = read_hidden(hidden_chunk.dst_indices)
+            event = inject_chunk(
+                decode_req.req,
+                hidden,
+                hidden_chunk.hidden_start,
+            )
+            submit_ack = getattr(
+                self.kv_manager, "submit_pd_hidden_chunk_ack", None
+            )
+            if submit_ack is None:
+                raise RuntimeError(
+                    "PD streaming hidden backend is missing ACK completion API."
+                )
+            if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
+                raise RuntimeError(
+                    "PD streaming hidden chunk is missing ACK endpoint: "
+                    f"rid={decode_req.req.rid}, "
+                    f"hidden_start={hidden_chunk.hidden_start}"
+                )
+            submit_ack(
+                event=event,
+                remote=hidden_chunk.ack_host,
+                dst_port=int(hidden_chunk.ack_port),
+                room=int(hidden_chunk.room),
+                prefill_rank=int(hidden_chunk.prefill_rank),
+                hidden_start=int(hidden_chunk.hidden_start),
+                is_last_hidden_chunk=hidden_chunk.is_last_hidden_chunk,
+            )
+
+    def _inject_full_pd_hidden(self, decode_req: DecodeRequest) -> None:
+        """Inject a non-streaming PD hidden transfer into the DSpark draft KV."""
+        hidden_state = decode_req.pd_hidden_state
+        if not hidden_state.enabled or hidden_state.streaming:
+            return
+        indices = decode_req.pd_hidden_dst_indices
+        if indices is None and decode_req.pd_hidden_dst_indices_by_pp:
+            indices = next(iter(decode_req.pd_hidden_dst_indices_by_pp.values()))
+        if not indices:
+            return
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        if pool is None:
+            raise RuntimeError("PD hidden row pool disappeared on decode.")
+        inject_chunk = getattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk", None)
+        if inject_chunk is None:
+            raise RuntimeError(
+                "PD full hidden transfer requires draft_worker.inject_pd_hidden_chunk."
+            )
+        read_hidden = getattr(pool, "read_view", None) or pool.read
+        hidden = read_hidden(indices)
+        event = inject_chunk(decode_req.req, hidden, hidden_state.start)
+        if event is not None:
+            event.synchronize()
+        hidden_state.mark_hidden_done()
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -2303,6 +3279,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+            try:
+                self._consume_pd_hidden_acked_chunks(decode_req)
+                self._drain_pd_hidden_ready_chunks(decode_req)
+            except Exception as e:
+                error_message = (
+                    "PD hidden decode transfer failed while draining chunks: "
+                    f"rid={decode_req.req.rid}, room={decode_req.req.bootstrap_room}, "
+                    f"error={e}"
+                )
+                self.kv_manager.record_failure(
+                    decode_req.req.bootstrap_room,
+                    error_message,
+                )
+                self.kv_manager.update_status(
+                    decode_req.req.bootstrap_room,
+                    KVPoll.Failed,
+                )
+                poll = KVPoll.Failed
 
             hicache_restore_status = decode_req.hicache_restore_status
             if (
@@ -2339,7 +3333,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 if (
                     self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
                     and decode_req.kv_receiver.abort_notified
                 ):
                     # Decode-initiated abort: a prefill write may still target
@@ -2352,6 +3345,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 else:
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    self._release_pd_hidden_rows(decode_req)
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
@@ -2363,6 +3357,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
+                    continue
+                hidden_state = decode_req.pd_hidden_state
+                hidden_state.mark_kv_done()
+                if hidden_state.enabled and not hidden_state.streaming:
+                    self._inject_full_pd_hidden(decode_req)
+                if not hidden_state.request_done():
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
@@ -2407,6 +3407,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
+            self._release_pd_hidden_rows(self.queue[i])
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -2472,6 +3473,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        for decode_req in self.queue:
+            self._release_pd_hidden_rows(decode_req)
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
@@ -2498,7 +3501,6 @@ class SchedulerDisaggregationDecodeMixin:
                 # Paused ranks must still join MLPSync so DP peers do not hang.
                 if getattr(self, "require_mlp_sync", False):
                     self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(None)
-                self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
 
@@ -2545,7 +3547,6 @@ class SchedulerDisaggregationDecodeMixin:
                 # Paused ranks must still join MLPSync so DP peers do not hang.
                 if getattr(self, "require_mlp_sync", False):
                     self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(None)
-                self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
 
@@ -2600,7 +3601,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
-    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
+    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
@@ -2674,10 +3675,8 @@ class SchedulerDisaggregationDecodeMixin:
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
-                if req.kv.kv_committed_len is not None:
-                    req.set_extend_range(
-                        len(req.prefix_indices), req.kv.kv_committed_len
-                    )
+                if req.kv_committed_len is not None:
+                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
                 waiting_queue.append(req)
 
@@ -2708,7 +3707,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
-    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
         """Advance local PD queues; cross-DP sync happens later in MLPSync."""
         pd_t0 = time.monotonic()

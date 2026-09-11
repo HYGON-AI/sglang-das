@@ -41,6 +41,7 @@ def get_spec_layer_idx_from_weight_name(
 
 
 class SharedHead(nn.Module):
+
     def __init__(
         self,
         config,

@@ -54,7 +54,8 @@ class TransferTensorBuffer:
 
         pool_location = "pinned CPU" if device == "cpu" else f"GPU ({device})"
         logger.info(
-            "TransferTensorBuffer[%s]: allocated %d MiB %s memory (min_block=%d KiB)",
+            "TransferTensorBuffer[%s]: allocated %d MiB %s memory "
+            "(min_block=%d KiB)",
             role_name,
             actual_size >> 20,
             pool_location,

@@ -256,9 +256,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), (
-                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
-            )
+            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -709,6 +707,7 @@ class LLaDA2MoeBlock(nn.Module):
 
 
 class LLaDA2MoeModel(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,

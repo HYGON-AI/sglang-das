@@ -494,6 +494,7 @@ class SanaTransformerBlock(nn.Module):
 
 
 class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+
     _fsdp_shard_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),
     ]

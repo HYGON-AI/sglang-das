@@ -15,18 +15,32 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.distributed
+from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.hidden_state import (
+    get_pd_hidden_capture_layer_ids,
+    get_pd_hidden_req_state as pd_hidden_state,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    get_attention_dp_size,
+    is_dp_attention_enabled,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import ExpertDistributionReq
 from sglang.srt.managers.overlap_utils import RelayPayload
@@ -37,22 +51,28 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.input_buffers import get_pp_proxy_hidden_states_shape
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+PPTransferStatus = Tuple[List[str], List[str]]
+PPReleasePayload = Union[List[str], PPTransferStatus]
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -65,6 +85,35 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
+    right_set = set(right)
+    return [rid for rid in left if rid in right_set]
+
+
+def _pp_ordered_union(left: List[str], right: List[str]) -> List[str]:
+    seen = set(left)
+    merged = list(left)
+    for rid in right:
+        if rid not in seen:
+            seen.add(rid)
+            merged.append(rid)
+    return merged
+
+
+def _pp_merge_transfer_status(
+    previous: PPTransferStatus,
+    current: PPTransferStatus,
+) -> PPTransferStatus:
+    previous_success, previous_failed = previous
+    current_success, current_failed = current
+    failed = _pp_ordered_union(previous_failed, current_failed)
+    success = _pp_ordered_intersection(previous_success, current_success)
+    if failed:
+        failed_set = set(failed)
+        success = [rid for rid in success if rid not in failed_set]
+    return success, failed
 
 
 @dataclass
@@ -244,8 +293,8 @@ class SchedulerPPMixin:
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
+        transferred_rids: PPTransferStatus = ([], [])
+        release_rids: Optional[PPTransferStatus] = None
         send_bootstrapped_work = []
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
@@ -608,6 +657,230 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
 
+    def profile_and_init_predictor(self: Scheduler):
+        """
+        Profile prefill latency for dynamic chunk sizing.
+
+        Only runs on PP0 (first rank), then broadcasts data to all ranks.
+        All ranks fit coefficients using the same data.
+        """
+        seq_lens: List[int] = []
+        latencies: List[float] = []
+
+        if self.pp_group.is_first_rank:
+            model_runner = self.tp_worker.model_runner
+            model_config = model_runner.model_config
+            input_ids_list: List[array[int]] = []
+            for i in range(128):
+                chunk_size = int(
+                    self.chunked_prefill_size * 1.25
+                    - i * (self.chunked_prefill_size * 1.25 // 128)
+                )
+                if chunk_size <= 0:
+                    break
+                input_ids = array(
+                    "q",
+                    np.random.randint(
+                        0, 10000, size=chunk_size, dtype=np.int64
+                    ).tobytes(),
+                )
+                input_ids_list.append(input_ids)
+
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_new_tokens=1,
+            )
+            # Create and profile requests
+            for i, input_ids in enumerate(
+                tqdm(
+                    input_ids_list,
+                    desc="Profiling prefill latency for dynamic chunking",
+                )
+            ):
+                req = Req(
+                    rid=str(i),
+                    origin_input_text="",
+                    origin_input_ids=input_ids,
+                    sampling_params=sampling_params,
+                )
+                req.full_untruncated_fill_ids = req.origin_input_ids
+                req.logprob_start_len = -1
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
+
+                # Prepare batch
+                batch = ScheduleBatch.init_new(
+                    [req],
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    self.tree_cache,
+                    self.model_config,
+                    False,
+                    self.spec_algorithm,
+                )
+
+                current_seq_len = req.extend_range.end
+
+                if is_dp_attention_enabled():
+                    # For profiling, we only have one request on PP0
+                    # Set global_num_tokens to indicate this rank has tokens, others have 0
+                    dp_size = get_attention_dp_size()
+                    global_num_tokens = [0] * dp_size
+                    dp_rank = get_attention_dp_rank()
+                    global_num_tokens[dp_rank] = current_seq_len
+                    batch.global_num_tokens = global_num_tokens
+                    batch.global_num_tokens_for_logprob = global_num_tokens
+
+                hs = (
+                    getattr(model_config, "hc_hidden_size", None)
+                    or model_config.hidden_size
+                )
+                proxy_tensors = {
+                    "hidden_states": torch.zeros(
+                        get_pp_proxy_hidden_states_shape(
+                            num_tokens=current_seq_len,
+                            hidden_size=hs,
+                            model_config=model_config,
+                        ),
+                        dtype=model_config.dtype,
+                        device=self.device,
+                    ),
+                    "residual": torch.zeros(
+                        (current_seq_len, model_config.hidden_size),
+                        dtype=model_config.dtype,
+                        device=self.device,
+                    ),
+                }
+                pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
+                if pp_proxy_topk_size is not None:
+                    proxy_tensors["topk_indices"] = torch.zeros(
+                        (current_seq_len, pp_proxy_topk_size),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+
+                pp_proxy = PPProxyTensors(proxy_tensors)
+
+                # Measure latency with device synchronization for accurate timing
+                device_module = get_device_module()
+                # Synchronize before starting timing to ensure clean measurement
+                device_module.synchronize()
+
+                start = time.perf_counter()
+                batch.prepare_for_extend()
+
+                # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
+                if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+                    batch.input_ids = batch.prefill_input_ids_cpu.to(
+                        self.device, non_blocking=True
+                    )
+                    batch.prefill_input_ids_cpu = None
+
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    model_runner,
+                    return_hidden_states_before_norm=False,
+                )
+                set_is_extend_in_batch(batch.forward_mode.is_extend())
+
+                _ = model_runner.forward(
+                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
+                )
+
+                # Synchronize after forward to ensure GPU operations complete
+                device_module.synchronize()
+
+                latency_seconds = time.perf_counter() - start
+                latency_ms = latency_seconds * 1e3  # Convert to milliseconds
+                seq_lens.append(len(input_ids))
+                latencies.append(latency_ms)
+
+                # Release KV and Mamba cache
+                if req.req_pool_idx is not None:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : req.extend_range.end
+                    ]
+                    self.token_to_kv_pool_allocator.free(kv_indices)
+                    if req.mamba_pool_idx is not None:
+                        self.req_to_token_pool.free_mamba_cache(req)
+                    self.req_to_token_pool.free(req)
+                    req.kv = None
+
+            logger.info(
+                f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
+                f"seq_lens={seq_lens}, latencies_ms={latencies}"
+            )
+
+            if self.ps.attn_tp_size > 1:
+                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = broadcast_pyobj(
+                    data_to_sync_tp,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+                seq_lens, latencies = data_to_sync_tp
+
+            if self.ps.attn_cp_size > 1:
+                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = broadcast_pyobj(
+                    data_to_sync_tp,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+
+        # Broadcast data to all ranks
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            data_to_sync = [seq_lens, latencies]
+            self.pp_group.broadcast_object_list(data_to_sync, src=0)
+            seq_lens, latencies = data_to_sync
+
+        # Quadratic model: f(l) = al^2 + bl + c
+        self.length_predictor = ChunkSizePredictor()
+        self.length_predictor.fit(seq_lens, latencies)
+        self.length_predictor.set_target_latency(self.chunked_prefill_size)
+        self.length_predictor.is_ready = True
+        logger.info(
+            f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
+            f"Target latency: {self.length_predictor.target_latency:.2f}ms"
+        )
+
+    def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
+        """
+        Predict next chunk size dynamically based on current history length.
+
+        Args:
+            history_len: Current sequence length
+
+        Returns:
+            Predicted chunk size, or None to use default chunked_prefill_size
+        """
+        if (
+            not self.enable_dynamic_chunking
+            or self.length_predictor is None
+            or not self.length_predictor.is_ready
+        ):
+            return None
+
+        max_chunk_size = self.max_prefill_tokens
+        predicted_size = self.length_predictor.predict_next_chunk_size(
+            history_len=history_len,
+            base_chunk_size=self.chunked_prefill_size,
+            page_size=self.page_size,
+            context_len=self.model_config.context_len,
+            max_chunk_size=max_chunk_size,
+        )
+
+        if predicted_size is not None:
+            logger.debug(
+                f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predicted chunk size: "
+                f"{predicted_size} (history_len={history_len})"
+            )
+
+        return predicted_size
+
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
@@ -631,18 +904,38 @@ class SchedulerPPMixin:
             # if ready_reqs:
             #     self._try_send_prefill_kv_ready_batch(ready_reqs)
             self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.rid for req in good_reqs],
+                _pp_ordered_union(
+                    bad_consensus_bootstrapped_rids,
+                    [req.rid for req in failed_reqs],
+                ),
+            ]
         return None
+
+    def _pp_ordered_intersection(
+        self: Scheduler, left: List[str], right: List[str]
+    ) -> List[str]:
+        right_set = set(right)
+        return [rid for rid in left if rid in right_set]
+
+    def _pp_ordered_union(
+        self: Scheduler, left: List[str], right: List[str]
+    ) -> List[str]:
+        seen = set(left)
+        merged = list(left)
+        for rid in right:
+            if rid not in seen:
+                seen.add(rid)
+                merged.append(rid)
+        return merged
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            # Probe local credits without reserving resources before consensus.
+            good_bootstrapped_rids, bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -650,17 +943,14 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = self._pp_ordered_intersection(
+                prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
             )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            bad_bootstrapped_rids = self._pp_ordered_union(
+                prev_bad_bootstrapped_rids, curr_bad_bootstrapped_rids
             )
         # Route locally-aborted reqs through the bad-union consensus so every PP
         # rank flushes them in the same consensus round, regardless of when the
@@ -676,28 +966,21 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+    def _pp_pd_get_prefill_transferred_ids(
+        self: Scheduler,
+    ) -> PPTransferStatus:
         # get the current stage transfer success
+        current_status = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = current_status
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            previous_status = self._pp_recv_pyobj_from_prev_stage()
+            transferred_rids = _pp_merge_transfer_status(
+                previous=previous_status,
+                current=current_status,
             )
         return transferred_rids
 
@@ -726,10 +1009,10 @@ class SchedulerPPMixin:
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
-        tmbs: List[List[str]],
+        tmbs: List[Optional[PPReleasePayload]],
         next_first_rank_mb_id: int,
-        release_rids: List[str],
-        transferred_rids: List[str],
+        release_rids: Optional[PPReleasePayload],
+        transferred_rids: PPReleasePayload,
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
@@ -807,7 +1090,22 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        data = attn_cp_tp_broadcast_pyobj(data)
+        if self.ps.attn_tp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+
+        if self.ps.attn_cp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+
         return data
 
     def _pp_prepare_tensor_dict(
@@ -816,14 +1114,6 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
-
-        # Draft extend runs only on the last stage, but every rank needs its relayed
-        # output to fill PD auxiliary buffers.
-        draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
-            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
-            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -837,6 +1127,13 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+        if (
+            get_pd_hidden_capture_layer_ids(batch.reqs)
+            and not self._pp_should_owner_direct_pd_hidden(batch)
+            and result.logits_output is not None
+            and result.logits_output.hidden_states is not None
+        ):
+            tensor_dict["pd_aux_hidden_states_0"] = result.logits_output.hidden_states
         return tensor_dict
 
     def _pp_prepare_proxy_tensor_dict_for_send(
@@ -846,6 +1143,56 @@ class SchedulerPPMixin:
         if not result.can_run_cuda_graph:
             return tensor_dict
         return {name: tensor.clone() for name, tensor in tensor_dict.items()}
+    def _pp_should_owner_direct_pd_hidden(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> bool:
+        if batch and batch.spec_algorithm.is_dspark():
+            return False
+        if not hasattr(self, "disagg_prefill_bootstrap_queue"):
+            return False
+        if not batch or not get_pd_hidden_capture_layer_ids(batch.reqs):
+            return False
+        capture_reqs = [
+            req
+            for req in batch.reqs
+            if pd_hidden_state(req).capture_layer_ids
+        ]
+        if not capture_reqs:
+            return False
+        if any(req.pending_bootstrap for req in capture_reqs):
+            return False
+        return all(
+            bool((pd_hidden_state(req).meta or {}).get("streaming_hidden", False))
+            for req in capture_reqs
+        )
+
+    def _pp_strip_pd_aux_hidden_from_proxy(
+        self: Scheduler, result: GenerationBatchResult
+    ) -> None:
+        proxy = result.pp_hidden_states_proxy_tensors
+        if proxy is None:
+            return
+        tensors = proxy.tensors
+        aux_keys = [
+            key for key in tensors if key.startswith("pd_aux_hidden_states_")
+        ]
+        for key in aux_keys:
+            tensors.pop(key, None)
+
+    def _pp_maybe_send_dspark_owner_direct_hidden(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        if not self._pp_should_owner_direct_pd_hidden(batch):
+            return
+        send_owner_direct = getattr(
+            self, "send_dspark_owner_direct_hidden_for_batch", None
+        )
+        if send_owner_direct is None:
+            return
+        if send_owner_direct(batch, result):
+            self._pp_strip_pd_aux_hidden_from_proxy(result)
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
@@ -950,7 +1297,6 @@ class SchedulerPPMixin:
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
-
     def _pp_prep_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -980,43 +1326,40 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-
-        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
-        # processor sees the same object on every rank.
         next_draft_input = None
-        if "draft_topk_p" in pp_outputs.tensors:
-            from sglang.srt.speculative.eagle_info import EagleDraftInput
+        if isinstance(batch, ScheduleBatch) and batch.spec_algorithm.is_dspark():
+            next_token_ids = next_token_ids.to(
+                device=batch.device,
+                dtype=torch.int64,
+                non_blocking=True,
+            )
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
 
-            next_draft_input = EagleDraftInput(
-                topk_p=pp_outputs["draft_topk_p"],
-                topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
+            next_draft_input = make_next_draft_input(
                 bonus_tokens=next_token_ids,
-                num_tokens_per_req=1,
-                num_tokens_for_logprob_per_req=1,
+                new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
-
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
-            batch.req_pool_indices,
-            RelayPayload(
-                bonus_tokens=next_token_ids,
-                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
-                topk_index=(
-                    None if next_draft_input is None else next_draft_input.topk_index
-                ),
-                hidden_states=(
-                    None if next_draft_input is None else next_draft_input.hidden_states
-                ),
-            ),
+            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
+        pd_aux_hidden = {
+            key: value
+            for key, value in pp_outputs.tensors.items()
+            if key.startswith("pd_aux_hidden_states_")
+        }
+
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
+            pp_hidden_states_proxy_tensors=(
+                PPProxyTensors(pd_aux_hidden) if pd_aux_hidden else None
+            ),
             next_token_ids=pp_outputs["next_token_ids"],
             next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
@@ -1151,7 +1494,16 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if cur_batch.spec_algorithm.is_dspark():
+                    self.model_worker.set_pp_proxy_tensors_for_next_forward(
+                        pp_proxy_tensors
+                    )
+                try:
+                    result = self.run_batch(cur_batch, pp_proxy_tensors)
+                finally:
+                    if cur_batch.spec_algorithm.is_dspark():
+                        self.model_worker.set_pp_proxy_tensors_for_next_forward(None)
+                self._pp_maybe_send_dspark_owner_direct_hidden(cur_batch, result)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
@@ -1242,6 +1594,10 @@ class SchedulerPPMixin:
             bad_prealloc_rids = list(
                 set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
             )
+        aborted = self.disagg_decode_prealloc_queue.locally_aborted_rids
+        if aborted:
+            bad_prealloc_rids = sorted(set(bad_prealloc_rids) | set(aborted))
+            good_prealloc_rids = sorted(set(good_prealloc_rids) - set(bad_prealloc_rids))
         # Same abort routing as the prefill bootstrap consensus above.
         aborted_rids = {
             decode_req.req.rid
@@ -1267,30 +1623,32 @@ class SchedulerPPMixin:
         bad_rids = list(set(bad_rids) | set(aborted_rids))
         return good_rids, bad_rids
 
+    def _pp_pd_local_transfer_status(self: Scheduler):
+        success_rids, failed_rids = self.get_rids(
+            self.disagg_decode_transfer_queue.queue,
+            False,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+        )
+        success_rids = self.disagg_decode_transfer_queue.filter_commit_ready_rids(
+            success_rids
+        )
+        aborted = self.disagg_decode_transfer_queue.locally_aborted_rids
+        failed_rids = sorted(set(failed_rids) | set(aborted))
+        success_rids = sorted(set(success_rids) - set(failed_rids))
+        return success_rids, failed_rids
+
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Success requires every PP rank; Failed is a union and wins.
+        success_rids, failed_rids = self._pp_pd_local_transfer_status()
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
+            return [success_rids, failed_rids]
+
+        prev_success_rids, prev_failed_rids = self._pp_recv_pyobj_from_prev_stage()
+        success_rids = sorted(set(prev_success_rids) & set(success_rids))
+        failed_rids = sorted(set(prev_failed_rids) | set(failed_rids))
+        success_rids = sorted(set(success_rids) - set(failed_rids))
+        return [success_rids, failed_rids]
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -1312,6 +1670,9 @@ class SchedulerPPMixin:
                 good_consensus_prealloc_rids,
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
+            self.disagg_decode_prealloc_queue.drop_by_rids(bad_consensus_prealloc_rids)
+            for rid in bad_consensus_prealloc_rids:
+                self.disagg_decode_prealloc_queue.locally_aborted_rids.discard(rid)
             good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
                 pp_good_rids=good_consensus_prealloc_rids,
                 pp_bad_rids=bad_consensus_prealloc_rids,
@@ -1329,13 +1690,217 @@ class SchedulerPPMixin:
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
-        if release_rids is not None:
-            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                release_rids
+        if release_rids is None:
+            return None
+        if (
+            isinstance(release_rids, (list, tuple))
+            and len(release_rids) == 2
+            and not (release_rids and isinstance(release_rids[0], str))
+        ):
+            success_rids, failed_rids = release_rids
+        else:
+            success_rids, failed_rids = list(release_rids), []
+        if failed_rids:
+            failed_set = set(failed_rids)
+            poll_failed = []
+            force_drop = []
+            for decode_req in self.disagg_decode_transfer_queue.queue:
+                if decode_req.req.rid not in failed_set:
+                    continue
+                poll = (
+                    int(decode_req.kv_receiver.poll())
+                    if decode_req.kv_receiver is not None
+                    else int(KVPoll.Failed)
+                )
+                if poll == int(KVPoll.Failed):
+                    poll_failed.append(decode_req.req.rid)
+                else:
+                    force_drop.append(decode_req.req.rid)
+            self.disagg_decode_transfer_queue.drop_by_rids(
+                poll_failed, stream_error=True
             )
-            if self.enable_hisparse:
-                for req in released_reqs:
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(released_reqs)
-            return [req.rid for req in released_reqs]
-        return None
+            self.disagg_decode_transfer_queue.drop_by_rids(
+                force_drop, stream_error=False
+            )
+            for rid in failed_rids:
+                self.disagg_decode_transfer_queue.locally_aborted_rids.discard(rid)
+        released_reqs = self.disagg_decode_transfer_queue.pop_transferred(success_rids)
+        if self.enable_hisparse:
+            for req in released_reqs:
+                self.hisparse_coordinator.admit_request_direct(req)
+        self.waiting_queue.extend(released_reqs)
+        return [req.rid for req in released_reqs]
+
+
+class ChunkSizePredictor:
+    """
+    Predictor for dynamic chunk size based on quadratic latency model.
+
+    Models latency as: f(l) = a*l^2 + b*l + c
+    Predicts next chunk size x such that: f(L+x) - f(L) = target_latency
+    """
+
+    def __init__(self):
+        self.quadratic_coeff_a = 0.0
+        self.linear_coeff_b = 0.0
+        self.constant_coeff_c = 0.0
+        self.target_latency: Optional[float] = None
+        self.is_ready = False
+
+    def fit(self, seq_lens: List[int], latencies: List[float]):
+        """Fit quadratic coefficients f(l) = al^2 + bl + c from data points."""
+        # Skip the first data point to reduce fitting bias, as the first run is slower without warmup
+        L = np.array(seq_lens[1:], dtype=np.float64)
+        T = np.array(latencies[1:], dtype=np.float64)
+
+        if len(L) < 8:
+            raise ValueError(
+                f"Not enough data points for quadratic fitting ({len(L)} < 8). "
+                "Need at least 8 samples with different sequence lengths."
+            )
+
+        # Build design matrix for f(l) = al^2 + bl + c
+        X = np.column_stack([L * L, L, np.ones_like(L)])  # [l^2, l, 1]
+
+        try:
+            coeffs, residuals, rank, s = np.linalg.lstsq(X, T, rcond=None)
+            if len(coeffs) >= 3:
+                fitted_a = float(coeffs[0])  # quadratic coefficient
+                fitted_b = float(coeffs[1])  # linear coefficient
+                fitted_c = float(coeffs[2])  # constant coefficient
+            else:
+                raise ValueError("Failed to fit coefficients: insufficient rank")
+        except np.linalg.LinAlgError as e:
+            raise ValueError(f"Failed to fit f(l) = al^2 + bl + c: {e}")
+
+        # Validate coefficients
+        if fitted_a <= 0:
+            raise ValueError(
+                f"Fitted quadratic coefficient a={fitted_a:.2e} is not positive. "
+                "Attention has O(n^2) complexity, so a must be positive. "
+                "Check warmup data quality."
+            )
+
+        if fitted_b < 0:
+            logger.warning(
+                f"Fitted linear coefficient b={fitted_b:.2e} is negative. Setting b=0."
+            )
+            fitted_b = 0.0
+
+        self.quadratic_coeff_a = fitted_a
+        self.linear_coeff_b = fitted_b
+        self.constant_coeff_c = fitted_c
+
+        logger.info(
+            f"[ChunkSizePredictor] Fitted coefficients: a={fitted_a:.2e}, "
+            f"b={fitted_b:.2e}, c={fitted_c:.2e}"
+        )
+
+    def set_target_latency(self, base_chunk_size: int):
+        """Set target latency based on base chunk size: target = f(base_chunk_size) - f(0)."""
+
+        def f(length: float) -> float:
+            """Total latency function: f(length) = a*length^2 + b*length + c."""
+            return (
+                self.quadratic_coeff_a * length * length
+                + self.linear_coeff_b * length
+                + self.constant_coeff_c
+            )
+
+        self.target_latency = f(float(base_chunk_size)) - f(0.0)
+
+        if self.target_latency <= 0:
+            raise ValueError(
+                f"Calculated target_latency={self.target_latency:.2f}ms is not positive. "
+                "Check warmup data quality."
+            )
+
+        logger.info(
+            f"[ChunkSizePredictor] Target latency: {self.target_latency:.2f}ms "
+            f"(base_chunk_size={base_chunk_size})"
+        )
+
+    def predict_next_chunk_size(
+        self,
+        history_len: int,
+        base_chunk_size: int,
+        page_size: int,
+        context_len: int,
+        max_chunk_size: Optional[int] = None,
+    ) -> Optional[int]:
+        """
+        Predict next chunk size x such that f(history_len + x) - f(history_len) = target_latency.
+
+        Args:
+            history_len: Current sequence length (L)
+            base_chunk_size: Base chunk size
+            page_size: Page size for alignment
+            context_len: Maximum context length
+            max_chunk_size: Maximum allowed chunk size (optional)
+
+        Returns:
+            Predicted chunk size, or None if prediction fails
+        """
+        if not self.is_ready or self.target_latency is None:
+            return None
+
+        # Handle quadratic model: f(l) = al^2 + bl + c
+        if self.quadratic_coeff_a <= 0:
+            return None
+
+        # Solve f(L+x) - f(L) = T
+        # where f(L) = a*L^2 + b*L + c
+        # This expands to: ax^2 + (2aL+b)x - T = 0
+        # A = a, B = 2aL + b, C = -T
+        A = self.quadratic_coeff_a
+        B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
+        C = -self.target_latency
+
+        discriminant = B * B - 4 * A * C
+
+        if discriminant < 0:
+            logger.warning(
+                f"Discriminant is negative ({discriminant:.2e}). "
+                f"No real solution for chunk size. L={history_len}, T={self.target_latency:.2f}ms."
+            )
+            return None
+
+        sqrt_discriminant = math.sqrt(discriminant)
+        calculated_chunk_size_float = (-B + sqrt_discriminant) / (2 * A)
+
+        if calculated_chunk_size_float <= 0:
+            logger.warning(
+                f"Calculated chunk size is non-positive ({calculated_chunk_size_float:.2f}). "
+                f"L={history_len}, T={self.target_latency:.2f}ms."
+            )
+            return None
+
+        # Use a smooth coefficient to reduce the abrupt decrease in chunk size
+        smooth_coeff = envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.get()
+        smoothed_chunk_size = base_chunk_size + smooth_coeff * (
+            calculated_chunk_size_float - base_chunk_size
+        )
+        # Make sure the dynamic chunk size is at least 1/4 of the base chunk size
+        calculated_chunk_size = max(int(smoothed_chunk_size), base_chunk_size // 4)
+
+        # Align to page_size (minimum alignment size is 64)
+        alignment_size = max(page_size, 64)
+        dynamic_chunk_size = (calculated_chunk_size // alignment_size) * alignment_size
+
+        # Ensure aligned size is at least alignment_size
+        if dynamic_chunk_size < alignment_size:
+            dynamic_chunk_size = alignment_size
+
+        # Apply constraints
+        max_allowed = context_len - history_len - 100  # Leave 100 tokens margin
+        if max_chunk_size is not None:
+            max_allowed = min(max_allowed, max_chunk_size)
+        dynamic_chunk_size = min(dynamic_chunk_size, max_allowed)
+
+        # Align again after min operation
+        dynamic_chunk_size = (dynamic_chunk_size // alignment_size) * alignment_size
+
+        if dynamic_chunk_size < alignment_size:
+            return None
+
+        return dynamic_chunk_size

@@ -24,9 +24,11 @@ from sglang.srt.managers.schedule_batch import (
     mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
+    free_swa_out_of_window_slots,
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -34,22 +36,18 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_memory,
     get_observability,
+    mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_observer import CommittedTokens
-from sglang.srt.sampling.sampling_params import (
-    get_request_reasoning_end_token_ids,
-)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
-    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -74,18 +72,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
-
-
-def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
-    """Return the padded per-request width in flattened speculative output."""
-    stride = result.speculative_output_stride
-    if stride is None:
-        stride = result.speculative_num_draft_tokens
-    if stride is None or stride < 1:
-        raise RuntimeError("speculative result is missing a positive output row stride")
-    return stride
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -94,6 +83,7 @@ class SchedulerBatchResultProcessor:
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
+    server_args: ServerArgs
     model_config: ModelConfig
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -106,7 +96,6 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
-    beam_coordinator: BeamCoordinator
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -149,7 +138,7 @@ class SchedulerBatchResultProcessor:
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.routed_experts = capturer.get_topk(
-            req_pool_idx=req.kv.req_pool_idx,
+            req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
@@ -173,13 +162,107 @@ class SchedulerBatchResultProcessor:
                 req.routed_experts_start_len,
             )
 
+    def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req):
+        if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
+            return
+
+        # process_batch_result_prebuilt() runs before the first real decode
+        # forward and the batch still references request-owned prompt pages via
+        # out_cache_loc. Insert only after a decode forward completes. For DSV4
+        # we donate the prompt pages to radix cache; protect the prompt snapshot
+        # before insertion so the generic overlap path does not free those pages
+        # again, and later request release skips the donated prefix. Keep the key
+        # bounded to the prefill-committed prompt snapshot so MTP accepted/draft
+        # deltas never enter the tree.
+        req.dsv4_decode_radix_cache_prompt_once = False
+        req.allow_radix_cache_insert_once = True
+        prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
+        if prompt_len is None:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            return
+
+        page_size = self.tree_cache.page_size
+        # prompt-once flag was armed (decode.py), so get_fill_ids() already
+        # returns exactly the committed prompt snapshot.
+        prompt_fill_ids = req.get_fill_ids()
+        tree_core = getattr(self.tree_cache, "tree_core", None)
+        is_eagle = getattr(
+            self.tree_cache, "is_eagle", getattr(tree_core, "is_eagle", False)
+        )
+        radix_key_len = len(
+            RadixKey(
+                prompt_fill_ids,
+                req.extra_key,
+                is_bigram=is_eagle,
+                cache_salt=getattr(req, "cache_salt", None),
+            ).page_aligned(page_size)
+        )
+        if radix_key_len <= 0:
+            req.allow_radix_cache_insert_once = False
+            return
+
+        old_cache_protected_len = req.cache_protected_len
+        old_swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
+
+        # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
+        # whole donated key as SWA-evicted so the SWA component stays tombstoned,
+        # but force full leaf creation so later matches can reuse the full prefix.
+        # Do not pre-protect the whole radix key here: when the prefix already
+        # exists, the generic overlap path must free this request's duplicate
+        # prompt pages and repoint it to the existing radix leaf.
+        req.kv.swa_evicted_seqlen = radix_key_len
+        req.force_radix_leaf_creation = True
+        try:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            # The donated leaf is full-only, so this request's SWA tail is
+            # private and looks free to release outright. It is not: the request
+            # keeps decoding and its sliding window still reaches back into the
+            # donated range, so an untracked free hands live slots to another
+            # request (silent wrong tokens) while leaving the rest unaccounted
+            # for (pool leak). Use the tracked window-aware helper, which stops
+            # at max(window, page) and records swa_evicted_seqlen so the
+            # end-of-request path releases the remainder.
+            window_size = int(
+                getattr(self.model_config, "sliding_window_size", 0) or 0
+            )
+            if window_size > 0 and prompt_len > 0:
+                free_swa_out_of_window_slots(
+                    req,
+                    prompt_len - 1,
+                    sliding_window_size=window_size,
+                    page_size=page_size,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    retain_floor=self.tree_cache.swa_retain_floor(req),
+                )
+            # The tree keeps the donated full pages but tombstones their SWA,
+            # so no owner remains for the SWA under [0, radix_key_len). Hand the
+            # range to release_kv_cache, which runs after the last decode step.
+            req.dsv4_donated_swa_len = max(
+                int(getattr(req, "dsv4_donated_swa_len", 0) or 0), radix_key_len
+            )
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                logger.info(
+                    "DSV4 decode radix prompt inserted: rid=%s "
+                    "prompt_len=%d radix_key_len=%d",
+                    req.rid,
+                    prompt_len,
+                    radix_key_len,
+                )
+        finally:
+            req.kv.swa_evicted_seqlen = old_swa_evicted_seqlen
+            req.force_radix_leaf_creation = old_force_leaf_creation
+            if req.cache_protected_len < old_cache_protected_len:
+                req.cache_protected_len = old_cache_protected_len
+
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:
             return
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.indexer_topk = capturer.get_topk(
-            req_pool_idx=req.kv.req_pool_idx,
+            req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
@@ -293,6 +376,7 @@ class SchedulerBatchResultProcessor:
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,
+                self.server_args,
             )
 
             # Check finish conditions
@@ -328,28 +412,12 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    if req.beam_group is not None:
-                        # The relay point already replaced the sampled-token
-                        # append; the group owns all finish semantics.
-                        self.beam_coordinator.commit_prefill(
-                            req, up_to_tick=batch.forward_iter
-                        )
-                    else:
-                        # req output_ids are set here
-                        req.output_ids.append(next_token_id)
+                    # req output_ids are set here
+                    req.output_ids.append(next_token_id)
 
-                        self._maybe_update_reasoning_tokens(req, next_token_id)
+                    self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                        req.update_finish_state()
-                    # A mixed spec tail committed its pending bonus token; advance
-                    # so the next spec prepare_for_decode reserves from the right base.
-                    if (
-                        not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
-                        and not batch.spec_algorithm.is_none()
-                    ):
-                        req.kv.kv_committed_len += 1
+                    req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -454,15 +522,12 @@ class SchedulerBatchResultProcessor:
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph
-        # None on decode->extend converted batches; they are decode work and
-        # have no prefill stats to report.
-        if batch.prefill_stats is not None:
-            self.metrics_reporter.report_prefill_stats(
-                batch=batch,
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
+        self.metrics_reporter.report_prefill_stats(
+            batch=batch,
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
@@ -648,7 +713,10 @@ class SchedulerBatchResultProcessor:
             )
 
     @staticmethod
-    def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
+    def _get_prefill_hidden_capture_mode(
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+    ) -> CaptureHiddenMode:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
@@ -721,11 +789,9 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        stride = _get_speculative_output_stride(result)
-        num_non_draft = result.num_non_draft_tokens_per_req
-        result.num_correct_drafts_per_req_cpu = [
-            length - num_non_draft for length in accept_lens
-        ]
+        # A zero-length verify result has no accepted bonus token, so it also
+        # has zero (rather than -1) accepted draft tokens.
+        result.num_correct_drafts_per_req_cpu = [max(x - 1, 0) for x in accept_lens]
         result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
 
         block_accept_lens = (
@@ -754,6 +820,11 @@ class SchedulerBatchResultProcessor:
         self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
+        # In adaptive spec-v2, the worker state may already have switched when this
+        # delayed result is processed. Use the draft token count recorded on result.
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -769,7 +840,7 @@ class SchedulerBatchResultProcessor:
 
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
-                req.kv.kv_committed_len += num_accept_tokens
+                req.kv_committed_len += num_accept_tokens
                 req.spec_verify_ct += 1
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -862,7 +933,8 @@ class SchedulerBatchResultProcessor:
         if result.accept_lens is None:
             return
         accept_lens = result.accept_lens.tolist()
-        stride = _get_speculative_output_stride(result)
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
         retained = [None] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
             if req.grammar is None or req.is_retracted or req.finished():
@@ -915,14 +987,11 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        batch_size = batch.batch_size()
-        num_generated_tokens = result.get_num_generated_tokens(batch_size)
-        self.metrics_reporter.num_generated_tokens += num_generated_tokens
+        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch_size,
+                batch.batch_size(),
                 result.num_correct_drafts,
-                num_accept_tokens=num_generated_tokens,
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
@@ -933,27 +1002,8 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Folds the relay point's selection into the DAG and sets the finish
-        # states the loop below observes. Beam + spec is rejected at admission.
-        newly_finished_beam_groups = set()
-        if batch.spec_algorithm.is_none() and logits_output is not None:
-            newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
-
         for i, req in enumerate(batch.reqs):
             req: Req
-
-            if req.beam_group is not None:
-                # Under overlap a finished row reappears for one overshoot tick;
-                # gate on the committing tick so this runs exactly once.
-                if req.finished() and (
-                    id(req.beam_group) not in newly_finished_beam_groups
-                ):
-                    continue
-                req.time_stats.set_last_decode_finish_time()
-                self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
-                )
-                continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
@@ -961,6 +1011,8 @@ class SchedulerBatchResultProcessor:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
+
+            self._maybe_insert_dsv4_decode_radix_prompt(req)
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
@@ -993,8 +1045,8 @@ class SchedulerBatchResultProcessor:
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
-                # token; speculative workers record their padded row width.
-                stride = _get_speculative_output_stride(result) if is_spec else 1
+                # token; stride = speculative_num_draft_tokens for spec, 1 for non-spec.
+                stride = result.speculative_num_draft_tokens or 1
                 accept_len = len(next_token_id)
                 start = i * stride
                 self._append_decode_hidden_states(
@@ -1027,7 +1079,7 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
-            num_generated_tokens=num_generated_tokens,
+            num_correct_drafts=result.num_correct_drafts,
         )
 
     def _normalize_decode_outputs(
@@ -1131,7 +1183,7 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+        lazy = mamba_extra_buffer_lazy_enabled()
         known_mamba_boundary = None
         completed_mamba_boundary = None
         lookahead = 0
@@ -1148,14 +1200,14 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
+                req.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
+                req.mamba_last_track_seqlen = req.kv_committed_len - lookahead
             elif (
                 req.finished()
                 and lazy
                 and lookahead == 1
                 and known_mamba_boundary
-                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
+                and req.mamba_next_track_idx == req.mamba_last_track_idx
             ):
                 req.mamba_lazy_is_insert = False
 
@@ -1206,7 +1258,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -1220,23 +1272,9 @@ class SchedulerBatchResultProcessor:
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
-        if not req.require_reasoning:
-            return
         think_end_ids = self.model_config.think_end_ids
-        if req._think_end_matcher is None:
-            request_think_end_ids = get_request_reasoning_end_token_ids(
-                req.sampling_params.custom_params,
-                allowed_sequences=getattr(
-                    self.model_config,
-                    "request_selectable_think_end_id_sequences",
-                    None,
-                ),
-            )
-            if request_think_end_ids is not None:
-                think_end_ids = request_think_end_ids
-            if not think_end_ids:
-                return
-        req.update_reasoning_tokens(next_token_id, think_end_ids)
+        if req.require_reasoning and think_end_ids:
+            req.update_reasoning_tokens(next_token_id, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,
@@ -1253,13 +1291,13 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.kv.mamba_ping_pong_track_buffer is None:
+        if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+        lazy = mamba_extra_buffer_lazy_enabled()
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
-            track_seqlen = req.kv.kv_committed_len
+            track_seqlen = req.kv_committed_len
             assert track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
             at_boundary = True
         else:
@@ -1275,17 +1313,17 @@ class SchedulerBatchResultProcessor:
         if not at_boundary:
             return
 
-        track_idx = req.kv.mamba_next_track_idx
+        track_idx = req.mamba_next_track_idx
         if not known_boundary and batch.mamba_track_buffer_indices is not None:
             track_idx = batch.mamba_track_buffer_indices[i]
         if not known_boundary:
-            req.kv.mamba_last_track_seqlen = track_seqlen
+            req.mamba_last_track_seqlen = track_seqlen
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
             if not known_boundary:
-                req.kv.mamba_last_track_idx = track_idx
-            req.kv.mamba_next_track_idx = (
+                req.mamba_last_track_idx = track_idx
+            req.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
             )
 
@@ -1311,12 +1349,12 @@ class SchedulerBatchResultProcessor:
         if req.finished():
             # Skip the donation if a scatter wrote or may still write the keep slot.
             keep_written_by_this_step = (
-                crossed and planned_pos == req.kv.mamba_next_track_idx
+                crossed and planned_pos == req.mamba_next_track_idx
             )
-            other_idx = 1 - req.kv.mamba_next_track_idx
+            other_idx = 1 - req.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
+            keep_may_be_written_in_flight = req.mamba_ping_pong_track_buffer[
                 other_idx
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
@@ -1333,18 +1371,18 @@ class SchedulerBatchResultProcessor:
 
         if not crossed or planned_pos is None:
             return
-        if planned_pos != req.kv.mamba_next_track_idx:
+        if planned_pos != req.mamba_next_track_idx:
             # Promote pending -> keep: free the old checkpoint, repoint.
             pool = batch.req_to_token_pool
-            keep_idx = req.kv.mamba_next_track_idx
-            keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
+            keep_idx = req.mamba_next_track_idx
+            keep_val = req.mamba_ping_pong_track_buffer[keep_idx]
             pool.mamba_allocator.free(keep_val.unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
-            req.kv.mamba_next_track_idx = planned_pos
+            req.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
         # keep holds the track_seqlen state either way.
-        req.kv.mamba_last_track_idx = planned_pos
-        req.kv.mamba_last_track_seqlen = track_seqlen
+        req.mamba_last_track_idx = planned_pos
+        req.mamba_last_track_seqlen = track_seqlen
 
     @staticmethod
     def _mamba_assert_committed_len_lookahead(req: Req) -> None:
@@ -1354,8 +1392,8 @@ class SchedulerBatchResultProcessor:
             f"(req {req.rid}); output_ids is empty"
         )
         token_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        assert (req.kv.kv_committed_len - token_seq_len) in (0, 1), (
-            f"mamba track boundary: kv_committed_len={req.kv.kv_committed_len} "
+        assert (req.kv_committed_len - token_seq_len) in (0, 1), (
+            f"mamba track boundary: kv_committed_len={req.kv_committed_len} "
             f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "
             "overlap lookahead wider than assumed"
         )
@@ -1377,7 +1415,7 @@ class SchedulerBatchResultProcessor:
 
         if batch.spec_algorithm.is_none():
             lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
-            committed_len = req.kv.kv_committed_len - lookahead
+            committed_len = req.kv_committed_len - lookahead
             if committed_len % interval == 0:
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
@@ -1392,13 +1430,13 @@ class SchedulerBatchResultProcessor:
         self, req: Req, batch: ScheduleBatch, track_idx: int
     ):
         """Commit a completed lazy-mode boundary and free its old slot."""
-        req.kv.mamba_last_track_idx = track_idx
-        req.kv.mamba_next_track_idx = track_idx
+        req.mamba_last_track_idx = track_idx
+        req.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
+        other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
-                req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
+                req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)

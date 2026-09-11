@@ -22,6 +22,7 @@ _pass_context = None
 
 
 class PassContext:
+
     def __init__(self, runtime_shape: Optional[int]):
         self.runtime_shape = runtime_shape
 
@@ -113,6 +114,7 @@ class CallableInductorPass(InductorPass):
 
 
 class SGLangInductorPass(InductorPass):
+
     def __init__(
         self,
     ):
@@ -131,6 +133,7 @@ class SGLangInductorPass(InductorPass):
 
 
 class PrinterInductorPass(SGLangInductorPass):
+
     def __init__(self, name: str):
         super().__init__()
         self.name = name

@@ -56,8 +56,10 @@ constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 #endif
 
 constexpr uint32_t kClusterFloor = 65536;
+#ifndef USE_ROCM
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
+#endif
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -456,7 +458,7 @@ struct TopKKernel {
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLGPU>();
+    device_.set_options<kDLCUDA>();
 
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
@@ -467,13 +469,8 @@ struct TopKKernel {
         .with_device(device_)
         .verify(metadata);
 
-    RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
-#ifdef USE_ROCM
-    // ROCm compiles out the cluster path, the only consumer of this plan.
-    (void)static_cluster_threshold;
-    return;
-#else
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
     const auto device = device_.unwrap();
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan,
@@ -481,7 +478,6 @@ struct TopKKernel {
         static_cast<PlanItem*>(metadata.data_ptr()),
         batch_size,
         static_cluster_threshold);
-#endif
   }
 
   static void transform_paged(
@@ -499,7 +495,7 @@ struct TopKKernel {
     auto P = SymbolicSize{"page_table_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLGPU>();
+    device_.set_options<kDLCUDA>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
@@ -565,8 +561,12 @@ struct TopKKernel {
 
 #ifndef USE_ROCM
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
-#endif
     constexpr bool kUsePDL = true;
+#else
+    // HIP supports the register and streaming implementations, but not CUDA
+    // thread-block clusters or programmatic dependent launch.
+    constexpr bool kUsePDL = false;
+#endif
     const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
     const auto dispatch = [&]<typename F>(F&& f) {
       switch (mode) {
@@ -592,8 +592,7 @@ struct TopKKernel {
               .config({.use_pdl = kUsePDL})
               .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
         }
-        return;
-      }
+      } else
 #endif
       if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
@@ -636,7 +635,7 @@ struct TopKKernel {
     auto S = SymbolicSize{"score_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLGPU>();
+    device_.set_options<kDLCUDA>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
@@ -668,7 +667,11 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
+#ifdef USE_ROCM
+    constexpr bool kUsePDL = false;
+#else
     constexpr bool kUsePDL = true;
+#endif
     const auto params = TopKRaggedParams{
         .scores = static_cast<float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),

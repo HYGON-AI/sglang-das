@@ -269,6 +269,7 @@ class BaseResampler(nn.Module):
 
 
 class Resampler2_5(BaseResampler):
+
     def __init__(
         self,
         num_queries: int,
@@ -345,7 +346,9 @@ class Resampler2_5(BaseResampler):
             key_padding_mask[i, patch_len[i] :] = True
         pos_embed = torch.nn.utils.rnn.pad_sequence(
             pos_embed, batch_first=True, padding_value=0.0
-        ).permute(1, 0, 2)  # BLD => L * B * D
+        ).permute(
+            1, 0, 2
+        )  # BLD => L * B * D
         x, _ = self.kv_proj(x)  # B * L * D
         x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
 
@@ -366,6 +369,7 @@ class Resampler2_5(BaseResampler):
 
 
 class Resampler4_5(BaseResampler):
+
     def __init__(
         self,
         num_queries: int,
@@ -518,7 +522,9 @@ class Resampler4_5(BaseResampler):
 
         pos_embed_2d = torch.nn.utils.rnn.pad_sequence(
             pos_embed_2d, batch_first=True, padding_value=0.0
-        ).permute(1, 0, 2)  # BLD => L * B * D
+        ).permute(
+            1, 0, 2
+        )  # BLD => L * B * D
 
         k = x
         v = x + pos_embed_2d
@@ -548,10 +554,14 @@ class Resampler4_5(BaseResampler):
 
             k = torch.nn.utils.rnn.pad_sequence(
                 merge_k, batch_first=True, padding_value=0.0
-            ).permute(1, 0, 2)  # L*(end-start)
+            ).permute(
+                1, 0, 2
+            )  # L*(end-start)
             v = torch.nn.utils.rnn.pad_sequence(
                 merge_v, batch_first=True, padding_value=0.0
-            ).permute(1, 0, 2)  # L*(end-start)
+            ).permute(
+                1, 0, 2
+            )  # L*(end-start)
             key_padding_mask = torch.nn.utils.rnn.pad_sequence(
                 merge_key_padding_mask, batch_first=True, padding_value=True
             ).squeeze(-1)
@@ -715,7 +725,8 @@ class MiniCPMBaseModel(nn.Module):
             )
             if not isinstance(image_embeds, (torch.Tensor, list)):
                 raise ValueError(
-                    f"Incorrect type of image embeds. Got type: {type(image_embeds)}"
+                    f"Incorrect type of image embeds. "
+                    f"Got type: {type(image_embeds)}"
                 )
 
             if isinstance(image_embeds, list):

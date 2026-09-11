@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import random
+import logging
+import threading
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Iterable,
+    Any,
+    Dict,
     List,
     Literal,
     Optional,
@@ -16,16 +20,19 @@ from typing import (
 )
 
 import numpy as np
+import msgspec
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
 )
 from sglang.srt.utils import is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -71,7 +78,11 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
-    return get_dsa_mtp_topk_width(hf_config)
+    # QSA models reuse the same flag for their draft-side index sharing but
+    # carry no DSA seed metadata over PD.
+    if not is_deepseek_dsa(hf_config):
+        return 0
+    return get_dsa_index_topk(hf_config)
 
 
 def is_dsv4_c128_online_enabled() -> bool:
@@ -294,6 +305,263 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
+class PDHiddenRowPool:
+    """Compact row pool for PD hidden-state transfer."""
+
+    def __init__(
+        self,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: str = "cpu",
+    ):
+        self.size = max(0, int(size))
+        self.hidden_size = int(hidden_size)
+        self.dtype = dtype
+        self.device = device
+        self.buffer = torch.zeros(
+            (self.size, self.hidden_size), dtype=dtype, device=device
+        )
+        self._free_intervals = [(0, self.size - 1)] if self.size else []
+        self._free_count = self.size
+        self.lock = threading.Lock()
+
+    def available_size(self) -> int:
+        with self.lock:
+            return self._free_count
+
+    def alloc(self, n: int) -> Optional[List[int]]:
+        n = int(n)
+        if n <= 0:
+            return []
+        with self.lock:
+            if n > self._free_count:
+                return None
+
+            for interval_idx, (start, end) in enumerate(self._free_intervals):
+                if end - start + 1 < n:
+                    continue
+                allocated_end = start + n - 1
+                if allocated_end == end:
+                    self._free_intervals.pop(interval_idx)
+                else:
+                    self._free_intervals[interval_idx] = (allocated_end + 1, end)
+                self._free_count -= n
+                return list(range(start, allocated_end + 1))
+
+            # Preserve the previous fallback behavior when fragmentation leaves
+            # no contiguous run: consume the lowest free rows across intervals.
+            remaining = n
+            indices = []
+            updated_intervals = []
+            for start, end in self._free_intervals:
+                if remaining == 0:
+                    updated_intervals.append((start, end))
+                    continue
+                take = min(remaining, end - start + 1)
+                indices.extend(range(start, start + take))
+                remaining -= take
+                if start + take <= end:
+                    updated_intervals.append((start + take, end))
+            self._free_intervals = updated_intervals
+            self._free_count -= n
+            return indices
+
+    def free(self, indices: Optional[List[int]]) -> None:
+        if not indices:
+            return
+        with self.lock:
+            candidates = sorted(
+                int(idx) for idx in indices if 0 <= int(idx) < self.size
+            )
+            if not candidates:
+                return
+
+            interval_idx = 0
+            last_candidate = None
+            to_free = []
+            for idx in candidates:
+                if idx == last_candidate:
+                    continue
+                last_candidate = idx
+                while (
+                    interval_idx < len(self._free_intervals)
+                    and self._free_intervals[interval_idx][1] < idx
+                ):
+                    interval_idx += 1
+                if (
+                    interval_idx < len(self._free_intervals)
+                    and self._free_intervals[interval_idx][0] <= idx
+                ):
+                    continue
+                to_free.append(idx)
+            if not to_free:
+                return
+
+            freed_intervals = []
+            start = end = to_free[0]
+            for idx in to_free[1:]:
+                if idx == end + 1:
+                    end = idx
+                else:
+                    freed_intervals.append((start, end))
+                    start = end = idx
+            freed_intervals.append((start, end))
+
+            merged = []
+            existing_idx = freed_idx = 0
+            while (
+                existing_idx < len(self._free_intervals)
+                or freed_idx < len(freed_intervals)
+            ):
+                if (
+                    freed_idx == len(freed_intervals)
+                    or (
+                        existing_idx < len(self._free_intervals)
+                        and self._free_intervals[existing_idx][0]
+                        < freed_intervals[freed_idx][0]
+                    )
+                ):
+                    interval = self._free_intervals[existing_idx]
+                    existing_idx += 1
+                else:
+                    interval = freed_intervals[freed_idx]
+                    freed_idx += 1
+                if merged and interval[0] <= merged[-1][1] + 1:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], interval[1]))
+                else:
+                    merged.append(interval)
+            self._free_intervals = merged
+            self._free_count += len(to_free)
+
+    def write(self, indices: List[int], hidden: torch.Tensor) -> None:
+        if not indices:
+            return
+        if hidden.shape[0] != len(indices):
+            raise ValueError(
+                "PD hidden row count mismatch: "
+                f"hidden={hidden.shape[0]}, indices={len(indices)}"
+            )
+        if hidden.shape[-1] > self.hidden_size:
+            raise ValueError(
+                "PD hidden width exceeds row pool width: "
+                f"hidden={hidden.shape[-1]}, pool={self.hidden_size}"
+            )
+        hidden = hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        hidden_width = hidden.shape[-1]
+        first = int(indices[0])
+        contiguous = all(int(idx) == first + i for i, idx in enumerate(indices))
+        if contiguous:
+            dst = self.buffer[first : first + len(indices)]
+            if hidden_width < self.hidden_size:
+                dst.zero_()
+            dst[:, :hidden_width].copy_(hidden)
+            return
+
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        if hidden_width < self.hidden_size:
+            self.buffer[index_tensor, :] = 0
+        self.buffer[index_tensor, :hidden_width] = hidden
+
+    def read(self, indices: List[int]) -> torch.Tensor:
+        if not indices:
+            return torch.empty(
+                (0, self.hidden_size), dtype=self.dtype, device=self.device
+            )
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        return self.buffer[index_tensor].clone()
+
+    def read_view(self, indices: List[int]) -> torch.Tensor:
+        if not indices:
+            return torch.empty(
+                (0, self.hidden_size), dtype=self.dtype, device=self.device
+            )
+        first = int(indices[0])
+        contiguous = all(int(idx) == first + i for i, idx in enumerate(indices))
+        if contiguous:
+            return self.buffer[first : first + len(indices)]
+        return self.read(indices)
+
+    def get_state_buf_infos(self):
+        if self.size <= 0:
+            return [], [], []
+        return [self.buffer.data_ptr()], [self.buffer.nbytes], [self.buffer[0].nbytes]
+
+
+class PDHiddenTransferPlan(msgspec.Struct):
+    row_count: int
+    item_len: int
+    row_chunks: List[Dict[str, Any]]
+
+    @classmethod
+    def build(cls, row_count: int, item_len: int) -> "PDHiddenTransferPlan":
+        row_count = int(row_count)
+        item_len = int(item_len)
+        if row_count <= 0:
+            return cls(row_count=0, item_len=item_len, row_chunks=[])
+        return cls(
+            row_count=row_count,
+            item_len=item_len,
+            row_chunks=[{"row_start": 0, "row_len": row_count}],
+        )
+
+    def to_dynamic_dst(self, ptr: int = 0) -> Dict[str, Any]:
+        return {
+            "ptr": int(ptr),
+            "nbytes": int(self.row_count * self.item_len),
+            "item_len": int(self.item_len),
+            "row_count": int(self.row_count),
+            "row_chunks": [dict(chunk) for chunk in self.row_chunks],
+        }
+
+    @staticmethod
+    def trim_dynamic_dst(
+        dynamic_dst: Dict[str, Any],
+        *,
+        offset: int,
+        new_row_count: int,
+        old_row_count: int,
+    ) -> Dict[str, Any]:
+        new_dynamic_dst = dict(dynamic_dst)
+        item_len = int(new_dynamic_dst.get("item_len", 0))
+        offset = int(offset)
+        new_row_count = int(new_row_count)
+        old_row_count = int(old_row_count)
+        old_chunks = [dict(chunk) for chunk in new_dynamic_dst.get("row_chunks") or []]
+
+        new_dynamic_dst["row_count"] = new_row_count
+        new_dynamic_dst["nbytes"] = int(new_row_count * item_len)
+
+        if old_chunks and "ptr" in old_chunks[0]:
+            new_chunks = []
+            for old_chunk in old_chunks:
+                chunk_start = int(old_chunk.get("row_start", 0))
+                chunk_len = int(old_chunk.get("row_len", 0))
+                chunk_end = chunk_start + chunk_len
+                overlap_start = max(chunk_start, offset)
+                overlap_end = min(chunk_end, old_row_count)
+                if overlap_end <= overlap_start:
+                    continue
+                new_chunks.append(
+                    {
+                        "row_start": int(overlap_start - offset),
+                        "row_len": int(overlap_end - overlap_start),
+                        "ptr": int(old_chunk["ptr"])
+                        + int(overlap_start - chunk_start) * item_len,
+                        "nbytes": int((overlap_end - overlap_start) * item_len),
+                    }
+                )
+            new_dynamic_dst["row_chunks"] = new_chunks
+            new_dynamic_dst["ptr"] = int(new_chunks[0]["ptr"]) if new_chunks else 0
+            return new_dynamic_dst
+
+        if item_len > 0:
+            new_dynamic_dst["ptr"] = int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+        plan = PDHiddenTransferPlan.build(new_row_count, item_len)
+        new_dynamic_dst["row_chunks"] = plan.row_chunks
+        return new_dynamic_dst
+
+
 class MetadataBuffers:
     def __init__(
         self,
@@ -304,9 +572,20 @@ class MetadataBuffers:
         max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
+        pd_hidden_pool_size: int = 0,
+        pd_hidden_size: int = 0,
+        pd_hidden_device: str = "cpu",
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
+        self.pd_hidden_pool: Optional[PDHiddenRowPool] = None
+        if pd_hidden_pool_size > 0 and pd_hidden_size > 0:
+            self.pd_hidden_pool = PDHiddenRowPool(
+                pd_hidden_pool_size,
+                pd_hidden_size,
+                hidden_states_dtype,
+                device=pd_hidden_device,
+            )
         if max_sampling_mask_tokens is None:
             max_sampling_mask_tokens = (
                 envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
@@ -426,7 +705,7 @@ class MetadataBuffers:
             sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
             sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
             sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
-        return (
+        ret = (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
             self.output_token_logprobs_val[idx].clone(),
@@ -446,6 +725,7 @@ class MetadataBuffers:
             ),
             self.bootstrap_room[idx].clone(),
         )
+        return ret
 
     def set_buf(self, req: Req):
 
@@ -567,6 +847,34 @@ class MetadataBuffers:
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
 
+    def ensure_pd_hidden_pool(
+        self,
+        *,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: str = "cpu",
+    ) -> PDHiddenRowPool:
+        if self.pd_hidden_pool is None:
+            self.pd_hidden_pool = PDHiddenRowPool(
+                size=size,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+        elif self.pd_hidden_pool.hidden_size != int(hidden_size):
+            raise ValueError(
+                "PD hidden pool hidden_size mismatch: "
+                f"existing={self.pd_hidden_pool.hidden_size}, "
+                f"requested={hidden_size}"
+            )
+        return self.pd_hidden_pool
+
+    def get_pd_hidden_state_buf_infos(self):
+        if self.pd_hidden_pool is None:
+            return [], [], []
+        return self.pd_hidden_pool.get_state_buf_infos()
+
 
 #########################
 # Transfer Backend
@@ -579,6 +887,54 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+
+
+class DisaggMetadataConfig(msgspec.Struct, frozen=True):
+    hidden_size: int
+    hidden_states_dtype: torch.dtype
+    metadata_buffer_kwargs: dict
+
+
+def resolve_disagg_metadata_config(
+    *,
+    hidden_size: int,
+    hidden_states_dtype: torch.dtype,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+    spec_algorithm: Any,
+    model_config: Any,
+    server_args: Any,
+    model_runner: Any,
+    pp_rank: int,
+    pp_size: int,
+    gpu_id: int,
+    max_prefill_tokens: int,
+) -> DisaggMetadataConfig:
+    from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
+        resolve_disagg_metadata_config as resolve_dspark_metadata_config,
+    )
+
+    hidden_state_config = resolve_dspark_metadata_config(
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+        spec_algorithm=spec_algorithm,
+        model_config=model_config,
+        server_args=server_args,
+        model_runner=model_runner,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+        gpu_id=gpu_id,
+        max_prefill_tokens=max_prefill_tokens,
+    )
+    if hidden_state_config.enabled:
+        hidden_size = hidden_state_config.hidden_size
+        hidden_states_dtype = hidden_state_config.hidden_states_dtype
+
+    return DisaggMetadataConfig(
+        hidden_size=hidden_size,
+        hidden_states_dtype=hidden_states_dtype,
+        metadata_buffer_kwargs=hidden_state_config.metadata_buffer_kwargs(),
+    )
 
 
 class KVClassType(Enum):
@@ -693,6 +1049,48 @@ def get_kv_class(
         raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
     return class_mapping.get(class_type)
+
+
+def pack_state_types(state_types) -> bytes:
+    return ",".join(state_type.value for state_type in (state_types or [])).encode(
+        "ascii"
+    )
+
+
+def unpack_state_types(data: bytes):
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if not data:
+        return []
+    return [StateType(value) for value in data.decode("ascii").split(",") if value]
+
+
+def resolve_state_component_dst_index(src_state_types, dst_state_types, src_index: int):
+    if not dst_state_types:
+        return src_index
+    if not src_state_types:
+        raise RuntimeError(
+            "Destination state_types are present but source state_types are empty."
+        )
+    if src_index >= len(src_state_types):
+        raise RuntimeError(
+            f"Source state component index {src_index} exceeds "
+            f"state_types length {len(src_state_types)}."
+        )
+    state_type = src_state_types[src_index]
+    occurrence = sum(
+        1 for item in src_state_types[: src_index + 1] if item == state_type
+    )
+    seen = 0
+    for dst_index, dst_state_type in enumerate(dst_state_types):
+        if dst_state_type == state_type:
+            seen += 1
+            if seen == occurrence:
+                return dst_index
+    raise RuntimeError(
+        f"Decode peer is missing state component {state_type!s} "
+        f"occurrence {occurrence}."
+    )
 
 
 def _get_cp_rank_page_bounds(
@@ -922,33 +1320,29 @@ def build_kv_layer_ids(
     num_draft_entries: int,
     num_hidden_layers: int,
 ) -> List[int]:
-    """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
-
-    Draft KV buffers are appended after the target's, so they need ids of their
-    own: build_transfer_entry_pairs requires the id list to cover every entry,
-    and a target-only list would be rejected. The draft numbers its layers from
-    zero, which would collide with the target's, so its entries are remapped
-    into a reserved band above the target's layer range. Both PD peers run this
-    against the same draft config and so agree on the band.
-
-    Returns [] for pools that cannot report ids, leaving the peers on positional
-    pairing.
-    """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    """Return a global layer id for every target and draft KV entry."""
+    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    if not layer_ids:
+        return []
+    num_target_entries = len(token_to_kv_pool.get_contiguous_buf_infos()[0])
+    if len(layer_ids) == num_target_entries:
+        target_layer_ids = layer_ids
+    elif len(layer_ids) * 2 == num_target_entries:
+        target_layer_ids = layer_ids * 2
+    else:
+        return []
     if draft_token_to_kv_pool is None:
-        return layer_ids
+        return target_layer_ids
 
     draft_ids = _draft_entry_layer_ids(
         pool=draft_token_to_kv_pool, num_entries=num_draft_entries
     )
-    # Rank the draft's own ids by first appearance, so the band stays dense and
-    # contiguous whatever the draft config numbers its layers.
     band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
-    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+    return target_layer_ids + [
+        num_hidden_layers + band_index[lid] for lid in draft_ids
+    ]
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
@@ -957,8 +1351,6 @@ def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
     if isinstance(pool, HybridLinearKVPool):
         ids = pool.get_kv_layer_ids()
     else:
-        # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
-        # group; derive the group count rather than assuming MHA vs MLA.
         if pool.layer_num <= 0 or num_entries % pool.layer_num != 0:
             raise RuntimeError(
                 "Draft KV buffers must register a whole number of per-layer "
@@ -998,52 +1390,6 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
-def build_staging_slot_metadata(
-    *,
-    kv_layer_ids: List[int],
-    num_draft_entries: int,
-    kv_pool,
-    draft_kv_pool,
-):
-    """Buffers and per-slot layer ids for the staging gather.
-
-    The gather writes every k_buffer and then every v_buffer, while kv_layer_ids
-    follows kv_data_ptrs ([K target, V target, K draft, V draft]), so the two
-    orders diverge as soon as a draft pool is registered.
-
-    Returns (k_buffers, v_buffers, slot_layer_ids), or None for a pool that has
-    no contiguous K/V tensors to stage.
-    """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
-
-    # A hybrid pool keeps its contiguous K/V tensors on the inner full-attention
-    # pool, and the draft pool is wrapped the same way.
-    if isinstance(kv_pool, HybridLinearKVPool):
-        kv_pool = kv_pool.full_kv_pool
-    if isinstance(draft_kv_pool, HybridLinearKVPool):
-        draft_kv_pool = draft_kv_pool.full_kv_pool
-    if not isinstance(kv_pool, MHATokenToKVPool):
-        return None
-
-    ids = list(kv_layer_ids or [])
-    num_target = len(ids) - num_draft_entries
-    half = num_target // 2
-    k_buffers, k_ids = list(kv_pool.k_buffer), ids[:half]
-    v_buffers, v_ids = list(kv_pool.v_buffer), ids[half:num_target]
-
-    draft_half = num_draft_entries // 2
-    if draft_half:
-        if not isinstance(draft_kv_pool, MHATokenToKVPool):
-            # An empty id list puts the sender back on kv_data_ptrs order, which
-            # is what staging did before draft KV existed.
-            return k_buffers, v_buffers, []
-        k_buffers += list(draft_kv_pool.k_buffer)
-        v_buffers += list(draft_kv_pool.v_buffer)
-        k_ids += ids[num_target : num_target + draft_half]
-        v_ids += ids[num_target + draft_half :]
-    return k_buffers, v_buffers, k_ids + v_ids
-
-
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -1054,202 +1400,17 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    data_format: str = "",
 ) -> None:
-    """Append one state component. Caller orders state_types consistently
-    on prefill and decode sides."""
     kv_args.state_types.append(state_type)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
+    kv_args.state_data_formats.append(data_format)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
-
-
-def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
-    if getattr(pool, "use_dsa", False):
-        pool = pool.full_kv_pool
-    if not pool.kpool_use_compress:
-        return []
-
-    pool_size = int(pool.index_kpool)
-    tail_size = pool_size + int(getattr(pool, "tail_extra_slots", 0))
-    if pool_size <= 1 or tail_size < pool_size:
-        raise ValueError(
-            "DSA kpool-compress requires pool_size > 1 and "
-            f"tail_size >= pool_size, got pool_size={pool_size}, "
-            f"tail_size={tail_size}"
-        )
-
-    n_valid = int(seq_len) % pool_size
-    if n_valid == 0:
-        return []
-    start_phys = (int(seq_len) - n_valid) % tail_size
-    first_n = min(n_valid, tail_size - start_phys)
-    second_n = n_valid - first_n
-    return [
-        int(req_pool_idx),
-        start_phys,
-        first_n,
-        0,
-        second_n,
-        tail_size,
-    ]
-
-
-def slice_dsa_tail_dst_ptrs_for_pp(
-    src_ptrs: List[int],
-    dst_ptrs: List[int],
-    start_layer: int,
-    end_layer: Optional[int],
-) -> List[int]:
-    if len(src_ptrs) == len(dst_ptrs):
-        return list(dst_ptrs)
-    if len(src_ptrs) % 2 != 0 or len(dst_ptrs) % 2 != 0:
-        raise ValueError(
-            "DSA tail pointer lists must contain equal key/score halves, got "
-            f"src={len(src_ptrs)}, dst={len(dst_ptrs)}"
-        )
-
-    src_layers = len(src_ptrs) // 2
-    dst_layers = len(dst_ptrs) // 2
-    expected_end = start_layer + src_layers
-    if end_layer is not None and end_layer - start_layer == src_layers:
-        expected_end = end_layer
-    if start_layer < 0 or expected_end > dst_layers:
-        raise ValueError(
-            "DSA tail pointer count mismatch: "
-            f"src={len(src_ptrs)}, dst={len(dst_ptrs)}, "
-            f"prefill_layers=[{start_layer}, {expected_end})"
-        )
-
-    return list(dst_ptrs[start_layer:expected_end]) + list(
-        dst_ptrs[dst_layers + start_layer : dst_layers + expected_end]
-    )
-
-
-def build_dsa_tail_transfer_blocks(
-    src_ptrs: List[int],
-    src_item_lens: List[int],
-    dst_ptrs: List[int],
-    src_indices: List[int],
-    dst_indices: List[int],
-    dst_item_lens: Optional[List[int]] = None,
-) -> List[Tuple[int, int, int]]:
-    """Remap live DSA tail tokens between rings with different speculative-slot counts."""
-    if not src_indices and not dst_indices:
-        return []
-    if not src_indices or not dst_indices:
-        raise ValueError(
-            f"DSA tail slot index missing: src={src_indices}, dst={dst_indices}"
-        )
-    if len(src_indices) != 6 or len(dst_indices) != 6:
-        raise ValueError(
-            "DSA tail slot indices must be 6-tuples, "
-            f"got src={src_indices}, dst={dst_indices}"
-        )
-    if dst_item_lens is None:
-        dst_item_lens = src_item_lens
-    if not (len(src_ptrs) == len(dst_ptrs) == len(src_item_lens) == len(dst_item_lens)):
-        raise ValueError(
-            "DSA tail pointer metadata mismatch: "
-            f"src_ptrs={len(src_ptrs)}, dst_ptrs={len(dst_ptrs)}, "
-            f"src_item_lens={len(src_item_lens)}, "
-            f"dst_item_lens={len(dst_item_lens)}"
-        )
-
-    src_tail_size = int(src_indices[5])
-    dst_tail_size = int(dst_indices[5])
-    if src_tail_size <= 0 or dst_tail_size <= 0:
-        raise ValueError(
-            "DSA tail ring sizes must be positive: "
-            f"src={src_tail_size}, dst={dst_tail_size}"
-        )
-
-    def parse_segments(indices: List[int], tail_size: int, side: str):
-        segments = []
-        for seg in (1, 2):
-            off = int(indices[seg * 2 - 1])
-            n = int(indices[seg * 2])
-            if min(off, n) < 0:
-                raise ValueError(
-                    f"DSA tail {side} offsets and lengths must be non-negative"
-                )
-            if off + n > tail_size:
-                raise ValueError(
-                    f"DSA tail {side} segment {seg} exceeds ring size "
-                    f"{tail_size}: ({off}, {n})"
-                )
-            if n:
-                segments.append((off, n))
-        return segments
-
-    src_segments = parse_segments(src_indices, src_tail_size, "source")
-    dst_segments = parse_segments(dst_indices, dst_tail_size, "destination")
-    src_count = sum(n for _, n in src_segments)
-    dst_count = sum(n for _, n in dst_segments)
-    if src_count != dst_count:
-        raise ValueError(
-            f"DSA tail live-token count mismatch: src={src_count}, dst={dst_count}"
-        )
-
-    src_idx = int(src_indices[0])
-    dst_idx = int(dst_indices[0])
-    if src_idx < 0 or dst_idx < 0:
-        raise ValueError("DSA tail request row indices must be non-negative")
-
-    transfer_blocks = []
-    for src_ptr, src_row_bytes, dst_ptr, dst_row_bytes in zip(
-        src_ptrs, src_item_lens, dst_ptrs, dst_item_lens
-    ):
-        src_row_bytes = int(src_row_bytes)
-        dst_row_bytes = int(dst_row_bytes)
-        if src_row_bytes == 0 and dst_row_bytes == 0:
-            continue
-        if src_row_bytes <= 0 or src_row_bytes % src_tail_size != 0:
-            raise ValueError(
-                f"DSA source tail row size {src_row_bytes} is not divisible by "
-                f"{src_tail_size}"
-            )
-        if dst_row_bytes <= 0 or dst_row_bytes % dst_tail_size != 0:
-            raise ValueError(
-                f"DSA destination tail row size {dst_row_bytes} is not "
-                f"divisible by {dst_tail_size}"
-            )
-        src_slot_bytes = src_row_bytes // src_tail_size
-        dst_slot_bytes = dst_row_bytes // dst_tail_size
-        if src_slot_bytes != dst_slot_bytes:
-            raise ValueError(
-                "DSA tail slot-size mismatch: "
-                f"src={src_slot_bytes}, dst={dst_slot_bytes}"
-            )
-
-        slot_bytes = src_slot_bytes
-        src_row_base = int(src_ptr) + src_row_bytes * src_idx
-        dst_row_base = int(dst_ptr) + dst_row_bytes * dst_idx
-        src_seg_idx = dst_seg_idx = 0
-        src_consumed = dst_consumed = 0
-        while src_seg_idx < len(src_segments):
-            src_off, src_n = src_segments[src_seg_idx]
-            dst_off, dst_n = dst_segments[dst_seg_idx]
-            n = min(src_n - src_consumed, dst_n - dst_consumed)
-            transfer_blocks.append(
-                (
-                    src_row_base + (src_off + src_consumed) * slot_bytes,
-                    dst_row_base + (dst_off + dst_consumed) * slot_bytes,
-                    n * slot_bytes,
-                )
-            )
-            src_consumed += n
-            dst_consumed += n
-            if src_consumed == src_n:
-                src_seg_idx += 1
-                src_consumed = 0
-            if dst_consumed == dst_n:
-                dst_seg_idx += 1
-                dst_consumed = 0
-    return transfer_blocks
 
 
 def setup_state_kv_args(
@@ -1258,6 +1419,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    pd_hidden_pool: Optional[PDHiddenRowPool] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -1279,24 +1441,12 @@ def setup_state_kv_args(
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
+    kv_args.state_data_formats = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
-
-    def append_dsa_tail(pool) -> None:
-        if not pool.kpool_use_compress:
-            return
-        tail_ptrs, tail_lens, tail_item_lens = pool.get_compress_tail_buf_infos()
-        if tail_ptrs:
-            append_state_component(
-                kv_args,
-                StateType.DSA_TAIL,
-                tail_ptrs,
-                tail_lens,
-                tail_item_lens,
-            )
 
     if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         append_state_component(
@@ -1401,25 +1551,16 @@ def setup_state_kv_args(
                 slice_outer_counts,
                 layer_ids,
             )
-            # Hybrid DSA pools keep their index cache and kpool tail in the
-            # full-attention sub-pool rather than in the Mamba state above.
-            if getattr(token_to_kv_pool, "use_dsa", False):
-                dsa_pool = token_to_kv_pool.full_kv_pool
-                dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                append_state_component(
-                    kv_args,
-                    StateType.DSA,
-                    dsa_ptrs,
-                    dsa_lens,
-                    dsa_item_lens,
-                )
-                append_dsa_tail(dsa_pool)
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
-            tail_ptrs, tail_lens, tail_item_lens = [], [], []
-            if isinstance(token_to_kv_pool, DSATokenToKVPool):
-                tail_ptrs, tail_lens, tail_item_lens = (
-                    token_to_kv_pool.get_compress_tail_buf_infos()
-                )
+            data_format = (
+                token_to_kv_pool.get_index_k_cache_transfer_abi()
+                if isinstance(token_to_kv_pool, DSATokenToKVPool)
+                else ""
+            )
+            has_state_layer_ids = hasattr(token_to_kv_pool, "get_state_layer_ids")
+            state_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids() if has_state_layer_ids else []
+            )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1431,29 +1572,37 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
-                draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
-                    draft_token_to_kv_pool.get_compress_tail_buf_infos()
+                if has_state_layer_ids:
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "total_kv_layers is required for DSA draft state metadata"
+                        )
+                    state_layer_ids += [
+                        total_kv_layers + i for i in range(len(draft_data_ptrs))
+                    ]
+                draft_data_format = (
+                    draft_token_to_kv_pool.get_index_k_cache_transfer_abi()
                 )
-                tail_ptrs = tail_ptrs + draft_tail_ptrs
-                tail_lens = tail_lens + draft_tail_lens
-                tail_item_lens = tail_item_lens + draft_tail_item_lens
+                if draft_data_format != data_format:
+                    raise ValueError(
+                        "Target and draft DSA index-K cache transfer ABIs differ: "
+                        f"target={data_format!r}, draft={draft_data_format!r}"
+                    )
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
                 kv_args.total_kv_layers = total_kv_layers
-            else:
+            elif data_ptrs:
                 append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                    kv_args,
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    layer_ids=state_layer_ids,
+                    data_format=data_format,
                 )
-                if tail_ptrs:
-                    append_state_component(
-                        kv_args,
-                        StateType.DSA_TAIL,
-                        tail_ptrs,
-                        tail_lens,
-                        tail_item_lens,
-                    )
 
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
@@ -1466,6 +1615,17 @@ def setup_state_kv_args(
                 c128_ptrs,
                 c128_lens,
                 c128_item_lens,
+            )
+
+    if pd_hidden_pool is not None:
+        data_ptrs, data_lens, item_lens = pd_hidden_pool.get_state_buf_infos()
+        if data_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.PD_HIDDEN,
+                data_ptrs,
+                data_lens,
+                item_lens,
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same

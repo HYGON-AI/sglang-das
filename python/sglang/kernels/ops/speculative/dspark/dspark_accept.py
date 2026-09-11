@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shutil
 from typing import Optional
 
 import msgspec
@@ -246,12 +248,30 @@ except ImportError:
     _flashinfer_softmax = None
 
 
+def _flashinfer_softmax_supported() -> bool:
+    """FlashInfer's JIT softmax requires a CUDA nvcc toolchain.
+
+    ROCm/Hygon builds expose ``torch.cuda`` tensors too, but FlashInfer's
+    sampling module still asks for nvcc and defaults to ``/usr/local/cuda``.
+    Route those environments to the already-supported Triton implementation.
+    """
+    if _flashinfer_softmax is None or torch.version.hip is not None:
+        return False
+
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        return os.path.isfile(os.path.join(cuda_home, "bin", "nvcc"))
+    return shutil.which("nvcc") is not None or os.path.isfile(
+        "/usr/local/cuda/bin/nvcc"
+    )
+
+
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        if _flashinfer_softmax is not None:
+        if _flashinfer_softmax_supported():
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
@@ -306,9 +326,9 @@ def softmax_temp(
 ) -> torch.Tensor:
     num_rows = logits.shape[0]
     bs = num_rows // rows_per_request
-    assert bs * rows_per_request == num_rows, (
-        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
-    )
+    assert (
+        bs * rows_per_request == num_rows
+    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
     temp_per_row = torch.repeat_interleave(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     )
@@ -366,9 +386,9 @@ def softmax_temp_triton(
 ) -> torch.Tensor:
     num_rows, vocab = logits.shape[0], logits.shape[-1]
     bs = num_rows // rows_per_request
-    assert bs * rows_per_request == num_rows, (
-        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
-    )
+    assert (
+        bs * rows_per_request == num_rows
+    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
     BLOCK_V = 4096
@@ -397,9 +417,9 @@ def softmax_temp_flashinfer(
         )
     num_rows, vocab = logits.shape[0], logits.shape[-1]
     bs = num_rows // rows_per_request
-    assert bs * rows_per_request == num_rows, (
-        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
-    )
+    assert (
+        bs * rows_per_request == num_rows
+    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
     temp_per_row = torch.repeat_interleave(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     ).contiguous()

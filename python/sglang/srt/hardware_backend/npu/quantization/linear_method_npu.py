@@ -7,6 +7,12 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
+from sglang.kernels.npu_kernels.npu_dynamic_quant_triton import npu_dynamic_quant_triton
+from sglang.kernels.npu_kernels.npu_quant_matmul_w8a8 import (
+    npu_quant_matmul_w8a8,
+    pack_int8_weight_as_tn,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
@@ -54,6 +60,7 @@ def _get_float4_e2m1fn_x2_dtype():
 
 
 class _NPULinearMethodBase(LinearMethodBase):
+
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
@@ -62,6 +69,7 @@ class _NPULinearMethodBase(LinearMethodBase):
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -119,6 +127,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -127,6 +136,19 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "weight_offset"):
             layer.weight_offset.data = layer.weight_offset.data.flatten()
+
+        # lightop.gemm_w8a8_smooth needs TN [K, N] (stride 1, K). Pack once
+        # here so decode CUDA graphs do not recapture t().contiguous() on
+        # every token (~148 ms/token on Kimi-K3). Same byte count; prefill
+        # I8II is unchanged (still the large-M path inside smooth()).
+        w = layer.weight.data
+        if (
+            w.dim() == 2
+            and w.dtype == torch.int8
+            and w.is_contiguous()
+            and w.stride(1) == 1
+        ):
+            layer.weight.data = pack_int8_weight_as_tn(w)
 
     def apply(
         self,
@@ -139,10 +161,12 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             """dynamic_scale is calculated in malprolog kernel"""
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
+            device = quant_out.device
         else:
             original_dtype = x.dtype
-            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
-        return torch.ops.npu.npu_quant_matmul(
+            device = x.device
+            quant_out, dynamic_scale = npu_dynamic_quant_triton(x)
+        out = npu_quant_matmul_w8a8(
             quant_out,
             layer.weight,
             layer.weight_scale,
@@ -150,10 +174,11 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             bias=bias,
             output_dtype=original_dtype,
         )
+        return out.to(device=device)
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
-    """NPU MXFP8 linear method for LLM (SRT) models.
+    """Ascend NPU MXFP8 linear method for LLM (SRT) models.
 
     Shared kernel for both the online config path (``--quantization mxfp8``) and
     the offline ModelSlimMXFP8Scheme (which delegates to this as ``self.kernel``).
@@ -305,6 +330,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
+
     def process_weights_after_loading(self, layer):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()
@@ -339,7 +365,7 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
-    """NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
+    """Ascend NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
 
     This is a *true* W4(weight) A8(activation) path: it mirrors the offline
     ``W4A8_MXFP`` kernel (``NPUMXFP4W4A8OfflineLinearMethod``) exactly — the only
@@ -359,7 +385,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    Hardware: A5 NPU + a recent torch_npu with the FP4 npu_quant_matmul
+    Hardware: Ascend 950 (A5) + a recent torch_npu with the FP4 npu_quant_matmul
     (same requirement as the offline W4A8 path — see that class's docstring).
     """
 
@@ -509,7 +535,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
-    """NPU offline W4A8 (ModelSlim ``W4A8_MXFP``): packed-FP4 weights + MXFP8 activations.
+    """Ascend NPU offline W4A8 (ModelSlim ``W4A8_MXFP``): packed-FP4 weights + MXFP8 activations.
 
     Kernel for the offline ModelSlimMXFP4W4A8Scheme (delegated as ``self.kernel``).
     The msmodelslim ``W4A8_MXFP`` checkpoint stores weights as *packed FP4*
@@ -622,7 +648,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """NPU W4A4 online quantization: single-level MXFP4.
+    """Ascend NPU W4A4 online quantization: single-level MXFP4.
 
     True W4(weight) A4(activation): both weights and activations are quantised to
     single-level MXFP4 (``float4_e2m1fn_x2``), unlike the W4A8 path which keeps FP8
@@ -638,8 +664,8 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
 
-    Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
-    torch_npu exposing ``float4_e2m1fn_x2``.
+    Triggered by ``--quantization mxfp4`` on Ascend NPU. Hardware: Ascend 950 (A5)
+    with a recent torch_npu exposing ``float4_e2m1fn_x2``.
     """
 
     def create_weights(
@@ -761,7 +787,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
-    """NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): packed FP4 weights.
+    """Ascend NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): packed FP4 weights.
 
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
@@ -792,7 +818,7 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
 
 
 class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
-    """NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
+    """Ascend NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
 
     This is the sole online ``--quantization mxfp4`` linear path. Instead of a single
     UE8M0 (power-of-2) block scale, dual-level MX quant produces a finer L0 (FP8 E4M3)
@@ -815,8 +841,9 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
         → npu_dual_level_quant_matmul(act, weight, act_l0, w_l0, act_l1, w_l1)
 
-    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: A5 NPU
-    only — the ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
+    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod`` / MindIE-SD
+    ``W4A4MXFP4DualQuantLinear``. Hardware: Ascend 950 (A5) only — the
+    ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

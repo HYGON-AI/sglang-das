@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     build_m_indices_triton,
@@ -119,9 +122,17 @@ from deepgemm import (
     m_grouped_i8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked,
+    m_grouped_w4a8_gemm_nt_masked_hipc,
 )
+try:
+    from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
+except ImportError:
+    m_grouped_w4a8_gemm_nt_contiguous_hipc = None
+
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import moe as lightop_op
+from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
+from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
+from lightop import fuse_situ_mul_quant_ep
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -138,6 +149,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
+_use_w4a8_contiguous_hipc = get_bool_env_var(
+    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
+)
+_use_w4a8_masked_hipc = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -246,7 +261,7 @@ def _can_use_lightop_ep_gather(
         and input_index.dtype == torch.int32
         and topk_ids.shape == topk_weights.shape
         and topk_ids.shape == input_index.shape
-        and topk_ids.shape[1] <= 8
+        and topk_ids.shape[1] <= 16
         and input_tensor.is_contiguous()
         and output_tensor.is_contiguous()
         and topk_ids.is_contiguous()
@@ -336,6 +351,7 @@ def _ep_scatter_with_optional_lightop(
         recv_x_scale,
         recv_topk,
         num_recv_tokens_per_expert,
+        None,  # num_valid_tokens_per_expert is unused by the group-GEMM path
         expert_start_loc,
         output_tensor,
         output_tensor_scale,
@@ -366,6 +382,36 @@ def m_grouped_w4a8_gemm_nt_masked_wrapper(
 
 
 def m_grouped_w4a8_gemm_nt_masked_fake(
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+) -> torch.Tensor:
+    return d
+
+
+def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+) -> torch.Tensor:
+    return m_grouped_w4a8_gemm_nt_masked_hipc(
+        (a0, a1),
+        (b0, b1),
+        d,
+        masked_m,
+        expected_m_per_group,
+    )
+
+
+def m_grouped_w4a8_gemm_nt_masked_hipc_fake(
     a0: torch.Tensor,
     a1: torch.Tensor,
     b0: torch.Tensor,
@@ -434,6 +480,21 @@ def fuse_silu_mul_quant_ep_fake(
     scales = torch.empty((E, T, 1), device=input.device, dtype=torch.float32)
     return output, scales
 
+def fuse_situ_mul_quant_ep_fake(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+    expect_m: int = -1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    experts, tokens, doubled_hidden = input.shape
+    output = torch.empty(
+        (experts, tokens, doubled_hidden // 2), dtype=torch.int8, device=input.device
+    )
+    scales = torch.empty(
+        (experts, tokens, 1), dtype=torch.float32, device=input.device
+    )
+    return output, scales
 
 direct_register_custom_op(
     op_name="m_grouped_w4a8_gemm_nt_masked",
@@ -441,6 +502,13 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=m_grouped_w4a8_gemm_nt_masked_fake,
 )
+direct_register_custom_op(
+    op_name="m_grouped_w4a8_gemm_nt_masked_hipc",
+    op_func=m_grouped_w4a8_gemm_nt_masked_hipc_wrapper,
+    mutates_args=[],
+    fake_impl=m_grouped_w4a8_gemm_nt_masked_hipc_fake,
+)
+
 direct_register_custom_op(
     op_name="m_grouped_i8_gemm_nt_masked",
     op_func=m_grouped_i8_gemm_nt_masked_wrapper,
@@ -453,6 +521,13 @@ direct_register_custom_op(
     op_func=fuse_silu_mul_quant_ep_wrapper,
     mutates_args=[],
     fake_impl=fuse_silu_mul_quant_ep_fake,
+)
+
+direct_register_custom_op(
+    op_name="fuse_situ_mul_quant_ep",
+    op_func=fuse_situ_mul_quant_ep,
+    mutates_args=[],
+    fake_impl=fuse_situ_mul_quant_ep_fake,
 )
 
 
@@ -515,9 +590,7 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        if get_moe_a2a_backend().is_deepep_v2():
-            self.deprecate_flag = True
-        elif is_humming:
+        if is_humming:
             self.deprecate_flag = True
         elif _is_hcu and _use_aiter:
             self.deprecate_flag = False
@@ -563,9 +636,9 @@ class DeepEPMoE(FusedMoE):
             and not _is_npu
             and not _is_hip
         ):
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
-                "Unquantized DeepEP MoE requires DeepGEMM BF16"
-            )
+            assert (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ), "Unquantized DeepEP low-latency MoE requires DeepGEMM BF16"
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
@@ -652,16 +725,33 @@ class DeepEPMoE(FusedMoE):
 
         if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
             self.dispatcher.set_quant_config({"bf16_dispatch": True})
-        if (
-            self.deepep_mode.enable_low_latency()
-            and not _is_npu
-            and not _is_hip
-            and quant_config is not None
-        ):
-            # AMD HIP and NPU support low_latency DeepEP without DeepGEMM.
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
-                f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+        # if (
+        #     self.deepep_mode.enable_low_latency()
+        #     and not _is_npu
+        #     and not _is_hip
+        #     and not (
+        #         get_moe_runner_backend().is_flashinfer_cutedsl()
+        #         and self.quant_config.get_name() == "modelopt_fp4"
+        #     )
+        # ):
+        #     # AMD HIP, NPU supports low_latency deepep without deepgemm
+        #     # NV FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
+        #     assert (
+        #         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        #     ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+        if _use_aiter:
+            # expert_mask is of size (self.num_local_experts + 1),
+            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
+            # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
+            #     self.expert_mask = [1, 1, 1, 1, 0]
+            # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
+            self.expert_mask = torch.zeros(
+                (self.num_local_experts + 1),
+                device=torch.cuda.current_device(),
+                dtype=torch.int,
             )
+            # the last one is invalid rank_id
+            self.expert_mask[:-1] = 1
 
     def _a2a_forward_with_output_impl(
         self,
@@ -709,9 +799,9 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(topk_output), (
-                "Only standard topk output is supported for breakable cuda graph"
-            )
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for breakable cuda graph"
             output = torch.empty_like(hidden_states)
             self.a2a_forward_with_output(
                 hidden_states,
@@ -722,9 +812,9 @@ class DeepEPMoE(FusedMoE):
             )
             return output
         if is_in_tc_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(topk_output), (
-                "Only standard topk output is supported for piecewise cuda graph"
-            )
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
             return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
@@ -933,7 +1023,135 @@ class DeepEPMoE(FusedMoE):
         ) = dispatch_output
         # hidden_states_int8, hidden_states_scale = hidden_states_int8
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
+
+        if _use_w4a8_contiguous_hipc:
+            if m_grouped_w4a8_gemm_nt_contiguous_hipc is None:
+                raise RuntimeError(
+                    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC requires a deepgemm build "
+                    "with m_grouped_w4a8_gemm_nt_contiguous_hipc support."
+                )
+            if num_recv_tokens_per_expert is None:
+                return hidden_states.bfloat16()
+            all_tokens = sum(num_recv_tokens_per_expert)
+            if all_tokens <= 0:
+                return hidden_states.bfloat16()
+
+            _, k = hidden_states.shape
+            n1 = self.w13_weight_scale.size(1)
+            hidden_states_shape = hidden_states.shape
+            hidden_states_device = hidden_states.device
+            counts_are_aligned = all(
+                count % 256 == 0 for count in num_recv_tokens_per_expert
+            )
+            if not counts_are_aligned or all_tokens % 256 != 0:
+                raise RuntimeError(
+                    "W4A8 contiguous HIPC requires DeepEP normal dispatch "
+                    "counts aligned to 256; restart all ranks with the updated "
+                    "deepep.py and SGLANG_GROUPGEMM=true. Got counts="
+                    f"{num_recv_tokens_per_expert}"
+                )
+
+            # Both HIPC kernels consume the true scale restored by
+            # process_weights_after_loading; no forward-time rescaling is needed.
+
+            # DeepEP normal dispatch is token-major. Scatter it into contiguous
+            # expert segments and retain output_index for the weighted gather.
+            a_int8 = torch.empty(
+                (all_tokens, k),
+                device=hidden_states_device,
+                dtype=hidden_states.dtype,
+            )
+            a_scale = torch.empty(
+                (all_tokens, 1),
+                device=hidden_states_device,
+                dtype=torch.float32,
+            )
+            if get_offloader().forbid_copy_engine_usage:
+                num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+                    num_recv_tokens_per_expert
+                )
+            else:
+                num_recv_tokens_per_expert_gpu = torch.tensor(
+                    num_recv_tokens_per_expert,
+                    dtype=torch.int32,
+                    pin_memory=True,
+                    device="cpu",
+                ).cuda(non_blocking=True)
+            m_indices, output_index = _ep_scatter_with_optional_lightop(
+                hidden_states,
+                hidden_states_scale,
+                topk_idx,
+                num_recv_tokens_per_expert_gpu,
+                a_int8,
+                a_scale,
+                all_tokens,
+                counts_are_aligned=counts_are_aligned,
+            )
+
+            gateup_output_factory = torch.empty if counts_are_aligned else torch.zeros
+            gateup_output = gateup_output_factory(
+                (all_tokens, n1),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            m_grouped_w4a8_gemm_nt_contiguous_hipc(
+                (a_int8, a_scale),
+                (self.w13_weight, self.w13_weight_scale),
+                gateup_output,
+                m_indices,
+            )
+            del a_int8, a_scale
+
+            if self.moe_runner_config.activation == "situ":
+                q_a2_all, q_a2_scale = fuse_situ_mul_quant(
+                    gateup_output,
+                    self.moe_runner_config.gemm1_alpha,
+                    self.moe_runner_config.gemm1_clamp_limit,
+                )
+            else:
+                # Apply the model-declared SwiGLU clamp when present. Models
+                # without swiglu_limit retain the original unclamped path.
+                swiglu_limit = getattr(
+                    self.moe_runner_config, "swiglu_limit", None
+                )
+                if swiglu_limit is None:
+                    q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+                else:
+                    q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                        gateup_output,
+                        float(swiglu_limit),
+                    )
+            del gateup_output
+
+            down_output = torch.empty(
+                (all_tokens, k),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            m_grouped_w4a8_gemm_nt_contiguous_hipc(
+                (q_a2_all, q_a2_scale),
+                (self.w2_weight, self.w2_weight_scale),
+                down_output,
+                m_indices,
+            )
+
+            # This gather restores the normal-dispatch row order and applies
+            # top-k weights exactly as the existing FP8/W8A8 paths do.
+            # Both the LightOp and Triton EP gather kernels initialize their
+            # accumulators to zero and overwrite every output element. Avoid a
+            # redundant full-buffer fill before the gather.
+            gather_out = torch.empty(
+                hidden_states_shape,
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            _ep_gather_with_optional_lightop(
+                down_output, topk_idx, topk_weights, output_index, gather_out
+            )
+            del down_output
+            return gather_out
+
         all_tokens = sum(num_recv_tokens_per_expert)
 
         if all_tokens <= 0:
@@ -1621,7 +1839,7 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
 
         # base shapes
         num_groups, m, k = hidden_states.size()
@@ -1640,8 +1858,16 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
         )
 
+        # The HIPC kernel requires a separately shuffled int8 weight layout.
+        # Keep the existing packed-weight kernel as the compatibility default.
+        grouped_w4a8_op = (
+            torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc
+            if _use_w4a8_masked_hipc
+            else torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked
+        )
+
         # ---- first GEMM ----
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
+        grouped_w4a8_op(
             hidden_states,
             hidden_states_scale,
             w13_weight,
@@ -1651,9 +1877,30 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
-            gateup_output, masked_m
-        )
+        # Kimi K3 uses SiTU, not SiLU. Keep the original SiLU path intact for
+        # other models and use the correctness-first Triton INT8 op only here.
+        if self.moe_runner_config.activation == "situ":
+            q_a2_all, q_a2_scale = torch.ops.sglang.fuse_situ_mul_quant_ep(
+                gateup_output,
+                masked_m,
+                self.moe_runner_config.gemm1_alpha,
+                self.moe_runner_config.gemm1_clamp_limit,
+                expect_m=expected_m,
+            )
+        else:
+            # Only models that declare a SwiGLU clamp limit use the clamp kernel.
+            swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
+            if swiglu_limit is None:
+                q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+                    gateup_output, masked_m
+                )
+            else:
+                q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                    gateup_output,
+                    float(swiglu_limit),
+                    mask_m=masked_m,
+                    expect_m=expected_m,
+                )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
@@ -1664,7 +1911,7 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n2), device=q_a2_all.device, dtype=torch.bfloat16
         )
 
-        torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
+        grouped_w4a8_op(
             q_a2_all,
             q_a2_scale,
             w2_weight,
@@ -1748,11 +1995,14 @@ class DeepEPMoE(FusedMoE):
         hidden_states, hidden_states_scale, topk_ids, _, masked_m, expected_m = (
             dispatch_output
         )
+        # This HCU low-latency DeepGEMM path predates the MoeRunner refactor.
+        # Its overlap state is therefore stored directly on DeepEPMoE by
+        # FusedMoE.set_overlap_args(), and no ``self.runner`` is constructed.
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
-            self.runner, "down_gemm_overlap_args", None
+            self, "down_gemm_overlap_args", None
         )
         meta_overlap_args: Optional[dict] = getattr(
-            self.runner, "meta_overlap_args", None
+            self, "meta_overlap_args", None
         )
         assert self.moe_runner_config.activation == "silu"
         # base shapes
@@ -2396,9 +2646,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
     if (
-        get_moe_a2a_backend().is_mori()
-        or get_moe_a2a_backend().is_deepep()
-        or get_moe_a2a_backend().is_deepep_v2()
+        get_moe_a2a_backend().is_deepep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
         or get_moe_a2a_backend().is_pplx()

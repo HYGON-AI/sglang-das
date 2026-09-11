@@ -927,6 +927,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
 
 class MusaFlashAttentionMultiStepBackend(FlashAttentionMultiStepBackend):
+
     def __init__(
         self,
         model_runner: ModelRunner,

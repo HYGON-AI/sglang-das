@@ -1,21 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import (
-        QuantizationConfig as SRTQuantizationConfig,
-    )
 
 
 @dataclass
@@ -80,7 +73,7 @@ class EncoderConfig(ModelConfig):
     arch_config: ArchConfig = field(default_factory=EncoderArchConfig)
 
     prefix: str = ""
-    quant_config: QuantizationConfig | SRTQuantizationConfig | None = None
+    quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
 
     # Parallel folding: during the encoding stage the whole DiT replica is idle,

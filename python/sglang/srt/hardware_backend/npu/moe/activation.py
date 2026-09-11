@@ -10,7 +10,7 @@ from sglang.srt.distributed.communication_op import (
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.runtime_context import get_parallel
 
-
+from sglang.kernels.npu_kernels.npu_dequant_swiglu_quant_triton import npu_dequant_swiglu_quant_triton
 # =============================================================================
 # Abstract base for all activation variants
 # =============================================================================
@@ -31,12 +31,77 @@ class NPUSwiglu(BaseActivation):
 
 class NPUSwigluQuant(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+        device = hidden_states.device
+        hidden_states, swiglu_out_scale = npu_dequant_swiglu_quant_triton(
             hidden_states,
-            quant_mode=1,
             activate_left=True,
         )
-        return hidden_states, swiglu_out_scale
+        return hidden_states.to(device=device), swiglu_out_scale.to(device=device)
+
+
+class NPUSituQuant(BaseActivation):
+    """Kimi SiTU gated activation + dynamic int8 quant for W4A8/W8A8 MoE.
+
+    Ascend W4A8 previously forced ``NPUSwigluQuant`` (SiLU), which ignores
+    ``MoeRunnerConfig.activation == "situ"`` / ``gemm1_alpha`` and inflates
+    expert outputs vs the FP4 / Triton SiTU experts path.
+    """
+
+    def __init__(self, moe_runner_config=None):
+        from sglang.srt.layers.activation import SituAndMul
+
+        beta = 4.0
+        linear_beta = None
+        if moe_runner_config is not None:
+            if getattr(moe_runner_config, "gemm1_alpha", None) is not None:
+                beta = float(moe_runner_config.gemm1_alpha)
+            linear_beta = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+            if linear_beta is not None:
+                linear_beta = float(linear_beta)
+        self._situ = SituAndMul(beta=beta, linear_beta=linear_beta)
+        self._quantizer = None
+
+    def _get_quantizer(self):
+        if self._quantizer is None:
+            # Prefer Triton (DCU); fall back to torch.ops.npu when available.
+            try:
+                from pathlib import Path
+                import sys
+
+                from sglang.kernels.npu_kernels.npu_dynamic_quant_triton import npu_dynamic_quant_triton
+
+                self._quantizer = npu_dynamic_quant_triton
+            except Exception:
+                self._quantizer = lambda x: torch.ops.npu.npu_dynamic_quant(
+                    x, dst_type=torch.int8
+                )
+        return self._quantizer
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        device = hidden_states.device
+        y = self._situ(hidden_states)
+        y_q, y_scale = self._get_quantizer()(y)
+        return y_q.to(device=device), y_scale.to(device=device)
+
+
+class NPUSitu(BaseActivation):
+    """Kimi SiTU gated activation without post-quant (BF16 expert path)."""
+
+    def __init__(self, moe_runner_config=None):
+        from sglang.srt.layers.activation import SituAndMul
+
+        beta = 4.0
+        linear_beta = None
+        if moe_runner_config is not None:
+            if getattr(moe_runner_config, "gemm1_alpha", None) is not None:
+                beta = float(moe_runner_config.gemm1_alpha)
+            linear_beta = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+            if linear_beta is not None:
+                linear_beta = float(linear_beta)
+        self._situ = SituAndMul(beta=beta, linear_beta=linear_beta)
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        return self._situ(hidden_states), None
 
 
 class NPUSwigluQuantWithScales(BaseActivation):

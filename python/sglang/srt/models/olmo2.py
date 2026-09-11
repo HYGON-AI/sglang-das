@@ -322,6 +322,7 @@ class Olmo2DecoderLayer(nn.Module):
 
 
 class Olmo2Model(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,

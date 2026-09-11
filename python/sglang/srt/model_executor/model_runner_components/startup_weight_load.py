@@ -21,6 +21,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_dcp_size,
+    configured_pp_size,
+    configured_tp_size,
     get_device,
     get_exec,
     get_lora,
@@ -31,6 +35,7 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -97,16 +102,12 @@ class StartupWeightLoadOptions:
     prefetch_num_threads: int
 
     @classmethod
-    def from_published_config(
+    def from_server_args(
         cls,
         *,
+        server_args: ServerArgs,
         is_draft_worker: bool,
     ) -> StartupWeightLoadOptions:
-        """Everything this needs is a published leaf; nothing comes off a record.
-
-        `is_draft_worker` is the exception and travels as an argument: it is
-        this runner's role, not the process's configuration.
-        """
         cuda_graph_config = get_exec().graph.cuda_graph_config
         cuda_graph_enabled = any(
             getattr(cuda_graph_config, phase).backend != Backend.DISABLED
@@ -119,10 +120,10 @@ class StartupWeightLoadOptions:
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
             speculative_algorithm=get_spec().speculative_algorithm,
-            tp_size=get_parallel().tp_size,
-            attn_cp_size=get_parallel().attn_cp_size,
-            dcp_size=get_parallel().dcp_size,
-            pp_size=get_parallel().pp_size,
+            tp_size=configured_tp_size(),
+            attn_cp_size=configured_attn_cp_size(),
+            dcp_size=configured_dcp_size(),
+            pp_size=configured_pp_size(),
             dp_size=get_parallel().dp_size,
             ep_size=get_parallel().ep_size,
             cpu_offload_gb=get_exec().offload.cpu_offload_gb,
@@ -270,27 +271,29 @@ class StartupWeightLoadManager:
         self._prefetch_failure_reported = False
 
     @classmethod
-    def create_from_published_config(
+    def create_from_server_args(
         cls,
         *,
         loader,
         model_config: ModelConfig,
         load_config: LoadConfig,
         device_config: DeviceConfig,
+        server_args: ServerArgs,
         is_draft_worker: bool,
     ) -> StartupWeightLoadManager:
-        """Build a manager from the published configuration.
+        """Build a manager straight from ``ServerArgs``.
 
         Callers on the model-loading path only decide *whether* to overlap; the
-        knowledge of which config leaves matter, and every support rule, stays
-        in this module.
+        knowledge of which server arguments matter, and every support rule,
+        stays in this module.
         """
         return cls.create(
             loader=loader,
             model_config=model_config,
             load_config=load_config,
             device_config=device_config,
-            options=StartupWeightLoadOptions.from_published_config(
+            options=StartupWeightLoadOptions.from_server_args(
+                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             ),
         )
@@ -520,7 +523,8 @@ class StartupWeightLoadManager:
         if changed_names:
             preview = ", ".join(changed_names[:8])
             raise RuntimeError(
-                f"Startup weight commit changed graph-visible tensor storage: {preview}"
+                "Startup weight commit changed graph-visible tensor storage: "
+                f"{preview}"
             )
         unchanged_names = manifest.unchanged_parameter_names(
             CAPTURE_SAFE_WEIGHT_SENTINEL

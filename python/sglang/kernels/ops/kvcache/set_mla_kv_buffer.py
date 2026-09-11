@@ -89,8 +89,6 @@ def set_mla_kv_buffer(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     num_warps: int = 0,
-    *,
-    reserved_skip_index: int = 0,
 ) -> None:
     """Write packed [k_nope | k_rope] rows into ``kv_buffer`` at ``loc`` indices
     via a TMA bulk-store. SM90+ only — the caller is expected to gate.
@@ -101,9 +99,6 @@ def set_mla_kv_buffer(
         cache_k_nope: [n_loc, nope_dim] or [n_loc, 1, nope_dim]
         cache_k_rope: [n_loc, rope_dim] or [n_loc, 1, rope_dim]
         loc:          [n_loc]
-
-    Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
-    for CUDA-graph padding by default; pass -1 to disable skipping.
     """
     n_loc = loc.shape[0]
     if n_loc == 0:
@@ -119,11 +114,4 @@ def set_mla_kv_buffer(
         num_warps = _pick_num_warps(n_loc)
 
     module = set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
-    module.set_mla_kv_buffer(
-        buf,
-        loc,
-        src_nope,
-        src_rope,
-        num_warps,
-        reserved_skip_index,
-    )
+    module.set_mla_kv_buffer(buf, loc, src_nope, src_rope, num_warps)

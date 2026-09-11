@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import is_hcu
+from sglang.srt.utils import is_hip, is_hcu
 
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
+_is_hip = is_hip()
 _is_hcu = is_hcu()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
@@ -32,17 +29,6 @@ class DSATopKBackend(Enum):
     TORCH = "torch"
     FLASHINFER = "flashinfer"
 
-    @classmethod
-    def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
-        """Resolve the DSA top-k backend for one model runner.
-
-        ``--dsa-topk-backend`` selects the target backend, while
-        ``--speculative-dsa-topk-backend`` independently selects the draft.
-        """
-        if model_runner.is_draft_worker:
-            return cls(get_spec().speculative_dsa_topk_backend)
-        return cls(get_exec().kernel.dsa_topk_backend)
-
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
 
@@ -53,9 +39,13 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        # topk_v2 has no HCU kernel; it stays on the paged transform.
+        # The HIP implementation is intentionally limited to HCU: generic
+        # ROCm devices retain the registered top-k path until they have a
+        # validated JIT implementation.
         return (
-            self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_hcu
+            self.is_sgl_kernel()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and (not _is_hip or _is_hcu)
         )
 
     def topk_func(
@@ -318,7 +308,7 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
 
     num_rows = logits.shape[0]
 
@@ -347,7 +337,7 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
     return out
 
 

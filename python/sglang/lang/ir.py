@@ -531,6 +531,7 @@ class SglRoleEnd(SglExpr):
 
 
 class SglSelect(SglExpr):
+
     def __init__(
         self,
         name: str,

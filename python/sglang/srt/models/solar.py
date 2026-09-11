@@ -60,6 +60,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class SolarMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -86,7 +87,8 @@ class SolarMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -98,6 +100,7 @@ class SolarMLP(nn.Module):
 
 
 class SolarAttention(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -183,6 +186,7 @@ class SolarAttention(nn.Module):
 
 
 class SolarDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -259,6 +263,7 @@ class SolarDecoderLayer(nn.Module):
 
 
 class SolarModel(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -375,11 +380,12 @@ class SolarModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling factor attribute!"
+                    "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
 
 class SolarForCausalLM(nn.Module):
+
     packed_modules_mapping = {
         "qkv_proj": [
             ("q_proj", "q"),
@@ -469,10 +475,12 @@ class SolarForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+
             is_packed = False
             for packed_name, sources in self.packed_modules_mapping.items():
                 for src_name, shard_id in sources:
                     if src_name in name:
+
                         model_param_name = name.replace(src_name, packed_name)
 
                         if model_param_name in params_dict:

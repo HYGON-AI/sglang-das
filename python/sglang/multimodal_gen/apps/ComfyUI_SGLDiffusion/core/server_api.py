@@ -99,8 +99,7 @@ class SGLDiffusionServerAPI:
             seed: Random seed for reproducible generation
             enable_teacache: Enable TEA cache acceleration
             response_format: Response format ("b64_json" or "url")
-            quality: Request optimization tier ("auto", "lossless",
-                "extra-high", "high") - only for generation
+            quality: Image quality ("auto", "standard", "hd") - only for generation
             style: Image style ("vivid" or "natural") - only for generation
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")

@@ -36,7 +36,6 @@ class _TinyVAE(nn.Module):
 
 def _server_args():
     return SimpleNamespace(
-        component_precisions={},
         pipeline_config=SimpleNamespace(
             vae_decode_precision="fp16",
             vae_precision="fp32",

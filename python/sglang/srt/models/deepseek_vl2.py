@@ -156,6 +156,7 @@ class DeepseekVL2MlpProjector(nn.Module):
 
 
 class DeepseekVL2ForCausalLM(nn.Module):
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         language_config = hf_config.language_config

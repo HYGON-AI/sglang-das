@@ -473,15 +473,14 @@ class LlavaBaseForCausalLM(nn.Module):
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
-        device = next(self.language_model.parameters()).device
         if "clip" in vision_path:
             self.vision_tower = CLIPVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).to(device)
+            ).cuda()
         elif "siglip" in vision_path:
             self.vision_tower = SiglipVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).to(device)
+            ).cuda()
             # Siglip needs all feature tokens
             self.config.mm_vision_select_feature = "full"
         self.vision_tower.eval()

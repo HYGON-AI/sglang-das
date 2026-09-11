@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
+
     def __init__(
         self,
         config: PretrainedConfig,

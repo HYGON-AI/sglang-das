@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
 
@@ -64,6 +64,7 @@ def _jit_compress_norm_rope_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool = False,
+    int8_store: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -73,9 +74,10 @@ def _jit_compress_norm_rope_module(
         is_arch_support_pdl(),
         INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
         bf16_store,
+        int8_store,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
-    if head_dim == 128:
+    if head_dim == 128 and not int8_store:
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
         )
@@ -467,11 +469,6 @@ def compress_forward(
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
-    # C4/C128 kernels use the same InputFloat type for APE and kv_score_input.
-    # Keep the model parameter in FP32 but convert it to the kernel input dtype
-    # at the fused-kernel boundary.
-    if ape.dtype != kv_score_input.dtype:
-        ape = ape.to(dtype=kv_score_input.dtype)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
@@ -488,33 +485,12 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
-    # HIP FP4 uses split scale storage and precomputed BF16 RoPE tables.
-    kvcache_scale: Optional[torch.Tensor] = None,
-    rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    fp4_k_write_metadata=None,
+    int8_store: bool = False,
 ) -> None:
+    if int8_store and (kv.shape[-1] != 128 or use_fp4 or bf16_store or _is_xpu):
+        raise ValueError("INT8 compressed store requires a non-FP4 C4 indexer")
     if use_fp4:
         assert kv.shape[-1] == 128
-    if is_hip() and use_fp4:
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-            aiter_k_indexer_fp4_cache_write,
-        )
-
-        cos, sin = cast(tuple[torch.Tensor, torch.Tensor], rope_cache)
-        aiter_k_indexer_fp4_cache_write(
-            k=kv,
-            norm_weight=norm_weight,
-            norm_epsilon=norm_eps,
-            cos=cos,
-            sin=sin,
-            plan=plan,
-            out_loc=out_loc,
-            k_payload=kvcache,
-            k_scale=cast(torch.Tensor, kvcache_scale),
-            write_metadata=fp4_k_write_metadata,
-        )
-        return
-
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
         compress_norm_rope_store_xpu(
@@ -532,11 +508,10 @@ def compress_norm_rope_store(
         )
     else:
         module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store,
+            int8_store,
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
-        if norm_weight.dtype != kv.dtype:
-            norm_weight = norm_weight.to(dtype=kv.dtype)
         fn(
             kv,
             plan[1],

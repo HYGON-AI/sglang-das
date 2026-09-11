@@ -54,8 +54,7 @@ def is_kv_b_lora_active(attn_module: DeepseekV2AttentionMLA) -> bool:
     """Cheap precondition check used at call sites in the attention forward
     to skip the entire LoRA-correction path when no ``kv_b_proj`` adapter is
     wrapped on this module (the common case)."""
-    kv_b_proj = getattr(attn_module, "kv_b_proj", None)
-    return getattr(kv_b_proj, "set_lora", False)
+    return getattr(attn_module.kv_b_proj, "set_lora", False)
 
 
 def _get_state(

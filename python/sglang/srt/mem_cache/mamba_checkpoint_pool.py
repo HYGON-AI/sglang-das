@@ -53,7 +53,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
-from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +313,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     allocating, so an oversized ``--int8-mamba-ckpt-size`` fails with an actionable
     message instead of a cryptic mid-allocation CUDA OOM.
     """
+    from sglang.srt.runtime_context import get_exec
 
     try:
         mamba = get_exec().mamba

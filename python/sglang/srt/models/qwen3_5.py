@@ -30,7 +30,6 @@ import triton
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
-    qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -43,7 +42,6 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -71,6 +69,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    bf16_gemm_dispatch,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -103,6 +105,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_stream,
 )
@@ -140,9 +143,6 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-_gdn_decode_fused_proj_conv = (
-    _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
-)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -153,8 +153,10 @@ _is_xpu = is_xpu()
 # layout is handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
 # tuple so their control flow is unchanged.
+# Qwen4-Exp GDN uses v/k head ratio 3 (48/16). Keep ratio-3 on every
+# backend, including HCU, so Flash-Next does not fall off the fused path.
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 3, 4, 8) if _use_aiter else (1, 2, 3, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
@@ -164,12 +166,7 @@ def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the flag is written by the owning model's gate before
     # its layers build (per runner); models without a gate see the config
     # intent through the accessor's fallback.
-    # The deferred-finalize ABI needs the shared expert as a separate, gated
-    # local contribution; it cannot consume a shared slot fused into routed MoE.
-    return bool(
-        envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
-        or is_shared_experts_fusion_disabled()
-    )
+    return is_shared_experts_fusion_disabled()
 
 
 def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
@@ -186,7 +183,6 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
 
     if not (
         isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
         and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
         return
@@ -197,24 +193,6 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     mlp._enable_silu_fp4_quant_fusion = True
     mlp.down_proj._accepts_prequantized_fp4 = True
     logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
-
-
-def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
-    return bool(
-        not is_nextn
-        and config.model_type == "qwen3_5_moe_text"
-        and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
-    )
-
-
-def _layer_communicator_class(config: Qwen3_5TextConfig, is_nextn: bool):
-    if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            Qwen35FlashInferLayerCommunicator,
-        )
-
-        return Qwen35FlashInferLayerCommunicator
-    return LayerCommunicator
 
 
 if _is_cuda:
@@ -287,27 +265,6 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
-
-
-def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
-    if not expect_deferred:
-        if not isinstance(hidden_states, torch.Tensor):
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
-
-            if isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
-                raise RuntimeError("unexpected deferred-finalize handoff")
-        hidden_states._sglang_needs_allreduce_fusion = True
-        return hidden_states
-
-    from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-        Qwen35MoeFinalizeHandoff,
-    )
-
-    if not isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
-        raise RuntimeError("Qwen3.5 expected a FlashInfer deferred-finalize handoff")
-    return hidden_states
 
 
 if _is_npu:
@@ -390,13 +347,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
+        self._fused_in_proj_weight: Optional[torch.Tensor] = None
+        self._fused_in_proj_qkvz_width = 0
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
-                and self.in_proj_qkvz._parameters.get("weight") is not None
-                and self.in_proj_ba._parameters.get("weight") is not None
-                and self.in_proj_qkvz._parameters["weight"].dtype == torch.bfloat16
-                and self.in_proj_ba._parameters["weight"].dtype == torch.bfloat16
+                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
+                and self.in_proj_ba.weight.dtype == torch.bfloat16
                 and self.in_proj_qkvz.bias is None
                 and self.in_proj_ba.bias is None
                 and use_intel_amx_backend(self.in_proj_qkvz)
@@ -563,9 +520,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                             cpu_split_sizes.append(
                                 int(target_size_sim * split_sizes[i] / split_size_sum)
                             )
-                        assert sum(cpu_split_sizes) == target_size_sim, (
-                            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
-                        )
+                        assert (
+                            sum(cpu_split_sizes) == target_size_sim
+                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
                         chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
                     else:
                         chunks = loaded_weight.split(split_sizes, dim=split_dim)
@@ -648,6 +605,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def finalize_fused_in_proj(self) -> None:
+        """Merge in_proj_qkvz + in_proj_ba into one output-stacked GEMM weight.
+
+        Both projections consume the same hidden_states and are output-sharded
+        identically, so their per-rank weights can be stacked along dim 0. The
+        module weights are re-pointed to row views of the fused buffer, keeping
+        every other consumer (weight reload, dtype checks) working unchanged.
+        """
+        if not _is_cuda or self._fused_in_proj_weight is not None:
+            return
+        if get_lora().enable_lora or get_lora().lora_paths:
+            # LoRA wraps the individual Linear modules; the fused GEMM would
+            # bypass their adapters.
+            return
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if not (
+            isinstance(qkvz.quant_method, UnquantizedLinearMethod)
+            and isinstance(ba.quant_method, UnquantizedLinearMethod)
+            and qkvz.weight.dtype == torch.bfloat16
+            and ba.weight.dtype == torch.bfloat16
+            and qkvz.bias is None
+            and ba.bias is None
+        ):
+            return
+        fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
+        self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
+        qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
+        ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
+        self._fused_in_proj_weight = fused
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
@@ -656,6 +643,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # the tuple branch and keep the original control flow below unchanged.
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
+
+        if (
+            self._fused_in_proj_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            # At prefill widths cuBLAS serves the merged (m, 4120) shape
+            # ~10% slower than the two original GEMMs; the merged win is
+            # launch count, which only matters at decode sizes.
+            and hidden_states.shape[0] <= 1024
+        ):
+            fused_out = bf16_gemm_dispatch(
+                hidden_states, self._fused_in_proj_weight, None
+            )
+            return (
+                fused_out[:, : self._fused_in_proj_qkvz_width],
+                fused_out[:, self._fused_in_proj_qkvz_width :],
+            )
 
         if (
             _is_cpu
@@ -785,39 +788,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
-        use_strided_prefill_z = False
-        use_fused_decode_proj_conv = (
-            _gdn_decode_fused_proj_conv
-            and forward_batch.forward_mode.is_decode()
-            and isinstance(projected_states_qkvz, torch.Tensor)
-            and isinstance(projected_states_ba, torch.Tensor)
-        )
-        use_fused_contiguous_unpack = (
+        if (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
-        )
-        if use_fused_decode_proj_conv:
-            # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
-            # it replaces these temporary B/A placeholders before recurrence.
-            mixed_qkv = (projected_states_qkvz, projected_states_ba)
-            z = None
-            b = projected_states_ba
-            a = projected_states_ba
-        elif use_fused_contiguous_unpack and not _is_npu:
+            and not _is_npu
+        ):
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
-            )
-            split_fn = (
-                qwen3_5_gdn_prefill_projection_views
-                if use_strided_prefill_z
-                else fused_qkvzba_split_reshape_cat_contiguous
-            )
-            mixed_qkv, z, b, a = split_fn(
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
                 num_k_heads_tp,
@@ -837,35 +818,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
+        core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
         )
-        if use_fused_decode_proj_conv:
-            if not isinstance(attn_result, tuple) or len(attn_result) != 2:
-                raise RuntimeError(
-                    "Fused GDN decode projection/Conv1D backend must return "
-                    "(core_attn_out, z)"
-                )
-            core_attn_out, z = attn_result
-        else:
-            core_attn_out = attn_result
-        assert z is not None
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        if use_strided_prefill_z:
-            z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
-        else:
-            z = z.reshape(-1, z.shape[-1])
-            z_flat_shape = z.shape
+        z = z.reshape(-1, z.shape[-1])
 
         # Add padding for DP-Attn
-        if core_attn_out.shape != z_flat_shape:
-            core_attn_out_pad = z.new_zeros(z_flat_shape)
+        if core_attn_out.shape != z.shape:
+            core_attn_out_pad = torch.zeros_like(z)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
@@ -900,9 +867,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             config, layer_id, quant_config, alt_stream, prefix
         )
 
-        # NOTE: Determine the MLP type based on the model type
-        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        # NOTE: Determine the MLP type based on the number of routed experts
+        # (dense Qwen3.5 has none; Qwen3.5-MoE and derived backbones do).
+        if config.num_experts:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -919,7 +886,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_layer_sparse = True
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
-        elif config.model_type == "qwen3_5_text":
+        else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -931,8 +898,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -953,7 +918,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             _enable_qwen35_fused_ar_quant()
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
-        self.layer_communicator = _layer_communicator_class(config, is_nextn)(
+        self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
@@ -982,9 +947,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
-        hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1004,23 +967,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        defer_moe_finalize = (
-            fuse_mlp_allreduce
-            and isinstance(hidden_states, torch.Tensor)
-            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
-                forward_batch, int(hidden_states.shape[0])
-            )
-        )
-        if (
-            fuse_mlp_allreduce
-            and self.layer_communicator.is_last_layer
-            and not defer_moe_finalize
-        ):
-            # The last layer has no prepare_attn consumer for deferred AllReduce;
-            # fall back before MLP so postprocess_layer performs the collective.
-            fuse_mlp_allreduce = False
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
@@ -1029,14 +975,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
-                    defer_finalize=defer_moe_finalize,
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
         if fuse_mlp_allreduce:
-            hidden_states = _finish_mlp_output(
-                hidden_states, expect_deferred=defer_moe_finalize
-            )
+            hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -1142,8 +1085,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
         )
 
-        # Dense MLP for non-MoE variant
-        if config.model_type == "qwen3_5_text":
+        # Dense MLP for the variant without routed experts
+        if not config.num_experts:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1154,7 +1097,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        elif config.model_type == "qwen3_5_moe_text":
+        else:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1171,8 +1114,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = True
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -1195,7 +1136,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
-        self.layer_communicator = _layer_communicator_class(config, is_nextn)(
+        self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
@@ -1264,7 +1205,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
-            mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
@@ -1346,6 +1286,39 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         return q, k, v, gate
 
+    def _prepare_qkv_gate(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Project and rotate Q/K/V (+ the attention output gate) on the
+        platform's fused path."""
+        if _is_cuda and self.attn_output_gate:
+            return self.forward_prepare_cuda_fused(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+            return self.forward_prepare_fused_gate(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            return self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        return self.forward_prepare_npu(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -1353,31 +1326,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
-            q, k, v, gate = self.forward_prepare_cuda_fused(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
-            q, k, v, gate = self.forward_prepare_fused_gate(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        elif (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        else:
-            q, k, v, gate = self.forward_prepare_npu(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        q, k, v, gate = self._prepare_qkv_gate(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -1409,9 +1362,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
-        hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1431,21 +1382,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        defer_moe_finalize = (
-            fuse_mlp_allreduce
-            and isinstance(hidden_states, torch.Tensor)
-            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
-                forward_batch, int(hidden_states.shape[0])
-            )
-        )
-        if (
-            fuse_mlp_allreduce
-            and self.layer_communicator.is_last_layer
-            and not defer_moe_finalize
-        ):
-            fuse_mlp_allreduce = False
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
@@ -1454,14 +1390,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
-                    defer_finalize=defer_moe_finalize,
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
         if fuse_mlp_allreduce:
-            hidden_states = _finish_mlp_output(
-                hidden_states, expect_deferred=defer_moe_finalize
-            )
+            hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -1492,6 +1425,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1574,20 +1509,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
-        if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        self.embed_tokens = self._build_embed_tokens(config)
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = self.decoder_layer_types[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:
@@ -1609,48 +1536,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        self.flashinfer_mnnvl_cutedsl_fusion = None
-        if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-            if self.pp_group.world_size != 1:
-                raise RuntimeError(
-                    "Qwen3.5 FlashInfer MNNVL CuTe DSL fusion currently requires PP=1"
-                )
-            unsupported_layers = [
-                layer.layer_id
-                for layer in self.layers
-                if not isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
-                or not layer.mlp.supports_deferred_finalize
-            ]
-            if unsupported_layers:
-                raise RuntimeError(
-                    "Qwen3.5 FlashInfer MNNVL CuTe DSL fusion currently "
-                    "requires block-FP8 MoE weights with FlashInfer TRTLLM "
-                    "deferred-finalize support on every layer; unsupported "
-                    "layers: "
-                    f"{unsupported_layers}"
-                )
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35FlashInferFusionService,
-                Qwen35FlashInferLayerCommunicator,
-            )
-
-            self.flashinfer_mnnvl_cutedsl_fusion = Qwen35FlashInferFusionService(
-                hidden_size=config.hidden_size,
-                top_k=config.num_experts_per_tok,
-                rms_epsilon=config.rms_norm_eps,
-            )
-            for layer in self.layers:
-                communicator = layer.layer_communicator
-                if not isinstance(communicator, Qwen35FlashInferLayerCommunicator):
-                    raise RuntimeError(
-                        "Qwen3.5 fusion-enabled layer has the wrong communicator"
-                    )
-                communicator.fusion_service = self.flashinfer_mnnvl_cutedsl_fusion
-            logger.info(
-                "Installed one Qwen3.5 FlashInfer fusion handle for %d layers",
-                len(self.layers),
-            )
-
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1659,17 +1544,20 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if self.flashinfer_mnnvl_cutedsl_fusion is None:
-            return
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            prepare_qwen35_flashinfer_fusion,
+    def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
+        """How this architecture shards its embedding. Qwen3.5 replicates it
+        under DP attention; a model reusing this backbone may shard instead."""
+        if not self.pp_group.is_first_rank:
+            return PPMissingLayer()
+        return VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            enable_tp=not is_dp_attention_enabled(),
         )
 
-        prepare_qwen35_flashinfer_fusion(self, model_runner)
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -1694,16 +1582,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if (
-            self.flashinfer_mnnvl_cutedsl_fusion is not None
-            and input_deepstack_embeds is not None
-            and input_deepstack_embeds.numel() > 0
-        ):
-            raise RuntimeError(
-                "Qwen3.5 FlashInfer MNNVL CuTe DSL fusion currently supports "
-                "the text-only path, not deepstack visual inputs"
-            )
-
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1755,62 +1633,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 }
             )
 
-        # The final layer has no successor to consume its deferred MoE tail.
-        trace_final_norm = envs.SGLANG_TRACE_QWEN35_FINAL_NORM.get()
-        use_native_final_norm = envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
-        is_deferred_finalize = False
-        if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
-
-            is_deferred_finalize = isinstance(hidden_states, Qwen35MoeFinalizeHandoff)
-
-        if is_deferred_finalize:
-            if residual is None or self.flashinfer_mnnvl_cutedsl_fusion is None:
-                raise RuntimeError("invalid final deferred MoE handoff")
-            hidden_states, _ = self.flashinfer_mnnvl_cutedsl_fusion.finalize(
-                hidden_states, residual, self.norm.gemma_weight
-            )
-        elif hidden_states.shape[0] != 0:
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM "
-                    f"stage=pre_sync_enter hidden={tuple(hidden_states.shape)} "
-                    f"hidden_stride={hidden_states.stride()} "
-                    f"hidden_dtype={hidden_states.dtype} "
-                    f"hidden_contiguous={hidden_states.is_contiguous()} "
-                    f"residual={None if residual is None else tuple(residual.shape)} "
-                    f"native={use_native_final_norm}",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=pre_sync_returned",
-                    flush=True,
-                )
+        # Apply final normalization
+        if hidden_states.shape[0] != 0:
             if residual is None:
-                hidden_states = (
-                    self.norm.forward_native(hidden_states)
-                    if use_native_final_norm
-                    else self.norm(hidden_states)
-                )
+                hidden_states = self.norm(hidden_states)
             else:
-                hidden_states, _ = (
-                    self.norm.forward_native(hidden_states, residual)
-                    if use_native_final_norm
-                    else self.norm(hidden_states, residual)
-                )
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_enter",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_returned",
-                    flush=True,
-                )
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -2304,11 +2132,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
-
-    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        prepare = getattr(self.model, "prepare_before_cuda_graph_capture", None)
-        if prepare is not None:
-            prepare(model_runner)
 
     def should_apply_lora(self, module_name: str) -> bool:
         # Accept all language model layer modules (attention, linear_attn, mlp).

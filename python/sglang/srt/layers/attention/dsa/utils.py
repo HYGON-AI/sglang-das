@@ -5,6 +5,9 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+    effective_forward_mode,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -18,7 +21,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -71,24 +74,14 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int = 1):
-    if index_kpool <= 1:
-        return original_seq_lens.clamp(max=dsa_index_topk)
-
-    # Clamp only complete pools; the unfinished tail must remain selectable
-    # outside the pooled top-k budget.
-    full_pool_tokens = (
-        torch.div(original_seq_lens, index_kpool, rounding_mode="floor") * index_kpool
-    )
-    selected_history_tokens = full_pool_tokens.clamp(max=dsa_index_topk)
-    tail_tokens = original_seq_lens - full_pool_tokens
-    return selected_history_tokens + tail_tokens
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
+    return original_seq_lens.clamp(max=dsa_index_topk)
 
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
-        (is_cuda() or is_hip())
+        is_cuda()
         and envs.SGLANG_DSA_FUSE_TOPK.get()
         and get_disagg().disaggregation_mode == "decode"
         and not get_memory().enable_hisparse
@@ -115,17 +108,25 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu() or is_musa():
+    if not envs.SGLANG_ENABLE_CP_V2.get():
         return get_parallel().enable_dsa_prefill_context_parallel
 
-    # Generic prefill CP derives activation from the runtime topology and model
-    # architecture. Protected HIP/NPU paths continue to use their legacy field.
+    # Derive from the runtime CP topology + model arch rather than the legacy
+    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
+    # DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+
+
+def is_dsa_prefill_cp_in_seq_split():
+    return (
+        is_dsa_enable_prefill_cp()
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
+    )
 
 
 def is_dsa_prefill_cp_round_robin_split():
@@ -144,12 +145,12 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
         is_cuda()
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        and forward_batch.forward_mode.is_extend_without_speculative()
+        and effective_forward_mode(forward_batch).is_extend_without_speculative()
     )
 
 
 def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
+    if not effective_forward_mode(forward_batch).is_context_parallel_extend():
         return False
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
@@ -189,18 +190,7 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
         return input_[indices]
 
     # for torch device tensor
-    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
-    # .contiguous() is not sufficient here. When tokens == cp_size every rank's
-    # shard has a single row, and a size-1 outer dimension imposes no contiguity
-    # constraint, so is_contiguous() is True whatever stride(0) is and
-    # .contiguous() becomes a no-op. The shard then keeps the cp_size-inflated
-    # row pitch (cp_size * row_numel instead of row_numel), which any kernel that
-    # takes its row pitch from stride(0) will read as an oversized tensor.
-    # Compare the pitch against the parent's explicitly, so the copy happens
-    # exactly when the shard really is strided -- and not at all for cp_size == 1.
-    if shard.stride(0) != input_.stride(0):
-        shard = shard.clone(memory_format=torch.contiguous_format)
-    return shard
+    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
 
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
@@ -269,7 +259,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     if (
         cp_size <= 1
         or not use_dsa
-        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not effective_forward_mode(forward_batch).is_context_parallel_extend()
         or not is_dsa_enable_prefill_cp()
         or sum(forward_batch.extend_seq_lens_cpu) < cp_size
     ):
@@ -277,9 +267,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
 
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert seq_len % cp_size == 0, (
-            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
-        )
+        assert (
+            seq_len % cp_size == 0
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -343,7 +333,7 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
     if (
         forward_batch.attn_cp_metadata is not None
         and dsa_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend()
+        and effective_forward_mode(forward_batch).is_context_parallel_extend()
     ):
         return True
     else:

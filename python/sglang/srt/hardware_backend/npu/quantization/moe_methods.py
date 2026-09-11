@@ -179,6 +179,12 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
     def _get_bias_args(
         quant_info: "AscendQuantInfo", weight_prefix: str
     ) -> Dict[str, Any]:
+        # Ablation: drop ModelSlim W4A8 ``*_scale_bias`` (float bias after
+        # dequant). Still allow a separate ``*_weight_bias`` if present.
+        if envs.SGLANG_W4A8_MOE_SKIP_SCALE_BIAS.get():
+            bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
+            return {"bias": [bias]} if bias is not None else {}
+
         bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
@@ -223,7 +229,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         ).transpose(1, 2)
         weight_scale.data = scale
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
+        # The refactored Ascend dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
@@ -304,7 +310,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         ).transpose(1, 2)
         weight_scale.data = scale
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
+        # The refactored Ascend dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize immediately before each GMM.
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
@@ -673,7 +679,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         if is_per_channel:
             scale_np = scale.cpu().contiguous().numpy()
             scale_np.dtype = np.uint32
-            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
+            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).cuda()
             return scale_uint64_tensor
 
         # Per‑group: multiply channel and group scales, then pack into uint64
@@ -929,7 +935,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 #  NPUMXFP8MoEMethod
 # ---------------------------------------------------------------------------
 class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
-    """MXFP8 MoE on A5 NPU – float8_e4m3fn weights with e8m0 block scales.
+    """MXFP8 MoE on Ascend A5 – float8_e4m3fn weights with e8m0 block scales.
 
     Serves both the online config path (``--quantization mxfp8``, weights
     quantised at load time) and the offline ModelSlim ``W8A8_MXFP8`` scheme
@@ -1016,8 +1022,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # [E, K//64, N, 2] as strided transpose views — DO NOT call
         # .contiguous(). Beyond breaking the transpose-flag match above, it
         # measures slower on the same probe: making both sides contiguous costs
-        # 6.2% on decode. This matches NPUMXFP8LinearMethod and msmodelslim's
-        # offline layout.
+        # 6.2% on decode. This matches NPUMXFP8LinearMethod, msmodelslim's
+        # offline layout and vllm-ascend's AscendW8A8MXFP8DynamicFusedMoEMethod.
         setattr(
             layer,
             f"{weight_prefix}_weight",

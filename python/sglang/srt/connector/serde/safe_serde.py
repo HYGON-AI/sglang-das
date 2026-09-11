@@ -9,6 +9,7 @@ from sglang.srt.connector.serde.serde import Deserializer, Serializer
 
 
 class SafeSerializer(Serializer):
+
     def __init__(self):
         super().__init__()
 
@@ -17,6 +18,7 @@ class SafeSerializer(Serializer):
 
 
 class SafeDeserializer(Deserializer):
+
     def __init__(self):
         # TODO: dtype options
         super().__init__(torch.float32)

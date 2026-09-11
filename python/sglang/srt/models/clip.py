@@ -49,6 +49,7 @@ def prepare_clip_attention_mask(
 
 
 class CLIPVisionEmbeddings(nn.Module):
+
     def __init__(self, config: CLIPVisionConfig):
         super().__init__()
         self.config = config
@@ -140,6 +141,7 @@ class CLIPTextEmbeddings(nn.Module):
 
 
 class CLIPMLP(nn.Module):
+
     def __init__(
         self,
         config,
@@ -238,6 +240,7 @@ class CLIPAttention(nn.Module):
 
 
 class CLIPEncoderLayer(nn.Module):
+
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -425,6 +428,7 @@ class CLIPTextModel(nn.Module):
 
 
 class CLIPVisionTransformer(nn.Module):
+
     def __init__(
         self,
         config: CLIPVisionConfig,

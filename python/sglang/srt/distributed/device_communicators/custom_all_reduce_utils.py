@@ -57,10 +57,7 @@ if _is_hip:
             amdsmi_topo_get_link_type,
         )
     except ImportError as e:
-        if _is_hcu:
-            logger.warning("Failed to import ROCm SMI package on HCU")
-        else:
-            logger.warning("Failed to import ROCm SMI package with %r", e)
+        logger.warning("Failed to import ROCm SMI package with %r", e)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -70,7 +67,7 @@ def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s from '%s' to '%s'",
+                "Overwriting environment variable %s " "from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -375,10 +372,8 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                     except AmdSmiException as error:
                         if _is_hcu:
                             logger.error(
-                                "HCU 1 hop HSL topology query failed for "
-                                "device pair (%s, %s).",
-                                physical_device_ids[i],
-                                physical_device_ids[j],
+                                "HCU 1 hop HSL detection failed.",
+                                exc_info=error,
                             )
                         else:
                             logger.error(
@@ -463,9 +458,9 @@ def can_use_custom_all_reduce_with_nvlink(
     supported_world_size: List[int],
     cls_name: str,
 ) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
-    assert dist.get_backend(group) != dist.Backend.NCCL, (
-        f"{cls_name} should be attached to a non-NCCL group."
-    )
+    assert (
+        dist.get_backend(group) != dist.Backend.NCCL
+    ), f"{cls_name} should be attached to a non-NCCL group."
 
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
@@ -477,7 +472,7 @@ def can_use_custom_all_reduce_with_nvlink(
     # No need to initialize custom allreduce for multi-node case.
     if not all(in_the_same_node_as(group, source_rank=0)):
         logger.warning(
-            f"{cls_name} is disabled because this process group spans across nodes."
+            f"{cls_name} is disabled because this process group" " spans across nodes."
         )
         return
 

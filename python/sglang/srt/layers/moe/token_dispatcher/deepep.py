@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from contextlib import nullcontext
@@ -82,8 +83,6 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
-
-from sglang.srt.runtime_context import get_resources
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
@@ -205,15 +204,23 @@ class DeepEPBuffer:
     def _state(cls):
         from types import SimpleNamespace
 
+        from sglang.srt.runtime_context import get_resources
+
         buffers = get_resources().buffers
+        # DeepEP's low-latency runtime is process-wide. Creating a second LL
+        # Buffer for the speculative model invalidates/hangs the first runtime
+        # on HCU, so target and draft must share one compatible allocation.
         state = buffers.get("deepep_ep_state")
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
                 dispatch_mode=None,
+                deepep_mode=None,
+                group_size=None,
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                num_topk=None,
             )
             buffers["deepep_ep_state"] = state
         return state
@@ -227,14 +234,57 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        num_topk: int = -1,
     ):
         state = cls._state()
         if state.buffer is not None:
+            incompatible = []
+            if state.group_size != group.size():
+                incompatible.append(
+                    f"EP size {state.group_size} != requested {group.size()}"
+                )
+            if state.hidden_size != hidden_size:
+                incompatible.append(
+                    f"hidden size {state.hidden_size} != requested {hidden_size}"
+                )
+            if deepep_mode.enable_normal() and not state.deepep_mode.enable_normal():
+                incompatible.append("existing buffer has no normal-mode allocation")
+            if deepep_mode.enable_low_latency():
+                if not state.deepep_mode.enable_low_latency():
+                    incompatible.append("existing buffer has no low-latency allocation")
+                if (
+                    state.num_max_dispatch_tokens_per_rank
+                    != num_max_dispatch_tokens_per_rank
+                ):
+                    incompatible.append(
+                        "max dispatch tokens "
+                        f"{state.num_max_dispatch_tokens_per_rank} != requested "
+                        f"{num_max_dispatch_tokens_per_rank}"
+                    )
+                if state.num_experts != num_experts:
+                    incompatible.append(
+                        f"expert count {state.num_experts} != requested {num_experts}"
+                    )
+                if state.num_topk != num_topk:
+                    incompatible.append(
+                        f"topk {state.num_topk} != requested {num_topk}"
+                    )
+            if incompatible:
+                raise RuntimeError(
+                    "Target and speculative DeepEP cannot create independent "
+                    "low-latency buffers in one process. Make their DeepEP "
+                    "layouts compatible or use a non-DeepEP speculative MoE "
+                    "backend. Incompatibilities: "
+                    + "; ".join(incompatible)
+                )
             return state.buffer
 
+        state.deepep_mode = deepep_mode
+        state.group_size = group.size()
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
+        state.num_topk = num_topk
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -256,6 +306,7 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            assert num_topk != -1
             if not _is_npu:
                 _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
             num_rdma_bytes = max(
@@ -264,6 +315,7 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
+                    num_topk=num_topk
                 ),
                 num_rdma_bytes,
             )
@@ -316,7 +368,10 @@ class DeepEPBuffer:
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
+        supports_use_fabric = (
+            "use_fabric" in inspect.signature(Buffer.__init__).parameters
+        )
+        if not is_cu12 and use_mnnvl_fabric and supports_use_fabric:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
@@ -646,7 +701,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 expert_alignment=(
                     256
                     if (
-                        get_global_server_args().quantization == "slimquant_marlin"
+                        get_global_server_args().quantization
+                        in (
+                            "slimquant_marlin",
+                            "slimquant_w4a8_marlin",
+                        )
                         or _use_fp8_w8a8_moe
                         or _use_marlin_w16a16_moe
                     )
@@ -757,6 +816,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.router_topk,
         )
 
 
@@ -1019,6 +1079,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.router_topk,
         )
 
 

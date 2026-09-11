@@ -241,7 +241,8 @@ class ViT3DDecoder(ViTBase):
 
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                f"MiniMax H3 decoder autocast weights require fp16 or bf16, got {dtype}"
+                "MiniMax H3 decoder autocast weights require fp16 or bf16, "
+                f"got {dtype}"
             )
         if self._autocast_linear_dtype == dtype:
             return 0

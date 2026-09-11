@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -18,8 +17,9 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_global_forced_attn_backend,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    OnlineQuantizationComponentLoader,
+    ComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
@@ -29,10 +29,11 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
-    resolve_transformer_checkpoint_files,
     resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
+    resolve_transformer_safetensors_to_load,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import (
@@ -99,44 +100,12 @@ def _warn_if_expected_param_dtype_missing(
 
 
 def _server_args_for_transformer_component(
-    server_args: ServerArgs,
-    component_name: str,
-    structural_component_name: str | None = None,
+    server_args: ServerArgs, component_name: str
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
-    structural_component_name = structural_component_name or component_name
-    _, separator, suffix = structural_component_name.rpartition("_")
-    is_secondary = structural_component_name == "unconditional_transformer" or (
-        bool(separator) and suffix.isdigit() and int(suffix) >= 2
-    )
     component_weights_path = server_args.component_weights_paths.get(component_name)
-    component_quantization = server_args.component_quantizations.get(component_name)
-    component_ignored_layers = server_args.component_quantization_ignored_layers.get(
-        component_name
-    )
-    has_exact_override = (
-        component_weights_path is not None
-        or component_quantization is not None
-        or component_ignored_layers is not None
-    )
-    has_global_weights = (
-        server_args.transformer_weights_path is not None
-        or server_args.nunchaku_config is not None
-    )
-    if not has_exact_override and not (is_secondary and has_global_weights):
-        return server_args
-
-    component_server_args = copy.copy(server_args)
-    if is_secondary:
-        component_server_args.transformer_weights_path = None
-        component_server_args.nunchaku_config = None
-        if has_global_weights:
-            logger.info(
-                "Ignoring global transformer weight overrides for %s; keep them "
-                "on the primary component unless an exact override is provided.",
-                component_name,
-            )
     if component_weights_path is not None:
+        component_server_args = copy.copy(server_args)
         component_server_args.transformer_weights_path = component_weights_path
         component_server_args.nunchaku_config = None
         logger.info(
@@ -144,15 +113,25 @@ def _server_args_for_transformer_component(
             component_name,
             component_weights_path,
         )
-    if component_quantization is not None:
-        component_server_args.quantization = component_quantization
-        logger.info(
-            "Using quantization override %s for %s",
-            component_quantization,
-            component_name,
-        )
-    if component_ignored_layers is not None:
-        component_server_args.quantization_ignored_layers = component_ignored_layers
+        return component_server_args
+
+    if component_name not in ("transformer_2", "unconditional_transformer"):
+        return server_args
+
+    if (
+        server_args.transformer_weights_path is None
+        and server_args.nunchaku_config is None
+    ):
+        return server_args
+
+    component_server_args = copy.copy(server_args)
+    component_server_args.transformer_weights_path = None
+    component_server_args.nunchaku_config = None
+    logger.info(
+        "Ignoring global transformer_weights_path for %s; keep it on the base "
+        "checkpoint unless a per-component override path is provided.",
+        component_name,
+    )
     return component_server_args
 
 
@@ -163,8 +142,10 @@ def _should_use_streaming_state_dict_load(server_args: ServerArgs) -> bool:
     return bool(tp_size > 1 or (sp_degree > 1 and ulysses_degree > 1))
 
 
-class TransformerLoader(OnlineQuantizationComponentLoader):
+class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
+
+    allow_global_attention_backend_fallback = False
 
     component_names = [
         "transformer",
@@ -173,19 +154,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         "video_dit",
     ]
     expected_library = "diffusers"
-
-    def component_attention_backend_context(
-        self,
-        attn_backend,
-        component_attn_name: str | None,
-        require_backend_selection: bool,
-    ):
-        return component_attn_backend_context_manager(
-            attn_backend,
-            component_name=component_attn_name,
-            allow_global_backend_fallback=False,
-            require_backend_selection=require_backend_selection,
-        )
 
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
@@ -206,9 +174,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
         component_server_args = _server_args_for_transformer_component(
-            server_args,
-            component_name,
-            self.structural_component_name(component_name),
+            server_args, component_name
         )
         # Don't let a quantized load quietly fall back to the unquantized native
         # model. That would drop the requested precision and bury the real error.
@@ -217,42 +183,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             or component_server_args.transformer_weights_path is not None
             or component_server_args.quantization is not None
         )
-
-    def validate_native_fallback(
-        self, server_args: ServerArgs, component_name: str
-    ) -> None:
-        super().validate_native_fallback(server_args, component_name)
-        requested_distributed_execution = []
-        if server_args.tp_size is not None and server_args.tp_size > 1:
-            requested_distributed_execution.append(f"tp_size={server_args.tp_size}")
-        if server_args.sp_degree is not None and server_args.sp_degree > 1:
-            requested_distributed_execution.append(f"sp_degree={server_args.sp_degree}")
-        if server_args.ulysses_degree is not None and server_args.ulysses_degree > 1:
-            requested_distributed_execution.append(
-                f"ulysses_degree={server_args.ulysses_degree}"
-            )
-        if server_args.ring_degree is not None and server_args.ring_degree > 1:
-            requested_distributed_execution.append(
-                f"ring_degree={server_args.ring_degree}"
-            )
-        if (
-            server_args.kv_gather_degree is not None
-            and server_args.kv_gather_degree > 1
-        ):
-            requested_distributed_execution.append(
-                f"kv_gather_degree={server_args.kv_gather_degree}"
-            )
-        if server_args.should_use_fsdp_for_component(component_name):
-            requested_distributed_execution.append("FSDP")
-        if requested_distributed_execution:
-            raise RuntimeError(
-                f"Native Diffusers fallback for transformer component "
-                f"{component_name!r} cannot honor requested distributed execution: "
-                f"{', '.join(requested_distributed_execution)}. Use an SGLang-native "
-                "transformer implementation or set tp_size, sp_degree, "
-                "ulysses_degree, ring_degree, and kv_gather_degree to 1 without "
-                "FSDP."
-            )
 
     def load_customized(
         self,
@@ -263,9 +193,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         component_server_args = _server_args_for_transformer_component(
-            server_args,
-            component_name,
-            self.structural_component_name(component_name),
+            server_args, component_name
         )
 
         # 1. hf config
@@ -278,17 +206,14 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             # A GGUF file holds the whole transformer; the remaining components
             # still load from the base model path.
             safetensors_list = []
-            transformer_override_config_path = None
         else:
-            checkpoint_files = resolve_transformer_checkpoint_files(
+            safetensors_list = resolve_transformer_safetensors_to_load(
                 component_server_args, component_model_path
             )
-            safetensors_list = list(checkpoint_files.safetensors)
-            transformer_override_config_path = checkpoint_files.config_path
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_type = self.structural_component_type(component_name)
+        component_type = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
         if component_type in (
             "transformer",
@@ -308,7 +233,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:
             dit_config.arch_config.checkpoint_uses_diffusers_layout = (
-                cls_name != model_cls.__name__
+                cls_name == "MiniMaxH3Transformer3DModel"
             )
 
         checkpoint_quant_config = None
@@ -324,10 +249,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     safetensors_list
                 )
                 checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers,
-                    safetensors_list,
-                    dit_config.arch_config.param_names_mapping,
-                    dit_config.arch_config.reverse_param_names_mapping,
+                    layer_markers
                 )
                 if adaln_curve_shape is not None:
                     (
@@ -353,8 +275,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             component_name=component_name,
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
-            transformer_override_config_path=transformer_override_config_path,
-            arch_config=dit_config.arch_config,
         )
         if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
@@ -440,29 +360,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
                     "are mutually exclusive"
                 )
-            if dit_config.arch_config.checkpoint_uses_diffusers_layout:
-                # The rebuild reads native tensor names straight from the
-                # shards; on a Diffusers-layout checkpoint it would KeyError
-                # on the first request instead of failing here.
-                raise ValueError(
-                    "--minimax-h3-adaln-online requires the native-layout "
-                    "MiniMax H3 checkpoint (FL2VA/transformer or "
-                    "Ref2VA/transformer), not the Diffusers-layout one"
-                )
             # Keep the weights off-device; the model rebuilds the AdaLN
             # outputs from the checkpoint for each request's timestep plan.
             init_params["adaln_weight_files"] = safetensors_list
             init_params["adaln_plan_width"] = (
                 component_server_args.minimax_h3_adaln_plan_width
-            )
-            init_params["adaln_max_plans"] = (
-                envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
-            )
-            init_params["adaln_host_cache_bytes"] = int(
-                component_server_args.minimax_h3_adaln_host_cache_gb * 1e9
-            )
-            init_params["adaln_precision"] = (
-                "fp32" if envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32 else "match"
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
@@ -510,9 +412,8 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         )
         if direct_gpu_weight_loading:
             logger.warning(
-                "Direct GPU weight loading is enabled for %s; compatible checkpoint "
-                "tensors become model storage, while transformed tensors may still "
-                "require temporary GPU allocations",
+                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
+                "state dict and materialized model weights may coexist on GPU during startup",
                 component_name,
             )
 
@@ -535,14 +436,20 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         # Model construction resolves attention implementations, so apply the
         # quantization-specific default around FSDP initialization and loading.
         with attn_backend_context:
-            model = self.load_state_dict_model(
+            model = maybe_load_fsdp_model(
                 model_cls=model_cls,
                 init_params=init_params,
-                weight_files=safetensors_list,
-                server_args=component_server_args,
-                component_name=component_name,
+                weight_dir_list=safetensors_list,
+                device=local_torch_device,
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
                 component_starts_on_cpu=component_starts_on_cpu,
-                dtype=quant_spec.param_dtype,
+                pin_cpu_memory=component_server_args.pin_cpu_memory,
+                fsdp_inference=use_fsdp,
+                param_dtype=quant_spec.param_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=False,
                 weight_load_plan=weight_load_plan,
                 streaming_state_dict_load=_should_use_streaming_state_dict_load(
                     component_server_args

@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -26,12 +25,7 @@ SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 
 
-def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
-    """Return whether a DSpark checkpoint samples the anchor query row."""
-    return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
-
-
-def draft_is_deepseek_v4() -> bool:
+def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.utils.hf_transformers_utils import get_config
 
@@ -46,6 +40,45 @@ def draft_is_deepseek_v4() -> bool:
         model_config_parser=get_model().model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+
+
+def resolve_single_owner_pp_rank(
+    *, target_layer_ids: List[int], num_hidden_layers: int, pp_size: int
+) -> Optional[int]:
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    if not target_layer_ids:
+        return None
+    for pp_rank in range(pp_size):
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers=num_hidden_layers,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
+        if all(start_layer <= layer_id < end_layer for layer_id in target_layer_ids):
+            return pp_rank
+    return None
+
+
+def use_empty_draft_model_for_pp_prefill(
+    *,
+    disaggregation_mode: str,
+    pp_rank: int,
+    pp_size: int,
+    target_layer_ids: List[int],
+    num_hidden_layers: int,
+) -> bool:
+    owner_pp_rank = resolve_single_owner_pp_rank(
+        target_layer_ids=target_layer_ids,
+        num_hidden_layers=num_hidden_layers,
+        pp_size=pp_size,
+    )
+    return (
+        disaggregation_mode == "prefill"
+        and pp_size > 1
+        and owner_pp_rank == pp_size - 1
+        and pp_rank != owner_pp_rank
+    )
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
@@ -134,8 +167,9 @@ def resolve_runtime_config(
     )
 
 
-def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfig:
-    """Load and normalize the DSpark draft checkpoint configuration.
+def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
+    """Load the draft checkpoint's hf config and read its DSpark gamma
+    (block_size). Raises on config-load failure; callers pick the fallback.
 
     Reads the *resolving* configuration, not the bags: the speculative hook
     calls this from inside resolution, where no bag exists yet -- and the
@@ -143,6 +177,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     resolving = resolved_view(server_args)
@@ -152,11 +187,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
         revision=resolving.speculative_draft_model_revision,
         model_override_args=json.loads(resolving.json_model_override_args),
     )
-    return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
-
-
-def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
-    return read_draft_checkpoint_config(server_args=server_args).resolve_gamma(
+    return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
         default=None
     )
 

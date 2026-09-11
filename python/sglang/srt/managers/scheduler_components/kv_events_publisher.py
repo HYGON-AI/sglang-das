@@ -15,7 +15,6 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
-    is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
@@ -62,7 +61,12 @@ class SchedulerKvEventsPublisher:
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
-        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config, self.ps)
+        self.enable_kv_cache_events = bool(
+            kv_events_config
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(

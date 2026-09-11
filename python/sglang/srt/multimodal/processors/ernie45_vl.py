@@ -145,9 +145,9 @@ def smart_nframes(
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not ("fps" in ele and "nframes" in ele), (
-        "Only accept either `fps` or `nframes`"
-    )
+    assert not (
+        "fps" in ele and "nframes" in ele
+    ), "Only accept either `fps` or `nframes`"
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
@@ -282,13 +282,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         return pixel_values
 
     def process_mm_data(
-        self,
-        input_text,
-        images=None,
-        videos=None,
-        audios=None,
-        processor=None,
-        **kwargs,
+        self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
@@ -302,9 +296,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             if self.video_config:
                 kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
 
-        # Take the worker pool's per-thread clone when it hands one over; falling
-        # back to self._processor would put every worker on one shared object.
-        processor, _ = self._resolve_processor(processor)
+        processor = self._processor
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
@@ -412,7 +404,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             ]
             base_output.videos, _ = map(list, zip(*videos_processed))
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
 
@@ -426,9 +418,9 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
-        assert input_ids.shape[0] == mrope_positions.shape[-1], (
-            "input_ids and mrope_positions should have the same length"
-        )
+        assert (
+            input_ids.shape[0] == mrope_positions.shape[-1]
+        ), "input_ids and mrope_positions should have the same length"
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

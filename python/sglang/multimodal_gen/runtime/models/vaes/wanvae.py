@@ -777,6 +777,7 @@ class WanMidBlock(nn.Module):
 
 
 class WanResidualDownBlock(nn.Module):
+
     def __init__(
         self,
         in_dim,

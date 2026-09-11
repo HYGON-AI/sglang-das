@@ -22,7 +22,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
-    from sglang.srt.speculative.spec_info import SpecInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
 logger = logging.getLogger(__name__)
@@ -71,12 +71,6 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
-    # Padded row width in flattened speculative output. Existing algorithms
-    # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
-    speculative_output_stride: Optional[int] = None
-    # Valid output tokens that are not accepted draft proposals. Existing
-    # algorithms have one bonus token; UNO also emits its clean root.
-    num_non_draft_tokens_per_req: int = 1
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -97,7 +91,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[SpecInput] = None
+    next_draft_input: Optional[EagleDraftInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -123,16 +117,13 @@ class GenerationBatchResult:
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
-    def get_num_generated_tokens(self, batch_size: int) -> int:
-        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
-
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
+        if self.logits_output is not None and return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
                     self.logits_output.next_token_logprobs
@@ -156,11 +147,16 @@ class GenerationBatchResult:
                     _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
+        if (
+            self.logits_output is not None
+            and return_hidden_states
+            and self.logits_output.hidden_states is not None
+        ):
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        if self.next_token_ids is not None:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
@@ -395,7 +391,7 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
+                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 

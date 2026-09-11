@@ -22,9 +22,6 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
-    # DSA kpool-compress tail: one per-request ring row. The indices encode
-    # only the live subrange of that row for the current open pool.
-    DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
@@ -36,6 +33,8 @@ class StateType(str, enum.Enum):
     # KV it describes (whole sequence for full attention, window for SWA).
     BLOCK_SCALE = "block_scale"
     BLOCK_SCALE_SWA = "block_scale_swa"
+    # Target aux hidden rows used to bootstrap decode-side draft KV.
+    PD_HIDDEN = "pd_hidden"
 
 
 @dataclasses.dataclass
@@ -61,6 +60,9 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    # Transfer ABI identifier parallel to state_types. It distinguishes state
+    # layouts that have the same item size but different byte semantics.
+    state_data_formats: List[str]
     state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
@@ -118,8 +120,6 @@ class KVPoll:
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
-    enable_deferred_decode_kv_release: bool = False
-
     @abstractmethod
     def __init__(
         self,
@@ -171,6 +171,18 @@ class BaseKVSender(ABC):
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
+
+    def set_source_event(self, source_event) -> None:
+        del source_event
+
+    def set_pd_hidden_chunk_meta(
+        self,
+        hidden_start: int,
+        row_len: int,
+        is_last_hidden_chunk: bool,
+        release_indices: Optional[List[int]] = None,
+    ) -> None:
+        del hidden_start, row_len, is_last_hidden_chunk, release_indices
 
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
@@ -230,6 +242,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

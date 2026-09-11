@@ -107,6 +107,7 @@ logger = logging.getLogger(__name__)
 
 
 class LongcatFlashDenseDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -283,6 +284,7 @@ class LongcatFlashModelNextN(nn.Module):
 
 
 class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
+
     def __init__(
         self,
         config: LongcatFlashConfig,

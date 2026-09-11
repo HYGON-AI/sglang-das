@@ -24,10 +24,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.arg_groups.model_override_base import (
-    ep_scale_joiner_of,
-    resolving_view,
-)
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
@@ -46,16 +42,13 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
-    derive_attention_widths,
+    configured_attn_cp_size,
+    configured_moe_dp_size,
     get_device,
     get_exec,
     get_flags,
-    get_forward,
     get_parallel,
-    get_resources,
-    get_stream,
 )
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hcu, is_hip
 
@@ -86,7 +79,6 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
-    get_parallel().stamp_derived_widths(attn_dp_size=new_dp_size)
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -101,7 +93,15 @@ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 _is_cpu = is_cpu()
 
 
+@functools.lru_cache(maxsize=1)
+def _dp_use_max_len() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DP_USE_MAX_LEN.get()
+
+
 class DpPaddingMode(IntEnum):
+
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
     # Padding tokens to sum length and then gather tokens using `all_reduce`
@@ -125,11 +125,7 @@ class DpPaddingMode(IntEnum):
         # Force MAX_LEN so all ranks are padded to equal token counts.
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        moe_a2a_backend = get_moe_a2a_backend()
-        if moe_a2a_backend.is_pplx():
-            return DpPaddingMode.MAX_LEN
-
-        if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
+        if get_moe_a2a_backend().is_pplx():
             return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
@@ -156,10 +152,13 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA or _is_hcu:
+        if _USE_ROCM700A_WA:
             return cls.SUM_LEN
-        else:
-            return cls.MAX_LEN
+        # HCU keeps SUM_LEN until the aiter graph all-gather is validated; opt
+        # into MAX_LEN for all-gather plus fused reduce-scatter.
+        if _is_hcu and not _dp_use_max_len():
+            return cls.SUM_LEN
+        return cls.MAX_LEN
 
 
 class _DpGatheredBufferWrapper:
@@ -187,6 +186,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
+        from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         dp.buffer_hidden_size = hidden_size
@@ -210,6 +210,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
@@ -222,26 +223,12 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-
-        dp = get_flags().dp
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
-                dtype=dp.buffer_dtype,
-                device=dp.buffer_device,
-            )
-        return buffer
-
-    @classmethod
-    def get_local_dp_buffer_mhc(
-        cls, group: GroupCoordinator, n: int = 1
-    ) -> torch.Tensor:
         from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, dp.buffer_hidden_size * n),
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
                 dtype=dp.buffer_dtype,
                 device=dp.buffer_device,
             )
@@ -269,16 +256,19 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
+        from sglang.srt.runtime_context import get_flags
 
         return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
+        from sglang.srt.runtime_context import get_flags
 
         return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
+        from sglang.srt.runtime_context import get_flags
 
         return get_flags().dp.buffer_device
 
@@ -309,10 +299,6 @@ def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
 
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
-
-
-def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -347,11 +333,13 @@ def set_is_extend_in_batch(is_extend_in_batch: bool):
     # Sticky within the thread: every ForwardBatch construction writes it,
     # graph runners force False around capture; readers are the EP
     # dispatchers on the same (single) forward thread.
+    from sglang.srt.runtime_context import get_forward
 
     get_forward().set("is_extend_in_batch", is_extend_in_batch)
 
 
 def get_is_extend_in_batch() -> bool:
+    from sglang.srt.runtime_context import get_forward
 
     return get_forward().is_extend_in_batch
 
@@ -363,17 +351,8 @@ def is_dp_max_padding() -> bool:
 def compute_dp_attention_world_info(
     enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
 ):
-    """This rank's place in the attention topology, plus the widths it sits in.
-
-    The widths come from `derive_attention_widths`; what this adds is the two
-    ranks, which are per-process and so are not part of the stamped set.
-    """
-    attn_dp_size, attn_tp_size = derive_attention_widths(
-        tp_size=tp_size,
-        attn_cp_size=attn_cp_size,
-        dp_size=dp_size,
-        enable_dp_attention=enable_dp_attention,
-    )
+    attn_dp_size = dp_size if enable_dp_attention else 1
+    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
     attn_tp_rank = tp_rank % attn_tp_size
 
     if not enable_dp_attention:
@@ -397,26 +376,21 @@ def initialize_dp_attention(
     )
     enable_dp_attention = get_parallel().enable_dp_attention
     dp_size = get_parallel().dp_size
-    attn_cp_size = get_parallel().attn_cp_size
+    attn_cp_size = configured_attn_cp_size()
 
     dp.enabled = enable_dp_attention
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK, _ATTN_DP_SIZE = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    get_parallel().stamp_derived_widths(attn_dp_size=_ATTN_DP_SIZE)
+    _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
-        # Reads the resolution, not a bag: this runs under
-        # `initialize_dp_attention`, which the weight-cache daemon calls from
-        # `_init_distributed` -- and other callers reach it from processes
-        # whose publish is not guaranteed to have happened yet. (The daemon
-        # itself publishes first, at `daemon.py:284`, before `:320`.)
-        if ep_scale_joiner_of(resolving_view(server_args)):
+        if server_args.is_ep_scale_joiner:
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
@@ -446,14 +420,13 @@ def get_attention_dp_size() -> int:
 
 @contextmanager
 def disable_dp_size():
-    """Run without DP attention until this scope ends.
+    """Patch the tp group temporarily until this function ends.
 
-    This is for draft workers of speculative decoding, which run the draft model
-    at a different width from the target model's workers.
+    This method is for draft workers of speculative decoding to run draft model
+    with different tp degree from that of target model workers.
 
-    The scope replaces both the module global that ``get_attention_dp_size()``
-    reads and the derived width the runtime context answers with, so the two
-    spellings of the name cannot disagree inside it.
+    Args:
+        tp_group (GroupCoordinator): the tp group coordinator
     """
     global _ATTN_DP_SIZE
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
@@ -461,8 +434,7 @@ def disable_dp_size():
     old_dp_size = _ATTN_DP_SIZE
     _ATTN_DP_SIZE = 1
     try:
-        with get_parallel().override(attn_dp_size=1):
-            yield
+        yield
     finally:
         _ATTN_DP_SIZE = old_dp_size
 
@@ -554,9 +526,9 @@ def _dp_gather_via_all_reduce(
     if local_tokens.shape[0] > 0 and (
         is_partial or get_attn_tensor_model_parallel_rank() == 0
     ):
-        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
-            "aliasing between global_tokens and local_tokens not allowed"
-        )
+        assert (
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        ), "aliasing between global_tokens and local_tokens not allowed"
 
         memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
@@ -630,6 +602,8 @@ _dp_gather_fp8_bufs: dict = {}
 
 @functools.lru_cache(maxsize=1)
 def _use_dp_gather_fp8() -> bool:
+    from sglang.srt.environ import envs
+
     return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
 
 
@@ -907,11 +881,52 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
-            "aliasing between local_tokens and global_tokens not allowed"
-        )
+        assert (
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
+
+
+def _aiter_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor) -> bool:
+    """HCU-only: run the DP-attention MAX_LEN combine over aiter's custom (IPC)
+    reduce_scatter. Returns True if it handled the op, False to let the caller
+    fall back to `get_tp_group().reduce_scatter_tensor` (RCCL on HCU).
+
+    `GroupCoordinator._maybe_aiter_reduce_scatter` deliberately excludes HCU
+    (`and not _is_hcu`) as a historical precision guard, so the generic path sends
+    HCU to RCCL and misses the aiter IPC kernel. This narrow wrapper re-enables the
+    aiter kernel ONLY for the HCU DP-attention combine under MAX_LEN, leaving every
+    other reduce_scatter_tensor caller on HCU untouched. Mirrors the upstream 0518
+    `_aiter_reduce_scatter_tensor`, plus our should_custom_ar / equal-chunk guards.
+
+    Opt-in: needs SGLANG_DP_USE_MAX_LEN=1 (this wrapper) AND SGLANG_USE_AITER_AR=1
+    (so ca_comm is the aiter CustomAllreduce that actually has reduce_scatter).
+    registered=False is forced: HCU's registered graph-replay path corrupts output
+    (same root cause as all_gather_reg; see merge notes §7).
+    """
+    if not (_is_hcu and _dp_use_max_len()):
+        return False
+    # aiter custom comm only supports fp16/bf16/fp32.
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if output.dtype != input.dtype:
+        return False
+    if not (input.is_contiguous() and output.is_contiguous()):
+        return False
+    ca = getattr(get_tp_group(), "ca_comm", None)
+    if ca is None or getattr(ca, "disabled", True):
+        return False
+    if not (hasattr(ca, "reduce_scatter") and hasattr(ca, "should_custom_ar")):
+        return False
+    # should_custom_ar bounds the pre-reduce buffer size and validates topology.
+    if not ca.should_custom_ar(input):
+        return False
+    # Equal-chunk only: the global buffer must split evenly into per-rank output.
+    if input.shape[0] != output.shape[0] * get_tensor_model_parallel_world_size():
+        return False
+    ca.reduce_scatter(input, output, registered=False)
+    return True
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -924,6 +939,8 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
             return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+        if _aiter_reduce_scatter_tensor(output, input):
+            return
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(
@@ -946,6 +963,7 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
+    from sglang.srt.runtime_context import get_stream
 
     return get_stream("dp_tbo_comm")
 
@@ -957,6 +975,7 @@ def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
 # ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
 # and just re-record it (mirrors the mori CommStreamPool event reuse).
 def _tbo_event(key) -> torch.cuda.Event:
+    from sglang.srt.runtime_context import get_resources
 
     pool = get_resources().tbo_event_pool
     ev = pool.get(key)
@@ -1052,6 +1071,24 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
 
+def attn_cp_all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    output_split_sizes: Optional[List[int]] = None,
+    input_split_sizes: Optional[List[int]] = None,
+):
+    """All-to-all over dim 0 within the attention CP group (variable splits ok).
+
+    Used by the DSV4 compressor RLC path to repartition round-robin-scattered
+    tokens into per-rank contiguous blocks.
+    """
+    return get_attn_cp_group().all_to_all_single(
+        output,
+        input,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+    )
+
 
 def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
@@ -1077,10 +1114,12 @@ def get_moe_cp_size() -> int:
 def is_enable_moe_cp_allgather() -> bool:
     """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE.
 
-    In that configuration ``initialize_model_parallel`` aliases ``_MOE_DP`` to
-    ``_ATTN_CP``, so the two groups report equal widths.
+    Reads the configured sizes, not the live groups: that very configuration makes
+    ``initialize_model_parallel`` alias ``_MOE_DP`` to ``_ATTN_CP``
+    (``parallel_state.py``), so the live sizes are equal and the comparison would
+    always be false.
     """
-    return get_parallel().attn_cp_size > get_parallel().moe_dp_size
+    return configured_attn_cp_size() > configured_moe_dp_size()
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

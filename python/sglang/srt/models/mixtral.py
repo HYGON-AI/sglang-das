@@ -336,6 +336,7 @@ class MixtralModel(nn.Module):
 
 
 class MixtralForCausalLM(nn.Module):
+
     def __init__(
         self,
         config: MixtralConfig,

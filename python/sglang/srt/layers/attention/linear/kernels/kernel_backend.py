@@ -11,7 +11,6 @@ class LinearAttnKernelBase(ABC):
     """
 
     uses_state_checkpoints: bool = False
-    supports_fused_chain_verify: bool = False
 
     @abstractmethod
     def decode(

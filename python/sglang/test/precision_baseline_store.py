@@ -40,7 +40,6 @@ def _store_token() -> Optional[str]:
 class HfStoreConfig:
     repo: str
     revision: str = "main"
-    read_only: bool = False
 
     @classmethod
     def from_env(cls) -> HfStoreConfig:
@@ -52,8 +51,7 @@ class HfStoreConfig:
                 "and SGLANG_PRECISION_HF_TOKEN."
             )
         revision = os.environ.get("SGLANG_PRECISION_HF_REVISION", "main")
-        read_only = os.environ.get("SGLANG_PRECISION_HF_READ_ONLY", "0") == "1"
-        return cls(repo=repo, revision=revision, read_only=read_only)
+        return cls(repo=repo, revision=revision)
 
 
 def _sanitize_model_name(model: str) -> str:
@@ -152,7 +150,6 @@ def fetch_latest_baseline(
         rows, model=model, capture_signature=capture_signature
     )
     if run_path is None:
-        shutil.rmtree(target_tensors_dir, ignore_errors=True)
         return None
 
     snapshot_root = _with_retries(
@@ -167,15 +164,12 @@ def fetch_latest_baseline(
     )
     src = Path(snapshot_root) / run_path / "tensors"
     if not src.exists():
-        shutil.rmtree(target_tensors_dir, ignore_errors=True)
         return None
 
-    target_tensors_dir.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=target_tensors_dir.parent) as staging_root:
-        staged_tensors = Path(staging_root) / "tensors"
-        shutil.copytree(src, staged_tensors)
-        shutil.rmtree(target_tensors_dir, ignore_errors=True)
-        staged_tensors.rename(target_tensors_dir)
+    target_tensors_dir.mkdir(parents=True, exist_ok=True)
+    for fp in src.iterdir():
+        if fp.is_file():
+            shutil.copy2(fp, target_tensors_dir / fp.name)
     return run_path
 
 
@@ -230,9 +224,6 @@ def push_run(
     comparator_report: Optional[Path] = None,
     force: bool = False,
 ) -> str:
-    if config.read_only:
-        raise PermissionError("precision baseline store is read-only")
-
     # Dedup: same model+date+sha → skip tensor upload but still refresh meta
     # + comparator_report + append a new manifest row, so pass-1 baseline and
     # pass-2 stats both land. force=True re-uploads tensors too.

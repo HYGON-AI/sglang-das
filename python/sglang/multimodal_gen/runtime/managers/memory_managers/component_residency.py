@@ -82,7 +82,8 @@ def normalize_component_residency(
     for raw_selector, raw_mode in entries:
         if not isinstance(raw_selector, str) or not isinstance(raw_mode, str):
             raise ComponentResidencyError(
-                f"Invalid component residency assignment: {raw_selector!r}={raw_mode!r}"
+                "Invalid component residency assignment: "
+                f"{raw_selector!r}={raw_mode!r}"
             )
         selector = raw_selector.strip().replace("-", "_").lower()
         mode = raw_mode.strip().replace("_", "-").lower()
@@ -148,7 +149,8 @@ def resolve_diffusers_pipeline_offload(
         return None
     if LAYERWISE_OFFLOAD in assignments.values():
         raise ComponentResidencyError(
-            "--component-residency layerwise-offload requires the native SGLang backend"
+            "--component-residency layerwise-offload requires the native SGLang "
+            "backend"
         )
 
     pipeline_mode = assignments.get(LAYERWISE_OFFLOAD_ALL_COMPONENTS)
