@@ -45,7 +45,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
-    load_mimo_v2_qkv_proj_weight_v2,
+    load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -311,7 +311,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight_v2(
+                    load_mimo_v2_qkv_proj_weight(
                         name,
                         param,
                         loaded_weight,
