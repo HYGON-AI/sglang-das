@@ -924,12 +924,17 @@ class UnifiedRadixCacheSuite:
             key=key_2p,
             value=value_2p[: len(key_2p)],
             prev_prefix_len=0,
+            track_adopted_ranges=True,
         )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_1p))
+        self.assertEqual(
+            result.adopted_ranges[ComponentType.FULL],
+            [(len(seq_1p), len(seq_2p))],
+        )
         self.assertEqual(
             allocator.available_size(),
             initial_avail - len(seq_1p) - (len(seq_2p) - len(seq_1p)),
@@ -943,12 +948,17 @@ class UnifiedRadixCacheSuite:
             key=key_3p,
             value=value_3p[: len(key_3p)],
             prev_prefix_len=len(seq_2p),
+            track_adopted_ranges=True,
         )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         result = cache.insert(params)
         self.assertEqual(result.prefix_len, len(seq_2p))
+        self.assertEqual(
+            result.adopted_ranges[ComponentType.FULL],
+            [(len(seq_2p), len(seq_3p))],
+        )
         # alloc(3p), freed 0 (prev_prefix_len covers entire overlap), stored 1p new → net -3p
         self.assertEqual(allocator.available_size(), avail_before - len(seq_3p))
         cache.sanity_check()
@@ -7664,6 +7674,264 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
         self.assertTrue(
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
+        )
+
+
+class TestAnchorLockOutcomePolicy(CustomTestCase):
+    """try_lock_anchor finds the anchor by re-matching the live tree (no
+    carried node id to go stale): prefix intact -> lock the live node;
+    prefix shrunk -> anchor_lost so the caller cancels the storage IO
+    instead of gambling the read; cap_skip over budget (checked before the
+    match walk)."""
+
+    _REQ = "req-1"
+    _PREFIX = list(range(100, 100 + 8))
+
+    def _make_pipeline(self, cache, cap_tokens=10_000):
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline.anchor_locks = {}
+        pipeline.anchor_locked_tokens_ = 0
+        pipeline.anchor_lock_cap_tokens = cap_tokens
+        pipeline._anchor_lock_cap_skips = 0
+        pipeline._prefetch_prefix_ctx = {self._REQ: (list(self._PREFIX), None, None)}
+        pipeline._cache = cache
+        return pipeline
+
+    def _make_cache(self, live_match_len):
+        from types import SimpleNamespace
+
+        cache = mock.MagicMock()
+        cache.tree_core.is_eagle = False
+        cache.match_prefix.return_value = SimpleNamespace(
+            device_indices=list(range(live_match_len)), last_device_node=99
+        )
+        return cache
+
+    def test_intact_prefix_locks_live_node(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX))
+        pipeline = self._make_pipeline(cache)
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "locked")
+        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, 99)
+        self.assertEqual(pipeline.anchor_locked_tokens_, len(self._PREFIX))
+
+    def test_shrunk_prefix_reports_anchor_lost(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX) - 2)
+        pipeline = self._make_pipeline(cache)
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "anchor_lost")
+        self.assertEqual(pipeline.anchor_locks, {})
+        self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+
+    def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._storage_prefetch_missed_rids = set()
+        cache._finish_storage_prefetch = mock.Mock()
+        cache.revoke_pending_prefetch = mock.Mock()
+
+        cache._handle_storage_prefetch_anchor_loss(self._REQ)
+
+        cache._finish_storage_prefetch.assert_called_once_with(
+            self._REQ, fulfilled_tokens=0, reason="shrunk"
+        )
+        self.assertIn(self._REQ, cache._storage_prefetch_missed_rids)
+        cache.revoke_pending_prefetch.assert_called_once_with(self._REQ)
+
+    def test_over_cap_reports_cap_skip_before_matching(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX))
+        pipeline = self._make_pipeline(cache, cap_tokens=len(self._PREFIX) - 1)
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "cap_skip")
+        self.assertEqual(pipeline.anchor_locks, {})
+        cache.match_prefix.assert_not_called()
+
+    def test_root_anchor_reports_no_anchor(self):
+        cache = self._make_cache(live_match_len=0)
+        pipeline = self._make_pipeline(cache)
+        pipeline._prefetch_prefix_ctx[self._REQ] = ([], None, None)
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "no_anchor")
+        cache.match_prefix.assert_not_called()
+
+    def test_already_locked_is_idempotent(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX))
+        pipeline = self._make_pipeline(cache)
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "locked")
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "locked")
+        self.assertEqual(pipeline.anchor_locked_tokens_, len(self._PREFIX))
+        cache.match_prefix.assert_called_once()
+
+
+class _StubLinkerBackend:
+    """The linker surface the failed-chain reclaim touches, and nothing else.
+
+    The store probe is not what is under test here: what is under test is what
+    the tree does once a load's chain has to come back out of it.
+    """
+
+    def __init__(self):
+        self.failed_chains = {}
+
+    def take_failed_chain(self, rid):
+        return self.failed_chains.pop(rid, [])
+
+    def match(self, key, req, result):
+        return result
+
+    def has_hit(self, rid):
+        return False
+
+    def release_request(self, rid):
+        pass
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestFailedLinkerChainWithASecondOwner(CustomTestCase):
+    """A failed load's chain, held by a request that issued no load.
+
+    The chain is published into the tree before the transfer is verified, so a
+    request arriving while the load is in flight matches it and is repointed
+    onto exactly those pages. When the load then fails the chain is cut out of
+    the tree, and the loading request's reclaim finds it still locked.
+
+    Giving up there costs two things, and this pins both:
+
+      - the chain is never freed, because a locked node is not a device leaf,
+        so the eviction it was left to skips it for as long as the other owner
+        holds it;
+      - the other owner's next ``cache_unfinished_req`` inserts its own
+        ``req_to_token`` prefix, which *is* the chain's pages, under a fresh
+        node -- one set of pages on two nodes, which is the pool-accounting
+        leak the strict idle check turns into a crash.
+    """
+
+    CHAIN = 12
+    TAIL = 4
+
+    def _skip_external_load_recovery_on_rust(self) -> None:
+        # detach_external_load_chain and the reclaim it feeds read the Python
+        # core's node arena directly; the Rust core inherits the interface's
+        # raising defaults instead.
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("external-linker load-failure recovery is Python-core only")
+
+    def _fixture(self):
+        return build_fixture(
+            CacheConfig(
+                page_size=1,
+                kv_size=256,
+                max_context_len=512,
+                components=(ComponentType.FULL, ComponentType.SWA),
+                sliding_window_size=4,
+            )
+        )
+
+    def _accounting(self, cache, allocator):
+        return (
+            allocator.full_available_size()
+            + cache.full_evictable_size()
+            + cache.full_protected_size()
+        )
+
+    def _publish_chain_and_a_second_owner(self, cache, allocator, req_to_token_pool):
+        """Run the load, hand its chain a second owner, then fail the load."""
+        chain_tokens = list(range(100, 100 + self.CHAIN))
+        insert_result = cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", chain_tokens)),
+                value=allocator.alloc(self.CHAIN),
+                prev_prefix_len=0,
+                chunked=True,
+            )
+        )
+        endpoint = insert_result.last_device_node
+        loader_lock = cache.inc_lock_ref(endpoint)
+
+        other = Req(
+            rid="other",
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([other])
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", chain_tokens)))
+        )
+        self.assertEqual(len(match.device_indices), self.CHAIN)
+        other_lock = cache.inc_lock_ref(match.last_device_node)
+        other.prefix_indices = match.device_indices
+        other.last_node = match.last_device_node
+        other.kv.cache_protected_len = self.CHAIN
+        other.swa_uuid_for_lock = other_lock.swa_uuid_for_lock
+        other.extra_key = None
+
+        # Its own next chunk, computed the ordinary way.
+        tokens = chain_tokens + list(range(900, 900 + self.TAIL))
+        req_to_token_pool.write(
+            (other.kv.req_pool_idx, slice(0, self.CHAIN)), match.device_indices
+        )
+        tail_pages = allocator.alloc(self.TAIL)
+        req_to_token_pool.write(
+            (other.kv.req_pool_idx, slice(self.CHAIN, self.CHAIN + self.TAIL)),
+            tail_pages,
+        )
+        other.origin_input_ids = array("q", tokens)
+        other.output_ids = array("q")
+        other.full_untruncated_fill_ids = array("q", tokens)
+        other.set_extend_range(self.CHAIN, len(tokens))
+        other.kv.kv_committed_len = len(tokens)
+
+        cache.linker = _StubLinkerBackend()
+        chain = cache.tree_core.detach_external_load_chain(
+            endpoint, cache.tree_core.root_node.id
+        )
+        cache.linker.failed_chains["loader"] = list(chain)
+
+        # The loading request aborts: it drops its lock, then reclaims.
+        cache.dec_lock_ref(endpoint, loader_lock.to_dec_params())
+        cache._reclaim_failed_linker_chain("loader")
+        return other, other_lock, chain, tail_pages
+
+    def test_the_second_owner_is_visible_as_holding_the_failed_chain(self):
+        self._skip_external_load_recovery_on_rust()
+        cache, allocator, req_to_token_pool = self._fixture()
+        other, _lock, _chain, _tail = self._publish_chain_and_a_second_owner(
+            cache, allocator, req_to_token_pool
+        )
+
+        self.assertTrue(cache.has_outstanding_failed_linker_chains())
+        self.assertTrue(
+            cache.is_on_failed_linker_chain(other.last_node),
+            "a request holding a failed load's pages was not visible as one, so "
+            "the scheduler would serve it KV that never arrived",
+        )
+
+    def test_the_chain_is_freed_when_its_last_owner_releases(self):
+        self._skip_external_load_recovery_on_rust()
+        cache, allocator, req_to_token_pool = self._fixture()
+        total = self._accounting(cache, allocator)
+        other, lock, chain, tail_pages = self._publish_chain_and_a_second_owner(
+            cache, allocator, req_to_token_pool
+        )
+
+        # The loading request could not free it -- someone else still held it.
+        self.assertTrue(any(cache.tree_core.holds_detached_node(n) for n in chain))
+
+        # The other owner, aborted by the sweep, inserts nothing: it frees the
+        # tail it computed for itself, drops its lock, and runs the same
+        # reclaim on its way out -- cache_finished_req with is_insert=False.
+        allocator.free(tail_pages)
+        cache.dec_lock_ref(other.last_node, lock.to_dec_params())
+        cache._reclaim_failed_linker_chain(other.rid)
+
+        self.assertFalse(
+            [n for n in chain if cache.tree_core.holds_detached_node(n)],
+            "the chain outlived every owner, holding device slots no eviction "
+            "can reach and no request can match",
+        )
+        self.assertEqual(
+            self._accounting(cache, allocator),
+            total,
+            "available + evictable + protected no longer sums to the pool",
         )
 
 
