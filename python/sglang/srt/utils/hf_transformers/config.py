@@ -26,6 +26,7 @@ from sglang.srt.configs.deepseek_v41 import (
     DeepseekV41Config,
     normalize_deepseek_v41_config,
 )
+from sglang.srt.configs.dspark import normalize_dspark_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -142,6 +143,17 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
         residual_in_fp32=config_dict.get("residual_in_fp32", True),
         architectures=["MambaForCausalLM"],
     )
+def _try_load_dspark_config(model, revision: Optional[str], **kwargs):
+    raw_config, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    config_dict = normalize_dspark_config(raw_config)
+    if config_dict is None:
+        return None
+    model_type = config_dict.pop("model_type")
+    config = AutoConfig.for_model(model_type, **config_dict)
+    config._name_or_path = str(model)
+    return config
 
 
 @register_model_config_parser("hf")
@@ -153,7 +165,9 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_dspark_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
