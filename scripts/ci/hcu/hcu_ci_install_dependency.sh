@@ -44,7 +44,7 @@ import importlib
 import sys
 
 print(f"python {sys.version.split()[0]}")
-for name in ["sglang", "torch", "pytest", "tabulate", "sgl_kernel", "kernels", "tvm_ffi"]:
+for name in ["sglang", "torch", "pytest", "tabulate", "llguidance", "sgl_kernel", "kernels", "tvm_ffi"]:
     try:
         module = importlib.import_module(name)
         version = getattr(module, "__version__", "unknown")
@@ -71,6 +71,16 @@ install_with_retry() {
   done
 }
 
+install_required_test_dependencies() {
+  # Wheel mode deliberately skips project dependencies. Keep the constrained
+  # decoding dependency aligned with this release branch's pyproject range.
+  echo "[hcu-ci] Ensuring a branch-compatible llguidance is available"
+  install_with_retry docker exec "${CONTAINER}" \
+    python3 -m pip install --cache-dir=/sgl-data/pip-cache --no-deps "llguidance>=0.7.11,<0.8.0"
+  docker exec "${CONTAINER}" python3 -c \
+    'import importlib.metadata; from packaging.version import Version; version = Version(importlib.metadata.version("llguidance")); assert Version("0.7.11") <= version < Version("0.8.0")'
+}
+
 if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_COMPAT_INSTALL=${SKIP_COMPAT_INSTALL}; skipping HCU compatibility pins"
 else
@@ -92,6 +102,7 @@ fi
 
 if [[ "${SKIP_DEPENDENCY_INSTALL}" == "1" || "${SKIP_DEPENDENCY_INSTALL}" == "true" ]]; then
   echo "[hcu-ci] HCU_CI_SKIP_DEPENDENCY_INSTALL=${SKIP_DEPENDENCY_INSTALL}; skipping regular dependency installation"
+  install_required_test_dependencies
   print_python_status
   exit 0
 fi
@@ -133,4 +144,5 @@ fi
 
 echo "[hcu-ci] Installed sglang version:"
 run_in_container "python -c 'import sglang, sys; print(sglang.__version__); sys.exit(0)' || true"
+install_required_test_dependencies
 print_python_status
