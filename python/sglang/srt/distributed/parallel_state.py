@@ -1153,6 +1153,9 @@ class GroupCoordinator:
         # generic RCCL kernel for the small, latency-bound decode collective.
         # Gated by SGLANG_DP_USE_REDUCE_SCATTER. Falls back (returns False)
         # for HCU, non-ROCm, or unsupported shape/size/topology so the caller uses RCCL.
+        # HCU stays excluded here on purpose; the DP-attention MAX_LEN combine
+        # re-enables the aiter IPC kernel narrowly in dp_attention.py's
+        # `_aiter_reduce_scatter_tensor` so no other reduce_scatter caller is affected.
         if not (
             is_hip()
             and not _is_hcu
@@ -1315,7 +1318,7 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    if _is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)

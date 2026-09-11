@@ -647,6 +647,15 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
+    # Compact DSPARK exports name the same ordered target-layer selection
+    # aux_hidden_state_layer_ids. Never replace it with evenly spaced layers.
+    aux_layer_ids = _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None)
+    if aux_layer_ids is not None:
+        if layer_ids is not None and layer_ids != aux_layer_ids:
+            raise ValueError(
+                "Conflicting target_layer_ids and aux_hidden_state_layer_ids."
+            )
+        layer_ids = aux_layer_ids
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:
         parsed_target_layer_ids = None
