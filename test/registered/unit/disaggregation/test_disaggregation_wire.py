@@ -338,6 +338,22 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+    def test_metadata_buffer_carries_mooncake_source_breakdown(self):
+        req = self._make_req(None)
+        req.cached_tokens = 64000
+        req.cached_tokens_storage = 64000
+        req.cached_tokens_storage_source = "mooncake_dfs"
+        req.cached_tokens_by_source = {}
+
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+        )
+        buffers.set_buf(req)
+
+        self.assertEqual(buffers.cached_tokens[0, 7:10].tolist(), [0, 64000, 0])
+
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),

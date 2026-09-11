@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.entrypoints.openai.protocol import (
+    CacheHitRates,
     CachedTokensDetails,
     ChatCompletionRequest,
     CompletionRequest,
@@ -135,6 +136,26 @@ def cached_tokens_details_from_dict(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def cache_hit_rates_from_dict(details: Dict[str, Any]) -> CacheHitRates:
+    """Convert raw request cache-hit metrics to the OpenAI response model."""
+    return CacheHitRates(**details)
+
+
+def process_cache_hit_rates_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[CacheHitRates]:
+    if not getattr(request, "return_cache_hit_rates", False):
+        return None
+    details = ret_item["meta_info"].get("cache_hit_rates")
+    if details is None:
+        return None
+    return cache_hit_rates_from_dict(details)
 
 
 def process_cached_tokens_details_from_ret(

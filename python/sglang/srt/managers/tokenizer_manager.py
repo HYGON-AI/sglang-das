@@ -2254,6 +2254,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                if (
+                    hasattr(recv_obj, "cache_hit_rates")
+                    and recv_obj.cache_hit_rates
+                ):
+                    meta_info["cache_hit_rates"] = recv_obj.cache_hit_rates[i]
                 if customized_info is not None:
                     self.update_request_meta_info(
                         meta_info,
