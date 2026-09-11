@@ -76,7 +76,8 @@ jobs:
           INPUT_REF: ${{ inputs.ref || '' }}
           INPUT_JOB_FILTER: ${{ inputs.job_filter || 'all' }}
           VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
-          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE_0518 || '' }}
+          DEFAULT_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
         run: |
@@ -86,7 +87,7 @@ jobs:
             echo "Routing validation runner label hcu-ci-pr to hcu-ci-pr-2 for nmz4 test runner."
             runner_label="hcu-ci-pr-2"
           fi
-          image="${INPUT_IMAGE:-${VAR_IMAGE}}"
+          image="${INPUT_IMAGE:-${VAR_IMAGE:-${DEFAULT_IMAGE}}}"
           target_ref="${INPUT_REF:-${GITHUB_SHA_VALUE}}"
           continue_on_error="${CONTINUE_ON_ERROR:-true}"
           job_filter="${INPUT_JOB_FILTER:-all}"
@@ -109,7 +110,7 @@ jobs:
           fi
 
           if [[ -z "${image}" ]]; then
-            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE or workflow input image."
+            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE_0518 or workflow input image."
             exit 1
           fi
 
