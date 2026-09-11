@@ -62,6 +62,7 @@ static_assert(sizeof(GlobalMetadata) == 2 * sizeof(int32_t) && sizeof(PlanItem) 
 struct PageTransform {
   const int32_t* __restrict__ page_table;
   uint32_t page_bits;
+  int32_t* __restrict__ raw_out;  // the row's raw output, written in DUAL_OUTPUT only
 
   SGL_DEVICE int32_t page_to_indices(uint32_t i) const {
     const uint32_t mask = (1u << page_bits) - 1u;
@@ -295,7 +296,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
         device::PDLWaitPrimary<kPDLFinal>();
         problem.out = params.get_output_ptr(bx);  // in-place transform
         device::PDLTriggerSecondary<kPDL>();
-        return paged_transform(problem, problem.out, params.get_transform(bx));
+        return paged_transform<kMode>(problem, problem.out, params.get_transform(bx));
       } else {
         return device::PDLTriggerSecondary<kPDL>();
       }
@@ -379,7 +380,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
       cluster.sync();
       if (by != 0) return;
       problem.out = s_topk_indices;
-      return paged_transform(problem, params.get_output_ptr(bx), params.get_transform(bx));
+      return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
     } else {
       return device::PDLTriggerSecondary<kPDL>();
     }
@@ -576,6 +577,17 @@ struct TopKKernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(metadata);
+    // Present means "both outputs": `page_indices` receives the page-table
+    // transform and `raw_indices` the selected raw indices, same -1 padding.
+    int32_t* raw_indices_ptr = nullptr;
+    if (raw_indices.has_value()) {
+      RuntimeCheck(page_table.has_value(), "raw_indices requires a page table");
+      TensorMatcher({B, K})  // raw_indices
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(raw_indices.value());
+      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
+    }
 
     int32_t* raw_indices_ptr = nullptr;
     if (raw_indices.has_value()) {
@@ -631,7 +643,9 @@ struct TopKKernel {
                       : page_table.has_value() ? TopKMode::PAGE_TABLE
                                                : TopKMode::INDICES;
     const auto dispatch = [&]<typename F>(F&& f) {
-      const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
+      const auto mode = raw_indices.has_value()  ? TopKMode::DUAL_OUTPUT
+                        : page_table.has_value() ? TopKMode::PAGE_TABLE
+                                                 : TopKMode::INDICES;
       switch (mode) {
         case TopKMode::INDICES:
           return f.template operator()<TopKMode::INDICES>();
@@ -639,6 +653,8 @@ struct TopKKernel {
           return f.template operator()<TopKMode::DUAL_OUTPUT>();
         default:
           return f.template operator()<TopKMode::PAGE_TABLE>();
+        case TopKMode::DUAL_OUTPUT:
+          return f.template operator()<TopKMode::DUAL_OUTPUT>();
         default:
           Panic("Invalid mode, this path should be unreachable");
       }
