@@ -23,6 +23,8 @@ from flash_attn import (
     vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
 )
 
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -468,6 +470,8 @@ def vllm_flash_attn_varlen_func(
     # without changing their bottom-right causal alignment or the KV cache.
     if (
         _is_hcu
+        and envs.SGLANG_USE_QWEN_DSPARK.get()
+        and get_spec().speculative_algorithm == "DSPARK"
         and layout == "legacy_bhsd"
         and k.shape[2] == 64
         and q.shape[2] == v.shape[2]

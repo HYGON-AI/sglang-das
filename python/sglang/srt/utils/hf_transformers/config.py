@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config_parser_registry import (
     register_model_config_parser,
 )
 from sglang.srt.connector import create_remote_connector
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
 from ..hf_transformers_patches import _ensure_gguf_version
@@ -101,6 +102,8 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
 
 
 def _try_load_dspark_config(model, revision: Optional[str], **kwargs):
+    if not envs.SGLANG_USE_QWEN_DSPARK.get():
+        return None
     raw_config, _ = PretrainedConfig.get_config_dict(
         model, revision=revision, **kwargs
     )
