@@ -168,9 +168,9 @@ def is_deepseek_v4(config) -> bool:
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # Only DSV4 carries the hc-flattened stream across the target->draft
+    # DSV4 and Qwen4Exp carry the hc-flattened stream across the target->draft
     # boundary; HYV4 collapses to hidden_size before its MTP layer.
-    if hc_mult <= 1 or not is_deepseek_v4(hf_config):
+    if hc_mult <= 1 or is_hy_v4(hf_config):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size
@@ -768,6 +768,24 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+        ):
+            # The target's ModelConfig shares this hf_config object; deep-copy
+            # before the MTP rewrites below so the target keeps its full depth.
+            self.hf_config = copy.deepcopy(self.hf_config)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
+            self.hf_config.architectures[0] = "Qwen4ExpForCausalLMMTP"
+            text_config = self.hf_text_config
+            text_config.num_nextn_predict_layers = 1
+            # Collapse to a single full_attention layer so the draft's
+            # full_attention_layer_ids is [0]. Qwen4ExpTextConfig.layers_block_type
+            # bypasses num_hidden_layers when layer_types is set.
+            text_config.num_hidden_layers = 1
+            text_config.layer_types = ["full_attention"]
+            text_config.full_attention_interval = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.hf_config.architectures[0] = "Qwen3MoeForCausalLMMTP"
