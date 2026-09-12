@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.unified_cache_linker import ExternalLinkerLoadError
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1149,7 +1150,12 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                try:
+                    result = self.run_batch(batch)
+                except ExternalLinkerLoadError as error:
+                    self._abort_external_linker_failed_batch(batch, error)
+                    self.last_batch = None
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
@@ -1188,7 +1194,17 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
+                try:
+                    batch_result = self.run_batch(batch)
+                except ExternalLinkerLoadError as error:
+                    # The previous result can share Req objects with this batch.
+                    # Resolve it before the failed batch releases request/KV slots.
+                    while self.result_queue:
+                        tmp_batch, tmp_result = self.result_queue.popleft()
+                        self.process_batch_result(tmp_batch, tmp_result)
+                    self._abort_external_linker_failed_batch(batch, error)
+                    self.last_batch = None
+                    continue
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -2161,6 +2177,8 @@ class SchedulerDisaggregationPrefillMixin:
             # the last chunk. Payload builders stay on the release's newer
             # _full_kv_pages_payload (MINIMAX_INDEX_K included: index rows live
             # at the same loc as main KV on the same page_size).
+            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
+            # as main KV on the same page_size.
             payloads = {StateType.PD_HIDDEN: _pd_hidden_payload}
             if last_chunk:
                 payloads.update(

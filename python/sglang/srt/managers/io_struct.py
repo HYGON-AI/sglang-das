@@ -1357,6 +1357,7 @@ TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 CachedTokensDetails = Dict[str, Union[int, str]]
+CacheHitRates = Dict[str, Union[int, float]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
@@ -1462,6 +1463,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     customized_info: Optional[PickleWrapper] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
+    # Per-request cache hit counts and rates by L1/L3/L4 source.
+    cache_hit_rates: Optional[List[Optional[CacheHitRates]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
@@ -1553,6 +1556,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     customized_info: Optional[PickleWrapper] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
+    # Per-request cache hit counts and rates by L1/L3/L4 source.
+    cache_hit_rates: Optional[List[Optional[CacheHitRates]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
@@ -1598,6 +1603,8 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     retraction_counts: Optional[List[int]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
+    # Per-request cache hit counts and rates by L1/L3/L4 source.
+    cache_hit_rates: Optional[List[Optional[CacheHitRates]]] = None
 
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]

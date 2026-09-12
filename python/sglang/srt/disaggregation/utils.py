@@ -34,6 +34,13 @@ from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
+# Slots 7-9 in the cached_tokens metadata buffer carry the source breakdown.
+CACHED_TOKENS_SOURCE_SLOTS = {
+    "l3_mooncake_memory": 7,
+    "l4_mooncake_dfs": 8,
+    "l4_mooncake_local_disk": 9,
+}
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
     from sglang.srt.disaggregation.common.conn import (
@@ -731,13 +738,41 @@ class MetadataBuffers:
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # counts, slots 4-6 hold multimodal prompt token counts, and slots 7-9
+        # carry the Mooncake source breakdown. This avoids adding new RDMA
+        # buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio
+        # 6=video 7=mooncake_memory 8=mooncake_dfs 9=local_disk.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+
+        source_counts = dict(getattr(req, "cached_tokens_by_source", {}) or {})
+        if (
+            sum(
+                max(0, int(source_counts.get(source, 0)))
+                for source in CACHED_TOKENS_SOURCE_SLOTS
+            )
+            == 0
+            and int(getattr(req, "cached_tokens_storage", 0)) > 0
+        ):
+            storage_source = (
+                str(getattr(req, "cached_tokens_storage_source", "") or "").lower()
+            )
+            if storage_source.endswith("_memory") or storage_source == "memory":
+                source_counts["l3_mooncake_memory"] = req.cached_tokens_storage
+            elif storage_source.endswith("_dfs") or storage_source == "dfs":
+                source_counts["l4_mooncake_dfs"] = req.cached_tokens_storage
+            elif (
+                storage_source.endswith("_local_disk")
+                or storage_source in {"local_disk", "localdisk"}
+            ):
+                source_counts["l4_mooncake_local_disk"] = req.cached_tokens_storage
+        for source, slot in CACHED_TOKENS_SOURCE_SLOTS.items():
+            self.cached_tokens[req.metadata_buffer_index][slot] = max(
+                0, int(source_counts.get(source, 0))
+            )
 
         # Compute multimodal prompt token counts on the prefill node so decode
         # can report them in usage.

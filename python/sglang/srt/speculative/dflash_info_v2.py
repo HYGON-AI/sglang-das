@@ -261,6 +261,30 @@ class DFlashDraftInputV2(SpecInput):
                 new_indices
             ]
 
+        if (
+            self.prefill_tail_hidden_states is not None
+            and self.prefill_tail_hidden_states.numel() > 0
+        ):
+            lengths = self.prefill_tail_valid_mask.to(torch.int64)
+            selected = torch.zeros(
+                lengths.shape[0], dtype=torch.bool, device=lengths.device
+            )
+            selected[new_indices] = True
+            row_mask = torch.repeat_interleave(selected, lengths)
+            self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[row_mask]
+        if (
+            self.prefill_tail_valid_mask is not None
+            and self.prefill_tail_valid_mask.numel() > 0
+        ):
+            self.prefill_tail_valid_mask = self.prefill_tail_valid_mask[new_indices]
+        if (
+            self.prefill_tail_start_positions is not None
+            and self.prefill_tail_start_positions.numel() > 0
+        ):
+            self.prefill_tail_start_positions = self.prefill_tail_start_positions[
+                new_indices
+            ]
+
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return

@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import (
+    CACHED_TOKENS_SOURCE_SLOTS,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -3054,6 +3055,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        decode_req.req.cached_tokens_by_source = {
+            "l1_device": cached_tokens[1].item(),
+            **{
+                source: cached_tokens[slot].item()
+                for source, slot in CACHED_TOKENS_SOURCE_SLOTS.items()
+            },
+        }
+        source_suffixes = {
+            "l3_mooncake_memory": "memory",
+            "l4_mooncake_dfs": "dfs",
+            "l4_mooncake_local_disk": "local_disk",
+        }
+        nonzero_sources = [
+            source_suffixes[source]
+            for source, count in decode_req.req.cached_tokens_by_source.items()
+            if source in source_suffixes and count > 0
+        ]
+        if len(nonzero_sources) == 1:
+            decode_req.req.cached_tokens_storage_source = (
+                f"mooncake_{nonzero_sources[0]}"
+            )
+        elif len(nonzero_sources) > 1:
+            decode_req.req.cached_tokens_storage_source = "mooncake_mixed"
+        else:
+            decode_req.req.cached_tokens_storage_source = None
         # Multimodal prompt token counts packed into cached_tokens slots 4-6
         # by the prefill node (see MetadataBuffers.set_buf).
         decode_req.req.mm_image_tokens = cached_tokens[4].item()

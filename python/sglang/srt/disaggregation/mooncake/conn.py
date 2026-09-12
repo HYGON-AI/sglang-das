@@ -2047,14 +2047,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if kv_chunk.source_event is not None:
                     kv_chunk.source_event.synchronize()
                     kv_chunk.source_event = None
-
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
-                ):
-                    # Only a recorded Failed status has hidden-ack waiters to
-                    # release; an unknown room never registered any.
-                    if kv_chunk.room in self.request_status:
+                current_status = self.request_status.get(kv_chunk.room)
+                if current_status is None or current_status == KVPoll.Failed:
+                    if current_status == KVPoll.Failed:
                         self._wake_pd_hidden_ack_waiters(kv_chunk.room)
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
