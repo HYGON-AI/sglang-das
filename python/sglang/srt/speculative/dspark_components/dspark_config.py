@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.environ import envs
+
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -245,7 +247,10 @@ def _get_dspark_config(config: Any) -> dict:
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
-    base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    base = parse_dflash_draft_config(
+        draft_hf_config=draft_hf_config,
+        use_qwen_dspark_config=envs.SGLANG_USE_QWEN_DSPARK.get(),
+    )
 
     dspark_cfg = _get_dspark_config(draft_hf_config)
     text_config = _get_text_config(draft_hf_config)

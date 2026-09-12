@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
 from typing import Callable, Iterable, Optional, Tuple
 
 import torch
@@ -489,6 +490,14 @@ class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        if envs.SGLANG_USE_QWEN_DSPARK.get() and getattr(
+            config, "aux_hidden_state_layer_ids", None
+        ) is not None:
+            # Pass canonical fields to the shared DFlash backbone without
+            # changing DFlash's own configuration semantics or the caller's config.
+            draft_config = parse_dspark_draft_config(draft_hf_config=config)
+            config = copy(config)
+            config.target_layer_ids = draft_config.target_layer_ids
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None
@@ -618,6 +627,7 @@ class DSparkDraftMixin:
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        use_qwen_dspark = envs.SGLANG_USE_QWEN_DSPARK.get()
         offsets = None
         lm_weight = None
         markov_weights = []
@@ -625,10 +635,10 @@ class DSparkDraftMixin:
         backbone_weights = []
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if name == "d2t":
+            if use_qwen_dspark and name == "d2t":
                 offsets = loaded_weight
                 continue
-            if name == "lm_head.weight":
+            if use_qwen_dspark and name == "lm_head.weight":
                 lm_weight = loaded_weight
                 continue
             normalized_name = name.removeprefix("model.")
