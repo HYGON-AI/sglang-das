@@ -199,15 +199,21 @@ class DpPaddingMode(IntEnum):
         if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
             return DpPaddingMode.MAX_LEN
 
+        # Hybrid-SSM/linear models materialize idle ranks through the existing
+        # MAX_LEN fabricated-row path. This must also cover decode idle
+        # participation, not only extend batches: DSpark target verification
+        # invokes the eager path for idle DP ranks when CUDA graph is disabled.
+        if (
+            dp_size > 1
+            and get_flags().dp.max_len_with_idle
+            and min(global_num_tokens) == 0
+        ):
+            return DpPaddingMode.MAX_LEN
+
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
-        # overhead from uneven token distribution.
-        # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
-        # to enable symmetric memory optimization (needed for DSA CP, etc.).
+        # overhead from uneven token distribution. For dp_size=1, max_len equals
+        # sum_len, so prefer MAX_LEN mode to enable symmetric memory optimization.
         if is_extend_in_batch and dp_size > 1:
-            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
-            # fabricated-row conversion; other models keep mainline SUM_LEN.
-            if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
-                return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -487,8 +493,14 @@ def initialize_dp_attention(server_args: ServerArgs):
 
 def init_dp_gathered_buffer(model_config: ModelConfig):
     """Size the gathered buffer from the model this worker is about to run."""
+    # Kimi linear and other hybrid models may not expose the legacy
+    # hybrid_override_pattern field. Reuse the central hybrid detector so
+    # eager DP idle ranks take the existing MAX_LEN fabricated-row path.
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
     get_flags().dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+        or mambaish_config(model_config) is not None
     )
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
