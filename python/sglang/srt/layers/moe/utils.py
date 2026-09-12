@@ -234,6 +234,9 @@ class MoeRunnerBackend(Enum):
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
 
+    def is_lightop(self):
+        return self == MoeRunnerBackend.LIGHTOP
+
 
 class DeepEPMode(Enum):
 
