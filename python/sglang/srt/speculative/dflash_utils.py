@@ -574,7 +574,9 @@ class DFlashDraftConfig:
         return resolved
 
 
-def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
+def parse_dflash_draft_config(
+    *, draft_hf_config: Any, use_qwen_dspark_config: bool = False
+) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
@@ -650,7 +652,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     # Compact DSPARK exports name the same ordered target-layer selection
     # aux_hidden_state_layer_ids. Never replace it with evenly spaced layers.
     aux_layer_ids = _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None)
-    if aux_layer_ids is not None:
+    if use_qwen_dspark_config and aux_layer_ids is not None:
         if layer_ids is not None and layer_ids != aux_layer_ids:
             raise ValueError(
                 "Conflicting target_layer_ids and aux_hidden_state_layer_ids."

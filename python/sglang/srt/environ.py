@@ -488,6 +488,8 @@ class Envs:
     # ===================================================================
     # DSpark speculative decoding
     # ===================================================================
+    # Opt in to Qwen DSPARK checkpoint and HCU MTP compatibility fixes.
+    SGLANG_USE_QWEN_DSPARK = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
