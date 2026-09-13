@@ -444,6 +444,40 @@ def vllm_flash_attn_varlen_func(
         and window_size is not None
         and window_size[0] >= 0
     )
+    if (
+        use_hcu_fp8_swa_fallback
+        and not _use_triton_vllm_fa
+        and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
+        and get_spec().speculative_algorithm == "DFLASH"
+        and layout == "legacy_bhsd"
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.float8_e5m2
+        and q.shape[-1] == k.shape[-1] == v.shape[-2] == 128
+        and k.shape[2] == v.shape[3] == 64
+        and 1 <= max_seqlen_q <= 16
+        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
+        and 0 <= window_size[0] <= 8192
+    ):
+        from sglang.srt.layers.attention.hcu_native_swa import (
+            native_hcu_sliding_attention,
+        )
+
+        return native_hcu_sliding_attention(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            window_size=window_size,
+            block_table=block_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
     if _is_hcu and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback):
         return triton_vllm_flash_attn_varlen_func(
             q=q,
