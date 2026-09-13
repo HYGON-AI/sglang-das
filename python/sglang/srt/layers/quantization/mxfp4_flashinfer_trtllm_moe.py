@@ -462,7 +462,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=topk_ids.shape[1],
+            top_k=packed_topk.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,
