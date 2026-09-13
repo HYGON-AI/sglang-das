@@ -1,4 +1,4 @@
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 import triton
@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_hcu
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 _is_hcu = is_hcu()
@@ -33,15 +34,25 @@ def _jit_fused_store_module(
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
     page_size: int,
+    layout: KVLayout,
 ):
-    args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
-    cname = "FlashMLA" if name == "flashmla" else "Indexer"
+    if name == "flashmla":
+        args = make_cpp_args(
+            input_dtype, index_dtype, page_size, layout.cpp_name, is_arch_support_pdl()
+        )
+        # The V4 layout keeps its RoPE dims in bf16 and has no in-kernel RoPE.
+        cname = "FlashMLA"
+        wrappers = ["run"] if layout is KVLayout.V4 else ["run", "run_rope"]
+    else:
+        assert layout is KVLayout.V4, "only the FlashMLA cache has V4.1 layouts"
+        args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
+        cname, wrappers = "Indexer", ["run"]
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(
         make_name("store_" + name),
         *args,
         cuda_files=["deepseek_v4/store.cuh"],
-        cuda_wrappers=[("run", f"{kernel_class}::run")],
+        cuda_wrappers=[(w, f"{kernel_class}::{w}") for w in wrappers],
     )
 
 
@@ -73,6 +84,8 @@ def fused_store_cache(
     *,
     page_size: int,
     type: Literal["flashmla", "indexer"],
+    layout: Union[KVLayout, str] = KVLayout.V4,
+    freqs_cis: Optional[torch.Tensor] = None,
 ) -> None:
     if is_hip_runtime() and not _is_hcu:
         from sglang.kernels.ops.kvcache.triton_store_cache import (
@@ -86,8 +99,15 @@ def fused_store_cache(
             input_dtype=input.dtype,
             index_dtype=indices.dtype,
             page_size=page_size,
+            layout=layout,
         )
-        module.run(input, cache, indices)
+        if freqs_cis is None:
+            module.run(input, cache, indices)
+        else:
+            assert layout is not KVLayout.V4, "the V4 layout has no in-kernel RoPE"
+            if freqs_cis.is_complex():
+                freqs_cis = torch.view_as_real(freqs_cis).flatten(-2)
+            module.run_rope(input, cache, indices, freqs_cis.contiguous())
 
 
 @triton.jit
