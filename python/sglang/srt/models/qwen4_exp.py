@@ -612,6 +612,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             total += size
         return sizes, offsets, total
 
+    def _scale_ple_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        lookup_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        ngram_embedding = self.ngram_embedding
+        if ngram_embedding.weight.dtype != torch.int8:
+            return embeddings * ngram_embedding.weight_scale
+        if isinstance(ngram_embedding, Qwen4ExpPinnedHostEmbedding):
+            return embeddings
+        global_ids = lookup_ids.long()
+        local_ids = global_ids
+        if ngram_embedding.tp_size > 1:
+            start = ngram_embedding.shard_indices.org_vocab_start_index
+            end = ngram_embedding.shard_indices.org_vocab_end_index
+            in_range = (global_ids >= start) & (global_ids < end)
+            local_ids = torch.where(in_range, global_ids - start, 0)
+        return embeddings * ngram_embedding.weight_scale[local_ids]
+
     def _embed_ngram_ids(
         self,
         ngram_ids: torch.Tensor,
@@ -622,8 +641,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids, forward_batch, physical_tokens
         )
         embeddings = self.ngram_embedding(lookup_ids)
-        if self.ngram_embedding.weight.dtype != torch.int8:
-            embeddings = embeddings * self.ngram_embedding.weight_scale
+        embeddings = self._scale_ple_embeddings(embeddings, lookup_ids)
         return self._finish_embedding_lookup(
             embeddings, semantic_tokens, forward_batch, physical_tokens
         )
