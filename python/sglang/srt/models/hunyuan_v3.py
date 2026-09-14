@@ -1059,7 +1059,13 @@ class HYV3Model(nn.Module):
             )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            # postprocess_layer may fold residual into hidden_states and return
+            # residual=None (CommunicateSummableTensorPairFn._gather). RMSNorm
+            # then returns a bare tensor, so unpacking a 2-tuple would fail.
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         if use_hy3_sp:
             attn_tp_group = get_parallel().attn_tp_group
