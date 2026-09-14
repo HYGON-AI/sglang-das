@@ -1860,3 +1860,9 @@ def test_component_commit_filters_overlapping_full_and_swa_load_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
