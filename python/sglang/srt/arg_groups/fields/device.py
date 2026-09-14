@@ -9,7 +9,6 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Annotated as A
 from typing import (
     Callable,
@@ -17,9 +16,11 @@ from typing import (
     Optional,
 )
 
+import msgspec
 
-@dataclasses.dataclass
-class Device:
+
+
+class Device(msgspec.Struct):
     """Namespace ``device``."""
 
     _NS_PATH = "device"

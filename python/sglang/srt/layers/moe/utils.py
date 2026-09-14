@@ -16,6 +16,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_flags,
     get_forward,
@@ -45,6 +46,7 @@ class MoeA2ABackend(Enum):
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -88,6 +90,9 @@ class MoeA2ABackend(Enum):
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
+
+    def is_flashinfer_megamoe(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -143,6 +148,9 @@ class _MoeRunnerBackendPredicates:
     def is_flashinfer_cutedsl(self):
         return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
 
+    def is_flashinfer_megamoe(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_MEGAMOE.value
+
     def is_flashinfer_mxfp4(self):
         return self.value == MoeRunnerBackend.FLASHINFER_MXFP4.value
 
@@ -167,6 +175,9 @@ class _MoeRunnerBackendPredicates:
     def is_aiter(self):
         return self.value == MoeRunnerBackend.AITER.value
 
+    def is_intel_xpu(self):
+        return self.value == MoeRunnerBackend.INTEL_XPU.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -180,6 +191,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
@@ -229,9 +241,6 @@ def resolve_moe_runner_backend(
         raise ValueError(
             f"MoE runner backend {backend!r} is neither built in nor registered"
         ) from None
-
-    def is_intel_xpu(self):
-        return self == MoeRunnerBackend.INTEL_XPU
 
 
 class DeepEPv2Fp8ScaleFormat(NamedTuple):
@@ -287,6 +296,33 @@ class DispatcherOutputDtype(Enum):
     INT8 = "int8"
     NVFP4 = "nvfp4"
     MXFP8 = "mxfp8"
+
+
+class FlashinferA2ADispatchType(Enum):
+    BF16 = "bf16"
+    NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
+
+
+def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
+    dispatch_type = get_exec().moe.flashinfer_a2a_dispatch_type
+
+    if dispatch_type is None:
+        if envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            return (
+                FlashinferA2ADispatchType.NVFP4
+                if envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+                else FlashinferA2ADispatchType.BF16
+            )
+        return FlashinferA2ADispatchType.BF16
+
+    if dispatch_type != "auto":
+        return FlashinferA2ADispatchType(dispatch_type)
+
+    raise RuntimeError(
+        "flashinfer_a2a_dispatch_type='auto' reached the published runtime "
+        "configuration; ServerArgs must resolve it before publication"
+    )
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
@@ -727,6 +763,11 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         # pplx's AllToAll.combine already sums each token's expert outputs back
         # to the source rank
         return True
+    if get_moe_a2a_backend().is_flashinfer_megamoe():
+        # The mega kernel does its EP all-to-all + combine internally and
+        # returns per-rank outputs, so any further EP/TP all-reduce would
+        # double-count. Same opt-in as the flashinfer a2a dispatcher.
+        return True
     return False
 
 
@@ -878,10 +919,9 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
 
 def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
     """Return the DeepGEMM INT8 unique-token policy for the PD topology."""
-    from sglang.srt.server_args import get_global_server_args
 
     try:
-        mode = get_global_server_args().disaggregation_mode
+        mode = get_disagg().disaggregation_mode
         if mode in ("prefill", "decode"):
             return 0, mode
     except Exception:

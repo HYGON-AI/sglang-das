@@ -39,7 +39,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.utils import is_hcu
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -104,10 +104,8 @@ def _is_standalone_megamoe_runtime() -> bool:
 
 
 def _is_pd_prefill_instance() -> bool:
-    from sglang.srt.server_args import get_global_server_args
-
     try:
-        return get_global_server_args().disaggregation_mode == "prefill"
+        return get_disagg().disaggregation_mode == "prefill"
     except ValueError:
         return False
 
@@ -473,8 +471,8 @@ def _run_mega_routed(
     assert dispatch_num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
         f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-        f"{num_max_tokens_per_rank}; raise the env var or shrink "
-        f"cuda_graph_max_bs / chunked_prefill_size accordingly"
+        f"{num_max_tokens_per_rank}; raise the env var or lower "
+        f"--cuda-graph-max-bs-decode / --chunked-prefill-size accordingly"
     )
 
     runtime = get_hcu_mega_moe_runtime() if _IS_HCU else _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM

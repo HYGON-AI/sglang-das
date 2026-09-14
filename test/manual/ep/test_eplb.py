@@ -73,7 +73,6 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                     "--expert-distribution-recorder-buffer-size",
                     "50",
                     # TODO pr-chain: enable later
-                    # "--enable-expert-distribution-metrics",
                     # TODO auto determine these flags
                     "--expert-distribution-recorder-mode",
                     "stat",
@@ -163,6 +162,7 @@ class TestStaticEPLB(CustomTestCase):
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
+            engine = None
             time.sleep(5)
 
     def _assert_engine_generate_correct(self, engine: sgl.Engine):

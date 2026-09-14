@@ -54,6 +54,7 @@ class HiCacheBaseServer(CustomTestCase):
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = []
+    server_env: dict = {}
 
     @classmethod
     def setUpClass(cls):
@@ -69,6 +70,7 @@ class HiCacheBaseServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.hicache_args,
+            env=cls.server_env,
         )
 
     @classmethod
@@ -80,6 +82,7 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--mem-fraction-static",
@@ -96,6 +99,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
     model_name = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--trust-remote-code",
         "--enable-hierarchical-cache",
@@ -117,6 +121,7 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
 
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",
@@ -148,6 +153,7 @@ class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--page-size",

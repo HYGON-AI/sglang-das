@@ -10,13 +10,14 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from typing import Annotated as A
 from typing import (
     List,
     Literal,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     Arg,
@@ -39,8 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.utils import is_hcu
 
 
-@dataclasses.dataclass
-class ExecFeatures:
+class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
@@ -96,6 +96,13 @@ class ExecFeatures:
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit. "
+        "Use the same value on disaggregated prefill and decode nodes; clients "
+        "should set top_k below the limit to leave headroom for cutoff ties.",
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -106,8 +113,7 @@ class ExecFeatures:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecKernel:
+class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
@@ -179,9 +185,9 @@ class ExecKernel:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'flashinfer_pr4266' (legacy compatibility alias for the optimized CuTe DSL path), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
-            choices=["auto", "cutedsl", "flashinfer_pr4266", "gemv", "torch"],
+            choices=["auto", "cutedsl", "gemv", "torch"],
         ),
     ] = "auto"
     dsa_prefill_backend: A[
@@ -196,6 +202,7 @@ class ExecKernel:
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -225,12 +232,26 @@ class ExecKernel:
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
             resolvable=True,
         ),
     ] = None
+    dsv4_attn_backend: A[
+        str,
+        Arg(
+            help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
+            "'flashmla'. 'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
+            "switches the SWA/compressed KV pools to a "
+            "uniform 512-dim FP8 layout and runs decode and sparse prefill "
+            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
+            "choice is shared by prefill and decode.",
+            choices=["auto", "flashmla", "trtllm"],
+            resolvable=True,
+        ),
+    ] = "auto"
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
@@ -310,8 +331,7 @@ class ExecKernel:
     ] = 8192
 
 
-@dataclasses.dataclass
-class ExecMamba:
+class ExecMamba(msgspec.Struct):
     """Namespace ``exec.mamba``."""
 
     _NS_PATH = "exec.mamba"
@@ -451,8 +471,7 @@ class ExecMamba:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecGraph:
+class ExecGraph(msgspec.Struct):
     """Namespace ``exec.graph``."""
 
     _NS_PATH = "exec.graph"
@@ -555,8 +574,7 @@ def _pre_warm_nccl_help() -> str:
     )
 
 
-@dataclasses.dataclass
-class ExecComm:
+class ExecComm(msgspec.Struct):
     """Namespace ``exec.comm``."""
 
     _NS_PATH = "exec.comm"
@@ -631,8 +649,7 @@ class ExecComm:
     ] = False
 
 
-@dataclasses.dataclass
-class ExecMoe:
+class ExecMoe(msgspec.Struct):
     """Namespace ``exec.moe``."""
 
     _NS_PATH = "exec.moe"
@@ -663,6 +680,7 @@ class ExecMoe:
             "deepep_v2",
             "ascend_tp",
             "pplx",
+            "flashinfer_megamoe",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -678,6 +696,7 @@ class ExecMoe:
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "flashinfer_megamoe",
             ],
             resolvable=True,
         ),
@@ -722,6 +741,10 @@ class ExecMoe:
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+    ] = None
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
@@ -836,8 +859,7 @@ class ExecMoe:
     record_nolora_graph: A[bool, "Record no-lora graph."] = True
 
 
-@dataclasses.dataclass
-class ExecOverlap:
+class ExecOverlap(msgspec.Struct):
     """Namespace ``exec.overlap``."""
 
     _NS_PATH = "exec.overlap"
@@ -858,8 +880,7 @@ class ExecOverlap:
     ] = 0.48
 
 
-@dataclasses.dataclass
-class ExecOffload:
+class ExecOffload(msgspec.Struct):
     """Namespace ``exec.offload``."""
 
     _NS_PATH = "exec.offload"
@@ -884,10 +905,43 @@ class ExecOffload:
         "Steps to prefetch in offloading.",
     ] = 1
     offload_mode: A[str, "Mode of offloading."] = "cpu"
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
+
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
+            "file under --ple-offload-dir and lets the gather kernel read it "
+            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
+            "where pinned host memory comes out of the same pool as the model "
+            "weights. Requires a device that reports "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        Arg(
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'. Defaults to "
+            "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
+            "The file is sparse and reused across restarts; put it on fast "
+            "local storage (NVMe).",
+        ),
+    ] = None
 
 
-@dataclasses.dataclass
-class ExecDllm:
+class ExecDllm(msgspec.Struct):
     """Namespace ``exec.dllm``."""
 
     _NS_PATH = "exec.dllm"
@@ -911,8 +965,7 @@ class ExecDllm:
     ] = True
 
 
-@dataclasses.dataclass
-class ExecDeterministic:
+class ExecDeterministic(msgspec.Struct):
     """Namespace ``exec.deterministic``."""
 
     _NS_PATH = "exec.deterministic"

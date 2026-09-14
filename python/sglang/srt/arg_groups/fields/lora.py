@@ -10,13 +10,14 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from typing import Annotated as A
 from typing import (
     List,
     Optional,
     Union,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     Arg,
@@ -29,8 +30,7 @@ from sglang.srt.utils.common import (
 )
 
 
-@dataclasses.dataclass
-class Lora:
+class Lora(msgspec.Struct):
     """Namespace ``lora``."""
 
     _NS_PATH = "lora"

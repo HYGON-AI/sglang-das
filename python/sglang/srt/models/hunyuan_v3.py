@@ -71,8 +71,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_stream
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_stream
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, make_layers
 from sglang.srt.utils.common import LazyValue
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -187,7 +186,7 @@ class HYV3MoEFused(nn.Module):
         experts_cls = get_moe_impl_class(quant_config)
         self.experts = experts_cls(
             num_experts=self.n_routed_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
@@ -556,11 +555,11 @@ class HYV3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, rms_norm_eps)
         self.page_size = 64
-        if get_global_server_args().kv_cache_dtype == "fp8_e4m3":
+        if get_model().kv_cache_dtype == "fp8_e4m3":
             self.kv_cache_dtype = torch.float8_e4m3fn
-        elif get_global_server_args().kv_cache_dtype == "fp8_e5m2":
+        elif get_model().kv_cache_dtype == "fp8_e5m2":
             self.kv_cache_dtype = torch.float8_e5m2
-        elif get_global_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
+        elif get_model().kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
         else:
             self.kv_cache_dtype = None
@@ -923,7 +922,7 @@ class HYV3ForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.lm_head",
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -999,7 +998,7 @@ class HYV3ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())

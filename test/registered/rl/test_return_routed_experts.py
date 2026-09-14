@@ -217,7 +217,7 @@ class TestReturnRoutedExperts(CustomTestCase):
                 2,
                 "--enable-return-routed-experts",
                 "--disable-cuda-graph",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 *other_args,
             ],
         )

@@ -146,7 +146,7 @@ jobs:
         run: |
           docker rm -f ci_sglang_${{ matrix.name }} || true
           docker run -dt \
-            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v ${{ github.workspace }}:/sglang-checkout/ --shm-size=64g \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
@@ -173,7 +173,7 @@ jobs:
         run: |
           docker rm -f ci_sglang_${{ matrix.name }} || true
           docker run -dt \
-            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v ${{ github.workspace }}:/sglang-checkout/ --shm-size=64g \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \

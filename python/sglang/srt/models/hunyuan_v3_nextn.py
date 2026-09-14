@@ -36,8 +36,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
-from sglang.srt.runtime_context import get_stream
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -137,7 +136,7 @@ class HYV3ForCausalLMNextN(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix="lm_head",
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -182,7 +181,7 @@ class HYV3ForCausalLMNextN(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
         )
 
         params_dict = dict(self.named_parameters())

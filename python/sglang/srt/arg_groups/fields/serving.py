@@ -9,7 +9,6 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from typing import Annotated as A
 from typing import (
@@ -19,17 +18,24 @@ from typing import (
     Optional,
 )
 
+import msgspec
+
 from sglang.srt.arg_groups.arg_utils import (
     Arg,
 )
 from sglang.srt.utils.common import json_list_type
 
 
-@dataclasses.dataclass
-class Serving:
+class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"
+    enable_response_store: A[
+        bool,
+        "Enable in-memory Responses storage for retrieval, chaining, and background "
+        "requests. Disabled by default; unsupported with prefill-decode "
+        "disaggregation. Storage has no TTL or size limit.",
+    ] = False
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,

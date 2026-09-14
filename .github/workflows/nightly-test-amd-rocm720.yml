@@ -109,7 +109,7 @@ on:
         type: string
         # A single flavor, unlike the schedule and the dispatch form: a caller
         # that says nothing should not silently get multi-version GPU cost.
-        default: rocm724
+        default: rocm10
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -293,6 +293,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -332,6 +333,7 @@ jobs:
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi35x-glm51-mxfp4 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -372,6 +374,7 @@ jobs:
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -408,6 +411,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-2-gpu-vlm --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -444,6 +448,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-perf-text-2-gpu --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
@@ -481,6 +486,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-perf-vlm-2-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
@@ -616,6 +622,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -629,6 +636,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-gpt-oss --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -998,6 +1006,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1009,6 +1018,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-basic --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1106,6 +1116,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1117,6 +1128,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1157,6 +1169,7 @@ jobs:
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp4_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1168,6 +1181,7 @@ jobs:
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp4_mtp_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1209,6 +1223,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1220,6 +1235,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_kv_fp8_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1261,6 +1277,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1272,6 +1289,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_ar_fusion_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1618,6 +1636,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-kimi-k26 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1665,6 +1684,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k3 --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1682,6 +1702,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/perf/mi35x/test_kimi_k3_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1738,6 +1759,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
@@ -1779,6 +1801,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1791,6 +1814,7 @@ jobs:
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1830,6 +1854,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35-triton-dcp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1888,6 +1913,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-qwen38-mxfp4 --nightly --timeout-per-file 21600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1930,6 +1956,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm51 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -1941,6 +1968,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-glm51 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
@@ -1988,6 +2016,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm52-fp8 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -2001,6 +2030,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-glm52-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -2045,6 +2075,7 @@ jobs:
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5-mxfp4 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -2057,6 +2088,7 @@ jobs:
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/perf/mi35x/test_glm5_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -2144,6 +2176,7 @@ jobs:
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-minimax-m3-tp4 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -2158,6 +2191,7 @@ jobs:
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-4-gpu-mi35x-minimax-m3 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -2200,6 +2234,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-minimax-m27 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
@@ -2212,6 +2247,7 @@ jobs:
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m27 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?

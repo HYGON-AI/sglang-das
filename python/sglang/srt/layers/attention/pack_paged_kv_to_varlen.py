@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hcu
 
 _kv_layout_hcu_fa = is_hcu() and get_bool_env_var(
@@ -37,8 +37,8 @@ def can_pack_paged_kv_to_varlen(
     value_cache: torch.Tensor,
     page_size: int,
 ) -> bool:
-    server_args = get_global_server_args()
-    pack_mode = server_args.pack_paged_kv_to_varlen
+    kernel = get_exec().kernel
+    pack_mode = kernel.pack_paged_kv_to_varlen
     if pack_mode == "off":
         return False
 
@@ -66,7 +66,7 @@ def can_pack_paged_kv_to_varlen(
         and metadata.cu_seqlens_k.shape[0] >= batch_size + 1
         and metadata.max_seq_len_k > 0
         and int(seq_lens_cpu.min().item()) > 0
-        and server_args.minimax_opt
+        and get_parallel().minimax_opt
     )
     if not correctness_ok:
         return False
@@ -80,8 +80,8 @@ def can_pack_paged_kv_to_varlen(
     max_batch_size = _max_batch_size_by_kv_heads.get(layer.tp_k_head_num, 1)
     return (
         batch_size <= max_batch_size
-        and total_kv_tokens >= server_args.pack_paged_kv_to_varlen_min_kv_tokens
-        and metadata.max_seq_len_q >= server_args.pack_paged_kv_to_varlen_min_q_tokens
+        and total_kv_tokens >= kernel.pack_paged_kv_to_varlen_min_kv_tokens
+        and metadata.max_seq_len_q >= kernel.pack_paged_kv_to_varlen_min_q_tokens
     )
 
 
