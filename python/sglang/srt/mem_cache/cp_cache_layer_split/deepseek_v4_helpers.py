@@ -10,7 +10,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_cp_round_robin_split_data,
     dsa_use_prefill_cp,
 )
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_finish,
+    cp_all_gather_rerange_output,
+)
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
     CpCacheLayerSplitDeepSeekV4TokenToKVPool,
 )
@@ -51,6 +54,33 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
     if _should_sync_cp_cache_layer_split(pool, forward_batch):
         core_metadata = _get_core_attn_metadata()
         pool.prefetch_swa_layer(layer_id, core_metadata.swa_page_indices)
+
+
+def finish_cp_kv_swa_prefetch(pool, layer_id, forward_batch, attn_backend, handle):
+    """Enqueue gathered KV store and SWA broadcast without blocking compute.
+
+    The broadcast must snapshot the owner's cache after this chunk's store.
+    Attention waits through ``wait_swa_prefetch`` before using the staging
+    buffer; projections and compression can run in the meantime.
+    """
+    compute_stream = torch.cuda.current_stream()
+    store_stream = getattr(pool, "_cp_swa_store_stream", None)
+    if store_stream is None:
+        store_stream = torch.cuda.Stream(device=handle[0].device)
+        pool._cp_swa_store_stream = store_stream
+    store_stream.wait_stream(compute_stream)
+    with torch.cuda.stream(store_stream):
+        kv = cp_all_gather_rerange_finish(handle)
+        # These buffers were allocated on the compute stream. Keep them alive
+        # until the gather and reordering queued on the side streams finish.
+        handle[0].record_stream(store_stream)
+        handle[1].record_stream(store_stream)
+        attn_backend.store_cache(layer_id, kv, forward_batch)
+        maybe_prefetch_cp_kv_swa(pool, layer_id, forward_batch)
+    # The caller may also consume the BF16 KV on the compute stream after its
+    # SWA prefetch wait. The allocation itself belongs to the store stream.
+    kv.record_stream(compute_stream)
+    return kv
 
 
 def maybe_wait_cp_kv_swa_prefetch(pool, layer_id: int, forward_batch=None) -> None:

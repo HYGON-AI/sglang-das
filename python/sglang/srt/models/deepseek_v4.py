@@ -167,6 +167,7 @@ if not _is_hip:
     )
 
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    finish_cp_kv_swa_prefetch,
     is_cp_cache_layer_split_deepseek_v4_pool,
     maybe_prefetch_cp_kv_swa,
     maybe_wait_cp_kv_swa_prefetch,
@@ -1439,12 +1440,19 @@ class MQALayer(MqaAttentionBase):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
         kv_handle = None
+        swa_prefetched = False
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
         unified = is_unified_kv_triton()
+        layer_split_comm_stream = (
+            getattr(forward_batch, "_cp_prefetch_comm_stream", None)
+            if _is_hcu and use_cp and not unified
+            and is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            else None
+        )
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         # The kernel is token-indexed (q, kv and positions are all length M), so
         # a verify batch carrying several draft tokens per request is a shape it
@@ -1586,7 +1594,8 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            if layer_split_comm_stream is None:
+                q = self._compute_q_b(q_lora, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1618,23 +1627,40 @@ class MQALayer(MqaAttentionBase):
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+                if layer_split_comm_stream is not None:
+                    # Launch before Q-B so both the transfer and the ordered
+                    # cache-store/broadcast chain can overlap independent work.
+                    handle = cp_all_gather_rerange_launch(
+                        kv, self.cp_size, layer_split_comm_stream,
+                        ("kv", self.layer_id),
+                    )
+                    kv = finish_cp_kv_swa_prefetch(
+                        get_token_to_kv_pool(), self.layer_id, forward_batch,
+                        attn_backend, handle,
+                    )
+                    swa_prefetched = True
+                else:
+                    kv = cp_materialize_global_token_order(
+                        kv.contiguous(),
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    attn_backend.store_cache(
+                        layer_id=self.layer_id,
+                        swa_k=kv,
+                        forward_batch=forward_batch,
+                    )
             else:
                 self._compute_kv_to_cache(
                     x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
                 )
                 kv = None
 
-        maybe_prefetch_cp_kv_swa(get_token_to_kv_pool(), self.layer_id, forward_batch)
+            if layer_split_comm_stream is not None:
+                q = self._compute_q_b(q_lora, positions, q_out)
+
+        if not swa_prefetched:
+            maybe_prefetch_cp_kv_swa(get_token_to_kv_pool(), self.layer_id, forward_batch)
 
         del qkv_a
 
@@ -3347,6 +3373,21 @@ class DeepseekV4Model(nn.Module):
             self._can_run_tbo(forward_batch) and not capture_dspark
             and not is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
         )
+        # DSpark capture keeps LayerSplit on the eager per-layer loop, so the
+        # CP attention gathers cannot inherit TBO's communication stream. Arm
+        # the same two-phase launch/finish path explicitly: kv_score and KV
+        # collectives then run on the duplicate CP communicator while their
+        # projections, compressor and indexer execute on the compute stream.
+        layer_split_cp_overlap = (
+            _is_hcu
+            and use_prefill_cp
+            and not cp_v2_active
+            and not run_tbo
+            and is_dsa_prefill_cp_round_robin_split()
+            and is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+        )
+        if layer_split_cp_overlap:
+            forward_batch._cp_prefetch_comm_stream = get_dp_tbo_comm_stream()
         if deferred_mhc_input is not None:
             if not run_tbo:
                 hidden_states = _repeat_mhc_input_on_cp_rank(
@@ -3423,6 +3464,9 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
+
+        if layer_split_cp_overlap:
+            del forward_batch._cp_prefetch_comm_stream
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         # CP v2 partitions the output per rank, so it needs no output re-gather,
