@@ -513,25 +513,33 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     and weight_type == "int"
                 )
                 break
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.int8
-                if ple_int8
-                else (
-                    torch.float8_e4m3fn
-                    if (
-                        quant_config is not None and quant_config.get_name() == "fp8"
-                    )
-                    or getattr(config, "ple_embedding_dtype", None)
-                    == "float8_e4m3fn"
-                    else torch.bfloat16
-                )
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
+        # Allocate the large PLE table on CPU from the start when offload is
+        # requested. This avoids a transient GPU allocation without requiring
+        # a separate process-wide environment variable.
+        allocation_context = (
+            torch.device("cpu") if config.ple_offload_embedding else nullcontext()
         )
+        with allocation_context:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.int8
+                    if ple_int8
+                    else (
+                        torch.float8_e4m3fn
+                        if (
+                            quant_config is not None
+                            and quant_config.get_name() == "fp8"
+                        )
+                        or getattr(config, "ple_embedding_dtype", None)
+                        == "float8_e4m3fn"
+                        else torch.bfloat16
+                    )
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
         scale_shape = (
             (self.ngram_embedding.num_embeddings_per_partition, 1)
             if ple_int8
@@ -539,7 +547,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         self.ngram_embedding.register_buffer(
             "weight_scale",
-            torch.ones(scale_shape, dtype=torch.bfloat16, device="cpu"),
+            torch.ones(scale_shape, dtype=torch.bfloat16),
             persistent=True,
         )
 
@@ -584,6 +592,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             total += size
         return sizes, offsets, total
 
+    def _scale_ple_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        lookup_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        ngram_embedding = self.ngram_embedding
+        if ngram_embedding.weight.dtype != torch.int8:
+            return embeddings * ngram_embedding.weight_scale
+        if isinstance(ngram_embedding, Qwen4ExpPinnedHostEmbedding):
+            return embeddings
+        global_ids = lookup_ids.long()
+        local_ids = global_ids
+        if ngram_embedding.tp_size > 1:
+            start = ngram_embedding.shard_indices.org_vocab_start_index
+            end = ngram_embedding.shard_indices.org_vocab_end_index
+            in_range = (global_ids >= start) & (global_ids < end)
+            local_ids = torch.where(in_range, global_ids - start, 0)
+        return embeddings * ngram_embedding.weight_scale[local_ids]
+
     def _embed_ngram_ids(
         self,
         ngram_ids: torch.Tensor,
@@ -594,8 +621,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids, forward_batch, physical_tokens
         )
         embeddings = self.ngram_embedding(lookup_ids)
-        if self.ngram_embedding.weight.dtype != torch.int8:
-            embeddings = embeddings * self.ngram_embedding.weight_scale
+        embeddings = self._scale_ple_embeddings(embeddings, lookup_ids)
         return self._finish_embedding_lookup(
             embeddings, semantic_tokens, forward_batch, physical_tokens
         )
