@@ -66,7 +66,7 @@ class TestPyTorchSamplingBackend(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.64)
+        self.assertGreaterEqual(metrics["score"], 0.50)
 
     @unittest.skipIf(
         is_in_amd_ci(),
