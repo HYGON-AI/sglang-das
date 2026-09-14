@@ -3,6 +3,10 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import json
+
+from sglang.srt.mem_cache.cp_cache_layer_split.transfer import (
+    decode_v4_transfer_metadata, encode_v4_transfer_metadata, match_transfer_entries,
+)
 import logging
 import os
 import struct
@@ -172,6 +176,7 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    v4_transfer_metadata: dict = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -206,6 +211,7 @@ class KVArgsRegisterInfo:
                 unpack_string_list(msg[18]) if len(msg) > 18 and msg[18] != b"" else []
             ),
             dst_state_types=unpack_state_types(msg[19]) if len(msg) > 19 else [],
+            v4_transfer_metadata=decode_v4_transfer_metadata(msg),
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -863,6 +869,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        src_layout=None,
+        dst_layout=None,
+        dst_item_lens=None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -887,8 +896,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         layers_params = None
 
+        # Only the opt-in LayerSplit sender consumes descriptor metadata.
+        if getattr(self, "cp_cache_layer_split", False):
+            pairs = match_transfer_entries(src_layout or [], dst_layout or [], item_lens, dst_item_lens or [])
+            layers_params = [(src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs]
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+        elif self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
             if src_layer_ids or dst_layer_ids:
@@ -1071,6 +1084,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        v4_transfer_metadata=None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1098,6 +1112,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            src_layout=getattr(self.kv_args, "v4_transfer_metadata", {}).get("kv"),
+            dst_layout=(v4_transfer_metadata or {}).get("kv"),
+            dst_item_lens=(v4_transfer_metadata or {}).get("kv_sizes"),
         )
 
     def send_kvcache_dcp(
@@ -1482,6 +1499,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and not getattr(self, "cp_cache_layer_split", False)
         ):
             skip_state = True
 
@@ -1593,6 +1611,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
+            src_layout = dst_layout = None
+            if getattr(self, "cp_cache_layer_split", False):
+                src_layout = self.kv_args.v4_transfer_metadata["states"][i]
+                metadata = getattr(target_rank_registration_info, "v4_transfer_metadata", {})
+                layouts = metadata.get("states", [])
+                dst_layout = layouts[dst_component_index] if dst_component_index < len(layouts) else []
             dst_indices = (
                 req.dst_state_indices[dst_component_index]
                 if dst_component_index < len(req.dst_state_indices)
@@ -1737,6 +1761,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         state_type=st,
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
+                        src_layout=src_layout,
+                        dst_layout=dst_layout,
+                        dst_item_lens=dst_item_lens,
                     )
                     or rc
                 )
@@ -2467,6 +2494,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 chunked_dst_kv_indice,
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+                                v4_transfer_metadata=target_rank_registration_info.v4_transfer_metadata,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
@@ -3333,7 +3361,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_state_data_formats,
-                        ]
+                        ] + ([packed_state_types, encode_v4_transfer_metadata(self.kv_mgr.kv_args)]
+                             if getattr(self.kv_mgr.kv_args, "v4_transfer_metadata", None) else [])
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(

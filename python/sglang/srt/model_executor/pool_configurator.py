@@ -829,6 +829,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.context_len = kvc.model_config.context_len
+        self.use_cp_cache_layer_split = (
+            kvc.server_args.enable_cp_cache_layer_split and not kvc.is_draft_worker
+        )
+        self.cp_cache_layer_split_layout = None
+        if self.use_cp_cache_layer_split:
+            from sglang.srt.mem_cache.cp_cache_layer_split import (
+                build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout,
+            )
+
+            self.cp_cache_layer_split_layout = (
+                build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout(
+                    kvc.ps.attn_cp_size, kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer, cfg.compress_ratios,
+                )
+            )
+            logger.info("CP Cache LayerSplit layout=%s", self.cp_cache_layer_split_layout)
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
@@ -879,8 +895,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 kvc.server_args.max_speculative_num_draft_tokens or 0
             )
 
+        if self.use_cp_cache_layer_split:
+            hf_config = cfg.hf_config
+            self.cp_draft_layers = (
+                len(getattr(hf_config, "dspark_target_layer_ids", []))
+                if get_spec().speculative_algorithm == "DSPARK"
+                else getattr(hf_config, "num_nextn_predict_layers", 1)
+            )
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and not self.use_cp_cache_layer_split:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
@@ -968,6 +991,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
+        if self.use_cp_cache_layer_split:
+            layout = self.cp_cache_layer_split_layout
+            # One full-capacity staging pool per read family. State is only
+            # persisted on its owner and is never broadcast during forward.
+            result = (
+                self.swa_ratio * kv_bytes * (layout.swa_layer_num + 1)
+                + c4_frac * kv_bytes * (layout.c4_layer_num + 1)
+                + kv_bytes / 128 * (layout.c128_layer_num + 1)
+                + indexer_bytes / 4 * (layout.c4_indexer_layer_num + 1)
+                + self.swa_ratio * c4_state_ratio * (
+                    c4_state_bytes * layout.c4_state_layer_num
+                    + c4_indexer_state_bytes * layout.c4_indexer_state_layer_num
+                )
+            )
+            if self.is_speculative:
+                # Flash0731 DSPARK has three SWA-only draft layers. They keep
+                # their original replicated pools on every CP rank.
+                draft_layers = getattr(self, "cp_draft_layers", 1)
+                result += self.swa_ratio * kv_bytes * draft_layers
+            return result
         return (
             self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac * kv_bytes * self.num_layers_ca4
@@ -1016,9 +1059,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows = ceil_div(state_rows, 128) * 128
             state_last_dim = 2 * attn_head_dim
 
-        return (
-            state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
+        num_layers = (
+            self.cp_cache_layer_split_layout.c128_state_layer_num
+            if self.use_cp_cache_layer_split else self.num_layers_ca128
         )
+        return state_rows * state_last_dim * c128_state_dtype_size * num_layers
 
     def _get_c128_state_fixed_bytes_for_token_capacity(
         self, token_capacity: int
