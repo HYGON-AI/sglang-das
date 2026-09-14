@@ -19,7 +19,7 @@ on:
       torch_version:
         description: 'PyTorch version to install'
         required: false
-        default: '2.10.0'
+        default: '2.11.0'
         type: string
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
@@ -41,7 +41,7 @@ jobs:
         shell: bash
 
     container:
-      image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
+      image: ${{ vars.HCU_CI_IMAGE_0518 }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -57,7 +57,7 @@ jobs:
         python-version: ['3.10']
 
     env:
-      TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
+      TORCH_VERSION: ${{ inputs.torch_version || '2.11.0' }}
       SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201

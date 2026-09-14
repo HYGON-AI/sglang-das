@@ -188,6 +188,7 @@ jobs:
       CHECKOUT_REF: ${{ needs.validate-config.outputs.target_ref }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
+      HCU_WHEEL_EXPECTED_TORCH_VERSION: '2.11.0'
     steps:
       - name: Checkout code
         env:
@@ -222,6 +223,7 @@ jobs:
           echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
 
           python3 - <<'PY_PROBE' | tee /tmp/hcu_nightly_probe_wheels.out
+          import json
           import os
           import pathlib
           import sys
@@ -229,6 +231,7 @@ jobs:
           root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_ROOT", "/ci_public/sglang-das/hcu-wheel-staging"))
           container_root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_CONTAINER_ROOT", "/hcu-wheel-staging"))
           target_sha = os.environ["HCU_WHEEL_TARGET_SHA"]
+          expected_torch_version = os.environ["HCU_WHEEL_EXPECTED_TORCH_VERSION"]
           repo = os.environ["GITHUB_REPOSITORY"]
           owner, repo_name = repo.split("/", 1)
           repo_key = f"{owner}_{repo_name}"
@@ -262,6 +265,22 @@ jobs:
               wheel_dir = staging_dir / "wheels"
               if not ready.exists() or not wheel_dir.is_dir():
                   print(f"[probe-hcu-wheels] skipping incomplete staging dir {staging_dir}", file=sys.stderr)
+                  continue
+              manifest_path = staging_dir / "manifest.json"
+              try:
+                  manifest = json.loads(manifest_path.read_text())
+              except (OSError, json.JSONDecodeError) as error:
+                  print(f"[probe-hcu-wheels] skipping invalid manifest {manifest_path}: {error}", file=sys.stderr)
+                  continue
+              if manifest.get("commit_sha") != target_sha:
+                  print(f"[probe-hcu-wheels] skipping commit-mismatched wheels in {staging_dir}", file=sys.stderr)
+                  continue
+              if manifest.get("torch_version") != expected_torch_version:
+                  print(
+                      f"[probe-hcu-wheels] skipping Torch {manifest.get('torch_version')} wheels in "
+                      f"{staging_dir}; expected {expected_torch_version}",
+                      file=sys.stderr,
+                  )
                   continue
               found = {}
               for wheel in sorted(wheel_dir.glob("*.whl")):
@@ -297,7 +316,7 @@ jobs:
       run:
         shell: bash
     container:
-      image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
+      image: ${{ vars.HCU_CI_IMAGE_0518 }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -307,7 +326,7 @@ jobs:
         --privileged=true
         -v /ci_public/sglang-das/hcu-wheel-staging:/ci_public/sglang-das/hcu-wheel-staging
     env:
-      TORCH_VERSION: '2.10.0'
+      TORCH_VERSION: '2.11.0'
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
       RESOURCE_SERVER: http://10.16.1.201:8000/
@@ -496,6 +515,7 @@ jobs:
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       HCU_WHEEL_TARGET_SHA: ${{ needs.probe-hcu-wheels.outputs.full_sha }}
       HCU_WHEEL_TARGET_SHORT_SHA: ${{ needs.probe-hcu-wheels.outputs.short_sha }}
+      HCU_WHEEL_EXPECTED_TORCH_VERSION: '2.11.0'
       PROBE_WHEEL_AVAILABLE: ${{ needs.probe-hcu-wheels.outputs.wheel_available }}
       PROBE_WHEEL_URLS: ${{ needs.probe-hcu-wheels.outputs.wheel_urls }}
     steps:
@@ -512,6 +532,7 @@ jobs:
           echo "Waiting for newly staged HCU wheels for ${HCU_WHEEL_TARGET_SHA}"
           echo "Host staging root: ${HCU_WHEEL_STAGING_ROOT}"
           python3 - <<'PY_WAIT' | tee /tmp/hcu_nightly_wheel_paths.out
+          import json
           import os
           import pathlib
           import sys
@@ -520,6 +541,7 @@ jobs:
           root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_ROOT", "/ci_public/sglang-das/hcu-wheel-staging"))
           container_root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_CONTAINER_ROOT", "/hcu-wheel-staging"))
           target_sha = os.environ["HCU_WHEEL_TARGET_SHA"]
+          expected_torch_version = os.environ["HCU_WHEEL_EXPECTED_TORCH_VERSION"]
           short_sha = os.environ.get("HCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
           repo = os.environ["GITHUB_REPOSITORY"]
           owner, repo_name = repo.split("/", 1)
@@ -559,6 +581,22 @@ jobs:
                       continue
                   if not wheel_dir.is_dir():
                       print(f"[wait-hcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
+                      continue
+                  manifest_path = staging_dir / "manifest.json"
+                  try:
+                      manifest = json.loads(manifest_path.read_text())
+                  except (OSError, json.JSONDecodeError) as error:
+                      print(f"[wait-hcu-wheels] invalid manifest {manifest_path}: {error}", file=sys.stderr)
+                      continue
+                  if manifest.get("commit_sha") != target_sha:
+                      print(f"[wait-hcu-wheels] commit mismatch in {manifest_path}", file=sys.stderr)
+                      continue
+                  if manifest.get("torch_version") != expected_torch_version:
+                      print(
+                          f"[wait-hcu-wheels] ignoring Torch {manifest.get('torch_version')} wheels in "
+                          f"{staging_dir}; expected {expected_torch_version}",
+                          file=sys.stderr,
+                      )
                       continue
                   found = {}
                   for wheel in sorted(wheel_dir.glob("*.whl")):
