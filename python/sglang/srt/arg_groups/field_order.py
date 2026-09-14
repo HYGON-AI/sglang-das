@@ -249,6 +249,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_fused_moe_sum_all_reduce",
     "enable_deepseek_v4_fp4_indexer",
     "disable_custom_all_reduce",
+    "custom_all_reduce_backend",
     "enable_mscclpp",
     "enable_torch_symm_mem",
     "enable_scattered_sconv",

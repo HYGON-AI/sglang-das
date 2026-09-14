@@ -639,6 +639,22 @@ class ExecComm(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    custom_all_reduce_backend: A[
+        str,
+        Arg(
+            help=(
+                "Choose the custom all-reduce backend. "
+                "'auto' picks aiter on HIP/HCU when available otherwise the "
+                "native SGLang implementation; 'native' forces the SGLang "
+                "kernel; 'aiter' forces the Hygon/HCU aiter kernel and, when "
+                "AITER_AR_TRANSPORT=fabric, fails hard rather than silently "
+                "falling back; 'off' disables custom all-reduce entirely. "
+                "--disable-custom-all-reduce overrides this and forces 'off'."
+            ),
+            choices=["auto", "native", "aiter", "off"],
+            resolvable=True,
+        ),
+    ] = "auto"
     enable_mscclpp: A[
         bool,
         "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
