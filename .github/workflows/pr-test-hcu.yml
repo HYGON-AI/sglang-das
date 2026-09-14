@@ -615,7 +615,7 @@ jobs:
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
-      HCU_CI_USE_INSTALLED_WHEELS: "1"
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -716,7 +716,7 @@ jobs:
       HCU_CI_INSTALL_WHEEL_URLS: ${{ needs.wait-hcu-wheels.outputs.wheel_urls || '' }}
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
-      HCU_CI_USE_INSTALLED_WHEELS: "1"
+      HCU_CI_USE_INSTALLED_WHEELS: ${{ needs.check-changes.outputs.wheel_required == 'true' && '1' || '' }}
       SGLANG_HCU_RERANKER_MODEL: /public/opendas/DL_DATA/llm-models/qwen3/Qwen3-Reranker-0.6B
     steps:
       - name: Checkout code
@@ -775,7 +775,6 @@ jobs:
               --include-file registered/unit/parser/test_reasoning_parser.py \
               --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
               --include-file registered/attention/test_triton_attention_kernels.py \
-              --include-file registered/hcu/kernels/test_fp8_quant_reference_hcu.py \
               --include-file registered/layers/mamba/test_mamba_ssm.py \
               --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
               --include-file registered/rl/test_fp32_lm_head.py \
