@@ -9,6 +9,8 @@ SHELL ["/bin/bash", "-c"]
 
 ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
+ARG IMAGE_TAG=unknown
+ENV IMAGE_TAG=${IMAGE_TAG}
 
 # pip 配置 + das-install
 RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
@@ -30,16 +32,11 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     'pip install --no-cache-dir --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com "$pkg==$ver"' \
     > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
 
-# AICC 编译器 (nightly 最新版地址由 CI 通过 build-arg 传入, 在镜像内下载安装)
-# AICC_VERSION 由 CI 从同一 URL 解析传入; ENV 指令不支持 bash 参数展开, 无法在 Dockerfile 内由 URL 自动推导
-ARG AICC_URL
-ARG AICC_VERSION
-ENV AICC_VERSION=${AICC_VERSION}
-
-RUN wget -q "${AICC_URL}" -O /tmp/aicc.run && \
-    chmod +x /tmp/aicc.run && \
-    yes | /tmp/aicc.run --dtk_dir /opt/dtk && \
-    rm -f /tmp/aicc.run
+# AICC 编译器 (安装脚本内部解析 nightly 最新版本)
+RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
+    chmod +x /tmp/hcu_llvm_installer.sh && \
+    bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
+    rm -f /tmp/hcu_llvm_installer.sh
 
 RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
