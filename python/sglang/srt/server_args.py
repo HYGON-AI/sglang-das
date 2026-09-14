@@ -75,6 +75,7 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_media_url_security,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -2113,6 +2114,22 @@ class ServerArgs:
         ),
         NS("exec.comm"),
     ] = False
+    custom_all_reduce_backend: A[
+        str,
+        Arg(
+            help=(
+                "Choose the custom all-reduce backend. "
+                "'auto' picks aiter on HIP/HCU when available otherwise the "
+                "native SGLang implementation; 'native' forces the SGLang "
+                "kernel; 'aiter' forces the Hygon/HCU aiter kernel and, when "
+                "AITER_AR_TRANSPORT=fabric, fails hard rather than silently "
+                "falling back; 'off' disables custom all-reduce entirely. "
+                "--disable-custom-all-reduce overrides this and forces 'off'."
+            ),
+            choices=["auto", "native", "aiter", "off"],
+        ),
+        NS("exec.comm"),
+    ] = "auto"
     enable_mscclpp: A[
         bool,
         "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
@@ -8824,6 +8841,32 @@ class ServerArgs:
         )
         if self.enable_deterministic_inference:
             envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+        # Normalize custom_all_reduce_backend: --disable-custom-all-reduce wins,
+        # else on HIP with legacy SGLANG_USE_AITER_AR=1 promote auto -> aiter.
+        if self.disable_custom_all_reduce:
+            if self.custom_all_reduce_backend != "off":
+                logger.info(
+                    "--disable-custom-all-reduce overrides "
+                    "--custom-all-reduce-backend=%s to 'off'.",
+                    self.custom_all_reduce_backend,
+                )
+            self._declare(
+                "_handle_environment_variables",
+                custom_all_reduce_backend="off",
+            )
+        elif (
+            self.custom_all_reduce_backend == "auto"
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_AR", default="false")
+        ):
+            logger.info(
+                "Promoting custom_all_reduce_backend from 'auto' to 'aiter' "
+                "because SGLANG_USE_AITER_AR=1 is set on HIP."
+            )
+            self._declare(
+                "_handle_environment_variables",
+                custom_all_reduce_backend="aiter",
+            )
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(

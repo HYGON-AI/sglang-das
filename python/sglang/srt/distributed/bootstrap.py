@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_custom_all_reduce_backend,
     set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
@@ -189,6 +190,7 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
 
 def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
+    set_custom_all_reduce_backend(get_exec().comm.custom_all_reduce_backend)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
     set_flashinfer_allreduce_only(
