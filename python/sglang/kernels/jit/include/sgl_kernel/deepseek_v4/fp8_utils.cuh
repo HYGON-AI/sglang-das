@@ -52,7 +52,7 @@ SGL_DEVICE float fp8_e4m3_clip(float val) {
 // Upstream splits ROCm into a gfx950/gfx12xx hardware convert and a uint16-backed
 // software cast. Neither fits this fork: fp8x2_e4m3_t is the native HIP vector
 // type here (sgl_kernel/utils.cuh), so the typed construction performs the
-// conversion on every arch, and DCU arches lack the hardware convert instruction.
+// conversion on every arch, and HCU arches lack the hardware convert instruction.
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
 }
