@@ -355,6 +355,12 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 f"active_pages={selected_pages.numel()}, capacity={staging.shape[0]}"
             )
 
+        if broadcast_kind == "extra":
+            # A zero-query rank can skip attention and leave the previous extra
+            # broadcast active. Drain it before the owner's compact copy writes
+            # the shared C4/C128 storage, not only when start() launches NCCL.
+            self._broadcast_slots.clear("extra")
+
         active_pages = selected_pages.numel()
         broadcast_pages = max(1, active_pages)
         owner_cp = self._get_layer_owner_rank(layer_id)
@@ -409,15 +415,25 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                     self._pool_num_pages(self.swa_kv_pool),
                     lambda n: self.swa_kv_pool.create_buffer(num_pages=n),
                 )
-                for ratio, pool in (
-                    (4, self.c4_kv_pool),
-                    (128, self.c128_kv_pool),
-                ):
-                    self._staging.allocate(
-                        self._extra_family_name(ratio),
-                        self._pool_num_pages(pool),
-                        lambda n, pool=pool: pool.create_buffer(num_pages=n),
-                    )
+                # C4 and C128 are mutually exclusive within a layer. Both use
+                # the same "extra" broadcast slot; the eager layer loop consumes
+                # its attention input before the next layer reuses this storage.
+                # Keep their different padded page layouts as separate views.
+                stage_ratios = self.compression_ratios[
+                    self._stage_start : self._stage_end
+                ]
+                self._staging.allocate_shared(
+                    {
+                        self._extra_family_name(ratio): (
+                            self._pool_num_pages(pool) if ratio in stage_ratios else 0,
+                            lambda n, pool=pool: pool.create_buffer(num_pages=n),
+                        )
+                        for ratio, pool in (
+                            (4, self.c4_kv_pool),
+                            (128, self.c128_kv_pool),
+                        )
+                    }
+                )
                 indexer_pool = self.c4_indexer_kv_pool
                 self._staging.allocate(
                     "indexer",

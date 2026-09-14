@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import prod
 from typing import Callable, Optional
 
 import torch
@@ -104,3 +105,36 @@ class StagingBufferManager:
 
     def get_existing(self, family: str) -> Optional[torch.Tensor]:
         return self._buffers.get(family)
+
+    def allocate_shared(
+        self, families: dict[str, tuple[int, Callable[[int], torch.Tensor]]]
+    ) -> None:
+        """Allocate aliased views for families with disjoint read/write lifetimes.
+
+        Zero-page templates preserve each pool's padded page ABI without first
+        allocating separate full-sized buffers. Callers must serialize reuse.
+        """
+        if not families:
+            return
+        for family, (num_pages, _) in families.items():
+            if family in self._buffers:
+                raise RuntimeError(f"Staging buffer is already allocated: {family}")
+            if num_pages < 0:
+                raise ValueError(f"Negative staging page count: {family}={num_pages}")
+
+        templates = {
+            family: allocate_fn(0)
+            for family, (_, allocate_fn) in families.items()
+        }
+        first = next(iter(templates.values()))
+        shapes = {}
+        for family, template in templates.items():
+            if template.ndim < 1 or template.shape[0] != 0:
+                raise ValueError("Shared staging requires zero-page templates")
+            if template.dtype != first.dtype or template.device != first.device:
+                raise ValueError("Shared staging requires matching dtype and device")
+            shapes[family] = (families[family][0], *template.shape[1:])
+
+        storage = first.new_zeros(max(prod(shape) for shape in shapes.values()))
+        for family, shape in shapes.items():
+            self._buffers[family] = storage[: prod(shape)].view(shape)
