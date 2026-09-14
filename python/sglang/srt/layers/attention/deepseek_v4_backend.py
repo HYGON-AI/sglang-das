@@ -92,6 +92,11 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    cp_cache_layer_split_resolve_store_swa_loc,
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prepare_cp_cache_layer_split_forward,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -1456,6 +1461,7 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
+        maybe_prepare_cp_cache_layer_split_forward(self.token_to_kv_pool, forward_batch)
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
@@ -1716,7 +1722,16 @@ class DeepseekV4AttnBackend(
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        pool = self.token_to_kv_pool
+        if is_cp_cache_layer_split_deepseek_v4_pool(pool):
+            swa_loc = cp_cache_layer_split_resolve_store_swa_loc(
+                pool, layer_id, forward_batch, forward_batch.out_cache_loc,
+                swa_k.shape[0],
+            )
+            if swa_loc is None:
+                return
+        else:
+            swa_loc = self.get_swa_out_cache_loc(forward_batch)
         if self.token_to_kv_pool.is_bf16_attention_kv_cache or (
             envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
         ):
@@ -2171,7 +2186,12 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-
+        is_cp_cache_layer_split = is_cp_cache_layer_split_deepseek_v4_pool(
+            token_to_kv_pool
+        )
+        use_cp_cache_layer_split_prefill = (
+            is_cp_cache_layer_split and dsa_use_prefill_cp(forward_batch)
+        )
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
@@ -2209,6 +2229,14 @@ class DeepseekV4AttnBackend(
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+            if use_cp_cache_layer_split_prefill:
+                swa_page_indices = token_to_kv_pool.remap_swa_indices_for_read(
+                    layer_id, swa_page_indices
+                )
+                if extra_indices is not None:
+                    extra_indices = token_to_kv_pool.remap_extra_indices_for_read(
+                        layer_id, extra_indices
+                    )
 
             def match_num_queries(x, value):
                 if x is None or x.shape[0] == q.shape[0]:
@@ -2510,6 +2538,16 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
+        swa_token_ids = cache.swa_token_ids
+        if is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool):
+            swa_token_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                layer_id, swa_token_ids, family="swa"
+            )
+            if flat_token_ids is not None:
+                flat_token_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                    layer_id, flat_token_ids, family="extra"
+                )
+
         if envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get():
             from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
 
@@ -2523,7 +2561,7 @@ class DeepseekV4AttnBackend(
                 )
             dsv4_dequantize_k_cache_paged_out(
                 token_to_kv_pool.get_swa_key_buffer_radix(layer_id).view(torch.uint8),
-                cache.swa_token_ids,
+                swa_token_ids,
                 swa_slice,
                 cache.swa_page_size,
             )
@@ -2537,7 +2575,7 @@ class DeepseekV4AttnBackend(
                 )
             dequantize_k_cache_paged(
                 token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-                cache.swa_token_ids,
+                swa_token_ids,
                 page_size=cache.swa_page_size,
                 out=swa_slice,
             )

@@ -166,6 +166,11 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -607,6 +612,38 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _can_dsa_cp_split_for_deepseek_v4(
+    input_ids_len: int,
+    cp_size: int,
+    use_dsa: bool,
+    forward_batch: ForwardBatch,
+) -> bool:
+    if can_dsa_cp_split(input_ids_len, cp_size, use_dsa, forward_batch):
+        return True
+    if (
+        not use_dsa
+        or not is_dsa_prefill_cp_round_robin_split()
+        or cp_size <= 1
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or input_ids_len == 0
+        or input_ids_len % cp_size != 0
+    ):
+        return False
+    extend_seq_lens = forward_batch.extend_seq_lens_cpu
+    if extend_seq_lens is None:
+        return False
+    real_extend_tokens = sum(int(x) for x in extend_seq_lens)
+    if real_extend_tokens == 0:
+        return False
+    token_to_kv_pool = get_token_to_kv_pool()
+    # LayerSplit KV is CP-sharded, so tiny padded prefill batches still need
+    # the CP path to broadcast/remap non-owned layers before attention reads.
+    can_force_tiny_cp = is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
+    if not can_force_tiny_cp:
+        return False
+    return True
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def deepseek_v4_attention_with_output(
@@ -1043,6 +1080,9 @@ class MQALayer(MqaAttentionBase):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
+        pool = get_token_to_kv_pool()
+        if is_cp_cache_layer_split_deepseek_v4_pool(pool) and pool.should_skip_swa_write(self.layer_id):
+            return
         if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
@@ -1416,6 +1456,9 @@ class MQALayer(MqaAttentionBase):
         )
         do_fused_qk_norm_rope = (unified and (is_decode or fuse_verify)) or (
             not unified and self.use_fused_qk_norm_rope
+            and not (
+                use_cp and is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            )
         )
 
         if do_fused_qk_norm_rope:
@@ -1591,8 +1634,28 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
 
+        maybe_prefetch_cp_kv_swa(get_token_to_kv_pool(), self.layer_id, forward_batch)
+
         del qkv_a
 
+        token_to_kv_pool = get_token_to_kv_pool()
+        reorder_c4_extra = (
+            use_cp
+            and self.indexer is not None
+            and self.compressor is not None
+            and is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
+            and token_to_kv_pool.should_prefetch_extra_from_page_table(self.layer_id)
+        )
+
+        if reorder_c4_extra:
+            # LayerSplit runs C4 compression before the indexer so the extra-KV
+            # broadcast can overlap with indexer work on this layer.
+            attn_backend.forward_core_compressor(
+                x,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
+            )
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1600,7 +1663,7 @@ class MQALayer(MqaAttentionBase):
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )
-        if self.compressor is not None:
+        if self.compressor is not None and not reorder_c4_extra:
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
@@ -1620,7 +1683,15 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant=None,
     ) -> torch.Tensor:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+        token_to_kv_pool = get_token_to_kv_pool()
+        use_layer_split_prefill = is_cp_cache_layer_split_deepseek_v4_pool(
+            token_to_kv_pool
+        ) and dsa_use_prefill_cp(forward_batch)
+        if (
+            not get_attn_tp_context().input_scattered
+            and x.shape[0] == 0
+            and not use_layer_split_prefill
+        ):
             return x
 
         attn_backend = get_attn_backend()
@@ -1667,7 +1738,10 @@ class MQALayer(MqaAttentionBase):
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink()
 
-        if enable_multi_stream:
+        has_tokens = x.shape[0] > 0 or get_attn_tp_context().input_scattered
+        q: torch.Tensor
+        kv: Optional[torch.Tensor]
+        if enable_multi_stream and has_tokens:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
@@ -1698,6 +1772,9 @@ class MQALayer(MqaAttentionBase):
                     x_quant=x_quant,
                 )
             kv = None
+            maybe_prefetch_cp_kv_swa(
+                get_token_to_kv_pool(), self.layer_id, forward_batch
+            )
         else:
             q, kv = self._forward_prepare(
                 x,
@@ -1707,6 +1784,16 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
             )
+
+        if not has_tokens:
+            maybe_wait_cp_kv_swa_prefetch(
+                get_token_to_kv_pool(), self.layer_id, forward_batch
+            )
+            assert not self.wo_b.reduce_results
+            return x
+        maybe_wait_cp_kv_swa_prefetch(
+            get_token_to_kv_pool(), self.layer_id, forward_batch
+        )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
@@ -3256,7 +3343,10 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        run_tbo = (
+            self._can_run_tbo(forward_batch) and not capture_dspark
+            and not is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+        )
         if deferred_mhc_input is not None:
             if not run_tbo:
                 hidden_states = _repeat_mhc_input_on_cp_rank(
@@ -3544,7 +3634,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+            if _can_dsa_cp_split_for_deepseek_v4(
+                len(input_ids), self.cp_size, True, forward_batch
+            ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
@@ -3562,6 +3654,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
+            elif is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool()):
+                forward_batch.attn_cp_metadata = None
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
