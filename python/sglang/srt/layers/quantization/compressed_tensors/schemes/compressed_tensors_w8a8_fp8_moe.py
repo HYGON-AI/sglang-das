@@ -40,8 +40,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -77,12 +76,13 @@ logger = logging.getLogger(__name__)
 
 
 def is_moe_prefill_or_normal():
-    args = get_global_server_args()
-    return args.disaggregation_mode == "prefill" or args.deepep_mode == "normal"
+    return (
+        get_disagg().disaggregation_mode == "prefill"
+        or get_exec().moe.deepep_mode == "normal"
+    )
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
-
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -254,9 +254,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         # INPUT_SCALES
         if self.static_input_scales:
-            assert (
-                self.input_quant.strategy == QuantizationStrategy.TENSOR
-            ), "Only per-tensor quantization is supported for static input scales"
+            assert self.input_quant.strategy == QuantizationStrategy.TENSOR, (
+                "Only per-tensor quantization is supported for static input scales"
+            )
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )

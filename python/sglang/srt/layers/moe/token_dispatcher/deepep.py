@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from contextlib import nullcontext
@@ -45,7 +46,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -83,7 +83,7 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import get_model, get_resources
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
@@ -480,6 +480,10 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
+            DispatcherOutputDtype.MXFP8: {
+                "use_fp8": False,
+                "use_nvfp4": False,
+            },
         }
 
         # Validate and apply hardware-specific adjustments
@@ -496,6 +500,25 @@ class _DeepEPDispatcherImplBase:
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
+        self.low_latency_quant_mode = None
+        self._low_latency_quant_mode_runtime_checked = False
+        if self.deepep_output_dtype == DispatcherOutputDtype.MXFP8:
+            if not _is_npu or self.dispatch_mode != DeepEPMode.LOW_LATENCY:
+                raise RuntimeError(
+                    "MXFP8 DeepEP dispatch is supported only for A5 "
+                    "low-latency dispatch."
+                )
+
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            if not is_npu_arch35():
+                raise RuntimeError(
+                    "MXFP8 DeepEP dispatch is supported only on Ascend A5 "
+                    "in low-latency mode."
+                )
+            self.low_latency_quant_mode = "mx_fp8_e4m3"
+            return
+
         if _is_npu:
             if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
@@ -646,7 +669,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 expert_alignment=(
                     256
                     if (
-                        get_global_server_args().quantization == "slimquant_marlin"
+                        get_model().quantization == "slimquant_marlin"
                         or _use_fp8_w8a8_moe
                         or _use_marlin_w16a16_moe
                     )
@@ -855,6 +878,49 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
+        if (
+            self.low_latency_quant_mode is not None
+            and not self._low_latency_quant_mode_runtime_checked
+        ):
+            try:
+                dispatch_signature = inspect.signature(buffer.low_latency_dispatch)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "A5 MXFP8 DeepEP dispatch requires a recent "
+                    "sgl-kernel-npu/DeepEP runtime exposing "
+                    "low_latency_dispatch(..., quant_mode=...)."
+                ) from exc
+            if "quant_mode" not in dispatch_signature.parameters:
+                raise RuntimeError(
+                    "A5 MXFP8 DeepEP dispatch requires a recent "
+                    "sgl-kernel-npu/DeepEP runtime exposing "
+                    "low_latency_dispatch(..., quant_mode=...)."
+                )
+            self._low_latency_quant_mode_runtime_checked = True
+
+        use_fp8 = self.use_fp8
+        low_latency_quant_kwargs = {}
+        if self.low_latency_quant_mode is not None:
+            deep_use_mode = os.environ.get("DEEP_USE_MODE", "default")
+            if deep_use_mode == "default":
+                low_latency_quant_kwargs = {
+                    "quant_mode": self.low_latency_quant_mode,
+                }
+            elif deep_use_mode == "ops":
+                # The ops strategy ignores quant_mode and uses the legacy
+                # flags. Pass both forms so the request is explicit and the
+                # strategy still produces E4M3 + E8M0 MXFP8 tensors.
+                use_fp8 = True
+                low_latency_quant_kwargs = {
+                    "quant_mode": self.low_latency_quant_mode,
+                    "use_ue8m0": True,
+                }
+            else:
+                raise RuntimeError(
+                    "A5 MXFP8 DeepEP dispatch supports only "
+                    "DEEP_USE_MODE=default or DEEP_USE_MODE=ops; got "
+                    f"{deep_use_mode!r}."
+                )
         _deepep_precompile_tp_barrier()
         if use_groupgemm:
             if _use_fp8_w8a8_moe:
@@ -906,7 +972,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     topk_ids,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
-                    use_fp8=self.use_fp8,
+                    use_fp8=use_fp8,
+                    **low_latency_quant_kwargs,
                     **(
                         dict(topk_weights=topk_weights)
                         if _is_npu and not _use_zbal

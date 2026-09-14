@@ -37,7 +37,7 @@ if _is_hcu and _use_triton_vllm_fa:
 
 import torch
 
-_SERVER_ARGS = None
+_MODEL_CONFIG = None
 IS_SLIMQUANT_W4A8 = None
 IS_KVCACHE_FP8_E4M3 = None
 
@@ -232,14 +232,14 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
 ):
-    global _SERVER_ARGS, IS_SLIMQUANT_W4A8, IS_KVCACHE_FP8_E4M3
+    global _MODEL_CONFIG, IS_SLIMQUANT_W4A8, IS_KVCACHE_FP8_E4M3
 
     if IS_KVCACHE_FP8_E4M3 is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_model
 
-        _SERVER_ARGS = get_global_server_args()
-        IS_SLIMQUANT_W4A8 = _SERVER_ARGS.quantization == "slimquant_w4a8_marlin"
-        IS_KVCACHE_FP8_E4M3 = _SERVER_ARGS.kv_cache_dtype == "fp8_e4m3"
+        _MODEL_CONFIG = get_model()
+        IS_SLIMQUANT_W4A8 = _MODEL_CONFIG.quantization == "slimquant_w4a8_marlin"
+        IS_KVCACHE_FP8_E4M3 = _MODEL_CONFIG.kv_cache_dtype == "fp8_e4m3"
 
     if is_nmz_fp8(k.dtype) and not IS_SLIMQUANT_W4A8 and not IS_KVCACHE_FP8_E4M3:
         q_descale = torch.ones_like(k_descale)

@@ -1,0 +1,14 @@
+# Gitleaks false positives in upstream sglang commits; none of them is a credential.
+#
+# The HYGON quality gate scans every commit in base..head. Official sync PRs land
+# on main as squash merges, so these upstream commits never enter main's history
+# and are re-scanned by each later sync PR. Every entry is pinned to
+# commit:file:rule:line and suppresses nothing else.
+
+# SenseNova-U1 (#36606): transformers import line inside a usage docstring.
+daf66f6670724b27e07f26b99514517d82e1a89f:python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_qwen3.py:generic-api-key:1464
+# CPU FP8 KV cache (#32733): torch dtype comparison on the KV buffer.
+26f760d5c0e67973a94d5f35d8d9aa98d23b26c0:python/sglang/srt/layers/attention/intel_amx_backend.py:generic-api-key:315
+# GLM 5.3 Flash kernels (#37477): torch dtype assertions on the index key tensor.
+c66a285c94bfeb224697560c88c936948f1fe923:python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py:generic-api-key:765
+c66a285c94bfeb224697560c88c936948f1fe923:python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py:generic-api-key:1641

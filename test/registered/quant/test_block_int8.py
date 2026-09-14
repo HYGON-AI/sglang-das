@@ -32,7 +32,7 @@ register_hcu_ci(
 
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=44, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=22, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -44,9 +44,9 @@ def native_per_token_group_quant_int8(x, group_size, eps=1e-10, dtype=torch.int8
     quantized tensor along with the scaling factor used for quantization.
     Note that only `torch.float8_e4m3fn` is supported for now.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     iinfo = torch.iinfo(dtype)

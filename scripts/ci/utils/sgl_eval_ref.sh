@@ -1,3 +1,8 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# shellcheck disable=SC2034
+
 # Single source of truth for the sgl-eval commit every CI variant installs.
 # Meant to be sourced, not executed -- each variant then installs
 # "$SGL_EVAL_SPEC" with its own pip invocation, since those differ (uv pip on

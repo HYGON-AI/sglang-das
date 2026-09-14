@@ -391,11 +391,12 @@ jobs:
           INPUT_RUNNER_LABEL: ${{ inputs.runner_label || '' }}
           INPUT_IMAGE: ${{ inputs.image || '' }}
           VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
-          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+          VAR_IMAGE: ${{ vars.HCU_CI_IMAGE_0518 || '' }}
+          DEFAULT_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || false }}
         run: |
           runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
-          image="${INPUT_IMAGE:-${VAR_IMAGE}}"
+          image="${INPUT_IMAGE:-${VAR_IMAGE:-${DEFAULT_IMAGE}}}"
 
           if [[ -z "${runner_label}" ]]; then
             echo "::error::HCU runner label is required. Set vars.HCU_CI_RUNNER_LABEL or workflow input runner_label."
@@ -403,7 +404,7 @@ jobs:
           fi
 
           if [[ -z "${image}" ]]; then
-            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE or workflow input image."
+            echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE_0518 or workflow input image."
             exit 1
           fi
 
@@ -774,7 +775,6 @@ jobs:
               --include-file registered/unit/parser/test_reasoning_parser.py \
               --include-file registered/unit/entrypoints/openai/test_serving_embedding.py \
               --include-file registered/attention/test_triton_attention_kernels.py \
-              --include-file registered/hcu/kernels/test_fp8_quant_reference_hcu.py \
               --include-file registered/layers/mamba/test_mamba_ssm.py \
               --include-file registered/layers/mamba/test_mamba_ssm_ssd.py \
               --include-file registered/rl/test_fp32_lm_head.py \

@@ -38,8 +38,6 @@ else:
 
     from sgl_kernel.allreduce import *
     from sgl_kernel.attention import (
-        cutlass_mla_decode,
-        cutlass_mla_get_workspace_size,
         merge_state_v2,
         normal_decode_metadata_general,
     )
@@ -69,10 +67,7 @@ else:
         es_sm100_mxfp8_blockscaled_grouped_quant,
     )
     from sgl_kernel.gemm import (
-        awq_dequantize,
         fp8_scaled_mm,
-        gptq_gemm,
-        gptq_shuffle,
         int8_scaled_mm,
         sgl_per_token_group_quant_8bit,
         sgl_per_token_group_quant_fp8,
@@ -165,15 +160,12 @@ else:
     _DEBUG_EXPORT_NAMES = [
         "apply_shuffle_mul_sum",
         "apply_token_bitmask_inplace_cuda",
-        "awq_dequantize",
         "build_tree_kernel_efficient",
         "causal_conv1d_fwd",
         "causal_conv1d_update",
         "concat_mla_absorb_q",
         "concat_mla_k",
         "copy_to_gpu_no_ce",
-        "cutlass_mla_decode",
-        "cutlass_mla_get_workspace_size",
         "dsv4_fused_k_norm_rope_flashmla",
         "dsv4_fused_q_indexer_rope_hadamard_quant",
         "dsv4_fused_q_norm_rope",
@@ -192,8 +184,6 @@ else:
         "gelu_tanh_and_mul",
         "gemma_fused_add_rmsnorm",
         "gemma_rmsnorm",
-        "gptq_gemm",
-        "gptq_shuffle",
         "int8_scaled_mm",
         "kimi_k2_moe_fused_gate",
         "l2norm",

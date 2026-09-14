@@ -14,6 +14,19 @@
 #include <cfloat>
 #include <cstdint>
 
+// Upstream mask width fix, kept for parity. This fork does not use it: the
+// shuffles below go through device::warp::shfl_down (sgl_kernel/warp.cuh),
+// which drops the mask entirely under ROCm and so is correct on HCU wave64 --
+// the branch below would still hand a 32-bit mask to __shfl_down_sync there.
+// gfx1250 needs a 64-bit __shfl_*_sync mask (static_assert sizeof == 8); it's
+// masked to wave32 internally, so 64-bit is fine everywhere. __gfx1250__ is
+// device-pass only, so widen in the host pass too or the launch stub won't build.
+#if defined(__gfx1250__) || (defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_DEVICE_COMPILE__))
+#define SGL_WARP_SYNC_MASK 0xFFFFFFFFFFFFFFFFULL
+#else
+#define SGL_WARP_SYNC_MASK 0xFFFFFFFF
+#endif
+
 namespace sglang {
 
 constexpr uint32_t kWarpSize = 32;
@@ -47,8 +60,8 @@ __device__ __forceinline__ float compute_score(float x) {
     // sigmoid(x) = 1 / (1 + exp(-x))
     return 1.0f / (1.0f + expf(-x));
   } else {
-    // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
-    float softplus = log1pf(expf(x));
+    // sqrt(softplus(x)); sign folded out because expf overflows above 88.7.
+    const float softplus = fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
     return sqrtf(softplus);
   }
 }

@@ -2675,3 +2675,258 @@ on an already-warm build. The server-side aggregate decode throughput above is
 the meaningful signal. A like-for-like perf comparison needs a warm re-run.
 
 All eight cards returned to 2 MiB after shutdown.
+
+---
+
+## Sync/official main daily 20260907
+
+Anchored on `a9d5ca723a30b80655954688eef6e0e66cacb025` with `git merge -s ours`
+(tree unchanged, `3c38e25aaed…`); the 20260831 sync had landed as squash merge
+`50bacb0280`, so `merge-base` would otherwise have replayed 1170 commits instead
+of 401. Third time this trap has come up -- see `fp-base-is-second-parent`.
+
+Official tip `97dcbf9410c1df1b7a4d341c4ed021f06f8d5087`.
+401 commits, 3592 files, +210994 / −53009. **79 conflicted files / 113 hunks.**
+
+Full write-up in `sync-official-main-20260907-summary.md`. The load-bearing points:
+
+**Upstream fixed it better, ours dropped (3):** the `quick_all_reduce.cuh` arch
+gate (official's empty-asm reassociation barrier is portable, no HCU special
+case needed); the commented-out low-latency DeepEP DeepGEMM assert (official
+re-enabled it with the `quant_config is not None` guard we were working around);
+the DSA `raw_indices` shape assert (official's row-chunked `run_topk_transform`
+slices `raw_indices[rows]`, so the global assert is no longer even true).
+
+**Ours kept (4):** `moe_fused_gate.cuh` -- official's new `SGL_WARP_SYNC_MASK`
+only widens for gfx1250 and the AMD host pass, so a DCU device pass still gets a
+32-bit mask, the exact bug we fixed; `allocator/swa.py` -- official's one-line
+version can double-free a page shared by several full tokens at `page_size > 1`;
+`glm4_moe.py` -- official's one-liner AttributeErrors when `quant_method` has no
+`quant_config`; `kv_cache_dtype.py` -- HCU supports `fp8_e5m2` natively, so the
+new HIP→`fp8_dtype` (e4m3) rewrite is gated off for us.
+
+**Relocations forced by the `server_args.py` split (−3585 lines into
+`arg_groups/`):** `_pre_warm_nccl_help`, `minimax_opt`, `record_nolora_graph`,
+`pack_paged_kv_to_varlen*`, `"lightop"`, the eight `HCU_*_CHOICES`,
+`"layout_hcu"`. The `SGLANG_OPT_USE_TOPK_V2 and not _is_hcu` gate collapsed into
+`DSATopKBackend.should_use_topk_v2()` -- one site now covers all four callers.
+`field_order.py` needs no edit: a name absent from it sorts last, which is the
+compatible position for a new field anyway.
+
+**mHC PP proxy, nearly lost.** Official extracted `profile_and_init_predictor`
+into `scheduler_components/dynamic_chunk_sizer.py`, and the extracted copy
+allocates a 2-D proxy `(tokens, hidden)`. DeepSeek-V4 packs mHC into
+hidden_states, so it has to be `(tokens, hc_mult, hidden)`. Ported our
+`get_pp_proxy_hidden_states_shape` into the new home.
+
+**Three nested duplicates flattened.** Successive syncs had stacked our old
+copies under upstream's later restructures, leaving unreachable branches in
+`compressor_v2.py` and `deepseek_v2.py` (router GEMM) and a stale
+`breakable_prefill` in `dp_attn.py`. Only the genuinely-ours branches were
+grafted back: the `is_bf16_attention_kv_cache` store flag and the
+`_is_hcu and is_deepseek_v4` fp32 router-logits path. The aiter `expert_mask` in
+`ep_moe/layer.py` was deleted -- upstream moved it to
+`DeepEPDispatcher.expert_mask_gpu` and nothing read our copy.
+
+### Static gates
+
+| Gate | Result |
+|---|---|
+| `compileall` (python/sglang + test) | pass |
+| `environ.py` whole-file symbol diff | pass. base 588 / ours 647 / theirs 600 / merged 659. The 3 ours-only names missing (`SGLANG_ENABLE_CP_V2`, `SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK`, `SGLANG_SORT_FREE_LIST_AFTER_MERGE`) are byte-identical in base and ours and were **deleted by official**; zero references remain tree-wide |
+| `envs.SGLANG_*` reference audit | pass. merged 82 / ours 97 / theirs 94 undeclared; no new dangling reference |
+| cross-module import (AST, 3-way) | pass. Sole candidate `FLYDSL_NORM_MIN_ALIGNED_DIM` verified a false positive -- `kernels/ops/diffusion/__init__.py` re-exports it through `__getattr__`; it only fails here because `flydsl` (a gfx1250 dep) is not installed |
+| ruff F821/F811/F401 (3-way) | pass. merged 255 / ours 248 / theirs 237; **0 introduced by the merge** after normalising line numbers |
+
+Two real defects surfaced, **both in files that never conflicted**:
+
+1. `model_loader/checkpoint_quantization.py` -- upstream swapped the `_get_field`
+   helper for `_as_config_mapping(...).get(...)` and dropped the
+   `text_config.compression_config` lookup. Auto-merge took the rewrite but kept
+   our call site: `NameError` on that path (reachable for kimi_k26-style
+   multimodal compressed-tensors checkpoints). Rewritten in upstream's idiom with
+   our lookup preserved.
+2. `multimodal_gen/runtime/loader/fsdp_load.py` -- `initialize_model()` replaced
+   the `set_default_torch_dtype` context; only our import survived. Removed.
+
+### Runtime defect found by validation, not by any gate
+
+First prefill died with
+`TypeError: object of type 'NoneType' has no len()` at `allocator/swa.py:379`.
+
+Upstream #37146 replaced `PagedTokenToKVPoolAllocator.release_pages` with a
+`staged_pages` list; `release_pages` now stays at the `base.__init__` default of
+`None` for paged allocators, and `get_all_free_pages()` is the accessor that
+spans both containers. Our fork reached into the field directly in two places --
+`paged.py` `free()` (the repeated-free guard) and `swa.py` `free_swa()` (the
+already-free skip). Official's `paged.py` mentions `release_pages` zero times, so
+both sites are ours. Both now go through `get_all_free_pages()`; the `swa.py`
+site no longer needs its own `merge_and_sort_free()` because the accessor already
+covers the staged frees.
+
+Worth noting this is **not a merge regression** -- our parent `d93a583ba2` has the
+same two unguarded reads. It only became reachable because upstream changed the
+allocator underneath. Neither conflict markers nor any static gate can see it:
+`release_pages` is an attribute access, not an undefined name, and neither file
+was among the 79 conflicts. Cross-file implicit coupling like this is only caught
+by actually running the thing.
+
+The change also tightens the already-free filter rather than loosening it: the
+old test compared against `free_pages` alone and missed staged frees, which had
+left a latent double-free between our pre-pass free and the `_release_swa` tail
+(newly assert-checked upstream).
+
+### Runtime validation: passed (agent-observed, 2026-09-08)
+
+`zz-nmz26` / `rye_sglang_latest`. `sgl-kernel` rebuilt from this merge with
+`install_sglang.sh` (19 hipcc units, gfx906/926/928/936/938) -- required, since
+`quick_all_reduce.cuh`, `quick_all_reduce_base.h`, `topk.hip`,
+`include/hip/dsa_topk_coop.cuh` and the wheel's Python side all changed.
+
+`bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`
+(pure TP8, `mem_fraction_static=0.8`, `max_total_num_tokens=2870016`):
+
+| Check | Result |
+|---|---|
+| Server ready | yes |
+| Greedy sanity | `"The capital of France is **Paris**."` |
+| **GSM8K 100q** | **1.000** (avg 7.678 s, 15.62 tok/s per request) |
+| Peak aggregate decode throughput | 803.26 tok/s |
+| CUDA graph | active on decode |
+| Traceback / VMFault / illegal access / scheduler exception | 0 / 0 / 0 / 0 |
+
+Eight `multimem all-gather disabled` lines -- the same benign RCCL fallback count
+as the 20260817 run. All eight cards returned to 0% after shutdown.
+
+**Three failed attempts before this one, none of them code:** the first crashed on
+the `release_pages` defect above; the second hit `[Errno 98] Address already in
+use` because `pkill -f "sglang.launch_server"` matches nothing (this script
+launches `sglang serve`, so 15 processes from the first run survived and kept the
+port); the third was cut off mid-CUDA-graph-capture by a host restart. Note that
+`hy-smi` showed 0% HCU during the second failure while the stale processes still
+held both VRAM and the port -- read the `VRAM%` column, not `HCU%`, when checking
+whether a box is really free.
+
+---
+
+## Sync/official main daily 20260914
+
+The 20260907 sync landed on main as squash merge `ee0f2375e5` (#328) again, so
+`merge-base(main, officials/main)` fell back to `92b1d382c7` and a plain merge
+would have replayed 1502 commits. `#328`'s tree is byte-identical to the
+pre-squash tip `d642fbb8f5`, whose merge `06316d9b76` has official `97dcbf9410`
+as second parent; anchored with `git merge -s ours 97dcbf9410` (`c1b59527c9`,
+tree unchanged). Fourth squash in a row -- see `fp-base-is-second-parent`.
+
+Official tip `0d95a9c1ff14773b722009a6c6fd6ad66c7ce395`. 332 commits,
+1702 files, +115443 / −43998. **60 conflicted files / 72 hunks** (55 content,
+3 file location, 2 modify/delete). Full write-up in
+`sync-official-main-20260914-summary.md`.
+
+**Upstream fixed it better, ours dropped:** `allocator/swa.py` -- the stricter
+`free_swa` block we kept for two syncs is superseded by #38159 (pools page in
+step, whole expanded page cleared, debug assertion), and under the new preamble
+our block no longer even binds `mapping_indices`; `paged.free()` still absorbs
+duplicate page frees. Also taken: the `c4_sparse_raw_indices` check moved to the
+head of the indexer chain, the `use_req_ring` JIT plan-builder signature, and
+official's XPU backend imports (lazily imported, never on HCU).
+
+**Ours kept:** `fp8_utils.cuh` (this fork aliases `fp8x2_e4m3_t` to the native
+`__hip_fp8x2_e4m3` on ROCm, so upstream's `uint16_t` software cast cannot even
+type-check, and its gfx950 hardware convert needs an instruction DCU lacks);
+the `from typing import Annotated as A` imports in `arg_groups/fields/*` (ruff
+F722 cannot see through `arg_utils.A = Annotated`); the HCU `unsqueeze` exclusion
+in `deepseek_v4_backend.py`; the DSV4-safe compressed-tensors detection in
+`deepseek_v2.py` (`_DeepseekV4ConfigAlias` has no `quantization_config`).
+
+**Split or reordered:** cutlass_mla (deleted upstream, #32114) shared hunks with
+our HCU-only `decode_metadata` kernel -- kept the latter, which notably has no
+Python caller on any branch. `fp8.py`'s Fp8MoE post-load chain was reordered so
+HCU takes the ASM b8 shuffle and still reaches the CPU/DeepGEMM arms while a
+non-HCU fnuz platform stops after its fnuz arm, exactly as upstream -- our old
+edit had also silently changed AMD. `scheduler_pp_mixin.py` lost our PP
+`ExpertDistributionReq` pre-forward when upstream folded receive+process into
+`ingest_requests()` (#38389); restored through a default-`None`
+`before_process` hook. `fsdp_load.py` keeps our streaming state-dict branch
+around upstream's reworked full load.
+
+### Static gates
+
+compileall 0 errors; `environ.py` whole-file symbol diff an exact union
+(600 / 659 / 620 → 679), nothing dropped; no new undeclared `envs.*` reference;
+ruff F821/F811/F401/**F722** 3-way 0 introduced (226 / 255 / 228); cross-module
+import 3-way 0 introduced.
+
+**Two new gates, kept for future syncs:**
+
+1. *Preprocessor structure.* The auto-merge rewrote the head of
+   `fp8_utils.cuh` into `#ifdef USE_ROCM … #else … #elif …` -- an `#elif` after
+   `#else` -- **with no conflict marker anywhere near it**. A JIT kernel only
+   reports that when first compiled on the device, i.e. at runtime. The gate walks
+   the directive stack of every C-family file and compares against both parents:
+   407 files, 0 introduced after the fix.
+2. *Dangling attribute reads.* For lines only our side has, every `.name` read on
+   an sglang-owned object (`self`, `forward_batch`, `metadata`, `token_to_kv_pool`,
+   …) must still be bound somewhere in the merged tree. Catches "upstream renamed
+   the field, our code still reads the old name" (this range renamed
+   `c4_seq_lens` → `compressed_seq_lens`). 0 hits; verified on a synthetic case.
+
+### Runtime break no gate could see: `get_global_server_args()`
+
+#38375 kept `def get_global_server_args() -> NoReturn` so imports still resolve,
+but **the call raises RuntimeError**. Import, compile, ruff and the import gate all
+pass. Eight of our files called it -- including
+`compressed_tensors_w8a8_fp8_moe.py`, the MoE scheme DeepSeek-V4-Flash
+FP8-Channel loads. Migrated every read to its namespace bag (`get_disagg()`,
+`get_exec().moe`, `get_exec().kernel`, `get_model()`, `get_parallel()`).
+
+Worse than a crash in two places: `moe/utils.py` wrapped the call in
+`except Exception: pass`, so the RuntimeError was swallowed and **PD mode silently
+answered "ifb"**; `mega_moe.py`'s `except ValueError` did not catch it and would
+have crashed. The bags raise `ValueError` while config is unpublished, which is
+what both guards were written for.
+
+Not a merge regression in the usual sense -- the same calls worked on our
+parent; upstream changed what the callee does.
+
+### Pre-existing debt surfaced (identical on parent `b5108cc7fe`)
+
+Upstream's ratchet unit tests (`base-a-test-cpu`) fail with exactly the same
+entries and counts on our parent and on the merge, so none of this was
+introduced here:
+
+- `test_global_config_read_ratchet`: 31 `get_server_args().field` reads in our
+  code (upstream: 0) -- `communicator.py`, `bailing_moe.py`, `minimax_m2.py`,
+  `qwen2.py` / `qwen3.py` / `qwen3_moe.py`, `fused_moe.py`, `loader.py`.
+- `test_chain_read_ratchet`: `hcu_mla_backend.py:133/136` read
+  `model_runner.server_args.page_size`, `:158` `.speculative_num_draft_tokens`.
+  `page_size` is decided by resolution (HCU defaults to 64), so this is worth
+  checking against an `hcu_mla` model run.
+- `test_supplied_instance_exposure_ratchet`: `scheduler.py` `dp_size` /
+  `enable_dp_attention`, `hiradix_cache.py` `hicache_mem_layout`.
+
+### Runtime validation: passed (agent-observed, 2026-09-14)
+
+`zz-nmz26` / `rye_sglang_latest`, sgl-kernel rebuilt from this merge (0.4.7).
+`bash run_dpsk-v4.sh 10015 /module/DeepSeek-V4-Flash-0731-FP8-Channel`
+(pure TP8, `max_total_num_tokens=2870016`):
+
+| Check | Result |
+|---|---|
+| Greedy sanity | `The capital of France is **Paris**.` |
+| **GSM8K 100q** | **0.99** |
+| Peak aggregate decode throughput | 802.16 tok/s |
+| Traceback / VMFault / scheduler exception | 0 / 0 / 0 |
+
+The one miss is GSM8K index 12, the "lemon tree" item: arithmetic correct
+(90 / 7.5 = 12), but break-even taken for "starts earning" (target 13). Against
+the 9/8 run the prompts are identical 100/100 and extracted answers match 99/100,
+yet only 19/100 full generations are identical -- a small, uniform numeric drift
+under greedy decoding. It traces to #34459, which rewrote `sqrt(softplus(x))` as
+`max(x,0)+log1p(exp(-|x|))` and added a `1e-20` renorm epsilon in exactly the
+Hash-MoE routing kernels (`hash_topk.cuh`, `moe_fused_gate.cuh`, `hash_topk.py`)
+DSV4 uses on HCU. Within the historical pure-TP band (0.95–1.00); accepted.
+
+Eval client note: `rye_sglang_latest` lost evalscope in the 9/8 host restart
+(the local wheelhouse only has 1.5.1), so GSM8K ran from `rye_sglang_open`
+(evalscope 1.10.0, host network) against the service in `rye_sglang_latest`.

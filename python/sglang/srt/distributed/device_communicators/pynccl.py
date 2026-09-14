@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 class PyNcclCommunicator:
-
     def __init__(
         self,
         group: Union[ProcessGroup, StatelessProcessGroup],
@@ -53,9 +52,9 @@ class PyNcclCommunicator:
         """
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
-            assert (
-                dist.get_backend(group) != dist.Backend.NCCL
-            ), "PyNcclCommunicator should be attached to a non-NCCL group."
+            assert dist.get_backend(group) != dist.Backend.NCCL, (
+                "PyNcclCommunicator should be attached to a non-NCCL group."
+            )
             # note: this rank is the rank in the group
             self.rank = dist.get_rank(group)
             self.world_size = dist.get_world_size(group)

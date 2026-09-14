@@ -36,6 +36,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_hcu_ci
 
@@ -87,6 +89,10 @@ class _MockTokenizerManager:
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
 
+    def config_value(self, key):
+        """Support the TokenizerManager API used by current source checkouts."""
+        return getattr(self.server_args, key, None)
+
 
 class _MockTemplateManager:
     """Minimal mock for TemplateManager."""
@@ -96,11 +102,15 @@ class _MockTemplateManager:
         self.jinja_template_content_format: Optional[str] = None
         self.completion_template_name: Optional[str] = None
         self.reasoning_config = None
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)

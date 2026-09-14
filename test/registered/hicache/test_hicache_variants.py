@@ -21,7 +21,7 @@ register_hcu_ci(
 )
 
 
-register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=534, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
@@ -31,7 +31,7 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import is_hcu, is_hip, kill_process_tree
+from sglang.srt.utils import is_hcu, is_hip
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -42,6 +42,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
@@ -53,6 +54,7 @@ class HiCacheBaseServer(CustomTestCase):
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = []
+    server_env: dict = {}
 
     @classmethod
     def setUpClass(cls):
@@ -68,17 +70,19 @@ class HiCacheBaseServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.hicache_args,
+            env=cls.server_env,
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
 
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--mem-fraction-static",
@@ -95,6 +99,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
     model_name = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--trust-remote-code",
         "--enable-hierarchical-cache",
@@ -116,6 +121,7 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
 
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",
@@ -147,6 +153,7 @@ class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     hicache_args = [
         "--enable-hierarchical-cache",
         "--page-size",

@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, regist
 register_hcu_ci(est_time=270, suite="nightly-hcu-vlm", nightly=True, disabled='HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.')
 
 
-register_cuda_ci(est_time=156, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
 """
 Usage:
@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 
 
 class TestVisionChunkedPrefill(CustomTestCase):
-
     def prepare_video_messages(self, video_path, max_frames_num=8):
         from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -205,12 +204,12 @@ class TestVisionChunkedPrefill(CustomTestCase):
         try:
             outputs_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
-                logger.info(f"Chunked test iteration {i+1}/{len(batches)}")
+                logger.info(f"Chunked test iteration {i + 1}/{len(batches)}")
                 output_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_chunked += [output_chunked]
-                logger.info(f"Chunked test iteration {i+1} completed")
+                logger.info(f"Chunked test iteration {i + 1} completed")
         finally:
             logger.info(f"Killing chunked server pid={chunked_server_pid}")
             kill_process_tree(chunked_server_pid)
@@ -224,12 +223,12 @@ class TestVisionChunkedPrefill(CustomTestCase):
             logger.info(f"Non-chunked server started with pid={no_chunked_server_pid}")
             outputs_no_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
-                logger.info(f"Non-chunked test iteration {i+1}/{len(batches)}")
+                logger.info(f"Non-chunked test iteration {i + 1}/{len(batches)}")
                 output_no_chunked = self.generate_for_video(
                     batch=batch, num_frame=num_frame
                 )
                 outputs_no_chunked += [output_no_chunked]
-                logger.info(f"Non-chunked test iteration {i+1} completed")
+                logger.info(f"Non-chunked test iteration {i + 1} completed")
 
         finally:
             logger.info(f"Killing non-chunked server pid={no_chunked_server_pid}")

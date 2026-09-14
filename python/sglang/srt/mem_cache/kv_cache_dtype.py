@@ -5,11 +5,13 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.utils import is_hip
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_hcu, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fn: "fp8_e4m3",
@@ -46,7 +48,12 @@ def configure_kv_cache_dtype(
         else:
             kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp8_e5m2":
-        kv_cache_dtype = torch.float8_e5m2
+        if current_platform.is_cpu():
+            raise ValueError("--kv-cache-dtype fp8_e5m2 is not supported on CPU.")
+        if _is_hip and not _is_hcu:  # Using natively supported format
+            kv_cache_dtype = fp8_dtype
+        else:
+            kv_cache_dtype = torch.float8_e5m2
     elif server_args_kv_cache_dtype == "fp8_e4m3":
         if _is_hip:  # Using natively supported format
             kv_cache_dtype = fp8_dtype

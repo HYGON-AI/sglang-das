@@ -304,7 +304,9 @@ class BailingMoESparseMoeBlock(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         # scaling factor for fused shared experts on AMD-platform.
         fused_shared_experts_scaling_factor = None
@@ -1097,7 +1099,6 @@ class BailingMoEBlock(nn.Module):
 
 
 class BailingMoEModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
