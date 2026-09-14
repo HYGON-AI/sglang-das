@@ -488,6 +488,8 @@ class Envs:
     # ===================================================================
     # DSpark speculative decoding
     # ===================================================================
+    # Opt in to Qwen DSPARK checkpoint and HCU MTP compatibility fixes.
+    SGLANG_USE_QWEN_DSPARK = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -792,6 +794,9 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Opt HCU CUDA graph DP padding into MAX_LEN, enabling all-gather and
+    # fused reduce-scatter for the pure TP-MoE DP-attention path.
+    SGLANG_DP_USE_MAX_LEN = EnvBool(False)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine
@@ -841,6 +846,8 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")  # HCU override
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+
+    SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1335,6 +1342,11 @@ class Envs:
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # ===================================================================
+    # Hunyuan V4
+    # ===================================================================
+    SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+
+    # ===================================================================
     # DeepSeek V4
     # ===================================================================
 
@@ -1355,6 +1367,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.

@@ -523,6 +523,11 @@ class MoEGate(nn.Module):
         if get_exec().deterministic.enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
+        if self.weight.dtype == torch.float32:
+            # HYV4 keeps the router in fp32 (config.router_fp32): upcast the
+            # activations so the router GEMM runs entirely in fp32.
+            return F.linear(hidden_states.float(), self.weight)
+
         if (
             not self.is_deepseek_v4
             and forward_batch is not None

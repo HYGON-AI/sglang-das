@@ -299,6 +299,14 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
+        # Hy4-preview's chat template opens the think block in the generation
+        # prompt for every reasoning_effort except "no_think", so reasoning is
+        # on by default there, unlike the earlier Hunyuan templates.
+        self.is_hy_v4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "hy_v4"
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -2296,6 +2304,13 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
             request.skip_special_tokens = False
+        # Hunyuan (Hy3/Hy4) emits its reasoning/tool structural tokens as
+        # *special* tokens (e.g. <think:xxx>, </think:xxx>, <tool_calls:xxx>,
+        # <arg_key:xxx> ...). With skip_special_tokens=True they are stripped
+        # from the decoded text, so the string-based reasoning/tool parsers
+        # never see the markers. Keep them visible.
+        if self.reasoning_parser == "hunyuan" or self.tool_call_parser == "hunyuan":
+            request.skip_special_tokens = False
 
         if (
             self.reasoning_parser in ["mistral"]
@@ -2442,6 +2457,13 @@ class OpenAIServingChat(OpenAIServingBase):
             ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
+            if getattr(self, "is_hy_v4", False):
+                # Hy4-preview appends think_begin_token to the generation
+                # prompt unless reasoning_effort is "no_think", so the model
+                # starts inside the think block and never emits the opening
+                # tag. Without forcing reasoning the detector leaves the whole
+                # reply -- thinking, closing tag and answer -- in `content`.
+                return request.reasoning_effort not in ("none", "no_think")
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.

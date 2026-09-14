@@ -191,6 +191,25 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+# Only the impls whose sparse kernels accept a per-head learnable attention
+# sink (a virtual key with logit t that only enlarges the softmax denominator:
+# o' = o * sigmoid(lse - t)) can host HYV4's learnable sinks. The flashmla
+# sparse kernels take the sink as a direct kernel argument.
+_ATTN_SINK_SUPPORTED_IMPLS = ("flashmla_sparse",)
+
+
+def _check_attn_sink_supported(
+    attn_sink: Optional[torch.Tensor], dsa_impl: str
+) -> None:
+    if attn_sink is None:
+        return
+    if dsa_impl not in _ATTN_SINK_SUPPORTED_IMPLS:
+        raise NotImplementedError(
+            f"learnable attention sinks (HYV4) are only implemented for DSA impls "
+            f"{_ATTN_SINK_SUPPORTED_IMPLS}, got {dsa_impl!r}."
+        )
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -1980,6 +1999,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1996,6 +2016,8 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+
+        _check_attn_sink_supported(attn_sink, dsa_impl)
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -2244,6 +2266,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
                 indices_are_sorted=skip_reused_topk_sort,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2316,11 +2339,14 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
+
+        _check_attn_sink_supported(attn_sink, self.dsa_decode_impl)
 
         if self.dsa_decode_impl == "trtllm":
             return self._forward_trtllm(
@@ -2402,6 +2428,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -2519,6 +2546,7 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
         indices_are_sorted: bool = False,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         flash_mla_sparse_fwd = get_flashmla_op("flash_mla_sparse_fwd", is_hcu=_is_hcu)
 
@@ -2546,6 +2574,12 @@ class DeepseekSparseAttnBackend(
             q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
             q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
+            # The per-head sink must match the padded head count; the padded
+            # heads' output is trimmed below, so the pad value is inert.
+            if attn_sink is not None:
+                sink_padded = attn_sink.new_zeros(required_padding)
+                sink_padded[:num_heads] = attn_sink
+                attn_sink = sink_padded
         else:
             q_input = q_all
 
@@ -2581,7 +2615,9 @@ class DeepseekSparseAttnBackend(
                 indices_input,
                 sm_scale,
                 v_head_dim,
-                None,
+                # HYV4's per-head learnable attention sink: the kernel folds
+                # the virtual-key logit into the online softmax denominator.
+                attn_sink,
                 topk_length,
             )
         else:
@@ -2591,6 +2627,7 @@ class DeepseekSparseAttnBackend(
                 indices=indices_input,
                 sm_scale=sm_scale,
                 d_v=v_head_dim,
+                attn_sink=attn_sink,
                 topk_length=topk_length,
             )
 

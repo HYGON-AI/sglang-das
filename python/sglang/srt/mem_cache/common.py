@@ -123,6 +123,16 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         if getattr(req, "allow_radix_cache_insert_once", False):
             req.allow_radix_cache_insert_once = False
         else:
+            if kwargs.get("chunked", False):
+                # Fake-bootstrap warmup requests skip tree insertion, but a
+                # later chunk must still reuse this request's own computed KV.
+                # Otherwise its prefix stays empty and every scheduling pass
+                # allocates the same first chunk again. Keep these slots
+                # request-owned: cache_protected_len and tree locks are unchanged.
+                end = req.extend_range.end
+                req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :end
+                ].to(dtype=torch.int64, copy=True)
             return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

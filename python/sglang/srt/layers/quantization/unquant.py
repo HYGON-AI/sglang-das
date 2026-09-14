@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -264,11 +265,17 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
+        total_rows = sum(output_partition_sizes)
+        ple_cpu_alloc = (
+            total_rows >= 1_000_000
+            and os.environ.get("SGLANG_PLE_CPU_ALLOC", "0") == "1"
+        )
         weight = Parameter(
             torch.empty(
-                sum(output_partition_sizes),
+                total_rows,
                 input_size_per_partition,
                 dtype=params_dtype,
+                device="cpu" if ple_cpu_alloc else None,
             ),
             requires_grad=False,
         )
@@ -1200,7 +1207,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     moe_config=moe_cfg,
-                    inplace=True,
+                    inplace=moe_runner_config.inplace,
                     w1_scale=None,
                     w2_scale=None,
                     activation=activation,

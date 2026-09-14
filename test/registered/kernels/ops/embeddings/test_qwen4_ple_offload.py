@@ -38,6 +38,11 @@ def _make_source_embedding(
         torch.empty((local_rows, embedding_dim), dtype=dtype, device="cuda"),
         requires_grad=False,
     )
+    weight_scale = torch.ones(
+        (local_rows, 1) if dtype == torch.int8 else (1,),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
     set_weight_attrs(
         weight,
         {
@@ -58,6 +63,7 @@ def _make_source_embedding(
     )
     return SimpleNamespace(
         weight=weight,
+        weight_scale=weight_scale,
         quant_config=None,
         enable_tp=True,
         use_attn_tp_group=False,
@@ -146,6 +152,28 @@ def test_qwen4_ple_pinned_gather_empty_input():
     actual = offloaded.gather(ids)
     assert actual.shape == (0, 3, 7)
     assert actual.numel() == 0
+
+
+def test_qwen4_ple_pinned_gather_int8_per_row_scale():
+    embedding_dim = 7
+    source = _make_source_embedding(dtype=torch.int8, embedding_dim=embedding_dim)
+    scales = torch.arange(1, 9, dtype=torch.bfloat16, device="cuda").reshape(8, 1)
+    source.weight_scale.copy_(scales)
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    rows = torch.arange(-28, 28, dtype=torch.int8, device="cuda").reshape(
+        8, embedding_dim
+    )
+    _load_rows(offloaded, rows)
+
+    ids = torch.tensor([[0, 7, 3], [4, 1, 6]], dtype=torch.int64, device="cuda")
+    expected = (
+        rows.to(torch.bfloat16) * scales
+    ).index_select(0, ids.flatten()).reshape(*ids.shape, embedding_dim)
+    actual = offloaded(ids)
+
+    assert offloaded.weight.dtype == torch.int8
+    assert offloaded.weight_scale.is_pinned()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():

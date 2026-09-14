@@ -1076,6 +1076,17 @@ class HYV3Model(nn.Module):
             )
             hidden_states = hidden_states_gathered
 
+        if use_hy3_sp:
+            attn_tp_group = get_parallel().attn_tp_group
+            hidden_states_gathered = hidden_states.new_empty(
+                hidden_states.shape[0] * attn_tp_group.world_size,
+                hidden_states.shape[1],
+            )
+            attn_tp_group.all_gather_into_tensor(
+                hidden_states_gathered, hidden_states
+            )
+            hidden_states = hidden_states_gathered
+
         return hidden_states
 
 

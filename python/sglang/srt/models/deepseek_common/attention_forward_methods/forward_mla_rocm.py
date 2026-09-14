@@ -619,6 +619,13 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            # Only models that own the MLA output gate (currently HYV4) emit
+            # this extra slot, so every other caller keeps the 9-tuple.
+            *(
+                (self.prepare_attention_output_gate(hidden_states),)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_rocm_core(
@@ -632,8 +639,16 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        attention_output_gate=None,
     ):
         save_kv_cache = True
+        # HYV4 carries a per-head learnable attention sink logit that the
+        # sparse backend folds into the softmax denominator.
+        sink_args = (
+            dict(attn_sink=self.learnable_sink_param)
+            if getattr(self, "learnable_sink_param", None) is not None
+            else {}
+        )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -670,6 +685,7 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=None,
                         k_rope=k_pe_fused,
                         save_kv_cache=save_kv_cache,
+                        **sink_args,
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -689,6 +705,7 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=q_pe_fused,
                         k_rope=k_pe_fused,
                         save_kv_cache=save_kv_cache,
+                        **sink_args,
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -728,6 +745,7 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=q_pe,
                         k_rope=k_pe,
                         **extra_args,
+                        **sink_args,
                         **(
                             dict(topk_indices=topk_indices)
                             if topk_indices is not None
@@ -760,6 +778,7 @@ class DeepseekMLARocmForwardMixin:
                 k_nope,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **sink_args,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
@@ -847,6 +866,10 @@ class DeepseekMLARocmForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if attention_output_gate is not None:
+            attn_bmm_output = self.apply_attention_output_gate(
+                attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 

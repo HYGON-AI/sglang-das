@@ -37,21 +37,29 @@ enum class TopKMode {
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
+#ifndef USE_ROCM
 using Cluster = impl::TopKCluster<8>;
+#endif
 
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
 constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
+#ifndef USE_ROCM
 constexpr uint32_t kClusterSize = Cluster::kClusterSize;
+#endif
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
+#ifndef USE_ROCM
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
+#endif
 
 constexpr uint32_t kClusterFloor = 65536;
+#ifndef USE_ROCM
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
+#endif
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -115,6 +123,7 @@ struct TopKRaggedParams {
   uint32_t topk;
 };
 
+#ifndef USE_ROCM
 /**
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
  * The short items are handled by the separate topk_kernel.
@@ -134,6 +143,7 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
     __syncthreads();
   }
 }
+#endif  // !USE_ROCM
 
 template <typename F>
 SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
@@ -306,6 +316,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   }
 }
 
+#ifndef USE_ROCM
 template <bool kPDL, TopKMode kMode>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
@@ -353,6 +364,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPag
     problem_transform(problem, params.get_output_ptr(blockIdx.x));
   }
 }
+#endif  // !USE_ROCM
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
 __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
@@ -547,8 +559,14 @@ struct TopKKernel {
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
+#ifndef USE_ROCM
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
+#else
+    // HIP supports the register and streaming implementations, but not CUDA
+    // thread-block clusters or programmatic dependent launch.
+    constexpr bool kUsePDL = false;
+#endif
     const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
     const auto dispatch = [&]<typename F>(F&& f) {
       switch (mode) {
@@ -559,6 +577,7 @@ struct TopKKernel {
       }
     };
     dispatch([&]<TopKMode kMode>() {
+#ifndef USE_ROCM
       if (use_cluster) {
         if (batch_size <= kNumPersistentClusters) {
           LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
@@ -573,7 +592,9 @@ struct TopKKernel {
               .config({.use_pdl = kUsePDL})
               .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
         }
-      } else if (max_seq_len <= kReg2MaxSeqLen) {
+      } else
+#endif
+      if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, kMode>, params);
@@ -646,7 +667,11 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
+#ifdef USE_ROCM
+    constexpr bool kUsePDL = false;
+#else
     constexpr bool kUsePDL = true;
+#endif
     const auto params = TopKRaggedParams{
         .scores = static_cast<float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),

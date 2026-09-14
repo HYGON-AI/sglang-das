@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.flashattention_interface import flash_attn_varl
 from flash_attn import varlen_fwd_unified
 from sglang.srt.utils import get_bool_env_var
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
+_use_varlen_fwd_unified_fa = get_bool_env_var("SGLANG_USE_VARLEN_FWD_UNIFIED")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
@@ -1585,6 +1586,8 @@ class FlashAttentionBackend(AttentionBackend):
                         and layer.v_scale is not None
                         else None
                     ),
+                    layout="legacy_bhsd",
+                    out=_fa_out,
                 )
             elif self._use_hcu_legacy_layout:
                 # Batch-semantic API: q.shape[0] is the batch size and row i
@@ -1614,6 +1617,38 @@ class FlashAttentionBackend(AttentionBackend):
                     ver=self.fa_impl_ver,
                 )
                 result = _restore_padded_q_rows(result, _sp_padded_rows)
+            elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
+                result = varlen_fwd_unified(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=cache_seqlens,
+                    block_table=page_table,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=self.max_context_len,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    softcap=layer.logit_cap,
+                    window_size=window_size,
+                    q_descale=(
+                        fa_k_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        else None
+                    ),
+                    k_descale=(
+                        fa_k_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        else None
+                    ),
+                    v_descale=(
+                        fa_v_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        else None
+                    ),
+                    return_softmax_lse=use_cascade_attn,
+                    s_aux=kwargs.get('sinks', None)
+                )
             else:
                 # SP (hy3_sp / minimax_opt) shards the sequence across TP ranks and
                 # pads q; trim the padding back to the metadata token count so the
@@ -2167,6 +2202,38 @@ class FlashAttentionBackend(AttentionBackend):
                         ver=self.fa_impl_ver,
                     )
                     result = _restore_padded_q_rows(result, _sp_padded_rows)
+                elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
+                    result = varlen_fwd_unified(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        seqused_k=cache_seqlens,
+                        block_table=page_table,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=self.max_context_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        softcap=layer.logit_cap,
+                        window_size=window_size,
+                        q_descale=(
+                        fa_k_descale
+                            if self.kv_cache_dtype_str != "auto"
+                            else None
+                        ),
+                        k_descale=(
+                            fa_k_descale
+                            if self.kv_cache_dtype_str != "auto"
+                            else None
+                        ),
+                        v_descale=(
+                            fa_v_descale
+                            if self.kv_cache_dtype_str != "auto"
+                            else None
+                        ),
+                        return_softmax_lse=use_cascade_attn,
+                        s_aux=kwargs.get('sinks', None)
+                    )
                 else:
                     result = flash_attn_with_kvcache(
                         q=q_reshaped,

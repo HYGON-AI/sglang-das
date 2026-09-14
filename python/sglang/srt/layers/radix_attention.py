@@ -307,6 +307,9 @@ def _unified_attention_with_output_impl(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    # HYV4's per-head learnable attention sink (virtual-key logit), folded into
+    # the softmax denominator by the sparse attention kernels.
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
@@ -349,6 +352,9 @@ def _unified_attention_with_output_impl(
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
         kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
+    if attn_sink is not None:
+        # Per-head parameter, no token slicing needed.
+        kwargs["attn_sink"] = attn_sink
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_positions = forward_batch.positions
@@ -419,6 +425,7 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> None:
     _unified_attention_with_output_impl(
         query,
@@ -437,6 +444,7 @@ def unified_attention_with_output(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        attn_sink=attn_sink,
     )
 
 
@@ -467,6 +475,7 @@ def unified_attention_with_output_and_lse(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     lse = _unified_attention_with_output_impl(
         query,
@@ -485,6 +494,7 @@ def unified_attention_with_output_and_lse(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        attn_sink=attn_sink,
     )
     assert lse is not None
     return lse

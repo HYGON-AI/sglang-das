@@ -1350,11 +1350,11 @@ class Scheduler(
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports attn_tp_size=1 and "
-                    "attn_cp_size=1 only"
-                )
+            # if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
+            #     raise RuntimeError(
+            #         "PD Decode DP sync currently supports attn_tp_size=1 and "
+            #         "attn_cp_size=1 only"
+            #     )
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
