@@ -180,6 +180,9 @@ class _MoeRunnerBackendPredicates:
     def is_triton(self):
         return self.value == MoeRunnerBackend.TRITON.value
 
+    def is_lightop(self):
+        return self.value == MoeRunnerBackend.LIGHTOP.value
+
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
 
