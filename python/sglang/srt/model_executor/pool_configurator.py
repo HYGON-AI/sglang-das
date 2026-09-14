@@ -993,12 +993,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         if self.use_cp_cache_layer_split:
             layout = self.cp_cache_layer_split_layout
-            # One full-capacity staging pool per read family. State is only
-            # persisted on its owner and is never broadcast during forward.
+            # SWA and indexer have separate staging pools. C4/C128 extra KV
+            # share storage because a layer consumes only one of those families.
+            # Charge the larger PP-local family, even on a non-owning CP rank.
+            extra_staging_bytes = max(
+                c4_frac * kv_bytes if self.num_layers_ca4 else 0,
+                kv_bytes / 128 if self.num_layers_ca128 else 0,
+            )
+            # State is persisted only on its owner and is never broadcast.
             result = (
                 self.swa_ratio * kv_bytes * (layout.swa_layer_num + 1)
-                + c4_frac * kv_bytes * (layout.c4_layer_num + 1)
-                + kv_bytes / 128 * (layout.c128_layer_num + 1)
+                + c4_frac * kv_bytes * layout.c4_layer_num
+                + kv_bytes / 128 * layout.c128_layer_num
+                + extra_staging_bytes
                 + indexer_bytes / 4 * (layout.c4_indexer_layer_num + 1)
                 + self.swa_ratio * c4_state_ratio * (
                     c4_state_bytes * layout.c4_state_layer_num
