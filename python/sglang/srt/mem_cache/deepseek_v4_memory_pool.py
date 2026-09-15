@@ -303,6 +303,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
@@ -314,6 +315,7 @@ class DeepSeekV4SingleKVPool(KVCache):
                 "a bf16 attention KV pool stores the finished value"
             )
             return self.set_key_buffer_bf16(layer_id, loc, cache_k, valid_mask)
+        assert valid_mask is None
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -2169,6 +2171,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
