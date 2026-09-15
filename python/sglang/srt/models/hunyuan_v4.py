@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import (
@@ -412,6 +411,13 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             prefix=prefix,
             alt_stream=alt_stream,
             is_nextn=is_nextn,
+            # HYV4 is DSA-only; forward the prefill-CP flag so the parent
+            # (DeepseekV2AttentionMLA) sets self.cp_size and
+            # self.dsa_enable_prefill_cp on the attention module. Both are read
+            # on the CP KV-gather path (rebuild_cp_kv_cache -> self.cp_size) and
+            # the per-module CP decision; without this they are missing and the
+            # DSA prefill-CP forward raises AttributeError: no attribute 'cp_size'.
+            dsa_enable_prefill_cp=is_dsa_enable_prefill_cp(),
         )
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -540,13 +546,16 @@ class HYV4DecoderLayer(nn.Module):
                 hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
             )
         )
-        hidden_states = self.self_attn(
-            positions,
-            hidden_states,
-            forward_batch,
-            zero_allocator,
-            prev_topk_indices=prev_topk_indices,
-        )
+        try:
+            hidden_states = self.self_attn(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -645,12 +654,21 @@ class HYV4Model(nn.Module):
         self.cp_size = get_parallel().attn_cp_size
 
     def _maybe_prepare_prefill_cp(self, input_ids, forward_batch):
-        """Build the DSA CP metadata for this batch, mirroring DeepseekV4Model.
+        """Set ``attn_cp_metadata`` so the prefill-CP data split can run.
 
-        The metadata has no producer outside the model: every CP-capable model
-        sets it itself before its layer loop, and ``dsa_use_prefill_cp``
-        returns False while it is None. Without this the CP split below is
-        silently skipped.
+        ``dsa_use_prefill_cp`` returns False while ``attn_cp_metadata`` is None,
+        so ``forward``'s ``cp_split_and_rebuild_data`` (the token/data split) is
+        gated on this being set here, before the layer loop.
+
+        Unlike DeepseekV4Model we do NOT reindex attention/indexer metadata
+        here: HYV4 uses the DSA backend, whose ``init_forward_metadata`` already
+        builds rank-local metadata for round-robin-split (see
+        ``can_dsa_prefill_cp_round_robin_split``). DeepseekV4's backend splits at
+        build only under CP-v2 and otherwise defers to a model-side
+        ``core_attn_metadata.apply_cp_reindex()``; copying that call here would
+        both hit ``DSAMetadata`` (which has no ``core_attn_metadata``) and
+        double-split metadata the backend already sharded. The backend owns the
+        metadata split; the model owns only the data split below.
         """
         if not (
             self.dsa_enable_prefill_cp
@@ -666,19 +684,6 @@ class HYV4Model(nn.Module):
             forward_batch.seq_lens_cpu.tolist(),
             extend_seqs_len=forward_batch.extend_seq_lens_cpu,
         )
-        if is_dsa_prefill_cp_round_robin_split():
-            # In round-robin-split mode the CP metadata decides the local token
-            # order, so the attention/indexer metadata built before
-            # model.forward() must be rebuilt to match.
-            attn_backend = get_attn_backend()
-            metadata = attn_backend.forward_metadata
-            core_meta = metadata.core_attn_metadata
-            core_meta.apply_cp_reindex()
-            core_meta.init_flashmla_related(is_prefill=True)
-            if metadata.indexer_metadata is not None:
-                metadata.indexer_metadata = (
-                    attn_backend.init_forward_metadata_indexer(core_meta)
-                )
         return True
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
