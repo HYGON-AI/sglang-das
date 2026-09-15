@@ -223,7 +223,7 @@ def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     Token-first encoders leave the text prompt empty; the MM processor
     expands their single placeholder ids rather than re-tokenizing text.
     """
-    return spec in ("inkling", "kimi_k3")
+    return spec in ("inkling", "kimi_k3", "dsv41")
 
 
 def encode_simple_chat(
