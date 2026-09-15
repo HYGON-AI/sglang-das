@@ -1501,6 +1501,12 @@ class Envs:
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
     SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
+    # unified_kv only: split the pool into an fp8 nope pool plus a parallel
+    # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
+    # dtype, so --kv-cache-dtype has no effect there and this switch is the
+    # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
+    # picks the buffer dtype and this switch is inert.
+    SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

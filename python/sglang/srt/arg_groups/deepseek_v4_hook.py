@@ -301,6 +301,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
+        # The trtllm-gen path serves swa/c4/c128 only; V4.1's ratio-1/2 layers
+        # and the encoder replay request window have no uniform-FP8 pool.
+        ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )

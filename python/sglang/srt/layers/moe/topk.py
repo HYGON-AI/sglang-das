@@ -2794,6 +2794,19 @@ def select_experts(
                     else biased_topk_impl
                 )
 
+            _packed_kwargs = {}
+            if _fused_gate_emits_packed_ids(
+                scoring_func,
+                num_fused_shared_experts,
+                expert_location_dispatch_info,
+                routing_overridden,
+            ):
+                packed_topk = torch.empty(
+                    (hidden_states.shape[0], top_k),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+                _packed_kwargs = dict(packed_out=packed_topk)
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

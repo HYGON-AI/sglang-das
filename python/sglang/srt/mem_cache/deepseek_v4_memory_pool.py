@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_masked,
@@ -2076,6 +2077,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         eps: float = 1e-8,
     ) -> None:
+        """Write ``cache_k`` ``[n, 512]`` bf16 into the layer's compressed cache.
+
+        For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, with
+        ``freqs_cis`` if it is not rotated yet: the kernel rounds to e2m1 once.
+        For the fp8 layouts ``cache_k`` is the finished (fake-quantized, rotated)
+        value, as today."""
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.set_key_buffer_lightop_fused(

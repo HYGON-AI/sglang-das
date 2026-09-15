@@ -941,12 +941,11 @@ DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
-    """The operator's --swa-full-tokens-ratio, or None when it was not given.
-
-    Read from the pristine record: the resolved schedule bag carries the
-    declared fallback for an unset ratio, which must not count as a request.
-    """
-    return get_server_args().swa_full_tokens_ratio
+    """The operator's --swa-full-tokens-ratio, or None when it was not given."""
+    schedule = get_schedule()
+    if not schedule._swa_full_tokens_ratio_explicitly_set:
+        return None
+    return schedule.swa_full_tokens_ratio
 
 
 @dataclass
@@ -976,14 +975,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            dsv4_unified_row_bytes,
         )
 
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
+        self._unified_fp8 = is_unified_kv_fp8()
+        # Row width across both unified pools: 1024 B bf16, 640 B fp8. Read from
+        # the pool module so sizing can't drift from the allocation.
+        self._unified_row_bytes = dsv4_unified_row_bytes(
+            self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
+        )
         if self._unified:
-            # Unified_kv stores the whole latent in bf16.
-            self.kv_bytes = self.attn_head_dim * 2
+            # Unified_kv stores the whole latent: one bf16 pool, or an fp8 nope
+            # pool plus a bf16 rope pool.
+            self.kv_bytes = self._unified_row_bytes
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
