@@ -213,6 +213,20 @@ store_row(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const device::Alig
 
 }  // namespace v41
 
+#else  // USE_ROCM
+
+namespace v41 {
+
+/// select_dsv4_kv_layout never picks the V4.1 pages on ROCm (only the SM100 FlashMLA
+/// kernels read them), but the shared kernels still name the row store in their
+/// V4.1 branches. Declare it so those branches parse, and reject any instantiation.
+template <KVLayout kLayout, typename Row>
+SGL_DEVICE void store_row(uint8_t*, uint8_t*, uint32_t, const Row&) {
+  static_assert(sizeof(Row) == 0, "the V4.1 KV cache layouts are not supported on ROCm");
+}
+
+}  // namespace v41
+
 #endif  // USE_ROCM
 
 }  // namespace deepseek_v4
