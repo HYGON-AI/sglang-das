@@ -195,6 +195,48 @@ class ReadPlanLoadCounter:
         self.errors.clear()
         self.active_indices.clear()
 
+
+class ReadPlanLoadCounter:
+    """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.producer_index = self.consumer_index = -1
+        self.plans: dict[int, Future] = {}
+
+    def update_producer(self) -> int:
+        self.producer_index += 1
+        self.plans[self.producer_index] = Future()
+        return self.producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def bind(self, index: int, plan) -> None:
+        self.plans[index].set_result(plan)
+
+    def fail(self, index: int, error: BaseException) -> None:
+        future = self.plans.get(index)
+        if future is not None and not future.done():
+            future.set_exception(error)
+
+    def wait_until(self, threshold: int) -> None:
+        index = self.consumer_index
+        future = self.plans.get(index)
+        if future is None:
+            return
+        try:
+            future.result().wait(threshold)
+        except BaseException as error:
+            raise RuntimeError("Mooncake layer-wise KV load failed.") from error
+        finally:
+            if threshold == self.num_layers - 1:
+                self.plans.pop(index, None)
+
+    def reset(self) -> None:
+        self.producer_index = self.consumer_index = -1
+        self.plans.clear()
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -291,6 +333,34 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             storage_suffix,
         )
+        self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
+        self.read_plan_reuse_ranges = (
+            os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
+        )
+        if self.read_plan_reuse_ranges and not self.read_plan_enabled:
+            raise ValueError(
+                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
+                "SGLANG_MOONCAKE_READ_PLAN=1"
+            )
+        if self.read_plan_enabled:
+            if not callable(getattr(self.storage.store, "create_read_plan", None)):
+                raise RuntimeError(
+                    "Mooncake ReadPlan requires a package with create_read_plan. "
+                    "Install the ReadPlan-enabled Mooncake package."
+                )
+            logger.info(
+                "Mooncake ReadPlan enabled; address reuse=%s",
+                self.read_plan_reuse_ranges,
+            )
+        if self.cp_single_writer:
+            logger.info(
+                "Mooncake CP node-owner writer/request-owner lookup enabled: "
+                "rank=%d/%d namespace=%s writer_owner=node_hash "
+                "lookup_owner=request_id_hash data_reader=all_ranks",
+                self.attn_cp_rank,
+                self.attn_cp_size,
+                storage_suffix,
+            )
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -312,15 +382,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         self.register_buffers()
         if self.read_plan_enabled:
-            self.layer_done_counter = ReadPlanLoadCounter(
-                self.num_layers,
-                sync_groups=(
-                    (params.attn_cp_cache_group, params.attn_tp_cache_group)
-                    if params.attn_cp_cache_group is not None
-                    or params.attn_tp_cache_group is not None
-                    else (params.tp_cache_group,)
-                ),
-            )
+            self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
         else:      
             self.layer_done_counter = LayerWiseLoadCounter(
                 self.num_layers,
@@ -803,6 +865,59 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # In page-wise mode a single batch_get carries all groups per key, so the
         # first wait(0) blocks until every page is complete and later waits are
         # no-ops, matching _load_page_wise's all-or-nothing release.
+        plan.run()
+
+    def _prepare_read_plan_layouts(
+        self, request_transfers: list[list[PoolTransfer]]
+    ):
+        # Consolidate index copies once per pool, preserving request/key order.
+        # Each component describes (base, row stride, byte count, source offset).
+        # Locations may be non-contiguous; Mooncake expands addresses in C++.
+        batches = {}
+        for transfers in request_transfers:
+            for transfer in transfers:
+                keys, indices = batches.setdefault(transfer.name, ([], []))
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                keys.extend(self.storage._tag_keys(component_keys))
+                indices.append(transfer.host_indices)
+
+        layouts = []
+        for name, (keys, indices) in batches.items():
+            pool = self.pools[name]
+            joined = indices[0] if len(indices) == 1 else torch.cat(indices)
+            locations = pool.prepare_locations(joined)
+            layout = []
+            for layer in range(self.num_layers):
+                index = pool.layer_mapping.get(layer)
+                layout.append(
+                    []
+                    if index is None
+                    else [
+                        (*component[index], offsets[index])
+                        for component, offsets in zip(
+                            pool.buffer_meta, pool._component_offsets
+                        )
+                    ]
+                )
+            layouts.append((keys, locations, pool.packed, layout))
+
+        return layouts
+
+    def load_with_read_plan(
+        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+    ) -> None:
+        layouts = self._prepare_read_plan_layouts(request_transfers)
+        plan = self.storage.store.create_read_plan(
+            layouts,
+            self.num_layers,
+            reuse_ranges=self.read_plan_reuse_ranges,
+            buffer_owners=self.pools,
+        )
+        self.layer_done_counter.bind(counter_index, plan)
+        # run() and wait() release the GIL. Each layer becomes visible only after
+        # every pool's bytes have been checked; the last wait includes cleanup.
         plan.run()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
