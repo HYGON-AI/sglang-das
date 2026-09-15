@@ -161,7 +161,7 @@ class DSV4AttnMetadata:
     swa_page_indices: torch.Tensor
     swa_topk_lengths: torch.Tensor
 
-    c4_sparse_topk: int
+    index_topk: int
     # Shared by all layer stores; locations are in SWA space.
     swa_out_cache_loc: Optional[torch.Tensor] = None
     c4_out_loc: Optional[torch.Tensor] = None

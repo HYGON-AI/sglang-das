@@ -161,6 +161,18 @@ def _router_triton_kernel(
             bias_alt_ptr + offs_n * stride_bias_alt, mask=mask_n, other=0.0
         ).to(tl.float32)
 
+    live_m = mask_m
+    if HAS_PADDING:
+        live_m = live_m & (offs_m < tl.load(num_token_non_padded_ptr))
+    row_bias = bias[None, :]
+    if HAS_TOKEN_BIAS:
+        input_ids = tl.load(
+            input_ids_ptr + offs_m * stride_input_ids, mask=live_m, other=0
+        )
+        row_bias = tl.where(
+            (input_ids == BIAS_ALT_TOKEN_ID)[:, None], bias_alt[None, :], row_bias
+        )
+
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = live_m[:, None] & mask_n[None, :]
     scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
@@ -172,15 +184,10 @@ def _router_triton_kernel(
         activated = tl.sigmoid(scores)
         biased = activated + row_bias
     elif SCORING_FUNC == 1:
-        # sqrt(softplus(x)). log(1.0 + exp(x)) rounds to 0 below -16.64 and overflows
-        # above 88.7; Triton has no log1p, so recover it from log via z*log(u)/(u-1).
-        z = tl.exp(-tl.abs(scores))
-        u = 1.0 + z
-        exact = u == 1.0
-        log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
-        sp = tl.maximum(scores, 0.0) + log1p_z
-        activated = tl.sqrt(sp)
-        biased = activated + bias[None, :]
+        # log1p preserves small positive scores for negative logits.
+        sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
+        activated = libdevice.sqrt(sp)
+        biased = activated + row_bias
     else:
         # softmax over the row: weight is the softmax probability (bias kept), with
         # optional tanh softcapping. Ranking by the (softcapped, biased) logit is

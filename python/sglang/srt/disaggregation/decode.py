@@ -59,10 +59,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
+    get_dsv4_request_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
@@ -1431,7 +1430,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         window_kv_indices_full
                     )
                 )

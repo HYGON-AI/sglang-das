@@ -60,10 +60,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
     )
 
-    if cfg.swa_full_tokens_ratio is None:
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
-
     if cfg.moe_runner_backend == "auto":
         model_config = model_config_of(server_args)
         # nvidia/DeepSeek-V4-Pro-NVFP4 uses the routed TRT-LLM runner.

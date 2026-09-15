@@ -79,6 +79,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
+    is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -1676,7 +1677,6 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -1960,14 +1960,28 @@ class MQALayer(MqaAttentionBase):
         if kernel_num_heads != self.n_local_heads:
             # Backends without an exact-head specialization retain the existing
             # padded shape. attn_sink is sliced to this rank and padded to match.
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+            # The kernel reads all padded heads; uninitialized values can affect real-head
+            # outputs, so the padding must be zero even though only real heads are written.
+            if self.is_dsv41:
+                # Each layer overwrites real heads and leaves padding zero. Reuse requires
+                # all consumers on the layer's stream and no retained reference after return;
+                # a side-stream consumer would need an event before the next layer writes.
+                want = (x.shape[0], kernel_num_heads, self.head_dim)
+                meta = getattr(attn_backend, "forward_metadata", None)
+                q_padded = getattr(meta, "q_pad_buffer", None)
+                if (
+                    q_padded is None
+                    or tuple(q_padded.shape) != want
+                    or q_padded.dtype != x.dtype
+                ):
+                    q_padded = x.new_zeros(*want)
+                    if meta is not None:
+                        try:
+                            meta.q_pad_buffer = q_padded
+                        except (AttributeError, TypeError):
+                            pass
             else:
-                q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
+                q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
@@ -2133,7 +2147,7 @@ class MQALayer(MqaAttentionBase):
                     perm_x2=(0, 1, 2),
                     perm_y=(1, 0, 2),
                 )
-            elif _FP8_WO_A_GEMM and _wo_a_fp8_mxscale is not None:
+            elif self.wo_a_fp8 and _wo_a_fp8_mxscale is not None:
                 # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
@@ -2576,11 +2590,25 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             # Keep the HCU implementation validated on v0.5.15.post1_dev.
-            # Generic ROCm/CUDA platforms use the upstream kernel below.
+            # Generic ROCm/CUDA platforms use the upstream kernels below.
             if _is_hcu and _use_aiter_tilelang_mhc:
                 from aiter.ops.tilelang import mhc_post_fwd
 
                 return mhc_post_fwd(x, residual, post, comb)
+
+            if (
+                get_platform().is_sm90
+                and x.is_cuda
+                and 1 <= x.shape[0] <= 64
+                and x.shape[1] == 5120
+                and residual.shape == (x.shape[0], 4, 5120)
+                and x.dtype == residual.dtype == torch.bfloat16
+                and post.dtype == comb.dtype == torch.float32
+                and post.numel() == x.shape[0] * 4
+                and comb.shape == (x.shape[0], 4, 4)
+                and all(t.is_contiguous() for t in (x, residual, post, comb))
+            ):
+                return mhc_post_split_h(x, residual, post, comb)
 
             from sglang.kernels.ops.layernorm.mhc import mhc_post
 
@@ -3611,6 +3639,156 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
+    def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
+        # Rows outside the tail are never computed past the last kv_source layer,
+        # so anything reading hidden states of earlier prompt tokens cannot be served.
+        if (
+            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and self.dspark_layers_to_capture is None
+        ):
+            raise ValueError(
+                "decoder SWA bounded replay cannot capture hidden states of all "
+                "prompt tokens"
+            )
+        if forward_batch.return_logprob and any(
+            start < n
+            for start, n in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            )
+        ):
+            raise ValueError(
+                "decoder SWA bounded replay cannot return logprobs of prompt tokens; "
+                "set logprob_start_len to the prompt length"
+            )
+
+    def _forward_layers_hc_pre_from_prev(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        capture_dspark: bool,
+        dspark_aux_hidden_states: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
+        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        hash_ids = None
+        cp_extend = (
+            is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
+        )
+        if self.engram_hasher is not None:
+            if cp_extend:
+                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+                hash_ids = self.engram_hasher(
+                    forward_batch.input_ids[:total], forward_batch
+                )
+                parallel = get_parallel()
+                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+                pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
+                if pad_rows > 0:
+                    hash_ids = torch.cat(
+                        [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
+                    )
+            elif (
+                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
+            ):
+                hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                    self.engram_hasher, input_ids
+                )
+            else:
+                hash_ids = self.engram_hasher(input_ids, forward_batch)
+        prefetched_engram_kv = None
+        if (
+            self.engram_prefetch_stream is not None
+            and forward_batch.forward_mode.is_decode()
+            and hash_ids.shape[0] == 1
+        ):
+            prefetch_stream = self.engram_prefetch_stream
+            prefetch_stream.wait_stream(torch.cuda.current_stream())
+            engram = self.layers[14].engram
+            with torch.cuda.stream(prefetch_stream):
+                prefetched_engram_kv = engram.project(
+                    hash_ids[:, engram.layer_hash_index]
+                )
+            hash_ids.record_stream(prefetch_stream)
+        tail = None
+        if (
+            self.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self._check_late_layer_tail_readers(forward_batch)
+            attn_backend = get_attn_backend()
+            tail = attn_backend.tail_forward_metadata.late_layer_tail
+        saved_full = None
+        prev_pre = None
+        for i in range(self.start_layer, self.end_layer):
+            if tail is not None and i == self.late_layer_start:
+                # Past the last kv_source layer a layer only owes its window KV,
+                # and decode reaches back at most SWA_WINDOW positions.
+                saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                hidden_states, prev_pre, input_ids, input_ids_global = (
+                    tail.rows(hidden_states),
+                    tail.rows(prev_pre),
+                    tail.rows(input_ids),
+                    tail.rows(input_ids_global),
+                )
+                positions = tail.positions
+                if hash_ids is not None:
+                    hash_ids = tail.rows(hash_ids)
+            engram = self.layers[i].engram
+            if engram is not None:
+                before_engram = hidden_states
+                if i == 14 and prefetched_engram_kv is not None:
+                    main_stream = torch.cuda.current_stream()
+                    main_stream.wait_stream(self.engram_prefetch_stream)
+                    prefetched_engram_kv.record_stream(main_stream)
+                    hidden_states = engram.apply_gate(
+                        hidden_states, prefetched_engram_kv
+                    )
+                    prefetched_engram_kv = None
+                else:
+                    hidden_states = engram(
+                        hidden_states,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        cp_all_tokens=cp_extend,
+                    )
+                if (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                ):
+                    hidden_states = torch.where(
+                        (input_ids == self.config.image_token_id)[:, None, None],
+                        before_engram,
+                        hidden_states,
+                    )
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                # The draft head reads the attention input of its target layers.
+                aux = hidden_states
+                if tail is not None and i < self.late_layer_start:
+                    aux = tail.rows(aux)
+                dspark_aux_hidden_states.append(aux.mean(dim=1))
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                    prev_pre=prev_pre,
+                )
+        if saved_full is not None:
+            attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+            return hidden_states, prev_pre, tail
+        return hidden_states, prev_pre, None
+
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
 
@@ -3793,8 +3971,20 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 positions,
             )
-
-        if run_tbo:
+        last_pre = None
+        tail = None
+        if self.hc_pre_from_prev_sublayer:
+            assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
+            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
+                positions,
+                hidden_states,
+                forward_batch,
+                input_ids,
+                input_ids_global,
+                capture_dspark,
+                dspark_aux_hidden_states,
+            )
+        elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -4065,6 +4255,24 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if (
+            self.vision is not None
+            and not forward_batch.forward_mode.is_decode()
+            and forward_batch.mm_inputs is not None
+            and any(x is not None for x in forward_batch.mm_inputs)
+        ):
+            if input_embeds is not None:
+                raise ValueError("Cannot combine input_embeds and image inputs")
+            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+        if self.vision is not None and not (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Decode/verify IDs are already vocabulary IDs. Remap prompt image
+            # hashes for Engram and routing without changing the scheduler's IDs.
+            input_ids = input_ids.masked_fill(
+                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+            )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
@@ -4347,7 +4555,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (_FP8_WO_A_GEMM or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
@@ -4643,17 +4851,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
-                            elif fuse_wqa_wkv and (
-                                name.endswith(".wq_a.weight")
-                                or name.endswith(".wq_a.weight_scale_inv")
-                                or name.endswith(".wq_a.weight_scale")
-                                or name.endswith(".wkv.weight")
-                                or name.endswith(".wkv.weight_scale_inv")
-                                or name.endswith(".wkv.weight_scale")
-                                or name.endswith(".wq_a.qweight")
-                                or name.endswith(".wkv.qweight")
-                                or name.endswith(".wq_a.qweight_type")
-                                or name.endswith(".wkv.qweight_type")
+                            elif (
+                                fuse_wqa_wkv
+                                and ".compressor." not in name
+                                and ".engram." not in name
+                                and (
+                                    name.endswith(".wq_a.weight")
+                                    or name.endswith(".wq_a.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
+                                    or name.endswith(".wkv.weight")
+                                    or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wkv.weight_scale")
+                                    or name.endswith(".wq_a.qweight")
+                                    or name.endswith(".wkv.qweight")
+                                    or name.endswith(".wq_a.qweight_type")
+                                    or name.endswith(".wkv.qweight_type")
+                                )
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(

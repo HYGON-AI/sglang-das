@@ -28,6 +28,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     _is_npu,
+    wo_a_fp8_gemm_enabled,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix

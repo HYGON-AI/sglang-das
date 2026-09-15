@@ -296,6 +296,7 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
@@ -528,7 +529,11 @@ class Fp8LinearMethod(LinearMethodBase):
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
+                weight_block_size=self.weight_block_size,
+                act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0",
+            )
             if _is_npu and is_npu_arch35() and self.quant_config.scale_fmt != "ue8m0":
                 # The A5 backend expects the ue8m0 weight layout installed by
                 # the arch35 load path; keep plain block-FP8 checkpoints on
@@ -538,6 +543,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
+        # 32-wide-K ue8m0 blocks can use FlashInfer MXFP8 on Blackwell;
+        # Triton is the fallback when no supported FlashInfer backend is selected.
+        self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
+            self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+        )
+        if self.block_fp8_as_mxfp8:
+            self.mxfp8_dense_backend = resolve_block_fp8_mxfp8_backend()
+            self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
+                self.mxfp8_dense_backend
+            )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
