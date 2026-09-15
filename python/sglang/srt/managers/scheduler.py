@@ -93,6 +93,7 @@ from sglang.srt.disaggregation.prefill import (
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
+    EXTERNAL_KV_LOAD_ERR_TYPE,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -456,6 +457,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        self.enable_unified_cache_external_linker = (
+            get_memory().enable_unified_cache_external_linker
+        )
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -1195,6 +1199,9 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # Failed external-linker rids that matched no scheduled request on the
+        # pass that drained them; retried once, see _mark_failed_linker_loads.
+        self._deferred_linker_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -2850,6 +2857,13 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.enable_unified_cache_external_linker and self.ps.pp_size > 1:
+            req.external_cache_hit_length = recv_req.external_cache_hit_length
+            if self.ps.pp_rank == 0:
+                # The existing PP request handoff carries this query result.
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
+                recv_req.external_cache_hit_length = req.external_cache_hit_length
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -2960,6 +2974,11 @@ class Scheduler(
             return False
         return True
 
+    def _release_aborted_request(self, rid: str) -> None:
+        """Drop the cache-side state an aborted request left behind."""
+        if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
+            self.tree_cache.release_aborted_request(rid)
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -2986,9 +3005,9 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                self._release_aborted_request(candidate_req.rid)
+                if self.enable_hierarchical_cache and not self.enable_hicache_storage:
+                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -3016,9 +3035,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
+                self._release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -3143,9 +3160,14 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
-        req.to_finish = None
+        # A caller that already staged a reason keeps it: the client needs to
+        # tell an external-linker load failure from a routine abort.
+        if req.to_finish is not None:
+            req.finished_reason = req.to_finish
+            req.to_finish = None
+        else:
+            prepare_abort(req, "Aborted")
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
@@ -3153,13 +3175,16 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+        self._release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        # Without the reason the tokenizer falls back to its generic "Abort in
+        # waiting queue", which loses both the message and the status code.
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3389,7 +3414,11 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if (
+            self.enable_hierarchical_cache
+            or get_memory().enable_flexkv
+            or self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3550,7 +3579,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_unified_cache_external_linker
+                    ):
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -3616,7 +3648,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -4166,6 +4198,9 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if self.enable_unified_cache_external_linker and batch.forward_mode.is_extend():
+            self._mark_failed_linker_loads(batch)
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4196,6 +4231,71 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
+        """Mark requests whose external-linker KV load failed for this batch.
+
+        Runs before the result processing that would otherwise stream their
+        output: the forward consumed the published pages before the transfer
+        could be verified, so those requests ran against KV that never arrived.
+        Granularity is the load batch, not the request -- the linker merges
+        every rid in a batch into shared plans.
+        """
+        deferred = self._deferred_linker_rids
+        self._deferred_linker_rids = set()
+        failed = set(self.tree_cache.drain_linker_loads()) | deferred
+        # A request that matched the chain while the load was in flight holds
+        # its pages too, and issued no load of its own -- so it is in no rid
+        # list and has to be found by where it points.
+        sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
+        if not failed and not sweep_chains:
+            return
+        message = "Aborted: external KV cache load failed."
+        # The MIN-reduced verdict can arrive a batch late on a lagging rank,
+        # by which point the request is already decoding. Sweep both lists.
+        candidates = list(batch.reqs)
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            candidates.extend(self.running_batch.reqs)
+        for req in candidates:
+            if req.rid in failed:
+                failed.discard(req.rid)
+            elif not (
+                sweep_chains
+                and self.tree_cache.is_on_failed_linker_chain(
+                    getattr(req, "last_node", None)
+                )
+            ):
+                continue
+            if req.finished() or req.to_finish is not None:
+                continue
+            # Never finished_reason here: a request finished ahead of the
+            # result processors is skipped by all of them, so it would leak its
+            # KV and never answer. update_finish_state promotes it instead.
+            req.skip_radix_cache_insert = True
+            req.to_finish = FINISH_ABORT(
+                message,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+            )
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            self._release_aborted_request(req.rid)
+            if req is self.chunked_req:
+                # A mid-chunk request never reaches update_finish_state, and
+                # freeing it here would leave self.chunked_req pointing at a
+                # freed request for the next step to stash and re-prefill.
+                self._pending_chunked_abort_req = req
+        if not failed:
+            return
+        # Under overlap the next batch is launched but not yet merged into
+        # running_batch, so its requests are in neither list. One retry is
+        # enough: a batch launched at step k is merged by step k + 1.
+        self._deferred_linker_rids = failed - deferred
+        if lost := failed & deferred:
+            logger.error(
+                "External linker load failed for %s, which never matched a "
+                "scheduled request; they were not aborted",
+                sorted(lost),
+            )
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -4715,10 +4815,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self._release_aborted_request(req.rid)
+            self.beam_coordinator.retire_group(req)
+            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4748,8 +4847,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                if self.enable_hicache_storage:
-                    self.tree_cache.release_aborted_request(req.rid)
+                self._release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid), req
                 )
@@ -4772,8 +4870,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
-                        self.tree_cache.release_aborted_request(req.rid)
+                    self._release_aborted_request(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
