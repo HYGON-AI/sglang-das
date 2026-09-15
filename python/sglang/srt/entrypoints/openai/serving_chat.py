@@ -1594,6 +1594,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )
+
+            # A multimodal model (V4.1 with a vision tower) hands the text prompt to
+            # the MM processor (_engine_prompt), so it must not stay empty.
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
         else:
             if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
