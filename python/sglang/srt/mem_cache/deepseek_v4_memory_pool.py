@@ -573,6 +573,7 @@ class DeepSeekV4IndexerPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         use_fp4_indexer: Optional[bool] = None,
+        packed_fp4_layout: bool = False,
     ):
         super().__init__(
             size,
@@ -588,8 +589,14 @@ class DeepSeekV4IndexerPool(KVCache):
         if use_fp4_indexer is None:
             use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.use_fp4_indexer = use_fp4_indexer
-        self.uses_aiter_fp4_layout = _is_hip and self.use_fp4_indexer
-        # Low-ratio pools round to nearest even; c4 keeps threshold rounding.
+        # packed_fp4_layout keeps the fused [payload | scale] page rows that the
+        # Triton store and readback use on every platform; otherwise HIP fp4 takes
+        # the split payload / scale layout of the aiter c4 kernels.
+        self.uses_aiter_fp4_layout = (
+            _is_hip and self.use_fp4_indexer and not packed_fp4_layout
+        )
+        # Low-ratio pools round to nearest even, as the reference does; c4 keeps
+        # the threshold rounding.
         self.index_k_rne = False
 
         self._create_buffer()
@@ -1617,6 +1624,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device,
                 enable_memory_saver,
                 use_fp4_indexer=True,
+                # The low-ratio pools go through store_fp4_index_k_cache and
+                # get_index_k_fp4 / get_index_k_dequant, never the aiter c4 kernels.
+                packed_fp4_layout=True,
             )
             # The dsv41 low-ratio indexer rounds to nearest even (reference rounding).
             pool.index_k_rne = True

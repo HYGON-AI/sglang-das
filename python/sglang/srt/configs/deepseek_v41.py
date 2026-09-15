@@ -20,6 +20,49 @@ def _config_dict(config):
     return config.to_dict() if isinstance(config, PretrainedConfig) else dict(config)
 
 
+def _per_channel_fp8_as_compressed_tensors(quant_config):
+    """FP8-Channel checkpoints declare {"quant_method": "fp8", "is_per_channel": true}
+    and store [out, 1] weight_scale_inv tensors, which the block/tensor Fp8Config
+    cannot load. Serve them through the compressed-tensors W8A8-FP8 channel scheme
+    (dynamic per-token activations) that the V4 FP8-Channel checkpoints use; the
+    loader already maps weight_scale_inv onto its weight_scale parameters."""
+    if not (
+        isinstance(quant_config, dict)
+        and quant_config.get("quant_method") == "fp8"
+        and quant_config.get("is_per_channel")
+        and quant_config.get("weight_block_size") is None
+        and quant_config.get("activation_scheme", "dynamic") == "dynamic"
+    ):
+        return quant_config
+    return {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "symmetric": True,
+                    "dynamic": False,
+                    "strategy": "channel",
+                    "group_size": None,
+                },
+                "input_activations": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "symmetric": True,
+                    "dynamic": True,
+                    "strategy": "token",
+                    "group_size": None,
+                },
+            }
+        },
+        # wo_a ships in bf16 without a scale.
+        "ignore": ["re:.*attn.wo_a.*"],
+    }
+
+
 def normalize_deepseek_v41_config(values):
     values = dict(values)
     text = values.pop("text_config", None)
@@ -37,6 +80,10 @@ def normalize_deepseek_v41_config(values):
         values["model_type"] = "deepseek_v41"
     if values.get("architectures") == ["DeepseekV41ForCausalLM"]:
         values["architectures"] = ["DeepseekV4ForCausalLM"]
+    if "quantization_config" in values:
+        values["quantization_config"] = _per_channel_fp8_as_compressed_tensors(
+            values["quantization_config"]
+        )
     return values
 
 
