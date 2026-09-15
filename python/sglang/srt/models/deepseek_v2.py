@@ -553,6 +553,16 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
+            elif (
+                _is_hcu
+                and self.is_deepseek_v4
+                and envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "auto"
+            ):
+                # Route auto before the broad AITER branch so HCU DSV4 router
+                # logits use the per-shape selector.
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+
+                logits = linear_bf16_fp32(hidden_states, self.weight)
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_hcu and self.is_deepseek_v4:

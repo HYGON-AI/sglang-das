@@ -368,8 +368,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_v2_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
-        # TcPiecewise does its compile pass during backend construction.
-        # Wrap only that path with the prefill CUDA graph failure hint.
+        # Auto mode may initialize AITER during the TC compile pass; prewarm
+        # chip metadata before backend construction and capture.
+        maybe_pre_warm_aiter_chip_info()
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -522,9 +523,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._input_embeds_arg_idx = (
                 params.index("input_embeds") if "input_embeds" in params else None
             )
-
-        # --- aiter chip info pre-warming (AMD) -------------------------
-        maybe_pre_warm_aiter_chip_info()
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
