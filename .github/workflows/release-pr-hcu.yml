@@ -59,6 +59,7 @@ jobs:
 
     env:
       TORCH_VERSION: ${{ inputs.torch_version || ((github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' && '2.11.0' || '2.10.0') }}
+      SGLANG_PACKAGE_VERSION: ${{ (github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' && '0.5.18' || '0.5.15.post1' }}
       SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
@@ -183,7 +184,7 @@ jobs:
       - name: Build sglang python package
         # if: steps.changes.outputs.sglang == 'true' || github.event_name == 'workflow_dispatch'
         env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: "0.5.15.post1"
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ env.SGLANG_PACKAGE_VERSION }}
         run: |
           source /opt/dtk/env.sh
           source $HOME/.cargo/env
@@ -263,6 +264,14 @@ jobs:
                       archive.read(metadata_names[0]).decode("utf-8")
                   )
               version = metadata.get("Version", "")
+              # Validate the repaired wheel, not just its externally visible filename.
+              filename_version = path.name.split("-")[1]
+              if filename_version != version:
+                  raise RuntimeError(f"Wheel filename/METADATA mismatch: {path.name}: {version}")
+              if metadata.get("Name", "").lower().replace("_", "-") == "sglang":
+                  expected = os.environ["SGLANG_PACKAGE_VERSION"]
+                  if version.partition("+")[0] != expected:
+                      raise RuntimeError(f"Incorrect SGLang package version: {version}; expected {expected}")
               _, separator, local_version = version.partition("+")
               if not separator or not local_version:
                   raise RuntimeError(f"Missing local version in {path.name}: {version}")
