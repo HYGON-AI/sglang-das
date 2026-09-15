@@ -281,18 +281,22 @@ def load_model_with_memory_saver(
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
 
-    if not is_draft_worker:
-        architectures = model_config.hf_config.architectures or []
-        is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
-        if server_args.ple_offload_embedding and not is_qwen4_exp:
-            raise ValueError(
-                "--ple-offload-embedding only supports "
-                "Qwen4ExpForConditionalGeneration"
-            )
-        if is_qwen4_exp:
-            model_config.hf_text_config.ple_offload_embedding = (
-                server_args.ple_offload_embedding
-            )
+    # The EAGLE draft is also Qwen4Exp and owns the same large PLE table, so
+    # apply the offload setting to target and draft workers alike.
+    architectures = model_config.hf_config.architectures or []
+    is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
+    if not is_qwen4_exp:
+        model_type = getattr(model_config.hf_config, "model_type", "") or ""
+        is_qwen4_exp = model_type == "qwen4_exp"
+    if server_args.ple_offload_embedding and not is_qwen4_exp:
+        raise ValueError(
+            "--ple-offload-embedding only supports "
+            "Qwen4ExpForConditionalGeneration"
+        )
+    if is_qwen4_exp:
+        model_config.hf_text_config.ple_offload_embedding = (
+            server_args.ple_offload_embedding
+        )
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup

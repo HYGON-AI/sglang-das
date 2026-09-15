@@ -1313,6 +1313,31 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def split_kv_infos(values: List[int]) -> Tuple[List[int], List[int]]:
+    """Split a [K_0..K_n, V_0..V_n] list into its K and V halves."""
+    mid = len(values) // 2
+    return list(values[:mid]), list(values[mid:])
+
+
+def normalize_mha_mtp_kv_infos(
+    main_values: List[int],
+    draft_values: Optional[List[int]],
+) -> List[int]:
+    """Fold draft KV infos into each K/V half: [K_main, K_draft, V_main, V_draft].
+
+    The non-MLA transfer path separates K from V by halving the pointer list.
+    Appending the draft pool at the tail would move that split point off the
+    K/V boundary and shift every V pointer by the draft entry count, so the
+    draft entries have to be folded into each half instead. This is the layout
+    KVArgs documents for total_main_kv_layers and friends.
+    """
+    if not draft_values:
+        return list(main_values)
+    main_k, main_v = split_kv_infos(main_values)
+    draft_k, draft_v = split_kv_infos(draft_values)
+    return main_k + draft_k + main_v + draft_v
+
+
 def build_kv_layer_ids(
     *,
     token_to_kv_pool,

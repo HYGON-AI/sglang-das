@@ -23,6 +23,8 @@ from flash_attn import (
     vllm_flash_attn_with_kvcache as vllm_flash_attn_with_kvcache_interface,
 )
 
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -442,6 +444,40 @@ def vllm_flash_attn_varlen_func(
         and window_size is not None
         and window_size[0] >= 0
     )
+    if (
+        use_hcu_fp8_swa_fallback
+        and not _use_triton_vllm_fa
+        and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
+        and get_spec().speculative_algorithm == "DFLASH"
+        and layout == "legacy_bhsd"
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.float8_e5m2
+        and q.shape[-1] == k.shape[-1] == v.shape[-2] == 128
+        and k.shape[2] == v.shape[3] == 64
+        and 1 <= max_seqlen_q <= 16
+        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
+        and 0 <= window_size[0] <= 8192
+    ):
+        from sglang.srt.layers.attention.hcu_native_swa import (
+            native_hcu_sliding_attention,
+        )
+
+        return native_hcu_sliding_attention(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            window_size=window_size,
+            block_table=block_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
     if _is_hcu and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback):
         return triton_vllm_flash_attn_varlen_func(
             q=q,
@@ -462,6 +498,60 @@ def vllm_flash_attn_varlen_func(
             layout=layout,
             out=out,
         )
+
+    # HCU paged MTP folds query tokens into heads and supports at most
+    # 64 query heads per KV head. Split uniform causal verification blocks
+    # without changing their bottom-right causal alignment or the KV cache.
+    if (
+        _is_hcu
+        and envs.SGLANG_USE_QWEN_DSPARK.get()
+        and get_spec().speculative_algorithm == "DSPARK"
+        and layout == "legacy_bhsd"
+        and k.shape[2] == 64
+        and q.shape[2] == v.shape[2]
+        and causal
+        and window_size == (-1, -1)
+        and 1 < max_seqlen_q <= 16
+        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
+        and q.shape[1] * max_seqlen_q > k.shape[1] * 64
+        and q.shape[1] <= k.shape[1] * 64
+    ):
+        batch_size = cu_seqlens_q.numel() - 1
+        chunk_size = min(16, k.shape[1] * 64 // q.shape[1])
+        queries = q.reshape(batch_size, max_seqlen_q, *q.shape[1:])
+        chunks = []
+        for begin in range(0, max_seqlen_q, chunk_size):
+            end = min(begin + chunk_size, max_seqlen_q)
+            chunk_q = queries[:, begin:end].contiguous().flatten(0, 1)
+            chunk_cu = torch.arange(
+                batch_size + 1, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype
+            ) * (end - begin)
+            chunk_lengths = (seqused_k - (max_seqlen_q - end)).clamp_min(0)
+            chunk_out = vllm_flash_attn_varlen_func_interface(
+                q=chunk_q,
+                k=k,
+                v=v,
+                cu_seqlens_q=chunk_cu,
+                max_seqlen_q=end - begin,
+                seqused_k=chunk_lengths,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_table,
+                fa_version=fa_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            chunks.append(
+                chunk_out.reshape(batch_size, end - begin, *chunk_out.shape[1:])
+            )
+        result = torch.cat(chunks, dim=1).flatten(0, 1)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
     return vllm_flash_attn_varlen_func_interface(
         q=q,

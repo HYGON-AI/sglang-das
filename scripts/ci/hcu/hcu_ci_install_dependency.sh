@@ -103,7 +103,7 @@ if [[ "${SKIP_COMPAT_INSTALL}" == "1" || "${SKIP_COMPAT_INSTALL}" == "true" ]]; 
 else
   echo "[hcu-ci] Installing HCU compatibility pins"
   install_with_retry docker exec "${CONTAINER}" \
-    pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.9" tabulate
+    pip install --cache-dir=/sgl-data/pip-cache "kernels<0.15" "apache-tvm-ffi==0.1.11" tabulate
 fi
 
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then

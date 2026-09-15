@@ -131,8 +131,8 @@ except ImportError:
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
-from lightop import fuse_situ_mul_quant_ep
+# from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
+# from lightop import fuse_situ_mul_quant_ep
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -140,6 +140,20 @@ from lightop.activation import (
     fuse_silu_mul_quant,
     fuse_silu_mul_quant_ep,
 )
+
+
+# Dummy SiTU functions for Kimi K3 (not used by Qwen)
+def fuse_situ_mul_quant(input, gemm1_alpha, gemm1_clamp_limit):
+    raise NotImplementedError("SiTU activation not supported. This build only supports Qwen with SiLU.")
+
+def fuse_situ_mul_quant_ep(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+    expect_m: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raise NotImplementedError("SiTU activation not supported. This build only supports Qwen with SiLU.")
 
 _is_hip = is_hip()
 _is_npu = is_npu()

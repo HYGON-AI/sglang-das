@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    normalize_mha_mtp_kv_infos,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -660,15 +661,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+            num_main_entries = len(kv_data_ptrs)
+            draft_layer_ids = []
             if has_kv_layer_ids:
                 target_layer_num = self.scheduler.model_config.num_hidden_layers
-                kv_layer_ids += [
+                draft_layer_ids = [
                     target_layer_num + i for i in range(len(draft_kv_data_ptrs))
                 ]
+            if self.is_mla_backend:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+                kv_layer_ids += draft_layer_ids
+            else:
+                # MHA transfer separates K from V by halving the pointer list,
+                # so appending the draft pool at the tail would shift every V
+                # pointer by one layer. Fold it into each half instead.
+                kv_data_ptrs = normalize_mha_mtp_kv_infos(
+                    kv_data_ptrs, draft_kv_data_ptrs
+                )
+                kv_data_lens = normalize_mha_mtp_kv_infos(
+                    kv_data_lens, draft_kv_data_lens
+                )
+                kv_item_lens = normalize_mha_mtp_kv_infos(
+                    kv_item_lens, draft_kv_item_lens
+                )
+                # Layer ids are only entry-parallel with the pointers for pools
+                # that report one id per buffer; otherwise leave the ordering
+                # alone rather than splitting a list of a different length.
+                if len(kv_layer_ids) == num_main_entries:
+                    kv_layer_ids = normalize_mha_mtp_kv_infos(
+                        kv_layer_ids, draft_layer_ids
+                    )
+                else:
+                    kv_layer_ids += draft_layer_ids
+            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -966,7 +993,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
+            # Fake transfer has no prefill endpoint; do not resolve a missing host.
+            # bootstrap_addr=_bootstrap_addr(req),
+            bootstrap_addr=(
+                "" if backend == TransferBackend.FAKE else _bootstrap_addr(req)
+            ),
             bootstrap_room=req.bootstrap_room,
         )
 

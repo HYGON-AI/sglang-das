@@ -1305,6 +1305,80 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("HYV4ForCausalLM")
+def _hy_v4_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Hunyuan-V4 (Hy4-preview) defaults, ported from an internal fork's
+    ``_handle_hyv4_adjustments``: DSA attention backend, the learnable-sink
+    KV-cache dtype restriction, and the prefill-CP topology requirements.
+
+    In-model restrictions (DP attention requires an all-to-all MoE backend and
+    --moe-dense-tp-size 1; two-batch overlap unsupported) are raised by
+    ``models/hunyuan_v4.py`` itself and are not repeated here.
+    """
+    overrides: Dict[str, Any] = {}
+
+    # Same MLA + DSA skeleton as DeepSeek: the dsa backend owns the indexer
+    # and the sparse attention kernels.
+    if server_args.is_attention_backend_not_set():
+        overrides["attention_backend"] = "dsa"
+        logger.info("Use dsa attention backend for HYV4.")
+    overrides["page_size"] = 64
+    logger.warning("Setting page size to 64 for HYV4 DSA.")
+
+    # The checkpoint's config.json has "learnable_sink": true. The sink is
+    # folded in from the softmax LSE, which requires an unquantized 16-bit KV
+    # cache on the flashmla_sparse path.
+    if server_args.kv_cache_dtype in (None, "auto", "bf16"):
+        overrides["kv_cache_dtype"] = "bfloat16"
+        logger.info(
+            "Setting kv_cache_dtype to bfloat16 for HYV4 learnable attention sinks."
+        )
+    elif server_args.kv_cache_dtype not in ("bfloat16", "float16", "fp16"):
+        logger.warning(
+            "HYV4 learnable attention sinks require an unquantized 16-bit KV "
+            "cache (bfloat16/float16); forcing kv_cache_dtype=bfloat16 "
+            f"(was {server_args.kv_cache_dtype!r})."
+        )
+        overrides["kv_cache_dtype"] = "bfloat16"
+
+    if server_args.enable_prefill_cp:
+        # HYV4 splits/gathers at the model level (embed_tokens .. hc_head) so
+        # the 3D iHC residual never crosses a 2D CP helper. That keeps MoE
+        # inside the CP-local token range, so the experts must cover the CP
+        # dimension themselves: deepep's dispatcher EP group does, a "none"
+        # a2a backend does not.
+        overrides["enable_dp_attention"] = True
+        overrides["moe_dense_tp_size"] = 1
+        if server_args.moe_a2a_backend == "none":
+            overrides["moe_a2a_backend"] = "deepep"
+            logger.warning(
+                "HYV4 prefill CP: forcing moe_a2a_backend=deepep. Without it "
+                "each rank's experts only see this rank's CP-local tokens."
+            )
+        overrides["ep_size"] = server_args.tp_size
+        attn_cp_size = server_args.tp_size // server_args.dp_size
+        overrides["attn_cp_size"] = attn_cp_size
+        logger.warning(
+            f"Enabled HYV4 prefill context parallel: "
+            f"dp_size={server_args.dp_size}, moe_dense_tp_size=1, "
+            f"ep_size={server_args.tp_size}, tp_size={server_args.tp_size}, "
+            f"attn_cp_size={attn_cp_size}"
+        )
+
+    # HYV4 is excluded from _DEEPSEEK_FAMILY_ARCHS, so the family DSA
+    # split-backend slot pass (_dsa_split_backend_resolution) skips it and
+    # dsa_prefill_impl/dsa_decode_impl stay None, which the dsa backend's
+    # _check_attn_sink_supported rejects: the learnable sinks require the
+    # flashmla_sparse impl. On HCU that is also the correct sparse kernel.
+    if is_hcu():
+        if server_args.dsa_prefill_backend is None:
+            overrides["dsa_prefill_backend"] = "flashmla_sparse"
+        if server_args.dsa_decode_backend is None:
+            overrides["dsa_decode_backend"] = "flashmla_sparse"
+
+    return overrides
+
+
 @_register_for(
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationMTP",
@@ -1443,7 +1517,6 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
-    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     if not is_sm100_supported() or server_args.attention_backend is not None:
@@ -1471,59 +1544,6 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         "attention_backend": sm100_default_attn_backend,
         "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
     }
-
-
-@_register_for("Qwen4ExpForConditionalGeneration")
-def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Qwen4-Exp keeps the MoE config under ``text_config``; every layer is
-    sparse, so a dense-MLP TP size of 1 only stalls the DP MoE path.
-
-    Compressed QSA additionally pins page_size=64 (overriding the hybrid
-    family's triton default of 1, last-writer-wins): its compressed cache is
-    addressed as ``full_slot // compress_ratio`` (the DSV4 scheme), which
-    requires page-aligned full-KV allocation with the page a multiple of the
-    compress ratio, and page-granular prefix sharing so shared pages share
-    their compressed slots. MambaRadixCache supports page_size > 1 only with
-    the mamba extra-buffer strategy, so fall back to the family default when
-    neither that nor --disable-radix-cache holds (the QSA pool then fails
-    fast at boot).
-    """
-    overrides: Dict[str, Any] = {}
-    if server_args.ple_offload_embedding is None:
-        import torch
-
-        overrides["ple_offload_embedding"] = (
-            is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
-        )
-
-    text_config = getattr(hf_config, "text_config", hf_config)
-    if (
-        getattr(text_config, "num_experts", None) is not None
-        and server_args.moe_dense_tp_size == 1
-    ):
-        overrides["moe_dense_tp_size"] = None
-
-    from sglang.srt.layers.attention.qsa.config import (
-        QSA_VARIANT_COMPRESSED,
-        parse_qsa_profile,
-    )
-
-    profile = parse_qsa_profile(hf_config)
-    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
-        # Unconditional, like DeepSeek-V4's page-256 declaration: compressed
-        # addressing is full_slot // ratio and requires page-aligned
-        # allocation on every backend. Do not gate this on
-        # mamba_radix_cache_strategy — that field resolves in a later pass
-        # (mid-resolution it still holds the unresolved default, which made
-        # this declaration silently skip on non-SM100 boxes); if the finally
-        # resolved strategy cannot support page > 1, MambaRadixCache's own
-        # boot assertion reports it.
-        overrides["page_size"] = 64
-        logger.info(
-            "Setting page size to 64 for compressed QSA "
-            "(full//ratio compressed addressing)."
-        )
-    return overrides
 
 
 @_register_for("InternS2MobiusForConditionalGeneration")
@@ -1556,7 +1576,6 @@ def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
-    "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
@@ -1685,7 +1704,6 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "InternS2PreviewForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
-        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -1707,7 +1725,6 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
-        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -2150,7 +2167,6 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
-        "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
