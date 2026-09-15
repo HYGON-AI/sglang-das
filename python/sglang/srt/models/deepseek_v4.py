@@ -6182,6 +6182,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+            from sglang.kernels.ops.gemm.bf16_fp32 import prewarm_auto_bf16_fp32
+
+            prewarm_auto_bf16_fp32()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
