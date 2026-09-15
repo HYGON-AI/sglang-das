@@ -70,6 +70,26 @@ def finish_cp_kv_swa_prefetch(pool, layer_id, forward_batch, attn_backend, handl
         pool._cp_swa_store_stream = store_stream
     store_stream.wait_stream(compute_stream)
     with torch.cuda.stream(store_stream):
+        rank_major_loc = getattr(
+            attn_backend, "get_swa_out_cache_loc_cp_rank_major", None
+        )
+        swa_loc = (
+            rank_major_loc(layer_id, forward_batch, handle[3], handle[0])
+            if rank_major_loc is not None
+            else None
+        )
+        if swa_loc is not None:
+            # The non-unified HCU attention path consumes only stored KV.
+            # Pair raw CP-major rows with CP-major destinations instead of
+            # materializing another full BF16 KV tensor in global order.
+            store_stream.wait_event(handle[2])
+            handle[0].record_stream(store_stream)
+            handle[1].record_stream(store_stream)
+            pool.set_swa_key_buffer_radix_fused(
+                layer_id=layer_id, swa_loc=swa_loc, cache_k=handle[0]
+            )
+            maybe_prefetch_cp_kv_swa(pool, layer_id, forward_batch)
+            return None
         kv = cp_all_gather_rerange_finish(handle)
         # These buffers were allocated on the compute stream. Keep them alive
         # until the gather and reordering queued on the side streams finish.

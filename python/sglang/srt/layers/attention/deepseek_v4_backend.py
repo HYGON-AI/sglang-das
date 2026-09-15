@@ -1719,6 +1719,100 @@ class DeepseekV4AttnBackend(
             torch.int32
         )
 
+    def get_swa_out_cache_loc_cp_rank_major(
+        self, layer_id: int, forward_batch: ForwardBatch, cp_size: int, raw_kv: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Return paired destinations for an unpadded HCU LayerSplit gather.
+
+        Ordinary paged prefill allocates distinct real SWA locations. Whole-row
+        permutation then preserves the existing per-token quantization exactly.
+        Padded, speculative, ring, graph and unknown layouts keep the old path.
+        Never mutate the globally ordered locations used by other consumers.
+        """
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+        from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+            effective_forward_mode,
+        )
+        from sglang.srt.layers.attention.dsa.utils import (
+            dsa_use_prefill_cp,
+            is_dsa_prefill_cp_round_robin_split,
+        )
+        from sglang.srt.layers.cp.utils import enable_cp_v2
+        from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+            CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4SingleKVPool,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+        from sglang.srt.utils import is_hcu
+
+        pool = self.token_to_kv_pool
+        if (
+            not is_hcu()
+            or not isinstance(pool, CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+            or is_unified_kv_triton()
+            or getattr(pool, "_unified_kv", True)
+            or type(pool.swa_kv_pool) is not DeepSeekV4SingleKVPool
+            or pool.is_bf16_attention_kv_cache
+            or not envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or effective_forward_mode(forward_batch) != ForwardMode.EXTEND
+            or not dsa_use_prefill_cp(forward_batch)
+            or not is_dsa_prefill_cp_round_robin_split()
+            or enable_cp_v2()
+            or get_is_capture_mode()
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            or getattr(forward_batch, "tbo_children", None)
+            or cp_size <= 1
+            or cp_size != pool.cp_size
+            or raw_kv.ndim != 2
+            or raw_kv.shape[1] != 512
+            or raw_kv.dtype != torch.bfloat16
+            or not raw_kv.is_contiguous()
+        ):
+            return None
+        num_tokens = raw_kv.shape[0]
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        out_loc = forward_batch.out_cache_loc
+        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        if (
+            num_tokens == 0
+            or num_tokens % cp_size != 0
+            or not isinstance(extend_lens, (list, tuple))
+            or not all(isinstance(n, int) and n >= 0 for n in extend_lens)
+            or sum(extend_lens) != num_tokens
+            or not isinstance(core, DSV4AttnMetadata)
+            or not isinstance(out_loc, torch.Tensor)
+            or out_loc.ndim != 1
+            or out_loc.shape[0] != num_tokens
+            or out_loc.device != raw_kv.device
+        ):
+            return None
+        if pool.should_skip_swa_write(layer_id):
+            # Empty view marks an eligible non-owner without translating or
+            # permuting locations. The pool setter checks ownership before
+            # reading this marker; the helper still waits, records and prefetches.
+            # None is reserved for the unchanged full-KV fallback.
+            return out_loc[:0]
+        # Match the LayerSplit branch in store_cache: its global-length fast
+        # path translates out_cache_loc directly, without using cached metadata
+        # locations or any additional all-gather.
+        swa_loc = pool.translate_loc_from_full_to_swa(out_loc).to(torch.int32)
+        if (
+            swa_loc.ndim != 1
+            or swa_loc.shape[0] != num_tokens
+            or swa_loc.device != raw_kv.device
+            or swa_loc.dtype not in (torch.int32, torch.int64)
+            or not swa_loc.is_contiguous()
+        ):
+            return None
+        return swa_loc.view(-1, cp_size).transpose(0, 1).reshape(num_tokens)
+
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
