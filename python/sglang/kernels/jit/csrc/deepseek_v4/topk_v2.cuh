@@ -75,7 +75,7 @@ struct TopKPagedParams {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
-  int32_t* __restrict__ raw_indices;
+  int32_t* __restrict__ raw_indices;      // DUAL_OUTPUT only, nullptr otherwise
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
@@ -96,8 +96,8 @@ struct TopKPagedParams {
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
     return page_indices + batch_id * static_cast<int64_t>(topk);
   }
-  SGL_DEVICE int32_t* get_raw_output_ptr(uint32_t batch_id) const {
-    return raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk);
+  SGL_DEVICE PageTransform get_transform(uint32_t batch_id) const {
+    return {page_table + batch_id * page_table_stride, page_bits, raw_indices + batch_id * static_cast<int64_t>(topk)};
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
@@ -137,30 +137,35 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
 }
 
 template <bool kPDL, TopKMode kMode>
-SGL_DEVICE void trivial_transform(const TopKProblem& problem, int32_t* raw_output_ptr) {
+SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransform& transform) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
     if constexpr (kMode == TopKMode::INDICES) {
       problem.out[tx] = tx < problem.seq_len ? static_cast<int32_t>(tx) : -1;
     } else {
-      problem.transform_output(tx, idx);
-      if constexpr (kMode == TopKMode::DUAL_OUTPUT) raw_output_ptr[tx] = idx;
+      problem.out[tx] = tx < problem.seq_len ? transform.page_to_indices(tx) : -1;
+      if constexpr (kMode == TopKMode::DUAL_OUTPUT) {
+        transform.raw_out[tx] = tx < problem.seq_len ? static_cast<int32_t>(tx) : -1;
+      }
     }
   });
 }
 
 template <TopKMode kMode>
-SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr, int32_t* raw_output_ptr) {
-  static_assert(kMode != TopKMode::INDICES, "problem_transform requires page-table output");
+SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
+  static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
-  int32_t source_index[kNumElems];
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { source_index[i] = problem.out[tx]; });
-  problem.out = output_ptr;
+  int32_t indices[kNumElems];
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
-    problem.transform_output(tx, source_index[i]);
-    if constexpr (kMode == TopKMode::DUAL_OUTPUT) raw_output_ptr[tx] = source_index[i];
+    // load into register at once
+    indices[i] = problem.out[tx];
+  });
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
+    // safe write to output
+    out[tx] = indices[i] >= 0 ? transform.page_to_indices(indices[i]) : -1;
+    if constexpr (kMode == TopKMode::DUAL_OUTPUT) transform.raw_out[tx] = indices[i];
   });
 }
 
@@ -263,8 +268,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   constexpr bool kPDLEarly = kPDL && !kHandleCluster;
   constexpr bool kPDLFinal = kPDL && kHandleCluster;
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk)
-    return trivial_transform<kPDLEarly, kMode>(problem, params.get_raw_output_ptr(blockIdx.x));
+  __shared__ int32_t s_topk_indices[kMaxTopK];
 
   const auto bx = blockIdx.x;
   auto problem = params.problem(bx);
@@ -306,7 +310,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    problem_transform<kMode>(problem, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
+    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
   }
 }
 
@@ -336,10 +340,23 @@ constexpr uint32_t kClusterMaxBatch = 512;
 template <bool kPDL, uint32_t kClusterSize>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
-  auto problem = params.problem(blockIdx.x);
-  __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk)
-    return trivial_transform<kPDL, kMode>(problem, params.get_raw_output_ptr(blockIdx.x));
+  using ClusterN = impl::TopKCluster<kClusterSize>;
+  __shared__ impl::MaxSmem<typename ClusterN::Smem> smem;
+  const auto bx = blockIdx.x;
+  const auto num_cluster_items = params.global().num_cluster_items;
+  device::PDLWaitPrimary<kPDL>();
+  if (bx >= params.batch_size) return;
+  device::PDLTriggerSecondary<kPDL>();
+  auto idx = static_cast<int32_t>(num_cluster_items - 1 - bx);
+#pragma unroll 1
+  while (idx >= 0) {
+    const auto it = params.item(idx);
+    const auto problem = params.problem(it.batch_id, it.seq_len);
+    ClusterN::template forward<false>(problem, &smem);
+    idx -= kNumPersistentClusters;
+    if (idx >= 0) __syncthreads();
+  }
+}
 
 template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy>
 CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
@@ -388,14 +405,8 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
 
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
-    // Only the elected worker reaches here, and it mapped `topk_indices` to
-    // itself, so `problem.out` is this block's own buffer. Stating that keeps the
-    // shared::cluster address out of the load problem_transform issues -- which is
-    // load-bearing, not an optimization: without it cicc segfaults on CUDA 13.1+
-    // for sm_90a (issue #32830, previously worked around by copying `problem` in
-    // #32910). Verified: dropping this line reproduces the crash on 13.1/13.2/13.3.
-    __builtin_assume(problem.out == s_topk_indices);
-    problem_transform<kMode>(problem, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
+    __syncthreads();
+    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.get_transform(bx));
   }
 }
 
@@ -593,13 +604,6 @@ struct TopKKernel {
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
 
-    int32_t* raw_indices_ptr = nullptr;
-    if (raw_indices.has_value()) {
-      RuntimeCheck(page_table.has_value(), "raw_indices requires a page table");
-      TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(raw_indices.value());
-      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
-    }
-
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
     RuntimeCheck(metadata.size(0) == B.unwrap() + 1, "invalid metadata shape");
@@ -639,13 +643,6 @@ struct TopKKernel {
         .batch_size = batch_size,
     };
 
-#ifndef USE_ROCM
-    const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
-#endif
-    constexpr bool kUsePDL = true;
-    const auto mode = raw_indices.has_value()  ? TopKMode::DUAL_OUTPUT
-                      : page_table.has_value() ? TopKMode::PAGE_TABLE
-                                               : TopKMode::INDICES;
     const auto dispatch = [&]<typename F>(F&& f) {
       const auto mode = raw_indices.has_value()  ? TopKMode::DUAL_OUTPUT
                         : page_table.has_value() ? TopKMode::PAGE_TABLE
@@ -653,9 +650,7 @@ struct TopKKernel {
       switch (mode) {
         case TopKMode::INDICES:
           return f.template operator()<TopKMode::INDICES>();
-        case TopKMode::DUAL_OUTPUT:
-          return f.template operator()<TopKMode::DUAL_OUTPUT>();
-        default:
+        case TopKMode::PAGE_TABLE:
           return f.template operator()<TopKMode::PAGE_TABLE>();
         case TopKMode::DUAL_OUTPUT:
           return f.template operator()<TopKMode::DUAL_OUTPUT>();
