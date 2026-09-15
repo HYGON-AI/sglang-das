@@ -17,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       torch_version:
-        description: 'PyTorch version to install'
+        description: 'PyTorch version override; empty selects the target branch default'
         required: false
-        default: '2.10.0'
+        default: ''
         type: string
       skip_gateway:
         description: 'Skip sgl-model-gateway build'
@@ -41,7 +41,8 @@ jobs:
         shell: bash
 
     container:
-      image: ${{ vars.HCU_CI_RELEASE_IMAGE }}
+      # Select by PR base, not by the untrusted source branch. Dispatch uses its selected ref.
+      image: ${{ vars[(github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' && 'HCU_CI_IMAGE_0518' || 'HCU_CI_RELEASE_IMAGE'] }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -57,7 +58,7 @@ jobs:
         python-version: ['3.10']
 
     env:
-      TORCH_VERSION: ${{ inputs.torch_version || '2.10.0' }}
+      TORCH_VERSION: ${{ inputs.torch_version || ((github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' && '2.11.0' || '2.10.0') }}
       SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
@@ -66,6 +67,22 @@ jobs:
       HCU_WHEEL_STAGING_ROOT: /ci_public/sglang-das/hcu-wheel-staging
 
     steps:
+      - name: Verify image Torch version before building extensions
+        run: |
+          python3 - <<'PY'
+          import os
+          import torch
+
+          expected = os.environ["TORCH_VERSION"]
+          actual = torch.__version__
+          print(f"Build Torch: {actual}; expected: {expected}")
+          if actual.split("+", 1)[0] != expected.split("+", 1)[0]:
+              raise SystemExit(
+                  "HCU build image and TORCH_VERSION do not match. "
+                  "Select a matching HCU image instead of replacing its Torch installation."
+              )
+          PY
+
       # =======================================================================
       # 环境准备
       # =======================================================================

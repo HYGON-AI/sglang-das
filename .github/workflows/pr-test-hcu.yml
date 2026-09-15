@@ -470,6 +470,7 @@ jobs:
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
       GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
+      HCU_WHEEL_EXPECTED_TORCH_VERSION: ${{ (github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' && '2.11.0' || '' }}
     steps:
       - name: Checkout code
         env:
@@ -515,6 +516,7 @@ jobs:
           echo "Host staging root: ${HCU_WHEEL_STAGING_ROOT}"
 
           python3 - <<'PY_WAIT' | tee /tmp/hcu_wheel_paths.out
+          import json
           import os
           import pathlib
           import sys
@@ -523,6 +525,7 @@ jobs:
           root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_ROOT", "/ci_public/sglang-das/hcu-wheel-staging"))
           container_root = pathlib.Path(os.environ.get("HCU_WHEEL_STAGING_CONTAINER_ROOT", "/hcu-wheel-staging"))
           target_sha = os.environ["HCU_WHEEL_TARGET_SHA"]
+          expected_torch_version = os.environ.get("HCU_WHEEL_EXPECTED_TORCH_VERSION", "")
           short_sha = os.environ.get("HCU_WHEEL_TARGET_SHORT_SHA", target_sha[:12])
           repo = os.environ["GITHUB_REPOSITORY"]
           owner, repo_name = repo.split("/", 1)
@@ -569,6 +572,22 @@ jobs:
                       continue
                   if not wheel_dir.is_dir():
                       print(f"[wait-hcu-wheels] {staging_dir} has no wheels directory", file=sys.stderr)
+                      continue
+                  manifest_path = staging_dir / "manifest.json"
+                  try:
+                      manifest = json.loads(manifest_path.read_text())
+                  except (OSError, ValueError) as error:
+                      print(f"[wait-hcu-wheels] invalid manifest {manifest_path}: {error}", file=sys.stderr)
+                      continue
+                  if not isinstance(manifest, dict) or manifest.get("commit_sha") != target_sha:
+                      print(f"[wait-hcu-wheels] commit mismatch in {manifest_path}", file=sys.stderr)
+                      continue
+                  if expected_torch_version and manifest.get("torch_version") != expected_torch_version:
+                      print(
+                          f"[wait-hcu-wheels] ignoring Torch {manifest.get('torch_version')} wheels in "
+                          f"{staging_dir}; expected {expected_torch_version}. Rebuild with the matching HCU image.",
+                          file=sys.stderr,
+                      )
                       continue
                   found = {}
                   for wheel in sorted(wheel_dir.glob("*.whl")):
