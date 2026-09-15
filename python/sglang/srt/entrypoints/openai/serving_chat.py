@@ -39,7 +39,12 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import (
+    chat_encoding,
+    encoding_dsv4,
+    encoding_dsv32,
+    encoding_dsv41,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -338,6 +343,14 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.chat_encoding_spec == "inkling"
             else None
         )
+        self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
+            chat_encoding.default_dsv41_reasoning_effort_from_env(
+                envs.SGLANG_DSV41_REASONING_EFFORT.get()
+            )
+            if self.chat_encoding_spec == "dsv41"
+            else None
+        )
+        self._dsv41_unsupported_efforts_warned: set = set()
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: Optional[ResponseParserProtocol] = None
@@ -684,6 +697,25 @@ class OpenAIServingChat(OpenAIServingBase):
         if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
             raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
         return parsed
+
+    def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
+        """Request effort for the V4.1 encoder; unsupported tiers warn once and fall back."""
+        effort = chat_encoding.resolve_dsv41_reasoning_effort(value)
+        if effort is not None:
+            return effort
+        if (
+            value is not None
+            and repr(value) not in self._dsv41_unsupported_efforts_warned
+        ):
+            self._dsv41_unsupported_efforts_warned.add(repr(value))
+            logger.warning(
+                "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
+                "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
+                "integer budget in [1, 100] via chat_template_kwargs are accepted).",
+                value,
+                self._dsv41_default_reasoning_effort,
+            )
+        return self._dsv41_default_reasoning_effort
 
     @staticmethod
     def _get_inkling_default_reasoning_effort() -> float:
@@ -1391,43 +1423,60 @@ class OpenAIServingChat(OpenAIServingBase):
                         modalities,
                     )
         elif self.chat_encoding_spec is not None:
-            # dsv4/dsv32 encoding path
+            # dsv4/dsv41/dsv32 encoding path
             messages = copy.deepcopy(messages)
+            is_dsv41 = self.chat_encoding_spec == "dsv41"
 
-            # dsv4/dsv32 are text-only and consume string content; flatten
-            # OpenAI parts-list content here so the encoder sees a plain string.
-            for i, msg in enumerate(messages):
-                if isinstance(msg.get("content"), list):
-                    messages[i] = process_content_for_template_format(
-                        msg, "string", [], [], [], []
+            if is_dsv41:
+                # The V4.1 encoder consumes OpenAI parts lists itself (image
+                # parts become placeholders), so no flattening here.
+                for msg in messages:
+                    if msg.get("content") is None:
+                        msg["content"] = ""
+            else:
+                # dsv4/dsv32 are text-only and consume string content; flatten
+                # OpenAI parts-list content here so the encoder sees a plain string.
+                for i, msg in enumerate(messages):
+                    if isinstance(msg.get("content"), list):
+                        messages[i] = process_content_for_template_format(
+                            msg, "string", [], [], [], []
+                        )
+
+                for msg in messages:
+                    if msg.get("content") is None:
+                        msg["content"] = ""
+                    processed_msg = process_content_for_template_format(
+                        msg,
+                        template_content_format,
+                        image_data,
+                        video_data,
+                        audio_data,
+                        modalities,
+                        use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
                     )
-
-            for msg in messages:
-                if msg.get("content") is None:
-                    msg["content"] = ""
-                processed_msg = process_content_for_template_format(
-                    msg,
-                    template_content_format,
-                    image_data,
-                    video_data,
-                    audio_data,
-                    modalities,
-                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
-                )
-                msg.update(processed_msg)
+                    msg.update(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
 
-            if messages[0]["role"] != "system":
-                # insert an empty system prompt to help render tool system prompt
+            # An empty system message hosts the request tools. dsv4/dsv32 render
+            # it to nothing, so they always insert one; dsv41 renders a system
+            # token for it, so it only gets one when tools need the host.
+            if messages[0]["role"] != "system" and (request.tools or not is_dsv41):
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
-                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+                messages[0]["tools"] = [
+                    (
+                        chat_encoding.dsv41_tool_payload(tool)
+                        if is_dsv41
+                        else tool.model_dump()
+                    )
+                    for tool in request.tools
+                ]
 
-            # Default encoding (dsv4/dsv32)
+            # Default encoding (dsv4/dsv41/dsv32)
             if self.chat_encoding_spec == "dsv4":
                 effort_source = request.reasoning_effort
                 if effort_source is None:
@@ -1453,6 +1502,31 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            elif is_dsv41:
+                if request.task is not None:
+                    encoding_dsv41.attach_task_to_last_user_message(
+                        messages, request.task
+                    )
+                real_input, media = encoding_dsv41.encode_messages(
+                    messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=self._resolve_dsv41_reasoning_effort(
+                        request.reasoning_effort
+                    ),
+                    return_multi_modal_data=True,
+                )
+                if media["images"]:
+                    if not is_multimodal:
+                        raise ValueError("image input is not supported for this model")
+                    image_data.extend(image["url"] for image in media["images"])
+                    tokenizer = self.tokenizer_manager.tokenizer
+                    real_input = real_input.replace(
+                        encoding_dsv41.IMAGE_PLACEHOLDER,
+                        tokenizer.convert_ids_to_tokens(
+                            self.tokenizer_manager.model_config.hf_config.image_token_id
+                        ),
+                    )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
@@ -1464,6 +1538,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )
+
+            # A multimodal model (V4.1 with a vision tower) hands the text prompt to
+            # the MM processor (_engine_prompt), so it must not stay empty.
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
         else:
             if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
@@ -2405,14 +2484,17 @@ class OpenAIServingChat(OpenAIServingBase):
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
-                    for call_info in call_info_list:
+                    for index, call_info in enumerate(call_info_list):
                         tool_id = self._process_tool_call_id(
                             call_info, history_tool_calls_cnt
                         )
+                        # index is the call's position in tool_calls, as in the
+                        # streaming deltas; tool_index is the tool's position
+                        # in the request for some detectors.
                         tool_calls.append(
                             ToolCall(
                                 id=tool_id,
-                                index=getattr(call_info, "tool_index", None),
+                                index=index,
                                 function=FunctionResponse(
                                     name=call_info.name,
                                     arguments=call_info.parameters,

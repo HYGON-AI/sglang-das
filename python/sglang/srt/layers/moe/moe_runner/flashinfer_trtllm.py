@@ -75,6 +75,11 @@ def flashinfer_trtllm_deferred_finalize_context(
         _deferred_finalize_enabled.reset(token)
 
 
+def is_deferred_finalize_enabled() -> bool:
+    """Whether the caller asked for the ``do_finalize=False`` output ABI."""
+    return _deferred_finalize_enabled.get()
+
+
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
@@ -98,14 +103,12 @@ def _make_deferred_finalize_output(
 ) -> FlashInferTrtllmDeferredFinalizeOutput:
     """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
     gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-    # Some FlashInfer versions size this buffer from routing_logits dtype while
-    # writing BF16 weights into it. Reinterpret only the live BF16 prefix.
-    if expert_weights.dtype == torch.float32:
-        n, k = expert_weights.shape
-        expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
-    if expert_weights.dtype != torch.bfloat16:
+    # FlashInfer >= 0.6.18 types this buffer by what it holds: bf16 for packed
+    # routing (flashinfer #3595) and the caller's dtype for unpacked routing,
+    # so fp32 here is genuine fp32 and must not be reinterpreted as bf16 bits.
+    if expert_weights.dtype not in (torch.bfloat16, torch.float32):
         raise RuntimeError(
-            "FlashInfer deferred finalize must return BF16 expert weights, got "
+            "FlashInfer deferred finalize must return BF16 or FP32 expert weights, got "
             f"{expert_weights.dtype}"
         )
     if gemm2_out.dtype != torch.bfloat16:

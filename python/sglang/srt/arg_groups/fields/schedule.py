@@ -162,6 +162,18 @@ class Schedule(msgspec.Struct):
             fallback=0.8,
         ),
     ] = None
+    swa_prefix_tails: A[
+        Optional[int],
+        Arg(
+            help=(
+                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+                "family), how many radix-cached prefix tails it keeps room for. "
+                "Each tail is one sliding window plus one page. Default: 4 x "
+                "max_running_requests per attention-DP rank, 0 when the radix "
+                "cache is disabled."
+            ),
+        ),
+    ] = None
     disable_hybrid_swa_memory: A[
         bool, Arg(help="Disable the hybrid SWA memory pool.", resolvable=True)
     ] = False
