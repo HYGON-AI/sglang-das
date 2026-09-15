@@ -24,6 +24,7 @@
 #else
 #include <cuda_fp8.h>
 #endif
+#include <optional>
 
 namespace sglang {
 
