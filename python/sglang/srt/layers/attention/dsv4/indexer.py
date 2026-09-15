@@ -1195,20 +1195,20 @@ def fp32_jit_paged_topk(
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             page_indices,
-            metadata.c4_page_size,
+            metadata.compressed_page_size,
             metadata.topk_metadata,
             raw_indices,
         )
     else:
         topk_transform_paged(
             logits,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             page_indices,
-            metadata.c4_page_size,
+            metadata.compressed_page_size,
             raw_indices,
         )
 
