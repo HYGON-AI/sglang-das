@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_server_args,
     get_spec,
     max_speculative_num_draft_tokens,
 )
