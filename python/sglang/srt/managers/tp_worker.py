@@ -529,6 +529,11 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def _raise_hicache_load_error(self) -> None:
+        counter = self.hicache_layer_transfer_counter
+        if counter is not None and hasattr(counter, "raise_if_failed"):
+            counter.raise_if_failed()
+
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator
 
@@ -621,6 +626,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            self._raise_hicache_load_error()
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -685,6 +691,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            self._raise_hicache_load_error()
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

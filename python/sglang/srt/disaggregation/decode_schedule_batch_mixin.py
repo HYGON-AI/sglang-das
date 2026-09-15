@@ -70,6 +70,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 delta = max(0, pre_len - req.already_computed)
                 req.cached_tokens += delta
                 req.cached_tokens_device += delta
+                req.cached_tokens_by_source["l1_device"] = req.cached_tokens_device
                 req.already_computed = seq_len
             req.is_retracted = False
             if getattr(req, "pd_rebootstrap_in_progress", False):

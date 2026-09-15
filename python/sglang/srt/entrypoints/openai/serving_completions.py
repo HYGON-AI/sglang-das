@@ -21,6 +21,8 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
+    cache_hit_rates_from_dict,
+    process_cache_hit_rates_from_ret,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
@@ -240,6 +242,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         routed_experts = {}
         cached_tokens_details = {}
         spec_tokens_details = {}
+        cache_hit_rates = {}
 
         stream_started = False
         try:
@@ -271,6 +274,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     spec_tokens_details[index] = spec_tokens_details_from_meta_info(
                         content["meta_info"]
                     )
+                cache_hit_rates[index] = content["meta_info"].get(
+                    "cache_hit_rates", None
+                )
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
@@ -448,12 +454,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         spec_details if request.n > 1 else spec_details[0]
                     )
 
+            sglext_cache_hit_rates = None
+            if request.return_cache_hit_rates and cache_hit_rates:
+                first_rates = next(
+                    (v for v in cache_hit_rates.values() if v is not None), None
+                )
+                if first_rates is not None:
+                    sglext_cache_hit_rates = cache_hit_rates_from_dict(first_rates)
+
             if any(
                 obj is not None
                 for obj in [
                     sglext_routed,
                     sglext_cached_tokens_details,
                     sglext_spec_tokens_details,
+                    sglext_cache_hit_rates,
                 ]
             ):
                 sglext_chunk = CompletionStreamResponse(
@@ -466,6 +481,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_cached_tokens_details,
                         spec_tokens_details=sglext_spec_tokens_details,
+                        cache_hit_rates=sglext_cache_hit_rates,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -558,12 +574,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.n > 1
             else (spec_details[0] if spec_details else None)
         )
+        cache_hit_rates = process_cache_hit_rates_from_ret(first_ret, request)
         response_sglext = None
-        if routed_experts or cached_tokens_details or spec_tokens_details:
+        if (
+            routed_experts
+            or cached_tokens_details
+            or spec_tokens_details
+            or cache_hit_rates
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
+                cache_hit_rates=cache_hit_rates,
             )
 
         for idx, ret_item in enumerate(ret):

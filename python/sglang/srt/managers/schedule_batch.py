@@ -1021,6 +1021,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Direct external-linker source used by cached_tokens_total cache_source.
+        self.cached_tokens_storage_source: Optional[str] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -1126,6 +1128,12 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self.cached_tokens_by_source = {
+            "l1_device": 0,
+            "l3_mooncake_memory": 0,
+            "l4_mooncake_dfs": 0,
+            "l4_mooncake_local_disk": 0,
+        }
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
@@ -2513,6 +2521,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         host_hit_len=req.host_hit_length,
                         storage_hit_len=req.storage_hit_length,
                     )
+                    source_counts = getattr(req, "cached_tokens_by_source", {})
+                    # The device prefix is authoritative after load-back. A
+                    # Mooncake load starts with this map initialized to zero,
+                    # so copying source_counts["l1_device"] here would erase a
+                    # real HBM hit computed above.
+                    req.cached_tokens_by_source = {
+                        "l1_device": req.cached_tokens_device,
+                        "l3_mooncake_memory": int(
+                            source_counts.get("l3_mooncake_memory", 0)
+                        ),
+                        "l4_mooncake_dfs": int(
+                            source_counts.get("l4_mooncake_dfs", 0)
+                        ),
+                        "l4_mooncake_local_disk": int(
+                            source_counts.get("l4_mooncake_local_disk", 0)
+                        ),
+                    }
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

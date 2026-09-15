@@ -335,6 +335,13 @@ Mooncake also supports high availability mode. This mode enhances fault toleranc
 
 ### Deployment with Dummy Client (Experimental)
 
+> **Compatibility:** Dummy Client / standalone storage requires the regular
+> HiCache L2 host pool and is not supported by
+> `--enable-unified-cache-external-linker`. The direct linker deliberately
+> bypasses L2 and registers device buffers directly, whereas `setup_dummy()`
+> requires buffers allocated by `MooncakeHostTensorAllocator` so they can be
+> shared with the local real-client process.
+
 In addition to the standard deployment where SGLang acts as a full Mooncake node, you can use the **Dummy Client** mode. In this mode, SGLang connects to a local **Mooncake Store Service** (Real Client) via RPC/IPC. This decouples the SGLang process from the heavy RDMA and memory management, potentially improving stability and allowing the cache to persist even if the SGLang process restarts.
 
 **Architecture:**

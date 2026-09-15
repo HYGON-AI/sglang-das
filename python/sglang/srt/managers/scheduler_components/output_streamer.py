@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -20,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    CacheHitRates,
     CachedTokensDetails,
     wrap_as_pickle,
 )
@@ -37,6 +39,14 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _source_debug_enabled() -> bool:
+    return os.getenv("SGLANG_MOONCAKE_SOURCE_DEBUG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
@@ -77,6 +87,138 @@ class SchedulerOutputStreamer:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
+    def get_cache_hit_rates(self, req: Req) -> Optional[CacheHitRates]:
+        """Build request-level cache hit counts and rates by cache tier."""
+        prompt_tokens = len(req.origin_input_ids)
+        if prompt_tokens <= 0:
+            return None
+
+        cached_tokens = max(0, int(req.cached_tokens))
+        device_tokens = max(0, int(req.cached_tokens_device))
+        host_tokens = max(0, int(req.cached_tokens_host))
+        storage_tokens = max(0, int(req.cached_tokens_storage))
+        source_counts = getattr(req, "cached_tokens_by_source", {}) or {}
+        source_l1 = max(0, int(source_counts.get("l1_device", 0)))
+        l3_memory = max(0, int(source_counts.get("l3_mooncake_memory", 0)))
+        l4_dfs = max(0, int(source_counts.get("l4_mooncake_dfs", 0)))
+        l4_local_disk = max(
+            0, int(source_counts.get("l4_mooncake_local_disk", 0))
+        )
+        storage_source = (
+            str(getattr(req, "cached_tokens_storage_source", "") or "").lower()
+        )
+
+        # `cached_tokens` is an aggregate count. It may come from storage, so
+        # it must not be used as an L1 count when any tier/source information
+        # is available.
+        source_sum = sum(max(0, int(value)) for value in source_counts.values())
+        has_detailed_breakdown = (
+            device_tokens > 0
+            or host_tokens > 0
+            or storage_tokens > 0
+            or source_sum > 0
+            or bool(storage_source)
+        )
+        if device_tokens > 0:
+            l1 = device_tokens
+        elif source_l1 > 0:
+            l1 = source_l1
+        elif not has_detailed_breakdown:
+            # Preserve the old aggregate-only behavior for paths that provide
+            # no tier or source information at all.
+            l1 = cached_tokens
+        else:
+            l1 = 0
+
+        # Legacy/PD paths may provide aggregate storage hit and its source
+        # without filling the per-source map. Keep that information even when
+        # the map already contains an L1 value.
+        if (
+            l3_memory + l4_dfs + l4_local_disk == 0
+            and storage_tokens > 0
+        ):
+            if storage_source.endswith("_memory") or storage_source == "memory":
+                l3_memory = storage_tokens
+            elif storage_source.endswith("_dfs") or storage_source == "dfs":
+                l4_dfs = storage_tokens
+            elif (
+                storage_source.endswith("_local_disk")
+                or storage_source in {"local_disk", "localdisk"}
+            ):
+                l4_local_disk = storage_tokens
+
+        if cached_tokens > prompt_tokens:
+            logger.error(
+                "Invalid cache accounting for request: cached_tokens=%s "
+                "exceeds prompt_tokens=%s",
+                cached_tokens,
+                prompt_tokens,
+            )
+            return None
+
+        tier_sum = l1 + l3_memory + l4_dfs + l4_local_disk
+        if tier_sum > cached_tokens:
+            logger.error(
+                "Invalid cache source accounting for request: prompt_tokens=%s "
+                "cached_tokens=%s l1=%s l3_memory=%s l4_dfs=%s "
+                "l4_local_disk=%s tier_sum=%s",
+                prompt_tokens,
+                cached_tokens,
+                l1,
+                l3_memory,
+                l4_dfs,
+                l4_local_disk,
+                tier_sum,
+            )
+            return None
+        if tier_sum != cached_tokens:
+            logger.warning(
+                "Cache source accounting does not cover aggregate cached tokens: "
+                "prompt_tokens=%s cached_tokens=%s l1=%s l3_memory=%s "
+                "l4_dfs=%s l4_local_disk=%s tier_sum=%s",
+                prompt_tokens,
+                cached_tokens,
+                l1,
+                l3_memory,
+                l4_dfs,
+                l4_local_disk,
+                tier_sum,
+            )
+
+        if _source_debug_enabled():
+            logger.info(
+                "Mooncake source debug rates rid=%s prompt_tokens=%d "
+                "cached_tokens=%d device_tokens=%d host_tokens=%d storage_tokens=%d "
+                "l1=%d l3_memory=%d l4_dfs=%d l4_local_disk=%d tier_sum=%d "
+                "uncached=%d",
+                getattr(req, "rid", "unknown"),
+                prompt_tokens,
+                cached_tokens,
+                device_tokens,
+                host_tokens,
+                storage_tokens,
+                l1,
+                l3_memory,
+                l4_dfs,
+                l4_local_disk,
+                tier_sum,
+                prompt_tokens - cached_tokens,
+            )
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "l1_device_tokens": l1,
+            "l3_mooncake_memory_tokens": l3_memory,
+            "l4_mooncake_dfs_tokens": l4_dfs,
+            "l4_mooncake_local_disk_tokens": l4_local_disk,
+            "uncached_tokens": prompt_tokens - cached_tokens,
+            "l1_device_rate": l1 / prompt_tokens,
+            "l3_mooncake_memory_rate": l3_memory / prompt_tokens,
+            "l4_mooncake_dfs_rate": l4_dfs / prompt_tokens,
+            "l4_mooncake_local_disk_rate": l4_local_disk / prompt_tokens,
+            "overall_hit_rate": cached_tokens / prompt_tokens,
+        }
+
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
@@ -98,7 +240,12 @@ class SchedulerOutputStreamer:
             # decode via metadata, while decode may not have a local storage backend.
             if req.cached_tokens_storage > 0 or self.enable_hicache_storage():
                 details["storage"] = req.cached_tokens_storage
-            if self.enable_hicache_storage():
+            direct_storage_source = getattr(
+                req, "cached_tokens_storage_source", None
+            )
+            if direct_storage_source:
+                details["storage_backend"] = direct_storage_source
+            elif self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
 
@@ -167,6 +314,7 @@ class SchedulerOutputStreamer:
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            get_cache_hit_rates=self.get_cache_hit_rates,
             rust_server_mode=self.rust_server is not None,
         )
         for req in reqs:
@@ -240,6 +388,7 @@ class SchedulerOutputStreamer:
         prompt_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
+        cache_hit_rates = []
         time_stats = []
         retraction_counts = []
         phs_list = []
@@ -255,6 +404,7 @@ class SchedulerOutputStreamer:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self.get_cached_tokens_details(req))
+                cache_hit_rates.append(self.get_cache_hit_rates(req))
                 time_stats.append(req.time_stats)
                 retraction_counts.append(req.retraction_count)
 
@@ -296,6 +446,7 @@ class SchedulerOutputStreamer:
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
                 cached_tokens_details=cached_tokens_details,
+                cache_hit_rates=cache_hit_rates,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
@@ -316,6 +467,7 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    get_cache_hit_rates: Callable[[Req], Optional[CacheHitRates]] = lambda req: None
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -334,6 +486,7 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    cache_hit_rates: list = field(default_factory=list)
     image_tokens: list = field(default_factory=list)
     audio_tokens: list = field(default_factory=list)
     video_tokens: list = field(default_factory=list)
@@ -471,6 +624,7 @@ class _GenerationStreamAccumulator:
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+            self.cache_hit_rates.append(self.get_cache_hit_rates(req))
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -681,6 +835,7 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            cache_hit_rates=self.cache_hit_rates,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,

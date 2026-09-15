@@ -55,3 +55,8 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+
+    # Regular DP launches one independent TP/PP world per rank.  Keep this
+    # separate from the default-world rank so storage clients can identify the
+    # physical scheduler process across those worlds.
+    dp_rank: Optional[int] = None
