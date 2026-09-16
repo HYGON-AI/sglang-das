@@ -1127,7 +1127,17 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        pool_kwargs = {}
+        if self.server_args.enable_cp_cache_layer_split and not self.is_draft_worker:
+            from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+                CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+            )
+
+            pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool
+            pool_kwargs = dict(cp_rank=self.ps.attn_cp_rank, cp_size=self.ps.attn_cp_size)
+
         token_to_kv_pool = pool_cls(
+            **pool_kwargs,
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
             # past max_running_requests (pre-alloc), so size to the real capacity.
@@ -1987,6 +1997,15 @@ class KVCacheConfigurator:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        if self.server_args.enable_cp_cache_layer_split and not self.is_draft_worker:
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_parallel().attn_cp_group.cpu_group,
             )
             token_capacity = tensor.item()
 

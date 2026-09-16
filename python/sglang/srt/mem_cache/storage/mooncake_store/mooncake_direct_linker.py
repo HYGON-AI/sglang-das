@@ -128,6 +128,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        self._load_revalidation_groups = ()
+        if self.pool_group.storage_layout_tag:
+            self._load_revalidation_groups = tuple(
+                group
+                for group in (params.attn_cp_cache_group, params.attn_tp_cache_group)
+                if group is not None
+                and torch.distributed.get_world_size(group=group) > 1
+            )
 
         tp_rank = 0
         tp_size = server_args.tp_size
@@ -170,6 +178,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )
+        if self.pool_group.storage_layout_tag:
+            storage_suffix = f"{self.pool_group.storage_layout_tag}_{storage_suffix}"
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
         logger.info(
@@ -253,6 +263,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
+        valid = self._revalidate_load_local(transfers)
+        groups = getattr(self, "_load_revalidation_groups", ())
+        if groups:
+            # LayerSplit shards can be evicted independently after lookup.
+            # All CP ranks must either restore or recompute the same prefix.
+            verdict = torch.tensor([int(valid)], dtype=torch.int)
+            for group in groups:
+                torch.distributed.all_reduce(
+                    verdict, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+            valid = bool(verdict.item())
+        return valid
+
+    def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
         """Re-check remote existence before the scheduler commits device
         slots to the async layer-wise load.
 
