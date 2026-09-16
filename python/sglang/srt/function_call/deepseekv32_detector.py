@@ -13,7 +13,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import _partial_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_end_token = "</｜DSML｜invoke>"
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        # Some DeepSeek V4 generations duplicate the closing tag name (for
+        # example `</｜DSML｜parameterparameter>`). Treat consecutive copies as
+        # the same closer so a recoverable model-format typo does not erase all
+        # otherwise valid arguments.
+        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜(?:parameter)+>'
         self.partial_parameter_regex = (
             r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
         )
@@ -185,6 +189,47 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         return json.dumps(parameters, ensure_ascii=False)
 
+    @staticmethod
+    def _normalize_parameters(
+        parameters: object, func_name: str, tools: list[Tool]
+    ) -> object:
+        """Remove model-added arguments/input wrappers when schema makes it safe."""
+        if not isinstance(parameters, dict) or len(parameters) != 1:
+            return parameters
+
+        wrapper = next(iter(parameters))
+        if wrapper not in ("arguments", "input"):
+            return parameters
+
+        tool = next((t for t in tools if t.function.name == func_name), None)
+        schema = tool.function.parameters if tool is not None else None
+        if not isinstance(schema, dict):
+            return parameters
+        properties = schema.get("properties")
+        if not isinstance(properties, dict) or wrapper in properties:
+            return parameters
+
+        value = parameters[wrapper]
+        if isinstance(value, str):
+            # XML string parameters may contain a second JSON encoding.
+            try:
+                decoded = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                decoded = value
+            if isinstance(decoded, dict):
+                return decoded
+            value = decoded
+        elif isinstance(value, dict):
+            return value
+
+        required = schema.get("required")
+        candidates = required if isinstance(required, list) and len(required) == 1 else []
+        if not candidates and len(properties) == 1:
+            candidates = list(properties)
+        if len(candidates) == 1:
+            return {candidates[0]: value}
+        return parameters
+
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -213,10 +258,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         invoke_match
                     )
                     func_args = self._parse_parameters_from_xml(invoke_content)
+                    parameters = self._normalize_parameters(
+                        json.loads(func_args), func_name, tools
+                    )
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
-                        "parameters": json.loads(func_args),
+                        "parameters": parameters,
                     }
                     calls.extend(self.parse_base_json(match_result, tools))
 
@@ -312,23 +360,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_content, allow_partial=not is_tool_end
                 )
 
-                # 3. Calculate and send incremental arguments
-                sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
-                prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
-                    "arguments"
-                )
-
+                # 3. Hold arguments until the invoke is complete. DeepSeek can
+                # emit a schema-invalid wrapper that must be rewritten as a
+                # whole; streaming a prefix would make that correction unsafe.
                 argument_diff = None
-
                 if is_tool_end:
-                    # If complete, send everything remaining
-                    argument_diff = current_params[sent_len:]
-                elif prev_params is not None:
-                    # If partial, send stable prefix diff
-                    if current_params != prev_params:
-                        prefix = _find_common_prefix(current_params, prev_params)
-                        if len(prefix) > sent_len:
-                            argument_diff = prefix[sent_len:]
+                    normalized = self._normalize_parameters(
+                        json.loads(current_params), func_name, tools
+                    )
+                    argument_diff = json.dumps(normalized, ensure_ascii=False)
 
                 if argument_diff:
                     all_calls.append(

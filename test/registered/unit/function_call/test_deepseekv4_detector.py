@@ -1,5 +1,6 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -101,6 +102,50 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         )
 
         self.assertEqual(len(result.calls), 2)
+
+    def test_duplicate_parameter_closer_is_recovered(self):
+        """A repeated close-tag name must not turn valid arguments into `{}`."""
+        malformed = _weather_call().replace(
+            f"</{DSML}parameter>", f"</{DSML}parameterparameter>"
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(malformed, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_duplicate_parameter_closer_streaming_is_valid_json(self):
+        malformed = _weather_call().replace(
+            f"</{DSML}parameter>", f"</{DSML}parameterparameter>"
+        )
+
+        _, calls = self._feed(
+            [malformed[i : i + 3] for i in range(0, len(malformed), 3)]
+        )
+        arguments = "".join(call.parameters for call in calls if call.parameters)
+
+        self.assertEqual(json.loads(arguments), {"city": "SF"})
+
+    def test_wrapped_arguments_are_unwrapped_from_direct_json(self):
+        text = _wrapped(
+            _invoke("get_weather", '{"arguments":{"city":"SF"}}')
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_wrapped_arguments_are_unwrapped_from_xml(self):
+        text = _wrapped(
+            _invoke(
+                "get_weather",
+                _param("arguments", "true", '{"city":"SF"}'),
+            )
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
 
     def test_parse_error_neither_swallows_nor_duplicates(self):
         """An unexpected parse error must not empty the turn, and the dropped
