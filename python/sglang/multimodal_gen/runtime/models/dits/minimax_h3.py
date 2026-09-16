@@ -308,6 +308,21 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _use_int8_fp32_modulation(arch, quant_config) -> bool:
+    if quant_config is None or arch.adaln_curve_grid is None:
+        return False
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+        MiniMaxH3Int8Config,
+    )
+
+    return (
+        isinstance(quant_config, MiniMaxH3Int8Config)
+        and quant_config.compressed_adaln
+        and quant_config.fused
+        and arch.adaln_curve_grid is not None
+    )
+
+
 def _modulate_scale_shift(
     x: torch.Tensor,
     shift: torch.Tensor,
@@ -315,8 +330,17 @@ def _modulate_scale_shift(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    fused_fp32: bool = False,
 ) -> torch.Tensor:
     """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
+    if fused_fp32:
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+            affine,
+            supports_fp32_modulation,
+        )
+
+        if supports_fp32_modulation(x, (shift, scale), indices, dtype=dtype):
+            return affine(x, shift, scale, indices)
     # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
     if (
         x.is_cuda
@@ -340,8 +364,18 @@ def _modulate_gate(
     *,
     dtype: torch.dtype,
     allow_inplace: bool = True,
+    fused_fp32: bool = False,
 ) -> torch.Tensor:
     """Apply an indexed gated residual, optionally reusing the input buffer."""
+    if fused_fp32:
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+            gate as fused_gate,
+            supports_fp32_modulation,
+        )
+
+        if supports_fp32_modulation(x, (gate,), indices, dtype=dtype, other=other):
+            # Out of place even with CacheDiT: its saved residual must survive.
+            return fused_gate(x, gate, other, indices)
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
         x.is_cuda
@@ -1454,6 +1488,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
+        self._fused_fp32_modulation = _use_int8_fp32_modulation(arch, quant_config)
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.attn = MiniMaxH3Attention(
@@ -1508,7 +1543,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+            h,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            fused_fp32=self._fused_fp32_modulation,
         )
         h = self.attn(
             h,
@@ -1526,12 +1566,18 @@ class MiniMaxH3DiTBlock(nn.Module):
             combined_indices,
             dtype=_BF16_DTYPE,
             allow_inplace=not self.preserve_input_for_cache_dit,
+            fused_fp32=self._fused_fp32_modulation,
         )
 
         residual = x
         h = self.norm2(x)
         h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+            h,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            fused_fp32=self._fused_fp32_modulation,
         )
         h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
@@ -1542,6 +1588,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
+            fused_fp32=self._fused_fp32_modulation,
         )
 
 
@@ -1555,6 +1602,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
+        self._fused_fp32_modulation = _use_int8_fp32_modulation(arch, quant_config)
         video_patch_dim = (
             arch.latents_dim
             * arch.patch_size[0]
@@ -1646,7 +1694,14 @@ class MiniMaxH3FinalLayer(nn.Module):
             assert video is not None and audio is not None
             return video, audio
         h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
+        h = _modulate_scale_shift(
+            h,
+            shift,
+            scale,
+            inverse_indices,
+            dtype=_BF16_DTYPE,
+            fused_fp32=self._fused_fp32_modulation,
+        )
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         video, _ = self.video_out(h)
