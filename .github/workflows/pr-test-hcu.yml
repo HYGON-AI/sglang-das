@@ -21,6 +21,7 @@ on:
       - ".github/workflows/release-pypi-nightly-hcu.yml"
       - "scripts/ci/hcu/**"
       - "python/**"
+      - "rust/**"
       - "test/run_suite.py"
       - "test/registered/**"
       - "python/sglang/kernels/aot/**"
@@ -183,7 +184,7 @@ jobs:
             --jq '.[].filename')"
           echo "${changed_files}"
 
-          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|test/run_suite\.py|test/registered/|python/sglang/kernels/aot/|sgl-model-gateway/|requirements_hcu\.txt$)'
+          hcu_path_pattern='^(\.github/workflows/(pr-test-hcu|pr-gate|release-pr-hcu|hcu-full-enabled|release-pypi-nightly-hcu)\.yml|scripts/ci/hcu/|python/|rust/|test/run_suite\.py|test/registered/|python/sglang/kernels/aot/|sgl-model-gateway/|requirements_hcu\.txt$)'
 
           if echo "${changed_files}" | grep -Eq "${hcu_path_pattern}"; then
             echo "hcu=true" >> "${GITHUB_OUTPUT}"
@@ -256,7 +257,7 @@ jobs:
           wheel_required=false
           gateway_wheel_required=false
 
-          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|python/sglang/kernels/aot/|requirements_hcu\.txt$|python/)'; then
+          if echo "${changed_files}" | grep -Eq '^(\.github/workflows/release-pr-hcu\.yml$|python/sglang/kernels/aot/|requirements_hcu\.txt$|python/|rust/)'; then
             wheel_required=true
           fi
 
@@ -470,7 +471,7 @@ jobs:
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
       GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
-      HCU_WHEEL_EXPECTED_TORCH_VERSION: ${{ (github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' && '2.11.0' || '' }}
+      HCU_WHEEL_EXPECTED_TORCH_VERSION: ${{ ((github.event.pull_request.base.ref || github.ref_name) == 'main' || (github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18') && '2.11.0' || '' }}
     steps:
       - name: Checkout code
         env:

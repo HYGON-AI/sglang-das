@@ -109,6 +109,49 @@ fi
 if [[ -n "${INSTALL_WHEEL_URLS}" ]]; then
   echo "[hcu-ci] Installing HCU wheels from explicit URLs or local paths"
   echo "[hcu-ci] HCU_CI_INSTALL_WHEEL_URLS=${INSTALL_WHEEL_URLS}"
+  docker exec -i -e HCU_CI_INSTALL_WHEEL_URLS="${INSTALL_WHEEL_URLS}" "${CONTAINER}" python3 - <<'PY_WHEEL_ABI'
+import json
+import os
+import re
+import subprocess
+import zipfile
+from email.parser import Parser
+from pathlib import Path
+
+import torch
+
+actual_torch = torch.__version__.split("+", 1)[0]
+for value in os.environ["HCU_CI_INSTALL_WHEEL_URLS"].split():
+    path = Path(value)
+    # Remote wheel URLs remain supported; this guard covers CI's shared staging.
+    if not path.is_absolute() or "hcu-wheel-staging" not in path.parts:
+        continue
+    manifest = json.loads((path.parent.parent / "manifest.json").read_text())
+    target_sha = subprocess.check_output(
+        ["git", "-c", "safe.directory=/sglang-checkout", "-C", "/sglang-checkout", "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    if manifest.get("commit_sha") != target_sha:
+        raise SystemExit(f"Wheel SHA mismatch: {path.name}; expected {target_sha}")
+    if manifest.get("torch_version") != actual_torch:
+        raise SystemExit(f"Wheel Torch mismatch: built={manifest.get('torch_version')}, runtime={actual_torch}")
+    with zipfile.ZipFile(path) as archive:
+        names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        if len(names) != 1:
+            raise SystemExit(f"Invalid wheel metadata: {path.name}")
+        metadata = Parser().parsestr(archive.read(names[0]).decode("utf-8"))
+    version = metadata.get("Version", "")
+    if path.name.split("-")[1] != version:
+        raise SystemExit(f"Wheel filename/METADATA mismatch: {path.name}")
+    local_version = version.partition("+")[2]
+    torch_tag = "torch" + actual_torch.replace(".", "")
+    if torch_tag not in local_version.split("."):
+        raise SystemExit(f"Wheel Torch tag mismatch: {path.name}; expected {torch_tag}")
+    commits = re.findall(r"(?:^|\.)g([0-9a-f]{6,40})(?:\.|$)", local_version)
+    if len(commits) != 1 or not target_sha.startswith(commits[0]):
+        raise SystemExit(f"Wheel commit tag mismatch: {path.name}; expected {target_sha}")
+    print(f"[hcu-ci] Verified {path.name}: SHA={target_sha}, Torch={actual_torch}")
+PY_WHEEL_ABI
   run_in_container "python3 -m pip uninstall -y sglang sgl-kernel sglang-kernel sgl-model-gateway || true"
   install_with_retry docker exec "${CONTAINER}" \
     python3 -m pip install --no-cache-dir --no-deps ${INSTALL_WHEEL_URLS}
