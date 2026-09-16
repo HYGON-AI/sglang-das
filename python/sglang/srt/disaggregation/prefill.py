@@ -357,14 +357,12 @@ class PrefillBootstrapQueue:
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
-        cp_cache_layer_split = getattr(self.token_to_kv_pool, "requires_descriptor_matched_transfer", False)
         transfer_draft_cache = (
             (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
             and (
                 not layer_shard_enabled
                 or layer_shard_rank == layer_shard_size - 1
             )
-            and (not cp_cache_layer_split or self.token_to_kv_pool.cp_rank == self.token_to_kv_pool.cp_size - 1)
         )
         kv_args.prefill_start_layer = (
             getattr(
@@ -475,9 +473,6 @@ class PrefillBootstrapQueue:
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            from sglang.srt.mem_cache.cp_cache_layer_split.transfer import configure_v4_transfer
-
-            configure_v4_transfer(kv_args, self.token_to_kv_pool, draft_kv_pool)
             # V4's KVCache is organized by compression-ratio
             # buckets rather than by layer.
             kv_args.mla_compression_ratios = list(
