@@ -61,7 +61,7 @@ def _written_positions(plan_w: torch.Tensor, prefix_len: int) -> set[int]:
     return {prefix_len + int(r) for r in ragged_ids[valid]}
 
 
-class TestCompressWritePlanDraftPad(CustomTestCase):
+class TestCompressWritePlanBounds(CustomTestCase):
     def test_64k_prefill_preserves_last_token(self):
         """65536 tokens fit uint16 indices; the last token must not wrap or vanish."""
         for cr in (4, 128):
