@@ -1135,6 +1135,32 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_stop = None
         required_parsed_natively = False
         effective_tools = self._effective_tools(request)
+        constraint_tool_choice = request.tool_choice
+        constraint_tools = effective_tools
+        if (
+            self.tool_call_parser == "deepseekv4"
+            and request.tool_choice == "required"
+            and effective_tools
+            and len(effective_tools) == 1
+        ):
+            # For one available function, OpenAI's `required` choice is
+            # semantically equivalent to naming that function.  DeepSeek-V4's
+            # generic required structural tag can stall in xgrammar under PD,
+            # while its named-function constraint is stable.  Keep the public
+            # request unchanged so response parsing still treats it as
+            # required; only normalize the internal grammar constraint.
+            constraint_tool_choice = ToolChoice(
+                function={"name": effective_tools[0].function.name}
+            )
+            constraint_tools = [
+                effective_tools[0].model_copy(
+                    update={
+                        "function": effective_tools[0].function.model_copy(
+                            update={"strict": True}
+                        )
+                    }
+                )
+            ]
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -1147,12 +1173,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(
-                    effective_tools,
+                    constraint_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
                 tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice,
+                    constraint_tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
@@ -1167,13 +1193,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     and self.tool_call_parser == "kimi_k3"
                 )
                 and (
-                    request.tool_choice == "required"
-                    or isinstance(request.tool_choice, ToolChoice)
+                    constraint_tool_choice == "required"
+                    or isinstance(constraint_tool_choice, ToolChoice)
                 )
             ):
                 json_schema = get_json_schema_constraint(
-                    effective_tools,
-                    request.tool_choice,
+                    constraint_tools,
+                    constraint_tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
