@@ -808,6 +808,26 @@ class DeepSeekV4LayerItem(NamedTuple):
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
 
+# Re-exported: the pool allocates the rows, while the writers own the layout.
+DSV4_FP8_NOPE_ROW_BYTES = layout.DSV4_FP8_NOPE_ROW_BYTES
+DSV4_FP8_QUANT_TILE = layout.DSV4_FP8_QUANT_TILE
+
+
+def dsv4_unified_row_bytes(
+    qk_nope_head_dim: int, qk_rope_head_dim: int, fp8: bool
+) -> int:
+    if not fp8:
+        return (qk_nope_head_dim + qk_rope_head_dim) * 2
+    num_tiles = -(-qk_nope_head_dim // DSV4_FP8_QUANT_TILE)
+    scale_bytes = 2 * num_tiles
+    if qk_nope_head_dim + scale_bytes > DSV4_FP8_NOPE_ROW_BYTES:
+        raise ValueError(
+            f"fp8 nope row overflows: {qk_nope_head_dim} latent values at 1 B + "
+            f"{scale_bytes} B scales > {DSV4_FP8_NOPE_ROW_BYTES} B stride"
+        )
+    return DSV4_FP8_NOPE_ROW_BYTES + qk_rope_head_dim * 2
+
+
 # The following kv pool follows ATOM's unified_kv kernel layout.
 class DeepSeekV4UnifiedKVPool:
     """
