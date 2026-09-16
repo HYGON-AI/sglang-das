@@ -36,6 +36,7 @@ class TestHCUWheelVersion(unittest.TestCase):
                     "github.event.pull_request.base.ref", repr(base)
                 )
                 code = code.replace("github.ref_name", repr(ref))
+                code = code.replace("inputs.target_branch", repr(""))
                 code = code.replace("&&", " and ").replace("||", " or ")
                 self.assertEqual(eval(code, {"__builtins__": {}}), expected)
         build = next(

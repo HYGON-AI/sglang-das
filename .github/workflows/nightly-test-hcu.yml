@@ -277,6 +277,9 @@ jobs:
               found = {}
               for wheel in sorted(wheel_dir.glob("*.whl")):
                   kind = wheel_kind(wheel)
+                  if kind == "sglang" and wheel.name.split("-")[1].partition("+")[0] != "0.5.18":
+                      print(f"[probe-hcu-wheels] ignoring wrong SGLang version: {wheel.name}; expected 0.5.18", file=sys.stderr)
+                      continue
                   if kind and kind not in found:
                       found[kind] = wheel
               missing = [name for name in ("sglang", "sgl-kernel") if name not in found]
@@ -608,6 +611,9 @@ jobs:
                   found = {}
                   for wheel in sorted(wheel_dir.glob("*.whl")):
                       kind = wheel_kind(wheel)
+                      if kind == "sglang" and wheel.name.split("-")[1].partition("+")[0] != "0.5.18":
+                          print(f"[wait-hcu-wheels] ignoring wrong SGLang version: {wheel.name}; expected 0.5.18", file=sys.stderr)
+                          continue
                       if kind and kind not in found:
                           found[kind] = wheel
                   missing = [name for name in ("sglang", "sgl-kernel") if name not in found]

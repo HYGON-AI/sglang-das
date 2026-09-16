@@ -34,12 +34,13 @@ def heredoc(script, marker):
     return script.split("\n", 1)[1].split("\n" + marker, 1)[0]
 
 
-def evaluate(expression, base, ref, override=""):
+def evaluate(expression, base, ref, override="", target=""):
     code = expression[3:-2].strip()
     for key, value in {
         "github.event.pull_request.base.ref": base,
         "github.ref_name": ref,
         "inputs.torch_version": override,
+        "inputs.target_branch": target,
         "vars.HCU_CI_IMAGE_0518": "image-211",
         "vars.HCU_CI_RELEASE_IMAGE": "image-210",
     }.items():
@@ -48,6 +49,50 @@ def evaluate(expression, base, ref, override=""):
 
 
 class TestBuildAlignment(unittest.TestCase):
+    def test_temporary_branch_manual_target(self):
+        build = workflow("release-pr-hcu.yml")["jobs"]["compile"]
+        for target in ["main", "release/20260825_v0.5.18"]:
+            self.assertEqual(
+                evaluate(
+                    build["container"]["image"], "", "hcu/temporary", target=target
+                ),
+                "image-211",
+            )
+            self.assertEqual(
+                evaluate(
+                    build["env"]["TORCH_VERSION"], "", "hcu/temporary", target=target
+                ),
+                "2.11.0",
+            )
+            self.assertEqual(
+                evaluate(
+                    build["env"]["SGLANG_PACKAGE_VERSION"],
+                    "",
+                    "hcu/temporary",
+                    target=target,
+                ),
+                "0.5.18",
+            )
+        self.assertEqual(
+            evaluate(
+                build["env"]["TORCH_VERSION"], "v0.5.12_dev", "feature", target="main"
+            ),
+            "2.10.0",
+        )
+        guard = step(build, "Validate manual build target")["run"]
+        for target, expected in [
+            ("hcu/temporary", 1),
+            ("main", 0),
+            ("release/20260825_v0.5.18", 0),
+        ]:
+            result = subprocess.run(
+                ["bash", "-c", guard],
+                env={**os.environ, "BUILD_TARGET": target},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, expected)
+
     def test_pr_environment_routing(self):
         build = workflow("release-pr-hcu.yml")["jobs"]["compile"]
         wait = workflow("pr-test-hcu.yml")["jobs"]["wait-hcu-wheels"]
@@ -161,7 +206,11 @@ class TestBuildAlignment(unittest.TestCase):
         job = workflow("nightly-test-hcu.yml")["jobs"]["wait-hcu-wheels"]
         script = step(job, "Wait for current commit HCU wheels")["run"]
         code = heredoc(script.split("python3 - <<'PY_WAIT'", 1)[1], "PY_WAIT")
-        for torch_version in ["2.11.0", "2.10.0"]:
+        for torch_version, package_version in [
+            ("2.11.0", "0.5.18"),
+            ("2.10.0", "0.5.18"),
+            ("2.11.0", "0.5.15.post1"),
+        ]:
             with self.subTest(
                 torch=torch_version
             ), tempfile.TemporaryDirectory() as temp:
@@ -174,7 +223,10 @@ class TestBuildAlignment(unittest.TestCase):
                         {"commit_sha": "abcdef123456", "torch_version": torch_version}
                     )
                 )
-                for name in ["sglang-0.5.18.whl", "sglang_kernel-0.4.6.whl"]:
+                for name in [
+                    f"sglang-{package_version}-py3-none-any.whl",
+                    "sglang_kernel-0.4.6.whl",
+                ]:
                     (wheels / name).touch()
                 with patch.dict(
                     os.environ,
@@ -192,7 +244,12 @@ class TestBuildAlignment(unittest.TestCase):
                     with self.assertRaises(SystemExit) as result:
                         exec(code, {})
                     self.assertEqual(
-                        result.exception.code, 0 if torch_version == "2.11.0" else 1
+                        result.exception.code,
+                        (
+                            0
+                            if torch_version == "2.11.0" and package_version == "0.5.18"
+                            else 1
+                        ),
                     )
 
     def test_nightly_probe_rejects_bad_manifest_and_router(self):
@@ -203,6 +260,7 @@ class TestBuildAlignment(unittest.TestCase):
             "valid",
             "wrong-sha",
             "wrong-torch",
+            "wrong-version",
             "broken",
             "missing",
             "router-only",
@@ -225,7 +283,8 @@ class TestBuildAlignment(unittest.TestCase):
                 for name in ["sglang_kernel-0.4.6.whl", "sglang_router-0.4.0.whl"]:
                     (wheels / name).touch()
                 if kind != "router-only":
-                    (wheels / "sglang-0.5.18.whl").touch()
+                    version = "0.5.15.post1" if kind == "wrong-version" else "0.5.18"
+                    (wheels / f"sglang-{version}-py3-none-any.whl").touch()
                 out = io.StringIO()
                 with patch.dict(
                     os.environ,
