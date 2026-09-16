@@ -4202,6 +4202,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
+            from sglang.kernels.ops.attention.dsv4.gemm import prewarm_auto_bf16_fp32
+
+            prewarm_auto_bf16_fp32()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):

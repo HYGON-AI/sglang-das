@@ -149,6 +149,15 @@ def process_weights_after_loading_aiter_w8a8_int8(layer: torch.nn.Module) -> Non
     setattr(layer, "_aiter_w8a8_int8_original_w2_shape", tuple(layer.w2_weight.shape))
     setattr(layer, "_aiter_w8a8_int8_moe_config_cache", {})
     setattr(layer, "_aiter_w8a8_int8_moe_c_weight_layout", False)
+    layer.register_buffer(
+        "_aiter_w8a8_int8_local_expert_mask",
+        torch.ones(
+            layer.w13_weight.shape[0],
+            dtype=torch.int32,
+            device=layer.w13_weight.device,
+        ),
+        persistent=False,
+    )
 
 
 def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None:
@@ -165,6 +174,15 @@ def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None
     setattr(layer, "_aiter_w8a8_fp8_original_w2_shape", tuple(layer.w2_weight.shape))
     setattr(layer, "_aiter_w8a8_fp8_moe_config_cache", {})
     setattr(layer, "_aiter_w8a8_fp8_moe_c_weight_layout", False)
+    layer.register_buffer(
+        "_aiter_w8a8_fp8_local_expert_mask",
+        torch.ones(
+            layer.w13_weight.shape[0],
+            dtype=torch.int32,
+            device=layer.w13_weight.device,
+        ),
+        persistent=False,
+    )
 
 
 def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
@@ -201,6 +219,7 @@ def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
         use_int8_w8a8=True,
         global_num_experts=getattr(layer, "num_experts", None),
         expert_map=expert_map,
+        expert_mask=getattr(layer, "_aiter_w8a8_int8_local_expert_mask", None),
         moe_config_cache=getattr(layer, "_aiter_w8a8_int8_moe_config_cache", None),
         moe_c_weight_layout=getattr(
             layer, "_aiter_w8a8_int8_moe_c_weight_layout", False
@@ -249,6 +268,7 @@ def get_aiter_w8a8_fp8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
         use_fp8_w8a8=True,
         global_num_experts=getattr(layer, "num_experts", None),
         expert_map=expert_map,
+        expert_mask=getattr(layer, "_aiter_w8a8_fp8_local_expert_mask", None),
         moe_config_cache=getattr(layer, "_aiter_w8a8_fp8_moe_config_cache", None),
         moe_c_weight_layout=getattr(
             layer, "_aiter_w8a8_fp8_moe_c_weight_layout", False
@@ -427,6 +447,31 @@ def _get_aiter_w8a8_weights_for_solution(
     return quant_info.w13_weight, quant_info.w2_weight
 
 
+def _remap_aiter_ep_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_map: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map global expert ids to local ids without allowing an OOB GPU index.
+
+    Some HCU fused top-k implementations can leave an invalid id behind when a
+    routing row is non-finite.  Indexing ``expert_map`` with that value causes a
+    device VMFault before the MoE kernel can reject it.  Clamp only for the
+    lookup, then mask both invalid-global and non-local routes out.
+    """
+    if expert_map.numel() == 0:
+        raise ValueError("AITER EP expert_map must not be empty")
+
+    topk_ids_i64 = topk_ids.to(torch.int64)
+    valid_global = (topk_ids_i64 >= 0) & (topk_ids_i64 < expert_map.numel())
+    safe_global_ids = topk_ids_i64.clamp(0, expert_map.numel() - 1)
+    topk_ids_local = expert_map[safe_global_ids].to(torch.int32)
+    valid_local = valid_global & (topk_ids_local >= 0)
+    topk_ids_local = topk_ids_local.masked_fill(~valid_local, 0)
+    topk_weights = topk_weights.masked_fill(~valid_local, 0)
+    return topk_ids_local, topk_weights
+
+
 def _run_aiter_w8a8(
     runner_input: AiterRunnerInput,
     quant_info: AiterMoeQuantInfo,
@@ -461,8 +506,41 @@ def _run_aiter_w8a8(
         if runner_config.routed_scaling_factor is not None
         else 1.0
     )
+    expert_map_arg = None
     if quant_info.expert_map is not None:
-        global_num_experts = quant_info.global_num_experts or w1.shape[0]
+        # EP: the AITER ck sorting operator (moe_sorting_fwd) does not support
+        # the expert_map format the framework passes down.  Remap global
+        # topk_ids to the local expert space here (triton-style python-layer
+        # conversion) and pass a binary all-ones mask to aiter_moe.
+        #
+        # Non-local expert assignments become -1 after mapping; AITER cannot
+        # accept negative ids, so reroute them to expert 0 and zero their
+        # topk_weights.  The zeroed slots contribute nothing on this rank; the
+        # post-MoE all-reduce combines the partial results from every EP rank
+        # to produce the correct output.
+        #
+        # We pass a binary all-ones mask (instead of None) so that
+        # fused_experts_asm_impl takes the EP code path that zero-initializes
+        # d_w2_out via torch.zeros, avoiding reads of uninitialized memory in
+        # triton_moe_sum.
+        topk_ids, topk_weights = _remap_aiter_ep_topk(
+            topk_ids,
+            topk_weights,
+            quant_info.expert_map,
+        )
+        global_num_experts = w1.shape[0]
+        expert_map_arg = quant_info.expert_mask
+        if expert_map_arg is None:
+            # Compatibility fallback for callers that bypass the normal weight
+            # post-processing hook. Production layers use the registered mask.
+            expert_map_arg = torch.ones(
+                global_num_experts, dtype=torch.int32, device=hidden_states.device
+            )
+        elif expert_map_arg.numel() != global_num_experts:
+            raise ValueError(
+                "AITER EP local expert mask size does not match local weights: "
+                f"{expert_map_arg.numel()} != {global_num_experts}"
+            )
     else:
         global_num_experts = w1.shape[0]
 
@@ -483,7 +561,7 @@ def _run_aiter_w8a8(
         a2_scale=quant_info.a2_scale,
         block_shape=None,
         global_num_experts=global_num_experts,
-        expert_map=quant_info.expert_map,
+        expert_map=expert_map_arg,
         routed_scaling_factor=float(routed_scaling_factor),
         output_dtype=hidden_states.dtype,
         gemm1_alpha=runner_config.gemm1_alpha,

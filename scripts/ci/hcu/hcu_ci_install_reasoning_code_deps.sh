@@ -16,7 +16,7 @@
 set -euo pipefail
 
 CONTAINER="${HCU_CI_CONTAINER:-${HCU_CI_CONTAINER_NAME:-ci_sglang}}"
-HOST_WHEEL_DIR="${HCU_REASONING_CODE_WHEEL_HOST_DIR:-/home/github/sgl_whl_temp/hcu_eval_wheels}"
+HOST_WHEEL_DIR="${HCU_REASONING_CODE_WHEEL_HOST_DIR:-${HCU_WHEEL_STAGING_ROOT:-/home/github/sgl_whl_temp}/hcu_eval_wheels}"
 CONTAINER_WHEEL_DIR="${HCU_REASONING_CODE_WHEEL_CONTAINER_DIR:-/hcu-wheel-staging/hcu_eval_wheels}"
 MATH_VERIFY_HOST_WHEEL="${HOST_WHEEL_DIR}/math_verify-0.8.0-py3-none-any.whl"
 LATEX2SYMPY_HOST_WHEEL="${HOST_WHEEL_DIR}/latex2sympy2_extended-1.10.2-py3-none-any.whl"

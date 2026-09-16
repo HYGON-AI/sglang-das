@@ -1023,6 +1023,9 @@ class Req(ReqDllmMixin):
         self.storage_hit_length = 0
         # Direct external-linker source used by cached_tokens_total cache_source.
         self.cached_tokens_storage_source: Optional[str] = None
+        self.host_loaded_length = 0
+        # Absolute external-cache hit boundary shared by PP0; None outside PP.
+        self.external_cache_hit_length: Optional[int] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early

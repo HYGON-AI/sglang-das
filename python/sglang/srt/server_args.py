@@ -75,6 +75,7 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_media_url_security,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -2113,6 +2114,22 @@ class ServerArgs:
         ),
         NS("exec.comm"),
     ] = False
+    custom_all_reduce_backend: A[
+        str,
+        Arg(
+            help=(
+                "Choose the custom all-reduce backend. "
+                "'auto' picks aiter on HIP/HCU when available otherwise the "
+                "native SGLang implementation; 'native' forces the SGLang "
+                "kernel; 'aiter' forces the Hygon/HCU aiter kernel and, when "
+                "AITER_AR_TRANSPORT=fabric, fails hard rather than silently "
+                "falling back; 'off' disables custom all-reduce entirely. "
+                "--disable-custom-all-reduce overrides this and forces 'off'."
+            ),
+            choices=["auto", "native", "aiter", "off"],
+        ),
+        NS("exec.comm"),
+    ] = "auto"
     enable_mscclpp: A[
         bool,
         "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
@@ -2897,6 +2914,23 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -5994,15 +6028,9 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
-                if is_deepseek_dsa(hf_config):
-                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
-                    # CUDA/Hopper-only path: its JIT source includes
-                    # <cooperative_groups.h> and uses cg::this_cluster()
-                    # (thread-block clusters), neither of which exists on ROCm,
-                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                    # here for the rest of the DSA family (DeepSeek-V3.2 /
-                    # GLM-5.x) that shares the same decode top-k path.
+                if is_deepseek_dsa(hf_config) and not is_hcu():
+                    # Generic ROCm keeps the registered top-k path; HCU uses
+                    # the HIP-compatible non-cluster TopK v2 implementation.
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
@@ -6052,7 +6080,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                if not is_hcu():
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
@@ -8877,6 +8906,32 @@ class ServerArgs:
         )
         if self.enable_deterministic_inference:
             envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+        # Normalize custom_all_reduce_backend: --disable-custom-all-reduce wins,
+        # else on HIP with legacy SGLANG_USE_AITER_AR=1 promote auto -> aiter.
+        if self.disable_custom_all_reduce:
+            if self.custom_all_reduce_backend != "off":
+                logger.info(
+                    "--disable-custom-all-reduce overrides "
+                    "--custom-all-reduce-backend=%s to 'off'.",
+                    self.custom_all_reduce_backend,
+                )
+            self._declare(
+                "_handle_environment_variables",
+                custom_all_reduce_backend="off",
+            )
+        elif (
+            self.custom_all_reduce_backend == "auto"
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_AR", default="false")
+        ):
+            logger.info(
+                "Promoting custom_all_reduce_backend from 'auto' to 'aiter' "
+                "because SGLANG_USE_AITER_AR=1 is set on HIP."
+            )
+            self._declare(
+                "_handle_environment_variables",
+                custom_all_reduce_backend="aiter",
+            )
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(

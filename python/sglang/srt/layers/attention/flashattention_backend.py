@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.flashattention_interface import flash_attn_varl
 from flash_attn import varlen_fwd_unified
 from sglang.srt.utils import get_bool_env_var
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
+_use_varlen_fwd_unified_fa = get_bool_env_var("SGLANG_USE_VARLEN_FWD_UNIFIED")
 _use_fused_bailing_rms_rotary = get_bool_env_var("SGLANG_USE_FUSED_RMS_ROTARY")
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
@@ -64,6 +65,37 @@ def is_nmz_fp8(dtype: torch.dtype) -> bool:
         if "gfx938" in gcn_arch and (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2):
             return True
     return False
+
+
+def _trim_padded_q_for_batch_api(q, page_table):
+    """Return (q_trimmed, padded_rows) for a batch-semantic kvcache kernel.
+
+    vllm_flash_attn_with_kvcache drops cu_seqlens_q/max_seqlen_q, so it reads
+    q.shape[0] as the batch size and indexes page_table/cache_seqlens per row.
+    hy3-sp/minimax_opt pad q to a multiple of attn_tp_size; those padding rows
+    would index past both tensors and fault. Trim them off here and let the
+    caller pad the result back, since this API has no out= buffer to preserve
+    the row count the SP all_to_all reshape requires.
+    """
+    if page_table is None or q.ndim == 0:
+        return q, None
+    padded_rows = q.shape[0]
+    real_rows = page_table.shape[0]
+    if padded_rows <= real_rows:
+        return q, None
+    return q[:real_rows], padded_rows
+
+
+def _restore_padded_q_rows(result, padded_rows):
+    """Zero-pad a batch-semantic attention output back to padded_rows rows."""
+    if padded_rows is None:
+        return result
+    if isinstance(result, tuple):
+        return tuple(_restore_padded_q_rows(r, padded_rows) for r in result)
+    if not isinstance(result, torch.Tensor) or result.shape[0] >= padded_rows:
+        return result
+    pad = result.new_zeros((padded_rows - result.shape[0],) + tuple(result.shape[1:]))
+    return torch.cat([result, pad], dim=0)
 
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
@@ -1558,8 +1590,15 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                 )
             elif self._use_hcu_legacy_layout:
+                # Batch-semantic API: q.shape[0] is the batch size and row i
+                # indexes page_table[i]/cache_seqlens[i]. hy3-sp pads q to a
+                # multiple of attn_tp_size, so drop the padding rows before the
+                # kernel reads past both tensors, then pad the output back.
+                q_for_attn, _sp_padded_rows = _trim_padded_q_for_batch_api(
+                    q, page_table
+                )
                 result = vllm_flash_attn_with_kvcache(
-                    q=q.contiguous()
+                    q=q_for_attn.contiguous()
                     .view(-1, layer.tp_q_head_num, layer.head_dim)
                     .unsqueeze(1),
                     k_cache=key_cache,
@@ -1576,6 +1615,39 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                )
+                result = _restore_padded_q_rows(result, _sp_padded_rows)
+            elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
+                result = varlen_fwd_unified(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=cache_seqlens,
+                    block_table=page_table,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=self.max_context_len,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    softcap=layer.logit_cap,
+                    window_size=window_size,
+                    q_descale=(
+                        fa_k_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        else None
+                    ),
+                    k_descale=(
+                        fa_k_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        else None
+                    ),
+                    v_descale=(
+                        fa_v_descale
+                        if self.kv_cache_dtype_str != "auto"
+                        else None
+                    ),
+                    return_softmax_lse=use_cascade_attn,
+                    s_aux=kwargs.get('sinks', None)
                 )
             else:
                 # SP (hy3_sp / minimax_opt) shards the sequence across TP ranks and
@@ -2108,8 +2180,13 @@ class FlashAttentionBackend(AttentionBackend):
                 ):
                     sched_meta = metadata.scheduler_metadata
                 if self._use_hcu_legacy_layout:
+                    # See forward_extend: this API is batch-semantic, so SP
+                    # padding rows must not reach the kernel.
+                    q_dec, _sp_padded_rows = _trim_padded_q_for_batch_api(
+                        q_reshaped, page_table
+                    )
                     result = vllm_flash_attn_with_kvcache(
-                        q=q_reshaped.unsqueeze(1),
+                        q=q_dec.unsqueeze(1),
                         k_cache=key_cache,
                         v_cache=value_cache,
                         page_table=page_table,
@@ -2123,6 +2200,39 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                    )
+                    result = _restore_padded_q_rows(result, _sp_padded_rows)
+                elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
+                    result = varlen_fwd_unified(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        seqused_k=cache_seqlens,
+                        block_table=page_table,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=self.max_context_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        softcap=layer.logit_cap,
+                        window_size=window_size,
+                        q_descale=(
+                        fa_k_descale
+                            if self.kv_cache_dtype_str != "auto"
+                            else None
+                        ),
+                        k_descale=(
+                            fa_k_descale
+                            if self.kv_cache_dtype_str != "auto"
+                            else None
+                        ),
+                        v_descale=(
+                            fa_v_descale
+                            if self.kv_cache_dtype_str != "auto"
+                            else None
+                        ),
+                        return_softmax_lse=use_cascade_attn,
+                        s_aux=kwargs.get('sinks', None)
                     )
                 else:
                     result = flash_attn_with_kvcache(
