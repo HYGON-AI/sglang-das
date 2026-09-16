@@ -85,7 +85,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -783,6 +783,15 @@ def set_random_seed(seed: int) -> None:
         torch.xpu.manual_seed_all(seed)
 
 
+# Raised by the loaders below when client-supplied media cannot be fetched or
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+CLIENT_MEDIA_EXCEPTIONS = (
+    ValueError,
+    UnidentifiedImageError,
+    requests.exceptions.RequestException,
+)
+
+
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -833,10 +842,18 @@ def load_audio(
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    try:
+        if isinstance(source, bytes):
+            audio, original_sr = sf.read(BytesIO(source))
+        else:
+            audio, original_sr = sf.read(source)
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
+
+    # if isinstance(source, bytes):
+    #     audio, original_sr = sf.read(BytesIO(source))
+    # else:
+    #     audio, original_sr = sf.read(source)
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
@@ -1020,7 +1037,14 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    # return VideoDecoderWrapper(source, device=device)
+    try:
+        return VideoDecoderWrapper(source, device=device)
+    except (ImportError, MemoryError):
+        raise  # missing backend / OOM is not a bad payload
+    except Exception as e:
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
+        raise ValueError(f"Could not decode video: {e}") from e
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
