@@ -242,15 +242,34 @@ class TransformerLoader(ComponentLoader):
             if gguf_file is not None:
                 validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
             elif component_server_args.transformer_weights_path is not None:
+                from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+                    MiniMaxH3Int8Config,
+                    inspect_int8_checkpoint,
+                )
+
                 validate_minimax_h3_checkpoint_variant(
                     safetensors_list, selected_variant
                 )
-                adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
-                    safetensors_list
-                )
-                checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers
-                )
+                int8_manifest = inspect_int8_checkpoint(safetensors_list)
+                if int8_manifest is not None:
+                    if int8_manifest["variant"] != selected_variant.lower():
+                        raise ValueError(
+                            "MiniMax-H3 INT8 checkpoint model variant mismatch"
+                        )
+                    compressed = int8_manifest["profile"] == "backbone-adaln"
+                    checkpoint_quant_config = MiniMaxH3Int8Config(
+                        targets=int8_manifest["quantized_layers"],
+                        compressed_adaln=compressed,
+                    )
+                    dit_config.arch_config.checkpoint_uses_diffusers_layout = False
+                    adaln_curve_shape = (1025, 8) if compressed else None
+                else:
+                    adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
+                        safetensors_list
+                    )
+                    checkpoint_quant_config = (
+                        resolve_minimax_h3_checkpoint_quantization(layer_markers)
+                    )
                 if adaln_curve_shape is not None:
                     (
                         dit_config.arch_config.adaln_curve_grid,
@@ -296,6 +315,12 @@ class TransformerLoader(ComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        if (
+            use_fsdp
+            and quant_spec.quant_config is not None
+            and quant_spec.quant_config.get_name() == "minimax_h3_int8"
+        ):
+            raise ValueError("MiniMax-H3 INT8 supports TP/SP, not FSDP inference")
         if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
