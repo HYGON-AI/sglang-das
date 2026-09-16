@@ -149,7 +149,7 @@ class DraftLMHeadVocabParallelTop1:
         self.hidden_size = full_weight.shape[1]
         self.device = full_weight.device
         self.dtype = full_weight.dtype
-        # rocBLAS on DCU can produce incorrect results for the non-contiguous
+        # rocBLAS on HCU can produce incorrect results for the non-contiguous
         # transpose view at larger padded row counts. Cache a contiguous
         # vocabulary shard transpose once so decode does not copy it per step.
         self.weight_shard_t = full_weight.narrow(
