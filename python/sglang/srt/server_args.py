@@ -263,7 +263,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
-    "hcu_mla"
+    "hcu_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -2238,6 +2238,16 @@ class ServerArgs:
         "The number of tokens sampled from the draft model in eagle2 each step.",
         NS("spec"),
     ] = None
+    speculative_draft_lm_head_vp_size: A[
+        int,
+        Arg(
+            help="Node-local vocabulary parallel group size for EAGLE draft decode "
+            "LM-head top-1. Requires DP attention, DP LM head, and eagle topk=1. "
+            "Use 1 to disable; target verify and draft extend keep their existing paths.",
+            choices=[1, 4, 8, 16],
+        ),
+        NS("spec"),
+    ] = 1
     speculative_num_draft_tokens: A[
         Optional[int],
         "The number of tokens sampled from the draft model in Speculative Decoding.",
@@ -10058,13 +10068,12 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert self.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
+            assert (
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
             pp_dspark_prefill = (
-                (self.speculative_algorithm or "").upper() == "DSPARK"
-                and self.disaggregation_mode == "prefill"
-            )
+                self.speculative_algorithm or ""
+            ).upper() == "DSPARK" and self.disaggregation_mode == "prefill"
             assert self.speculative_algorithm is None or pp_dspark_prefill, (
                 "Pipeline parallelism with speculative decoding is only supported "
                 "for DSPARK on a PD prefill server"
