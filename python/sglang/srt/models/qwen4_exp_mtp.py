@@ -127,7 +127,16 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         decoder_view = hidden_states.view(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
-        encoder_inputs, _ = self.fc_hidden(decoder_view)
+        # Quantized Linear backends are not required to preserve arbitrary
+        # leading dimensions.  In particular, the HCU hipBLASLt W8A8 wrapper
+        # takes ``shape[-2]`` as GEMM M, so passing [tokens, hc_count, hidden]
+        # would only project one hc_count-wide slice and then broadcast it over
+        # tokens.  Flatten every logical row explicitly and restore the HC
+        # layout after the projection.
+        encoder_inputs, _ = self.fc_hidden(
+            decoder_view.reshape(-1, self.hidden_size)
+        )
+        encoder_inputs = encoder_inputs.view_as(decoder_view)
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
     def _fuse_standard(
