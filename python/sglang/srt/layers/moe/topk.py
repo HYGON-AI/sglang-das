@@ -106,6 +106,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
+from sglang.srt.layers.moe.ep_balance import make_ep_balanced_expert_ids
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -145,8 +146,8 @@ _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_lightop_topk_ids_postprocess = get_bool_env_var(
     "SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS", "false"
 )
-simulated_expert_balance = get_bool_env_var("SGLANG_SIMULATED_EXPERT_BALANCE")
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
+_simulated_expert_balance = envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -702,6 +703,16 @@ class TopK(BaseFusedOp):
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
+        if _simulated_expert_balance:
+            if get_exec().moe.ep_num_redundant_experts != 0:
+                raise ValueError(
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with "
+                    "redundant physical experts"
+                )
+            if self.enable_waterfill:
+                raise ValueError(
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with " "waterfill"
+                )
 
         self.waterfill_balancer = None
         if self.enable_waterfill:
@@ -809,6 +820,12 @@ class TopK(BaseFusedOp):
         else:
             output_format = TopKOutputFormat.STANDARD
 
+        if _simulated_expert_balance and output_format != TopKOutputFormat.STANDARD:
+            raise ValueError(
+                "SGLANG_SIMULATED_EXPERT_BALANCE only supports STANDARD TopK "
+                f"output, got {output_format.name}"
+            )
+
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             (
@@ -892,6 +909,12 @@ class TopK(BaseFusedOp):
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 dynamic_expert_bias=dynamic_expert_bias,
+            )
+
+        if _simulated_expert_balance:
+            raise ValueError(
+                "SGLANG_SIMULATED_EXPERT_BALANCE does not support the "
+                "NPU-specific TopK path"
             )
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
@@ -2805,6 +2828,12 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
+    if _simulated_expert_balance and expert_location_dispatch_info is not None:
+        raise ValueError(
+            "SGLANG_SIMULATED_EXPERT_BALANCE requires contiguous expert "
+            "placement and cannot be used with EPLB"
+        )
+
     # Set by the fused-gating+pack branches below; None everywhere else.
     packed_topk = None
     # True when the router itself masked rows >= num_token_non_padded.
@@ -2812,12 +2841,24 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if _simulated_expert_balance and (
+        simulate_uniform_experts or simulate_round_robin_experts
+    ):
+        raise ValueError(
+            "SGLANG_SIMULATED_EXPERT_BALANCE cannot be combined with "
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS or "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+        )
     if simulate_uniform_experts and simulate_round_robin_experts:
         raise ValueError(
             "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
         )
-    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
+    routing_overridden = (
+        simulate_uniform_experts
+        or simulate_round_robin_experts
+        or _simulated_expert_balance
+    )
 
     (
         router_logits,
@@ -3068,7 +3109,34 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    if routing_overridden:
+    if routing_overridden and _simulated_expert_balance:
+        # Benchmark-only: exact per-EP-rank balanced routed ids; router weights
+        # are kept. Do NOT use in production.
+        if topk_ids.shape[1] < num_routed_topk:
+            raise ValueError(
+                f"Top-k output has {topk_ids.shape[1]} columns, but "
+                f"{num_routed_topk} routed expert columns are required"
+            )
+        parallel = get_parallel()
+        balanced_routed_ids = make_ep_balanced_expert_ids(
+            topk_ids.shape[0],
+            num_routed_topk,
+            router_logits.shape[1],
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+            device=topk_ids.device,
+            dtype=topk_ids.dtype,
+            layer_id=layer_id,
+        )
+        if topk_ids.shape[1] == num_routed_topk:
+            topk_ids = balanced_routed_ids
+        else:
+            # Keep fused shared-expert columns, if this backend appended them.
+            topk_ids = torch.cat(
+                (balanced_routed_ids, topk_ids[:, num_routed_topk:]), dim=1
+            )
+        padded_rows_masked = False
+    elif routing_overridden:
         # Benchmark-only: override gating with a balanced expert assignment (so
         # dummy/random benchmark tokens don't skew MoE load) via a single fused
         # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
@@ -3158,6 +3226,7 @@ def precomputed_topk_postprocess_is_noop(
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        and not envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
     )
 
 
