@@ -130,6 +130,48 @@ class PagedSWATest(unittest.TestCase):
         import inspect
         self.assertNotIn("hcu_block16_paged", inspect.signature(vendor.vllm_flash_attn_varlen_func).parameters)
 
+    def test_draft_small_blocks(self):
+        saved = namespace["get_spec"]
+        try:
+            for block in (4, 8):
+                namespace["get_spec"] = lambda: types.SimpleNamespace(speculative_algorithm="DFLASH", speculative_num_draft_tokens=block, speculative_dflash_block_size=block)
+                for causal in (False, True):
+                    self.check_case([128, 21021], block, (4095, 0 if causal else 4095), causal, graph=True)
+        finally:
+            namespace["get_spec"] = saved
+
+    def test_target_dispatch_and_legacy_signature(self):
+        saved = namespace.copy()
+        try:
+            for enabled, algorithm, block, arch, expected in (
+                (True, "DFLASH", 8, "gfx936", 2),
+                (True, "DFLASH", 16, "gfx936", 4),
+                (True, "DFLASH", 4, "gfx936", 0),
+                (False, "DFLASH", 16, "gfx936", 0),
+                (True, "EAGLE", 16, "gfx936", 0),
+                (True, "DSPARK", 16, "gfx936", 0),
+                (True, None, 16, "gfx936", 0),
+                (True, "DFLASH", 16, "gfx938", 0),
+            ):
+                namespace["get_bool_env_var"] = lambda name: enabled
+                namespace["get_spec"] = lambda: types.SimpleNamespace(speculative_algorithm=algorithm, speculative_num_draft_tokens=None, speculative_dflash_block_size=block)
+                legacy_calls = []
+                def legacy(q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal, window_size, block_table, fa_version, q_descale, k_descale, v_descale):
+                    legacy_calls.append(max_seqlen_k)
+                    return "legacy"
+                namespace["vllm_flash_attn_varlen_func_interface"] = legacy
+                with patch("torch.cuda.get_device_properties", return_value=types.SimpleNamespace(gcnArchName=arch)), patch.object(vendor.flash_attn_cuda, "paged_attention") as kernel:
+                    wrapped(torch.empty(block,8,256,dtype=torch.bfloat16), torch.empty(1,1,64,256,dtype=torch.float8_e5m2), torch.empty(1,1,256,64,dtype=torch.float8_e5m2), torch.tensor([0,block]), block, torch.tensor([block]), 0, 256**-.5, True, (-1,-1), torch.zeros(1,2,dtype=torch.int32), 3, None,None,None,"legacy_bhsd")
+                    self.assertEqual(kernel.call_count, expected)
+                    if expected:
+                        self.assertFalse(legacy_calls)
+                        for call in kernel.call_args_list:
+                            self.assertEqual(call.args[12], 128)
+                    else:
+                        self.assertEqual(legacy_calls, [0])
+        finally:
+            namespace.clear(); namespace.update(saved)
+
     def test_alias_selects_native(self):
         saved = namespace["get_spec"]
         try:

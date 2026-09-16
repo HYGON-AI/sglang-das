@@ -458,7 +458,7 @@ def vllm_flash_attn_varlen_func(
         and layout == "legacy_bhsd"
         and block_table is not None
         and seqused_k is not None
-        and max_seqlen_q in (8, 16)
+        and max_seqlen_q in (4, 8, 16)
         and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
         and q.dtype == torch.bfloat16
         and k.dtype == v.dtype == torch.float8_e5m2
@@ -466,22 +466,22 @@ def vllm_flash_attn_varlen_func(
         and q.shape[2] == k.shape[3] == v.shape[2]
         and "gfx936" in torch.cuda.get_device_properties(q.device).gcnArchName
     )
-    use_dflash_native_block16 = (
+    use_dflash_native_draft = (
         use_dflash_native_block
-        and max_seqlen_q == 16
         and q.shape[2] == 128
-        and q.shape[1] * 16 <= k.shape[1] * 64
+        and q.shape[1] * max_seqlen_q <= k.shape[1] * 64
         and window_size in ((-1, -1), (4095, 0), (4095, 4095))
     )
     use_dflash_native_target = (
         use_dflash_native_block
+        and max_seqlen_q in (8, 16)
         and q.shape[2] == 256
         and q.shape[1] == 8
         and k.shape[1] == v.shape[1] == 1
         and causal
         and window_size == (-1, -1)
     )
-    if use_dflash_native_block16 or use_dflash_native_target:
+    if use_dflash_native_draft or use_dflash_native_target:
         # Call the existing vendor kernel, without extending the installed
         # flash_attn Python API. Keep all model/shape guards above local.
         from flash_attn.flash_attn_interface import flash_attn_cuda
@@ -492,7 +492,7 @@ def vllm_flash_attn_varlen_func(
         if out is None:
             out = torch.empty_like(q)
         queries = q.reshape(batch_size, max_seqlen_q, *q.shape[1:])
-        if use_dflash_native_block16:
+        if use_dflash_native_draft:
             out.zero_()  # Native attention skips empty graph-padding rows.
             flash_attn_cuda.paged_attention(
                 out, queries, k, v, scale, block_table, seqused_k,
@@ -515,7 +515,7 @@ def vllm_flash_attn_varlen_func(
         return out
     if (
         use_hcu_fp8_swa_fallback
-        and not use_dflash_native_block16
+        and not use_dflash_native_draft
         and not _use_triton_vllm_fa
         and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
         and get_spec().speculative_algorithm == "DFLASH"
@@ -551,7 +551,7 @@ def vllm_flash_attn_varlen_func(
     if (
         _is_hcu
         and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback)
-        and not use_dflash_native_block16
+        and not use_dflash_native_draft
     ):
         return triton_vllm_flash_attn_varlen_func(
             q=q,
