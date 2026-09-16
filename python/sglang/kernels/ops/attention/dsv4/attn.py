@@ -87,7 +87,23 @@ def fused_store_cache(
     layout: Union[KVLayout, str] = KVLayout.V4,
     freqs_cis: Optional[torch.Tensor] = None,
 ) -> None:
+    """Quantize ``input`` ``[num_tokens, 512]`` (bf16, normed and rotated) into the
+    paged cache at ``indices``.
+
+    :param layout: the cache's :class:`KVLayout`. ``V4`` is the 584-byte layout
+        (fp8 nope, bf16 rope); ``V41`` (528 B) and ``V41_FP4`` (288 B) are the
+        V4.1 formats, fp8 with per-32 ue8m0 scales and e2m1 with per-16 e4m3
+        scales over all 512 dims.
+    :param freqs_cis: V4.1 layouts only. ``[num_tokens, 32]`` complex or
+        ``[num_tokens, 64]`` fp32 (real / imag interleaved): rotate the 64-dim
+        RoPE tail in-kernel first, so that the caller passes the un-rotated,
+        un-quantized latent and the fp4 / fp8 rounding happens exactly once.
+    """
+    layout = KVLayout.parse(layout)
     if is_hip_runtime() and not _is_hcu:
+        assert layout is KVLayout.V4 and freqs_cis is None, (
+            "the V4.1 KV layouts are CUDA (sm100) only"
+        )
         from sglang.kernels.ops.kvcache.triton_store_cache import (
             triton_fused_store_cache,
         )

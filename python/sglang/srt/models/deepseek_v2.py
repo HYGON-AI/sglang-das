@@ -469,6 +469,7 @@ class MoEGate(nn.Module):
         prefix: str = "",
         is_hash_moe: bool = False,
         is_deepseek_v4: bool = False,
+        vl_correction_bias: bool = False,
     ):
         super().__init__()
         self.is_deepseek_v4 = is_deepseek_v4
@@ -502,7 +503,7 @@ class MoEGate(nn.Module):
         else:
             self.e_score_correction_bias = None
         self.e_score_correction_bias_vl = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if vl_correction_bias:
             self.e_score_correction_bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
@@ -579,6 +580,7 @@ class DeepseekV2MoE(nn.Module):
         routed_quant_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
+        vl_correction_bias: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -643,6 +645,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("gate", prefix),
             is_hash_moe=self.is_hash,
             is_deepseek_v4=is_deepseek_v4,
+            vl_correction_bias=vl_correction_bias,
         )
 
         # scaling factor for fused shared experts on AMD-platform.
@@ -1124,18 +1127,62 @@ class DeepseekV2MoE(nn.Module):
                 from sglang.kernels.ops.communication.all_reduce_fusion import (
                     moe_finalize_all_reduce,
                 )
-
-                final_hidden_states = moe_finalize_all_reduce(
-                    deferred.gemm2_out,
-                    deferred.expanded_idx_to_permuted_idx,
-                    deferred.expert_weights,
-                    deferred.top_k,
-                    shared_output,
-                    world_size=self.tp_size,
-                    hidden_dim=hidden_states.shape[-1],
-                    # Routing metadata must be ready before it is consumed.
-                    prefetch_metadata=False,
+                from sglang.srt.layers.moe.mhc_post_fusion import (
+                    current_mhc_post_fusion,
                 )
+
+                mhc = current_mhc_post_fusion()
+                if mhc is not None:
+                    from sglang.kernels.ops.communication.all_reduce_mhc import (
+                        moe_finalize_all_reduce_mhc,
+                    )
+
+                    # Coefficients are produced alongside the MoE. Join before
+                    # the fused epilogue reads them, rather than after the AR.
+                    mhc.materialize_stats()
+                    if mhc.stats_stream is not None:
+                        current_stream.wait_stream(mhc.stats_stream)
+                    args = (
+                        deferred.gemm2_out,
+                        deferred.expanded_idx_to_permuted_idx,
+                        deferred.expert_weights,
+                        deferred.top_k,
+                        shared_output,
+                        mhc.residual,
+                        mhc.post,
+                        mhc.comb,
+                    )
+                    if mhc.norm_weight is not None:
+                        from sglang.kernels.ops.communication.all_reduce_mhc import (
+                            moe_finalize_all_reduce_mhc_quant,
+                        )
+
+                        final_hidden_states, mhc.output, mhc.normalized, q, sf = (
+                            moe_finalize_all_reduce_mhc_quant(
+                                *args,
+                                mhc.pre,
+                                mhc.norm_weight,
+                                mhc.norm_eps,
+                                world_size=self.tp_size,
+                            )
+                        )
+                        mhc.quantized = (q, sf)
+                    else:
+                        final_hidden_states, mhc.output = moe_finalize_all_reduce_mhc(
+                            *args, world_size=self.tp_size
+                        )
+                else:
+                    final_hidden_states = moe_finalize_all_reduce(
+                        deferred.gemm2_out,
+                        deferred.expanded_idx_to_permuted_idx,
+                        deferred.expert_weights,
+                        deferred.top_k,
+                        shared_output,
+                        world_size=self.tp_size,
+                        hidden_dim=hidden_states.shape[-1],
+                        # Routing metadata must be ready before it is consumed.
+                        prefetch_metadata=False,
+                    )
                 all_reduce_done = True
             else:
                 final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
@@ -1238,7 +1285,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
@@ -1478,7 +1524,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1496,7 +1541,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
 
                 if (
@@ -1534,7 +1578,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )

@@ -387,6 +387,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+
         precision = self.flashinfer_mxfp4_moe_precision
         input_ready: Optional[torch.cuda.Event] = None
         if precision == "bf16":
@@ -444,7 +447,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     device=x_quant.device,
                 )
 
-        output = trtllm_fp4_block_scale_routed_moe(
+        if input_ready is not None:
+            # The routing kernel is launched inside the op below, so the
+            # cross-stream join for x_quant/x_scale must precede the op call.
+            torch.cuda.current_stream().wait_event(input_ready)
+
+        result = trtllm_fp4_block_scale_routed_moe(
             topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=x_quant,

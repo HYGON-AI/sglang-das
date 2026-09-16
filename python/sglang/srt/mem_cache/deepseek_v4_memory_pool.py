@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_masked,
@@ -805,6 +806,26 @@ class DeepSeekV4LayerItem(NamedTuple):
     # kv_source layer that writes it and the layers that read it.
     compress_layer_id: int
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
+
+
+# Re-exported: the pool allocates the rows, while the writers own the layout.
+DSV4_FP8_NOPE_ROW_BYTES = layout.DSV4_FP8_NOPE_ROW_BYTES
+DSV4_FP8_QUANT_TILE = layout.DSV4_FP8_QUANT_TILE
+
+
+def dsv4_unified_row_bytes(
+    qk_nope_head_dim: int, qk_rope_head_dim: int, fp8: bool
+) -> int:
+    if not fp8:
+        return (qk_nope_head_dim + qk_rope_head_dim) * 2
+    num_tiles = -(-qk_nope_head_dim // DSV4_FP8_QUANT_TILE)
+    scale_bytes = 2 * num_tiles
+    if qk_nope_head_dim + scale_bytes > DSV4_FP8_NOPE_ROW_BYTES:
+        raise ValueError(
+            f"fp8 nope row overflows: {qk_nope_head_dim} latent values at 1 B + "
+            f"{scale_bytes} B scales > {DSV4_FP8_NOPE_ROW_BYTES} B stride"
+        )
+    return DSV4_FP8_NOPE_ROW_BYTES + qk_rope_head_dim * 2
 
 
 # The following kv pool follows ATOM's unified_kv kernel layout.
@@ -2076,6 +2097,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         eps: float = 1e-8,
     ) -> None:
+        """Write ``cache_k`` ``[n, 512]`` bf16 into the layer's compressed cache.
+
+        For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, with
+        ``freqs_cis`` if it is not rotated yet: the kernel rounds to e2m1 once.
+        For the fp8 layouts ``cache_k`` is the finished (fake-quantized, rotated)
+        value, as today."""
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.set_key_buffer_lightop_fused(
