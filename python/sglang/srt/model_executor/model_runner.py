@@ -626,6 +626,9 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=self.draft_model_idx,
+            dsa_layer_split_scratch_source=getattr(
+                self, "dsa_layer_split_scratch_source", None
+            ),
         )
 
     def init_mindspore_runner(self):

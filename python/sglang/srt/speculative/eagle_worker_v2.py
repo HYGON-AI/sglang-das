@@ -243,6 +243,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+        from sglang.srt.utils.common import is_hcu
+
+        target_pool = self.target_worker.model_runner.token_to_kv_pool
+        # The P-side executes target and NextN serially. One draft layer is
+        # owned by the final CP rank, matching the existing P/D sender policy.
+        # Other speculative workers and multi-layer drafts retain their pools.
+        self.draft_runner.dsa_layer_split_scratch_source = None
+        if (
+            self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value
+            and is_hcu()
+            and self.ps.pp_size == 1
+            and self.speculative_algorithm.is_eagle()
+            and not self.speculative_algorithm.is_eagle3()
+            and self.draft_runner.layer_info.num_effective_layers == 1
+            and self.draft_runner.model_config.num_nextn_predict_layers == 1
+            and isinstance(target_pool, LayerSplitDSATokenToKVPool)
+        ):
+            self.draft_runner.dsa_layer_split_scratch_source = target_pool
         self.draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
