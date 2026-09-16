@@ -365,6 +365,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+        self.draft_lm_head_vp = None
+        vp_size = get_spec().speculative_draft_lm_head_vp_size
+        if vp_size > 1:
+            from sglang.srt.speculative.draft_lm_head_vp import (
+                DraftLMHeadVocabParallelTop1,
+            )
+
+            logits_processor = getattr(
+                self.draft_runner.model, "logits_processor", None
+            )
+            if logits_processor is None:
+                raise RuntimeError(
+                    "Draft LM-head VP requires the draft model to expose logits_processor."
+                )
+            # Use the launched ranks per node, not the number of visible devices:
+            # a process may see one GPU or the node may use only some of its GPUs.
+            self.draft_lm_head_vp = DraftLMHeadVocabParallelTop1(
+                full_weight=head,
+                vocab_size=self.draft_runner.model_config.vocab_size,
+                vp_size=vp_size,
+                max_rows_per_rank=self.draft_runner.req_to_token_pool.size,
+                local_world_size=get_parallel().tp_size // get_parallel().nnodes,
+            )
+            logits_processor.set_draft_lm_head_vp(self.draft_lm_head_vp)
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
@@ -724,6 +749,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and _is_cuda
             and self.hot_token_id is None
             and not get_spec().speculative_use_rejection_sampling
+            and getattr(self, "draft_lm_head_vp", None) is None
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -786,7 +812,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                vp_top1_token_ids = getattr(logits_output, "draft_top1_token_ids", None)
+                if vp_top1_token_ids is not None:
+                    topk_p = logits_output.draft_top1_probs
+                    topk_index = vp_top1_token_ids
+                    forward_batch.positions.add_(1)
+                elif get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -815,11 +846,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                vocab_size = (
+                    self.draft_runner.model_config.vocab_size
+                    if vp_top1_token_ids is not None
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
