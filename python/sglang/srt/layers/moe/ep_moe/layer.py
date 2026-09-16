@@ -2160,10 +2160,11 @@ class DeepEPMoE(FusedMoE):
         )
 
         q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
-            input = gateup_output,
-            fp8type = 0,
-            tokens_per_expert = masked_m,
-            limit = self.moe_runner_config.swiglu_limit)
+            input=gateup_output,
+            fp8type=0,
+            tokens_per_expert=masked_m,
+            limit=self.moe_runner_config.swiglu_limit,
+        )
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output
