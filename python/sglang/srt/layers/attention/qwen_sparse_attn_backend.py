@@ -69,6 +69,16 @@ def _resolve_trtllm_sparse_decode():
 
 
 @lru_cache(maxsize=1)
+def _resolve_sparse_gqa_attn_funcs():
+    try:
+        from flash_attn import sparse_gqa_attn_fp8_func, sparse_gqa_attn_func
+
+        return sparse_gqa_attn_func, sparse_gqa_attn_fp8_func
+    except ImportError:
+        return None, None
+
+
+@lru_cache(maxsize=1)
 def _resolve_flash_attn_varlen_func():
     """The dense varlen kernel behind the packed sparse-decode fallback.
 
@@ -1522,17 +1532,58 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
-        output = sparse_gqa_fwd_interface_triton_ck(
-            q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
-            topk_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            sequence_lens_tensor,
-            layer.scaling,
-            **scale_kwargs,
+        k_packed = torch.cat(k_parts).contiguous()
+        v_packed = torch.cat(v_parts).contiguous()
+        max_q = max(extend_lens, default=1)
+        sparse_gqa_attn_func, sparse_gqa_attn_fp8_func = (
+            _resolve_sparse_gqa_attn_funcs()
         )
+        if sparse_gqa_attn_func is not None and is_hip():
+            if layer.head_dim != 256 or layer.scaling != 1.0 / 16:
+                raise ValueError(
+                    "FA sparse GQA requires head_dim=256 and scaling=1/16: "
+                    f"head_dim={layer.head_dim}, scaling={layer.scaling}"
+                )
+            fa_kwargs = {
+                "scale": 1.0 / 16,
+                "max_seqlen_q": max_q,
+            }
+            if is_fp8_kv_dtype(k_packed.dtype):
+                output = sparse_gqa_attn_fp8_func(
+                    q.contiguous(),
+                    k_packed,
+                    v_packed,
+                    topk_indices,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    sequence_lens_tensor,
+                    k_scale=scale_kwargs["k_scale"],
+                    v_scale=scale_kwargs["v_scale"],
+                    **fa_kwargs,
+                )
+            else:
+                output = sparse_gqa_attn_func(
+                    q.contiguous(),
+                    k_packed,
+                    v_packed,
+                    topk_indices,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    sequence_lens_tensor,
+                    **fa_kwargs,
+                )
+        else:
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                k_packed,
+                v_packed,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+                **scale_kwargs,
+            )
         return self._pad_extend_output(output, num_output_rows)
 
     @staticmethod
