@@ -836,6 +836,7 @@ class C4IndexerBackendMixin:
                     None,
                     indexer_metadata.max_c4_seq_len,
                     False,
+                    forward_batch.forward_mode == ForwardMode.EXTEND,
                 )
             else:
                 c4_indexer_kv_cache = (
