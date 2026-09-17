@@ -572,6 +572,14 @@ class DSV4AttnMetadata:
     def positions(self) -> torch.Tensor:
         return self.positions_casual
 
+    @property
+    def has_c4(self) -> bool:
+        return 4 in self.present_ratios
+
+    @property
+    def has_c128(self) -> bool:
+        return 128 in self.present_ratios
+
     def get_flashmla_metadata(self, compress_ratio: Literal[0, 1, 2, 4, 128]):
         if compress_ratio == 0:
             return self.c0_flashmla_metadata
@@ -2848,9 +2856,9 @@ class DeepseekV4AttnBackend(
         ):
             core = metadata.core_attn_metadata
             core.c0_flashmla_metadata = _create_flashmla_metadata()
-            if 4 in core.present_ratios:
+            if core.has_c4:
                 core.c4_flashmla_metadata = _create_flashmla_metadata()
-            if 128 in core.present_ratios:
+            if core.has_c128:
                 core.c128_flashmla_metadata = _create_flashmla_metadata()
             if 1 in core.low_ratios:
                 core.c1_flashmla_metadata = _create_flashmla_metadata()
