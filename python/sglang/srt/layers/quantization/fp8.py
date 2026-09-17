@@ -552,8 +552,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
                 self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
         # 32-wide-K ue8m0 blocks can use FlashInfer MXFP8 on Blackwell;
-        # Triton is the fallback when no supported FlashInfer backend is selected.
-        self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
+        # Triton is the fallback when no supported FlashInfer backend is selected.        self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
             self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
         )
         if self.block_fp8_as_mxfp8:
@@ -826,11 +825,11 @@ class Fp8LinearMethod(LinearMethodBase):
         # this quant method is what consumes the weight. A layer whose weight is
         # read directly by the model (DeepSeek-V4 wo_a, whose absorb GEMM takes
         # .weight/.weight_scale_inv and runs its own batched kernel) sets
-        # skip_aiter_bpreshuffle and keeps the plain row-major layout.
+        # keep_plain_weight_layout and keeps the plain row-major layout.
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
-            and not getattr(layer, "skip_aiter_bpreshuffle", False)
+            and not getattr(layer, "keep_plain_weight_layout", False)
         ):
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
