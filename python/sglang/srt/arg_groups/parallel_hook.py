@@ -622,8 +622,11 @@ def validate_prefill_cp_platform(server_args: Any):
     cfg = resolving_view(server_args)
     platform = get_platform()
     if cfg.enable_prefill_cp and (
-        platform.is_hip or platform.is_npu or platform.is_musa
+        (platform.is_hip and not platform.is_hcu)
+        or platform.is_npu
+        or platform.is_musa
     ):
         raise ValueError(
-            "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on non-HCU HIP/NPU/MUSA is deprecated; "
+            "CP support will be refactored soon."
         )

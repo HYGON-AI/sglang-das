@@ -18,7 +18,14 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_hcu,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 from sglang.srt.utils.common import ceil_div
 
 
@@ -118,7 +125,7 @@ def is_dsa_enable_prefill_cp():
     if get_parallel().attn_cp_size <= 1:
         return False
 
-    if is_hip() or is_npu() or is_musa():
+    if (is_hip() and not is_hcu()) or is_npu() or is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model
