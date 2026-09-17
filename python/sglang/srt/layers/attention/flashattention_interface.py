@@ -444,8 +444,78 @@ def vllm_flash_attn_varlen_func(
         and window_size is not None
         and window_size[0] >= 0
     )
+    # The dedicated model switch isolates vendor-specific behavior. The block
+    # size comes from published service configuration, including its alias.
+    use_dflash_native_block = (
+        _is_hcu
+        and not _use_triton_vllm_fa
+        and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
+        and get_spec().speculative_algorithm == "DFLASH"
+        and (
+            get_spec().speculative_num_draft_tokens == max_seqlen_q
+            or get_spec().speculative_dflash_block_size == max_seqlen_q
+        )
+        and layout == "legacy_bhsd"
+        and block_table is not None
+        and seqused_k is not None
+        and max_seqlen_q in (4, 8, 16)
+        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.float8_e5m2
+        and k.shape[2] == v.shape[3] == 64
+        and q.shape[2] == k.shape[3] == v.shape[2]
+        and "gfx936" in torch.cuda.get_device_properties(q.device).gcnArchName
+    )
+    use_dflash_native_draft = (
+        use_dflash_native_block
+        and q.shape[2] == 128
+        and q.shape[1] * max_seqlen_q <= k.shape[1] * 64
+        and window_size in ((-1, -1), (4095, 0), (4095, 4095))
+    )
+    use_dflash_native_target = (
+        use_dflash_native_block
+        and max_seqlen_q in (8, 16)
+        and q.shape[2] == 256
+        and q.shape[1] == 8
+        and k.shape[1] == v.shape[1] == 1
+        and causal
+        and window_size == (-1, -1)
+    )
+    if use_dflash_native_draft or use_dflash_native_target:
+        # Call the existing vendor kernel, without extending the installed
+        # flash_attn Python API. Keep all model/shape guards above local.
+        from flash_attn.flash_attn_interface import flash_attn_cuda
+
+        batch_size = cu_seqlens_q.numel() - 1
+        kv_bound = max(max_seqlen_k or 0, block_table.shape[1] * k.shape[2])
+        scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+        if out is None:
+            out = torch.empty_like(q)
+        queries = q.reshape(batch_size, max_seqlen_q, *q.shape[1:])
+        if use_dflash_native_draft:
+            out.zero_()  # Native attention skips empty graph-padding rows.
+            flash_attn_cuda.paged_attention(
+                out, queries, k, v, scale, block_table, seqused_k,
+                None, "", q_descale, k_descale, v_descale, kv_bound,
+                None, 0, window_size[0], window_size[1], causal,
+            )
+        else:
+            outputs = out.reshape(batch_size, max_seqlen_q, *q.shape[1:])
+            for begin in range(0, max_seqlen_q, 4):
+                chunk_q = queries[:, begin:begin + 4].contiguous()
+                chunk_out = torch.zeros_like(chunk_q)
+                # Preserve bottom-right causal positions within the full block.
+                chunk_lengths = (seqused_k - (max_seqlen_q - 4 - begin)).clamp_min(0)
+                flash_attn_cuda.paged_attention(
+                    chunk_out, chunk_q, k, v, scale, block_table, chunk_lengths,
+                    None, "", q_descale, k_descale, v_descale, kv_bound,
+                    None, 0, -1, -1, True,
+                )
+                outputs[:, begin:begin + 4].copy_(chunk_out)
+        return out
     if (
         use_hcu_fp8_swa_fallback
+        and not use_dflash_native_draft
         and not _use_triton_vllm_fa
         and get_bool_env_var("SGLANG_USE_QWEN_DFLASH2")
         and get_spec().speculative_algorithm == "DFLASH"
@@ -478,7 +548,11 @@ def vllm_flash_attn_varlen_func(
             v_descale=v_descale,
             out=out,
         )
-    if _is_hcu and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback):
+    if (
+        _is_hcu
+        and (_use_triton_vllm_fa or use_hcu_fp8_swa_fallback)
+        and not use_dflash_native_draft
+    ):
         return triton_vllm_flash_attn_varlen_func(
             q=q,
             k=k,
@@ -553,6 +627,7 @@ def vllm_flash_attn_varlen_func(
             return out
         return result
 
+    # Capture may leave the host bound at zero; live lengths remain on GPU.
     return vllm_flash_attn_varlen_func_interface(
         q=q,
         k=k,
