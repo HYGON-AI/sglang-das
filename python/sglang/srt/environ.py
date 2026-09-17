@@ -1540,12 +1540,12 @@ class Envs:
     # Pin and map the host table with cudaHostRegister. False leaves the plain
     # mapping to the platform (Grace-Blackwell ATS reaches it directly).
     SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
-    # How the host table is laid out: "shared" is one memfd copy for the TP group
-    # with no all-reduce; "private" is one anonymous mapping per rank holding its
-    # row range, gathered with the all-reduce. "auto" picks shared when shmem THP
-    # (transparent_hugepage/shmem_enabled) is on, else private when anonymous THP
-    # is on, else shared without huge pages.
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("auto")
+    # How the host table is laid out: "shared" is one buffer for the whole TP
+    # group, mapped by every rank, with no lookup all-reduce (the ranks must share
+    # a PID namespace); "per_rank" is one anonymous mapping per rank holding only
+    # its rows, gathered with the all-reduce, and the only layout that gets huge
+    # pages without shmem THP.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
     # With the host table on, drop the checkpoint's page cache (posix_fadvise
     # DONTNEED on the safetensors) before pre-faulting the table and again after
     # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
