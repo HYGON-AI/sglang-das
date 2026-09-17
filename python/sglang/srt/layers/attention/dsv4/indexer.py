@@ -1213,6 +1213,13 @@ def fp32_jit_paged_topk(
         )
 
 
+# Community dsv4.1 renamed these helpers when it introduced the candidate
+# indexer library. Keep the HCU candidate implementations on their established
+# names while exposing the updated backend API.
+deep_gemm_fp4_paged_mqa_logits = fp4_paged_mqa_logits
+topk_transform_paged_from_metadata = fp32_jit_paged_topk
+
+
 def select_candidate_blocks(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,

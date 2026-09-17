@@ -76,13 +76,14 @@ from sglang.srt.layers.attention.debug_flash_mla_adapter import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    CandidateMasks,
     CandidateMetadata,
     IndexerInputs,
     make_candidate_indexer,
+)
+from sglang.srt.layers.attention.dsv4.candidate_torch import (
+    CandidateMasks,
     mask_topk_scores,
     published_masks,
-    select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -96,6 +97,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
     deep_gemm_fp4_paged_mqa_logits,
+    select_candidate_blocks,
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
