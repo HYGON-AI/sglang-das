@@ -178,6 +178,62 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args,
         )
 
+    _validate_draft_lm_head_vp(server_args)
+
+
+def _validate_draft_lm_head_vp(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    view = resolved_view(server_args)
+    vp_size = view.speculative_draft_lm_head_vp_size
+    if vp_size not in (1, 4, 8, 16):
+        raise ValueError(
+            "--speculative-draft-lm-head-vp-size must be one of 1, 4, 8, 16, "
+            f"got {vp_size}."
+        )
+    if vp_size == 1:
+        return
+    if view.speculative_algorithm != "EAGLE" or view.speculative_eagle_topk != 1:
+        raise ValueError(
+            "Draft LM-head VP requires --speculative-algorithm EAGLE "
+            "(or NEXTN) and --speculative-eagle-topk 1."
+        )
+    if not view.device.startswith("cuda"):
+        raise ValueError("Draft LM-head VP requires a CUDA or HIP device.")
+    if not view.enable_dp_attention or not view.enable_dp_lm_head:
+        raise ValueError(
+            "Draft LM-head VP requires --enable-dp-attention and --enable-dp-lm-head."
+        )
+    if view.tp_size != view.dp_size or view.attn_cp_size != 1 or view.pp_size != 1:
+        raise ValueError(
+            "Draft LM-head VP requires tp_size == dp_size, attn_cp_size == 1, "
+            "and pp_size == 1."
+        )
+    if view.tp_size % (view.nnodes * vp_size) != 0:
+        raise ValueError(
+            "Draft LM-head VP groups must fit within each node: "
+            f"tp_size={view.tp_size} must be divisible by "
+            f"nnodes={view.nnodes} * vp_size={vp_size}."
+        )
+    if view.speculative_token_map is not None:
+        raise ValueError(
+            "Draft LM-head VP cannot be combined with --speculative-token-map."
+        )
+    if view.enable_fp32_lm_head or view.enable_lora:
+        raise ValueError(
+            "Draft LM-head VP does not support --enable-fp32-lm-head or --enable-lora."
+        )
+    if view.speculative_use_rejection_sampling:
+        raise ValueError(
+            "Draft LM-head VP returns deterministic top-1 proposals and cannot be "
+            "combined with --speculative-use-rejection-sampling."
+        )
+    if view.speculative_adaptive or view.enable_multi_layer_eagle:
+        raise ValueError(
+            "Draft LM-head VP requires fixed-step, single-layer EAGLE; "
+            "--speculative-adaptive and --enable-multi-layer-eagle are unsupported."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
@@ -396,7 +452,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "none",
             "megamoe",
         ) or (
-            server_args.moe_a2a_backend == "deepep"
+            server_args.moe_a2a_backend
+            == "deepep"
             # and server_args.moe_runner_backend == "deep_gemm"
         )
         if not _is_npu and not supports_dspark_dp_moe:
@@ -433,7 +490,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
         # 'megamoe' is official's DSpark-under-DP-attention draft path (#34844).
         supports_dspark_draft_moe = draft_a2a in ("none", "megamoe") or (
-            draft_a2a == "deepep" # and draft_runner == "deep_gemm"
+            draft_a2a == "deepep"  # and draft_runner == "deep_gemm"
         )
         if not supports_dspark_draft_moe:
             raise ValueError(

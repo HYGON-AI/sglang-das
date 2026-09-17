@@ -489,6 +489,9 @@ class Envs:
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    # Benchmark-only synthetic routing; replaces routed expert IDs and must not
+    # be used for correctness or production inference.
+    SGLANG_SIMULATED_EXPERT_BALANCE = EnvBool(False)
 
     # ===================================================================
     # DSpark speculative decoding
