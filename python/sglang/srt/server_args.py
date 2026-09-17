@@ -2941,6 +2941,31 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "mooncake"
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+        NS("memory"),
+    ] = 10
+    mooncake_page_wise_load_batch_size: A[
+        int,
+        "Maximum number of keys in one complete-page Mooncake direct-linker "
+        "read call.",
+        NS("memory"),
+    ] = 128
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+        NS("memory"),
+    ] = False
+    mooncake_dfs_replica_num: A[
+        int,
+        "Number of DFS replicas for Mooncake store ReplicateConfig. "
+        "Controls the dfs_replica_num field passed to put/batch_put operations.",
+        NS("memory"),
+    ] = 1
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
