@@ -657,14 +657,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             layout = []
             for layer in range(self.num_layers):
                 index = pool.layer_mapping.get(layer)
+                buffer_indices = (index,) if isinstance(index, int) else index
                 layout.append(
                     []
                     if index is None
                     else [
-                        (*component[index], offsets[index])
+                        (*component[buffer_index], offsets[buffer_index])
                         for component, offsets in zip(
                             pool.buffer_meta, pool._component_offsets
                         )
+                        for buffer_index in buffer_indices
                     ]
                 )
             layouts.append((keys, locations, pool.packed, layout))
