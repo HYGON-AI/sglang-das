@@ -420,7 +420,11 @@ def hcu_moe_align_block_size(
     # spelling also changed between the two builds (``Is_EP`` vs ``is_ep``).
     align_op = getattr(op, "moe_align_block_size_out", None)
     if align_op is None:
-        align_op = op.moe_align_block_size
+        # Newer LightOP moved the wrapper into its public MoE API.
+        try:
+            from lightop.moe import moe_align_block_size_out as align_op
+        except ImportError:
+            align_op = op.moe_align_block_size
     align_op(
         topk_ids,
         num_experts,
