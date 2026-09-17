@@ -57,6 +57,7 @@ from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
+    _is_hcu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -125,6 +126,17 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _scaled_bmm_weight(
+    weight: torch.Tensor, scale: float | torch.Tensor
+) -> torch.Tensor:
+    weight = weight.to(torch.bfloat16)
+    # The loader may preapply the scale and reset it to a Python 1.0.
+    # Reuse those weights instead of materializing an identical tensor per batch.
+    if isinstance(scale, (int, float)) and scale == 1:
+        return weight
+    return weight * scale
+
+
 def rocm_absorb_q_bmm(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -170,7 +182,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                attn.w_kc.to(torch.bfloat16) * attn.w_scale,
+                _scaled_bmm_weight(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
 
@@ -225,9 +237,31 @@ def rocm_absorb_v_bmm(
                 dtype=torch.bfloat16,
             )
         else:
+            if (
+                _is_hcu
+                and attn_output.dtype == torch.bfloat16
+                and attn.w_vc.dtype == torch.bfloat16
+                and attn.o_proj.weight.dtype != torch.uint8
+                and not _is_block_scale_fp8(attn.o_proj)
+            ):
+                # rocBLAS accepts this strided output. Writing the final token-
+                # major layout avoids a transpose/flatten copy after the GEMM.
+                output = torch.empty(
+                    attn_output.shape[0],
+                    attn_output.shape[1],
+                    attn.w_vc.shape[-1],
+                    dtype=torch.bfloat16,
+                    device=attn_output.device,
+                )
+                torch.bmm(
+                    attn_output.transpose(0, 1),
+                    _scaled_bmm_weight(attn.w_vc, attn.w_scale),
+                    out=output.transpose(0, 1),
+                )
+                return output.flatten(1, 2)
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                attn.w_vc.to(torch.bfloat16) * attn.w_scale,
+                _scaled_bmm_weight(attn.w_vc, attn.w_scale),
             )
 
     if _bmm_buf is not None:
