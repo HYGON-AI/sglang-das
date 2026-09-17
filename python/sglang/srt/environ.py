@@ -1825,6 +1825,8 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
+    # Optional legacy fixed GiB budget; unset retains the fraction policy.
+    SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB = EnvFloat(None)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
     SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(

@@ -2155,6 +2155,15 @@ class DeepseekSparseAttnBackend(
                     topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
+                if topk_indices_offset.shape[0] < topk_indices.shape[0]:
+                    # CP/MTP may pad query rows beyond the real ragged metadata.
+                    # _pad_topk_indices marks those rows -1, so zero offsets
+                    # preserve the invalid indices while aligning the shapes.
+                    padded_offsets = topk_indices_offset.new_zeros(
+                        (topk_indices.shape[0], *topk_indices_offset.shape[1:])
+                    )
+                    padded_offsets[: topk_indices_offset.shape[0]] = topk_indices_offset
+                    topk_indices_offset = padded_offsets
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)

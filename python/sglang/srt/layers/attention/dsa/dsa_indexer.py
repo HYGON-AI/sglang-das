@@ -48,6 +48,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_STATIC_SKIP_ELEMS,
     MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
+    mqa_logits_free_mem_bytes,
     mqa_logits_free_mem_fraction,
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
@@ -1441,9 +1442,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if use_int8_index_cache and not hasattr(
                 self, "_hcu_int8_indexer_path_logged"
             ):
-                logger.info(
-                    "DSA INT8 index-K consumer=LightOp dense INT8 Paged MQA"
-                )
+                logger.info("DSA INT8 index-K consumer=LightOp dense INT8 Paged MQA")
                 self._hcu_int8_indexer_path_logged = True
         else:
             kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
@@ -1599,11 +1598,48 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if get_is_capture_mode():
             return mqa_logits_static_budget_bytes(device_index=device_index)
 
+        # Include reusable allocator cache that mem_get_info omits.
         budget_bytes = mqa_logits_budget_bytes(
-            device_index=device_index, allow_sync=True
+            device_index=device_index, allow_sync=True, include_reusable_cache=True
         )
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
         return budget_bytes
+
+    def _legacy_mqa_logits_chunk_decision(
+        self, num_q: int, num_k: int, device_index: int
+    ) -> Optional[Tuple[bool, int]]:
+        """An explicitly configured legacy GiB budget takes precedence over the
+        fraction-based policy, including its cached/static headroom limit."""
+        budget_gb = envs.SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB.get()
+        if budget_gb is None:
+            return None
+        budget_gb = float(budget_gb)
+        if not 0 < budget_gb < float("inf"):
+            raise ValueError(
+                "SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB must be a positive "
+                f"finite number, got {budget_gb}"
+            )
+        configured_budget_bytes = int(budget_gb * (1024**3))
+        if configured_budget_bytes <= 0:
+            raise ValueError("SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB is too small")
+        logits_bytes = num_q * num_k * MQA_LOGITS_BYTES_PER_ELEM
+        if (
+            num_q * num_k < self._MQA_LOGITS_STATIC_SKIP_ELEMS
+            and logits_bytes <= configured_budget_bytes
+        ):
+            return False, configured_budget_bytes
+        free_mem, total_mem = mqa_logits_free_mem_bytes(
+            device_index, include_reusable_cache=True
+        )
+        logits_budget_bytes = max(
+            1,
+            min(
+                configured_budget_bytes,
+                free_mem // 2,
+                int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION),
+            ),
+        )
+        return logits_bytes > logits_budget_bytes, logits_budget_bytes
 
     def _get_topk_ragged(
         self,
@@ -1716,12 +1752,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
-        need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
-            num_rows=q_offset,
-            num_cols=k_offset,
-            get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
-            rocm=_is_hip,
+        legacy_decision = self._legacy_mqa_logits_chunk_decision(
+            q_offset, k_offset, device_index
         )
+        if legacy_decision is not None:
+            need_chunk, logits_budget_bytes = legacy_decision
+        else:
+            need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
+                num_rows=q_offset,
+                num_cols=k_offset,
+                get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(
+                    device_index
+                ),
+                rocm=_is_hip,
+            )
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -1791,7 +1835,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
-        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+        bytes_per_row = k_offset * MQA_LOGITS_BYTES_PER_ELEM
         max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
         max_rows = min(max_rows, q_offset)
 
