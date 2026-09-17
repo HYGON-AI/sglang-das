@@ -532,8 +532,13 @@ class Fp8LinearMethod(LinearMethodBase):
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
+            # Dispatch on the block size the weight will have after loading: an
+            # MXFP8 checkpoint converted to block-fp8 ends up as [128, 128].
+            effective_block_size = (
+                [128, 128] if self.convert_mxfp8_to_block else self.weight_block_size
+            )
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
-                weight_block_size=self.weight_block_size,
+                weight_block_size=effective_block_size,
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )

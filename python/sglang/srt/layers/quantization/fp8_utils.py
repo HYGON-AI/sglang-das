@@ -584,14 +584,14 @@ def dispatch_w8a8_block_fp8_linear(
     This function selects the backend based on:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
+
+    Only the Triton kernel reads the weight block size at launch; DeepGEMM, the
+    FlashInfer groupwise kernels and CUTLASS take 128-wide K blocks only, so any
+    other block shape goes to Triton regardless of the backend setting.
     """
-    if weight_block_size is not None and weight_block_size != [128, 128]:
-        # DeepGEMM, FlashInfer groupwise and CUTLASS take 128x128 blocks only;
-        # the Triton kernel reads the block size at launch. With an explicit
-        # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
-        # blocks with ue8m0 scales to the MXFP8 dense kernels instead
-        # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
+    if weight_block_size is not None and weight_block_size[1] != 128:
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
+
 
     backend = get_fp8_gemm_runner_backend()
     # Handle explicit backend selection via --fp8-gemm-backend
