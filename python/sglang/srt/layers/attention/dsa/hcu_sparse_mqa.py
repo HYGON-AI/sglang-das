@@ -33,7 +33,7 @@ import torch
 class LightOpSparseMQARoute:
     """Validated sparse-MQA dispatch choice.
 
-    ``group_size == 1`` selects independent rows. Values 3, 4, and 5 select
+    ``group_size == 1`` selects independent rows. Values 3, 4, 5, and 6 select
     the MTP grouped implementation, after the caller has proved that each
     consecutive group shares one request's page table.
     """
@@ -154,7 +154,7 @@ def select_lightop_sparse_mqa_route(
         return None
 
     if is_target_verify or is_draft_extend_v2:
-        if mtp_group_size not in (3, 4, 5):
+        if mtp_group_size not in (3, 4, 5, 6):
             return None
         if rows != batch_size * mtp_group_size:
             return None

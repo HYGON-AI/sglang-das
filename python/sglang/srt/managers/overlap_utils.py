@@ -568,13 +568,15 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip and not _is_hcu:
+            if _is_hip and (not _is_hcu or self.needs_cpu_seq_lens):
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
-                # HCU does not use this workaround: synchronize() blocks the
-                # scheduler host thread until the previous speculative step
-                # finishes and defeats single-batch overlap.
+                # HCU only takes it when the CPU seq_lens copy below will block
+                # anyway; otherwise synchronize() stalls the scheduler host
+                # thread and defeats single-batch overlap.
                 self.publish_ready.synchronize()
             else:
+                # HCU GPU-only backends can wait on the stream without blocking
+                # the host from preparing the next forward pass.
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
