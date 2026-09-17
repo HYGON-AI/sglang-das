@@ -677,8 +677,7 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
         backend.is_flashinfer_cutedsl()
         or backend.is_flashinfer_cutlass()
         or backend.is_flashinfer_trtllm()
-    ):
-        return Mxfp8DenseGemmBackend.UNSUPPORTED
+    ):        return Mxfp8DenseGemmBackend.UNSUPPORTED
     if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
     resolved = resolve_mxfp8_dense_gemm_backend()
@@ -716,8 +715,7 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     if backend.is_flashinfer_cutedsl():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
-        )
-    return _unsupported_mxfp8_linear
+        )    return _unsupported_mxfp8_linear
 
 
 def block_fp8_scale_to_mxfp8_e8m0(
