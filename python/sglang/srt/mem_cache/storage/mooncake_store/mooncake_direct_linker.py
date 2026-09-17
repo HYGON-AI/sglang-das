@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from concurrent.futures import Future
 from queue import Empty, Queue
 
@@ -24,11 +25,24 @@ from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
+    if getattr(server_args, "enable_dp_attention", False):
+        from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+        return get_attention_dp_rank()
+    return getattr(params, "dp_rank", None) or 0
 
 
 def _storage_suffix(
@@ -239,13 +253,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_page_first_layout=False,
             model_name=get_model().model_path,
             extra_config=extra_config,
+            dp_rank=getattr(params, "dp_rank", None),
         )
         if storage is None:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeStore,
             )
 
-            self.storage = MooncakeStore(storage_config, mem_pool=None)
+            self.storage = MooncakeStore(
+                storage_config,
+                mem_pool=None,
+                enable_client_http_server=params.enable_metrics,
+            )
         else:
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
@@ -267,6 +286,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             storage_suffix,
         )
+
+        self.storage_metrics_collector = None
+        if params.enable_metrics:
+            labels = {
+                "storage_backend": "mooncake_direct",
+                "tp_rank": tp_rank,
+                "dp_rank": _get_mooncake_storage_metrics_dp_rank(server_args, params),
+                "pp_rank": params.pp_rank,
+                "pp_size": params.pp_size,
+                "attn_cp_rank": params.attn_cp_rank,
+                "attn_cp_size": params.attn_cp_size,
+            }
+            if server_args.extra_metric_labels:
+                labels.update(server_args.extra_metric_labels)
+            collector_cls = resolve_collector_class(
+                server_args, STAT_LOGGER_ROLE_STORAGE, StorageMetricsCollector
+            )
+            self.storage_metrics_collector = collector_cls(labels=labels)
 
         self.register_buffers()
         if self.read_plan_enabled:
@@ -294,6 +331,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.pending_load_tokens: dict[str, int] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -301,9 +339,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # (rids, success) per started load batch. Pushed from a finally so a
         # failed batch still releases the tree-side locks it pinned.
         self.completed_loads: Queue[tuple[list[str], bool]] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[
+            tuple[list[PoolTransfer], int, float, object] | None
+        ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -415,9 +453,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
+        logical_pages = {
+            page_key for transfer in expanded for page_key in transfer.keys
+        }
+        pending_load_tokens = getattr(self, "pending_load_tokens", None)
+        if pending_load_tokens is None:
+            pending_load_tokens = self.pending_load_tokens = {}
+        pending_load_tokens[rid] = len(logical_pages) * self.page_size
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
+        getattr(self, "pending_load_tokens", {}).pop(rid, None)
         return self.pending_loads.pop(rid, None) is not None
 
     def num_completed_loads(self) -> int:
@@ -465,6 +511,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    self._finish_prefetch_metrics(list(pending), success is True)
                     self.completed_loads.put((list(pending), success))
             finally:
                 self.load_queue.task_done()
@@ -569,6 +616,36 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load session cleanup failed")
                     success = False
         return success
+
+    def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
+        pending_load_tokens = getattr(self, "pending_load_tokens", {})
+        tokens = sum(pending_load_tokens.pop(rid, 0) for rid in rids)
+        if not success or tokens <= 0:
+            return
+        self._log_prefetched_tokens(tokens)
+        recorder = getattr(
+            getattr(self.storage, "store", None), "record_prefetched_tokens", None
+        )
+        if recorder is not None:
+            try:
+                recorder(tokens)
+            except BaseException:
+                logger.warning(
+                    "Failed to record Mooncake prefetched token metric.",
+                    exc_info=True,
+                )
+
+    def _log_prefetched_tokens(self, tokens: int) -> None:
+        collector = getattr(self, "storage_metrics_collector", None)
+        if collector is None or tokens <= 0:
+            return
+        try:
+            collector.log_prefetched_tokens(tokens)
+        except BaseException:
+            logger.warning(
+                "Failed to record SGLang direct-storage prefetch metrics.",
+                exc_info=True,
+            )
 
     def _load_page_wise(
         self, counter_index: int, batches, started, maybe_fail
@@ -706,19 +783,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         tokens = len(kv.keys) * self.page_size
         ready_event = device_module.Event()
         ready_event.record()
-        self.offload_queue.put((expanded, tokens, ready_event))
+        self.offload_queue.put((expanded, tokens, time.perf_counter(), ready_event))
         return True
 
     def offload_thread_func(self) -> None:
         while True:
             task = self.offload_queue.get()
+            metric_recorded = False
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_event = task
+                expanded, tokens, started, ready_event = task
                 ready_event.synchronize()
                 results = self.storage.batch_set_v2(expanded)
                 success = all(all(pool_results) for pool_results in results.values())
+                self._log_l4_backup_metric(
+                    tokens, time.perf_counter() - started, success
+                )
+                metric_recorded = True
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
@@ -726,9 +808,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(success)
             except BaseException:
                 logger.exception("Mooncake offload failed")
+                if task is not None and not metric_recorded:
+                    _, tokens, started, _ = task
+                    self._log_l4_backup_metric(
+                        tokens, time.perf_counter() - started, False
+                    )
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+
+    def _log_l4_backup_metric(
+        self, tokens: int, duration: float, success: bool
+    ) -> None:
+        collector = getattr(self, "storage_metrics_collector", None)
+        if collector is None:
+            return
+        try:
+            # This branch intentionally does not guess DFS versus local disk.
+            # Its Mooncake configuration owns that routing decision.
+            collector.log_l4_backup("mooncake", tokens, duration, success)
+        except BaseException:
+            logger.warning(
+                "Failed to record SGLang L4 backup metrics.",
+                exc_info=True,
+            )
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
@@ -738,6 +841,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
+        getattr(self, "pending_load_tokens", {}).clear()
         self.load_queue.join()
         self.offload_queue.join()
         while True:
