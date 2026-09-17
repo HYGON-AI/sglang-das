@@ -1727,28 +1727,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             state[state_locs, half:] = float("-inf")
 
     def request_state_transfer_indices(self, req_pool_idx: int, seq_len: int):
-        """PD transfer indices of the request-scoped state component: one c128
-        page per item (or the single online row) of the request's ring."""
-        from sglang.srt.disaggregation.utils import get_dsv4_c128_state_indices
-
+        """PD transfer indices of the request-scoped state component."""
         pools = [
             p for p in self.compress_state_pools if p is not None and p.request_scoped
         ]
         assert len(pools) == 1, (
             f"expected one request-scoped state pool, got {len(pools)}"
         )
-        pool = pools[0]
-        if pool.ratio == 2:
-            if seq_len % 2 == 0:
-                return np.empty((0,), dtype=np.int32)
-            return np.array([int(req_pool_idx)], dtype=np.int32)
-        assert pool.ratio == 128
-        return get_dsv4_c128_state_indices(
-            req_pool_idx,
-            seq_len,
-            online=pool.online,
-            ring_size=1 if pool.online else pool.ring_size,
-        )
+        return pools[0].transfer_indices(req_pool_idx, seq_len)
 
     def clear_request_scoped_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped state for one req slot."""

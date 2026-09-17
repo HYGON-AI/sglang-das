@@ -1262,18 +1262,11 @@ def _populate_extra_kv_cache(
 def _extra_metadata_indices(
     core_metadata, compress_ratio: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return `(extra_indices, extra_topk_lengths)` for C4 / C128 paths from
-    the upgraded `DSV4AttnMetadata`. Mirrors the dispatch in
-    `DeepseekV4AttnBackend.forward(compress_ratio=...)`.
-    """
-    if compress_ratio in (1, 2, 4):
-        return (
-            core_metadata.sparse_page_indices(compress_ratio),
-            core_metadata.sparse_topk_lengths(compress_ratio),
-        )
-    if compress_ratio == 128:
-        return core_metadata.c128_page_indices, core_metadata.c128_topk_lengths_clamp1
-    raise ValueError(f"unsupported compress_ratio={compress_ratio}")
+    """Return the extra-cache indices and valid lengths for one ratio."""
+    return (
+        core_metadata.sparse_page_indices(compress_ratio),
+        core_metadata.sparse_topk_lengths(compress_ratio),
+    )
 
 
 def _pure_torch_dsv4_combined_reference(

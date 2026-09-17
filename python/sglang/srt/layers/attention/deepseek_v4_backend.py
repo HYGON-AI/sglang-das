@@ -587,37 +587,70 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
-    def sparse_page_indices(self, compress_ratio: Literal[1, 2, 4]) -> torch.Tensor:
-        """Top-k slots into the ratio's extra cache, -1 padded; the indexer fills them."""
+    # Per-ratio metadata stays in flat fields because graph replay copies it by name.
+    def sparse_page_indices(self, compress_ratio: int) -> torch.Tensor:
+        """Slots into the ratio's extra cache, padded with -1 where needed."""
         if compress_ratio == 1:
             return self.c1_sparse_page_indices
-        elif compress_ratio == 2:
+        if compress_ratio == 2:
             return self.c2_sparse_page_indices
-        elif compress_ratio == 4:
+        if compress_ratio == 4:
             return self.c4_sparse_page_indices
+        if compress_ratio == 128:
+            return self.c128_page_indices
         raise ValueError(f"invalid {compress_ratio=}")
 
-    def sparse_raw_indices(
-        self, compress_ratio: Literal[1, 2, 4]
-    ) -> Optional[torch.Tensor]:
-        """The same top-k as request-local compressed positions, for the sparse
-        prefill workspace; allocated for prefill metadata only."""
+    def sparse_raw_indices(self, compress_ratio: int) -> Optional[torch.Tensor]:
+        """Request-local compressed positions used by sparse prefill."""
         if compress_ratio == 1:
             return self.c1_sparse_raw_indices
-        elif compress_ratio == 2:
+        if compress_ratio == 2:
             return self.c2_sparse_raw_indices
-        elif compress_ratio == 4:
+        if compress_ratio == 4:
             return self.c4_sparse_raw_indices
         raise ValueError(f"invalid {compress_ratio=}")
 
-    def sparse_topk_lengths(self, compress_ratio: Literal[1, 2, 4]) -> torch.Tensor:
+    def sparse_topk_lengths(self, compress_ratio: int) -> torch.Tensor:
         if compress_ratio == 1:
             return self.c1_sparse_topk_lengths
-        elif compress_ratio == 2:
+        if compress_ratio == 2:
             return self.c2_sparse_topk_lengths
-        elif compress_ratio == 4:
+        if compress_ratio == 4:
             return self.c4_sparse_topk_lengths
+        if compress_ratio == 128:
+            return self.c128_topk_lengths_clamp1
         raise ValueError(f"invalid {compress_ratio=}")
+
+    def set_sparse_topk(
+        self,
+        compress_ratio: int,
+        *,
+        page_indices: torch.Tensor,
+        topk_lengths: torch.Tensor,
+        raw_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Writer counterpart of the per-ratio sparse metadata accessors."""
+        if compress_ratio == 1:
+            self.c1_sparse_page_indices = page_indices
+            self.c1_sparse_topk_lengths = topk_lengths
+            if raw_indices is not None:
+                self.c1_sparse_raw_indices = raw_indices
+        elif compress_ratio == 2:
+            self.c2_sparse_page_indices = page_indices
+            self.c2_sparse_topk_lengths = topk_lengths
+            if raw_indices is not None:
+                self.c2_sparse_raw_indices = raw_indices
+        elif compress_ratio == 4:
+            self.c4_sparse_page_indices = page_indices
+            self.c4_sparse_topk_lengths = topk_lengths
+            if raw_indices is not None:
+                self.c4_sparse_raw_indices = raw_indices
+        elif compress_ratio == 128:
+            assert raw_indices is None, "c128 has no raw top-k"
+            self.c128_page_indices = page_indices
+            self.c128_topk_lengths_clamp1 = topk_lengths
+        else:
+            raise ValueError(f"invalid {compress_ratio=}")
 
     def init_trtllm_sparse_buffers(self) -> None:
         """Build decode tables with 128 SWA columns followed by compressed KV.
@@ -4066,7 +4099,7 @@ class DeepseekV4AttnBackend(
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
-            if compress_ratio in (1, 2, 4):
+            if compress_ratio != 0:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
