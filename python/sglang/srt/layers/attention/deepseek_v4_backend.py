@@ -594,7 +594,8 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
-    # Per-ratio metadata stays in flat fields because graph replay copies it by name.
+    # Per-ratio metadata stays in flat fields; graph replay copies it by name,
+    # while these accessors unify reads and writes across ratios.
     def sparse_page_indices(self, compress_ratio: int) -> torch.Tensor:
         """Slots into the ratio's extra cache, padded with -1 where needed."""
         if compress_ratio == 1:
@@ -636,7 +637,7 @@ class DSV4AttnMetadata:
         topk_lengths: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        """Writer counterpart of the per-ratio sparse metadata accessors."""
+        """Writer counterpart of the accessors above."""
         if compress_ratio == 1:
             self.c1_sparse_page_indices = page_indices
             self.c1_sparse_topk_lengths = topk_lengths
