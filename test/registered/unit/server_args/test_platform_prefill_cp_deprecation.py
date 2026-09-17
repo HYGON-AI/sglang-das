@@ -17,7 +17,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestPlatformPrefillCPDeprecation(CustomTestCase):
     def test_platform_cp_rejected_before_model_lookup(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
-            facts = dict(is_hip=False, is_npu=False, is_musa=False)
+            facts = dict(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for strategy in (None, "zigzag", "interleave"):
                 with self.subTest(platform=platform, strategy=strategy):
@@ -32,7 +32,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
 
     def test_context_parallel_handler_rejects_before_model_lookup(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
-            facts = dict(is_hip=False, is_npu=False, is_musa=False)
+            facts = dict(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
             facts[platform] = True
             with self.subTest(platform=platform), override_platform(**facts):
                 args = ServerArgs(
@@ -45,7 +45,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
 
     def test_resolution_rejects_even_dummy_models(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
-            facts = dict(is_hip=False, is_npu=False, is_musa=False)
+            facts = dict(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for model_path in ("dummy", "none", "missing-model-must-not-be-loaded"):
                 with self.subTest(platform=platform, model_path=model_path):
@@ -60,7 +60,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
-            facts = dict(is_hip=False, is_npu=False, is_musa=False)
+            facts = dict(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
             facts[platform] = True
             for dcp_size in (1, 2):
                 with self.subTest(platform=platform, dcp_size=dcp_size):
@@ -68,7 +68,14 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                         args = ServerArgs(model_path="dummy", dcp_size=dcp_size)
                         validate_prefill_cp_platform(args)
 
-    @override_platform(is_hip=False, is_npu=False, is_musa=False)
+    @override_platform(is_hip=True, is_hcu=True, is_npu=False, is_musa=False)
+    def test_hcu_prefill_cp_is_not_rejected(self):
+        args = ServerArgs(
+            model_path="dummy", enable_prefill_cp=True, cp_strategy="interleave"
+        )
+        validate_prefill_cp_platform(args)
+
+    @override_platform(is_hip=False, is_hcu=False, is_npu=False, is_musa=False)
     def test_generic_cp_is_not_rejected_or_modified(self):
         for strategy in ("zigzag", "interleave"):
             with self.subTest(strategy=strategy):
