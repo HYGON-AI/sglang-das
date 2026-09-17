@@ -58,7 +58,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -236,6 +236,51 @@ class DSV4AttnMetadata:
                 "c128_flashmla_metadata",
             ],
         )
+
+    def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
+        assert self.index_topk == other.index_topk
+        assert self.page_size == other.page_size
+        assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
+
+        tensor_copy_fields = [
+            "raw_out_loc",
+            "seq_lens_casual",
+            "positions_casual",
+            "swa_out_cache_loc",
+            "c4_out_loc",
+            "c128_out_loc",
+            "page_table",
+            "swa_page_indices",
+            "swa_topk_lengths",
+            "c128_page_indices",
+            "c128_topk_lengths_clamp1",
+            "c128_topk_lengths_raw",
+            "c4_topk_lengths_raw",
+            "c4_topk_lengths_clamp1",
+            "c4_sparse_topk_lengths",
+            "c4_sparse_topk_lengths_raw",
+            "c4_sparse_page_indices",
+            "c4_sparse_raw_indices",
+        ]
+        for field_name in tensor_copy_fields:
+            src_val = getattr(other, field_name)
+            dst_val = getattr(self, field_name)
+            if src_val is None and dst_val is None:
+                continue
+            assert src_val is not None and dst_val is not None, (
+                f"{field_name=} {src_val=} {dst_val=}"
+            )
+            dst_val.copy_(src_val)
+
+        if self.unified is None and other.unified is None:
+            pass
+        else:
+            assert self.unified is not None and other.unified is not None
+            self.unified.refresh_for_breakable_cuda_graph_replay_(other.unified)
+
+        self.c0_flashmla_metadata = other.c0_flashmla_metadata
+        self.c4_flashmla_metadata = other.c4_flashmla_metadata
+        self.c128_flashmla_metadata = other.c128_flashmla_metadata
 
     def init_compression_metadata(self, unified_swa_pages: int = 0):
         assert self.page_table.dim() == 2
@@ -469,7 +514,7 @@ class DeepseekV4HipRadixBackend(
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer

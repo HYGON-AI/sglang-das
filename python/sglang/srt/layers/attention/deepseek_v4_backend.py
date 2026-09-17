@@ -96,9 +96,9 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-    fp4_paged_mqa_logits,
-    fp32_jit_paged_topk,
+    deep_gemm_fp4_paged_mqa_logits,
     select_candidate_blocks,
+    topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -172,7 +172,7 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -281,7 +281,7 @@ def _maybe_precompute_flashmla_sched_meta(
     each 32-byte entry to global memory. At the 152 partitions of a BS=1 step
     that is 28 us, and a decode graph replays it on the critical path. Filling
     the buffers here instead means FlashMLA finds them already populated and
-    skips its kernel; `decoding_sched_meta` produces the same schedule, bit for
+    skips its kernel; `flashmla_sched_meta` produces the same schedule, bit for
     bit, in about 9 us.
 
     Only fires where FlashMLA would have computed -- when the scheduler holds no
@@ -293,16 +293,16 @@ def _maybe_precompute_flashmla_sched_meta(
         return
     if not _fast_flashmla_sched_shape(q):
         return
-    from sglang.kernels.ops.attention.dsv4.decoding_sched_meta import (
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
-        decoding_sched_meta,
+        flashmla_sched_meta,
     )
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
-    decoding_sched_meta(
+    flashmla_sched_meta(
         meta,
         num_splits,
         topk_length=topk_length,
@@ -1239,17 +1239,8 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        # The distinct ratios this stage has, sorted -- (4, 128) for V4, (1, 2)
-        # for V4.1 -- not the per-layer hf_config.compress_ratios list. Nothing
-        # is built for a ratio outside this set.
-        # Empty C4/C128 pools are kept for compatibility even when the model
-        # only uses V4.1 ratios 1/2. They have no metadata consumers.
-        model_ratios = set(self.token_to_kv_pool.compression_ratios)
-        self.present_ratios: Tuple[int, ...] = tuple(
-            ratio
-            for ratio in sorted(self.token_to_kv_pool.kv_pools)
-            if ratio in model_ratios
-        )
+        # Nothing is built for a compress ratio outside the pool's set.
+        self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
         self.low_ratios: Tuple[int, ...] = tuple(
             ratio for ratio in (1, 2) if ratio in self.present_ratios
         )
@@ -1266,7 +1257,7 @@ class DeepseekV4AttnBackend(
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
 
         kernel = get_exec().kernel
@@ -2573,8 +2564,6 @@ class DeepseekV4AttnBackend(
             query_lens = extend_seq_lens.to(torch.int32)
         # padding rows are never combined
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
-        if query_pos.shape[0] < num_qo_tokens:
-            query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=extend_seq_lens.to(torch.int32),
@@ -3057,12 +3046,12 @@ class DeepseekV4AttnBackend(
         """Fused compressor write, index-key projection, then fused index-key write.
         Both write kernels consume metadata dtypes directly and suppress padded stores.
         """
-        from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
-        from sglang.kernels.ops.attention.dsv4.c2 import (
-            c2_decode_or_verify_norm_rope_store,
-        )
-        from sglang.kernels.ops.attention.dsv4.fp4_rope import (
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
+        )
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c1_decode_norm_rope_store,
+            c2_decode_norm_rope_store,
         )
 
         pool = self.token_to_kv_pool
@@ -3096,7 +3085,7 @@ class DeepseekV4AttnBackend(
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
-            latent = c2_decode_or_verify_norm_rope_store(
+            latent = c2_decode_norm_rope_store(
                 compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
@@ -3227,13 +3216,13 @@ class DeepseekV4AttnBackend(
                 and latent.dtype == torch.bfloat16
                 and layer.indexer.index_head_dim == 128
             ):
-                from sglang.kernels.ops.attention.dsv4.rope_pack_indexer import (
-                    rope_fake_quant_pack_indexer,
+                from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                    index_k_rope_pack,
                 )
 
                 indexer = layer.indexer
                 k = indexer.k_norm(indexer.forward_wk(latent))
-                rope_fake_quant_pack_indexer(
+                index_k_rope_pack(
                     k,
                     freqs,
                     indexer.rope_head_dim,
@@ -3483,7 +3472,7 @@ class DeepseekV4AttnBackend(
         topk = min(indexer.index_topk, width)
         columns = torch.arange(width, device=lens.device)
         for rows, plan in metadata.row_chunks():
-            logits = fp4_paged_mqa_logits(
+            logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
                 k_cache,
                 weights[rows],
@@ -3537,7 +3526,7 @@ class DeepseekV4AttnBackend(
             and x.dtype == torch.bfloat16
             and indexer.index_head_dim == 128
         ):
-            from sglang.kernels.ops.attention.dsv4.fp4_rope import (
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
                 index_q_rope_pack_weights,
             )
 
@@ -3592,7 +3581,7 @@ class DeepseekV4AttnBackend(
                 self.candidate_indexer.publish_decode(inputs, page_indices, raw_indices)
             )
             return
-        logits = fp4_paged_mqa_logits(
+        logits = deep_gemm_fp4_paged_mqa_logits(
             (q_fp4, q_sf),
             k_cache,
             weights,
@@ -3602,7 +3591,7 @@ class DeepseekV4AttnBackend(
             metadata.max_compressed_seq_len,
         )
         # TODO(dark): add bf16 topk
-        fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
+        topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
 
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.
@@ -4562,7 +4551,7 @@ class DeepseekV4AttnBackend(
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=q_flat.shape[0]
+                forward_batch, core_attn_metadata, num_qo_tokens=q_flat.shape[0]
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -4743,12 +4732,14 @@ class DeepseekV4AttnBackend(
         )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
-            from sglang.kernels.ops.attention.dsv41_small_metadata import (
-                low_ratio_metadata,
-                page_table_positions_small,
+            from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+                build_low_ratio_metadata,
+            )
+            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+                build_page_table_positions_small,
             )
 
-            build_pages = page_table_positions_small
+            build_pages = build_page_table_positions_small
         prep = build_pages(
             req_to_token=req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -4845,7 +4836,7 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             low_ratio_buffers = (
-                low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                build_low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
                 if small_metadata
                 else None
             )

@@ -21,6 +21,8 @@ from PIL import Image, ImageOps
 
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
+GPU_PLAN_KEY = "dsv41_gpu_plan"
+
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
     return n_llm_h * (n_llm_w + 1) + 2

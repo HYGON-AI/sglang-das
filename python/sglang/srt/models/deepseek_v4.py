@@ -30,8 +30,8 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
+    wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
@@ -101,12 +101,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram import (
-    Engram,
-    EngramHasher,
-    EngramLayout,
-    build_engram_layout,
-)
+from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -182,6 +177,7 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
+    GPU_PLAN_KEY,
     image_token_types,
     materialize_image_gpu,
 )
@@ -2591,7 +2587,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
         ):
-            from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
+            from sglang.kernels.ops.layernorm.mhc import (
                 split_tf32_hc_weight,
             )
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -2609,7 +2605,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     getattr(getattr(self, "config", None), "model_type", None)
                     == "deepseek_v41"
                 ):
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                    from sglang.kernels.ops.layernorm.mhc import (
                         split_bf16_hc_weight,
                     )
 
@@ -3116,7 +3112,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # tile only. Large prefill keeps its one-CTA-per-row norm and
                 # lets the projection quantize the full activation layout.
                 if quantize and x.shape[0] <= 8:
-                    from sglang.kernels.ops.layernorm.mxfp8_epilogue import (
+                    from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
                     )
 
@@ -3188,7 +3184,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         parts = getattr(self, "_hc_ffn_tf32_parts", None)
                         bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
                 if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                    from sglang.kernels.ops.layernorm.mhc import (
                         hc_mix_stats_sinkhorn_bf16x3,
                     )
 
@@ -3202,7 +3198,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_eps,
                     )
                 elif parts is not None:
-                    from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
+                    from sglang.kernels.ops.layernorm.mhc import (
                         hc_mix_stats_sinkhorn_deepgemm,
                     )
 
@@ -3969,7 +3965,7 @@ class DeepseekV4Model(nn.Module):
             and config.hc_pre_from_prev_sublayer
             else None
         )
-        self.engram_layout = build_engram_layout(config)
+        self.engram_layout = EngramLayout.from_config(config)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -4004,27 +4000,16 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
         self.engram_hasher = None
         if self.engram_layout is not None:
-            self.engram_hasher = EngramHasher.from_config(config, self.engram_layout)
-
-        self.engram_prefetch_stream = None
-        if (
-            _is_cuda
-            and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
-            and self.pp_group.world_size == 1
-            and not is_dp_attention_enabled()
-            and config.vision_n_layers == 0
-            and config.hc_pre_from_prev_sublayer
-            and self.start_layer <= 14 < self.end_layer
-            and self.layers[14].engram is not None
-            and self.layers[14].engram.embed._shared
-            # Other backends may share mutable GEMM workspace across streams.
-            and getattr(
-                self.layers[14].engram.wkv.quant_method, "mxfp8_dense_backend", None
+            self.engram_hasher = EngramHasher.from_config(
+                config,
+                self.engram_layout,
+                image_token_id=(
+                    config.image_token_id
+                    if config.model_type == "deepseek_v41"
+                    and config.vision_n_layers > 0
+                    else None
+                ),
             )
-            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-        ):
-            self.engram_prefetch_stream = torch.cuda.Stream()
-            logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
 
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
@@ -4147,20 +4132,6 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
-        prefetched_engram_kv = None
-        if (
-            self.engram_prefetch_stream is not None
-            and forward_batch.forward_mode.is_decode()
-            and hash_ids.shape[0] == 1
-        ):
-            prefetch_stream = self.engram_prefetch_stream
-            prefetch_stream.wait_stream(torch.cuda.current_stream())
-            engram = self.layers[14].engram
-            with torch.cuda.stream(prefetch_stream):
-                prefetched_engram_kv = engram.project(
-                    hash_ids[:, engram.layer_hash_index]
-                )
-            hash_ids.record_stream(prefetch_stream)
         tail = None
         if (
             self.late_layer_start is not None
@@ -4190,21 +4161,12 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
-                if i == 14 and prefetched_engram_kv is not None:
-                    main_stream = torch.cuda.current_stream()
-                    main_stream.wait_stream(self.engram_prefetch_stream)
-                    prefetched_engram_kv.record_stream(main_stream)
-                    hidden_states = engram.apply_gate(
-                        hidden_states, prefetched_engram_kv
-                    )
-                    prefetched_engram_kv = None
-                else:
-                    hidden_states = engram(
-                        hidden_states,
-                        hash_ids[:, engram.layer_hash_index],
-                        forward_batch,
-                        cp_all_tokens=cp_extend,
-                    )
+                hidden_states = engram(
+                    hidden_states,
+                    hash_ids[:, engram.layer_hash_index],
+                    forward_batch,
+                    cp_all_tokens=cp_extend,
+                )
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
@@ -4708,7 +4670,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
             h, w = int(item.n_vit_h), int(item.n_vit_w)
             pixels = torch.as_tensor(item.feature, device=device)
-            plan = item.model_specific_data.get("dsv41_gpu_plan")
+            plan = item.model_specific_data.get(GPU_PLAN_KEY)
             patches = (
                 materialize_image_gpu(pixels, plan).to(dtype)
                 if plan is not None

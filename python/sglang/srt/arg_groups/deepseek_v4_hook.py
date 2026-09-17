@@ -123,12 +123,20 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
     if get_platform().is_hip:
-        logger.warning(
-            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
-            f"for {model_arch}; set it explicitly to override."
-        )
-        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
-
+        if (
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+            and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        ):
+            logger.warning(
+                "Keeping explicitly enabled SGLANG_OPT_FLASHMLA_SPARSE_PREFILL "
+                f"on ROCm/HIP for experimental {model_arch} validation."
+            )
+        else:
+            logger.warning(
+                "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on "
+                f"ROCm/HIP for {model_arch}; set it explicitly to override."
+            )
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     # The kv-cache dtype default moved to the resolution pipeline
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
     # its legacy slot.
