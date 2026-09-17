@@ -180,6 +180,9 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
 
 
 class DeepSeekV4SingleKVPool(KVCache):
+    # Paged FlashMLA main-KV format of this pool's rows.
+    kv_layout: KVLayout = KVLayout.V4
+
     def __init__(
         self,
         size: int,
