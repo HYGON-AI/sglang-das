@@ -98,7 +98,7 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
-    def test_hip_dsa_cp_is_disabled(self):
+    def test_non_hcu_hip_dsa_cp_is_disabled(self):
         parallel = SimpleNamespace(
             attn_cp_size=2,
         )
@@ -114,12 +114,57 @@ class TestCPStrategyUnit(CustomTestCase):
                 return_value=model_config,
             ),
             patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hcu", return_value=False),
             patch(
                 "sglang.srt.configs.model_config.is_deepseek_dsa",
                 return_value=True,
             ),
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())
+
+    def test_hcu_dsa_cp_is_enabled(self):
+        parallel = SimpleNamespace(attn_cp_size=2)
+        model_config = SimpleNamespace(hf_config=SimpleNamespace())
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.process_model_config",
+                return_value=model_config,
+            ),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hcu", return_value=True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=False),
+            patch("sglang.srt.layers.attention.dsa.utils.is_musa", return_value=False),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(is_dsa_enable_prefill_cp())
+
+    def test_disabled_dsa_cp_skips_platform_probes(self):
+        parallel = SimpleNamespace(attn_cp_size=1)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                return_value=parallel,
+            ),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hip") as mock_is_hip,
+            patch("sglang.srt.layers.attention.dsa.utils.is_hcu") as mock_is_hcu,
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu") as mock_is_npu,
+            patch("sglang.srt.layers.attention.dsa.utils.is_musa") as mock_is_musa,
+        ):
+            self.assertFalse(is_dsa_enable_prefill_cp())
+
+        mock_is_hip.assert_not_called()
+        mock_is_hcu.assert_not_called()
+        mock_is_npu.assert_not_called()
+        mock_is_musa.assert_not_called()
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):

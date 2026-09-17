@@ -2925,15 +2925,35 @@ class DeepseekV4AttnBackend(
             )[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk_dense(
-                layer,
-                x[:num_local],
-                q_lora[:num_local],
-                positions[:num_local].to(torch.int64),
-                forward_batch,
-                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
-                q_lens_cpu,
-            )
+            q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device)
+            x_local = x[:num_local]
+            q_lora_local = q_lora[:num_local]
+            pos_local = positions[:num_local].to(torch.int64)
+            if self._use_dense_fp4_prefill_indexer(forward_batch):
+                self._low_ratio_index_topk_dense(
+                    layer,
+                    x_local,
+                    q_lora_local,
+                    pos_local,
+                    forward_batch,
+                    q_lens,
+                    q_lens_cpu,
+                )
+            else:
+                req_order = forward_batch.req_pool_indices.to(torch.int64)
+                req_local = torch.repeat_interleave(
+                    req_order,
+                    q_lens.to(torch.int64),
+                    output_size=num_local,
+                )
+                self._low_ratio_index_topk_torch(
+                    layer,
+                    x_local,
+                    q_lora_local,
+                    req_local,
+                    pos_local,
+                    req_order=req_order,
+                )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
@@ -3636,7 +3656,9 @@ class DeepseekV4AttnBackend(
 
     # TODO(candidate): torch prefill still publishes / consumes masks inline; same
     # move as above.
-    def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk_torch(
+        self, layer, x, q_lora, req, pos, *, req_order=None
+    ) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3658,8 +3680,16 @@ class DeepseekV4AttnBackend(
             if indexer.uses_candidates
             else None
         )
-        for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+        if req_order is None:
+            req_order = torch.unique_consecutive(req)
+        for b, r in enumerate(req_order.tolist()):
             tok = (req == r).nonzero().squeeze(1)
+            if tok.numel() == 0:
+                if publish is not None:
+                    publish.append(
+                        torch.zeros(0, 0, dtype=torch.bool, device=pos.device)
+                    )
+                continue
             lens = compress_lens[tok]
             lc = int(lens.max().item())
             if lc == 0:
