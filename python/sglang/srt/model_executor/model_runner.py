@@ -629,6 +629,9 @@ class ModelRunner:
             glm5_next_layer_split_scratch_source=getattr(
                 self, "glm5_next_layer_split_scratch_source", None
             ),
+            dsa_layer_split_scratch_source=getattr(
+                self, "dsa_layer_split_scratch_source", None
+            ),
         )
 
     def init_mindspore_runner(self):

@@ -269,18 +269,19 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
+        device_layer_id = 0 if is_draft else layer_id
+        # A single-layer LayerSplit draft pool is owned by one CP rank only.
+        if not self._is_device_layer_owned(device_pool, device_layer_id):
             return
         assert not getattr(self, "_is_dummy", False), (
             "load on a dummy (non-src DSA) host pool"
         )
-        # MTP draft layers do not participate in CP layer sharding.
+        # Packed draft host offsets differ from the draft device layer (zero).
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
         device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
-            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            if _is_hcu and self._is_device_layer_sharded(device_pool)
             else {}
         )
 
@@ -349,13 +350,13 @@ class DSAIndexerPoolHost(HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src DSA) host pool"
         )
-        # MTP draft layers do not participate in CP layer sharding.
+        # Packed draft host offsets differ from the draft device layer (zero).
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
         device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
-            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            if _is_hcu and self._is_device_layer_sharded(device_pool)
             else {}
         )
 
