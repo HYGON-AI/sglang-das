@@ -3,8 +3,9 @@
 import json
 from unittest.mock import patch
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.entrypoints.openai.protocol import Function, Tool, ToolChoice
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -103,28 +104,40 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(len(result.calls), 2)
 
-    def test_duplicate_parameter_closer_is_recovered(self):
-        """A repeated close-tag name must not turn valid arguments into `{}`."""
-        malformed = _weather_call().replace(
-            f"</{DSML}parameter>", f"</{DSML}parameterparameter>"
-        )
+    def test_malformed_parameter_closers_are_recovered(self):
+        """Known close-tag corruptions must not turn valid arguments into `{}`."""
+        for closer in (
+            f"</{DSML}parameterparameter>",
+            f"</{DSML}parameter_param>",
+            f'</{DSML}parameter string="true">',
+        ):
+            with self.subTest(closer=closer):
+                malformed = _weather_call().replace(f"</{DSML}parameter>", closer)
 
-        result = DeepSeekV4Detector().detect_and_parse(malformed, self.tools)
+                result = DeepSeekV4Detector().detect_and_parse(malformed, self.tools)
 
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"city": "SF"}
+                )
 
-    def test_duplicate_parameter_closer_streaming_is_valid_json(self):
-        malformed = _weather_call().replace(
-            f"</{DSML}parameter>", f"</{DSML}parameterparameter>"
-        )
+    def test_malformed_parameter_closers_streaming_are_valid_json(self):
+        for closer in (
+            f"</{DSML}parameterparameter>",
+            f"</{DSML}parameter_param>",
+            f'</{DSML}parameter string="true">',
+        ):
+            with self.subTest(closer=closer):
+                malformed = _weather_call().replace(f"</{DSML}parameter>", closer)
 
-        _, calls = self._feed(
-            [malformed[i : i + 3] for i in range(0, len(malformed), 3)]
-        )
-        arguments = "".join(call.parameters for call in calls if call.parameters)
+                _, calls = self._feed(
+                    [malformed[i : i + 3] for i in range(0, len(malformed), 3)]
+                )
+                arguments = "".join(
+                    call.parameters for call in calls if call.parameters
+                )
 
-        self.assertEqual(json.loads(arguments), {"city": "SF"})
+                self.assertEqual(json.loads(arguments), {"city": "SF"})
 
     def test_wrapped_arguments_are_unwrapped_from_direct_json(self):
         text = _wrapped(
@@ -166,6 +179,31 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         # No half-formed call: the failure can land between a tool's name and its
         # arguments, so an argument-less named call must not reach the client.
         self.assertEqual(first.calls, [])
+
+    def test_required_is_parsed_natively_without_any_grammar(self):
+        """PD must not compile a grammar for DeepSeek-V4 required calls."""
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+
+        self.assertTrue(
+            parser.detector.supports_structural_tag_for_tool_choice("auto")
+        )
+        self.assertFalse(
+            parser.detector.supports_structural_tag_for_tool_choice("required")
+        )
+        self.assertTrue(parser.detector.parses_required_natively())
+
+        self.assertIsNone(
+            parser.get_structure_constraint("required", parallel_tool_calls=False)
+        )
+
+    def test_named_parallel_choice_is_parsed_natively_without_any_grammar(self):
+        """Native DSML may contain repeated invokes of the selected function."""
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        choice = ToolChoice(function={"name": "get_weather"})
+
+        self.assertIsNone(
+            parser.get_structure_constraint(choice, parallel_tool_calls=True)
+        )
 
 
 if __name__ == "__main__":

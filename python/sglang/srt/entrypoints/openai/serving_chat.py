@@ -1137,30 +1137,6 @@ class OpenAIServingChat(OpenAIServingBase):
         effective_tools = self._effective_tools(request)
         constraint_tool_choice = request.tool_choice
         constraint_tools = effective_tools
-        if (
-            self.tool_call_parser == "deepseekv4"
-            and request.tool_choice == "required"
-            and effective_tools
-            and len(effective_tools) == 1
-        ):
-            # For one available function, OpenAI's `required` choice is
-            # semantically equivalent to naming that function.  DeepSeek-V4's
-            # generic required structural tag can stall in xgrammar under PD,
-            # while its named-function constraint is stable.  Keep the public
-            # request unchanged so response parsing still treats it as
-            # required; only normalize the internal grammar constraint.
-            constraint_tool_choice = ToolChoice(
-                function={"name": effective_tools[0].function.name}
-            )
-            constraint_tools = [
-                effective_tools[0].model_copy(
-                    update={
-                        "function": effective_tools[0].function.model_copy(
-                            update={"strict": True}
-                        )
-                    }
-                )
-            ]
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -2136,7 +2112,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
             )
             detector_owns_format = (
-                parser.detector.supports_structural_tag()
+                parser.detector.supports_structural_tag_for_tool_choice(tool_choice)
                 or parser.detector.parses_required_natively()
             )
             should_try_parser = not is_required or detector_owns_format
@@ -2587,7 +2563,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     use_native_parser = (
-                        probe.detector.supports_structural_tag()
+                        probe.detector.supports_structural_tag_for_tool_choice(
+                            request.tool_choice
+                        )
                         or probe.detector.parses_required_natively()
                     )
                 if use_native_parser:
