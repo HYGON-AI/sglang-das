@@ -90,7 +90,46 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
         return
     clear_global_lplb_solvers()
     ep_group = get_moe_ep_group()
+    static_mass = None
+    static_max_copies = None
+    static_path = envs.SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS.get()
+    if static_path:
+        import torch
+
+        if not torch.version.hip:
+            raise NotImplementedError("Precomputed compact LP dispatch requires HIP")
+        payload = torch.load(static_path, weights_only=True, map_location="cpu")
+        if not torch.equal(
+            payload["physical_to_logical_map"],
+            metadata.physical_to_logical_map_cpu,
+        ):
+            raise ValueError(
+                "Static LP artifact does not match the loaded expert layout"
+            )
+        if payload["physical_mass"].shape != metadata.physical_to_logical_map_cpu.shape:
+            raise ValueError(
+                "Static LP mass must match the physical expert layout shape"
+            )
+        static_mass = payload["physical_mass"].to(
+            device=metadata.physical_to_logical_map.device, dtype=torch.float32
+        )
+        if not bool(torch.isfinite(static_mass).all() and (static_mass >= 0).all()):
+            raise ValueError("Static LP mass must be finite and nonnegative")
+        static_max_copies = int(
+            metadata.logical_to_all_physical_map_num_valid.max().item()
+        )
+        logger.info(
+            "Using precomputed LP replica probabilities from %s; replica table %d -> %d columns",
+            static_path,
+            metadata.logical_to_all_physical_map.shape[-1],
+            static_max_copies,
+        )
     for lid in range(metadata.num_layers):
+        static_probabilities = None
+        if static_mass is not None:
+            replica_map = metadata.logical_to_all_physical_map[lid]
+            static_probabilities = static_mass[lid][replica_map.clamp_min(0).long()]
+            static_probabilities = static_probabilities * (replica_map >= 0)
         solver = LPLBSolver(
             phy2log=metadata.physical_to_logical_map[lid],
             log2phy=metadata.logical_to_all_physical_map[lid],
@@ -99,6 +138,8 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
             logical_to_all_physical_map_num_valid=(
                 metadata.logical_to_all_physical_map_num_valid[lid]
             ),
+            static_probabilities=static_probabilities,
+            static_max_copies=static_max_copies,
         )
         set_global_lplb_solver(lid, solver)
     logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")

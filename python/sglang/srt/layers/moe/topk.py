@@ -2401,6 +2401,26 @@ def _post_process_topk_ids(
             # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
             # the post-shared-expert mask below for the explicitly forced fused
             # shared-expert configuration.
+            if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
+                # LP dispatch uses a separate HIP kernel. Resolve probabilities
+                # before entering the compiled padding/dtype postprocess.
+                from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+                solver = get_global_lplb_solver(layer_id)
+                if solver is None:
+                    raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
+                probabilities = solver.solve(topk_ids)
+                if hasattr(solver, "static_dispatch_map"):
+                    from sglang.kernels.ops.lplb import cuda_solver
+
+                    topk_ids = cuda_solver.dispatch_probability(
+                        topk_ids, probabilities, solver.static_dispatch_map
+                    )
+                else:
+                    topk_ids = topk_ids_logical_to_physical(
+                        topk_ids, remap_info, probabilities
+                    )
+                remap_info = None  # IDs are physical; do not remap a second time.
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,
                 remap_info,
