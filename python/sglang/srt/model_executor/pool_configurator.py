@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_hcu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -213,7 +214,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    self._cell_size += draft_kv_size + draft_indexer_size
+                    if (
+                        kvc.server_args.enable_dsa_cache_layer_split
+                        and kvc.server_args.disaggregation_mode == "prefill"
+                        and is_hcu()
+                        and kvc.ps.pp_size == 1
+                        and get_parallel().attn_cp_size > 1
+                        and kvc.spec_algorithm.is_eagle()
+                        and not kvc.spec_algorithm.is_eagle3()
+                        and not kvc.server_args.enable_multi_layer_eagle
+                        and draft_num_layers == 1
+                        and kvc.model_config.num_nextn_predict_layers == 1
+                        and kvc.use_mla_backend
+                        and not get_memory().enable_hisparse
+                    ):
+                        self._cell_size = self._compute_dsa_layer_split_draft_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                            main_kv_bytes_per_layer=target_kv_size
+                            // target_kv_num_layers,
+                        )
+                    else:
+                        self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
@@ -405,6 +427,40 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim=qsa_profile.head_dim,
             num_layers=num_layers,
         )
+
+    @staticmethod
+    def _compute_dsa_layer_split_draft_cell_size(
+        *, kvc: KVCacheConfigurator, num_layers: int, main_kv_bytes_per_layer: int
+    ) -> int:
+        """Worst-rank bytes/token for a target and its single sharded NextN."""
+        from sglang.srt.layers.cp.utils import get_layer_shard_range
+
+        shard_size = get_parallel().attn_cp_size
+        cache_mode = resolve_index_k_cache_mode(
+            kvc.kv_cache_dtype,
+            kvc.page_size,
+            get_dsa_index_head_dim(kvc.model_config.hf_config),
+        )
+        index_bytes = index_k_cache_bytes_per_token(cache_mode)
+        # Each pool has its own INT8 workspace, irrespective of layer ownership.
+        workspace_bytes = 2 * index_k_workspace_bytes_per_token(cache_mode)
+        rank_costs = []
+        for rank in range(shard_size):
+            start, end = get_layer_shard_range(rank, shard_size, num_layers)
+            draft_start, draft_end = get_layer_shard_range(
+                (rank - (shard_size - 1)) % shard_size, shard_size, 1
+            )
+            owned = end - start + draft_end - draft_start
+            # PD allocates dense Index-K storage even for skip-topk layers.
+            # Main-KV shares one target scratch; Index-K has two independent
+            # scratches. Take the maximum combined cost, not separate maxima
+            # for target and draft, whose heaviest ranks can differ.
+            rank_costs.append(
+                (owned + 1) * main_kv_bytes_per_layer
+                + (owned + 2) * index_bytes
+                + workspace_bytes
+            )
+        return math.ceil(max(rank_costs))
 
     def _compute_dsa_indexer_cell_size(
         self,

@@ -468,8 +468,10 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             return
 
         current_stream = self.pool.device_module.current_stream()
-        self.pool.kv_broadcast_stream.wait_stream(current_stream)
-        with self.pool.device_module.stream(self.pool.kv_broadcast_stream):
+        broadcast_stream = self.pool._get_layer_prefetch_stream()
+        if broadcast_stream != current_stream:
+            broadcast_stream.wait_stream(current_stream)
+        with self.pool.device_module.stream(broadcast_stream):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
             with torch.profiler.record_function(
@@ -573,6 +575,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         *args,
         layer_shard_rank: int,
         layer_shard_size: int,
+        layer_shard_rank_offset: int = 0,
+        layer_split_scratch_source: Optional[LayerSplitDSATokenToKVPool] = None,
         indexer_prefetch_layer_ids: Optional[Sequence[int]] = None,
         **kwargs,
     ):
@@ -581,6 +585,15 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         ), "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
+        if not 0 <= layer_shard_rank_offset < layer_shard_size:
+            raise ValueError("LayerSplit rank offset must be inside the CP group")
+        self.layer_shard_rank_offset = layer_shard_rank_offset
+        self.layer_split_scratch_source = layer_split_scratch_source
+        self.shares_layer_split_scratch = layer_split_scratch_source is not None
+        # Only Main-KV storage is shared. Each pool keeps its own page mapping,
+        # indexer scratch, communicator, stream and validity state.
+        self._main_kv_scratch_user = None
+        self._main_kv_scratch_stream = None
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
         self.indexer_prefetch_layer_ids = (
@@ -603,7 +616,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def _owned_local_layer_range(self) -> tuple[int, int]:
         return get_layer_shard_range(
-            self.layer_shard_rank, self.layer_shard_size, self.layer_num
+            (self.layer_shard_rank - self.layer_shard_rank_offset)
+            % self.layer_shard_size,
+            self.layer_shard_size,
+            self.layer_num,
         )
 
     def _is_layer_owned(self, layer_id: int) -> bool:
@@ -612,14 +628,18 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         return owned_start <= local_idx < owned_end
 
     def _get_layer_owner_rank(self, layer_id: int) -> int:
-        return get_layer_owner(
+        logical_owner = get_layer_owner(
             self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
         )
+        return (logical_owner + self.layer_shard_rank_offset) % self.layer_shard_size
 
     def _log_layer_shard_plan(self) -> None:
         partitions = []
         for rank in range(self.layer_shard_size):
-            st, ed = get_layer_shard_range(rank, self.layer_shard_size, self.layer_num)
+            logical_rank = (rank - self.layer_shard_rank_offset) % self.layer_shard_size
+            st, ed = get_layer_shard_range(
+                logical_rank, self.layer_shard_size, self.layer_num
+            )
             partitions.append(f"r{rank}:[{st},{ed})")
         my_start, my_end = self._owned_local_layer_range()
         logger.info(
@@ -687,8 +707,73 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
+    def _get_shared_main_kv_scratch(self) -> Optional[torch.Tensor]:
+        source = self.layer_split_scratch_source
+        if source is None:
+            return None
+        if source is self or not isinstance(source, LayerSplitDSATokenToKVPool):
+            raise ValueError(
+                "Draft LayerSplit requires a distinct target LayerSplit pool"
+            )
+        if self.layer_num != 1 or source.shares_layer_split_scratch:
+            raise ValueError(
+                "Only a single draft layer may share target Main-KV scratch"
+            )
+        for name in (
+            "size",
+            "page_size",
+            "kv_cache_dim",
+            "store_dtype",
+            "dtype",
+            "device",
+            "layer_shard_rank",
+            "layer_shard_size",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "dsa_kv_cache_store_fp8",
+        ):
+            if getattr(self, name) != getattr(source, name):
+                raise ValueError(
+                    f"Incompatible draft LayerSplit scratch {name}: "
+                    f"draft={getattr(self, name)!r}, target={getattr(source, name)!r}"
+                )
+        buffer = source.remote_kv_buffer
+        if (
+            tuple(buffer.shape) != (self.size + self.page_size, 1, self.kv_cache_dim)
+            or buffer.dtype != self.store_dtype
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError("Incompatible target Main-KV scratch tensor geometry")
+        return buffer
+
+    def _acquire_main_kv_scratch(self) -> None:
+        """Order target/draft scratch reuse and invalidate the previous contents."""
+        root = self.layer_split_scratch_source or self
+        current_stream = self.device_module.current_stream()
+        previous = (
+            root._main_kv_scratch_user()
+            if root._main_kv_scratch_user is not None
+            else None
+        )
+        if root._main_kv_scratch_stream is not None:
+            if root._main_kv_scratch_stream != current_stream:
+                current_stream.wait_stream(root._main_kv_scratch_stream)
+        if previous is not self:
+            if previous is not None:
+                previous._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+                previous.remote_kv_layer_id = None
+                # Reusing the same ForwardBatch must not preserve a plan whose
+                # scratch has since been overwritten by the other model.
+                previous._active_main_kv_batch_marker = None
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+            self.remote_kv_layer_id = None
+            self._active_main_kv_batch_marker = None
+            root._main_kv_scratch_user = weakref.ref(self)
+        root._main_kv_scratch_stream = current_stream
+
     def _create_buffers(self):
         self._log_layer_shard_plan()
+        shared_main_kv = self._get_shared_main_kv_scratch()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -713,10 +798,14 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                     )
                     for i in range(self.layer_num)
                 ]
-                self.remote_kv_buffer = torch.empty(
-                    (self.size + self.page_size, 1, self.kv_cache_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
+                self.remote_kv_buffer = (
+                    shared_main_kv
+                    if shared_main_kv is not None
+                    else torch.empty(
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
                 )
                 # Physical page 0 is translated to compact page 0 and may be
                 # read for padded/dummy entries. Compact broadcasts start at
@@ -747,9 +836,18 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 self.remote_kv_layer_id: Optional[int] = None
                 self.device_module = torch.get_device_module(self.device)
                 self.kv_broadcast_stream = self.device_module.Stream()
+                self.pending_remote_kv_event = self.device_module.Event()
                 self.pending_remote_kv_layer_id: Optional[int] = None
                 self.pending_remote_kv_broadcast = False
         self._init_layer_broadcast_comm()
+        if shared_main_kv is not None:
+            logger.info(
+                "Draft LayerSplit: CP%d owns persistent KV; reused %d bytes of "
+                "target Main-KV scratch on CP%d",
+                self._get_layer_owner_rank(self.start_layer),
+                shared_main_kv.nbytes,
+                self.layer_shard_rank,
+            )
 
     def _create_index_key_cache(self) -> IndexKeyCache:
         cache = LayerSplitIndexKeyCache(self, self.index_buf_size)
@@ -817,10 +915,6 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if self._is_layer_owned(layer_id)
         ]
 
-    def get_kv_layer_ids(self):
-        my_start, my_end = self._owned_local_layer_range()
-        return list(range(self.start_layer + my_start, self.start_layer + my_end))
-
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -873,6 +967,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        self._acquire_main_kv_scratch()
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
         if self.pending_remote_kv_layer_id == layer_id:
@@ -906,6 +1001,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         this step follow them and are populated locally after CP AllGather.
         """
 
+        self._acquire_main_kv_scratch()
         if (
             self._active_main_kv_batch_marker is not None
             and self._active_main_kv_batch_marker() is batch_marker
@@ -1072,7 +1168,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     ) -> None:
         if not self.pending_remote_kv_broadcast:
             return
-        self.device_module.current_stream().wait_stream(self.kv_broadcast_stream)
+        self.device_module.current_stream().wait_event(self.pending_remote_kv_event)
         self.pending_remote_kv_broadcast = False
         if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
@@ -1105,6 +1201,15 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             has_history=has_history,
         )
 
+    def _get_layer_prefetch_stream(self):
+        # HCU draft broadcasts use a separate communicator and can stall on
+        # a side stream after HiCache reload. Match the GLM5-Next path: keep
+        # both draft Main-KV and Index-K on the forward stream, while target
+        # layers retain asynchronous prefetch.
+        if self.shares_layer_split_scratch:
+            return self.device_module.current_stream()
+        return self.kv_broadcast_stream
+
     def prefetch_kv_buffer(
         self,
         layer_id: int,
@@ -1118,6 +1223,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         ready by the time a non-owner rank reads it (see the prefetch wiring in
         ``DeepseekV2DecoderLayer``).
         """
+        self._acquire_main_kv_scratch()
         if self.remote_kv_layer_id == layer_id:
             return
         if self.pending_remote_kv_broadcast:
@@ -1160,8 +1266,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = layer_id
             return
 
-        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_broadcast_stream):
+        current_stream = self.device_module.current_stream()
+        broadcast_stream = self._get_layer_prefetch_stream()
+        if broadcast_stream != current_stream:
+            broadcast_stream.wait_stream(current_stream)
+        with self.device_module.stream(broadcast_stream):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
             if self._active_main_kv_page_plan is not None:
@@ -1173,10 +1282,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                     src_tensor=src_tensor,
                     use_layer_broadcast_comm=True,
                 )
+            self.pending_remote_kv_event.record()
         self.pending_remote_kv_layer_id = layer_id
         self.pending_remote_kv_broadcast = True
 
     def _get_broadcastable_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        self._acquire_main_kv_scratch()
         if self.pending_remote_kv_broadcast:
             self._finalize_pending_kv_broadcast(
                 set_remote_layer_id=self.pending_remote_kv_layer_id == layer_id

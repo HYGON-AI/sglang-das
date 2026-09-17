@@ -237,6 +237,7 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
+    dsa_layer_split_scratch_source: Optional[KVCache] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
@@ -1356,6 +1357,12 @@ class KVCacheConfigurator:
             use_layer_split_pool = True
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            pool_kwargs["layer_shard_rank_offset"] = (
+                dsa_cp_layer_shard_size - 1 if self.is_draft_worker else 0
+            )
+            pool_kwargs["layer_split_scratch_source"] = (
+                self.dsa_layer_split_scratch_source
+            )
         else:
             PoolCls = DSATokenToKVPool
         full_indexer_layer_ids = get_dsa_full_indexer_layer_ids(

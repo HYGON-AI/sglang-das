@@ -255,6 +255,15 @@ class BaseSpecWorker(ABC):
             )
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            # Single-layer draft LayerSplit has persistent KV only on its CP
+            # owner. Non-owners must not allocate or restore a packed host
+            # entry pointing at the draft's zero-row placeholder.
+            draft_pools = tuple(
+                pool
+                for pool in draft_pools
+                if not getattr(pool, "layer_shard_enabled", False)
+                or pool.get_kv_layer_ids()
+            )
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,

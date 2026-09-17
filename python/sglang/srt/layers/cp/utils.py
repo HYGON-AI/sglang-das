@@ -57,12 +57,16 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
 
     Layer split is a prefill-CP-only optimization for DSA (DeepSeek Sparse
-    Attention) MLA models (e.g. GLM-5.2). Draft workers keep the full cache.
+    Attention) MLA models (e.g. GLM-5.2). Single-layer NextN drafts can opt in
+    after the EAGLE worker supplies a compatible target Main-KV scratch pool.
     """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     return (
-        not model_runner.is_draft_worker
+        (
+            not model_runner.is_draft_worker
+            or getattr(model_runner, "dsa_layer_split_scratch_source", None) is not None
+        )
         and model_runner.server_args.enable_dsa_cache_layer_split
         and model_runner.use_mla_backend
         and is_deepseek_dsa(model_runner.model_config.hf_config)
@@ -99,6 +103,10 @@ def get_glm_dsa_layer_split_effective_num_layers(
     if shard_size <= 1:
         return num_layers
     owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
+    if getattr(model_runner, "dsa_layer_split_scratch_source", None) is not None:
+        # The draft aliases target Main-KV scratch, so count only its owner
+        # storage here. Index-K has its own independent scratch budget.
+        return owned_layers_upper_bound
     return max(1, owned_layers_upper_bound + 1)
 
 
