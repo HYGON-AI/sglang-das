@@ -1133,8 +1133,7 @@ class Fp8LinearMethod(LinearMethodBase):
             self.block_fp8_as_mxfp8
             and getattr(layer, "block_fp8_mxfp8_ready", False)
             and (not isinstance(x, tuple) or isinstance(x, Mxfp8SwizzledInput))
-        ):
-            backend = self.mxfp8_dense_backend
+        ):            backend = self.mxfp8_dense_backend
             if isinstance(x, Mxfp8SwizzledInput):
                 if not (
                     backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()
