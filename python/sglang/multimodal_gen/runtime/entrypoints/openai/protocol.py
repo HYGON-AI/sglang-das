@@ -84,7 +84,10 @@ class ImageGenerationsRequest(BaseModel):
 class VideoResponse(BaseModel):
     id: str
     object: str = "video"
-    model: str = "sora-2"
+    # Always populated explicitly by the endpoints with the served model
+    # name; no static default, so the generated document cannot suggest
+    # one that differs from actual deployments.
+    model: Optional[str] = None
     status: str = "queued"
     progress: int = 0
     created_at: int = Field(default_factory=lambda: int(time.time()))
@@ -147,6 +150,17 @@ class VideoGenerationsRequest(BaseModel):
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Model-task extensions (consumed by task-specific pipeline adapters, e.g.
+    # MiniMax H3). Declared explicitly so the generated OpenAPI document
+    # matches the accepted request contract. Values may arrive as native JSON
+    # objects or as JSON-encoded strings when submitted via multipart forms;
+    # adapters normalize both. ``task`` is required by deployments whose
+    # pipeline validates a task gate (e.g. MiniMax H3: t2va/fl2va/ref2va) and
+    # optional elsewhere, so it stays nullable here.
+    task: Optional[str] = None
+    conditions: Optional[Any] = None
+    target: Optional[Any] = None
+    audio_flow_shift: Optional[float] = None
     # Performance profiling
     perf_dump_path: Optional[str] = None
     profile: Optional[bool] = False
