@@ -663,6 +663,13 @@ class C4IndexerBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return
         token_to_kv_pool = self.token_to_kv_pool
+        use_int8_index_k_cache = _is_hcu and getattr(
+            token_to_kv_pool, "use_int8_index_k_cache", False
+        )
+        if c4_indexer.use_direct_int8_indexer_q and not use_int8_index_k_cache:
+            raise ValueError(
+                "SGLANG_NSA_INDEX_Q_INT8=1 requires an active INT8 index-K cache."
+            )
 
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -705,9 +712,6 @@ class C4IndexerBackendMixin:
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
-        use_int8_index_k_cache = _is_hcu and getattr(
-            token_to_kv_pool, "use_int8_index_k_cache", False
-        )
 
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
@@ -811,21 +815,23 @@ class C4IndexerBackendMixin:
                 )
 
                 # The native dense kernel consumes INT8 Q/K and applies only
-                # the per-token K scale. Quantize each query head separately
-                # and fold its scale into the existing per-head weight:
-                #   relu((Qi8 * Qs) dot (Ki8 * Ks)) * W
-                # = relu(Qi8 dot Ki8) * (W * Qs) * Ks.
-                # gfx936 produces BF16 Q directly after RoPE/Hadamard.
-                # Other HCU architectures retain their existing FP8 route.
-                q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
-                q_bf16 = q_bf16.contiguous()
-                q_flat = q_bf16.view(-1, q_bf16.shape[-1])
-                q_int8, q_scales = per_token_quant_int8(q_flat)
-                q_int8 = q_int8.view_as(q_bf16)
-                adjusted_weights = (
-                    weights.to(torch.float32)
-                    * q_scales.view(query_rows, -1)
-                ).contiguous()
+                # the per-token K scale. For direct INT8 Q, the Q scale is
+                # already folded into weights by the fused Q kernel.
+                if q.dtype == torch.int8:
+                    q_int8 = q.contiguous()
+                    adjusted_weights = weights.to(torch.float32).contiguous()
+                else:
+                    # Quantize each query head separately and fold its scale
+                    # into the existing per-head weight.
+                    q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
+                    q_bf16 = q_bf16.contiguous()
+                    q_flat = q_bf16.view(-1, q_bf16.shape[-1])
+                    q_int8, q_scales = per_token_quant_int8(q_flat)
+                    q_int8 = q_int8.view_as(q_bf16)
+                    adjusted_weights = (
+                        weights.to(torch.float32)
+                        * q_scales.view(query_rows, -1)
+                    ).contiguous()
 
                 logits = fn(
                     q_int8,
@@ -1044,6 +1050,28 @@ class C4Indexer(nn.Module):
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
 
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        self.use_direct_int8_indexer_q = (
+            not self.use_fp4_indexer and envs.SGLANG_NSA_INDEX_Q_INT8.get()
+        )
+        if self.use_direct_int8_indexer_q:
+            from sglang.srt.layers.attention.dsv4.hcu_int8_index_k_cache import (
+                is_hcu_gfx936,
+            )
+
+            if not envs.SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE.get():
+                raise ValueError(
+                    "SGLANG_NSA_INDEX_Q_INT8=1 requires "
+                    "SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE=1."
+                )
+            if not _is_hcu or not is_hcu_gfx936():
+                raise ValueError(
+                    "SGLANG_NSA_INDEX_Q_INT8=1 is supported only on HCU gfx936."
+                )
+            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                raise ValueError(
+                    "SGLANG_NSA_INDEX_Q_INT8=1 requires the native HCU LightOp indexer."
+                )
+
         # Only gfx936 defaults to BF16 Q for LightOp's FP8-cache path.
         # Enabling INT8 cache quantizes this BF16 Q at the consumer boundary.
         self.use_bf16_indexer_q = (
@@ -1067,6 +1095,14 @@ class C4Indexer(nn.Module):
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
+        if self.use_direct_int8_indexer_q:
+            from sglang.srt.layers.attention.dsv4.q_indexer_int8_jit import (
+                fused_q_indexer_rope_hadamard_quant_int8,
+            )
+
+            return fused_q_indexer_rope_hadamard_quant_int8(
+                q, weight, self.weight_scale, self.freqs_cis, positions
             )
         if self.use_bf16_indexer_q:
             return fused_q_indexer_rope_hadamard(
