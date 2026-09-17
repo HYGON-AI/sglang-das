@@ -63,5 +63,25 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         self.eot_token = "</｜DSML｜tool_calls>"
         self.function_calls_regex = r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>"
 
+    def supports_structural_tag_for_tool_choice(self, tool_choice) -> bool:
+        """Avoid native required/named tags that can stall xgrammar under PD.
+
+        Automatic strict tool choice can still use the native DeepSeek-V4 tag.
+        Required and named choices are parsed from the model's native DSML
+        output instead of compiling any grammar on the prefill worker.
+        """
+        return tool_choice == "auto"
+
+    def parses_required_natively(self) -> bool:
+        """Parse required/named calls as native DSML without an xgrammar rule.
+
+        Both DeepSeek-V4 structural tags and JSON-schema constraints can block
+        xgrammar compilation on the rank-0 prefill scheduler in PD mode.  The
+        model already emits DSML tool calls, and this detector handles repeated
+        invokes plus the model's malformed parameter closers, so constraining
+        required/named requests is unnecessary and unsafe here.
+        """
+        return True
+
     def get_structural_tag_name(self) -> str:
         return "deepseek_v4"

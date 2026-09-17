@@ -75,11 +75,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_end_token = "</｜DSML｜invoke>"
-        # Some DeepSeek V4 generations duplicate the closing tag name (for
-        # example `</｜DSML｜parameterparameter>`). Treat consecutive copies as
-        # the same closer so a recoverable model-format typo does not erase all
-        # otherwise valid arguments.
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜(?:parameter)+>'
+        # DeepSeek V4 can corrupt the parameter closer in several ways, for
+        # example `parameterparameter`, `parameter_param`, or by copying an
+        # attribute onto it.  Once a matching parameter opener was found,
+        # accept a same-tag closer that starts with `parameter` and remains
+        # within that closing tag; invoke/tool-call boundaries stay excluded.
+        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter[^>]*>'
         self.partial_parameter_regex = (
             r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
         )
