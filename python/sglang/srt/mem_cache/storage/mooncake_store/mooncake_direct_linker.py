@@ -196,19 +196,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.page_wise_load_threshold = (
             server_args.mooncake_page_wise_load_threshold
         )
-        self.page_wise_load_batch_size = (
-            server_args.mooncake_page_wise_load_batch_size
-        )
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
                 "--mooncake-page-wise-load-threshold must be positive, got "
                 f"{self.page_wise_load_threshold}."
-            )
-        if self.page_wise_load_batch_size <= 0:
-            raise ValueError(
-                "--mooncake-page-wise-load-batch-size must be positive, got "
-                f"{self.page_wise_load_batch_size}."
             )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
