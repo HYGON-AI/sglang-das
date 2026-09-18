@@ -194,12 +194,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def _normalize_parameters(
         parameters: object, func_name: str, tools: list[Tool]
     ) -> object:
-        """Remove model-added arguments/input wrappers when schema makes it safe."""
-        if not isinstance(parameters, dict) or len(parameters) != 1:
-            return parameters
+        """Repair schema-provable DSML argument shape errors.
 
-        wrapper = next(iter(parameters))
-        if wrapper not in ("arguments", "input"):
+        DeepSeek may add an ``arguments``/``input`` wrapper or emit a scalar for
+        a property declared as an array. Only apply a repair when the selected
+        tool schema makes the intended shape unambiguous.
+        """
+        if not isinstance(parameters, dict):
             return parameters
 
         tool = next((t for t in tools if t.function.name == func_name), None)
@@ -207,28 +208,67 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if not isinstance(schema, dict):
             return parameters
         properties = schema.get("properties")
-        if not isinstance(properties, dict) or wrapper in properties:
+        if not isinstance(properties, dict):
             return parameters
 
-        value = parameters[wrapper]
-        if isinstance(value, str):
-            # XML string parameters may contain a second JSON encoding.
-            try:
-                decoded = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                decoded = value
-            if isinstance(decoded, dict):
-                return decoded
-            value = decoded
-        elif isinstance(value, dict):
-            return value
+        if len(parameters) == 1:
+            wrapper = next(iter(parameters))
+            if wrapper in ("arguments", "input") and wrapper not in properties:
+                value = parameters[wrapper]
+                unwrapped_object = False
+                if isinstance(value, str):
+                    # XML string parameters may contain a second JSON encoding.
+                    try:
+                        decoded = json.loads(value)
+                    except (json.JSONDecodeError, TypeError):
+                        decoded = value
+                    if isinstance(decoded, dict):
+                        parameters = decoded
+                        unwrapped_object = True
+                    else:
+                        value = decoded
+                elif isinstance(value, dict):
+                    parameters = value
+                    unwrapped_object = True
 
-        required = schema.get("required")
-        candidates = required if isinstance(required, list) and len(required) == 1 else []
-        if not candidates and len(properties) == 1:
-            candidates = list(properties)
-        if len(candidates) == 1:
-            return {candidates[0]: value}
+                if not unwrapped_object:
+                    required = schema.get("required")
+                    candidates = (
+                        required
+                        if isinstance(required, list) and len(required) == 1
+                        else []
+                    )
+                    if not candidates and len(properties) == 1:
+                        candidates = list(properties)
+                    if len(candidates) == 1:
+                        parameters = {candidates[0]: value}
+
+        parameters = dict(parameters)
+        for name, value in parameters.items():
+            property_schema = properties.get(name)
+            if (
+                not isinstance(property_schema, dict)
+                or property_schema.get("type") != "array"
+                or isinstance(value, list)
+            ):
+                continue
+
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except json.JSONDecodeError:
+                    decoded = value
+                if isinstance(decoded, list):
+                    parameters[name] = decoded
+                    continue
+                value = decoded
+
+            # A single JSON scalar is the only unambiguous one-element array
+            # repair. Keep objects and null unchanged rather than inventing a
+            # meaning that the schema cannot prove.
+            if not isinstance(value, (dict, list)) and value is not None:
+                parameters[name] = [value]
+
         return parameters
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
