@@ -85,6 +85,10 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
+    # Completion event for the forward that wrote these KV pages. The transfer
+    # worker reads device memory outside the CUDA stream, so it has to wait on
+    # this before the RDMA read or it can observe half-written KV.
+    wait_event: Optional[object] = None
 
 
 # decode
@@ -1926,6 +1930,13 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # This worker reads device memory outside the CUDA stream, so
+                # without waiting here the read can race the prefill forward
+                # that is still writing these pages. Cleared afterwards so a
+                # chunk re-enqueued on a staging defer does not wait twice.
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1969,17 +1980,31 @@ class MooncakeKVManager(CommonKVManager):
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                        # A source/destination page-count mismatch means the
+                        # decode allocation no longer describes this prefill
+                        # chunk. Truncating either side silently accepts a
+                        # partial KV cache and can produce plausible-looking
+                        # but corrupted tokens. Fail the request before RDMA
+                        # instead; PP consensus will release both stages.
+                        src_page_count = len(kv_chunk.prefill_kv_indices)
+                        dst_page_count = len(chunked_dst_kv_indice)
+                        if src_page_count != dst_page_count:
+                            failure_reason = (
+                                "KV page-count mismatch before Mooncake transfer: "
+                                f"room={kv_chunk.room}, src_pages={src_page_count}, "
+                                f"dst_pages={dst_page_count}, slice={kv_chunk.index_slice}"
                             )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
+                            logger.error(failure_reason)
+                            self.record_failure(kv_chunk.room, failure_reason)
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                            break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -2342,6 +2367,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2376,6 +2402,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                wait_event=wait_event,
             )
         )
 
@@ -2457,12 +2484,19 @@ class MooncakeKVSender(CommonKVSender):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
 
+        # Pages handed over before their forward is known to have completed
+        # carry a completion event; the transfer worker waits on it before it
+        # reads them. Same handoff as MoriKVSender.send().
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
+
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
                 index_slice,
                 False,
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2472,6 +2506,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

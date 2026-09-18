@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
 register_hcu_ci(est_time=3600, suite="nightly-hcu-accuracy-text", nightly=True)
 
 DEFAULT_HCU_GSM8K_MODEL = (
-    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+    "/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B"
 )
 DEFAULT_HCU_GSM8K_DATA_PATH = (
     "/public/opendas/DL_DATA/opencompass_data/gsm8k/test.jsonl"

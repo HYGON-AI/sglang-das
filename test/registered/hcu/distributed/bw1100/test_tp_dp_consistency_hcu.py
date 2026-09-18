@@ -18,7 +18,7 @@ from sglang.test.test_utils import find_available_port
 register_hcu_ci(est_time=900, suite="nightly-hcu-2", nightly=True)
 
 DEFAULT_MODEL = (
-    "/public/opendas/DL_DATA/llm-models/qwen2.5/Qwen2.5-7B-Instruct"
+    "/public/opendas/DL_DATA/llm-models/vllm-gptq-models/qwen2.5/Qwen2.5-7B"
 )
 PROMPTS = (
     ("The capital of France is", "paris"),

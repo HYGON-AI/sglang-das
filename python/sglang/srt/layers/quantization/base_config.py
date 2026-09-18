@@ -46,6 +46,8 @@ class QuantizeMethodBase(ABC):
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
+    supports_fused_rms_quant: bool = False
+
     def create_weights(
         self,
         layer: torch.nn.Module,

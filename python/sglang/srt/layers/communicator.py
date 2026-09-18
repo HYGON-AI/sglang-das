@@ -485,12 +485,14 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        use_fused_rms_quant: Optional[bool] = None,
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             post_residual_addition=post_residual_addition,
+            use_fused_rms_quant=use_fused_rms_quant,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -511,7 +513,10 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        use_fused_rms_quant: Optional[bool] = None,
     ):
+        if use_fused_rms_quant is None:
+            use_fused_rms_quant = _use_fused_rms_quant
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
         if get_attn_tp_context().input_scattered:
@@ -599,7 +604,7 @@ class LayerCommunicator:
                         )
                         hidden_states = (out_fp8, out_bs)
                     else:
-                        if _use_fused_rms_quant:
+                        if use_fused_rms_quant:
                             forward_batch.residual_rms_per_quant_int8 = None
                         else:
                             hidden_states = self.input_layernorm(hidden_states)
@@ -659,7 +664,7 @@ class LayerCommunicator:
                         )
                         hidden_states = (out_fp8, out_bs)
                     else:
-                        if _use_fused_rms_quant:
+                        if use_fused_rms_quant:
                             forward_batch.residual_rms_per_quant_int8 = residual
                         else:
                             hidden_states, residual = self.input_layernorm(

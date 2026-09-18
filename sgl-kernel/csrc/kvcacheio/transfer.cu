@@ -827,6 +827,36 @@ void transfer_kv_per_layer_mla_pf_lf(
       num_warps_per_block);
 }
 
+at::Tensor build_kernel_accessible_pointer_table(
+    const at::Tensor& base,
+    const std::vector<at::Tensor>& views,
+    const at::Tensor& device_ref) {
+  TORCH_CHECK(!base.is_cuda(), "Pointer table base must be a host tensor");
+  TORCH_CHECK(device_ref.is_cuda(), "Pointer table device reference must be a CUDA tensor");
+  TORCH_CHECK(device_ref.scalar_type() == at::kUInt64, "Pointer table device reference must be uint64");
+  TORCH_CHECK(base.data_ptr() != nullptr, "Pointer table base must not be empty");
+
+  const auto raw_base = reinterpret_cast<uintptr_t>(base.data_ptr());
+  uintptr_t kernel_base = raw_base;
+#ifdef USE_ROCM
+  kernel_base = reinterpret_cast<uintptr_t>(get_rocm_kernel_accessible_ptr(base));
+#endif
+
+  auto host_ptrs = at::empty(
+      {static_cast<int64_t>(views.size())}, at::TensorOptions().dtype(device_ref.scalar_type()).device(at::kCPU));
+  auto* ptrs = host_ptrs.data_ptr<uint64_t>();
+  const auto raw_end = raw_base + static_cast<uintptr_t>(base.numel() * base.element_size());
+  for (const auto i : c10::irange(views.size())) {
+    TORCH_CHECK(!views[i].is_cuda(), "Pointer table views must be host tensors");
+    const auto raw_view = reinterpret_cast<uintptr_t>(views[i].data_ptr());
+    TORCH_CHECK(
+        raw_view >= raw_base && raw_view < raw_end,
+        "Pointer table view must reference storage within the base tensor");
+    ptrs[i] = kernel_base + (raw_view - raw_base);
+  }
+  return host_ptrs.to(device_ref.device());
+}
+
 void transfer_kv_all_layer_mla(
     const at::Tensor src_layers,
     const at::Tensor dst_layers,
