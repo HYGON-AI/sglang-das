@@ -29,6 +29,7 @@ from typing import (
     Protocol,
     Tuple,
     TypeGuard,
+    Union,
     runtime_checkable,
 )
 
@@ -393,7 +394,9 @@ class TopKConfig:
 
 class TopKOutputChecker:
     @staticmethod
-    def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
+    def format_is_standard(
+        topk_output: TopKOutput,
+    ) -> TypeGuard[Union[StandardTopKOutput, StandardTopKOutputPacked]]:
         return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
