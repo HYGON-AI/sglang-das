@@ -402,7 +402,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             build_hcu_w8a8_mega_moe_experts_weights(layer)
             return
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        moe_runner_backend = self._resolve_moe_runner_backend()
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and moe_runner_backend.is_aiter()
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -419,6 +423,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _use_deepgemm_moe
             and _is_hcu
+            and moe_runner_backend.is_deep_gemm()
         ):
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
 
@@ -438,6 +443,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         elif (
             _use_fp8_w8a8_moe
             and _is_hcu
+            and not moe_runner_backend.is_triton()
             and not getattr(layer, "_w8a8_fp8_packed", False)
         ):
             w1 = layer.w13_weight
@@ -528,20 +534,23 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 requires_grad=False,
             )
 
+    def _resolve_moe_runner_backend(self):
+        moe_runner_backend = get_moe_runner_backend()
+        if not moe_runner_backend.is_auto():
+            return moe_runner_backend
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and get_moe_a2a_backend().supports_aiter()
+        ):
+            return MoeRunnerBackend.AITER
+        return MoeRunnerBackend.TRITON
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
-            if (
-                _use_aiter
-                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().supports_aiter()
-            ):
-                moe_runner_backend = MoeRunnerBackend.AITER
-            else:
-                moe_runner_backend = MoeRunnerBackend.TRITON
+        moe_runner_backend = self._resolve_moe_runner_backend()
 
         if (
             moe_runner_backend.is_aiter()
@@ -642,7 +651,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     block_shape=self.weight_block_size,
                 )
             return self.runner.run(dispatch_output, quant_info)
-        elif _is_hcu and _use_fp8_w8a8_moe:
+        elif (
+            _is_hcu
+            and _use_fp8_w8a8_moe
+            and not self.runner.runner_backend.is_triton()
+        ):
             if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
                 layer.w2_weight, "_w8a8_fp8_packed", False
             ):
