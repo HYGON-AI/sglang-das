@@ -1253,6 +1253,7 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         # Two-level low-ratio indexer (dsv4/candidate_indexer.py).
         cfg = model_runner.model_config.hf_text_config
+        self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
         self.candidate_indexer = make_candidate_indexer(
             getattr(cfg, "candidate_topk_blocks", 0),
             getattr(cfg, "candidate_block_size", 0),
@@ -4140,12 +4141,14 @@ class DeepseekV4AttnBackend(
                         attn_sink=attn_sink,
                     )
 
+
                 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
                     can_use_swapab_attention,
                 )
 
                 if (
-                    get_platform().is_sm100
+                    self.is_dsv41
+                    and get_platform().is_sm100
                     and can_use_swapab_attention(
                         q,
                         swa_k_cache,
