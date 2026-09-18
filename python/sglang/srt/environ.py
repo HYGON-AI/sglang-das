@@ -1379,6 +1379,11 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # The upstream DSV4 encoder only supports a system message in the leading
+    # position. Keep the strict upstream behavior by default; compatibility
+    # deployments may explicitly remap later system reminders to developer
+    # messages so they retain a valid turn boundary.
+    SGLANG_DSV4_REMAP_NON_LEADING_SYSTEM_TO_DEVELOPER = EnvBool(False)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)

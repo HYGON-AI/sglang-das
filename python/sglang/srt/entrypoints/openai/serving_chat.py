@@ -874,6 +874,34 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # The native DSV4 encoder treats a non-leading system message as raw
+        # continuation text and may omit the assistant generation prefix. The
+        # upstream-safe behavior is to reject that unsupported shape. General-
+        # FC-style datasets can opt into the semantically closest supported
+        # representation: a developer message with the same content.
+        if (
+            self.chat_encoding_spec == "dsv4"
+            and request.input_ids is None
+            and self.template_manager.chat_template_name is None
+        ):
+            non_leading_system_indices = [
+                index
+                for index, message in enumerate(request.messages)
+                if index > 0 and getattr(message, "role", None) == "system"
+            ]
+            if non_leading_system_indices:
+                if not envs.SGLANG_DSV4_REMAP_NON_LEADING_SYSTEM_TO_DEVELOPER.get():
+                    indices = ", ".join(map(str, non_leading_system_indices))
+                    return (
+                        "DeepSeek-V4 chat encoding only supports a system message "
+                        "in the leading position; found non-leading system message "
+                        f"at index(es): {indices}."
+                    )
+                for index in non_leading_system_indices:
+                    request.messages[index] = request.messages[index].model_copy(
+                        update={"role": "developer"}
+                    )
+
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 

@@ -160,6 +160,125 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
 
+    def test_scalar_is_wrapped_for_schema_declared_array(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "queries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            }
+                        },
+                        "required": ["queries"],
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"queries":"SGLang"}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"queries": ["SGLang"]}
+        )
+
+    def test_wrapped_scalar_maps_to_sole_array_property(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                        "required": ["queries"],
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"arguments":"SGLang"}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"queries": ["SGLang"]}
+        )
+
+    def test_json_encoded_array_string_is_decoded(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(
+            _invoke("search", _param("queries", "true", '["SGLang", "ROCm"]'))
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"queries": ["SGLang", "ROCm"]},
+        )
+
+    def test_array_repair_is_identical_in_streaming(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"queries":"SGLang"}'))
+        detector = DeepSeekV4Detector()
+        calls = []
+        for start in range(0, len(text), 4):
+            calls.extend(
+                detector.parse_streaming_increment(text[start : start + 4], tools).calls
+            )
+        arguments = "".join(call.parameters for call in calls if call.parameters)
+
+        self.assertEqual(json.loads(arguments), {"queries": ["SGLang"]})
+
+    def test_object_is_not_wrapped_as_array_without_item_proof(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"queries":{"query":"SGLang"}}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"queries": {"query": "SGLang"}},
+        )
+
     def test_parse_error_neither_swallows_nor_duplicates(self):
         """An unexpected parse error must not empty the turn, and the dropped
         buffer must not come back on the next delta."""

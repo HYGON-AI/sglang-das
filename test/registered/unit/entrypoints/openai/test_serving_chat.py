@@ -255,6 +255,57 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertIn(media_type, error["message"])
         self.tm.generate_request.assert_not_called()
 
+    def test_dsv4_rejects_non_leading_system_message_by_default(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        self.template_manager.chat_template_name = None
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Find the weather."},
+                {"role": "system", "content": "Use the available tool."},
+            ],
+        )
+
+        error = self.chat._validate_request(request)
+
+        self.assertIn("non-leading system message", error)
+        self.assertEqual(request.messages[1].role, "system")
+
+    def test_dsv4_can_remap_non_leading_system_message_to_developer(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        self.template_manager.chat_template_name = None
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Find the weather."},
+                {"role": "system", "content": "Use the available tool."},
+            ],
+        )
+
+        with envs.SGLANG_DSV4_REMAP_NON_LEADING_SYSTEM_TO_DEVELOPER.override(True):
+            error = self.chat._validate_request(request)
+
+        self.assertIsNone(error)
+        self.assertEqual(request.messages[1].role, "developer")
+
+    def test_dsv4_non_leading_system_check_bypasses_other_renderers(self):
+        self.chat.chat_encoding_spec = "dsv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Find the weather."},
+                {"role": "system", "content": "Use the available tool."},
+            ],
+        )
+
+        # A named conversation template owns its message semantics.
+        self.assertIsNone(self.chat._validate_request(request))
+
+        # Raw token ids bypass chat encoding entirely.
+        self.template_manager.chat_template_name = None
+        request.input_ids = [1, 2, 3]
+        self.assertIsNone(self.chat._validate_request(request))
+
     def test_media_validation_does_not_reject_supported_content(self):
         text_request = ChatCompletionRequest(
             model="x",
