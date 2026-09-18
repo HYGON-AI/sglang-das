@@ -352,15 +352,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Mooncake ReadPlan enabled; address reuse=%s",
                 self.read_plan_reuse_ranges,
             )
-        if self.cp_single_writer:
-            logger.info(
-                "Mooncake CP node-owner writer/request-owner lookup enabled: "
-                "rank=%d/%d namespace=%s writer_owner=node_hash "
-                "lookup_owner=request_id_hash data_reader=all_ranks",
-                self.attn_cp_rank,
-                self.attn_cp_size,
-                storage_suffix,
-            )
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
