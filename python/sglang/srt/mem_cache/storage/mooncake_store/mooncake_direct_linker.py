@@ -520,7 +520,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         try:
             if getattr(self, "read_plan_enabled", False):
                 self.load_with_read_plan(counter_index, request_transfers)
-                return
+                return True
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:

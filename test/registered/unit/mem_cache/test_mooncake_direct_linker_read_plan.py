@@ -1,5 +1,6 @@
 import types
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -14,6 +15,17 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
+    def test_successful_read_plan_load_reports_success(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.read_plan_enabled = True
+        linker.tp_rank = 0
+        linker.load_with_read_plan = Mock()
+
+        success = linker.load_layer_wise(7, [])
+
+        self.assertIs(success, True)
+        linker.load_with_read_plan.assert_called_once_with(7, [])
+
     def test_layout_expands_packed_layer_mapping(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.num_layers = 3
