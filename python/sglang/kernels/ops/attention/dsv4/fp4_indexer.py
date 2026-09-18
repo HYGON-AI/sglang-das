@@ -3,7 +3,15 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
+from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
+
+INDEX_HEAD_DIM = 128
+# One index-K slot: 64 packed e2m1 bytes and four ue8m0 block exponents.
+INDEX_K_PAYLOAD_BYTES = tl.constexpr(64)
+INDEX_K_SCALE_BYTES = tl.constexpr(4)
+INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
 
 @triton.jit
 def _select_group_value(group, v0, v1, v2, v3):
@@ -199,3 +207,261 @@ def store_fp4_index_k_cache(
         cache.stride(0),
         BLOCK=64,
     )
+
+
+@triton.jit
+def _index_k_rope_pack_kernel(
+    X,
+    F,
+    Pos,
+    Payload,
+    Scale,
+    Cache,
+    Loc,
+    F_STRIDE: tl.constexpr,
+    HEADS: tl.constexpr,
+    RD: tl.constexpr,
+    INDEXED: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+):
+    row = tl.program_id(0)
+    token = row // HEADS
+    frow = tl.load(Pos + token) if INDEXED else token
+    offsets = tl.arange(0, 128)
+    value = tl.load(X + row * 128 + offsets).to(tl.float32)
+    tail = offsets >= 128 - RD
+    pair = (offsets - (128 - RD)) // 2
+    imaginary = (offsets % 2) == 1
+    real = tl.load(X + row * 128 + 128 - RD + 2 * pair, tail, 0).to(tl.float32)
+    imag = tl.load(X + row * 128 + 128 - RD + 2 * pair + 1, tail, 0).to(tl.float32)
+    fr = tl.load(F + frow * F_STRIDE + 2 * pair, tail, 1.0)
+    fi = tl.load(F + frow * F_STRIDE + 2 * pair + 1, tail, 0.0)
+    rotated = tl.where(imaginary, real * fi + imag * fr, real * fr - imag * fi)
+    value = tl.where(tail, rotated.to(tl.bfloat16).to(tl.float32), value)
+
+    blocks = tl.reshape(value, (4, 32))
+    amax = tl.maximum(tl.max(tl.abs(blocks), 1), AMAX_FLOOR) * (1.0 / 6.0)
+    bits = amax.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    fake_scale = (exponent << 23).to(tl.float32, bitcast=True)
+    scaled = tl.minimum(tl.maximum(blocks / fake_scale[:, None], -6.0), 6.0)
+    magnitude = tl.abs(scaled)
+    step = tl.where(magnitude < 2.0, 0.5, tl.where(magnitude < 4.0, 1.0, 2.0))
+    sign = tl.where(scaled > 0, 1.0, tl.where(scaled < 0, -1.0, 0.0))
+    rounded = libdevice.rint(magnitude / step) * step * sign
+    # Preserve the BF16 intermediate before recomputing the indexer scale.
+    dequantized = (rounded * fake_scale[:, None]).to(tl.bfloat16).to(tl.float32)
+    pack_amax = tl.max(tl.abs(dequantized), 1)
+    pack_exponent = _ceil_ue8m0_exp(tl.maximum(pack_amax / 6.0, 1.0e-4))
+    pack_scale = (pack_exponent << 23).to(tl.float32, bitcast=True)
+    codes = _fp4_e2m1_code_rne(dequantized / pack_scale[:, None])
+    low, high = tl.split(tl.reshape(codes, (64, 2)))
+    payload = low | (high << 4)
+    sf = tl.sum(pack_exponent.to(tl.uint32) << (tl.arange(0, 4) * 8), 0)
+    byte_offsets = tl.arange(0, 64)
+    if STORE_CACHE:
+        location = tl.load(Loc + token)
+        page = location // PAGE_SIZE
+        slot = location % PAGE_SIZE
+        tl.store(Cache + page * CACHE_STRIDE + slot * 64 + byte_offsets, payload)
+        scale_bytes = (sf >> (tl.arange(0, 4) * 8)) & 0xFF
+        tl.store(
+            Cache + page * CACHE_STRIDE + PAGE_SIZE * 64 + slot * 4 + tl.arange(0, 4),
+            scale_bytes,
+        )
+    else:
+        tl.store(Payload + row * 64 + byte_offsets, payload)
+        tl.store(Scale + row, sf)
+
+
+def index_k_rope_pack(
+    x: torch.Tensor,
+    freqs: torch.Tensor,
+    rope_dim: int,
+    *,
+    positions: torch.Tensor | None = None,
+    cache: torch.Tensor | None = None,
+    loc: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """RoPE, fake fp4 quantization and the indexer pack in one launch: packed
+    ``[T*heads, 64]`` / ``[T*heads]`` when ``cache`` is None, else the paged index-K
+    cache write. Without positions, freqs is already gathered per token; otherwise
+    the kernel reads freqs[positions] directly, removing the gather launch.
+
+    Both quantization stages stay: the indexer packer has a different scale floor
+    from fake_quant_fp4, so packing the first stage directly is not equivalent.
+    """
+    assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    assert 0 <= rope_dim <= 128 and rope_dim % 2 == 0
+    x = x.contiguous()
+    rows = x.numel() // 128
+    heads = x[0].numel() // 128 if x.shape[0] else 1
+    f = torch.view_as_real(freqs.contiguous())
+    if cache is None:
+        payload = torch.empty((rows, 64), dtype=torch.int8, device=x.device)
+        scale = torch.empty((rows,), dtype=torch.int32, device=x.device)
+        page_size = cache_stride = 0
+    else:
+        assert heads == 1 and loc is not None and loc.numel() == rows
+        assert cache.ndim == 2 and cache.shape[1] % INDEX_K_SLOT_BYTES == 0
+        payload = scale = None
+        page_size, cache_stride = cache.shape[1] // INDEX_K_SLOT_BYTES, cache.stride(0)
+    if rows:
+        _index_k_rope_pack_kernel[(rows,)](
+            x,
+            f,
+            positions,
+            payload,
+            scale,
+            cache,
+            loc,
+            F_STRIDE=f.stride(0),
+            HEADS=heads,
+            RD=rope_dim,
+            INDEXED=positions is not None,
+            STORE_CACHE=cache is not None,
+            PAGE_SIZE=page_size,
+            CACHE_STRIDE=cache_stride,
+            AMAX_FLOOR=FP4_AMAX_FLOOR,
+            num_warps=4,
+        )
+    return (payload, scale) if cache is None else None
+
+
+@triton.jit
+def _e2m1_decode(code):
+    # code: uint 0..15 -> e2m1 value. exp = bits 2..1, mantissa = bit 0, sign = bit 3.
+    e = (code >> 1) & 3
+    m = (code & 1).to(tl.float32)
+    sub = m * 0.5
+    nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
+    v = tl.where(e == 0, sub, nor)
+    return tl.where((code >> 3) == 1, -v, v)
+
+
+@triton.jit
+def _fp4_index_logits_kernel(
+    q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
+    w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
+    slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
+    lens_ptr,  # [B] int64 visible compressed positions per request
+    table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
+    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
+    L,
+    page_size,
+    row_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
+    BLOCK_L: tl.constexpr,
+):
+    b = tl.program_id(0)
+    lb = tl.program_id(1)
+    offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_h = tl.arange(0, H)
+    offs_i = tl.arange(
+        0, HALF_D
+    )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
+
+    n_vis = tl.load(lens_ptr + b)
+    valid = offs_l < tl.minimum(n_vis, L)
+    slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
+    page = slot // page_size
+    off = slot % page_size
+    row_base = page * row_stride
+
+    # K payload: [BLOCK_L, HALF_D] uint8
+    pay = tl.load(
+        table_ptr
+        + row_base[:, None]
+        + off[:, None] * INDEX_K_PAYLOAD_BYTES
+        + offs_i[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    low = _e2m1_decode(pay & 0x0F)
+    high = _e2m1_decode((pay >> 4) & 0x0F)
+    # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
+    sc_idx = offs_i // 16
+    exps = tl.load(
+        table_ptr
+        + row_base[:, None]
+        + page_size * INDEX_K_PAYLOAD_BYTES
+        + off[:, None] * INDEX_K_SCALE_BYTES
+        + sc_idx[None, :],
+        mask=valid[:, None],
+        other=127,
+    )
+    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
+    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
+
+    # queries: even / odd elements, [H, HALF_D] bf16
+    q_even = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
+    )
+    q_odd = tl.load(
+        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
+    )
+
+    acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
+    acc += tl.dot(q_odd, tl.trans(k_high))
+    # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
+    s = acc.to(tl.bfloat16).to(tl.float32)
+    s = tl.maximum(s, 0.0)
+    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
+    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
+    logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
+    logit = tl.where(valid, logit, float("-inf"))
+    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
+
+
+def fp4_index_logits_decode(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Decode index logits read straight from the fp4 index-K pool (Triton; any
+    CUDA arch). q [B, H, 128] bf16, weights [B, H], slots [B, L] int64, lens [B]
+    int64, table = the layer's index-K page buffer (uint8, 2D). Returns [B, L]
+    fp32 logits, -inf at positions >= lens. Rounding follows the torch reference:
+    bf16 dot, bf16 relu * weight, bf16 head sum."""
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    B, H, _ = q.shape
+    L = slots.shape[1]
+    assert table.dtype == torch.uint8 and table.dim() == 2
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    slots = slots.contiguous()
+    out = torch.empty((B, L), dtype=torch.float32, device=q.device)
+    if L == 0:
+        return out
+    BLOCK_L = 64
+    grid = (B, triton.cdiv(L, BLOCK_L))
+    _fp4_index_logits_kernel[grid](
+        q,
+        weights,
+        slots,
+        lens.to(torch.int64).contiguous(),
+        table,
+        out,
+        L,
+        page_size,
+        table.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        H=H,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        BLOCK_L=BLOCK_L,
+        num_warps=4,
+    )
+    return out
