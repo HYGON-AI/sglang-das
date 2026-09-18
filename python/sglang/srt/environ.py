@@ -749,10 +749,6 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
-    # Use native ReadPlan for layer-wise loads; requires create_read_plan support.
-    SGLANG_MOONCAKE_READ_PLAN = EnvBool(False)
-    # Reuse native address ranges; requires SGLANG_MOONCAKE_READ_PLAN=1.
-    SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES = EnvBool(False)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
