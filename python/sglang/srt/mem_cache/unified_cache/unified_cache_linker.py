@@ -48,6 +48,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
+class ExternalLinkerLoadError(RuntimeError):
+    """A recoverable external-cache load failure for the current batch."""
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
