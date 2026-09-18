@@ -183,6 +183,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -4907,6 +4908,17 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+        if (
+            _is_hcu
+            and get_disagg().disaggregation_mode in ("prefill", "decode")
+            and config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+        ):
+            logger.info(
+                "Disabling the DeepSeek-V4.1 vision tower for HCU PD text serving; "
+                "the V4.1 vision path does not support CP or MoE A2A."
+            )
+            config.vision_n_layers = 0
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config

@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -246,9 +247,36 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        if (
+        common_invalid = (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.dcp_size != 1
+        )
+        if is_hcu():
+            if cfg.disaggregation_mode == "prefill":
+                topology_invalid = not (
+                    cfg.dp_size == 1
+                    and cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == cfg.tp_size
+                )
+                topology = "P requires DP=1 and interleave prefill CP=TP"
+            else:
+                topology_invalid = not (
+                    cfg.disaggregation_mode == "decode"
+                    and cfg.dp_size == cfg.tp_size
+                    and cfg.enable_dp_attention
+                    and not cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == 1
+                )
+                topology = "D requires DP=TP, DP attention and CP=1"
+            if common_invalid or topology_invalid:
+                raise ValueError(
+                    "DeepSeek-V4.1 DSpark PD on HCU requires static verify, "
+                    f"Mooncake and DCP=1; {topology}. Both servers must use "
+                    "the same DSpark block size and TP size."
+                )
+        elif (
+            common_invalid
             or cfg.dp_size != 1
             or cfg.enable_dp_attention
             or cfg.attn_cp_size != 1

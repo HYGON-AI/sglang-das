@@ -554,23 +554,27 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     # compatibility path.
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
-        from sglang.srt.utils.common import is_hcu
+    from sglang.srt.utils.common import is_hcu
 
-        if not is_hcu():
-            raise ValueError(
-                "DSpark speculative decoding only supports CUDA, NPU and HCU devices."
-            )
+    _is_hcu = is_hcu()
+    if not cfg.device.startswith(("cuda", "npu")) and not _is_hcu:
+        raise ValueError(
+            "DSpark speculative decoding only supports CUDA, NPU and HCU devices."
+        )
 
     # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
     if cfg.enable_dp_attention and cfg.dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        allowed_target_a2a = (
+            ("none", "megamoe", "deepep")
+            if _is_hcu
+            else ("none", "megamoe", "mori")
+        )
+        if not _is_npu and cfg.moe_a2a_backend not in allowed_target_a2a:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
-                f"{cfg.moe_a2a_backend!r}."
+                "DSpark with dp attention supports target moe_a2a_backend in "
+                f"{allowed_target_a2a}, got {cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and cfg.moe_a2a_backend != "none":
             from sglang.srt.speculative.ragged_verify import (
@@ -591,6 +595,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
         if (
             not _is_npu
+            and not _is_hcu
             and cfg.speculative_moe_a2a_backend is not None
             and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
         ):

@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Callable, Optional, Protocol, runtime_checkable
 
@@ -12,6 +12,10 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -123,6 +127,17 @@ def _configure_target_hidden_projection(
             num_context_features=int(draft_model.num_context_features),
         )
     )
+
+
+@contextmanager
+def _dspark_draft_context(tp_context):
+    """Run every draft phase under its configured runner and A2A backends."""
+    with (
+        tp_context,
+        speculative_moe_backend_context(),
+        speculative_moe_a2a_backend_context(),
+    ):
+        yield
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -412,9 +427,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         return getattr(self.target_worker, name)
 
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        tp_context = (
+            draft_tp_context(get_parallel().attn_tp_group)
+            if self._draft_dp_context_enabled
+            else nullcontext()
+        )
+        return _dspark_draft_context(tp_context)
 
     def alloc_memory_pool(
         self,
@@ -705,7 +723,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
