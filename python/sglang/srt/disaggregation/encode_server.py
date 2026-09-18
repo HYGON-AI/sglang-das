@@ -45,6 +45,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     load_audio,
     load_image,
     load_video,
@@ -466,7 +467,9 @@ class MMEncoder:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
-
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
+            raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
