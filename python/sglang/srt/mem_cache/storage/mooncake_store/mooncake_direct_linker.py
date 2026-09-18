@@ -678,6 +678,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, batches, started, maybe_fail
     ) -> None:
         """Load all layer ranges for each page before exposing the data."""
+        all_keys: list[str] = []
+        all_ptrs: list[list[int]] = []
+        all_sizes: list[list[int]] = []
+        all_offsets: list[list[int]] = []
         for name, (keys, locations) in batches.items():
             ptrs: list[list[int]] = [[] for _ in keys]
             sizes: list[list[int]] = [[] for _ in keys]
@@ -705,27 +709,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     sizes[index].extend(layer_sizes[index])
                     offsets[index].extend(layer_offsets[index])
 
-            for start in range(0, len(keys), self.page_wise_load_batch_size):
-                end = start + self.page_wise_load_batch_size
-                chunk_keys = keys[start:end]
-                chunk_sizes = sizes[start:end]
-                maybe_fail(name, "complete_page")
-                result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                    chunk_keys,
-                    ptrs[start:end],
-                    chunk_sizes,
-                    offsets[start:end],
-                )
-                expected = [sum(item) for item in chunk_sizes]
-                if (
-                    result is None
-                    or isinstance(result, int)
-                    or list(result) != expected
-                ):
-                    raise RuntimeError(
-                        f"Mooncake range get failed for pool={name}, "
-                        f"complete_page: transferred={result}, expected={expected}"
-                    )
+            all_keys.extend(keys)
+            all_ptrs.extend(ptrs)
+            all_sizes.extend(sizes)
+            all_offsets.extend(offsets)
+
+        lengths = {
+            "keys": len(all_keys),
+            "ptrs": len(all_ptrs),
+            "sizes": len(all_sizes),
+            "offsets": len(all_offsets),
+        }
+        if len(set(lengths.values())) != 1:
+            raise ValueError(
+                f"Mooncake page-wise aggregated metadata mismatch: {lengths}."
+            )
+
+        # Mooncake's range API is key-major and does not take a pool argument,
+        # so differently suffixed physical-pool objects can share one call.
+        maybe_fail("aggregated", "complete_page")
+        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+            all_keys, all_ptrs, all_sizes, all_offsets
+        )
+        expected = [sum(item) for item in all_sizes]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            pool_counts = {
+                str(name): len(keys) for name, (keys, _) in batches.items()
+            }
+            raise RuntimeError(
+                "Mooncake aggregated range get failed for "
+                f"pools={pool_counts}, complete_page: transferred={result}, "
+                f"expected={expected}"
+            )
 
         # Page-wise loading gives up layer overlap. Release the read sessions
         # only after every complete page is loaded, and before any layer becomes
