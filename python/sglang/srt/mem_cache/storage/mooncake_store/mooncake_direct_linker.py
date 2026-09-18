@@ -133,6 +133,8 @@ class ReadPlanLoadCounter:
         self.num_layers = num_layers
         self.producer_index = self.consumer_index = -1
         self.plans: dict[int, Future] = {}
+        # Batch indices already logged: one line per failed plan, not per layer.
+        self.reported: set[int] = set()
 
     def update_producer(self) -> int:
         self.producer_index += 1
@@ -158,14 +160,31 @@ class ReadPlanLoadCounter:
         try:
             future.result().wait(threshold)
         except BaseException as error:
-            raise RuntimeError("Mooncake layer-wise KV load failed.") from error
+            # Do not raise from the model forward. A rank-local failure here can
+            # strand peer TP/CP ranks in a later model collective and brings the
+            # scheduler down. load_layer_wise reports False through the linker
+            # completion queue; the cache MIN-reduces that verdict across the
+            # attention group and aborts the affected requests after forward.
+            if index not in self.reported:
+                self.reported.add(index)
+                logger.error(
+                    "Mooncake ReadPlan KV load failed for batch %d; affected "
+                    "requests will be aborted after this forward: %s",
+                    index,
+                    error,
+                )
+            # Repeated waits otherwise grow a traceback chain that keeps each
+            # layer's activations alive until the failed plan is retired.
+            error.__traceback__ = None
         finally:
             if threshold == self.num_layers - 1:
                 self.plans.pop(index, None)
+                self.reported.discard(index)
 
     def reset(self) -> None:
         self.producer_index = self.consumer_index = -1
         self.plans.clear()
+        self.reported.clear()
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):

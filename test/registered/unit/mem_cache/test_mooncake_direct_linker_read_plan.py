@@ -7,6 +7,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    ReadPlanLoadCounter,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -15,6 +16,25 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
+    def test_read_plan_failure_is_deferred_until_after_forward(self):
+        counter = ReadPlanLoadCounter(num_layers=2)
+        index = counter.update_producer()
+        counter.set_consumer(index)
+        plan = Mock()
+        plan.wait.side_effect = RuntimeError("range get failed: rc=-707")
+        counter.bind(index, plan)
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ) as logs:
+            counter.wait_until(0)
+            counter.wait_until(1)
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertNotIn(index, counter.plans)
+        self.assertNotIn(index, counter.reported)
+
     def test_successful_read_plan_load_reports_success(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.read_plan_enabled = True
