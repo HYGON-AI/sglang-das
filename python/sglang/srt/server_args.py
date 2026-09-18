@@ -1198,6 +1198,11 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    enable_cp_cache_layer_split: A[
+        bool,
+        "Split DeepSeek V4 prefill KV and compressor-state layers across CP ranks (CUDA/HCU, interleave, Mooncake). Draft caches remain replicated.",
+        NS("parallel"),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -5775,6 +5780,10 @@ class ServerArgs:
                     "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
                 )
 
+        if self.enable_cp_cache_layer_split:
+            if model_arch != "DeepseekV4ForCausalLM":
+                raise ValueError("--enable-cp-cache-layer-split requires DeepSeek V4")
+
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
                 "--enable-dsa-cache-layer-split is only supported for DSA "
@@ -6052,6 +6061,12 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
+            if self.enable_cp_cache_layer_split:
+                from sglang.srt.mem_cache.cp_cache_layer_split.validation import (
+                    validate_cp_cache_layer_split,
+                )
+
+                validate_cp_cache_layer_split(self, hf_config)
 
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on

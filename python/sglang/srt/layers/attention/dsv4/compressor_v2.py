@@ -26,6 +26,12 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    cp_cache_layer_split_pre_compressor_skip,
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prefetch_cp_kv_extra,
+    maybe_prefetch_cp_kv_indexer,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -264,6 +270,26 @@ class CompressorBackendMixin:
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
+        # compute_kv_score contains CP collectives: every rank must participate
+        # before only the owner updates persistent compressor/cache state.
+        split = is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
+        if not split or not cp_cache_layer_split_pre_compressor_skip(
+            token_to_kv_pool, layer_id, forward_batch,
+            is_indexer=compressor.is_in_indexer,
+        ):
+            self._forward_unified_store(
+                kv_score_input, forward_batch, layer_id, compressor,
+            )
+        if split:
+            if compressor.is_in_indexer:
+                maybe_prefetch_cp_kv_indexer(token_to_kv_pool, layer_id, forward_batch)
+            else:
+                maybe_prefetch_cp_kv_extra(token_to_kv_pool, layer_id, forward_batch)
+
+    def _forward_unified_store(
+        self, kv_score_input, forward_batch, layer_id, compressor,
+    ) -> None:
+        token_to_kv_pool = self.token_to_kv_pool
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
