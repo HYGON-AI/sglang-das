@@ -8,6 +8,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _split_hicache_size,
     build_full_draft_pools,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    _with_packed_draft_mapping,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +42,21 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+
+class TestPackedDraftMapping(CustomTestCase):
+    def test_packs_draft_into_sparse_target_mapping(self):
+        mapping = _with_packed_draft_mapping(
+            {0: 0, 2: 1, 4: 2},
+            target_device_layer_num=3,
+            draft_layer_num=2,
+            transfer_layer_num=5,
+        )
+
+        self.assertEqual(
+            mapping,
+            {0: (0, 3), 1: (4,), 2: 1, 4: 2},
+        )
 
 
 class TestDraftSidecarPoolDispatch(CustomTestCase):

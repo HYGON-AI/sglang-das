@@ -491,12 +491,12 @@ def _build_dsa_device_pool_group(
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
-    for depth, _ in enumerate(draft_indexer_buffers):
-        mapped = indexer_mapping.get(depth)
-        draft_buffer_index = len(indexer_buffers) + depth
-        indexer_mapping[depth] = (
-            (draft_buffer_index,) if mapped is None else (mapped, draft_buffer_index)
-        )
+    indexer_mapping = _with_packed_draft_mapping(
+        indexer_mapping,
+        target_device_layer_num=len(indexer_buffers),
+        draft_layer_num=len(draft_indexer_buffers),
+        transfer_layer_num=num_layers,
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
