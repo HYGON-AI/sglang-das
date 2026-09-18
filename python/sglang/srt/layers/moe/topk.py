@@ -2753,18 +2753,25 @@ def select_experts(
         ):
             if _is_xpu:
                 _biased_topk = biased_topk_xpu
-            elif scoring_func == "sqrtsoftplus" and _can_use_lightop_sqrtsoftplus_gate(
-                router_logits,
-                correction_bias,
-                num_routed_topk if _use_aiter else top_k,
-                num_fused_shared_experts,
-                routed_scaling_factor,
+            elif (
+                scoring_func == "sqrtsoftplus"
+                and not topk_config.sqrtsoftplus_log1p
+                and _can_use_lightop_sqrtsoftplus_gate(
+                    router_logits,
+                    correction_bias,
+                    num_routed_topk if _use_aiter else top_k,
+                    num_fused_shared_experts,
+                    routed_scaling_factor,
+                )
             ):
                 _biased_topk = biased_topk_lightop_impl
             else:
+                # DeepSeek-V4.1 requires the log1p/NaN-ordering variant, which is
+                # currently implemented by the fused Triton gate but not LightOp
+                # or the torch.compile fallback.
                 _biased_topk = (
                     biased_topk_jit_kernel_impl
-                    if use_jit_fused_gate
+                    if use_jit_fused_gate or topk_config.sqrtsoftplus_log1p
                     else biased_topk_impl
                 )
 

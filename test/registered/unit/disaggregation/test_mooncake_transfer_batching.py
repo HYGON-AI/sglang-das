@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, call
 import numpy as np
 
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -127,6 +130,38 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+
+class TestMooncakeBatchRegistration(unittest.TestCase):
+    @staticmethod
+    def _make_engine(return_value=0, side_effect=None):
+        transfer_engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
+        transfer_engine.engine = MagicMock()
+        transfer_engine.engine.batch_register_memory.return_value = return_value
+        transfer_engine.engine.batch_register_memory.side_effect = side_effect
+        return transfer_engine
+
+    def test_batch_register_returns_zero_on_success(self):
+        engine = self._make_engine()
+
+        self.assertEqual(engine.batch_register([1000], [4096]), 0)
+        engine.engine.batch_register_memory.assert_called_once_with([1000], [4096])
+
+    def test_batch_register_raises_on_nonzero_return(self):
+        engine = self._make_engine(return_value=-7)
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"Mooncake batch memory registration failed \(ret=-7\)"
+        ):
+            engine.batch_register([1000], [4096])
+
+    def test_batch_register_raises_on_engine_exception(self):
+        engine = self._make_engine(side_effect=ValueError("registration rejected"))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Mooncake batch memory registration failed"
+        ):
+            engine.batch_register([1000], [4096])
 
 
 if __name__ == "__main__":
