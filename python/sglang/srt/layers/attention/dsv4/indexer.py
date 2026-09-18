@@ -1111,6 +1111,8 @@ class C4IndexerBackendMixin:
                 None,
                 indexer_metadata.max_compressed_seq_len,
                 False,
+                # Extend batches use LightOp's paged MQA prefill kernel.
+                forward_batch.forward_mode == ForwardMode.EXTEND,
             )
             run_topk_transform(all_rows, logits)
             if not hasattr(self, "_dsv4_int8_indexer_path_logged"):
