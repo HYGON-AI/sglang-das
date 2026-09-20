@@ -27,11 +27,21 @@ wrapped=load_function(root/"python/sglang/srt/layers/attention/flashattention_in
 module=types.SimpleNamespace(triton_vllm_flash_attn_varlen_func=wrapped)
 
 class PagedSWATest(unittest.TestCase):
-    def check_case(self, lengths, qlen, window, causal, layout="legacy_bhsd", graph=False, target=False):
+    def check_case(
+        self,
+        lengths,
+        qlen,
+        window,
+        causal,
+        layout="legacy_bhsd",
+        graph=False,
+        target=False,
+        kv_dtype=torch.float8_e5m2,
+    ):
         torch.manual_seed(7)
         bs, hq, hk, d, page = len(lengths), (8 if target else 16), (1 if target else 4), (256 if target else 128), 64
         pages = (max(lengths) + page - 1) // page
-        k = (torch.randn(bs * pages, page, hk, d, device="cuda") * .2).to(torch.float8_e5m2)
+        k = (torch.randn(bs * pages, page, hk, d, device="cuda") * .2).to(kv_dtype)
         v = (torch.randn_like(k, dtype=torch.float32) * .2).to(k.dtype)
         table = torch.randperm(bs * pages, device="cuda").to(torch.int32).view(bs, pages)
         q = torch.randn(bs * qlen, hq, d, device="cuda", dtype=torch.bfloat16) * .2
@@ -137,6 +147,27 @@ class PagedSWATest(unittest.TestCase):
                 namespace["get_spec"] = lambda: types.SimpleNamespace(speculative_algorithm="DFLASH", speculative_num_draft_tokens=block, speculative_dflash_block_size=block)
                 for causal in (False, True):
                     self.check_case([128, 21021], block, (4095, 0 if causal else 4095), causal, graph=True)
+        finally:
+            namespace["get_spec"] = saved
+
+    def test_bf16_kv_native(self):
+        saved = namespace["get_spec"]
+        try:
+            for block, target in ((8, False), (8, True), (16, False), (16, True)):
+                namespace["get_spec"] = lambda: types.SimpleNamespace(
+                    speculative_algorithm="DFLASH",
+                    speculative_num_draft_tokens=block,
+                    speculative_dflash_block_size=block,
+                )
+                self.check_case(
+                    [128, 8192],
+                    block,
+                    (-1, -1) if target else (4095, 4095),
+                    target,
+                    graph=True,
+                    target=target,
+                    kv_dtype=torch.bfloat16,
+                )
         finally:
             namespace["get_spec"] = saved
 
