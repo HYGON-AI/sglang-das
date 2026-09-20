@@ -305,7 +305,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         cache_k: torch.Tensor,
         freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
         """Quantize ``cache_k`` ``[n, 512]`` bf16 into this pool's layout at ``loc``.
         ``freqs_cis`` (V4.1 only) rotates the RoPE tail in-kernel, so the input is
@@ -2183,7 +2182,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
         """Write ``cache_k`` ``[n, 512]`` bf16 into the layer's compressed cache.
         For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, plus
