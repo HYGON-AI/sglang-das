@@ -18,17 +18,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
-
-# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
-register_hcu_ci(
-    est_time=531,
-    suite="nightly-hcu",
-    nightly=True,
-    disabled="HCU CSV CI placeholder: DeepEP small path needs BW1100 multi-device validation before enabling.",
-)
-
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -37,9 +27,18 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=407, stage="base-c", runner_config="4-gpu-h100")
+
+# HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=531,
+    suite="nightly-hcu",
+    nightly=True,
+    disabled="HCU CSV CI placeholder: DeepEP small path needs BW1100 multi-device validation before enabling.",
+)
 
 
 class TestPureDP(CustomTestCase):
@@ -53,10 +52,10 @@ class TestPureDP(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--tp",
+                "--tp-size",
                 "4",
                 "--enable-dp-attention",
-                "--dp",
+                "--dp-size",
                 "4",
                 "--moe-a2a-backend",
                 "deepep",
@@ -71,7 +70,7 @@ class TestPureDP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -100,7 +99,7 @@ class TestTP(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--tp",
+                "--tp-size",
                 "4",
                 "--moe-a2a-backend",
                 "deepep",
@@ -113,7 +112,7 @@ class TestTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -142,10 +141,10 @@ class TestTBO(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--tp",
+                "--tp-size",
                 "4",
                 "--enable-dp-attention",
-                "--dp",
+                "--dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -165,7 +164,7 @@ class TestTBO(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -228,83 +227,7 @@ class TestMTPWithTBO(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreater(metrics["score"], 0.60)
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(
-            f"###test_gsm8k (deepseek-v3 mtp + dp + tbo):\n"
-            f"accuracy={metrics['score']=:.3f}\n"
-            f"{avg_spec_accept_length=:.3f}\n"
-        )
-        self.assertGreater(avg_spec_accept_length, 2.1)
-
-
-@unittest.skip("skipped due to bug when using MTP & TBO & attn_tp_size > 1")
-class TestMTPWithTPAttnAndTBO(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                "4",
-                "--moe-dense-tp-size",
-                "1",
-                "--enable-two-batch-overlap",
-                "--moe-a2a-backend",
-                "deepep",
-                "--trust-remote-code",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "2",
-                "--speculative-eagle-topk",
-                "3",
-                "--speculative-num-draft-tokens",
-                "3",
-                "--speculative-draft-model-path",
-                DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
-                "--chunked-prefill-size",
-                "256",
-                "--cuda-graph-max-bs-decode",
-                "32",
-                "--max-running-requests",
-                "128",
-                "--mem-fraction-static",  # temp fix as DeepEP buffer is too large.
-                "0.7",
-            ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

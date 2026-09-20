@@ -175,6 +175,11 @@ def transfer_kv_all_direct_lf_pf_D2H_hcu(
         page_size,
     )
 
+def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
+    """Return the address a kernel on ``device_index`` must use for ``tensor``."""
+    return torch.ops.sgl_kernel.get_device_accessible_ptr.default(tensor, device_index)
+
+
 def _default_mla_block_quota() -> int:
     """CU (block) quota for the MLA page_first KV gather kernel.
 

@@ -28,8 +28,6 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import (
@@ -51,10 +49,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend, post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
@@ -396,21 +391,7 @@ class HYV3MoEFused(nn.Module):
                     final_hidden_states, None
                 )
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -457,21 +438,7 @@ class HYV3MoEFused(nn.Module):
             final_hidden_states, shared_output
         )
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 

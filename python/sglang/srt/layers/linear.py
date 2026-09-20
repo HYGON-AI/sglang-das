@@ -18,7 +18,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -1786,7 +1785,7 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
 
         if use_fused_silu_mul_quant:

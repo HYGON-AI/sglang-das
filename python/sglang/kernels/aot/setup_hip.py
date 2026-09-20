@@ -38,6 +38,9 @@ include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
+    # upstream moved shared kernel headers (e.g. speculative/eagle.cuh) under the
+    # JIT include tree; setup_musa.py already carries this entry.
+    root.parent / "jit" / "include",
 ]
 
 sources = [

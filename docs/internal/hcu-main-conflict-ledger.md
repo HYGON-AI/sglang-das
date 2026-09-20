@@ -2930,3 +2930,109 @@ DSV4 uses on HCU. Within the historical pure-TP band (0.95–1.00); accepted.
 Eval client note: `rye_sglang_latest` lost evalscope in the 9/8 host restart
 (the local wheelhouse only has 1.5.1), so GSM8K ran from `rye_sglang_open`
 (evalscope 1.10.0, host network) against the service in `rye_sglang_latest`.
+
+## Sync/official main daily 20260920
+
+Official `0d95a9c1ff` .. `df0dc44931` (312 commits, 1543 files, +126334 / -30981).
+Branch `sync/official-main-daily-20260920` off main `07f94109f3`; anchored with
+`git merge -s ours 0d95a9c1ff` (commit `357c2b148a`, tree unchanged) because 20260914
+landed on main as the squash `ca25bc4275 (#362)` -- the fifth time in a row. 50 conflicts.
+
+Full write-up: `docs/internal/sync-official-main-20260920-summary.md`.
+
+### The three structural ones
+
+- **`mega_moe.py`** -- upstream split `_run_mega_routed` into a moe-level wrapper plus a
+  reusable `run_mega_routed_experts(experts, ...)` (Kimi K3 shares it), gave the symm buffer
+  an `mma_type` and a deep_gemm SM budget (#39223, #38080). Rebuilt both functions: the HCU
+  dual-runtime dispatch now lives in `run_mega_routed_experts`, the two HCU helpers take
+  `experts` + `activation_clamp` instead of `moe`, and `_get_mega_moe_symm_buffer` carries
+  both parameter sets (`runtime` / `cuda_graph_max_tokens_per_rank` keyword-only with
+  defaults, because upstream's new K3 call site does not pass them).
+  `is_mega_moe_experts_ready()` is new upstream and gates on `_device_sm` being 90 or 10x --
+  HCU is neither, so it needed an `if _IS_HCU: return True` opening or MegaMoE would never
+  run on HCU again.
+- **`deepseek_v4_backend.py`** -- upstream split `forward()` into `forward()` +
+  `_forward_attention()` and dropped the `SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA` tail
+  (with `_forward_flash_mla_decode/prefill`), which is exactly where our `if not _is_hcu:`
+  lands. Rebuilt from upstream's function with the CUDA block (sparse-prefill gate, the new
+  SM100 swapab path, SM120, flash_mla, `return o`) indented under `if not _is_hcu:` and our
+  tail appended.
+- **`deepep.py`** -- upstream folded the NPU quantization kwargs into helpers and merged the
+  per-variant dispatch calls. Our `SGLANG_GROUPGEMM` path (lightop per-token quant, the 256
+  expert alignment marlin/fp8 needs, `quant_type` 0/1/2) has no upstream equivalent, so it
+  stays as the `if use_groupgemm:` branch with upstream's call as the `else`.
+
+### Two traps that produced no conflict marker
+
+- `utils/common.py`: `get_physical_device_id()` (ours) was deleted by auto-merge while its
+  only caller (our NUMA lookup) survived. Caught by the 3-way ruff gate, not by a marker.
+- `clamp_position`: #38687 moved the dispatch into the fused-op registry and
+  `forward_batch_info.py` now imports `clamp_position` from it -- our module-level rebinding
+  of the same name would have shadowed the op at import time. Adopted upstream's import and
+  moved the HCU carve-out into `ClampPositionOp.capabilities` (JIT declares CUDA only when
+  `_is_hcu`, so HCU lands on `forward_native`).
+
+### AOT build breaks (only a real compile shows these)
+
+- `setup_hip.py` needed `root.parent / "jit" / "include"`: #40033 moved `eagle.cuh` under
+  the JIT include tree. `setup_musa.py` already had the entry.
+- `transfer.cu`: upstream landed our ROCm host-pointer fix as `resolve_device_accessible_ptr()`,
+  but our `transfer_kernel_impl_hcu` block had a *second* call site still named
+  `get_rocm_kernel_accessible_ptr`. Renamed, and added the `.defined()` guards upstream's
+  helper lacks.
+
+### `warp.cuh` -- the union that compiled nowhere
+
+#36176 removed `sync()` / `shfl_down()` / `shfl_xor()`; our `csrc/moe/moe_fused_gate.cuh` is
+their only consumer and needs the width-aware ROCm forms for wave64. The union kept both
+sides -- but both sides stopped *mid-function* (upstream's at `elect_one_lane()`'s
+`return pred != 0;`, ours at the last wrapper's body), and the single `}` after the marker
+can only close one of them. The result was one missing brace, which collapsed the namespace
+nesting and surfaced as `compress_v2.cuh` errors like
+`unknown type name 'SymbolicSize'; did you mean '::sglang::host::SymbolicSize'?` -- the same
+family as the 20260810 `::host::panic` break, and only on the first device JIT build.
+Upstream's `elect_one_lane()` also has a raw NVIDIA PTX body (`elect.sync`) while this header
+is included by every ROCm JIT module, so it needed a `#ifdef USE_ROCM` arm as well
+(lowest active lane via `__ballot` + `__ffsll`).
+
+This added an **eighth static gate**: C-family brace/paren balance, 3-way against both
+parents, comments and string literals stripped. The preprocessor gate walks
+`#if/#else/#endif` only and cannot see a missing `}`.
+
+### Static gates
+
+All eight pass (see the summary's §4). Only merge-introduced finding was
+`get_physical_device_id`. The ratchet test still reports our 31 direct
+`get_server_args().field` reads -- same count as 20260914, pre-existing.
+
+> Process note: a stray `git add -u` mid-resolution staged files that still carried conflict
+> markers, destroying the `:1:/:2:/:3:` stages and disabling `git checkout -m`. The working
+> tree was intact; the rest of the resolution read ours/theirs through
+> `git show HEAD:<path>` / `git show officials/main:<path>`. Do not use `git add -u` during a merge.
+
+### Runtime validation: passed (agent-observed, 2026-09-20)
+
+`zz-nmz110` / `rye_sglang_latest`, installed with
+`bash /home/scripts/install_sglang.sh /home/proj_sglang_open/sglang-das`
+(sgl-kernel 0.4.7 rebuilt from this merge against that container's torch 2.11).
+Pure TP8 on `/models/DeepSeek-V4-Flash-0731-FP8-Channel`,
+`max_total_num_tokens=7917056`:
+
+| Check | Result |
+|---|---|
+| Greedy sanity | `The capital of France is **Paris**.` |
+| **GSM8K 100q** | **1.000** |
+| Peak decode throughput | 326.13 tok/s |
+| Scheduler exception / Traceback / VMFault | 0 / 0 / 0 |
+
+Up from 0.99 on 20260914 (that run's one miss was the "lemon tree" break-even item).
+
+Environment notes for the next round: `zz-nmz26`'s `rye_sglang_latest` now points its editable
+sglang at `/home/proj_sglang_fork/sglang-das` (a feature branch), so validation moved to
+`zz-nmz110`. Neither nmz110 container has evalscope, so GSM8K ran from `zz-nmz26` /
+`rye_sglang_open` (evalscope 1.10.0) against `http://12.12.12.110:10015`. The shared
+`/home/scripts/sglang/run_dpsk-v4.sh` still passes `--cuda-graph-max-bs`, which upstream split
+into `--cuda-graph-max-bs-decode` / `-prefill` (argparse: ambiguous option), and it has no
+interface mapping for nmz110 (`ens65f0np0`); both were fixed in a private copy under
+`/home/proj_sglang_open/scripts_local/` rather than in the shared script.

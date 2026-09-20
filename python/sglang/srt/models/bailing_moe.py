@@ -33,8 +33,6 @@ from transformers import PretrainedConfig
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed import (
-    get_pp_group,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -73,6 +71,10 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
     is_sbo_enabled,
+)
+from sglang.srt.layers.multi_gate import (
+    create_multi_gate_mm_indices,
+    multi_gate_triton_kernel,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -257,6 +259,9 @@ class BailingMoESparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_deepep()
             else config.num_shared_experts
         )
+        self.multi_gate = getattr(config, "multi_gate", False) or (
+            getattr(config, "router_type", "topN") == "MultiRouter"
+        )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -299,6 +304,43 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.gate.expert_bias.data if self.gate.expert_bias is not None else None
         )
 
+        self.image_gate = None
+        self.audio_gate = None
+        self.image_correction_bias = None
+        self.audio_correction_bias = None
+        if self.multi_gate:
+            self.image_gate = BailingMoEGate(
+                config=config,
+                params_dtype=self.router_dtype,
+                prefix=add_prefix("image_gate", prefix),
+            )
+            self.audio_gate = BailingMoEGate(
+                config=config,
+                params_dtype=self.router_dtype,
+                prefix=add_prefix("audio_gate", prefix),
+            )
+            self.image_correction_bias = (
+                self.image_gate.expert_bias.data
+                if self.image_gate.expert_bias is not None
+                else None
+            )
+            self.audio_correction_bias = (
+                self.audio_gate.expert_bias.data
+                if self.audio_gate.expert_bias is not None
+                else None
+            )
+            if any(
+                bias is None
+                for bias in (
+                    self.correction_bias,
+                    self.image_correction_bias,
+                    self.audio_correction_bias,
+                )
+            ):
+                raise ValueError(
+                    "Bailing MultiRouter requires expert bias for text, image, and audio gates"
+                )
+
         if self.score_function is not None:
             assert (
                 self.score_function == "softmax" and self.correction_bias is None
@@ -326,6 +368,8 @@ class BailingMoESparseMoeBlock(nn.Module):
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             quant_config=quant_config,
+            scoring_func=self.score_function
+            or ("sigmoid" if self.correction_bias is not None else "softmax"),
             routed_scaling_factor=self.routed_scaling_factor,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
         )
@@ -369,7 +413,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.ep_size = get_parallel().tp_size
 
             self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -392,6 +436,7 @@ class BailingMoESparseMoeBlock(nn.Module):
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(
                 hidden_states,
+                forward_batch,
                 moe_i_q=moe_i_q,
                 moe_i_s=moe_i_s,
             )
@@ -426,16 +471,55 @@ class BailingMoESparseMoeBlock(nn.Module):
             shared_output = self.shared_experts(shared_input)
         return shared_output
 
+    def _forward_gate(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            self.multi_gate
+            and forward_batch is not None
+            and forward_batch.mm_token_modalities is not None
+        ):
+            if forward_batch.mm_token_modalities.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Bailing modality metadata must align with MoE tokens: "
+                    f"modalities={forward_batch.mm_token_modalities.shape[0]}, "
+                    f"hidden_states={hidden_states.shape[0]}"
+                )
+            if forward_batch.multi_gate_indices is None:
+                forward_batch.multi_gate_indices = create_multi_gate_mm_indices(
+                    forward_batch.mm_token_modalities
+                )
+            return multi_gate_triton_kernel(
+                hidden_states,
+                forward_batch.multi_gate_indices,
+                self.gate.weight,
+                self.image_gate.weight,
+                self.audio_gate.weight,
+                self.correction_bias,
+                self.image_correction_bias,
+                self.audio_correction_bias,
+            )
+        return self.gate(hidden_states), None
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         shared_output: Optional[torch.Tensor] = None,
         moe_i_q: Optional[torch.Tensor] = None,
         moe_i_s: Optional[torch.Tensor] = None,
     ):
         # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        router_logits, dynamic_expert_bias = self._forward_gate(
+            hidden_states, forward_batch
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            dynamic_expert_bias=dynamic_expert_bias,
+        )
         return self.experts(
             hidden_states,
             topk_output,
@@ -447,6 +531,7 @@ class BailingMoESparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         moe_i_q: Optional[torch.Tensor] = None,
         moe_i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -463,7 +548,7 @@ class BailingMoESparseMoeBlock(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             router_output = self._forward_router_experts(
-                hidden_states, moe_i_q=moe_i_q, moe_i_s=moe_i_s
+                hidden_states, forward_batch, moe_i_q=moe_i_q, moe_i_s=moe_i_s
             )
         current_stream.wait_stream(self.alt_stream)
 
@@ -472,6 +557,7 @@ class BailingMoESparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         moe_i_q: Optional[torch.Tensor] = None,
         moe_i_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -485,12 +571,13 @@ class BailingMoESparseMoeBlock(nn.Module):
             and get_is_capture_mode()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states, moe_i_q=moe_i_q, moe_i_s=moe_i_s
+                hidden_states, forward_batch, moe_i_q=moe_i_q, moe_i_s=moe_i_s
             )
         else:
             if self.num_fused_shared_experts > 0:
                 final_hidden_states = self._forward_router_experts(
                     hidden_states,
+                    forward_batch,
                     moe_i_q=moe_i_q,
                     moe_i_s=moe_i_s,
                 )
@@ -504,6 +591,7 @@ class BailingMoESparseMoeBlock(nn.Module):
                 if not _use_fused_bailing_moe_sum_add:
                     final_hidden_states = self._forward_router_experts(
                         hidden_states,
+                        forward_batch,
                         moe_i_q=moe_i_q,
                         moe_i_s=moe_i_s,
                     )
@@ -512,7 +600,8 @@ class BailingMoESparseMoeBlock(nn.Module):
                 else:
                     final_hidden_states = self._forward_router_experts(
                         hidden_states,
-                        shared_output,
+                        forward_batch,
+                        shared_output=shared_output,
                         moe_i_q=moe_i_q,
                         moe_i_s=moe_i_s,
                     )
@@ -561,10 +650,13 @@ class BailingMoESparseMoeBlock(nn.Module):
                     )
                     shared_output = self.shared_experts(shared_input)
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
+            router_logits, dynamic_expert_bias = self._forward_gate(
+                hidden_states, forward_batch
+            )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                dynamic_expert_bias=dynamic_expert_bias,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
@@ -793,6 +885,7 @@ class BailingMoEAttention(nn.Module):
             base=config.rope_parameters["rope_theta"],
             rope_scaling=config.rope_parameters,
         )
+        self.is_mrope_enabled = "mrope_section" in config.rope_parameters
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -830,6 +923,7 @@ class BailingMoEAttention(nn.Module):
         can_fuse_set_kv = (
             self.head_dim == self.rotary_emb.rotary_dim
             and enable_fused_set_kv_buffer(forward_batch)
+            and not self.is_mrope_enabled
         )
         if self.use_qk_norm and not _use_fused_bailing_rms_rotary:
             q, k = apply_qk_norm(
@@ -1107,11 +1201,14 @@ class BailingMoEModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
-        if self.pp_group.is_first_rank:
+        keep_word_embeddings = self.pp_group.is_first_rank or (
+            config.tie_word_embeddings and self.pp_group.is_last_rank
+        )
+        if keep_word_embeddings:
             self.word_embeddings = VocabParallelEmbedding(
                 self.vocab_size,
                 self.embed_dim,
@@ -1209,8 +1306,7 @@ class BailingMoEForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
-
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda or is_sbo_enabled() else None
@@ -1243,6 +1339,9 @@ class BailingMoEForCausalLM(nn.Module):
         )
 
         self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self):
+        return self.model.word_embeddings
 
     @property
     def start_layer(self):
@@ -1312,6 +1411,10 @@ class BailingMoEForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        replaced_params_mapping = {
+            "key_layernorm": "k_norm",
+            "query_layernorm": "q_norm",
+        }
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -1353,6 +1456,10 @@ class BailingMoEForCausalLM(nn.Module):
                     "mlp.shared_experts",
                     f"mlp.experts.{self.config.num_experts}",
                 )
+            for param_name, weight_name in replaced_params_mapping.items():
+                if weight_name in name:
+                    name = name.replace(weight_name, param_name)
+                    break
 
             if is_nextn:
                 if not name.startswith(nextn_layer_prefix):
