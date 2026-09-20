@@ -183,6 +183,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -451,13 +452,8 @@ def _apply_wo_a_bf16_matmul(
     fuse_mxfp8_quant: bool = False,
     is_prefill: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
-    """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
-
-    Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
-    verify batches up to 384 rows and large prefill batches write token-major
-    output directly to avoid the layout copy before wo_b. ROCm decode can use
-    aiter batched GEMM; other cases use torch.einsum.
-    """
+    # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
+    # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
     if (
         _is_cuda
@@ -495,9 +491,8 @@ def _apply_wo_a_bf16_matmul(
         result = torch.empty(
             (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
         )
-        # cuBLAS accepts the strided destination, preserving the einsum
-        # reduction while producing the contiguous layout consumed by wo_b.
-        # Draft warmup/capture can enter with grad tracking enabled.
+        # The strided destination keeps the einsum reduction while producing the
+        # layout wo_b consumes; draft warmup/capture can enter with grad enabled.
         with torch.no_grad():
             torch.bmm(
                 o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
@@ -728,8 +723,7 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
-    # The compressor and prefill indexer sync with the host: run them outside
-    # the prefill CUDA graph on the live batch, like the attention.
+    # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens == 0:
@@ -747,8 +741,7 @@ bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_s
 
 
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
-    # The hasher reads per-request rows: run it outside the prefill CUDA graph
-    # on the live batch.
+    # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     return hasher(input_ids, forward_batch)
 
@@ -757,7 +750,7 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 
 class MqaAttentionBase(nn.Module):
-    # Read on paths main's fixtures reach without running __init__.
+    # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
 
     def __init__(
@@ -920,7 +913,7 @@ class MqaAttentionBase(nn.Module):
             # that is aiter's B-preshuffle, which silently permutes the weight
             # in place (same shape, dtype and strides) and makes this GEMM
             # return noise.
-            self.wo_a.skip_aiter_bpreshuffle = True
+            self.wo_a.keep_plain_weight_layout = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1154,8 +1147,7 @@ class MQALayer(MqaAttentionBase):
                     fp4_sin=(self.sin_cache[:, 0, 0, :] if _is_hip else None),
                 )
         elif self.compress_ratio in (1, 2):
-            # V4.1: only kv_source layers compress and only index_source layers
-            # score; the layers in between read both through the attention backend.
+            # The layers in between read both through the attention backend.
             if self.layer_id in config.kv_source_layer_ids:
                 self.compressor = DeepseekV41Compressor(
                     hidden_size=config.hidden_size,
@@ -1252,8 +1244,7 @@ class MQALayer(MqaAttentionBase):
     def _normalize_q_lora(
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
-        # Keep the BF16 normalized row for the indexer while emitting the
-        # quantized input consumed by wq_b in the same launch.
+        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         method = self.wq_b.quant_method
         if (
             _is_cuda
@@ -1478,12 +1469,8 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """Decode / target-verify prepare of a compress-ratio 1/2 layer: the
-        compressor and indexer (``forward_low_ratio_sources``) run on one side
-        stream, the fused KV-cache write on another, and only the Q chain stays
-        on the current stream. Both side streams are joined before returning;
-        attention is the first reader of anything written on them, and no
-        tensor they read is released before the join."""
+        # Both side streams are joined before returning, and nothing they read is
+        # released before the join.
         assert self.alt_streams is not None
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
@@ -2120,10 +2107,8 @@ class MQALayer(MqaAttentionBase):
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
                 if self.is_dsv41:
-                    # The V4.1 kernels read all padded heads, so the padding must be zero.
-                    # Each layer overwrites real heads and leaves padding zero. Reuse requires
-                    # all consumers on the layer's stream and no retained reference after return;
-                    # a side-stream consumer would need an event before the next layer writes.
+                    # V4.1 kernels read all padded heads, so the padding must be
+                    # zero. The buffer is reused per layer; no consumer may keep it.
                     want = (x.shape[0], kernel_num_heads, self.head_dim)
                     meta = getattr(attn_backend, "forward_metadata", None)
                     q_padded = getattr(meta, "q_pad_buffer", None)
@@ -2437,7 +2422,7 @@ class MQALayer(MqaAttentionBase):
 
 @contextmanager
 def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
-    """Route every all-gathered row: under CP the real rows are not a prefix."""
+    # Under CP the real rows are not a prefix, so every row must be routed.
     saved = (
         forward_batch.num_token_non_padded,
         forward_batch.global_num_token_non_padded_cpu,
@@ -2528,8 +2513,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
-        # The fused post+pre boundary bakes in the same-sublayer pre-mix, which
-        # the predecessor-pre scheme cannot express.
+        # The fused post+pre boundary bakes in the same-sublayer pre-mix.
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
@@ -2575,8 +2559,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
-        # Rebuilt after weight loading, like the norm cache above. Keep the
-        # original FP32 parameters intact for small rows and invariant mode.
+        # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
@@ -3065,11 +3048,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         normalized: Optional[torch.Tensor] = None,
         precomputed: Optional[tuple] = None,
     ) -> torch.Tensor:
-        """Collapse and normalize on the main stream, then fork tiny-row stats.
-
-        Preserve the fused quantization and cross-layer precomputed inputs.
-        Record the stats themselves immediately before their consuming join.
-        """
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         quantize = quantized is not None
@@ -3108,9 +3086,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
-                # The fused scale writer supports the small decode/verify
-                # tile only. Large prefill keeps its one-CTA-per-row norm and
-                # lets the projection quantize the full activation layout.
+                # The fused scale writer supports the small decode/verify tile only.
                 if quantize and x.shape[0] <= 8:
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
@@ -3141,7 +3117,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         stats_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Record coefficient work just before its join, preserving compensation."""
         from sglang.kernels.ops.layernorm.mhc import hc_mix_stats, hc_mix_stats_sinkhorn
 
         x_flat = x.flatten(1)
@@ -3155,8 +3130,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             and x.dtype == torch.bfloat16
         ):
-            # The split-K partial fixes the reduction order;
-            # fusing the reduction and sinkhorn preserves batch invariance.
+            # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
             main_stream = torch.cuda.current_stream()
             if stats_stream is not None:
                 x.record_stream(stats_stream)
@@ -3223,14 +3197,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_eps,
                     )
             if stats_stream is not None:
-                # These allocations originate on the side stream and are read
-                # after the caller joins it, on the main stream.
+                # Allocated on the side stream, read on the main stream after the join.
                 for coefficient in (pre, post, comb):
                     coefficient.record_stream(main_stream)
             return pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
-            # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch reductions can
-            # change order with num_tokens. Kernel upcasts let x_flat remain a bf16 view.
+            # cuBLAS/torch reductions can change order with num_tokens; this kernel
+            # keeps the mixing and RMS reductions batch-invariant.
             mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
         else:
             x_flat = x_flat.float()
@@ -3272,8 +3245,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def _get_hc_stats_stream(self, hidden_states, forward_batch):
-        # Verify batches can also compute coefficients beside the
-        # sublayer; each branch joins before hc_post reads those coefficients.
+        # Every branch joins this stream before hc_post reads the coefficients.
         return (
             self.hc_stats_stream
             if (
@@ -3299,8 +3271,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         next_norm: Optional[RMSNorm] = None,
         next_input: Optional[list] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Layer forward where attention consumes the previous FFN's pre-mix and
-        the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
+        """Layer forward where each sublayer consumes the previous sublayer's
+        pre-mix. Returns (hidden_states, ffn_pre)."""
         from functools import partial
 
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
@@ -3886,8 +3858,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
-    # Rows outside the tail are never read (see _check_late_layer_tail_readers),
-    # so the buffer is left uninitialized: one copy, no fill.
+    # Rows outside the tail are never read (see _check_late_layer_tail_readers).
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
         full[tail.contiguous_start :].copy_(rows)
@@ -3947,16 +3918,15 @@ class DeepseekV4Model(nn.Module):
             if use_stream_pool
             else None
         )
-        # One stream for every layer's routed-MoE input pre-quant, separate from
-        # the attention/indexer streams and the shared expert's; each layer joins
-        # it (event wait) before its routed MoE op.
+        # Routed-MoE input pre-quant, separate from the attention/indexer and
+        # shared-expert streams.
         self.moe_routed_quant_stream = (
             device_module.Stream()
             if _is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             else None
         )
-        # One shared stream for all layers, separate from attention/indexer and
-        # shared-expert streams. Every sublayer joins before reusing its residual.
+        # One shared stream for all layers; every sublayer joins it before
+        # reusing its residual.
         self.hc_stats_stream = (
             device_module.Stream()
             if _is_cuda
@@ -4073,8 +4043,7 @@ class DeepseekV4Model(nn.Module):
         )
 
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
-        # Rows outside the tail are never computed past the last kv_source layer,
-        # so anything reading hidden states of earlier prompt tokens cannot be served.
+        # Rows outside the tail are never computed past the last kv_source layer.
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
@@ -4145,8 +4114,7 @@ class DeepseekV4Model(nn.Module):
         precomputed_attn = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
-                # Past the last kv_source layer a layer only owes its window KV,
-                # and decode reaches back at most SWA_WINDOW positions.
+                # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 hidden_states, prev_pre, input_ids, input_ids_global = (
                     tail.rows(hidden_states),
@@ -4528,6 +4496,17 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+        if (
+            _is_hcu
+            and get_disagg().disaggregation_mode in ("prefill", "decode")
+            and config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+        ):
+            logger.info(
+                "Disabling the DeepSeek-V4.1 vision tower for HCU PD text serving; "
+                "the V4.1 vision path does not support CP or MoE A2A."
+            )
+            config.vision_n_layers = 0
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -4592,14 +4571,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @torch.inference_mode()
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
-        """Tune resident MXFP8 linears without touching request/KV/draft state.
-
-        FlashInfer covers all M buckets through ``num_tokens`` from one call.
-        Decode/verify warmup only covers small M; the untuned large-M heuristic
-        can be substantially slower. Tune each distinct weight layout once and
-        call the quantization method directly to avoid TP collectives and model
-        side effects. The runner owns the synchronized autotune context.
-        """
+        """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
+        The quant method is called directly, so no TP collectives run and no
+        request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
         seen = set()
@@ -4613,15 +4587,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             if method.block_fp8_as_mxfp8 and not getattr(
                 layer, "block_fp8_mxfp8_ready", False
             ):
-                # Some weights have a model-specific consumer or retain the
-                # block-FP8 fallback; they have no swizzled MXFP8 scale buffer.
+                # No swizzled MXFP8 scale buffer: these kept the block-FP8 fallback.
                 continue
             backend = method.mxfp8_dense_backend
             if backend is None or not backend.is_flashinfer_cutedsl():
                 continue
             if method.block_fp8_as_mxfp8:
-                # Tune large row counts; small decode/verify shapes and
-                # deterministic execution retain their pinned tactic.
+                # Small shapes and deterministic execution keep their pinned tactic.
                 method.mxfp8_prefill_autotune_min_tokens = 4096
             weight = layer.weight
             scale = layer.weight_scale_inv_swizzled
@@ -4777,8 +4749,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
-            # Decode/verify IDs are already vocabulary IDs. Remap prompt image
-            # hashes for Engram and routing without changing the scheduler's IDs.
+            # Decode/verify IDs are already vocabulary IDs; remap prompt image
+            # hashes for Engram and routing.
             input_ids = input_ids.masked_fill(
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
@@ -4846,7 +4818,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
                 # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured skip_aiter_bpreshuffle: a
+                # check the linear method honoured keep_plain_weight_layout: a
                 # preshuffled weight has the same shape, dtype and strides and
                 # would only show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
@@ -5087,8 +5059,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         skipped_by_group: dict[str, int] = {}
-        # The skip list below is DeepSeek V4.1 only; V4 checkpoints must load
-        # every compressor / indexer tensor.
+        # V4 checkpoints must load every compressor / indexer tensor.
         is_dsv41 = getattr(self.config, "model_type", None) == "deepseek_v41"
 
         def auto_weight_loader(module):
@@ -5166,8 +5137,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
 
-                    # V4.1 checkpoint tensors with no module in the text model yet;
-                    # the per-group count is logged after loading.
+                    # V4.1 checkpoint tensors with no module in the text model yet.
                     skip_group = None
                     if not is_dsv41:
                         pass
@@ -5327,8 +5297,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and (name.rsplit(".", 2)[0] + ".wkv_gate.weight")
                                 in params_dict
                             ):
-                                # Concatenate checkpoint wkv/wgate whenever the target owns wkv_gate;
-                                # modules with split projections use per-parameter loading.
+                                # Split-projection modules load per parameter instead.
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
                                 assert is_kv != is_wgate
@@ -5529,8 +5498,7 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
-    # Block size is per-checkpoint (V4 128x128, V4.1 32x32); take it from the
-    # weight/scale shapes.
+    # Block size is per-checkpoint: V4 128x128, V4.1 32x32.
     bn = weight.shape[0] // scale.shape[0]
     bk = weight.shape[1] // scale.shape[1]
     weight_f32 = rearrange(

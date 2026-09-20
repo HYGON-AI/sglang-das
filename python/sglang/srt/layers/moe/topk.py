@@ -29,6 +29,7 @@ from typing import (
     Protocol,
     Tuple,
     TypeGuard,
+    Union,
     runtime_checkable,
 )
 
@@ -357,6 +358,8 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
+    sqrtsoftplus_log1p: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -393,10 +396,9 @@ class TopKConfig:
 
 class TopKOutputChecker:
     @staticmethod
-    def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        # StandardTopKOutputPacked is the standard (weights, ids, logits) triple
-        # plus the FlashInfer routed-MoE packed ids the router emitted alongside
-        # them; every standard-format consumer reads it by field name.
+    def format_is_standard(
+        topk_output: TopKOutput,
+    ) -> TypeGuard[Union[StandardTopKOutput, StandardTopKOutputPacked]]:
         return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
@@ -443,13 +445,8 @@ class StandardTopKOutput(NamedTuple):
         return TopKOutputFormat.STANDARD
 
 
-# Standard top-k output carrying, in addition, the FlashInfer routed-MoE packed
-# topk ``(id << 16) | bf16_bits(weight)`` that the gating kernel produced in the
-# same launch (the sqrtsoftplus Triton router under the flashinfer_mxfp4 runner
-# backend, and the experimental Qwen3 fused topk+pack). Kept a SEPARATE type
-# rather than a 4th StandardTopKOutput field so the `a, b, _ = topk_output`
-# 3-tuple unpack in runners that never see it stays valid; consumers read
-# .packed_topk_ids via _get_packed_topk_ids_for_flashinfer_routed (getattr).
+# Standard top-k output plus the FlashInfer routed-MoE packed ids that
+# ``moe_fused_gate`` writes; a separate type keeps the 3-tuple unpack valid.
 class StandardTopKOutputPacked(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -663,6 +660,7 @@ class TopK(BaseFusedOp):
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
         allow_routed_experts_capture: bool = True,
+        sqrtsoftplus_log1p: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -701,6 +699,7 @@ class TopK(BaseFusedOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            sqrtsoftplus_log1p=sqrtsoftplus_log1p,
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
@@ -1497,6 +1496,7 @@ def biased_topk_jit_kernel_impl(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
     packed_out: Optional[torch.Tensor] = None,
+    sqrtsoftplus_log1p: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -1540,17 +1540,14 @@ def biased_topk_jit_kernel_impl(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            # The router masks rows >= num_token_non_padded itself (id -1,
-            # weight 0), saving the post-process mask launch; see
-            # _fused_gate_masks_padded_rows for why this is sqrtsoftplus-only.
             num_token_non_padded=(
                 num_token_non_padded
                 if _fused_gate_masks_padded_rows(scoring_func)
                 else None
             ),
-            # Optional FlashInfer routed-MoE packed ids, written in the same
-            # launch (see _fused_gate_emits_packed_ids).
+            # Optional FlashInfer routed-MoE packed ids, written in the same launch.
             packed_out=packed_out,
+            sqrtsoftplus_log1p=sqrtsoftplus_log1p,
         )
         topk_weights, topk_ids = (
             topk_weights.to(torch.float32),
@@ -1759,18 +1756,8 @@ def _eplb_remap_enabled() -> bool:
 
 
 def _fused_gate_masks_padded_rows(scoring_func: str) -> bool:
-    """Whether the CUDA sqrtsoftplus router masks its own padded rows.
-
-    ``moe_fused_gate``'s Triton kernel already implements ``num_token_non_padded``
-    (rows >= it get id -1 and weight 0, ``HAS_PADDING``), so on this path the
-    count is handed to the router and :func:`_post_process_topk_ids` skips the
-    separate ``mask_topk_ids_padded_region`` launch. Live rows are bitwise
-    unchanged (the kernel only adds a final ``tl.where``); padded rows get the
-    same -1 ids and a 0 weight instead of a stale one, which every consumer of
-    a -1 id ignores. Restricted to sqrtsoftplus (DeepSeek-V4): on the sigmoid
-    path a padding count would bypass the Kimi-K3 radix fast path, which does
-    not take one, and on HIP the post-process fills padded ids with 0, not -1.
-    """
+    # Sigmoid is excluded: a padding count bypasses moe_fused_gate's radix fast
+    # path, and HIP fills padded ids with 0, not -1.
     return _is_cuda and not _use_aiter and scoring_func == "sqrtsoftplus"
 
 
@@ -1780,17 +1767,8 @@ def _fused_gate_emits_packed_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     routing_overridden: bool,
 ) -> bool:
-    """Whether the sqrtsoftplus router also writes the FlashInfer routed-MoE
-    packed ids ``(id << 16) | bf16_bits(weight)``, replacing the separate
-    ``PackTopkIds`` launch in ``Mxfp4FlashinferTrtllmMoEMethod.apply``.
-
-    Same admission as the Qwen3 fused topk+pack precedent: the pack is taken
-    from the router's final (renormalized, scaled, padding-masked) values, so
-    nothing may rewrite ids or weights afterwards -- no EPLB logical->physical
-    remap, no fused shared-expert slots (which also implies waterfill is off),
-    no benchmark routing override. Only the flashinfer_mxfp4 runner backend
-    consumes the packed form.
-    """
+    # The pack is taken from the router's final values, so every condition here
+    # rules out a later rewrite of ids or weights.
     return (
         _fused_gate_masks_padded_rows(scoring_func)
         and get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -2456,11 +2434,6 @@ def _post_process_topk_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``padded_rows_masked``: the router already wrote id -1 / weight 0 into
-    rows >= ``num_token_non_padded`` (see :func:`_fused_gate_masks_padded_rows`),
-    so the CUDA identity-remap branch skips its mask launch. Every branch that
-    remaps ids keeps the mask: a remap table indexed by -1 aliases its last
-    entry, so the mask must run after it."""
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
         num_fused_shared_experts
@@ -2506,6 +2479,8 @@ def _post_process_topk_ids(
             # space, so keep the routed physical ids separately for statistics.
             recorder_topk_ids = routed_cols
         else:
+            # A remap table indexed by -1 aliases its last entry, so only the
+            # identity-remap branch may drop the padded-row mask.
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,
                 expert_location_dispatch_info,
@@ -2679,8 +2654,7 @@ def select_experts(
 
     # Set by the fused-gating+pack branches below; None everywhere else.
     packed_topk = None
-    # True when the router itself masked rows >= num_token_non_padded, so the
-    # post-process can skip its mask launch (see _fused_gate_masks_padded_rows).
+    # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
@@ -2779,18 +2753,25 @@ def select_experts(
         ):
             if _is_xpu:
                 _biased_topk = biased_topk_xpu
-            elif scoring_func == "sqrtsoftplus" and _can_use_lightop_sqrtsoftplus_gate(
-                router_logits,
-                correction_bias,
-                num_routed_topk if _use_aiter else top_k,
-                num_fused_shared_experts,
-                routed_scaling_factor,
+            elif (
+                scoring_func == "sqrtsoftplus"
+                and not topk_config.sqrtsoftplus_log1p
+                and _can_use_lightop_sqrtsoftplus_gate(
+                    router_logits,
+                    correction_bias,
+                    num_routed_topk if _use_aiter else top_k,
+                    num_fused_shared_experts,
+                    routed_scaling_factor,
+                )
             ):
                 _biased_topk = biased_topk_lightop_impl
             else:
+                # DeepSeek-V4.1 requires the log1p/NaN-ordering variant, which is
+                # currently implemented by the fused Triton gate but not LightOp
+                # or the torch.compile fallback.
                 _biased_topk = (
                     biased_topk_jit_kernel_impl
-                    if use_jit_fused_gate
+                    if use_jit_fused_gate or topk_config.sqrtsoftplus_log1p
                     else biased_topk_impl
                 )
 
@@ -2807,6 +2788,8 @@ def select_experts(
                     device=hidden_states.device,
                 )
                 _packed_kwargs = dict(packed_out=packed_topk)
+            if topk_config.sqrtsoftplus_log1p:
+                _packed_kwargs["sqrtsoftplus_log1p"] = True
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

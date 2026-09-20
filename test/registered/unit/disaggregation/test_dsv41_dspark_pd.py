@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -187,6 +188,56 @@ class TestDSV41DSparkPD(CustomTestCase):
                     device_module.assert_not_called()
                     self.assertEqual(req.output_ids, [7, 8])
                     self.assertEqual(queue.retracted_queue, [req])
+
+
+    def test_idle_draft_participation_uses_draft_backend_context(self):
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        worker = object.__new__(DSparkWorkerV2)
+        worker._draft_is_moe = True
+        worker._observers = Mock()
+        worker._proposer = Mock()
+        worker._verify_executor = Mock()
+        worker._idle_verify_ragged_layout = Mock(return_value=None)
+        expected = object()
+        worker._decode_idle_result = Mock(return_value=expected)
+
+        active = False
+
+        @contextmanager
+        def draft_context():
+            nonlocal active
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        worker._draft_context = Mock(side_effect=draft_context)
+
+        def assert_draft_context(_batch):
+            self.assertTrue(active)
+
+        worker._proposer.run_idle_participation.side_effect = assert_draft_context
+        batch = SimpleNamespace(
+            spec_info=object.__new__(DFlashDraftInputV2),
+            forward_mode=SimpleNamespace(is_idle=Mock(return_value=True)),
+        )
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+            return_value=SimpleNamespace(enable_dp_attention=True),
+        ):
+            result = worker._forward_decode(batch, on_publish=None)
+
+        self.assertIs(result, expected)
+        worker._draft_context.assert_called_once_with()
+        worker._proposer.run_idle_participation.assert_called_once_with(batch)
+        worker._verify_executor.run_idle_participation.assert_called_once_with(
+            batch=batch, idle_layout=None
+        )
 
 
 if __name__ == "__main__":

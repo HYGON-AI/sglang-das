@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -253,7 +254,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
-    """Reject the server features DeepSeek-V4.1 cannot serve yet."""
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
@@ -309,8 +309,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
-        # The trtllm-gen path serves swa/c4/c128 only; V4.1's ratio-1/2 layers
-        # and the encoder replay request window have no uniform-FP8 pool.
+        # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
         ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
@@ -328,13 +327,39 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        if (
+        common_invalid = (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.dcp_size != 1
+        )
+        if is_hcu():
+            if cfg.disaggregation_mode == "prefill":
+                topology_invalid = not (
+                    cfg.dp_size == 1
+                    and cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == cfg.tp_size
+                )
+                topology = "P requires DP=1 and interleave prefill CP=TP"
+            else:
+                topology_invalid = not (
+                    cfg.disaggregation_mode == "decode"
+                    and cfg.dp_size == cfg.tp_size
+                    and cfg.enable_dp_attention
+                    and not cfg.enable_prefill_cp
+                    and cfg.attn_cp_size == 1
+                )
+                topology = "D requires DP=TP, DP attention and CP=1"
+            if common_invalid or topology_invalid:
+                raise ValueError(
+                    "DeepSeek-V4.1 DSpark PD on HCU requires static verify, "
+                    f"Mooncake and DCP=1; {topology}. Both servers must use "
+                    "the same DSpark block size and TP size."
+                )
+        elif (
+            common_invalid
             or cfg.dp_size != 1
             or cfg.enable_dp_attention
             or cfg.attn_cp_size != 1
-            or cfg.dcp_size != 1
             or cfg.enable_prefill_context_parallel
         ):
             raise ValueError(
@@ -364,15 +389,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     if cfg.enable_decoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
-        # The late layers see a per-request tail slice, so their token count is
-        # no longer the captured prefill shape.
+        # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
+            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
             ("DP attention", cfg.enable_dp_attention),
         )
         for feature, enabled in incompatible:
