@@ -551,6 +551,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            logger.info(
+                "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d, "
+                "capture_num_tokens=%s",
+                get_parallel().cp_strategy,
+                get_parallel().attn_cp_size,
+                self.capture_num_tokens,
+            )
         if self.max_context_size is not None and not (
             model_runner.attn_backend.supports_prefill_cuda_graph_max_context_size
         ):
@@ -1302,6 +1309,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._has_inactive_dp_rank(forward_batch):
             return False
 
+        # A batch can be too small to activate CP. Its unsharded inputs must
+        # not replay a model body captured with CP-local rows.
+        if getattr(self, "enable_cp_bcg_capture", False) and not is_cp_active(
+            forward_batch
+        ):
+            return False
+
         # Non-DP local check (sole decision for tp-only).
         batch_max_context_len = (
             self._batch_max_context_len(forward_batch)
@@ -1988,6 +2002,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
+
+        # Same MegaMoE valid-token refresh the decode graph runner performs.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                set_mega_moe_cuda_graph_num_tokens,
+            )
+
+            set_mega_moe_cuda_graph_num_tokens(raw_num_tokens)
 
         original_layer_forward = self.layer_model.forward
         self.layer_model.forward = replay_layer_forward

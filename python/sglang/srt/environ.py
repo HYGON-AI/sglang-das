@@ -1531,6 +1531,9 @@ class Envs:
     # CUDA graphs and execution buffers
     # ===================================================================
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Legacy alias of --cuda-graph-prefill-max-context (0 = unset); only read
+    # when the flag is not given.
+    SGLANG_BCG_PREFILL_MAX_CONTEXT = EnvInt(0)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
