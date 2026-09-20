@@ -1569,9 +1569,20 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
-                self.forward_pass_id,
-                forward_batch,
+            # Dense DSpark drafts run only on active DP groups; recording them
+            # inserts unmatched world collectives and overwrites target counts.
+            (
+                get_global_expert_distribution_recorder().disable_this_region()
+                if self.is_draft_worker
+                else contextlib.nullcontext()
+            ),
+            (
+                contextlib.nullcontext({})
+                if self.is_draft_worker
+                else get_global_expert_distribution_recorder().with_forward_pass(
+                    self.forward_pass_id,
+                    forward_batch,
+                )
             ) as recorder_outputs,
         ):
             output = self._forward_raw(
