@@ -28,6 +28,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import (
     k3_ar_fusion,
     k3_gemm_ar,
@@ -67,6 +69,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -152,6 +155,7 @@ _KIMI_K3_PACKED_MODULES_MAPPING: Dict[str, List[str]] = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
 }
+
 
 def kimi_k3_fuse_g_into_qkvg(quant_config: Optional[QuantizationConfig]) -> bool:
     """Whether full-rank KDA may fuse g into ``fused_qkvg_proj``.
@@ -417,6 +421,17 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
+    def get_moe_weights(self):
+        # Resolve after loading, which replaces Parameters during packing.
+        return [
+            parameter.data
+            for name, parameter in self.experts.named_parameters()
+            if name != "correction_bias"
+            and filter_moe_weight_param_global_expert(
+                name, parameter, self.experts.num_local_experts
+            )
+        ]
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -464,7 +479,10 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=(
+                (getattr(config, "n_routed_experts", None) or config.num_experts)
+                + get_exec().moe.ep_num_redundant_experts
+            ),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -485,6 +503,7 @@ class KimiK3MoE(nn.Module):
         )
 
         self.topk = TopK(
+            layer_id=self.layer_idx,
             top_k=config.num_experts_per_token,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
@@ -602,6 +621,7 @@ class KimiK3MoE(nn.Module):
         # ModelSlim W4A8: latent 投影是量化的，必须带 quant_config。
         # MXFP4 / compressed-tensors: latent 投影是 bf16，必须 UnquantizedLinearMethod。
         from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+
         latent_quant_config = (
             quant_config if isinstance(quant_config, ModelSlimConfig) else None
         )
@@ -855,6 +875,9 @@ class KimiK3MoE(nn.Module):
         # select_experts' post-processing collapses to the capture hook and the
         # recorder -- both of which build_precomputed_topk_output runs. Bail out
         # if that ever stops holding rather than silently dropping the remap.
+        # Fused routing does not apply logical-to-physical expert remapping.
+        if get_exec().moe.ep_dispatch_algorithm is not None:
+            return False
         if not precomputed_topk_postprocess_is_noop(cfg):
             return False
         if get_exec().deterministic.enable_deterministic_inference:
@@ -944,7 +967,13 @@ class KimiK3MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
@@ -1007,7 +1036,13 @@ class KimiK3MoE(nn.Module):
             # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
 
         issue_shared()
 
@@ -1094,7 +1129,13 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1110,7 +1151,13 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1727,6 +1774,7 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
+
             def _fused_qkv_and_g():
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 if self.fuse_g_into_qkvg:
@@ -2732,7 +2780,27 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
+
     packed_modules_mapping = _KIMI_K3_PACKED_MODULES_MAPPING
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=getattr(config, "n_routed_experts", None)
+            or config.num_experts,
+            num_groups=getattr(config, "n_group", None)
+            or getattr(config, "num_expert_group", None),
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(self.model.start_layer, self.model.end_layer)
+            if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)
+        }
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3163,6 +3231,18 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if name.startswith("language_model."):
             name = name[len("language_model.") :]
         return name.replace("block_sparse_moe", "mlp")
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        if self.language_model is None:
+            return {}
+        return self.language_model.routed_experts_weights_of_layer
 
     def __init__(
         self,
