@@ -116,6 +116,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -279,6 +280,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
+        # Fixed context extent baked into captured attention metadata; batches
+        # with a longer context replay eagerly instead.
+        self.max_context_size = envs.SGLANG_BCG_PREFILL_MAX_CONTEXT.get() or None
+        table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
+        if self.max_context_size is not None and self.max_context_size > table_width:
+            raise ValueError(
+                "SGLANG_BCG_PREFILL_MAX_CONTEXT exceeds the request-to-token pool "
+                f"capacity: {self.max_context_size} > {table_width}"
+            )
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -473,6 +483,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            logger.info(
+                "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d, "
+                "capture_num_tokens=%s",
+                server_args.cp_strategy,
+                get_parallel().attn_cp_size,
+                self.capture_num_tokens,
+            )
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -1054,6 +1071,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return_logprob: bool,
         lora_ineligible: bool = False,
         chunked_prefix_uncapturable: bool = False,
+        batch_max_context_len: Optional[int] = None,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1097,6 +1115,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
             return False
+        # Hand-built runners (unit tests) may bypass __init__.
+        max_context_size = getattr(self, "max_context_size", None)
+        if max_context_size is not None and (
+            batch_max_context_len is None or batch_max_context_len > max_context_size
+        ):
+            return False
         if num_tokens is None:
             return True
         if num_tokens > self.max_num_tokens:
@@ -1107,6 +1131,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
         return True
+
+    @staticmethod
+    def _batch_max_context_len(forward_batch: ForwardBatch) -> Optional[int]:
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None:
+            if torch.is_tensor(seq_lens_cpu):
+                return int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() > 0 else 0
+            return max((int(value) for value in seq_lens_cpu), default=0)
+        seq_lens = forward_batch.seq_lens
+        if seq_lens is None or seq_lens.numel() == 0:
+            return None
+        return int(seq_lens.max().item())
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # DP check: group verdict from the schedule-time all-gather
@@ -1120,6 +1156,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        # A batch can be too small to activate CP. Its unsharded inputs must
+        # not replay a model body captured with CP-local rows.
+        if getattr(self, "enable_cp_v2_bcg_capture", False) and not is_cp_v2_active(
+            forward_batch
+        ):
             return False
 
         # Non-DP local check (sole decision for tp-only).
@@ -1143,6 +1186,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._capture_chunked_prefix
                 and self._has_prefix_hit(forward_batch)
                 and self._select_prefix_capture_chunks(forward_batch) is None
+            ),
+            batch_max_context_len=(
+                self._batch_max_context_len(forward_batch)
+                if getattr(self, "max_context_size", None) is not None
+                else None
             ),
         ):
             return False
@@ -1185,7 +1233,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        context_length = self.model_runner.model_config.context_len
+        model_context_length = self.model_runner.model_config.context_len
+        max_context_size = getattr(self, "max_context_size", None)
+        context_length = min(
+            max_context_size or model_context_length, model_context_length
+        )
         # A prefill bucket is an aggregate token count. Capture it as the
         # fewest synthetic requests, with every request containing no more
         # than context_length tokens.
@@ -1317,6 +1369,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # refreshes the static batch info with live values.
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
+                max_seq_len_override=getattr(self, "max_context_size", None),
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
@@ -1578,6 +1631,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_return_pooled_hidden_states
                 or forward_batch.return_pooled_hidden_states
             ),
+            max_seq_len_override=getattr(self, "max_context_size", None),
         )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
@@ -1685,6 +1739,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
+
+        # Same MegaMoE valid-token refresh the decode graph runner performs.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                set_mega_moe_cuda_graph_num_tokens,
+            )
+
+            set_mega_moe_cuda_graph_num_tokens(raw_num_tokens)
 
         original_layer_forward = self.layer_model.forward
         self.layer_model.forward = replay_layer_forward

@@ -1289,6 +1289,11 @@ class Envs:
     # CUDA graphs and execution buffers
     # ===================================================================
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Fixed context extent for breakable prefill CUDA graph attention metadata
+    # (0 = request-pool width, i.e. the model context). DSV4 otherwise sizes the
+    # captured page tables for the full context (e.g. 1M) on every replay; batches
+    # whose context exceeds the limit fall back to eager prefill.
+    SGLANG_BCG_PREFILL_MAX_CONTEXT = EnvInt(0)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)

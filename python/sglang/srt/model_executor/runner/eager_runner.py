@@ -401,6 +401,18 @@ class EagerRunner(BaseRunner):
                     cp_gather_after_forward(aux, forward_batch, stream)
                     for aux in aux_hidden_states
                 ]
+        # Models with a model-specific logits contract (DSV4: DSpark/PD aux
+        # packing) finish from the gathered body output themselves.
+        logits_from_body_output = getattr(model, "logits_from_body_output", None)
+        if logits_from_body_output is not None:
+            body_output = (
+                (hidden_states, aux_hidden_states)
+                if capture_aux_hidden_states
+                else hidden_states
+            )
+            return logits_from_body_output(
+                forward_batch.input_ids, body_output, forward_batch
+            )
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
