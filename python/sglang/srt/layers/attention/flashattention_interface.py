@@ -461,7 +461,11 @@ def vllm_flash_attn_varlen_func(
         and max_seqlen_q in (4, 8, 16)
         and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
         and q.dtype == torch.bfloat16
-        and k.dtype == v.dtype == torch.float8_e5m2
+        and k.dtype == v.dtype
+        and k.dtype in (
+            torch.bfloat16,
+            torch.float8_e5m2,
+        )
         and k.shape[2] == v.shape[3] == 64
         and q.shape[2] == k.shape[3] == v.shape[2]
         and "gfx936" in torch.cuda.get_device_properties(q.device).gcnArchName
