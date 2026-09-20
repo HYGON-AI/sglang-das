@@ -1,6 +1,12 @@
 name: Release Docker Images Nightly (Intel XPU)
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch, tag or commit to build (empty builds main).'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.branch || 'main' }}

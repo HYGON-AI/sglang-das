@@ -55,7 +55,7 @@ SGL_DEVICE bool elect_one_lane() {
 }
 
 // Kept for csrc/moe/moe_fused_gate.cuh: under ROCm these drop the mask and
-// use the width-aware builtins, which is what wave64 DCU needs.
+// use the width-aware builtins, which is what wave64 HCU needs.
 SGL_DEVICE void sync(mask_t active_mask = kFullMask) {
 #ifdef USE_ROCM
   __syncthreads();

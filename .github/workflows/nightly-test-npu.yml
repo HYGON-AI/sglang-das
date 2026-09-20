@@ -522,7 +522,9 @@ jobs:
 
   nightly-poc-multi-node-mix-tests-cann910:
     name: multi-node-mix-poc-cann910
-    if: false
+    # Off unless the repository variable is set to "true"; actionlint rejects a
+    # constant `if: false`, and an unset variable is an empty string.
+    if: ${{ vars.ENABLE_NPU_POC_MIX_TESTS == 'true' }}
     needs: [set-image-config, nightly-poc-multi-node-tests-cann910]
     strategy:
       fail-fast: false

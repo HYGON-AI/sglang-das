@@ -12,3 +12,5 @@ daf66f6670724b27e07f26b99514517d82e1a89f:python/sglang/multimodal_gen/runtime/mo
 # GLM 5.3 Flash kernels (#37477): torch dtype assertions on the index key tensor.
 c66a285c94bfeb224697560c88c936948f1fe923:python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py:generic-api-key:765
 c66a285c94bfeb224697560c88c936948f1fe923:python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py:generic-api-key:1641
+# Prefetch cache scoping (#39318): keyword arguments naming a token mask.
+dad8c074e76de83d8e39242aec49d7499181fa83:python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py:generic-api-key:256
