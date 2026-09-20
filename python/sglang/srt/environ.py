@@ -796,6 +796,9 @@ class Envs:
     # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
+    # Avoid nonzero synchronization when committing HCU FA prefix KV rows.
+    SGLANG_ENABLE_HCU_FA_PREFIX_VALID = EnvBool(False)
+
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk

@@ -73,6 +73,7 @@ _TRITON_KERNELS = [
     ("aiter_unified_attention", "scatter_req_to_token_to_page_table_kernel"),
     ("cache_move", "store_cache_4d"),
     ("cache_move", "set_kv_buffer_prefix_valid_tiled"),
+    ("cache_move", "set_kv_buffer_prefix_valid_hcu_fa"),
     ("cache_move", "copy_all_layer_kv_cache_tiled"),
     ("mla_buffer", "set_mla_kv_buffer_triton"),
     ("mla_buffer", "get_mla_kv_buffer_triton"),

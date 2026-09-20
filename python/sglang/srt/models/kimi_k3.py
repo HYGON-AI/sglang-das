@@ -38,6 +38,8 @@ from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    attn_tp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_global_dp_buffer,
@@ -130,7 +132,8 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-
+_k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
+_k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -318,6 +321,17 @@ class KimiK3MLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        # Opt-in K3 dense MLP: shard inside each attention-TP replica.
+        # Explicit TP overrides (e.g. shared experts) retain their own layout.
+        self._dense_attn_tp = (
+            _k3_dense_mlp_attn_tp
+            and is_dp_attention_enabled()
+            and tp_rank is None
+            and tp_size is None
+        )
+        if self._dense_attn_tp:
+            tp_rank = get_parallel().attn_tp_rank
+            tp_size = get_parallel().attn_tp_size
         _tp_kwargs = (
             dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
         )
@@ -335,6 +349,7 @@ class KimiK3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            use_dp_attention_reduce=self._dense_attn_tp,
             prefix=f"{prefix}.down_proj",
             **_tp_kwargs,
         )
@@ -359,7 +374,11 @@ class KimiK3MLP(nn.Module):
         # DP attention only when driven from the decoder layer (forward_batch
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
-        use_dp = self._dp_attention and forward_batch is not None
+        # Default is unchanged; attention-TP dense weights consume local DP rows.
+        use_dp = (
+            self._dp_attention and forward_batch is not None
+            and not self._dense_attn_tp
+        )
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
@@ -557,7 +576,28 @@ class KimiK3MoE(nn.Module):
         # a2a: the block runs on partial batches (shard / DP-local rows), and
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
-        self._shared_experts_tp1 = self._ep_a2a
+        # Opt-in shared branch: gather/scatter only inside attention TP.
+        if _k3_shared_experts_attn_tp and not self._ep_a2a:
+            raise ValueError(
+                "K3 shared-experts attention TP requires EP A2A to be enabled."
+            )
+        self._shared_experts_attn_tp_comm = (
+            _k3_shared_experts_attn_tp
+            and self._ep_a2a
+            and self._dp_attention
+            and get_parallel().attn_tp_size > 1
+        )
+        self._shared_experts_tp1 = (
+            self._ep_a2a and not self._shared_experts_attn_tp_comm
+        )
+        shared_experts_tp_kwargs = {}
+        if self._shared_experts_tp1:
+            shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
+        elif self._shared_experts_attn_tp_comm:
+            shared_experts_tp_kwargs = dict(
+                tp_rank=get_parallel().attn_tp_rank,
+                tp_size=get_parallel().attn_tp_size,
+            )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiK3MLP(
@@ -569,7 +609,7 @@ class KimiK3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                **(dict(tp_rank=0, tp_size=1) if self._shared_experts_tp1 else {}),
+                **shared_experts_tp_kwargs,
             )
         else:
             self.shared_experts = None
@@ -589,6 +629,7 @@ class KimiK3MoE(nn.Module):
         # overlap than two streams.
         self._sbo_shared_overlap = (
             self._ep_a2a
+            and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -963,6 +1004,18 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run TP-sharded shared experts and restore this rank's token rows."""
+        if not self._shared_experts_attn_tp_comm:
+            return self.shared_experts(hidden_states)
+        group = get_parallel().attn_tp_group
+        gathered_hidden_states = get_local_dp_buffer(group)
+        attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+        gathered_shared_output = self.shared_experts(gathered_hidden_states)
+        shared_output = torch.empty_like(hidden_states)
+        attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+        return shared_output
+
     def _forward_unfused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -987,10 +1040,10 @@ class KimiK3MoE(nn.Module):
             if self._sbo_shared_overlap:
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self.shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(hidden_states)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self.shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(hidden_states)
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -1047,7 +1100,11 @@ class KimiK3MoE(nn.Module):
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
-            if self.tp_size > 1 and not self._shared_experts_tp1:
+            if (
+                self.tp_size > 1
+                and not self._shared_experts_tp1
+                and not self._shared_experts_attn_tp_comm
+            ):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
