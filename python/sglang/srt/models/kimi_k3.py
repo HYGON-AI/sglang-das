@@ -138,6 +138,9 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+# Legacy env aliases of --enable-dense-mlp-attn-tp / --enable-shared-experts-attn-tp.
+_k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
+_k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -354,7 +357,7 @@ class KimiK3MLP(nn.Module):
         # but allow the NPU launcher to retain the proven attention-TP layout
         # without a device-type branch in shared model code.
         self._dense_attn_tp = (
-            get_parallel().enable_dense_mlp_attn_tp
+            (get_parallel().enable_dense_mlp_attn_tp or _k3_dense_mlp_attn_tp)
             and is_dp_attention_enabled()
             and tp_rank is None
             and tp_size is None
@@ -615,7 +618,9 @@ class KimiK3MoE(nn.Module):
         parallel = get_parallel()
         requested_shared_tp = parallel.shared_experts_tp_size
         shared_tp = requested_shared_tp
-        if shared_tp is None and parallel.enable_shared_experts_attn_tp:
+        if shared_tp is None and (
+            parallel.enable_shared_experts_attn_tp or _k3_shared_experts_attn_tp
+        ):
             shared_tp = parallel.attn_tp_size
         if requested_shared_tp is not None and not self._ep_a2a:
             raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
