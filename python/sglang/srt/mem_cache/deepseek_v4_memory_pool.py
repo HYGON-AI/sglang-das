@@ -363,8 +363,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
-        freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
+        freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
         """Quantize ``cache_k`` ``[n, 512]`` bf16 into this pool's layout at ``loc``.
         ``freqs_cis`` (V4.1 only) rotates the RoPE tail in-kernel, so the input is
@@ -1339,8 +1339,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.present_ratios: Tuple[int, ...] = tuple(
             ratio for ratio in sorted(self.kv_pools) if ratio in model_ratios
         )
+        # V4.1 can have only ratio-1/2 index pools; the HCU INT8 layout is
+        # specific to ratio 4 and must stay disabled when that pool is absent.
         self.use_int8_index_k_cache = (
-            self.c4_indexer_kv_pool.use_int8_index_k_cache
+            self.c4_indexer_kv_pool is not None
+            and self.c4_indexer_kv_pool.use_int8_index_k_cache
         )
 
         self._init_compressed_layer_mapping()
@@ -1650,7 +1653,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         slot = full-pool loc // ratio, page = page_size // ratio, so pages line up."""
         configs = self.compressed_pool_configs
         layer_counts = {ratio: stage_ratios.count(ratio) for ratio in configs}
-        split_layout = self.cp_cache_layer_split_layout
+        split_layout = getattr(self, "cp_cache_layer_split_layout", None)
         if split_layout is not None:
             layer_counts.update(
                 {4: split_layout.c4_layer_num, 128: split_layout.c128_layer_num}
@@ -2347,8 +2350,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
-        freqs_cis: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
+        freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
         """Write ``cache_k`` ``[n, 512]`` bf16 into the layer's compressed cache.
         For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, plus
