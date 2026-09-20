@@ -3570,7 +3570,7 @@ class DeepseekSparseAttnBackend(
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.dsa_kv_cache_store_fp8:
                 if (
-                    (is_blackwell() or _is_hcu())
+                    (is_blackwell() or _is_hcu)
                     and forward_batch is not None
                     and effective_forward_mode(forward_batch) == ForwardMode.EXTEND
                 ):

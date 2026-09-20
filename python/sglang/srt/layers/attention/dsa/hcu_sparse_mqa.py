@@ -90,8 +90,9 @@ def select_lightop_sparse_mqa_route(
 ) -> Optional[LightOpSparseMQARoute]:
     """Choose the native gfx938 sparse-MQA route, or return ``None``.
 
-    The validated target is deliberately narrow: gfx938/64CU, E4M3FN Q,
-    packed FP8 KV, 32 heads, page size 64, and paged TopK=2048.
+    The route targets gfx938 with 64 or 72 CUs, E4M3FN Q, packed FP8 KV,
+    32 heads, page size 64, and paged TopK=2048. The 72-CU route requires
+    a matching LightOp build with 72-CU Python and native dispatch support.
     """
 
     if not (
@@ -104,7 +105,7 @@ def select_lightop_sparse_mqa_route(
         and topk == 2048
         and page_size == 64
         and arch_name.startswith("gfx938")
-        and num_cus == 64
+        and num_cus in (64, 72)
     ):
         return None
 
