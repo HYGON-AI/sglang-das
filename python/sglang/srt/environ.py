@@ -823,6 +823,9 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Pin the AITER MoE to the moe_c backend instead of the tuned-config
+    # priority order (asm > moe_c > triton). Default keeps autodetection.
+    SGLANG_FORCE_AITER_MOE_C = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
