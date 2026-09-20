@@ -90,13 +90,22 @@ async def shutdown_video_jobs() -> None:
 
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
+    """Read a model-task extension field.
+
+    These fields are declared explicitly on ``VideoGenerationsRequest`` so
+    they appear in the OpenAPI document, but older clients may still send
+    them through pydantic's ``extra="allow"`` channel, so the extra dict
+    remains a fallback. JSON-encoded-string normalization for multipart
+    forms is handled by the pipeline adapters' ``_parse_extra_value``.
+    """
+
+    value = getattr(request, name, None)
+    if value is not None:
+        return value
     return (request.model_extra or {}).get(name)
 
 
 def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
-    value = getattr(request, name, None)
-    if value is not None:
-        return value
     return _extra_value(request, name)
 
 
@@ -562,8 +571,35 @@ async def _dispatch_job_async(
             shutil.rmtree(td, ignore_errors=True)
 
 
+# The endpoint's handler signature is multipart-only, so FastAPI would document
+# just ``multipart/form-data`` even though JSON bodies are accepted and parsed in
+# the handler. Augment the generated document with the JSON variant, described by
+# the request model's own JSON Schema so the two can never drift apart.
+_VIDEO_REQUEST_JSON_SCHEMA = VideoGenerationsRequest.model_json_schema()
+
+# Model-task extensions declared on VideoGenerationsRequest (consumed by
+# task-specific pipeline adapters, e.g. MiniMax H3); multipart forms carry
+# them as plain form fields, JSON bodies as top-level keys.
+_MODEL_TASK_EXTENSION_FIELDS = (
+    "task",
+    "conditions",
+    "target",
+    "audio_flow_shift",
+)
+
+
 # TODO: support image to video generation
-@router.post("", response_model=VideoResponse)
+@router.post(
+    "",
+    response_model=VideoResponse,
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {"schema": _VIDEO_REQUEST_JSON_SCHEMA},
+            },
+        }
+    },
+)
 async def create_video(
     request: Request,
     # multipart/form-data fields (optional; used only when content-type is multipart)
@@ -699,10 +735,17 @@ async def create_video(
             return value if value is not None else extra_from_form.get(name)
 
         request_field_names = set(VideoGenerationsRequest.model_fields)
+        # Model-task extensions are declared request fields now, so the
+        # ``extra_request_fields`` filter below would silently drop them;
+        # pass them through explicitly from the form extras instead.
+        extension_kwargs = {
+            field_name: form_value(field_name, None)
+            for field_name in _MODEL_TASK_EXTENSION_FIELDS
+        }
         extra_request_fields = {
             key: value
             for key, value in extra_from_form.items()
-            if key not in request_field_names
+            if key not in request_field_names and key not in extension_kwargs
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
@@ -752,6 +795,7 @@ async def create_video(
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             diffusers_kwargs=form_value("diffusers_kwargs", None),
+            **extension_kwargs,
             **extra_request_fields,
         )
     else:
