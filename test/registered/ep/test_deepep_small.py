@@ -30,7 +30,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=407, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=425, stage="base-c", runner_config="4-gpu-h100")
 
 # HCU_CSV_CI_UNVERIFIED: Registered from sglang.csv CI coverage; not re-tested in this framework pass.
 register_hcu_ci(

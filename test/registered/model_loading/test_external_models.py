@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=34, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=33, stage="base-b", runner_config="1-gpu-small")
 # HCU BW1100 validated on 10.16.1.66/dxl-sglang: local Qwen2-VL external model path passed three runs.
 register_hcu_ci(
     est_time=120,
