@@ -211,7 +211,7 @@ jobs:
           source $HOME/.cargo/env
           cd python
           # Use the existing HCU build metadata, as the HCU nightly publisher does.
-          cp pyproject_hcu.toml pyproject.toml
+          [ -f pyproject_hcu.toml ] && cp pyproject_hcu.toml pyproject.toml
           export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}"
           python -m build --wheel --no-isolation -Cfeatures=all_hip
           echo "=== sglang wheel ==="
