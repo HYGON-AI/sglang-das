@@ -96,6 +96,18 @@ __all__ = ["CompressedTensorsLinearMethod"]
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
 
+# Qwen3.8-Flash-Next / Qwen4Exp. Do not infer this from a bare
+# "ngram_embedding" substring: DeepSeek 4.1 / LongCat use ngram_embeddings.
+_QWEN4_EXP_ARCHS = (
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLMMTP",
+)
+_QWEN4_EXP_MODEL_TYPES = ("qwen4_exp", "qwen4_exp_text")
+_QWEN4_PLE_NGRAM_MARKERS = (
+    "ple_embedding.ngram_embedding",
+    r"ple_embedding\.ngram_embedding",
+)
+
 
 class DeviceCapability(NamedTuple):
     major: int
@@ -138,6 +150,63 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+
+    def _is_qwen4_exp_model(self) -> Optional[bool]:
+        """Identify Qwen4Exp from HF architectures / model_type.
+
+        ``from_config`` receives ``hf_config`` via ``get_quant_config``.
+        Returns None when that object is missing (unit tests / raw quant dict).
+        """
+        hf_config = None
+        if isinstance(self.config, dict):
+            hf_config = self.config.get("hf_config")
+        if hf_config is None:
+            return None
+        if isinstance(hf_config, dict):
+            archs = list(hf_config.get("architectures") or [])
+            model_type = hf_config.get("model_type")
+            text_config = hf_config.get("text_config") or {}
+            if isinstance(text_config, dict):
+                model_type = model_type or text_config.get("model_type")
+        else:
+            archs = list(getattr(hf_config, "architectures", None) or [])
+            model_type = getattr(hf_config, "model_type", None)
+            text_config = getattr(hf_config, "text_config", None)
+            if text_config is not None:
+                model_type = model_type or getattr(text_config, "model_type", None)
+        if any(arch in _QWEN4_EXP_ARCHS for arch in archs):
+            return True
+        if model_type in _QWEN4_EXP_MODEL_TYPES:
+            return True
+        return False
+
+    def _has_qwen4_ple_ngram_quant_marker(self) -> bool:
+        """Qwen4 PLE ngram module path, not DeepSeek/LongCat ngram_embeddings.
+
+        Qwen4 ngram checkpoints keep ``ple_embedding.ngram_embedding``
+        quantized and ignore the rest of PLE. The ignore regex stores
+        escaped dots (``ple_embedding\\.ngram_embedding``). The
+        compressed-tensors group name is the exact key ``ngram_embedding``.
+        """
+        names = [str(item) for item in (self.ignore or [])]
+        names.extend(str(key) for key in (self.target_scheme_map or {}))
+        if any(
+            marker in text
+            for text in names
+            for marker in _QWEN4_PLE_NGRAM_MARKERS
+        ):
+            return True
+        groups = {}
+        if isinstance(self.config, dict):
+            groups = self.config.get("config_groups") or {}
+        return "ngram_embedding" in groups
+
+    def _is_qwen4_exp_ngram_checkpoint(self) -> bool:
+        """Qwen3.8-Flash-Next ngram compressed-tensors fingerprint."""
+        is_qwen4 = self._is_qwen4_exp_model()
+        if is_qwen4 is False:
+            return False
+        return self._has_qwen4_ple_ngram_quant_marker()
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -774,6 +843,25 @@ class CompressedTensorsConfig(QuantizationConfig):
                         input_symmetric=input_quant.symmetric,
                     )
 
+            if self._is_dynamic_token_w4a8(weight_quant, input_quant):
+                # Qwen3.8 Flash-Next INT4 W4A8 stores unpacked int8 channel
+                # weights. Reuse the HCU INT8 W8A8 linear GEMM without
+                # touching other W4A8 checkpoints.
+                if _is_hip and self._is_qwen4_exp_ngram_checkpoint():
+                    logger.info_once(
+                        "Using CompressedTensorsW8A8Int8 for Qwen4Exp ngram "
+                        "W4A8 linear (unpacked INT4 stored as int8)"
+                    )
+                    return CompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
+                raise NotImplementedError(
+                    "compressed-tensors W4A8 linear is only implemented for "
+                    "Qwen4Exp ngram checkpoints on HIP/HCU."
+                )
+
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -893,10 +981,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
-            else:
-                raise NotImplementedError(
-                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+            if _is_hip and self._is_qwen4_exp_ngram_checkpoint():
+                logger.info_once(
+                    "Using CompressedTensorsW8A8Int8MoE for Qwen4Exp ngram "
+                    "W4A8 MoE (unpacked INT4 stored as int8)"
                 )
+                return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
+            raise NotImplementedError(
+                "The W4A8Int8 Fused MoE scheme is implemented only for NPU, "
+                "or Qwen4Exp ngram checkpoints on HIP/HCU."
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"

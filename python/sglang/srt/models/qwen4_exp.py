@@ -512,10 +512,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     weight_args = scheme.get("weights") if scheme else None
                     weight_type = getattr(weight_args, "type", None)
                     weight_type = getattr(weight_type, "value", weight_type)
-                    ple_int8 = (
-                        getattr(weight_args, "num_bits", None) == 8
-                        and weight_type == "int"
-                    )
+                    # INT8 PLE stores int8 directly. W4A8 ngram checkpoints
+                    # store unpacked INT4 as int8; both use the INT8 table.
+                    num_bits = getattr(weight_args, "num_bits", None)
+                    ple_int8 = num_bits in (4, 8) and weight_type == "int"
                     break
                 # FP8-ngram checkpoints leave ngram_embedding shards un-ignored
                 # but only list Linear in config_groups.targets.
@@ -552,16 +552,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
             )
-        scale_shape = (
-            (self.ngram_embedding.num_embeddings_per_partition, 1)
-            if self.ple_per_row_scale
-            else (1,)
-        )
-        self.ngram_embedding.register_buffer(
-            "weight_scale",
-            torch.ones(scale_shape, dtype=torch.bfloat16),
-            persistent=True,
-        )
+            scale_shape = (
+                (self.ngram_embedding.num_embeddings_per_partition, 1)
+                if self.ple_per_row_scale
+                else (1,)
+            )
+            self.ngram_embedding.register_buffer(
+                "weight_scale",
+                torch.ones(scale_shape, dtype=torch.bfloat16),
+                persistent=True,
+            )
 
     @classmethod
     def _splitmix64(cls, x: int) -> int:
@@ -921,15 +921,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if source_weight.device.type == "cpu" and source_weight.is_pinned():
             cpu_weight = source_weight
         else:
-            cpu_weight = nn.Parameter(
-                torch.empty(
-                    source_weight.shape,
-                    dtype=source_weight.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                ),
-                requires_grad=False,
-            )
+            # HIP pin_memory goes through the active Device mixin; wrap CPU
+            # so a CUDA default device cannot stage the full PLE table on GPU.
+            with torch.device("cpu"):
+                cpu_weight = nn.Parameter(
+                    torch.empty(
+                        source_weight.shape,
+                        dtype=source_weight.dtype,
+                        pin_memory=True,
+                    ),
+                    requires_grad=False,
+                )
             # This wrapper is installed while the model is being constructed;
             # the checkpoint loader fills cpu_weight afterwards. Copying the
             # uninitialized source would touch the full PLE table once for no
@@ -945,12 +947,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         elif source_scale.device.type == "cpu" and source_scale.is_pinned():
             cpu_scale = source_scale
         else:
-            cpu_scale = torch.empty(
-                source_scale.shape,
-                dtype=source_scale.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
+            with torch.device("cpu"):
+                cpu_scale = torch.empty(
+                    source_scale.shape,
+                    dtype=source_scale.dtype,
+                    pin_memory=True,
+                )
             cpu_scale.copy_(source_scale.to("cpu"))
         self.register_buffer("weight_scale", cpu_scale, persistent=True)
         if cpu_weight is not source_weight:
