@@ -4889,6 +4889,23 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
+    if not (
+        _is_hcu
+        and config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+    ):
+        return False
+
+    parallel = get_parallel()
+    return (
+        get_disagg().disaggregation_mode in ("prefill", "decode")
+        or parallel.attn_cp_size != 1
+        or parallel.pp_group.world_size != 1
+        or not get_moe_a2a_backend().is_none()
+    )
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4908,15 +4925,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
-        if (
-            _is_hcu
-            and get_disagg().disaggregation_mode in ("prefill", "decode")
-            and config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0
-        ):
+        if _should_disable_v41_vision_for_hcu(config):
             logger.info(
-                "Disabling the DeepSeek-V4.1 vision tower for HCU PD text serving; "
-                "the V4.1 vision path does not support CP or MoE A2A."
+                "Disabling the DeepSeek-V4.1 vision tower for this HCU text "
+                "serving topology; the V4.1 vision path does not support PD, "
+                "CP, PP or MoE A2A."
             )
             config.vision_n_layers = 0
         self.config = config
