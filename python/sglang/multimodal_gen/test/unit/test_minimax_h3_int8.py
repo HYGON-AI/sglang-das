@@ -21,7 +21,7 @@ RUNTIME = REPO / "python/sglang/multimodal_gen/runtime"
 def cpu_runtime():
     """Isolate server/Triton imports; GPU kernel execution is not mocked as valid."""
     envs = SimpleNamespace(
-        SGLANG_MINIMAX_H3_INT8_ENABLE=False, SGLANG_MINIMAX_H3_INT8_FUSION=True
+        SGLANG_MINIMAX_H3_INT8_ENABLE=True, SGLANG_MINIMAX_H3_QUANT_OPTIMIZE=True
     )
     linear = ModuleType("linear")
     linear.LinearBase = type("LinearBase", (torch.nn.Module,), {})
@@ -58,10 +58,10 @@ def cpu_runtime():
             "triton.language.extra.libdevice": extra.libdevice,
         }
     )
-    name = "sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8"
+    name = "sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant"
     with patch.dict(sys.modules, modules):
         spec = importlib.util.spec_from_file_location(
-            name, RUNTIME / "layers/quantization/minimax_h3_int8.py"
+            name, RUNTIME / "layers/quantization/minimax_h3_quant.py"
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
@@ -81,7 +81,8 @@ class TestMiniMaxH3Int8Scope(unittest.TestCase):
             targets=["blocks.0.attn.qkv_proj"], compressed_adaln=compressed
         )
 
-    def test_disabled_by_default(self):
+    def test_explicit_legacy_disable(self):
+        self.envs.SGLANG_MINIMAX_H3_INT8_ENABLE = False
         with self.assertRaisesRegex(ValueError, "ENABLE=1"):
             self.module.MiniMaxH3Int8Config(targets=["blocks.0.attn.qkv_proj"])
 
@@ -129,7 +130,7 @@ class TestMiniMaxH3Int8Scope(unittest.TestCase):
             method.process_weights_after_loading(layer)
 
     def test_fusion_can_be_disabled_independently(self):
-        self.envs.SGLANG_MINIMAX_H3_INT8_FUSION = False
+        self.envs.SGLANG_MINIMAX_H3_QUANT_OPTIMIZE = False
         config = self.config(compressed=True)
         method = config.get_quant_method(
             self.linear.LinearBase(), "blocks.0.attn.qkv_proj"
@@ -179,7 +180,7 @@ class TestMiniMaxH3Int8Scope(unittest.TestCase):
 )
 class TestMiniMaxH3Int8Kernels(unittest.TestCase):
     def test_fused_linear_matches_reference(self):
-        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
             linear,
         )
 
@@ -194,7 +195,7 @@ class TestMiniMaxH3Int8Kernels(unittest.TestCase):
                 self.assertTrue(bool(torch.isfinite(result).all()))
 
     def test_fp32_modulation_matches_reference_without_aliasing(self):
-        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
             affine,
             gate,
         )

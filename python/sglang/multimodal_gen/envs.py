@@ -15,7 +15,8 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    SGLANG_MINIMAX_H3_INT8_ENABLE: bool = False
+    SGLANG_MINIMAX_H3_QUANT_OPTIMIZE: bool = True
+    SGLANG_MINIMAX_H3_INT8_ENABLE: bool = True
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
     SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
@@ -156,8 +157,14 @@ def _lazy_path(
 # begin-env-vars-definition
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # These switches only affect explicitly validated MiniMax-H3 INT8 checkpoints.
-    "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool("SGLANG_MINIMAX_H3_INT8_ENABLE"),
+    # Only used after recognizing a validated MiniMax-H3 INT8/FP8 checkpoint.
+    "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE": _lazy_bool(
+        "SGLANG_MINIMAX_H3_QUANT_OPTIMIZE", "true"
+    ),
+    # Legacy aliases; new deployments need only QUANT_OPTIMIZE.
+    "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool(
+        "SGLANG_MINIMAX_H3_INT8_ENABLE", "true"
+    ),
     "SGLANG_MINIMAX_H3_INT8_FUSION": _lazy_bool(
         "SGLANG_MINIMAX_H3_INT8_FUSION", "true"
     ),
