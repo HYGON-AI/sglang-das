@@ -3585,6 +3585,13 @@ class DeepseekV4AttnBackend(
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+        """Hopper/DCU decode or verify indexer: one query per row, all rows scored at
+        once against its visible compressed positions straight off the fp4 page
+        table using LightOp when SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4
+        is enabled and supported, or the Triton BF16 fallback,
+        then the same candidate / top-k contract as the DeepGEMM path: level-one
+        candidate blocks where the layer publishes or consumes them, and -1 padded
+        slots with the valid prefix first."""
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
