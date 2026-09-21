@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     SGLANG_MINIMAX_H3_INT8_ENABLE: bool = False
     SGLANG_MINIMAX_H3_INT8_FUSION: bool = True
+    SGLANG_MINIMAX_H3_FP8_OPTIMIZE: bool = True
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
@@ -159,6 +160,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_MINIMAX_H3_INT8_ENABLE": _lazy_bool("SGLANG_MINIMAX_H3_INT8_ENABLE"),
     "SGLANG_MINIMAX_H3_INT8_FUSION": _lazy_bool(
         "SGLANG_MINIMAX_H3_INT8_FUSION", "true"
+    ),
+    "SGLANG_MINIMAX_H3_FP8_OPTIMIZE": _lazy_bool(
+        "SGLANG_MINIMAX_H3_FP8_OPTIMIZE", "true"
     ),
     # ================== Installation Time Env Vars ==================
     # Target device of sglang-diffusion, supporting [cuda (by default),
