@@ -219,10 +219,15 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
-def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+def _should_use_sparse_prefill(
+    q: torch.Tensor,
+    forward_batch: ForwardBatch,
+    *,
+    allow_cp: bool = False,
+) -> bool:
     return (
         not _is_sm120
-        and not dsa_use_prefill_cp(forward_batch)
+        and (allow_cp or not dsa_use_prefill_cp(forward_batch))
         and (
             q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
             or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -4282,7 +4287,9 @@ class DeepseekV4AttnBackend(
                 )
 
             if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
-                if _should_use_sparse_prefill(q, forward_batch):
+                if _should_use_sparse_prefill(
+                    q, forward_batch, allow_cp=self.is_dsv41
+                ):
                     return self._forward_prefill_sparse(
                         q=q,
                         layer_id=layer_id,
