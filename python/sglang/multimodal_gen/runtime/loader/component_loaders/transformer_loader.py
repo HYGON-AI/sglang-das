@@ -242,6 +242,11 @@ class TransformerLoader(ComponentLoader):
             if gguf_file is not None:
                 validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
             elif component_server_args.transformer_weights_path is not None:
+                from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_fp8 import (
+                    MiniMaxH3Fp8Config,
+                    backbone_layers,
+                    inspect_fp8_checkpoint,
+                )
                 from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
                     MiniMaxH3Int8Config,
                     inspect_int8_checkpoint,
@@ -251,6 +256,11 @@ class TransformerLoader(ComponentLoader):
                     safetensors_list, selected_variant
                 )
                 int8_manifest = inspect_int8_checkpoint(safetensors_list)
+                fp8_manifest = (
+                    inspect_fp8_checkpoint(safetensors_list)
+                    if int8_manifest is None
+                    else None
+                )
                 if int8_manifest is not None:
                     if int8_manifest["variant"] != selected_variant.lower():
                         raise ValueError(
@@ -263,6 +273,16 @@ class TransformerLoader(ComponentLoader):
                     )
                     dit_config.arch_config.checkpoint_uses_diffusers_layout = False
                     adaln_curve_shape = (1025, 8) if compressed else None
+                elif fp8_manifest is not None:
+                    if selected_variant.lower() != "fl2va":
+                        raise ValueError(
+                            "This MiniMax-H3 FP8 export requires --model-variant fl2va"
+                        )
+                    checkpoint_quant_config = MiniMaxH3Fp8Config(
+                        targets=backbone_layers()
+                    )
+                    dit_config.arch_config.checkpoint_uses_diffusers_layout = True
+                    adaln_curve_shape = None
                 else:
                     adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
                         safetensors_list
@@ -318,9 +338,10 @@ class TransformerLoader(ComponentLoader):
         if (
             use_fsdp
             and quant_spec.quant_config is not None
-            and quant_spec.quant_config.get_name() == "minimax_h3_int8"
+            and quant_spec.quant_config.get_name()
+            in ("minimax_h3_int8", "minimax_h3_fp8")
         ):
-            raise ValueError("MiniMax-H3 INT8 supports TP/SP, not FSDP inference")
+            raise ValueError("MiniMax-H3 INT8/FP8 supports TP/SP, not FSDP inference")
         if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
