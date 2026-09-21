@@ -242,47 +242,22 @@ class TransformerLoader(ComponentLoader):
             if gguf_file is not None:
                 validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
             elif component_server_args.transformer_weights_path is not None:
-                from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_fp8 import (
-                    MiniMaxH3Fp8Config,
-                    backbone_layers,
-                    inspect_fp8_checkpoint,
-                )
-                from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
-                    MiniMaxH3Int8Config,
-                    inspect_int8_checkpoint,
+                from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
+                    inspect_quant_checkpoint,
                 )
 
                 validate_minimax_h3_checkpoint_variant(
                     safetensors_list, selected_variant
                 )
-                int8_manifest = inspect_int8_checkpoint(safetensors_list)
-                fp8_manifest = (
-                    inspect_fp8_checkpoint(safetensors_list)
-                    if int8_manifest is None
-                    else None
+                checkpoint_info = inspect_quant_checkpoint(
+                    safetensors_list, selected_variant
                 )
-                if int8_manifest is not None:
-                    if int8_manifest["variant"] != selected_variant.lower():
-                        raise ValueError(
-                            "MiniMax-H3 INT8 checkpoint model variant mismatch"
-                        )
-                    compressed = int8_manifest["profile"] == "backbone-adaln"
-                    checkpoint_quant_config = MiniMaxH3Int8Config(
-                        targets=int8_manifest["quantized_layers"],
-                        compressed_adaln=compressed,
-                    )
-                    dit_config.arch_config.checkpoint_uses_diffusers_layout = False
-                    adaln_curve_shape = (1025, 8) if compressed else None
-                elif fp8_manifest is not None:
-                    if selected_variant.lower() != "fl2va":
-                        raise ValueError(
-                            "This MiniMax-H3 FP8 export requires --model-variant fl2va"
-                        )
-                    checkpoint_quant_config = MiniMaxH3Fp8Config(
-                        targets=backbone_layers()
-                    )
-                    dit_config.arch_config.checkpoint_uses_diffusers_layout = True
-                    adaln_curve_shape = None
+                if checkpoint_info is not None:
+                    (
+                        checkpoint_quant_config,
+                        dit_config.arch_config.checkpoint_uses_diffusers_layout,
+                        adaln_curve_shape,
+                    ) = checkpoint_info
                 else:
                     adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
                         safetensors_list

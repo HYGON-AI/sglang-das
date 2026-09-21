@@ -311,7 +311,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def _use_int8_fp32_modulation(arch, quant_config) -> bool:
     if quant_config is None or arch.adaln_curve_grid is None:
         return False
-    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+    from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
         MiniMaxH3Int8Config,
     )
 
@@ -334,7 +334,7 @@ def _modulate_scale_shift(
 ) -> torch.Tensor:
     """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
     if fused_fp32:
-        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
             affine,
             supports_fp32_modulation,
         )
@@ -368,7 +368,7 @@ def _modulate_gate(
 ) -> torch.Tensor:
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     if fused_fp32:
-        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_int8 import (
+        from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_quant import (
             gate as fused_gate,
             supports_fp32_modulation,
         )
