@@ -19,7 +19,9 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_hcu
+
+_is_hcu = is_hcu()
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
@@ -69,6 +71,25 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
+    if _is_hcu:
+        repeats = forward_batch.extend_seq_lens.to(torch.int64)
+        if num_tokens is not None:
+            # HCU EP may pad the token dimension without adding a request. Assign
+            # those masked tail rows to the last request so repeat_interleave's
+            # declared output size still matches the sum of repeats. A mismatch
+            # can make the HIP kernel access out of bounds instead of raising a
+            # Python exception.
+            num_extend_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            num_padding_tokens = num_tokens - num_extend_tokens
+            assert num_padding_tokens >= 0, (
+                f"num_tokens={num_tokens} is smaller than the extend token count "
+                f"{num_extend_tokens}"
+            )
+            if num_padding_tokens:
+                assert repeats.numel(), "padded extend requires a request row"
+                repeats = repeats.clone()
+                repeats[-1] += num_padding_tokens
+        return torch.repeat_interleave(req, repeats, output_size=num_tokens)
     return torch.repeat_interleave(
         req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )
