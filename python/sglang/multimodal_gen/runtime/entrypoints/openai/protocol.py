@@ -168,6 +168,53 @@ class VideoGenerationsRequest(BaseModel):
     profile_all_stages: Optional[bool] = False
 
 
+class MiniMaxH3Condition(BaseModel):
+    """One MiniMax-H3 keyframe or reference material descriptor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["image", "video", "video_audio", "audio"]
+    uri: str = Field(min_length=1)
+    role: Literal["keyframe", "reference"]
+    frame_index: Optional[int] = None
+    start_time_seconds: Optional[float] = Field(default=None, ge=0)
+
+
+class MiniMaxH3Target(BaseModel):
+    """Requested MiniMax-H3 output canvas and duration."""
+
+    short_edge: int = Field(gt=0)
+    # Task-specific admission applies the supported finite ratios. Keep this a
+    # non-empty string here because FL2VA may use a material-derived ratio that
+    # is not part of the T2VA/Ref2VA finite-ratio list.
+    aspect_ratio: str = Field(min_length=1)
+    duration_seconds: Optional[float] = Field(default=None, ge=4, le=15)
+
+
+class MiniMaxH3VideoGenerationsRequest(VideoGenerationsRequest):
+    """OpenAPI request contract used by a MiniMax-H3 deployment.
+
+    The generic video request keeps these extensions optional because the same
+    endpoint serves other model families. MiniMax-H3 selects this stricter
+    schema when the FastAPI application is assembled.
+    """
+
+    task: Literal["t2va", "fl2va", "ref2va"]
+    conditions: List[MiniMaxH3Condition] = Field(default_factory=list)
+    target: MiniMaxH3Target
+    audio_flow_shift: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+    )
+
+
+class VideoHTTPError(BaseModel):
+    """Synchronous video request error returned before a job is queued."""
+
+    detail: str
+
+
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
