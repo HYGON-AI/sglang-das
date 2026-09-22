@@ -975,6 +975,24 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            # HIP packed INT4 + dynamic per-token INT8: this is W4A8 in
+            # compressed-tensors metadata, but the checkpoint is still
+            # pack-quantized (not ngram unpacked int8). NVIDIA CUTLASS
+            # W4AFP8 is unavailable; reuse Triton GPTQ MoE with
+            # use_int4_w4a8 so activations are quantized per token.
+            if (
+                _is_hip
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+                and input_quant is not None
+                and input_quant.type == QuantizationType.INT
+            ):
+                logger.info_once(
+                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
+                    "(packed INT4 + dynamic per-token INT8 activations)"
+                )
+                return CompressedTensorsWNA16TritonMoE(
+                    self, weight_quant=weight_quant, use_int4_w4a8=True
+                )
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
@@ -987,6 +1005,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "W4A8 MoE (unpacked INT4 stored as int8)"
                 )
                 return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
+            if (
+                _is_hip
+                and self.quant_format == CompressionFormat.pack_quantized.value
+            ):
+                logger.info_once(
+                    "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
+                    "(packed INT4 + dynamic per-token INT8 activations)"
+                )
+                return CompressedTensorsWNA16TritonMoE(
+                    self, weight_quant=weight_quant, use_int4_w4a8=True
+                )
             raise NotImplementedError(
                 "The W4A8Int8 Fused MoE scheme is implemented only for NPU, "
                 "or Qwen4Exp ngram checkpoints on HIP/HCU."
