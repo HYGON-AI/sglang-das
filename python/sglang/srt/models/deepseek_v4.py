@@ -4929,10 +4929,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                or not (
+                    get_moe_a2a_backend().is_none()
+                    or get_moe_a2a_backend().is_deepep()
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP with none or DeepEP A2A, without CP or PP"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
