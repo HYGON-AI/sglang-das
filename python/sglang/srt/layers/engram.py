@@ -787,13 +787,21 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        if self.host_table is None and not _cuda_kernels(indices):
-            local = indices - self.row_start
+        cpu_host_gather = self.host_table is not None and os.getenv(
+            "SGLANG_ENABLE_DSV41_ENGRAM_CPU_GATHER", "0"
+        ) == "1"
+        if cpu_host_gather or (
+            self.host_table is None and not _cuda_kernels(indices)
+        ):
+            lookup_indices = indices.cpu() if cpu_host_gather else indices
+            local = lookup_indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
-            return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+            return values.to(torch.bfloat16).masked_fill(
+                ~owned.unsqueeze(-1), 0
+            ).to(indices.device)
         out = self._empty(indices)
         engram_gather(
             self.weight.data_ptr(),
