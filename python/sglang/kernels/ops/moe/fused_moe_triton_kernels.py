@@ -289,7 +289,13 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        # Packed INT4 B is K/2 bytes wide. When K is not a multiple of
+        # BLOCK_SIZE_K (e.g. TP4 down_proj K=160, BLOCK_SIZE_K=64) an
+        # unmasked load overruns the last packed K tile.
+        if not even_Ks:
+            b = tl.load(b_ptrs, mask=k_mask, other=0)
+        else:
+            b = tl.load(b_ptrs)
         if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
             b = (b >> b_shifter) & 0xF
             if use_mxfp4_w4a16 or use_mxfp4_w4a8:
