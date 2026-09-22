@@ -505,7 +505,7 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
     return mapped, huge
 
 
-_page_cache_dropped = False
+_page_cache_drop_reasons: set[str] = set()
 
 
 def drop_checkpoint_page_cache() -> tuple[int, int]:
@@ -530,18 +530,22 @@ def drop_checkpoint_page_cache() -> tuple[int, int]:
     return files, nbytes
 
 
-def _drop_page_cache_once(reason: str) -> None:
-    global _page_cache_dropped
-    if _page_cache_dropped:
+def _drop_page_cache_once(reason: str, group=None) -> None:
+    if reason in _page_cache_drop_reasons:
         return
-    _page_cache_dropped = True
-    files, nbytes = drop_checkpoint_page_cache()
-    logger.info(
-        "engram host table: dropped the page cache of %d checkpoint files (%.0f GiB) %s",
-        files,
-        nbytes / 2**30,
-        reason,
-    )
+    if group is not None:
+        group.barrier()
+    if group is None or group.rank_in_group == 0:
+        files, nbytes = drop_checkpoint_page_cache()
+        logger.info(
+            "engram host table: dropped the page cache of %d checkpoint files (%.0f GiB) %s",
+            files,
+            nbytes / 2**30,
+            reason,
+        )
+    if group is not None:
+        group.barrier()
+    _page_cache_drop_reasons.add(reason)
 
 
 class _HostTable:
@@ -583,7 +587,9 @@ class _HostTable:
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
+            _drop_page_cache_once(
+                "before pre-faulting the per-rank shard", group=self.group
+            )
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
@@ -639,10 +645,14 @@ class _HostTable:
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if self.layout == "per_rank":
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
-            drop_checkpoint_page_cache()
+            _drop_page_cache_once(
+                "after loading the per-rank shard for huge-page collapse",
+                group=self.group,
+            )
+        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0

@@ -5553,6 +5553,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
+                    # EnGram tables are much larger than ordinary model weights.
+                    # Loading them asynchronously keeps the full checkpoint tensors
+                    # alive in pending futures and can exhaust host memory before
+                    # their TP-local row shards are copied. Consume them inline so
+                    # each full tensor can be released before reading the next one.
+                    if _is_hcu and ".engram." in name:
+                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,

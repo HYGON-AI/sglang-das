@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    HCUCompressedTensorsW4A8Int8DynamicMoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -75,9 +76,10 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
@@ -821,7 +823,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
-        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        scheme_dict = None
+        with suppress(ValueError):
+            scheme_dict = self.get_scheme_dict(layer, layer_name)
         if scheme_dict is not None:
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
@@ -829,12 +833,30 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
                 return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
 
-        unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        # Check both runtime projection names and checkpoint aliases. DeepSeek-V4
+        # checkpoints use w1/w2/w3, while the model loader remaps them to
+        # gate_proj/down_proj/up_proj before materializing FusedMoE.
+        projection_name_groups = [
+            [".0.gate_proj", ".0.up_proj", ".0.down_proj"],
+            [".0.w1", ".0.w3", ".0.w2"],
         ]
+        all_scheme_dicts = None
+        last_match_error = None
+        for projection_names in projection_name_groups:
+            try:
+                all_scheme_dicts = [
+                    self.get_scheme_dict(layer, layer_name + projection_name)
+                    for projection_name in projection_names
+                ]
+                break
+            except ValueError as error:
+                last_match_error = error
+
+        if all_scheme_dicts is None:
+            assert last_match_error is not None
+            raise last_match_error
+
         # TODO: refactor this to use expert_mapping and check all layer numbers
-        all_scheme_dicts = [self.get_scheme_dict(layer, name) for name in unfused_names]
         scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
 
         # multiple schemes found
@@ -923,12 +945,22 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            if _is_hcu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
+                logger.info_once("Using HCUCompressedTensorsW4A8Int8DynamicMoE")
+                return HCUCompressedTensorsW4A8Int8DynamicMoE(
+                    self, weight_quant=weight_quant
+                )
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            elif _is_hcu:
+                logger.info_once("Using HCUCompressedTensorsW4A8Int8DynamicMoE")
+                return HCUCompressedTensorsW4A8Int8DynamicMoE(
+                    self, weight_quant=weight_quant
+                )
             else:
                 raise NotImplementedError(
                     "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."

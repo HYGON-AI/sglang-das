@@ -376,10 +376,14 @@ def dist_barrier_after_load(
             dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
+        timeout_s = max(
+            UNBALANCED_MODEL_LOADING_TIMEOUT_S,
+            get_parallel().dist_timeout or 0,
+        )
         try:
             dist.monitored_barrier(
                 group=get_parallel().tp_group.cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                timeout=datetime.timedelta(seconds=timeout_s),
                 wait_all_ranks=True,
             )
         except RuntimeError:
