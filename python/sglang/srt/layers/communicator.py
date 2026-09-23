@@ -397,6 +397,27 @@ class LayerScatterModes:
             return ScatterMode.model_input_output()
         return cls._compute_layer_output_mode(context.previous_layer())
 
+    @staticmethod
+    def _moe_layout_matches_attention_layout() -> bool:
+        """Whether sparse MoE can consume the DP-attention-local token layout.
+
+        With EP=1, CP=1 and matching DP/TP sizes, the current parallel-state
+        construction gives attention TP and MoE TP the same contiguous rank
+        groups.  Keeping activations TP_ATTN_FULL then avoids a global TP
+        all-gather before every MoE and a reduce-scatter afterwards.
+
+        EP and CP layouts are intentionally excluded: equal group *sizes* do
+        not imply equal rank membership for those layouts.
+        """
+        parallel = get_parallel()
+        return (
+            is_dp_attention_enabled()
+            and parallel.attn_cp_size == 1
+            and parallel.moe_ep_size == 1
+            and parallel.moe_dp_size == parallel.attn_dp_size
+            and parallel.moe_tp_size == parallel.attn_tp_size
+        )
+
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
@@ -412,6 +433,8 @@ class LayerScatterModes:
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
             ):
                 return ScatterMode.MOE_FULL
+            if cls._moe_layout_matches_attention_layout():
+                return ScatterMode.TP_ATTN_FULL
             return ScatterMode.FULL
         else:
             return (
@@ -434,7 +457,11 @@ class LayerScatterModes:
         mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
-        if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
+        if mlp_mode in (
+            ScatterMode.TP_ATTN_FULL,
+            ScatterMode.FULL,
+            ScatterMode.MOE_FULL,
+        ):
             return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
@@ -447,7 +474,11 @@ class LayerScatterModes:
             if cls._should_gather_for_tbo(context):
                 return ScatterMode.TP_ATTN_FULL
             return ScatterMode.SCATTERED
-        if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
+        if mlp_mode in (
+            ScatterMode.TP_ATTN_FULL,
+            ScatterMode.FULL,
+            ScatterMode.MOE_FULL,
+        ):
             return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
@@ -944,7 +975,11 @@ class CommunicateContext:
         attn_cp_rank = get_parallel().attn_cp_rank
         tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
-        moe_cp_size = get_moe_cp_size()
+        # _MOE_DP is also the MoE-CP group only when CP has more partitions
+        # than MoE-DP.  In an aligned DP-attention/MoE-DP layout its world size
+        # is the data-parallel replication factor and must not enter the
+        # MOE_FULL token-count formula (MOE_FULL is inactive there).
+        moe_cp_size = get_moe_cp_size() if is_enable_moe_cp_allgather() else 1
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
