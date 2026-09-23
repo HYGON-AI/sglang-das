@@ -47,7 +47,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cuda, is_hcu
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -506,10 +506,20 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
 
 
 _page_cache_dropped = False
+_page_cache_drop_reasons: set[str] = set()
+
+
+def _use_hcu_dsv41_w4a8_engram_load_optimization() -> bool:
+    return (
+        is_hcu()
+        and envs.SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION.get()
+    )
 
 
 def drop_checkpoint_page_cache() -> tuple[int, int]:
     """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
+    if os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE", "1") == "0":
+        return 0, 0
     try:
         model_path = get_model().model_path
     except (ValueError, AttributeError):
@@ -530,18 +540,33 @@ def drop_checkpoint_page_cache() -> tuple[int, int]:
     return files, nbytes
 
 
-def _drop_page_cache_once(reason: str) -> None:
+def _drop_page_cache_once(reason: str, group=None) -> None:
     global _page_cache_dropped
-    if _page_cache_dropped:
-        return
-    _page_cache_dropped = True
-    files, nbytes = drop_checkpoint_page_cache()
-    logger.info(
-        "engram host table: dropped the page cache of %d checkpoint files (%.0f GiB) %s",
-        files,
-        nbytes / 2**30,
-        reason,
-    )
+    use_hcu_optimization = _use_hcu_dsv41_w4a8_engram_load_optimization()
+    if use_hcu_optimization:
+        if reason in _page_cache_drop_reasons:
+            return
+        if group is not None:
+            group.barrier()
+        should_drop = group is None or group.rank_in_group == 0
+    else:
+        if _page_cache_dropped:
+            return
+        _page_cache_dropped = True
+        should_drop = True
+
+    if should_drop:
+        files, nbytes = drop_checkpoint_page_cache()
+        logger.info(
+            "engram host table: dropped the page cache of %d checkpoint files (%.0f GiB) %s",
+            files,
+            nbytes / 2**30,
+            reason,
+        )
+    if use_hcu_optimization:
+        if group is not None:
+            group.barrier()
+        _page_cache_drop_reasons.add(reason)
 
 
 class _HostTable:
@@ -583,7 +608,9 @@ class _HostTable:
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
+            _drop_page_cache_once(
+                "before pre-faulting the per-rank shard", group=self.group
+            )
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
@@ -592,6 +619,18 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+
+        self.device_ptr = self.bytes.data_ptr()
+        if torch.version.hip:
+            from sgl_kernel.kvcacheio import get_device_accessible_ptr
+
+            try:
+                self.device_ptr = get_device_accessible_ptr(
+                    self.bytes, torch.cuda.current_device()
+                )
+            except Exception:
+                torch.cuda.cudart().cudaHostUnregister(self.bytes.data_ptr())
+                raise
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -639,10 +678,17 @@ class _HostTable:
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if self.layout == "per_rank":
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
-            drop_checkpoint_page_cache()
+            if _use_hcu_dsv41_w4a8_engram_load_optimization():
+                _drop_page_cache_once(
+                    "after loading the per-rank shard for huge-page collapse",
+                    group=self.group,
+                )
+            elif huge_kb < mapped_kb * 0.98:
+                drop_checkpoint_page_cache()
+        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
@@ -715,6 +761,12 @@ class EngramEmbedding(nn.Module):
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
 
+    def _gather_ptr(self, tensor: torch.Tensor) -> int:
+        ptr = tensor.data_ptr()
+        if self.host_table is not None:
+            ptr += self.host_table.device_ptr - self.host_table.bytes.data_ptr()
+        return ptr
+
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
@@ -745,12 +797,13 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             out = self._empty(indices)
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                self._gather_ptr(self.weight),
+                self._gather_ptr(self.scale),
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
+                row_hi=self.weight.shape[0],
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -796,8 +849,8 @@ class EngramEmbedding(nn.Module):
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            self._gather_ptr(self.weight),
+            self._gather_ptr(self.scale),
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,

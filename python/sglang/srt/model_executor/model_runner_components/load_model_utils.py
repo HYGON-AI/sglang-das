@@ -22,6 +22,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -35,7 +36,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_hcu, is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 
 
@@ -376,10 +378,16 @@ def dist_barrier_after_load(
             dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
+        timeout_s = UNBALANCED_MODEL_LOADING_TIMEOUT_S
+        if (
+            _is_hcu
+            and envs.SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION.get()
+        ):
+            timeout_s = max(timeout_s, get_parallel().dist_timeout or 0)
         try:
             dist.monitored_barrier(
                 group=get_parallel().tp_group.cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                timeout=datetime.timedelta(seconds=timeout_s),
                 wait_all_ranks=True,
             )
         except RuntimeError:

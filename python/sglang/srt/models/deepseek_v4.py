@@ -4942,10 +4942,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                or not (
+                    get_moe_a2a_backend().is_none()
+                    or get_moe_a2a_backend().is_deepep()
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP with none or DeepEP A2A, without CP or PP"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -5553,6 +5556,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
+                    # EnGram tables are much larger than ordinary model weights.
+                    # Loading them asynchronously keeps the full checkpoint tensors
+                    # alive in pending futures and can exhaust host memory before
+                    # their TP-local row shards are copied. Consume them inline so
+                    # each full tensor can be released before reading the next one.
+                    if (
+                        _is_hcu
+                        and envs.SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION.get()
+                        and ".engram." in name
+                    ):
+                        use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
