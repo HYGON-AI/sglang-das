@@ -13,6 +13,7 @@ on:
       - v0.5.15.post1_dev
       - main
       - "release/**"
+      - feat/20260920_deepseek-v4.1
     paths:
       - ".github/workflows/pr-test-hcu.yml"
       - ".github/workflows/pr-gate.yml"
@@ -471,7 +472,7 @@ jobs:
       HCU_WHEEL_STAGING_CONTAINER_ROOT: /hcu-wheel-staging
       CHECKOUT_REF: ${{ inputs.pr_head_sha || inputs.ref || github.event.pull_request.head.sha || github.sha }}
       GATEWAY_WHEEL_REQUIRED: ${{ needs.check-changes.outputs.gateway_wheel_required }}
-      HCU_WHEEL_EXPECTED_TORCH_VERSION: ${{ ((github.event.pull_request.base.ref || github.ref_name) == 'main' || (github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18') && '2.11.0' || '' }}
+      HCU_WHEEL_EXPECTED_TORCH_VERSION: ${{ ((github.event.pull_request.base.ref || github.ref_name) == 'main' || (github.event.pull_request.base.ref || github.ref_name) == 'release/20260825_v0.5.18' || (github.event.pull_request.base.ref || github.ref_name) == 'feat/20260920_deepseek-v4.1') && '2.11.0' || '' }}
     steps:
       - name: Checkout code
         env:

@@ -48,7 +48,7 @@ jobs:
 
     container:
       # Select by PR base, not by the untrusted source branch. Dispatch uses its selected ref.
-      image: ${{ ((github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'main' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'release/20260825_v0.5.18') && (vars.HCU_CI_IMAGE_0518 || '10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest') || vars.HCU_CI_RELEASE_IMAGE }}
+      image: ${{ ((github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'main' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'release/20260825_v0.5.18' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'feat/20260920_deepseek-v4.1') && (vars.HCU_CI_IMAGE_0518 || '10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest') || vars.HCU_CI_RELEASE_IMAGE }}
       options: >
         --device=/dev/kfd --device=/dev/dri/ --group-add video
         -v /opt/hyhal/:/opt/hyhal/:ro
@@ -64,8 +64,8 @@ jobs:
         python-version: ['3.10']
 
     env:
-      TORCH_VERSION: ${{ inputs.torch_version || (((github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'main' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'release/20260825_v0.5.18') && '2.11.0' || '2.10.0') }}
-      SGLANG_PACKAGE_VERSION: ${{ ((github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'main' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'release/20260825_v0.5.18') && '0.5.18' || '0.5.15.post1' }}
+      TORCH_VERSION: ${{ inputs.torch_version || (((github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'main' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'release/20260825_v0.5.18' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'feat/20260920_deepseek-v4.1') && '2.11.0' || '2.10.0') }}
+      SGLANG_PACKAGE_VERSION: ${{ ((github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'main' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'release/20260825_v0.5.18' || (github.event.pull_request.base.ref || inputs.target_branch || github.ref_name) == 'feat/20260920_deepseek-v4.1') && '0.5.18' || '0.5.15.post1' }}
       SKIP_GATEWAY: ${{ inputs.skip_gateway || false }}
       PIP_INDEX_URL: http://10.16.1.201:9929/nightly/dtk2604/+simple/
       PIP_TRUSTED_HOST: 10.16.1.201
@@ -80,7 +80,7 @@ jobs:
           BUILD_TARGET: ${{ inputs.target_branch || github.ref_name }}
         run: |
           case "${BUILD_TARGET}" in
-            main|release/20260825_v0.5.18|v0.5.12_dev|v0.5.15.post1_dev) ;;
+            main|release/20260825_v0.5.18|feat/20260920_deepseek-v4.1|v0.5.12_dev|v0.5.15.post1_dev) ;;
             *) echo "::error::Set target_branch to the intended base branch for manual builds."; exit 1 ;;
           esac
 
