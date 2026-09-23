@@ -10,10 +10,7 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.utils import (
-    get_moe_a2a_backend,
-    is_shared_experts_fusion_disabled,
-)
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import get_layer_id
@@ -47,14 +44,10 @@ from sglang.srt.models.minimax_vl_common import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import add_prefix, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
-
-
-_is_cuda = is_cuda()
-_device_sm = get_device_sm()
 
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
@@ -144,28 +137,15 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         the loader before any layer is built; the experts live on the text
         config."""
         text_config = getattr(hf_config, "text_config", hf_config)
-        if not getattr(text_config, "n_shared_experts", None):
-            return "No shared experts are defined in the config."
-        if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
-            return (
-                "Shared and routed experts may use different quantization formats "
-                "in ModelOpt mixed-precision checkpoints."
-            )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if (_device_sm is not None) and (_device_sm < 80):
-            return "Shared experts fusion requires SM80 or newer GPUs."
-        if get_parallel().moe_ep_size > 1:
-            return (
-                "Shared experts fusion is not supported together with expert "
-                "parallelism yet."
-            )
-        if get_moe_a2a_backend().is_deepep():
-            return (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
-            )
-        return None
+        # Keep the multimodal wrapper's policy identical to the text model.
+        # In particular, MiniMax-M3 channel-FP8 on validated ROCm backends may
+        # explicitly enable the E129/Top5 AITER path with
+        # --enforce-shared-experts-fusion.  Duplicating the old CUDA-only gate
+        # here silently disabled that path for checkpoints whose outer
+        # architecture is MiniMaxM3SparseForConditionalGeneration.
+        return MiniMaxM3SparseForCausalLM.shared_experts_fusion_disable_reason(
+            text_config, quant_config
+        )
 
     def _determine_num_fused_shared_experts(self) -> None:
         # The decision was installed by the loader; this only reads it.
@@ -212,20 +192,44 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             return
 
         self.capture_aux_hidden_states = True
-        # MiniMaxM3Model.forward captures at layer ENTRY (= previous layer's
-        # output), so to capture layer L's output we must mark layer L+1. Apply
-        # +1 on both paths so EAGLE3 works out-of-the-box even when the draft
-        # config omits ``eagle_aux_hidden_state_layer_ids`` (the upstream
-        # Inferact/MiniMax-M3-EAGLE3 checkpoint does not ship it); otherwise the
-        # default-path layers are off by one and draft accept collapses.
         if layer_ids is None:
             num_layers = self.config.text_config.num_hidden_layers
-            layer_ids = [2, num_layers // 2, num_layers - 3]
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # Match vLLM's default EAGLE3 convention: default ids name the
+            # following layer entry whose input is the requested auxiliary
+            # output.  These values are already entry indices in SGLang.
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            # Explicit checkpoint ids are zero-based output layer ids.
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
         # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
         # attribute (not ``i in layers_to_capture``); set it explicitly so the
         # (hidden, aux) tuple is actually returned during capture-enabled forwards.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Configure text-model hidden-state snapshots consumed by DSpark."""
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError(
+                "MiniMax-M3 DSPARK aux hidden capture requires PP=1."
+            )
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # DSpark names HF-style target layer outputs; MiniMax captures the same
+        # tensor at the following decoder-layer entry.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
         for layer_id in self.model.layers_to_capture:
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)

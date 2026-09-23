@@ -7263,9 +7263,21 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
         if view.attn_cp_size != self.moe_dp_size:
-            assert (
-                self.moe_dp_size == 1
-            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+            # DP attention and MoE-DP may use the same DP partition while CP is
+            # disabled. In that layout (EP=1, attn-DP == MoE-DP), attention TP
+            # and MoE TP are identical contiguous rank groups, so no CP token
+            # sharing is required.
+            moe_dp_matches_attn_dp = (
+                self.enable_dp_attention
+                and view.attn_cp_size == 1
+                and self.moe_dp_size == self.dp_size
+                and view.ep_size == 1
+            )
+            assert self.moe_dp_size == 1 or moe_dp_matches_attn_dp, (
+                "attn_cp_size != moe_dp_size requires moe_dp_size == 1, or "
+                "the aligned DP-attention layout: attn_cp_size=1, ep_size=1, "
+                "and moe_dp_size=dp_size"
+            )
 
         from sglang.srt.layers.cp.base import init_cp_strategy
 
