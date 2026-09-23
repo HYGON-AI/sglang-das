@@ -180,6 +180,11 @@ def prepare_for_draft_extend(
         draft_model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
+        # The draft-extend graph runner owns persistent copies of the DP token
+        # counts and does not consume ForwardBatch.num_token_non_padded.  Avoid
+        # pageable host-to-device copies here; if graph selection fails, the
+        # eager path below materializes the same metadata before using it.
+        defer_device_metadata=True,
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
@@ -194,6 +199,8 @@ def prepare_for_draft_extend(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
+    if not can_run_decode_cuda_graph:
+        forward_batch.materialize_deferred_device_metadata(draft_model_runner.device)
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer

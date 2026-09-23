@@ -707,7 +707,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mark_forward_metadata_ready()
 
     def init_mlp_sync_metadata(
-        self, batch: ScheduleBatch, device: Union[str, torch.device]
+        self,
+        batch: ScheduleBatch,
+        device: Union[str, torch.device],
+        *,
+        materialize_device_tensors: bool = True,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
         if batch.global_num_tokens is None:
@@ -731,18 +735,58 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens,
-            dtype=torch.int64,
-            pin_memory=_pin_host_metadata(device),
-        ).to(device, non_blocking=True)
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=_pin_host_metadata(device),
-        ).to(device, non_blocking=True)
+        if materialize_device_tensors:
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
+        else:
+            # Draft-extend CUDA Graph replay consumes its own persistent token
+            # count buffers.  Building these transient tensors from pageable
+            # host memory can block the CPU behind the target stream and leave
+            # a launch bubble before replay.  Preserve the CPU values needed
+            # for graph selection and materialize the tensors only if the
+            # caller ultimately falls back to eager execution.
+            self.global_num_tokens_gpu = None
+            self.global_num_tokens_for_logprob_gpu = None
         self.global_cp_num_tokens_cpu = batch.global_cp_num_tokens
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+
+    def materialize_deferred_device_metadata(
+        self, device: Union[str, torch.device]
+    ) -> None:
+        """Materialize device metadata deferred by a graph-first prepare path."""
+        if (
+            self.num_token_non_padded is None
+            and self.num_token_non_padded_cpu is not None
+            and enable_num_token_non_padded()
+        ):
+            self.num_token_non_padded = torch.tensor(
+                self.num_token_non_padded_cpu, dtype=torch.int32, device=device
+            )
+
+        if (
+            self.global_num_tokens_cpu is not None
+            and self.global_num_tokens_gpu is None
+        ):
+            self.global_num_tokens_gpu = torch.tensor(
+                self.global_num_tokens_cpu, dtype=torch.int64, device=device
+            )
+        if (
+            self.global_num_tokens_for_logprob_cpu is not None
+            and self.global_num_tokens_for_logprob_gpu is None
+        ):
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                self.global_num_tokens_for_logprob_cpu,
+                dtype=torch.int64,
+                device=device,
+            )
 
     @classmethod
     def init_new(
@@ -752,6 +796,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        defer_device_metadata: bool = False,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -920,14 +965,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=pin_host_metadata,
-            ).to(device, non_blocking=True)
+            if not defer_device_metadata:
+                ret.num_token_non_padded = torch.tensor(
+                    num_tokens,
+                    dtype=torch.int32,
+                    pin_memory=pin_host_metadata,
+                ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        ret.init_mlp_sync_metadata(
+            batch,
+            device,
+            materialize_device_tensors=not defer_device_metadata,
+        )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
