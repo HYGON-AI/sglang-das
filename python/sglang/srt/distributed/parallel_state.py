@@ -1261,8 +1261,15 @@ class GroupCoordinator:
                     ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
+            elif get_bool_env_var(
+                "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+            ):
+                # Registered AITER buffers are valid only during real HIP graph
+                # capture. Keep eager warmup on the same collective so consumers
+                # never observe a synthetic zero result.
+                ca_comm.reduce_scatter(input, output, registered=False)
             else:
-                # True CUDA graph warmup: avoid a different host collective.
+                # Compatibility escape hatch for older AITER runtimes.
                 output.zero_()
             return True
         ca_comm.reduce_scatter(input, output, registered=False)
@@ -1403,8 +1410,12 @@ class GroupCoordinator:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
+                elif get_bool_env_var(
+                    "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+                ):
+                    ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
-                    # True CUDA graph warmup: avoid a different host collective.
+                    # Compatibility escape hatch for older AITER runtimes.
                     output.zero_()
                 return
             else:
