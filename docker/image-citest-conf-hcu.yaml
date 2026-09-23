@@ -1,44 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-GLM-5-Channel-FP8-w8a8:
+Qwen3.8-Flash-Next-Channel-INT8-w8a8:
   env:
-    SGLANG_ENABLE_SPEC_V2: 1
-    SGLANG_TORCH_PROFILER_DIR: /workspace/profiling
-    HSA_ENABLE_COREDUMP: 1
-    ALLREDUCE_STREAM_WITH_COMPUTE: 1
-    HIP_KERNEL_EVENT_SYSTENFENCE: 1
-    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD: 0
-    GLIBC_TUNABLES: glibc.rtld.optional_static_tls=0x40000
-    HIP_KERNEL_BATCH_CEILING: 100
-    GPU_FORCE_BLIT_COPY_SIZE: 16
-    HSA_KERNARG_POOL_SIZE: 8388608
-    ROC_AQL_QUEUE_SIZE: 131072
+    SGLANG_USE_AITER_AR: 1
+    SGLANG_USE_AITER_LINEAR_ATTN: 1
+    SGLANG_USE_CAUSAL_CONV1D: 1
+    SGLANG_USE_FUSED_TOPK_SOFTMAX: 1
     SGLANG_USE_LIGHTOP: 1
-    SGLANG_USE_FP8_W8A8_MOE: 1
-    SGLANG_KVALLOC_KERNEL: 1
-    SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO: 1
-    SGLANG_ASSIGN_EXTEND_CACHE_LOCS: 1
-    SGLANG_ASSIGN_REQ_TO_TOKEN_POOL: 1
-    SGLANG_GET_LAST_LOC: 1
-    SGLANG_CREATE_FLASHMLA_KV_INDICES_TRITON: 1
-    SGLANG_CREATE_CHUNKED_PREFIX_CACHE_KV_INDICES: 1
-    HIP_GRAPH_ACCUMULATE_DISPATCH: 1
-    HIP_GRAPH_USE_CMD_CACHE: 0
-    ROCSHMEM_DISABLE_HDP_FLUSH: 1
-    ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX: 288
-    ROCSHMEM_HEAP_SIZE: 3173741824
-    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 256
-    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT: 1200
-    AMDGCN_USE_BUFFER_OPS: 0
-    ROCSHMEM_IB_GID_INDEX: 0
-    MC_IB_GID_INDEX: 0
-    MC_ENABLE_DEST_DEVICE_AFFINITY: 1
-    SGLANG_HOST_IP: '$(hostname -I 2>/dev/null | awk ''{print $1}'')'
-    SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH: 1
-    USE_DCU_CUSTOM_ALLREDUCE: 0
-    SGLANG_USE_AITER_AR: 0
-    SGLANG_USE_DEEPGEMM_MOE: 1
+    W8A8_SUPPORT_METHODS: 3
   evalscope:
     datasets:
     - swe_bench_lite_agentic
@@ -54,35 +24,105 @@ GLM-5-Channel-FP8-w8a8:
         limit: 5
       mcp_atlas:
         limit: 5
-  model: GLM-5-Channel-FP8-w8a8
+  model: Qwen3.8-Flash-Next-Channel-INT8-w8a8
   server: sglang
   server_args:
-    attn-cp-size: 8
-    chunked-prefill-size: 16384
-    context-length: 140000
-    deepep-mode: auto
-    dist-timeout: 100000
-    dp-size: 1
+    chunked-prefill-size: 4096
+    context-length: 32768
     dtype: bfloat16
-    enable-dp-attention: true
-    enable-dp-lm-head: true
-    enable-nsa-prefill-context-parallel: true
-    ep-size: 8
+    dp-size: 1
+    ep-size: 1
     kv-cache-dtype: fp8_e4m3
+    language-model-only: true
+    mamba-radix-cache-strategy: extra_buffer
+    max-running-requests: 32
     mem-fraction-static: 0.85
-    moe-a2a-backend: deepep
-    moe-dense-tp-size: 1
-    nsa-decode-backend: flashmla_kv
-    nsa-prefill-backend: flashmla_auto
-    nsa-prefill-cp-mode: round-robin-split
+    moe-runner-backend: aiter
+    numa-node: '0 0 0 0 0 0 0 0'
     page-size: 64
     pp-size: 1
-    reasoning-parser: glm45
+    reasoning-parser: qwen3
     speculative-algorithm: EAGLE
     speculative-eagle-topk: 1
+    speculative-moe-runner-backend: aiter
     speculative-num-draft-tokens: 4
     speculative-num-steps: 3
-    tool-call-parser: glm47
+    tool-call-parser: qwen3_coder
+    tp-size: 8
+    trust-remote-code: true
+    watchdog-timeout: 1200
+  type: precision
+
+DeepSeek-V4-Flash-Channel-FP8-w8a8:
+  env:
+    ROCSHMEM_DISABLE_HDP_FLUSH: 1
+    ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX: 288
+    ROCSHMEM_HEAP_SIZE: 3173741824
+    SGLANG_APPLY_CONFIG_BACKUP: none
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 128
+    SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS: 2
+    SGLANG_DSPARK_ENABLE_MULTI_STREAM: 1
+    SGLANG_DSPARK_FAST_KERNEL: 1
+    SGLANG_DSPARK_FAST_SAMPLING: 1
+    SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA: 1
+    SGLANG_JIT_DEEPGEMM_PRECOMPILE: 0
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL: 1
+    SGLANG_OPT_FP8_WO_A_GEMM: 0
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION: false
+    SGLANG_OPT_USE_FUSED_HASH_TOPK: true
+    SGLANG_OPT_USE_FUSED_STORE_CACHE: false
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK: true
+    SGLANG_RAGGED_VERIFY_MODE: compact
+    SGLANG_ROCM_USE_AITER_MOE: 1
+    SGLANG_ROCM_USE_AITER_TILELANG_MHC: 1
+    SGLANG_TOPK_TRANSFORM_512_TORCH: false
+    SGLANG_USE_AITER_AG: 0
+    SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE: 1
+    SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM: 1
+    SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT: 1
+    SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT: 1
+    SGLANG_USE_FUSED_MLA_CAT: 1
+    SGLANG_USE_LIGHTOP: 1
+    SGLANG_USE_LIGHTOP_EP_GATHER: 1
+    SGLANG_USE_LIGHTOP_EP_MOE_ALIGN: 1
+    SGLANG_USE_LIGHTOP_EP_SCATTER: 1
+    SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT: 1
+    SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS: 1
+    SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT: 1
+    SGLANG_USE_OPT_CAT: 1
+  evalscope:
+    datasets:
+    - swe_bench_lite_agentic
+    - mcp_atlas
+    - ifbench
+    - bfcl_v3
+    - humaneval
+    - gsm8k
+    - math_500
+    limit: 50
+    dataset_args:
+      swe_bench_lite_agentic:
+        limit: 5
+      mcp_atlas:
+        limit: 5
+  model: DeepSeek-V4-Flash-Channel-FP8-w8a8
+  server: sglang
+  server_args:
+    chunked-prefill-size: 32768
+    context-length: 81920
+    cuda-graph-max-bs-decode: 256
+    disable-flashinfer-autotune: true
+    dist-timeout: 10000
+    enable-metrics: true
+    max-running-requests: 64
+    mem-fraction-static: 0.8
+    model-loader-extra-config: '{"enable_multithread_load": true, "num_threads": 64}'
+    reasoning-parser: deepseek-v4
+    skip-server-warmup: true
+    speculative-algorithm: DSPARK
+    speculative-eagle-topk: 1
+    speculative-num-steps: 1
+    tool-call-parser: deepseekv4
     tp-size: 8
     trust-remote-code: true
     watchdog-timeout: 3600
