@@ -5558,7 +5558,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                     # alive in pending futures and can exhaust host memory before
                     # their TP-local row shards are copied. Consume them inline so
                     # each full tensor can be released before reading the next one.
-                    if _is_hcu and ".engram." in name:
+                    if (
+                        _is_hcu
+                        and envs.SGLANG_HCU_ENABLE_DSV41_W4A8_ENGRAM_LOAD_OPTIMIZATION.get()
+                        and ".engram." in name
+                    ):
                         use_async_loading = False
 
                     name = self.remap_weight_name_to_dpsk_hf_format(

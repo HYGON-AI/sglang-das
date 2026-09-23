@@ -273,6 +273,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
         self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
 
+    def _is_hcu_dsv41_w4a8_config(self) -> bool:
+        if not _is_hcu or not any("engram" in pattern for pattern in self.ignore):
+            return False
+
+        for target, scheme in self.target_scheme_map.items():
+            if "w[123]" not in target:
+                continue
+            weight_quant = scheme.get("weights")
+            input_quant = scheme.get("input_activations")
+            if (
+                weight_quant is not None
+                and input_quant is not None
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+            ):
+                return True
+        return False
+
     # @property
     # def weight_block_size(self) -> Optional[List[int]]:
     #     """Get the weight block size from the quantization config."""
@@ -823,8 +840,12 @@ class CompressedTensorsConfig(QuantizationConfig):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
-        scheme_dict = None
-        with suppress(ValueError):
+        is_hcu_dsv41_w4a8 = self._is_hcu_dsv41_w4a8_config()
+        if is_hcu_dsv41_w4a8:
+            scheme_dict = None
+            with suppress(ValueError):
+                scheme_dict = self.get_scheme_dict(layer, layer_name)
+        else:
             scheme_dict = self.get_scheme_dict(layer, layer_name)
         if scheme_dict is not None:
             weight_quant = scheme_dict.get("weights")
@@ -833,30 +854,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
                 return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
 
-        # Check both runtime projection names and checkpoint aliases. DeepSeek-V4
-        # checkpoints use w1/w2/w3, while the model loader remaps them to
-        # gate_proj/down_proj/up_proj before materializing FusedMoE.
-        projection_name_groups = [
-            [".0.gate_proj", ".0.up_proj", ".0.down_proj"],
-            [".0.w1", ".0.w3", ".0.w2"],
+        unfused_names = [
+            layer_name + projection_name
+            for projection_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
         ]
-        all_scheme_dicts = None
-        last_match_error = None
-        for projection_names in projection_name_groups:
-            try:
-                all_scheme_dicts = [
-                    self.get_scheme_dict(layer, layer_name + projection_name)
-                    for projection_name in projection_names
-                ]
-                break
-            except ValueError as error:
-                last_match_error = error
-
-        if all_scheme_dicts is None:
-            assert last_match_error is not None
-            raise last_match_error
-
         # TODO: refactor this to use expert_mapping and check all layer numbers
+        try:
+            all_scheme_dicts = [
+                self.get_scheme_dict(layer, name) for name in unfused_names
+            ]
+        except ValueError:
+            if not is_hcu_dsv41_w4a8:
+                raise
+            checkpoint_aliases = [".0.w1", ".0.w3", ".0.w2"]
+            all_scheme_dicts = [
+                self.get_scheme_dict(layer, layer_name + projection_name)
+                for projection_name in checkpoint_aliases
+            ]
+
         scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
 
         # multiple schemes found
@@ -963,7 +978,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
             else:
                 raise NotImplementedError(
-                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W4A8Int8 Fused MoE scheme is currently implemented "
+                    "only for NPU and HCU."
                 )
         else:
             raise RuntimeError(
