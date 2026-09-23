@@ -326,6 +326,7 @@ def _get_aiter_w8a8_moe_config(
     quant_info: AiterMoeQuantInfo,
 ):
     from aiter.moe import MoeSolutionType, get_aiter_moe_config
+    from sglang.srt.environ import envs
 
     if hidden_states.dim() != 2:
         raise RuntimeError(
@@ -359,6 +360,9 @@ def _get_aiter_w8a8_moe_config(
         quant_type=quant_type,
         activation=activation,
     )
+
+    if envs.SGLANG_FORCE_AITER_MOE_C.get():
+        config_kwargs["spec_sol_type"] = MoeSolutionType.MOE_C
 
     try:
         status, moe_config = get_aiter_moe_config(**config_kwargs)
