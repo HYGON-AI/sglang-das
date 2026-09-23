@@ -1279,6 +1279,7 @@ class Scheduler(
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
                     attn_tp_size=self.ps.attn_tp_size,
+                    attn_cp_size=self.ps.attn_cp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
                     server_args=self.server_args,
