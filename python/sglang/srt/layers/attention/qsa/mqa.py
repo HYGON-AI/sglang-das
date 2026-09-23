@@ -1,12 +1,26 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer;
-the torch implementations are the fallback and the reference."""
+"""Weight-free MQA operators for the simple QSA indexer.
 
+The public entry points try BoltOPs TileLang first (HCU only), then the in-tree
+TileLang kernels, then the Torch reference.
+"""
+
+import logging
 import math
+from functools import lru_cache
 from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_hcu, is_hip
+
+logger = logging.getLogger(__name__)
+
+_is_hcu = is_hcu()
+
+
+@lru_cache(maxsize=8)
+def _warn_tilelang_fallback(kind: str, reason: str) -> None:
+    logger.warning("QSA MQA TileLang %s falls back to torch: %s", kind, reason)
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -388,8 +402,21 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if _is_hcu:
+        from sglang.srt.layers.attention.qsa.boltops_mqa import (
+            try_boltops_qsa_mqa_prefill,
+        )
+
+        boltops_logits = try_boltops_qsa_mqa_prefill(
+            q, k, row_starts, row_ends, score_scale
+        )
+        if boltops_logits is not None:
+            return boltops_logits
     if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+        try:
+            return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+        except Exception as exc:
+            _warn_tilelang_fallback("prefill", str(exc))
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
@@ -401,10 +428,23 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_decode(
+    if _is_hcu:
+        from sglang.srt.layers.attention.qsa.boltops_mqa import (
+            try_boltops_qsa_mqa_decode,
+        )
+
+        boltops_logits = try_boltops_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
         )
+        if boltops_logits is not None:
+            return boltops_logits
+    if q.is_cuda and HAS_TILELANG:
+        try:
+            return tilelang_qsa_mqa_decode(
+                q, k_cache, page_table, context_lens, max_model_len, score_scale
+            )
+        except Exception as exc:
+            _warn_tilelang_fallback("decode", str(exc))
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
     )
