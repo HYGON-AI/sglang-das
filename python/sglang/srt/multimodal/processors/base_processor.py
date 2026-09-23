@@ -200,6 +200,11 @@ class BaseMultimodalProcessor(ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
 
+        mm_process_config = self.server_args.mm_process_config
+        self.image_config = mm_process_config.get("image", {})
+        self.video_config = mm_process_config.get("video", {})
+        self.audio_config = mm_process_config.get("audio", {})
+
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
         if hasattr(self._processor, "tokenizer"):
