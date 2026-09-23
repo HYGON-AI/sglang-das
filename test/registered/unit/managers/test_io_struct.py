@@ -1127,6 +1127,22 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
 
+    def test_per_item_routed_dp_rank_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            routed_dp_rank=[0, 1],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_dp_rank, 0)
+        self.assertEqual(req[1].routed_dp_rank, 1)
+
+    def test_per_item_routed_dp_rank_requires_batch_length(self):
+        req = GenerateReqInput(text=["Hello", "World"], routed_dp_rank=[0])
+        with self.assertRaisesRegex(ValueError, "routed_dp_rank.*batch size"):
+            req.normalize_batch_and_arguments()
+
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
