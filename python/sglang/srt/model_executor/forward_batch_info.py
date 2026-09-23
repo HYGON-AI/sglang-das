@@ -1146,11 +1146,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
-
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
-            if require_mlp_tp_gather():
+            if len(self.global_num_tokens_cpu) > 1:
                 num_tokens_per_dp = self.global_num_tokens_cpu[
                     get_parallel().attn_dp_rank
                 ]
