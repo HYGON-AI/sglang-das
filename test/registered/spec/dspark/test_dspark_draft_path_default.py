@@ -7,6 +7,9 @@ from sglang.srt.arg_groups.speculative_hook import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_utils import (
+    get_dflash_attention_sliding_window_size,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -146,19 +149,31 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
-        """Both sides of the allowlist: megamoe passes, others raise by name."""
+    def test_ep_a2a_backends_are_admitted(self):
+        """Static verification admits the supported token A2A backends."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
-            _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
-            for backend in ("deepep", "pplx"):
+            for backend in ("deepep", "megamoe"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+            for backend in ("pplx",):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
-        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-            with self.assertRaisesRegex(ValueError, "static"):
-                _handle_dspark(server_args)
+        for backend in ("deepep", "megamoe"):
+            server_args = self._dp_server_args(moe_a2a_backend=backend)
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+                with self.assertRaisesRegex(ValueError, "static"):
+                    _handle_dspark(server_args)
+
+
+class TestDsparkSlidingWindowCompatibility(CustomTestCase):
+    def test_official_dspark_swa_field_is_used_when_qwen3_drops_top_level(self):
+        config = SimpleNamespace(
+            layer_types=["sliding_attention"] * 6,
+            sliding_window=None,
+            dflash_config={"use_swa": True, "swa_window_size": 1024},
+        )
+        self.assertEqual(get_dflash_attention_sliding_window_size(config), 1023)
 
 
 if __name__ == "__main__":

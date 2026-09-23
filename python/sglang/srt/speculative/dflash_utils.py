@@ -448,6 +448,16 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    # Transformers 5.x normalizes Qwen3's top-level ``sliding_window`` to
+    # ``None`` unless ``use_sliding_window`` is also present.  Official DSpark
+    # checkpoints retain the trained window in ``dflash_config.swa_window_size``.
+    # Accept that canonical DSpark field as a compatibility fallback.
+    if sliding_window is None:
+        dflash_config = _cfg_get(
+            text_config, "dflash_config", _cfg_get(config, "dflash_config")
+        )
+        if _cfg_get(dflash_config, "use_swa", False):
+            sliding_window = _cfg_get(dflash_config, "swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
