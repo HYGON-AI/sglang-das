@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_local_dp_state,
     cp_shard_model_inputs,
     is_cp_v2_active,
     prepare_cp_forward,
@@ -367,6 +368,19 @@ class EagerRunner(BaseRunner):
         with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
         ) as (sharded_input_embeds, sharded_positions):
+            position_tokens = sharded_positions.shape[-1]
+            if sharded_input_embeds.shape[0] != position_tokens:
+                parallel = get_parallel()
+                raise RuntimeError(
+                    "CP-v2 model input shard mismatch: "
+                    f"embeddings={tuple(sharded_input_embeds.shape)}, "
+                    f"positions={tuple(sharded_positions.shape)}, "
+                    f"dp_rank={parallel.attn_dp_rank}, "
+                    f"cp_rank={parallel.attn_cp_rank}, "
+                    f"cp_size={parallel.attn_cp_size}, "
+                    f"metadata_total={forward_batch.attn_cp_metadata.total_seq_lens}, "
+                    f"metadata_physical={forward_batch.attn_cp_metadata.per_rank_actual_token}"
+                )
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -444,7 +458,18 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        with device_timer_ctx(model_runner.device_timer, "idle"):
+        global_cp_tokens = forward_batch.global_cp_num_tokens_cpu
+        use_cp_local_dp = (
+            get_parallel().attn_cp_size > 1
+            and global_cp_tokens is not None
+            and any(global_cp_tokens)
+        )
+        cp_context = (
+            cp_local_dp_state(forward_batch)
+            if use_cp_local_dp
+            else contextlib.nullcontext()
+        )
+        with device_timer_ctx(model_runner.device_timer, "idle"), cp_context:
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

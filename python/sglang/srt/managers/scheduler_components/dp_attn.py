@@ -93,6 +93,7 @@ class MLPSyncBatchInfo:
 
     num_tokens: int
     num_tokens_for_logprob: int
+    cp_num_tokens: int
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
@@ -103,6 +104,7 @@ class MLPSyncBatchInfo:
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_cp_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -117,6 +119,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.cp_num_tokens,
             ],
             device=device,
             dtype=dtype,
@@ -132,6 +135,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # cp_num_tokens
             ],
             device=device,
             dtype=dtype,
@@ -200,6 +204,13 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.global_cp_num_tokens = tp0_info_cpu[:, 7].tolist()
+        if self.cp_size > 1:
+            from sglang.srt.layers.cp.utils import normalize_dp_cp_token_counts
+
+            self.global_cp_num_tokens = normalize_dp_cp_token_counts(
+                self.global_num_tokens, self.global_cp_num_tokens
+            )
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -219,11 +230,13 @@ def _update_gather_batch(
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.global_cp_num_tokens = [mlp_sync_info.cp_num_tokens]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.global_cp_num_tokens = mlp_sync_info.global_cp_num_tokens
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -272,6 +285,16 @@ def prepare_mlp_sync_batch_raw(
         assert (
             local_batch.return_logprob
             or num_tokens_for_logprob == local_batch.batch_size()
+        )
+
+    cp_num_tokens = 0
+    if local_batch is not None and local_batch.forward_mode.is_extend():
+        from sglang.srt.layers.cp.utils import get_cp_v2_physical_token_count
+
+        cp_num_tokens = get_cp_v2_physical_token_count(
+            num_tokens=num_tokens,
+            extend_seq_lens=local_batch.extend_lens,
+            cp_size=attn_cp_size,
         )
 
     # With a single DP replica and no residual attention-TP/MLP-TP gather,
@@ -359,6 +382,7 @@ def prepare_mlp_sync_batch_raw(
         cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        cp_num_tokens=cp_num_tokens,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,

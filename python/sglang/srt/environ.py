@@ -672,6 +672,10 @@ class Envs:
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    # Minimum extend length of every request before CP-v2 shards the batch.
+    # Small requests are both slower and more fragile on highly partitioned
+    # attention layouts; zero preserves the historical cp_size * 2 threshold.
+    SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE = EnvInt(0)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")

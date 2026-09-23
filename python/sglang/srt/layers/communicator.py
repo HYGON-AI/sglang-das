@@ -48,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
+    get_global_dp_buffer_len,
     get_local_dp_buffer,
     get_moe_cp_rank,
     get_moe_cp_size,
@@ -428,10 +429,19 @@ class LayerScatterModes:
                 or enable_dwdp()
             ):
                 return ScatterMode.SCATTERED
-            # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
-            if is_enable_moe_cp_allgather() and not (
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
-            ):
+            if is_enable_moe_cp_allgather():
+                # DSA still owns a separate CP layout.  CP-v2 MLA, however,
+                # enters the model body with distinct CP-local token shards.
+                # A TP-sharded MoE must materialize the complete token set on
+                # every MoE-TP rank before expert GEMMs, then slice back to the
+                # local CP shard after the MoE-TP all-reduce.
+                if is_dsa_enable_prefill_cp():
+                    return ScatterMode.FULL
+                if is_mla_prefill_cp_enabled():
+                    from sglang.srt.layers.cp.utils import enable_cp_v2
+
+                    if not enable_cp_v2():
+                        return ScatterMode.FULL
                 return ScatterMode.MOE_FULL
             if cls._moe_layout_matches_attention_layout():
                 return ScatterMode.TP_ATTN_FULL
@@ -894,6 +904,14 @@ class LayerCommunicator:
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
+            return False
+        if (
+            self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._scatter_hidden_states_moe
+        ):
+            # MOE_FULL gathers every CP token shard before a TP-sharded MoE.
+            # MiniMaxM3MoE must therefore perform its normal MoE-TP all-reduce
+            # before this postprocess function selects the local CP chunk.
             return False
         if (
             self._communicate_summable_tensor_pair_fn
@@ -1450,12 +1468,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         Residual is left at TP_ATTN_FULL throughout.
         """
-        # Early return on empty tensor is safe for MOE_CP because:
-        # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
-        #   so no rank hits this path while others proceed to the allgather.
-        # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-        # - CUDA graph warmup: not applicable when --disable-piecewise-cuda-graph is used.
-        if hidden_states.shape[0] == 0:
+        # An idle attention-DP replica starts with zero local tokens, but it must
+        # still run both collectives: the DP gather supplies the active replica's
+        # CP shard, then the MoE-CP gather materializes the complete MoE input.
+        cp_local_dp_layout = getattr(forward_batch, "cp_local_dp_layout", False)
+        cp_v2_local_layout = (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        )
+        if hidden_states.shape[0] == 0 and not cp_local_dp_layout:
             return hidden_states, residual
 
         # Step 1: Standard all-reduce/DP-allgather + layernorm (reuse existing logic).
@@ -1476,22 +1497,22 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if (
             moe_cp_size > 1
             and hidden_states.shape[0] > 0
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
+            and (cp_local_dp_layout or cp_v2_local_layout)
         ):
             # Zigzag split can produce unequal token counts across CP ranks
             # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
             # equal input sizes, so pad to the max per-rank token count.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens = max(per_rank_tokens)
-            pad_size = max_tokens - hidden_states.shape[0]
-            if pad_size > 0:
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states, [0, 0, 0, pad_size]
-                )
+            if not cp_local_dp_layout:
+                per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
+                max_tokens = max(per_rank_tokens)
+                pad_size = max_tokens - hidden_states.shape[0]
+                if pad_size > 0:
+                    hidden_states = torch.nn.functional.pad(
+                        hidden_states, [0, 0, 0, pad_size]
+                    )
 
             output = torch.empty(
-                (max_tokens * moe_cp_size, hidden_states.shape[1]),
+                (hidden_states.shape[0] * moe_cp_size, hidden_states.shape[1]),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
@@ -1651,23 +1672,31 @@ class CommunicateSummableTensorPairFn:
 
         If DP>1, further scatter back to the local DP slice.
         """
-        # Only scatter back during prefill; decode was never allgathered so no-op.
-        # Safe w.r.t. empty tensors: same reasoning as _gather_hidden_states_and_residual_moe
-        # — CP extend always has non-zero tokens per rank, and decode skips this path.
+        # Only the CP-local model-body layout was gathered above.  This includes
+        # idle DP peers participating on behalf of an active replica.
         moe_cp_size = get_moe_cp_size()
-        if (
-            moe_cp_size > 1
-            and forward_batch.forward_mode.is_context_parallel_extend()
+        cp_local_dp_layout = getattr(forward_batch, "cp_local_dp_layout", False)
+        cp_v2_local_layout = (
+            forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
-        ):
+        )
+        if moe_cp_size > 1 and (cp_local_dp_layout or cp_v2_local_layout):
             moe_cp_rank = get_moe_cp_rank()
-            # The allgather was padded to max_tokens_per_rank (equal chunks).
-            # Extract this rank's actual (non-padded) tokens from its chunk.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens_per_rank = max(per_rank_tokens)
-            actual_local_tokens = per_rank_tokens[moe_cp_rank]
+            if cp_local_dp_layout:
+                # Each gathered CP chunk contains every attention-DP replica
+                # for that CP index. Select the whole chunk first; the DP
+                # scatter below then extracts this rank's local replica.
+                cp_chunk_tokens = get_global_dp_buffer_len()
+                actual_local_tokens = cp_chunk_tokens
+            else:
+                # DP1 CP-v2 has no remapped DP buffer. The gather uses equally
+                # padded CP chunks, then restores this rank's actual zigzag
+                # token count.
+                per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
+                cp_chunk_tokens = max(per_rank_tokens)
+                actual_local_tokens = per_rank_tokens[moe_cp_rank]
             hidden_states = hidden_states.narrow(
-                0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
+                0, moe_cp_rank * cp_chunk_tokens, actual_local_tokens
             ).contiguous()
 
         # DP scatter (if DP attention is enabled)

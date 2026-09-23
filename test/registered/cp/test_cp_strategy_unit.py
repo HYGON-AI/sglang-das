@@ -318,12 +318,42 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertFalse(enable_cp_v2())
             self.assertFalse(is_cp_v2_active(active_batch))
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        with (
+            patch("sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True),
+            patch(
+                "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+                return_value=0,
+            ),
         ):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_cp_v2_min_tokens_is_enforced_per_sequence(self):
+        strategy = ZigzagCPStrategy(cp_size=4)
+        mode = _ExtendMode()
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+            return_value=4096,
+        ):
+            self.assertFalse(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4095, 4097],
+                    ),
+                )
+            )
+            self.assertTrue(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4096, 4096],
+                    ),
+                )
+            )
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
@@ -925,7 +955,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertEqual(metadata.per_rank_actual_token, [4, 4, 4, 4])
         self.assertEqual(metadata.max_rank_len, [4, 4, 4, 4])
 
-    def test_prepare_cp_forward_sizes_gather_buffer_for_all_cp_ranks(self):
+    def test_prepare_cp_forward_keeps_dp_buffer_until_model_body(self):
         forward_batch = SimpleNamespace(
             input_ids=torch.arange(10),
             positions=torch.arange(10),
@@ -957,7 +987,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
             forward_batch.attn_cp_metadata.per_rank_actual_token,
             [4, 4, 4, 4],
         )
-        set_buffer_len.assert_called_once_with(16)
+        set_buffer_len.assert_not_called()
 
     def test_interleave_shards_hidden_states_and_position_ids(self):
         cp_size = 4

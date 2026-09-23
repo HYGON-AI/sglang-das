@@ -59,6 +59,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         batch = SimpleNamespace(
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
+            global_cp_num_tokens=None,
             can_run_dp_cuda_graph=True,
         )
 
