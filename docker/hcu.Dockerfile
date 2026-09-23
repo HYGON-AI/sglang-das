@@ -68,6 +68,12 @@ RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh
     bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
     rm -f /tmp/dtk_blas_cut_installer.sh
 
+# ---layer--- shca 驱动
+RUN wget -q "${RESOURCE_SERVER_URL}/pkg/shca/others/20260706/shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb" \
+    && dpkg -i --force-all shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb \
+    && rm -rf shca-tools*.deb
+
+# ---layer---
 RUN pip install --no-cache-dir ninja wheel setuptools \
     && pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     && pip install --no-cache-dir amdsmi==1.0.0+630c16a6.dirty \
