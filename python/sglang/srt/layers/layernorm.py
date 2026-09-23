@@ -124,7 +124,7 @@ if _use_aiter:
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
-elif _is_hip:
+elif _is_hip and not _is_hcu:
     try:
         from vllm._custom_ops import fused_add_rms_norm, rms_norm
 
@@ -809,8 +809,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Fallback to native implementation if vllm is not available
-        if not _has_vllm_rms_norm:
+        # HCU uses LightOp directly; only generic ROCm depends on vLLM ops.
+        if not _is_hcu and not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
@@ -1240,6 +1240,19 @@ class GemmaRMSNorm(BaseFusedOp):
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
+        if _is_hcu:
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return gemma_fused_add_rmsnorm_hcu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+            out = torch.empty_like(x)
+            op.rms_norm_opt(out, x, self.gemma_weight, self.variance_epsilon)
+            return out
+
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
@@ -1257,11 +1270,6 @@ class GemmaRMSNorm(BaseFusedOp):
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                if _is_hcu:
-                    out, residual_out = gemma_fused_add_rmsnorm_hcu(
-                        x, residual, self.weight.data, self.variance_epsilon
-                    )
-                    return out, residual_out
                 return _call_vllm_fused_add_rms_norm(
                     fused_add_rms_norm,
                     x,
@@ -1269,10 +1277,6 @@ class GemmaRMSNorm(BaseFusedOp):
                     w,
                     self.variance_epsilon,
                 )
-            if _is_hcu:
-                out = torch.empty_like(x)
-                op.rms_norm_opt(out, x, w, self.variance_epsilon)
-                return out
             return rms_norm(x, w, self.variance_epsilon)
 
     def forward_cpu(

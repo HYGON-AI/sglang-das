@@ -3,6 +3,51 @@ import torch
 import sglang.srt.layers.layernorm as layernorm
 
 
+def test_hcu_rmsnorm_does_not_require_vllm_ops(monkeypatch):
+    class FakeLightOp:
+        @staticmethod
+        def fused_add_rms_norm_opt(x, residual, weight, eps):
+            residual.add_(x)
+            x.copy_(residual)
+
+        @staticmethod
+        def rms_norm_opt(out, x, weight, eps):
+            out.copy_(x + 1)
+
+    monkeypatch.setattr(layernorm, "_is_hcu", True)
+    monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", False)
+    monkeypatch.setattr(layernorm, "op", FakeLightOp(), raising=False)
+    norm = layernorm.RMSNorm(4, eps=1e-6)
+    x = torch.ones((1, 4))
+    residual = torch.full_like(x, 2)
+
+    out, residual_out = norm.forward_hip(x, residual)
+
+    assert out is x
+    assert residual_out is residual
+    torch.testing.assert_close(out, torch.full_like(out, 3))
+
+
+def test_hcu_gemma_rmsnorm_does_not_require_vllm_ops(monkeypatch):
+    def fake_gemma(x, residual, weight, eps):
+        return x + 1, residual + x
+
+    monkeypatch.setattr(layernorm, "_is_hcu", True)
+    monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", False)
+    monkeypatch.setattr(layernorm, "_use_aiter", False)
+    monkeypatch.setattr(
+        layernorm, "gemma_fused_add_rmsnorm_hcu", fake_gemma, raising=False
+    )
+    norm = layernorm.GemmaRMSNorm(4, eps=1e-6)
+    x = torch.ones((1, 4))
+    residual = torch.full_like(x, 2)
+
+    out, residual_out = norm.forward_hip(x, residual)
+
+    torch.testing.assert_close(out, torch.full_like(out, 2))
+    torch.testing.assert_close(residual_out, torch.full_like(residual_out, 3))
+
+
 def test_gemma_lightop_fp8_quant_preserves_residual_contract(monkeypatch):
     calls = []
 

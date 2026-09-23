@@ -22,7 +22,9 @@ def _fake_legacy_fused_add_rms_norm(out, x, residual_out, residual, weight, eps)
 def test_rmsnorm_hip_uses_vllm_four_argument_inplace_contract(monkeypatch):
     monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", True)
     monkeypatch.setattr(layernorm, "_is_hcu", False)
-    monkeypatch.setattr(layernorm, "fused_add_rms_norm", _fake_fused_add_rms_norm)
+    monkeypatch.setattr(
+        layernorm, "fused_add_rms_norm", _fake_fused_add_rms_norm, raising=False
+    )
     norm = layernorm.RMSNorm(4, eps=1e-6)
     norm.weight.data.fill_(1)
     x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
@@ -40,7 +42,9 @@ def test_gemma_rmsnorm_hip_uses_vllm_four_argument_inplace_contract(monkeypatch)
     monkeypatch.setattr(layernorm, "_is_hcu", False)
     monkeypatch.setattr(layernorm, "_use_aiter", False)
     monkeypatch.setattr(layernorm, "_use_hcu_lightop_gemma_rmsnorm", False)
-    monkeypatch.setattr(layernorm, "fused_add_rms_norm", _fake_fused_add_rms_norm)
+    monkeypatch.setattr(
+        layernorm, "fused_add_rms_norm", _fake_fused_add_rms_norm, raising=False
+    )
     norm = layernorm.GemmaRMSNorm(4, eps=1e-6)
     norm.weight.data.zero_()
     x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
@@ -63,7 +67,7 @@ def test_rmsnorm_hip_without_residual_uses_vllm_op(monkeypatch):
 
     monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", True)
     monkeypatch.setattr(layernorm, "_is_hcu", False)
-    monkeypatch.setattr(layernorm, "rms_norm", fake_rms_norm)
+    monkeypatch.setattr(layernorm, "rms_norm", fake_rms_norm, raising=False)
     norm = layernorm.RMSNorm(4, eps=1e-6)
     x = torch.ones((1, 4))
 
@@ -86,7 +90,7 @@ def test_gemma_rmsnorm_hip_without_residual_uses_vllm_op(monkeypatch):
     monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", True)
     monkeypatch.setattr(layernorm, "_is_hcu", False)
     monkeypatch.setattr(layernorm, "_use_aiter", False)
-    monkeypatch.setattr(layernorm, "rms_norm", fake_rms_norm)
+    monkeypatch.setattr(layernorm, "rms_norm", fake_rms_norm, raising=False)
     norm = layernorm.GemmaRMSNorm(4, eps=1e-6)
     x = torch.ones((1, 4))
 
@@ -103,7 +107,10 @@ def test_rmsnorm_hip_supports_legacy_six_argument_contract(monkeypatch):
     monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", True)
     monkeypatch.setattr(layernorm, "_is_hcu", False)
     monkeypatch.setattr(
-        layernorm, "fused_add_rms_norm", _fake_legacy_fused_add_rms_norm
+        layernorm,
+        "fused_add_rms_norm",
+        _fake_legacy_fused_add_rms_norm,
+        raising=False,
     )
     norm = layernorm.RMSNorm(4, eps=1e-6)
     norm.weight.data.fill_(1)
