@@ -512,10 +512,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     weight_args = scheme.get("weights") if scheme else None
                     weight_type = getattr(weight_args, "type", None)
                     weight_type = getattr(weight_type, "value", weight_type)
-                    ple_int8 = (
-                        getattr(weight_args, "num_bits", None) == 8
-                        and weight_type == "int"
-                    )
+                    # INT8 PLE stores int8 directly. W4A8 ngram checkpoints
+                    # store unpacked INT4 as int8; both use the INT8 table.
+                    num_bits = getattr(weight_args, "num_bits", None)
+                    ple_int8 = num_bits in (4, 8) and weight_type == "int"
                     break
                 # FP8-ngram checkpoints leave ngram_embedding shards un-ignored
                 # but only list Linear in config_groups.targets.
@@ -552,16 +552,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
             )
-        scale_shape = (
-            (self.ngram_embedding.num_embeddings_per_partition, 1)
-            if self.ple_per_row_scale
-            else (1,)
-        )
-        self.ngram_embedding.register_buffer(
-            "weight_scale",
-            torch.ones(scale_shape, dtype=torch.bfloat16),
-            persistent=True,
-        )
+            scale_shape = (
+                (self.ngram_embedding.num_embeddings_per_partition, 1)
+                if self.ple_per_row_scale
+                else (1,)
+            )
+            self.ngram_embedding.register_buffer(
+                "weight_scale",
+                torch.ones(scale_shape, dtype=torch.bfloat16),
+                persistent=True,
+            )
 
     @classmethod
     def _splitmix64(cls, x: int) -> int:
@@ -611,7 +611,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         ngram_embedding = self.ngram_embedding
         if not self._uses_per_row_scale():
-            return embeddings * ngram_embedding.weight_scale
+            # BF16 PLE offload keeps the scalar scale on CPU. CUDA graph
+            # capture forbids unpinned H2D copies, so prefer the GPU replica
+            # installed by Qwen4ExpPinnedHostEmbedding.
+            scale = getattr(ngram_embedding, "_device_scalar_scale", None)
+            if scale is None:
+                scale = ngram_embedding.weight_scale
+                if scale.device != embeddings.device or scale.dtype != embeddings.dtype:
+                    if scale.device.type == "cpu" and not scale.is_pinned():
+                        scale = scale.pin_memory()
+                    scale = scale.to(
+                        device=embeddings.device, dtype=embeddings.dtype
+                    )
+            return embeddings * scale
         if isinstance(ngram_embedding, Qwen4ExpPinnedHostEmbedding):
             return embeddings
         global_ids = lookup_ids.long()
@@ -921,15 +933,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if source_weight.device.type == "cpu" and source_weight.is_pinned():
             cpu_weight = source_weight
         else:
-            cpu_weight = nn.Parameter(
-                torch.empty(
-                    source_weight.shape,
-                    dtype=source_weight.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                ),
-                requires_grad=False,
-            )
+            # HIP pin_memory goes through the active Device mixin; wrap CPU
+            # so a CUDA default device cannot stage the full PLE table on GPU.
+            with torch.device("cpu"):
+                cpu_weight = nn.Parameter(
+                    torch.empty(
+                        source_weight.shape,
+                        dtype=source_weight.dtype,
+                        pin_memory=True,
+                    ),
+                    requires_grad=False,
+                )
             # This wrapper is installed while the model is being constructed;
             # the checkpoint loader fills cpu_weight afterwards. Copying the
             # uninitialized source would touch the full PLE table once for no
@@ -941,18 +955,34 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_parameter("weight", cpu_weight)
         source_scale = embedding.weight_scale
         if source_scale.numel() <= 1:
-            cpu_scale = source_scale
+            if source_scale.device.type == "cpu" and source_scale.is_pinned():
+                cpu_scale = source_scale
+            else:
+                with torch.device("cpu"):
+                    cpu_scale = torch.empty(
+                        source_scale.shape,
+                        dtype=source_scale.dtype,
+                        pin_memory=True,
+                    )
+                cpu_scale.copy_(source_scale.detach().to("cpu"))
         elif source_scale.device.type == "cpu" and source_scale.is_pinned():
             cpu_scale = source_scale
         else:
-            cpu_scale = torch.empty(
-                source_scale.shape,
-                dtype=source_scale.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
+            with torch.device("cpu"):
+                cpu_scale = torch.empty(
+                    source_scale.shape,
+                    dtype=source_scale.dtype,
+                    pin_memory=True,
+                )
             cpu_scale.copy_(source_scale.to("cpu"))
         self.register_buffer("weight_scale", cpu_scale, persistent=True)
+        self._device_scalar_scale = None
+        if cpu_scale.numel() <= 1 and torch.cuda.is_available():
+            # Graph capture cannot H2D-copy an unpinned CPU scalar.
+            self._device_scalar_scale = cpu_scale.to(
+                device=f"cuda:{torch.cuda.current_device()}",
+                dtype=cpu_scale.dtype,
+            )
         if cpu_weight is not source_weight:
             del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
@@ -1297,7 +1327,9 @@ class Qwen4ExpPLELayer(nn.Module):
         torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         if not self.ple_embedding._uses_per_row_scale():
-            embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
+            embeddings = self.ple_embedding._scale_ple_embeddings(
+                embeddings, embeddings.new_empty(0, dtype=torch.long)
+            )
         embeddings = self.ple_embedding._finish_embedding_lookup(
             embeddings,
             semantic_tokens,
