@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -72,7 +73,28 @@ else:
 
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_HCU_FUSED_QUANT_SCATTER = get_bool_env_var(
+    "SGLANG_OPT_DG_HCU_FUSED_QUANT_SCATTER", "false"
+)
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+_hcu_masked_output_buffer: Optional[torch.Tensor] = None
+
+
+@contextmanager
+def use_hcu_masked_output_buffer(output: torch.Tensor):
+    """Make HCU masked GEMM2 write directly to a graph-break bridge.
+
+    Breakable replay invokes MoE cores serially in one scheduler thread.  The
+    scoped override avoids allocating and then copying a full [E,M,K] tensor
+    at every layer while leaving ordinary eager/contiguous calls unchanged.
+    """
+    global _hcu_masked_output_buffer
+    previous = _hcu_masked_output_buffer
+    _hcu_masked_output_buffer = output
+    try:
+        yield
+    finally:
+        _hcu_masked_output_buffer = previous
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -136,7 +158,14 @@ def _estimate_masked_standard_layout_peak_bytes(
         input_scale_row_bytes = 0
         down_scale_row_bytes = 0
     else:
-        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        # DTK's channel-wise HCU kernels consume one FP32 activation scale per
+        # token, unlike CUDA block-scaled DeepGEMM.  Account for the real scale
+        # footprint when choosing masked vs compact standard dispatch.
+        block_k = (
+            hidden_size
+            if quant_info.hcu_packed
+            else (quant_info.block_shape[1] if quant_info.block_shape else 128)
+        )
         packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         scale_item_bytes = (
             torch.uint8.itemsize if packed_scales else torch.float32.itemsize
@@ -232,6 +261,12 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
+    # DTK/HCU ``deepgemm`` packs [E,N,K] weights into a 6-D W6 view.  Preserve
+    # the logical shapes because the packed tensor no longer exposes N/K at
+    # dimensions 1/2.  CUDA/MUSA callers leave these fields unset.
+    logical_w13_shape: Optional[Tuple[int, ...]] = None
+    logical_w2_shape: Optional[Tuple[int, ...]] = None
+    hcu_packed: bool = False
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -261,6 +296,52 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
+        if deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM:
+            if not quant_info.hcu_packed:
+                raise RuntimeError(
+                    "HCU DeepGEMM requires channel-FP8 weights packed during "
+                    "process_weights_after_loading"
+                )
+            # Local-only shared fusion is a low-latency optimization.  Normal
+            # DeepEP keeps its routed contiguous layout; an unused seventeenth
+            # weight group makes the HCU grouped launcher see M=0 and can drive
+            # hipBLASLt into an invalid problem.  Restrict normal-mode weights
+            # to the routed groups; the shared branch is evaluated separately
+            # by DeepEPMoE for prefill/extend.
+            hcu_quant_info = quant_info
+            if (
+                self.config.local_shared_experts_without_dispatch
+                and not runner_input.use_masked_gemm
+            ):
+                num_routed = self.config.num_dispatch_local_experts
+                if num_routed is None:
+                    raise RuntimeError(
+                        "Local shared grouping requires num_dispatch_local_experts."
+                    )
+                hcu_quant_info = replace(
+                    quant_info,
+                    w13_weight=quant_info.w13_weight[:num_routed],
+                    w2_weight=quant_info.w2_weight[:num_routed],
+                    w13_scale=quant_info.w13_scale[:num_routed],
+                    w2_scale=quant_info.w2_scale[:num_routed],
+                    logical_w13_shape=(
+                        num_routed,
+                        *quant_info.logical_w13_shape[1:],
+                    ),
+                    logical_w2_shape=(
+                        num_routed,
+                        *quant_info.logical_w2_shape[1:],
+                    ),
+                )
+            hidden_states = (
+                self._run_hcu_masked_gemm(runner_input, hcu_quant_info, running_state)
+                if runner_input.use_masked_gemm
+                else self._run_hcu_contiguous_gemm(
+                    runner_input, hcu_quant_info, running_state
+                )
+            )
+            return DeepGemmRunnerOutput(hidden_states=hidden_states)
+
         weight_dtype = quant_info.w13_weight.dtype
         if not runner_input.use_masked_gemm:
             if weight_dtype == torch.bfloat16:
@@ -281,6 +362,199 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     runner_input, quant_info, running_state
                 )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
+
+    @staticmethod
+    def _hcu_weight_scale(scale: Optional[torch.Tensor]) -> torch.Tensor:
+        if scale is None:
+            raise RuntimeError("HCU DeepGEMM requires FP8 weight scales")
+        if scale.ndim == 3 and scale.shape[-1] == 1:
+            scale = scale.squeeze(-1)
+        return scale.to(dtype=torch.float32).contiguous()
+
+    @staticmethod
+    def _hcu_problem_shape(
+        quant_info: DeepGemmMoeQuantInfo,
+    ) -> Tuple[int, int, int]:
+        if quant_info.logical_w13_shape is None or quant_info.logical_w2_shape is None:
+            raise RuntimeError("HCU DeepGEMM logical weight shapes are missing")
+        experts, gateup_size, hidden_size = quant_info.logical_w13_shape
+        w2_experts, w2_hidden, intermediate_size = quant_info.logical_w2_shape
+        if experts != w2_experts or hidden_size != w2_hidden:
+            raise RuntimeError(
+                "HCU DeepGEMM logical weight shapes disagree: "
+                f"w13={quant_info.logical_w13_shape}, "
+                f"w2={quant_info.logical_w2_shape}"
+            )
+        if gateup_size != 2 * intermediate_size:
+            raise RuntimeError(
+                "HCU DeepGEMM expects split gated [gate;up] weights, got "
+                f"w13={quant_info.logical_w13_shape}, "
+                f"w2={quant_info.logical_w2_shape}"
+            )
+        return experts, gateup_size, hidden_size
+
+    def _run_hcu_masked_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        masked_m = runner_input.masked_m
+        if hidden_states_scale is None or masked_m is None:
+            raise RuntimeError(
+                "HCU DeepGEMM low-latency path requires FP8 DeepEP activations "
+                "and masked_m"
+            )
+        if hidden_states.ndim != 3:
+            raise RuntimeError(
+                "HCU DeepGEMM low-latency input must be [E,M,K], got "
+                f"{tuple(hidden_states.shape)}"
+            )
+
+        experts, gateup_size, hidden_size = self._hcu_problem_shape(quant_info)
+        if hidden_states.shape[0] != experts or hidden_states.shape[2] != hidden_size:
+            raise RuntimeError(
+                "HCU DeepGEMM low-latency activation shape mismatch: "
+                f"input={tuple(hidden_states.shape)}, logical experts/hidden="
+                f"{experts}/{hidden_size}"
+            )
+        capacity = hidden_states.shape[1]
+        gateup_output = torch.empty(
+            (experts, capacity, gateup_size),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (hidden_states, hidden_states_scale),
+            (
+                quant_info.w13_weight,
+                self._hcu_weight_scale(quant_info.w13_scale),
+            ),
+            gateup_output,
+            masked_m,
+            capacity,
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        intermediate_size = gateup_size // 2
+        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
+            gateup_output,
+            masked_m,
+            # Channel-wise FP8 weights require one activation scale per row.
+            group_size=intermediate_size,
+            topk=self.config.top_k or 1,
+            gemm1_alpha=self.config.gemm1_alpha,
+            gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+        )
+        del gateup_output
+
+        output_shape = (experts, capacity, hidden_size)
+        down_output = _hcu_masked_output_buffer
+        if down_output is None:
+            down_output = torch.empty(
+                output_shape,
+                device=down_input.device,
+                dtype=torch.bfloat16,
+            )
+        elif (
+            tuple(down_output.shape) != output_shape
+            or down_output.device != down_input.device
+            or down_output.dtype != torch.bfloat16
+        ):
+            raise RuntimeError(
+                "HCU DeepGEMM graph bridge mismatch: "
+                f"expected shape/device/dtype={output_shape}/{down_input.device}/"
+                f"{torch.bfloat16}, got {tuple(down_output.shape)}/"
+                f"{down_output.device}/{down_output.dtype}"
+            )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            (down_input, down_input_scale),
+            (
+                quant_info.w2_weight,
+                self._hcu_weight_scale(quant_info.w2_scale),
+            ),
+            down_output,
+            masked_m,
+            capacity,
+        )
+        return down_output
+
+    def _run_hcu_contiguous_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        hidden_states = runner_input.hidden_states
+        hidden_states_scale = runner_input.hidden_states_scale
+        m_indices = runner_input.m_indices
+        if hidden_states_scale is None or m_indices is None:
+            raise RuntimeError(
+                "HCU DeepGEMM contiguous path requires FP8 activations, scales "
+                "and m_indices"
+            )
+        _, gateup_size, hidden_size = self._hcu_problem_shape(quant_info)
+        all_tokens = hidden_states.shape[0]
+        gateup_output = torch.empty(
+            (all_tokens, gateup_size),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (hidden_states, hidden_states_scale),
+            (
+                quant_info.w13_weight,
+                self._hcu_weight_scale(quant_info.w13_scale),
+            ),
+            gateup_output,
+            m_indices,
+        )
+        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_scale)
+
+        if self.config.gemm1_alpha is not None:
+            if self.config.gate_up_interleaved:
+                raise ValueError("MiniMax HCU DeepGEMM expects split [gate;up] weights")
+            from sglang.kernels.ops.moe.minimax_m3_swiglu import swiglu_oai_split
+
+            down_input_bf16 = swiglu_oai_split(
+                gateup_output,
+                alpha=float(self.config.gemm1_alpha),
+                beta=float(self.config.gemm1_beta or 1.0),
+                limit=self.config.gemm1_clamp_limit,
+                out_dtype=torch.bfloat16,
+            )
+        else:
+            gate, up = gateup_output.chunk(2, dim=-1)
+            down_input_bf16 = torch.nn.functional.silu(gate) * up
+        del gateup_output
+
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_quant_fp8,
+        )
+
+        down_input, down_input_scale = sglang_per_token_quant_fp8(
+            down_input_bf16.contiguous()
+        )
+        del down_input_bf16
+        down_output = torch.empty(
+            (all_tokens, hidden_size),
+            device=down_input.device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (down_input, down_input_scale),
+            (
+                quant_info.w2_weight,
+                self._hcu_weight_scale(quant_info.w2_scale),
+            ),
+            down_output,
+            m_indices,
+        )
+        return down_output
 
     def _run_contiguous_gemm(
         self,
@@ -836,13 +1110,18 @@ def pre_permute_standard_to_deep_gemm(
             if quant_info.w13_weight.dtype == torch.bfloat16
             else torch.float8_e4m3fn
         )
+        input_block_shape = (
+            [1, hidden_states.size(1)]
+            if quant_info.hcu_packed
+            else quant_info.block_shape
+        )
         masked_m, _, src2dst, hidden_states, hidden_states_scale = (
             moe_ep_deepgemm_preprocess(
                 topk_ids,
                 runner_config.num_local_experts,
                 hidden_states,
                 runner_config.top_k,
-                quant_info.block_shape,
+                input_block_shape,
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
             )
@@ -867,7 +1146,7 @@ def pre_permute_standard_to_deep_gemm(
         running_state["hidden_states_device"] = hidden_states_device
         running_state["src2dst"] = src2dst
         running_state["mxfp8_act_gran_k"] = (
-            quant_info.block_shape[1] if quant_info.block_shape else 128
+            input_block_shape[1] if input_block_shape else 128
         )
 
         return DeepGemmRunnerInput(
@@ -901,6 +1180,17 @@ def pre_permute_standard_to_deep_gemm(
         if quant_info.w13_weight.dtype == torch.bfloat16
         else torch.float8_e4m3fn
     )
+    input_quant_block_size = (
+        k
+        if quant_info.hcu_packed
+        else (quant_info.block_shape[1] if quant_info.block_shape else 128)
+    )
+    fused_hcu_quant_scatter = (
+        output_dtype == torch.float8_e4m3fn
+        and _is_hip
+        and quant_info.hcu_packed
+        and _HCU_FUSED_QUANT_SCATTER
+    )
     if output_dtype == torch.bfloat16:
         packed_input_source = hidden_states
         packed_input_source_scale = None
@@ -912,20 +1202,40 @@ def pre_permute_standard_to_deep_gemm(
         packed_input_scale = torch.empty(
             (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
         )
-    else:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
+    elif fused_hcu_quant_scatter:
+        packed_input_source = hidden_states
+        packed_input_source_scale = None
+        packed_input = torch.zeros(
+            (all_tokens, k),
+            device=hidden_states_device,
+            dtype=torch.float8_e4m3fn,
         )
-
-        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-        packed_input_source, packed_input_source_scale = (
-            sglang_per_token_group_quant_fp8(
-                hidden_states,
-                block_k,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        packed_input_scale = torch.zeros(
+            (all_tokens, 1),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+    else:
+        if _is_hip:
+            # The generic SGLang wrapper depends on a CUDA-only group-quant
+            # symbol.  HIP's platform-selected alias uses the equivalent
+            # native Triton implementation and preserves the same scale
+            # layout used by HCU DeepGEMM.
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                per_token_group_quant_fp8 as quantize_packed_input,
             )
+        else:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8 as quantize_packed_input,
+            )
+
+        block_k = input_quant_block_size
+        packed_input_source, packed_input_source_scale = quantize_packed_input(
+            hidden_states,
+            block_k,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         packed_input = torch.zeros(
             (all_tokens, k),
@@ -965,7 +1275,8 @@ def pre_permute_standard_to_deep_gemm(
         m_indices,
         src2dst,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+        quant_block_size=input_quant_block_size,
+        quantize_fp8=fused_hcu_quant_scatter,
     )
     if packed_input_source is not hidden_states:
         dispose_tensor(packed_input_source)
@@ -983,9 +1294,7 @@ def pre_permute_standard_to_deep_gemm(
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
     running_state["all_tokens"] = all_tokens
-    running_state["mxfp8_act_gran_k"] = (
-        quant_info.block_shape[1] if quant_info.block_shape else 128
-    )
+    running_state["mxfp8_act_gran_k"] = input_quant_block_size
 
     return DeepGemmRunnerInput(
         hidden_states=packed_input,
@@ -1046,9 +1355,12 @@ def pre_permute_deepep_ll_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
-        dispatch_output
-    )
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    masked_m = dispatch_output.masked_m
+    expected_m = dispatch_output.expected_m
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -1057,6 +1369,9 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_device"] = hidden_states.device
     # DeepEP-LL FP8 dispatch quantises activations at a fixed 128 block, not the checkpoint block_shape.
     running_state["mxfp8_act_gran_k"] = 128
+    running_state["local_shared_rows"] = getattr(
+        dispatch_output, "local_shared_rows", 0
+    )
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
@@ -1074,7 +1389,20 @@ def post_permute_deep_gemm_to_deepep_ll(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPLLCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLLocalSharedCombineInput,
+    )
+
+    local_shared_rows = running_state.get("local_shared_rows", 0)
+    if local_shared_rows:
+        hidden_states = runner_output.hidden_states
+        return DeepEPLLLocalSharedCombineInput(
+            hidden_states=hidden_states[:-1],
+            topk_ids=running_state["topk_ids"],
+            topk_weights=running_state["topk_weights"],
+            local_shared_output=hidden_states[-1, :local_shared_rows],
+        )
 
     return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
@@ -1092,17 +1420,21 @@ def pre_permute_deepep_normal_to_deep_gemm(
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
 
-    (
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        topk_weights,
-        num_recv_tokens_per_expert,
-    ) = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
     assert runner_config.activation in ("silu", "situ")
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
+    running_state["local_shared_rows"] = getattr(
+        dispatch_output, "local_shared_rows", 0
+    )
+    running_state["routed_recv_rows"] = getattr(
+        dispatch_output, "routed_recv_rows", hidden_states.shape[0]
+    )
 
     K = hidden_states.shape[1]
 
@@ -1137,8 +1469,9 @@ def pre_permute_deepep_normal_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
+        quant_block_size = K if deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM else 128
         input_tensor_scale = buffer_init(
-            (all_tokens, K // 128),
+            (all_tokens, K // quant_block_size),
             device=hidden_states.device,
             dtype=torch.float32,
         )
@@ -1170,6 +1503,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         m_indices,
         output_index,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        quant_block_size=(K if deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM else 128),
     )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
@@ -1193,7 +1527,10 @@ def post_permute_deep_gemm_to_deepep_normal(
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPNormalCombineInput,
+        DeepEPNormalLocalSharedCombineInput,
+    )
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
@@ -1206,6 +1543,18 @@ def post_permute_deep_gemm_to_deepep_normal(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+
+    local_shared_rows = running_state.get("local_shared_rows", 0)
+    if local_shared_rows:
+        routed_recv_rows = running_state["routed_recv_rows"]
+        return DeepEPNormalLocalSharedCombineInput(
+            hidden_states=gather_out[:routed_recv_rows],
+            topk_ids=topk_ids[:routed_recv_rows],
+            topk_weights=topk_weights[:routed_recv_rows],
+            local_shared_output=gather_out[
+                routed_recv_rows : routed_recv_rows + local_shared_rows
+            ],
+        )
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,

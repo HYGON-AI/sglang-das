@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -168,6 +169,11 @@ class TestDeepEPPaddedTokenMasking(unittest.TestCase):
             patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
             patch.object(topk_mod, "_mask_topk_ids_padded_region") as mask_ids,
             patch.object(topk_mod, "_zero_topk_weights_padded_region") as zero_weights,
+            patch.object(
+                topk_mod,
+                "_biased_grouped_topk_postprocess",
+                return_value=topk_ids.to(torch.int64),
+            ) as fused_postprocess,
         ):
             get_a2a.return_value.is_deepep.return_value = skip_deepep_padded_tokens
             get_runner.return_value.is_deep_gemm.return_value = (
@@ -182,23 +188,44 @@ class TestDeepEPPaddedTokenMasking(unittest.TestCase):
                 num_token_non_padded=num_token_non_padded,
             )
 
-        return mask_ids, zero_weights, topk_ids, num_token_non_padded
+        return (
+            mask_ids,
+            zero_weights,
+            fused_postprocess,
+            topk_ids,
+            num_token_non_padded,
+        )
 
     def test_hcu_deepep_deepgemm_masks_ids_to_negative_one(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
-            skip_deepep_padded_tokens=True
-        )
+        (
+            mask_ids,
+            zero_weights,
+            fused_postprocess,
+            topk_ids,
+            num_token_non_padded,
+        ) = self._run_post_process(skip_deepep_padded_tokens=True)
 
-        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=-1)
+        mask_ids.assert_not_called()
         zero_weights.assert_not_called()
+        fused_postprocess.assert_called_once_with(
+            topk_ids,
+            None,
+            num_token_non_padded,
+            output_int64=True,
+        )
 
     def test_other_hip_paths_keep_in_range_ids_and_zero_weights(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
-            skip_deepep_padded_tokens=False
-        )
+        (
+            mask_ids,
+            zero_weights,
+            fused_postprocess,
+            topk_ids,
+            num_token_non_padded,
+        ) = self._run_post_process(skip_deepep_padded_tokens=False)
 
         mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=0)
         zero_weights.assert_called_once()
+        fused_postprocess.assert_not_called()
 
 
 @unittest.skipUnless(
@@ -240,6 +267,71 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
             self.assertTrue(torch.all(out[n_valid:] > 0.0))
         finally:
             topk_mod._skip_hip_pad_mask = orig
+
+    def test_deepep_drop_mode_uses_negative_one_ids(self):
+        n, k, n_valid = 32, 8, 5
+        topk_weights = torch.rand((n, k), device=self.DEVICE, dtype=torch.float32) + 0.5
+        topk_ids = torch.randint(0, 128, (n, k), device=self.DEVICE, dtype=torch.int32)
+        valid_ids = topk_ids[:n_valid].clone()
+        router_logits = torch.rand((n, 128), device=self.DEVICE, dtype=torch.float32)
+        pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(top_k=k, num_fused_shared_experts=0)
+
+        with (
+            patch.object(topk_mod, "_eplb_remap_enabled", return_value=False),
+            patch.object(topk_mod, "get_moe_a2a_backend") as get_a2a,
+            patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
+        ):
+            get_a2a.return_value.is_deepep.return_value = True
+            get_runner.return_value.is_deep_gemm.return_value = True
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+            )
+
+        self.assertTrue(torch.equal(out_ids[:n_valid], valid_ids))
+        self.assertTrue(torch.all(out_ids[n_valid:] == -1))
+        self.assertTrue(torch.all(out_weights[n_valid:] > 0.0))
+
+    def test_deepep_drop_mode_masks_after_eplb_remap(self):
+        n, k, n_valid = 16, 8, 3
+        topk_weights = torch.ones((n, k), device=self.DEVICE)
+        topk_ids = torch.randint(0, 127, (n, k), device=self.DEVICE, dtype=torch.int32)
+        valid_ids = topk_ids[:n_valid].clone()
+        router_logits = torch.rand((n, 128), device=self.DEVICE)
+        pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(top_k=k, num_fused_shared_experts=0)
+        dispatch_info = SimpleNamespace(ep_dispatch_algorithm="static")
+
+        with (
+            patch.object(topk_mod, "_eplb_remap_enabled", return_value=True),
+            patch.object(topk_mod, "get_moe_a2a_backend") as get_a2a,
+            patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
+            patch.object(
+                topk_mod,
+                "topk_ids_logical_to_physical",
+                side_effect=lambda ids, *_args, **_kwargs: ids + 1,
+            ),
+        ):
+            get_a2a.return_value.is_deepep.return_value = True
+            get_runner.return_value.is_deep_gemm.return_value = True
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+                expert_location_dispatch_info=dispatch_info,
+            )
+
+        self.assertTrue(torch.equal(out_ids[:n_valid], valid_ids + 1))
+        self.assertTrue(torch.all(out_ids[n_valid:] == -1))
+        self.assertTrue(torch.all(out_weights[n_valid:] > 0.0))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")

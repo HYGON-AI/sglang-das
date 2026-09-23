@@ -1141,6 +1141,12 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Keep DeepEP traffic off the TP communicator. This is required for
+    # partial EP groups and avoids sharing a collective ordering domain with CP.
+    SGLANG_DEEPEP_USE_MOE_EP_GROUP = EnvBool(False)
+    # Preserve asynchronous DeepEP by default while allowing synchronous
+    # completion for prefill backends and configurations that require it.
+    SGLANG_DEEPEP_ASYNC_FINISH = EnvBool(True)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
@@ -1665,6 +1671,12 @@ class Envs:
     # EAGLE TARGET_VERIFY score producer. Queries from the same request share
     # each Index-K tile load while preserving independent masks and Top-K rows.
     SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE = EnvBool(False)
+    # Standard EP keeps the shared MLP TP-sharded and overlaps that branch
+    # with router/routed-expert work on a side stream.
+    SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # DeepEP uses a replicated TP1 shared expert; long-prefill configurations
+    # can overlap it with routed A2A/GEMMs when CU contention is favorable.
+    SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP = EnvBool(False)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)

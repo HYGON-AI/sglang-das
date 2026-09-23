@@ -19,15 +19,24 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import ceil_div, is_cuda, is_musa
+from sglang.srt.utils import ceil_div, is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_musa = is_musa()
 
-if _is_cuda or _is_musa:
+if _is_hip:
+    # HIP does not provide the CUDA JIT ``per_token_group_quant`` symbol used
+    # by the generic SGLang wrapper.  The platform-selected alias falls back
+    # to the native Triton raw kernel instead.
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_max as _fp8_max
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        per_token_group_quant_fp8,
+    )
+elif _is_cuda or _is_musa:
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
@@ -38,6 +47,240 @@ from triton.language.extra import libdevice
 from sglang.srt.utils import get_bool_env_var
 
 use_groupgemm = get_bool_env_var("SGLANG_GROUPGEMM", default="true")
+
+
+@triton.jit
+def _deepep_ll_compact_dequant_kernel(
+    grouped_ptr,
+    grouped_scale_ptr,
+    masked_m_ptr,
+    expert_offsets_ptr,
+    compact_ptr,
+    compact_scale_ptr,
+    compact_topk_ids_ptr,
+    compact_topk_weights_ptr,
+    stride_grouped_e: tl.constexpr,
+    stride_grouped_m: tl.constexpr,
+    stride_grouped_k: tl.constexpr,
+    stride_scale_e: tl.constexpr,
+    stride_scale_m: tl.constexpr,
+    hidden_size: tl.constexpr,
+    max_compact_tokens: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    PRESERVE_FP8: tl.constexpr,
+):
+    """Compact DeepEP-LL expert-major rows and optionally dequantize FP8.
+
+    One program owns an (expert, K tile) pair and loops only over that
+    expert's live rows.  This avoids launching over DeepEP's large static
+    capacity (normally 1024 rows/expert on EP8) when decode has only a few
+    routed tokens.
+    """
+    expert = tl.program_id(0)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k < hidden_size
+    count = tl.load(masked_m_ptr + expert).to(tl.int32)
+    dst_start = tl.load(expert_offsets_ptr + expert).to(tl.int32)
+
+    for slot in tl.range(0, count):
+        value = tl.load(
+            grouped_ptr
+            + expert * stride_grouped_e
+            + slot * stride_grouped_m
+            + k * stride_grouped_k,
+            mask=k_mask,
+            other=0.0,
+        ).to(tl.float32)
+        if HAS_SCALE and not PRESERVE_FP8:
+            scale = tl.load(
+                grouped_scale_ptr + expert * stride_scale_e + slot * stride_scale_m
+            ).to(tl.float32)
+            value *= scale
+        dst = dst_start + slot
+        dst_valid = dst < max_compact_tokens
+        tl.store(
+            compact_ptr + dst * hidden_size + k,
+            value,
+            mask=k_mask & dst_valid,
+        )
+        if tl.program_id(1) == 0:
+            if PRESERVE_FP8:
+                scale = tl.load(
+                    grouped_scale_ptr + expert * stride_scale_e + slot * stride_scale_m
+                ).to(tl.float32)
+                tl.store(compact_scale_ptr + dst, scale, mask=dst_valid)
+            tl.store(compact_topk_ids_ptr + dst, expert, mask=dst_valid)
+            tl.store(compact_topk_weights_ptr + dst, 1.0, mask=dst_valid)
+
+
+@triton.jit
+def _deepep_ll_scatter_kernel(
+    compact_ptr,
+    masked_m_ptr,
+    expert_offsets_ptr,
+    grouped_ptr,
+    stride_grouped_e: tl.constexpr,
+    stride_grouped_m: tl.constexpr,
+    stride_grouped_k: tl.constexpr,
+    hidden_size: tl.constexpr,
+    max_compact_tokens: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Restore compact AITER output to DeepEP-LL's expert-major layout."""
+    expert = tl.program_id(0)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k < hidden_size
+    count = tl.load(masked_m_ptr + expert).to(tl.int32)
+    src_start = tl.load(expert_offsets_ptr + expert).to(tl.int32)
+
+    for slot in tl.range(0, count):
+        src = src_start + slot
+        src_valid = src < max_compact_tokens
+        value = tl.load(
+            compact_ptr + src * hidden_size + k,
+            mask=k_mask & src_valid,
+            other=0.0,
+        )
+        tl.store(
+            grouped_ptr
+            + expert * stride_grouped_e
+            + slot * stride_grouped_m
+            + k * stride_grouped_k,
+            value,
+            mask=k_mask,
+        )
+
+
+def compact_deepep_ll_for_aiter(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    max_compact_tokens: int,
+    sink_expert: int,
+) -> tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Build a graph-static, compact BF16 input for AITER from DeepEP LL.
+
+    The valid row count remains on device.  ``max_compact_tokens`` is derived
+    from local input tokens * EP size * top-k, so its shape is static for a
+    decode graph while being far smaller than ``E * DeepEP capacity``.
+    """
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            "DeepEP-LL AITER input must be [E,M,K], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if masked_m.ndim != 1 or masked_m.shape[0] != hidden_states.shape[0]:
+        raise ValueError(
+            "DeepEP-LL masked_m must have one entry per local expert, got "
+            f"hidden={tuple(hidden_states.shape)}, masked_m={tuple(masked_m.shape)}"
+        )
+    if max_compact_tokens <= 0:
+        raise ValueError("max_compact_tokens must be positive")
+    if hidden_states_scale is not None:
+        if hidden_states_scale.ndim == 3 and hidden_states_scale.shape[-1] == 1:
+            hidden_states_scale = hidden_states_scale.squeeze(-1)
+        if hidden_states_scale.ndim != 2:
+            raise ValueError(
+                "DeepEP-LL per-token scale must be [E,M] or [E,M,1], got "
+                f"{tuple(hidden_states_scale.shape)}"
+            )
+
+    masked_m_i32 = (
+        masked_m if masked_m.dtype == torch.int32 else masked_m.to(torch.int32)
+    )
+    expert_offsets = torch.cumsum(masked_m_i32, dim=0) - masked_m_i32
+    experts, _, hidden_size = hidden_states.shape
+    preserve_fp8 = (
+        hidden_states_scale is not None and hidden_states.dtype == torch.float8_e4m3fn
+    )
+    compact = torch.zeros(
+        (max_compact_tokens, hidden_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype if preserve_fp8 else torch.bfloat16,
+    )
+    compact_scale = (
+        torch.zeros(
+            (max_compact_tokens, 1),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        if preserve_fp8
+        else None
+    )
+    compact_topk_ids = torch.full(
+        (max_compact_tokens, 1),
+        sink_expert,
+        device=hidden_states.device,
+        dtype=torch.int32,
+    )
+    compact_topk_weights = torch.zeros(
+        (max_compact_tokens, 1),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+
+    block_k = 512
+    _deepep_ll_compact_dequant_kernel[(experts, triton.cdiv(hidden_size, block_k))](
+        hidden_states,
+        hidden_states_scale,
+        masked_m_i32,
+        expert_offsets,
+        compact,
+        compact_scale,
+        compact_topk_ids,
+        compact_topk_weights,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        hidden_states.stride(2),
+        hidden_states_scale.stride(0) if hidden_states_scale is not None else 0,
+        hidden_states_scale.stride(1) if hidden_states_scale is not None else 0,
+        hidden_size,
+        max_compact_tokens,
+        BLOCK_K=block_k,
+        HAS_SCALE=hidden_states_scale is not None,
+        PRESERVE_FP8=preserve_fp8,
+        num_warps=8,
+    )
+    return (
+        compact,
+        compact_scale,
+        compact_topk_ids,
+        compact_topk_weights,
+        expert_offsets,
+    )
+
+
+def scatter_aiter_to_deepep_ll(
+    compact: torch.Tensor,
+    masked_m: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    output_shape: torch.Size | tuple[int, ...],
+) -> torch.Tensor:
+    """Scatter compact AITER rows into the buffer consumed by LL combine."""
+    experts, _, hidden_size = output_shape
+    output = torch.empty(output_shape, device=compact.device, dtype=compact.dtype)
+    block_k = 512
+    _deepep_ll_scatter_kernel[(experts, triton.cdiv(hidden_size, block_k))](
+        compact,
+        masked_m,
+        expert_offsets,
+        output,
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        hidden_size,
+        compact.shape[0],
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return output
 
 
 def _get_launch_config_1d(device, numel):
@@ -388,6 +631,88 @@ def _silu_and_mul_post_quant_kernel(
         )
 
 
+@triton.jit
+def _silu_and_mul_post_quant_single_group_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    output_scale_ptr,
+    stride_output_scale_0,
+    stride_output_scale_1,
+    stride_output_scale_2,
+    masked_m_ptr,
+    size_n,
+    fp8_max,
+    fp8_min,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
+    GEMM1_ALPHA: tl.constexpr,
+    GEMM1_CLAMP_LIMIT: tl.constexpr,
+):
+    """One per-token quant group whose logical width need not be power-of-two."""
+    token_id = tl.program_id(0)
+    expert_id = tl.program_id(1)
+    block_num_per_expert = tl.num_programs(0)
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = tl.arange(0, BLOCK_N)
+    valid = offs_in_d < size_n
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        if GEMM1_ALPHA > 0:
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
+            gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
+        else:
+            gate_up = up * (gate / (1 + tl.exp(-gate)))
+
+        absmax = tl.max(tl.abs(gate_up), axis=0)
+        absmax = tl.maximum(absmax, 1e-10)
+        output_s = absmax / fp8_max
+        if SCALE_UE8M0:
+            output_s = tl.exp2(tl.ceil(tl.log2(output_s)))
+
+        output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
+            output_ptr.dtype.element_ty
+        )
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            output_q,
+            mask=valid,
+        )
+        tl.store(
+            output_scale_ptr
+            + expert_id * stride_output_scale_0
+            + token_index * stride_output_scale_1,
+            output_s,
+        )
+
+
 def silu_and_mul_masked_post_quant_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -479,6 +804,32 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_NUM_PER_EXPERT = 32
 
     groups_total = size_n // quant_group_size
+    if groups_total == 1 and quant_group_size & (quant_group_size - 1):
+        # Channel-wise FP8 weights use one activation scale per token.  MiniMax
+        # has intermediate_size=3072, but tl.arange/reshape require a power-of-2
+        # compile-time width.  Run a masked 4096-lane reduction without padding
+        # the logical tensor or changing its single-group quantization contract.
+        grid = (BLOCK_NUM_PER_EXPERT, expert_num)
+        _silu_and_mul_post_quant_single_group_kernel[grid](
+            input,
+            *input.stride(),
+            output,
+            *output.stride(),
+            output_scale,
+            *output_scale.stride(),
+            masked_m,
+            size_n,
+            fp8_max,
+            fp8_min,
+            BLOCK_N=triton.next_power_of_2(size_n),
+            NUM_STAGE=6,
+            num_warps=8,
+            SCALE_UE8M0=scale_ue8m0,
+            GEMM1_ALPHA=gemm1_alpha,
+            GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+        )
+        return
+
     gpb = 4
     while gpb > 1:
         block_n = quant_group_size * gpb
@@ -1279,6 +1630,79 @@ def _fwd_kernel_ep_scatter_non_quant(
                 tl.store(out_ptr, activation, mask=mask_hidden)
 
 
+@triton.jit
+def _fwd_kernel_ep_scatter_quant_fp8(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_index,
+    output_index_stride0,
+    topk_num: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    HIDDEN_SIZE_PAD: tl.constexpr,
+    BIT8_MAX: tl.constexpr,
+    ATOMIC_ADD_SEM: tl.constexpr,
+):
+    """Fuse HCU whole-row FP8 quantization with compact expert scatter.
+
+    MiniMax channel-FP8 uses one FP32 activation scale per token.  Quantizing
+    into a temporary [M, K] tensor and then copying every routed row performs
+    an avoidable full read/write pass.  This kernel computes the scale once per
+    source token and writes the FP8 row directly to all valid expert slots.
+    """
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+    offsets = tl.arange(0, HIDDEN_SIZE_PAD)
+    mask = offsets < HIDDEN_SIZE
+
+    for token_id_int32 in range(start_token_id, total_token_num, grid_num):
+        token_id = token_id_int32.to(tl.int64)
+        values = tl.load(
+            recv_x + token_id * recv_x_stride0 + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        absmax = tl.maximum(tl.max(tl.abs(values)), 1.0e-10)
+        scale = absmax / BIT8_MAX
+        scale_inv = 1.0 / scale
+        quantized = tl.clamp(values * scale_inv, -BIT8_MAX, BIT8_MAX).to(
+            output_tensor.dtype.element_ty
+        )
+
+        for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
+            topk_idx = topk_idx_int32.to(tl.int64)
+            expert_id = tl.load(
+                recv_topk + token_id * recv_topk_stride0 + topk_idx * recv_topk_stride1
+            )
+            if expert_id >= 0:
+                dest_token_index_int32 = tl.atomic_add(
+                    expert_start_loc + expert_id, 1, sem=ATOMIC_ADD_SEM
+                )
+                dest_token_index = dest_token_index_int32.to(tl.int64)
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_idx,
+                    dest_token_index_int32,
+                )
+                tl.store(
+                    output_tensor + dest_token_index * output_tensor_stride0 + offsets,
+                    quantized,
+                    mask=mask,
+                )
+                tl.store(
+                    output_tensor_scale
+                    + dest_token_index * output_tensor_scale_stride0,
+                    scale,
+                )
+
+
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
 @torch.no_grad()
 def ep_scatter_no_scale(
@@ -1345,6 +1769,7 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    quantize_fp8: bool = False,
 ):
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1365,6 +1790,15 @@ def ep_scatter(
 
     assert m_indices.shape[0] % BLOCK_E == 0
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
+    if quantize_fp8:
+        assert _is_hip, "fused compact quant-scatter is currently HCU-only"
+        assert not scale_ue8m0
+        assert recv_x.dtype == torch.bfloat16
+        assert output_tensor.dtype == torch.float8_e4m3fn
+        assert quant_block_size == hidden_size
+        assert output_tensor_scale.dtype == torch.float32
+        assert output_tensor_scale.shape[1] == 1
+        assert recv_x_scale is None
     if is_fp8:
         assert (
             recv_x_scale.dtype == output_tensor_scale.dtype
@@ -1396,6 +1830,30 @@ def ep_scatter(
         )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
+
+    if quantize_fp8:
+        _fwd_kernel_ep_scatter_quant_fp8[(grid,)](
+            recv_topk.shape[0],
+            expert_start_loc,
+            recv_x,
+            recv_x.stride(0),
+            recv_topk,
+            recv_topk.stride(0),
+            recv_topk.stride(1),
+            output_tensor,
+            output_tensor.stride(0),
+            output_tensor_scale,
+            output_tensor_scale.stride(0),
+            output_index,
+            output_index.stride(0),
+            topk_num=recv_topk.shape[1],
+            num_warps=num_warps,
+            HIDDEN_SIZE=hidden_size,
+            HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+            BIT8_MAX=_fp8_max,
+            ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
+        )
+        return
 
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
