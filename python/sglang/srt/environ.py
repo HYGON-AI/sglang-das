@@ -1013,8 +1013,7 @@ class Envs:
     SGLANG_ROCM_USE_AITER_TILELANG_MHC = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = EnvBool(False)
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
-    # Opt in to LightOp FP32 logits for the DSV4 FP4 decode/verify indexer on
-    # gfx928/936/938. Missing kernels or unsupported layouts retain Triton.
+       # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
     SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
