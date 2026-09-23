@@ -167,7 +167,13 @@ def _weak_ref_if_tensor(x):
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
-        return tuple(_weak_ref_if_tensor(e) for e in x)
+        values = tuple(_weak_ref_if_tensor(e) for e in x)
+        # NamedTuple dispatch/combine records carry semantic properties such
+        # as ``.format``.  Rebuilding them as a plain tuple makes an eager
+        # graph-break replay lose that protocol even though capture succeeds.
+        if hasattr(x, "_fields"):
+            return type(x)(*values)
+        return values
     if isinstance(x, list):
         return [_weak_ref_if_tensor(e) for e in x]
     return x
@@ -181,6 +187,13 @@ def _copy_output(dst: Any, src: Any) -> Any:
     succeeded, otherwise returns src.
     """
     if torch.is_tensor(dst) and torch.is_tensor(src):
+        if (
+            dst.data_ptr() == src.data_ptr()
+            and dst.shape == src.shape
+            and dst.stride() == src.stride()
+            and dst.dtype == src.dtype
+        ):
+            return dst
         dst.copy_(src)
         return dst
 
@@ -190,7 +203,11 @@ def _copy_output(dst: Any, src: Any) -> Any:
         and len(dst) == len(src)
     ):
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        return tuple(copied) if isinstance(dst, tuple) else copied
+        if isinstance(dst, tuple):
+            if hasattr(dst, "_fields"):
+                return type(dst)(*copied)
+            return tuple(copied)
+        return copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
