@@ -42,8 +42,6 @@ from sglang.srt.utils import W8a8GetCacheJSON, get_bool_env_var
 
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
-_w4a8_sync_debug = get_bool_env_var("SGLANG_W4A8_SYNC_DEBUG")
-_w4a8_debug_logged = False
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -94,7 +92,6 @@ def fused_experts_impl_w4a8_triton(
     swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Run SlimQuant W4A8 Triton GEMMs without whole-layer LightOp fusion."""
-    global _w4a8_debug_logged
     assert hidden_states.ndim == 2 and hidden_states.is_contiguous()
     assert hidden_states.shape[1] == w1.shape[2] * 2
     assert topk_weights.shape == topk_ids.shape
@@ -140,42 +137,6 @@ def fused_experts_impl_w4a8_triton(
             current_ids, config1["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
         qx, x_scale = per_token_quant_int8(current_x)
-        if _w4a8_sync_debug and not _w4a8_debug_logged:
-            def _meta(tensor):
-                if tensor is None:
-                    return None
-                return {
-                    "shape": tuple(tensor.shape),
-                    "stride": tuple(tensor.stride()),
-                    "dtype": str(tensor.dtype),
-                    "device": str(tensor.device),
-                    "contiguous": tensor.is_contiguous(),
-                }
-
-            print(
-                "W4A8_SYNC_DEBUG",
-                {
-                    "x": _meta(current_x),
-                    "qx": _meta(qx),
-                    "x_scale": _meta(x_scale),
-                    "w1": _meta(w1),
-                    "w1_scale": _meta(w1_scale),
-                    "w2": _meta(w2),
-                    "w2_scale": _meta(w2_scale),
-                    "topk_ids": _meta(current_ids),
-                    "topk_min": int(current_ids.min()),
-                    "topk_max": int(current_ids.max()),
-                    "expert_map": _meta(expert_map),
-                    "sorted_ids": _meta(sorted_ids),
-                    "expert_ids": _meta(expert_ids),
-                    "padded_count": int(padded_count.item()),
-                    "global_num_experts": global_num_experts,
-                    "config1": config1,
-                    "config2": config2,
-                },
-                flush=True,
-            )
-            _w4a8_debug_logged = True
         w4a8_triton.invoke_fused_moe_kernel_w4a8(
             qx,
             w1,
@@ -192,8 +153,6 @@ def fused_experts_impl_w4a8_triton(
             config1,
             compute_type=compute_type,
         )
-        if _w4a8_sync_debug:
-            torch.cuda.synchronize()
 
         if activation == "silu":
             from sgl_kernel import silu_and_mul
