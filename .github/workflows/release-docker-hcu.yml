@@ -14,7 +14,11 @@ permissions:
 env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: ${{ vars.HARBOR_NAMESPACE || 'jenkins/model_test_env' }}
-  BASE_IMAGE: ${{ vars.DTK2604_IMAGE_UBUNTU_PY310 }}
+  # 从 dev 基础镜像内联安装 DTK (不再依赖预装 DTK 的基础镜像), 便于按次换 DTK 包;
+  # 归档站地址走 RESOURCE_SERVER_URL 变量, 不在文件里暴露内网 IP
+  BASE_IMAGE: ${{ vars.DEV_IMAGE_UBUNTU_PY310 || 'harbor.sourcefind.cn:5443/dcu/admin/base/dev:ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10' }}
+  DTK_PKG_URL: ${{ vars.DTK_PKG_URL || format('{0}/dtk-pkg/dtk26.04.1/DTK-26.04.1-72cu-0911-ubuntu20.04-x86_64.tar.gz', vars.RESOURCE_SERVER_URL) }}
+  DTK_VERSION: "dtk2604-72cu-0911"
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
   SGLANG_VERSION: "0.5.18"
@@ -48,6 +52,8 @@ jobs:
             -t "${FULL_TAG}" \
             -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+            --build-arg "DTK_PKG_URL=${DTK_PKG_URL}" \
+            --build-arg "DTK_VERSION=${DTK_VERSION}" \
             --build-arg "IMAGE_TAG=${FULL_TAG}" \
             --build-arg "PYPI_URL=${PYPI_URL}" \
             --build-arg "RESOURCE_SERVER_URL=${RESOURCE_SERVER_URL}" \
