@@ -1,5 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import os
 from typing import Optional
 
 import torch
@@ -57,6 +58,8 @@ def _gqa_share_sparse_decode_kernel(
     # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
     k_scale,
     v_scale,
+    # Scale softmax probabilities into the useful e4m3 range before FP8 PV.
+    p_scale,
     # stride
     stride_q_b,
     stride_q_h,
@@ -218,13 +221,13 @@ def _gqa_share_sparse_decode_kernel(
         # compute m_ij and l_ij
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp(qk - m_ij[:, None])
+        acc_o_scale = tl.exp(m_i - m_ij)
         l_ij = tl.sum(p, axis=1)
         # scale acc_o
-        acc_o_scale = tl.exp(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # load v and update acc_o
         # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
+        acc_o += tl.dot((p * p_scale).to(v.dtype), v) * (v_scale / p_scale)
         # update statistics
         m_i = m_ij
         lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
@@ -298,8 +301,11 @@ def _merge_topk_attn_out_kernel(
     # standard flash-decoding merge in linear (not log2) space, matching the
     # decode kernel which uses tl.exp / tl.log.
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    has_value = lse_max > float("-inf")
+    safe_lse_max = tl.where(has_value, lse_max, 0.0)
+    weights = tl.where(has_value, tl.exp(lse - safe_lse_max), 0.0)
+    weight_sum = tl.sum(weights, axis=0)
+    weights = tl.where(has_value, weights / weight_sum, 0.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     o_out_ptrs = o_ptr + pid_b * stride_o_b + pid_h * stride_o_h + off_d * stride_o_d
     tl.store(o_out_ptrs, o_merged.to(o_ptr.dtype.element_ty), mask=off_d < head_dim)
@@ -321,11 +327,22 @@ def flash_decode_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    verify_group_size: int = 1,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
+    p_scale = (
+        float(os.environ.get("SGLANG_M3_TRITON_FP8_P_SCALE", "448"))
+        if q.dtype == torch.float8_e4m3fn
+        else 1.0
+    )
+    if q.dtype == torch.float8_e4m3fn and not (0.0 < p_scale <= 448.0):
+        raise ValueError(
+            "SGLANG_M3_TRITON_FP8_P_SCALE must be in (0, 448] for e4m3fn, "
+            f"got {p_scale}"
+        )
     # shape
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
@@ -356,6 +373,15 @@ def flash_decode_with_gqa_share_sparse(
         1,
         min(max_topk, TARGET_GRID // max(1, batch_size * num_kv_heads)),
     )
+    if verify_group_size > 1:
+        override = os.environ.get("SGLANG_MINIMAX_MTP_NUM_TOPK_CHUNKS")
+        if override is not None:
+            try:
+                requested = int(override)
+            except ValueError:
+                requested = 0
+            if requested > 0:
+                target = min(max_topk, requested)
     NUM_TOPK_CHUNKS = 1 << (target.bit_length() - 1)
     # output tensor: split-K partials, merged into chunk 0 by the merge kernel
     o_partial = torch.empty(
@@ -395,6 +421,7 @@ def flash_decode_with_gqa_share_sparse(
         sm_scale,
         k_scale,
         v_scale,
+        p_scale,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -421,6 +448,8 @@ def flash_decode_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
     )
+    if NUM_TOPK_CHUNKS == 1:
+        return o_partial[0]
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
     _merge_topk_attn_out_kernel[merge_grid](

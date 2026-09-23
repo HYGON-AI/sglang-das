@@ -1640,6 +1640,14 @@ class Envs:
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+    # MiniMax-M3 sparse decode score-kernel split-K controls. The selected
+    # number of chunks is the largest power of two no greater than
+    # min(MAX_CHUNKS, TARGET_GRID / (batch * local_index_kv_heads)).
+    SGLANG_MINIMAX_DECODE_SCORE_TARGET_GRID = EnvInt(4096)
+    SGLANG_MINIMAX_DECODE_SCORE_MAX_CHUNKS = EnvInt(256)
+    # EAGLE TARGET_VERIFY score producer. Queries from the same request share
+    # each Index-K tile load while preserving independent masks and Top-K rows.
+    SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE = EnvBool(False)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
