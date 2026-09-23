@@ -207,6 +207,117 @@ def _set_kv_buffer_impl(
         v_cache[indices] = v
 
 
+@triton.jit
+def _scaled_fp8_set_kv_buffer_kernel(
+    k_ptr,
+    v_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    indices_ptr,
+    n_rows,
+    k_src_stride,
+    v_src_stride,
+    k_scale,
+    v_scale,
+    size_limit,
+    K_ROW_DIM: tl.constexpr,
+    V_ROW_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    K_SCALE_IS_DEVICE_TENSOR: tl.constexpr,
+    V_SCALE_IS_DEVICE_TENSOR: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scale, cast to FP8, and scatter K/V in one memory pass."""
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1).to(tl.int64)
+    offs = tile * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    loc = tl.load(indices_ptr + row, mask=row < n_rows, other=0).to(tl.int64)
+    # Slot zero is the CUDA-graph padding slot, matching store_cache's default
+    # reserved_skip_index=0 contract.
+    row_valid = (row < n_rows) & (loc > 0) & (loc < size_limit)
+
+    k_mask = row_valid & (offs < K_ROW_DIM)
+    k = tl.load(k_ptr + row * k_src_stride + offs, mask=k_mask, other=0.0).to(
+        tl.float32
+    )
+    if K_SCALE_IS_DEVICE_TENSOR:
+        k_scale_value = tl.load(k_scale)
+    else:
+        k_scale_value = k_scale
+    k = tl.maximum(-FP8_MAX, tl.minimum(FP8_MAX, k / k_scale_value))
+    tl.store(
+        k_cache_ptr + loc * K_ROW_DIM + offs,
+        k,
+        mask=k_mask,
+    )
+
+    v_mask = row_valid & (offs < V_ROW_DIM)
+    v = tl.load(v_ptr + row * v_src_stride + offs, mask=v_mask, other=0.0).to(
+        tl.float32
+    )
+    if V_SCALE_IS_DEVICE_TENSOR:
+        v_scale_value = tl.load(v_scale)
+    else:
+        v_scale_value = v_scale
+    v = tl.maximum(-FP8_MAX, tl.minimum(FP8_MAX, v / v_scale_value))
+    tl.store(
+        v_cache_ptr + loc * V_ROW_DIM + offs,
+        v,
+        mask=v_mask,
+    )
+
+
+def _scaled_fp8_set_kv_buffer(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    k_scale: Union[float, torch.Tensor],
+    v_scale: Union[float, torch.Tensor],
+    row_dim: int,
+    v_row_dim: int,
+    size_limit: int,
+) -> None:
+    """Fused static-scale FP8 quantization and NHD paged-cache scatter.
+
+    The generic path historically executed ``div_`` and ``to(fp8)`` before the
+    scatter, causing three full K/V memory passes per layer and mutating the QKV
+    projection views.  Static checkpoint scales need only one read and one
+    final-cache write.
+    """
+    k_flat = k.flatten(1)
+    v_flat = v.flatten(1)
+    if k_flat.stride(1) != 1 or v_flat.stride(1) != 1:
+        raise RuntimeError("scaled FP8 KV store requires contiguous row payloads")
+    block = min(1024, triton.next_power_of_2(max(row_dim, v_row_dim)))
+    grid = (k_flat.shape[0], triton.cdiv(max(row_dim, v_row_dim), block))
+    k_scale_is_device_tensor = isinstance(k_scale, torch.Tensor) and k_scale.is_cuda
+    v_scale_is_device_tensor = isinstance(v_scale, torch.Tensor) and v_scale.is_cuda
+    k_scale_arg = k_scale if k_scale_is_device_tensor else float(k_scale)
+    v_scale_arg = v_scale if v_scale_is_device_tensor else float(v_scale)
+    _scaled_fp8_set_kv_buffer_kernel[grid](
+        k_flat,
+        v_flat,
+        k_cache.view(-1, row_dim),
+        v_cache.view(-1, v_row_dim),
+        indices,
+        k_flat.shape[0],
+        k_flat.stride(0),
+        v_flat.stride(0),
+        k_scale_arg,
+        v_scale_arg,
+        size_limit,
+        K_ROW_DIM=row_dim,
+        V_ROW_DIM=v_row_dim,
+        FP8_MAX=float(torch.finfo(k_cache.dtype).max),
+        K_SCALE_IS_DEVICE_TENSOR=k_scale_is_device_tensor,
+        V_SCALE_IS_DEVICE_TENSOR=v_scale_is_device_tensor,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
 def _set_kv_buffer_prefix_valid_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2532,11 +2643,55 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        # Float8 pools are backed by uint8 because index_put is not implemented
+        # for float8.  The backing dtype is only a storage detail: view it as
+        # the logical FP8 dtype before launching the saturated writer.
+        fp8_store_compatible = self.store_dtype in (self.dtype, torch.uint8)
+        use_scaled_fp8_store = (
+            cache_k.dtype != self.dtype
+            and self.dtype == fp8_dtype
+            and fp8_store_compatible
+            and k_scale is not None
+            and v_scale is not None
+            and dcp_kv_mask is None
+            and not self.use_hnd
+        )
+        if use_scaled_fp8_store:
+            k_buffer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer = self.v_buffer[layer_id - self.start_layer]
+            if k_buffer.dtype != self.dtype:
+                k_buffer = k_buffer.view(self.dtype)
+                v_buffer = v_buffer.view(self.dtype)
+            _scaled_fp8_set_kv_buffer(
+                cache_k,
+                cache_v,
+                k_buffer,
+                v_buffer,
+                loc,
+                k_scale,
+                v_scale,
+                self.row_dim,
+                self.v_row_dim,
+                self.size + self.page_size,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype in (
+                torch.float8_e5m2,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                # PyTorch's E4M3FN cast maps finite out-of-range values to the
+                # 0x7f/0xff NaN encodings.  Saturate before every generic FP8
+                # conversion so alternate layouts cannot silently poison KV.
+                fp8_max = float(torch.finfo(self.dtype).max)
+                cache_k.clamp_(min=-fp8_max, max=fp8_max)
+                cache_v.clamp_(min=-fp8_max, max=fp8_max)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 

@@ -466,6 +466,10 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+    # Reject FP8 KV-cache startup when a model did not load positive K/V
+    # dequantization scales. Calibrated checkpoints can also request this
+    # through kv_cache_scheme.require_checkpoint_scales.
+    SGLANG_REQUIRE_KV_CACHE_SCALES = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
