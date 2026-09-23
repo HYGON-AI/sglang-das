@@ -1066,8 +1066,8 @@ class DeepEPMoE(FusedMoE):
                     f"{num_recv_tokens_per_expert}"
                 )
 
-            # Both HIPC kernels consume the true scale restored by
-            # process_weights_after_loading; no forward-time rescaling is needed.
+            # HIPC kernels apply the checkpoint scale/16 factor internally.
+            # process_weights_after_loading must leave the stored scale unchanged.
 
             # DeepEP normal dispatch is token-major. Scatter it into contiguous
             # expert segments and retain output_index for the weighted gather.
