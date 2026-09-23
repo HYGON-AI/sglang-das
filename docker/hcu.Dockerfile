@@ -1,9 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-# 基础镜像由 CI 通过 build-arg 传入 (DTK/HCU 环境, 如 ubuntu22.04 + python3.10 + dtk2604)
+# DTK 包由 CI 通过 build-arg 传入, 从 dev 基础镜像内联安装 (分层方式同 ciimage 的框架镜像):
+#   第一段下载解压 DTK 并把 lib 移出 (约 20G 的层只存在于本地构建缓存, 不会推到 Harbor),
+#   第二段 lib 一层 + 其余一层 COPY 回 /opt/dtk, 避免单个超大层
+# 不再依赖预装 DTK 的基础镜像, 便于按次更换 DTK 包
 ARG BASE_IMAGE
+ARG DTK_PKG_URL
+
+# 第一段: 下载并解压 DTK, 按 ciimage 的方式把 lib 移出单独存放
+FROM ${BASE_IMAGE} AS dtk_src
+ARG DTK_PKG_URL
+RUN wget -q -O - "${DTK_PKG_URL}" | tar -xzf - -C /opt && \
+    mv /opt/dtk-* /opt/dtk && \
+    mv /opt/dtk/lib /dtk_lib
+
+# 第二段: 正式镜像, 先装入 DTK(lib 一层 + 其余一层), 再装框架
 FROM ${BASE_IMAGE}
+ARG DTK_VERSION
+
+ENV ROCM_PATH=/opt/dtk
+COPY --from=dtk_src /dtk_lib ${ROCM_PATH}/lib
+COPY --from=dtk_src /opt/dtk ${ROCM_PATH}
+
+RUN echo "source /opt/dtk/env.sh" >> ~/.bashrc && \
+    echo 'export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH' >> ~/.bashrc
+
+ENV DTK_VERSION=${DTK_VERSION}
 
 SHELL ["/bin/bash", "-c"]
 
@@ -39,6 +62,7 @@ RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp
     rm -f /tmp/hcu_llvm_installer.sh
 
 # 从 nightly 归档拉取 26.04 最新 blas cut 包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk)
+# 注意: 与 blas cut 一样依赖 /usr/local/lib/python3.10/dist-packages/amdsmi 路径追加, DTK ENV 块在末尾统一固化
 RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh" -O /tmp/dtk_blas_cut_installer.sh && \
     chmod +x /tmp/dtk_blas_cut_installer.sh && \
     bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
@@ -87,6 +111,24 @@ RUN pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator \
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
+
+# DTK 环境变量: 固化 env.sh 的导出(外加 bashrc 追加的 amdsmi 路径), 使 docker run 直接给命令 / sh /
+# k8s 等非交互 bash 场景也能加载; bashrc 保留作兜底(驱动缺失时 env.sh 的 .hyhal 分支只有 source 才命中)。
+# 放在文件末尾: 不改动其上方各构建步骤所见的环境。换 DTK 包后对照新 env.sh 同步这里(参考 ciimage「DTK 环境变量」)
+ENV HYHAL_PATH=/opt/hyhal
+ENV DTKROOT=${ROCM_PATH}
+ENV AMDGPU_TARGETS="gfx906;gfx926;gfx928;gfx936;gfx938"
+ENV HIP_PATH=${ROCM_PATH}/hip
+ENV MIOPEN_FIND_MODE=3
+ENV CMAKE_PREFIX_PATH=/opt/hyhal:$CMAKE_PREFIX_PATH
+ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${ROCM_PATH}/hip/bin:${ROCM_PATH}/hip/bin/hipify:${HYHAL_PATH}/bin:${ROCM_PATH}/opencl/bin:$PATH
+ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:${ROCM_PATH}/lib64:${HYHAL_PATH}/lib:${HYHAL_PATH}/lib64:${ROCM_PATH}/dushmem/lib:${ROCM_PATH}/opencl/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=${ROCM_PATH}/dcc/gcvm/lib:${ROCM_PATH}/hip/lib:${ROCM_PATH}/llvm/lib:$LD_LIBRARY_PATH
+ENV LIBRARY_PATH=${HYHAL_PATH}/lib:${ROCM_PATH}/opencl/lib:${ROCM_PATH}/dushmem/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}
+ENV C_INCLUDE_PATH=${ROCM_PATH}/include:${HYHAL_PATH}/include:${ROCM_PATH}/llvm/include:${ROCM_PATH}/opencl/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
+ENV C_INCLUDE_PATH=${ROCM_PATH}/dcc/gcvm/include:${C_INCLUDE_PATH}
+ENV CPLUS_INCLUDE_PATH=${ROCM_PATH}/dcc/gcvm/include:${C_INCLUDE_PATH}:${ROCM_PATH}/include:${HYHAL_PATH}/include:${ROCM_PATH}/llvm/include:${ROCM_PATH}/dushmem/include:${ROCM_PATH}/opencl/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH
 
 # 镜像完整引用由 CI 构建时通过 --build-arg 传入, 注入 ENV 便于容器运行时读取
 ARG IMAGE_TAG
