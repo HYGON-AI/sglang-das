@@ -1283,6 +1283,16 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def finishes_after_pending_token(self) -> bool:
+        """Whether one already-launched token will reach the length cap.
+
+        The overlap scheduler plans the next iteration before processing the
+        current forward result.  For a final Prefill chunk, that result already
+        contains one sampled token.  Requests at the cap must not be promoted
+        into a speculative one-token decode batch while that result is pending.
+        """
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
+
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
