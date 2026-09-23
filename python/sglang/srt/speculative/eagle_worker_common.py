@@ -7,7 +7,7 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_from_predict_func
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -626,15 +626,12 @@ def run_eagle_verify(
     )
 
     if not batch.forward_mode.is_idle():
-        accept_tokens = predict[accept_index]
-        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-        # stride = accept_tokens per-req width = accept_index.shape[1]
-        # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-        fill_bonus_tokens_func(
-            accept_tokens,
+        bonus_tokens = torch.empty((bs,), dtype=torch.int32, device=accept_lens.device)
+        fill_bonus_tokens_from_predict_func(
+            predict,
+            accept_index,
             accept_lens,
             bonus_tokens,
-            accept_index.shape[1],
             bs,
         )
     else:
