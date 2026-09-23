@@ -176,6 +176,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "correction_bias) -> ()");
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
+#ifdef SGLANG_HCU_AOT_FP8_QUANT
+  // HCU builds include the e4m3fn AOT implementation. Other ROCm builds keep
+  // using the existing runtime fallback instead of exporting a mismatched op.
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
+#endif
+
   /*
    * From csrc/speculative
    */
