@@ -26,6 +26,7 @@ from sglang.kernels.ops.activation.softcap import (
 )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -73,6 +74,7 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "PackWeightMethod",
 }
 
+
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
 # read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
@@ -107,7 +109,9 @@ class LogitsProcessorOutput:
     # Draft decode VP returns a deterministic top-1 proposal without full logits.
     draft_top1_token_ids: Optional[torch.Tensor] = None
     draft_top1_probs: Optional[torch.Tensor] = None
-
+    # Greedy EAGLE3 fast path.  When populated, the draft worker consumes
+    # these ids directly and ``next_token_logits`` is intentionally None.
+    draft_topk_index: Optional[torch.Tensor] = None
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
@@ -466,6 +470,114 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def forward_draft_top1_fp8(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        fp8_weight: Optional[torch.Tensor],
+        weight_scale: Optional[torch.Tensor],
+        aux_hidden_states: Optional[AuxHiddenStates] = None,
+        backend: str = "lightop",
+    ) -> LogitsProcessorOutput:
+        """Greedy EAGLE3 LM-head without materializing vocabulary logits."""
+        from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+            fp8_lm_head_top1,
+        )
+        from sglang.kernels.ops.speculative.topk1 import (
+            draft_topk1_select_candidates,
+        )
+
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+        if logits_metadata.extend_return_logprob:
+            raise RuntimeError("FP8 draft Top-1 does not support input logprobs")
+        if self.final_logit_softcapping is not None:
+            raise RuntimeError("FP8 draft Top-1 does not support logit softcapping")
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = self._get_pruned_states(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            logits_metadata,
+        )
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        pruned_states, local_states = self._gather_dp_attn_hidden_states(
+            pruned_states, logits_metadata
+        )
+
+        shard = lm_head.shard_indices
+        if shard.num_added_elements != 0:
+            raise RuntimeError("FP8 draft Top-1 does not support added vocabulary")
+        valid_local_vocab = shard.org_vocab_end_index - shard.org_vocab_start_index
+        if backend not in ("lightop", "lightop_fp8"):
+            raise RuntimeError(
+                "SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND must be lightop_fp8, got "
+                f"{backend!r}"
+            )
+        if pruned_states.numel() == 0:
+            # Idle DP ranks still execute the EAGLE draft control flow.  Do
+            # not send their empty [0, K] input to LightOp, which
+            # rejects M=0 and logs status=3 on every speculative step.
+            local_values = torch.empty(
+                (0,), dtype=torch.float32, device=pruned_states.device
+            )
+            local_indices = torch.empty(
+                (0,), dtype=torch.int32, device=pruned_states.device
+            )
+        else:
+            if fp8_weight is None or weight_scale is None:
+                raise RuntimeError("FP8 draft LM-head weights were not initialized")
+            local_values, local_indices = fp8_lm_head_top1(
+                pruned_states,
+                fp8_weight,
+                weight_scale,
+                valid_vocab_size=valid_local_vocab,
+            )
+        global_ids = local_indices.to(torch.float32).add_(shard.org_vocab_start_index)
+        candidates = torch.stack((local_values, global_ids), dim=-1)
+        if self.do_tensor_parallel_all_gather:
+            if self.use_attn_tp_group:
+                raise RuntimeError(
+                    "FP8 draft Top-1 currently requires the model TP group"
+                )
+            candidates = get_tp_group().all_gather(candidates, dim=-1)
+            candidates = candidates.view(candidates.shape[0], -1, 2)
+            global_top1 = draft_topk1_select_candidates(candidates)
+        else:
+            global_top1 = global_ids.to(torch.int64).view(-1, 1).contiguous()
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            local_top1 = torch.empty(
+                (local_states.shape[0], 1),
+                dtype=torch.int64,
+                device=global_top1.device,
+            )
+            dp_scatter(local_top1, global_top1, logits_metadata)
+        else:
+            local_top1 = global_top1
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states_to_store,
+            draft_topk_index=local_top1,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
 
     def _get_pruned_states(
         self,

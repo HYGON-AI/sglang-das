@@ -1811,6 +1811,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.hidden_states is not None
                 else None
             ),
+            draft_topk_index=(
+                output.draft_topk_index[:logits_rows]
+                if output.draft_topk_index is not None
+                else None
+            ),
             input_token_logprobs=output.input_token_logprobs,
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,
