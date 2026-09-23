@@ -510,6 +510,8 @@ _page_cache_dropped = False
 
 def drop_checkpoint_page_cache() -> tuple[int, int]:
     """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
+    if os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE", "1") == "0":
+        return 0, 0
     try:
         model_path = get_model().model_path
     except (ValueError, AttributeError):
@@ -592,6 +594,18 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+
+        self.device_ptr = self.bytes.data_ptr()
+        if torch.version.hip:
+            from sgl_kernel.kvcacheio import get_device_accessible_ptr
+
+            try:
+                self.device_ptr = get_device_accessible_ptr(
+                    self.bytes, torch.cuda.current_device()
+                )
+            except Exception:
+                torch.cuda.cudart().cudaHostUnregister(self.bytes.data_ptr())
+                raise
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -715,6 +729,12 @@ class EngramEmbedding(nn.Module):
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
 
+    def _gather_ptr(self, tensor: torch.Tensor) -> int:
+        ptr = tensor.data_ptr()
+        if self.host_table is not None:
+            ptr += self.host_table.device_ptr - self.host_table.bytes.data_ptr()
+        return ptr
+
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
@@ -745,12 +765,13 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             out = self._empty(indices)
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                self._gather_ptr(self.weight),
+                self._gather_ptr(self.scale),
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
+                row_hi=self.weight.shape[0],
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -787,25 +808,17 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        cpu_host_gather = self.host_table is not None and os.getenv(
-            "SGLANG_ENABLE_DSV41_ENGRAM_CPU_GATHER", "0"
-        ) == "1"
-        if cpu_host_gather or (
-            self.host_table is None and not _cuda_kernels(indices)
-        ):
-            lookup_indices = indices.cpu() if cpu_host_gather else indices
-            local = lookup_indices - self.row_start
+        if self.host_table is None and not _cuda_kernels(indices):
+            local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
-            return values.to(torch.bfloat16).masked_fill(
-                ~owned.unsqueeze(-1), 0
-            ).to(indices.device)
+            return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            self._gather_ptr(self.weight),
+            self._gather_ptr(self.scale),
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
