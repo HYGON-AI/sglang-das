@@ -199,6 +199,7 @@ jobs:
               --devpi_url "${PYPI_URL}" \
               --password "${CIUPLOAD_PASSWORD}" \
               --dtk_pkg_name "$(basename "${DTK_PKG_URL}")" \
+              --record \
               -f output/*.whl
           fi
           rm -rf /home/github/sgl_whl_temp/HYGON-AI_hcu-sglang/* || true
