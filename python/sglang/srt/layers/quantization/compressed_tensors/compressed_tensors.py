@@ -185,6 +185,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
@@ -249,6 +250,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
+        if isinstance(layer, RadixAttention) and self.kv_cache_scheme is not None:
+            # Static FP8 KV-cache scales are ordinary scalar parameters in the
+            # checkpoint.  The weight loader remaps HF k_scale/v_scale names to
+            # the RadixAttention parameters created by this method.
+            from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+            return BaseKVCacheMethod(self)
         return None
 
     def _add_fused_moe_to_target_scheme_map(self):
