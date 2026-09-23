@@ -241,9 +241,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        # TP-sharded Engram also gathers across attention-DP ranks, even when
+        # DeepEP keeps the MLP DP-local. Reuse the synchronized token buffers
+        # and max-DP graph bucket for both capture and replay.
         self.require_mlp_tp_gather = (
-            require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
-        )
+            require_mlp_tp_gather()
+            or (
+                model_runner.model_config.use_engram
+                and get_parallel().attn_dp_size > 1
+            )
+        ) and not self._forward_is_dp_local(model_runner)
         self.require_attn_tp_gather = require_attn_tp_gather()
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
