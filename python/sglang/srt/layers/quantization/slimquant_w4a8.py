@@ -16,7 +16,6 @@ import os
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 import triton.language as tl
 from lightop import gemm_ops as quant_tools
 from lightop._lmslim_native.layers.fused_moe import w4a8 as w4a8_triton
@@ -90,6 +89,7 @@ def fused_experts_impl_w4a8_triton(
     w2_scale: torch.Tensor,
     routed_scaling_factor: float,
     shared_output: Optional[torch.Tensor],
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Run SlimQuant W4A8 Triton GEMMs without whole-layer LightOp fusion."""
     assert hidden_states.ndim == 2 and hidden_states.is_contiguous()
@@ -118,6 +118,21 @@ def fused_experts_impl_w4a8_triton(
         config1, config2 = w4a8_triton.get_w8a8moe_json(
             token_count, w1.shape[0], n1, n2, n1 // 2
         )
+        config1 = dict(config1)
+        config2 = dict(config2)
+        gemm2_k = n1 // 2
+        if gemm2_k % config2["BLOCK_SIZE_K"] != 0:
+            # LightOp's INT4 kernel does not mask the final K tile.  TP8
+            # partitions the 2304-wide expert intermediate dimension to 288,
+            # so BLOCK_SIZE_K=64 would read through K=320.  Use the largest
+            # supported tile that divides the real K exactly.
+            if gemm2_k % 32 == 0:
+                config2["BLOCK_SIZE_K"] = 32
+            else:
+                raise ValueError(
+                    f"W4A8 GEMM2 K={gemm2_k} is not divisible by a supported "
+                    "BLOCK_SIZE_K"
+                )
         sorted_ids, expert_ids, padded_count = w4a8_triton.moe_align_block_size(
             current_ids, config1["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
@@ -139,11 +154,29 @@ def fused_experts_impl_w4a8_triton(
             compute_type=compute_type,
         )
 
-        gate, up = cache1.chunk(2, dim=-1)
         if activation == "silu":
-            activated = F.silu(gate) * up
+            from sgl_kernel import silu_and_mul
+
+            if swiglu_limit is not None:
+                assert swiglu_limit == 10
+                gate, up = cache1.chunk(2, dim=-1)
+                gate.clamp_(max=swiglu_limit)
+                up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+            activated = torch.empty(
+                (token_count * top_k, n1 // 2),
+                device=cache1.device,
+                dtype=cache1.dtype,
+            )
+            silu_and_mul(cache1.view(-1, n1), activated)
         elif activation == "gelu":
-            activated = F.gelu(gate) * up
+            from sgl_kernel import gelu_and_mul
+
+            activated = torch.empty(
+                (token_count * top_k, n1 // 2),
+                device=cache1.device,
+                dtype=cache1.dtype,
+            )
+            gelu_and_mul(cache1.view(-1, n1), activated)
         else:
             raise ValueError(f"Unsupported FusedMoE activation: {activation}")
         qactivated, activated_scale = per_token_quant_int8(
@@ -558,6 +591,7 @@ class SlimQuantW4A8Int8MoEMethod:
             w2_scale=layer.w2_weight_scale,
             routed_scaling_factor=routed_scaling_factor,
             shared_output=shared_output,
+            swiglu_limit=self.moe_runner_config.swiglu_limit,
         )
         return output
 

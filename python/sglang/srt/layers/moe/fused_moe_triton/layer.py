@@ -775,6 +775,11 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
+            if (
+                loaded_weight.ndim == 2
+                and loaded_weight.transpose(-2, -1).shape == expert_data.shape
+            ):
+                loaded_weight = loaded_weight.transpose(-2, -1)
             loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
@@ -840,7 +845,16 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
+                transpose_for_layout = (
+                    not is_bias
+                    and loaded_weight.ndim == 2
+                    and expert_data.ndim == 2
+                    and loaded_weight.shape[1 - shard_dim]
+                    != expert_data.shape[1 - shard_dim]
+                    and loaded_weight.transpose(-2, -1).shape[1 - shard_dim]
+                    == expert_data.shape[1 - shard_dim]
+                )
+                if not is_bias and (self.use_triton_kernels or transpose_for_layout):
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # When the buffer is padded (e.g., MXFP4 SM100 rounds
@@ -931,7 +945,15 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                transpose_for_layout = (
+                    loaded_weight.ndim == 2
+                    and expert_data.ndim == 2
+                    and loaded_weight.shape[1 - shard_dim]
+                    != expert_data.shape[1 - shard_dim]
+                    and loaded_weight.transpose(-2, -1).shape[1 - shard_dim]
+                    == expert_data.shape[1 - shard_dim]
+                )
+                if self.use_triton_kernels or transpose_for_layout:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
                 # do not cause out-of-bounds indexing into the checkpoint.
