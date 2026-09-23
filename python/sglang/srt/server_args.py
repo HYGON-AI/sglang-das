@@ -2552,7 +2552,7 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 0
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        Optional[Literal["static", "dynamic", "fake", "lp", "load_aware"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
@@ -7782,10 +7782,12 @@ class ServerArgs:
             )
 
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
-        # per-rank table and `lp` samples inside its kernel.
+        # per-rank table; `lp` and `load_aware` solve the current batch and
+        # sample inside their kernels.
         if needs_rank_invariant_dispatch and self.ep_dispatch_algorithm in (
             "static",
             "lp",
+            "load_aware",
         ):
             raise ValueError(
                 f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks a "
@@ -7793,6 +7795,18 @@ class ServerArgs:
                 "a2a backend routes each token to a single rank. Use "
                 "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
             )
+
+        if self.ep_dispatch_algorithm == "load_aware":
+            if not is_hip():
+                raise ValueError(
+                    "--ep-dispatch-algorithm load_aware is currently supported "
+                    "only on ROCm."
+                )
+            if self.ep_num_redundant_experts <= 0:
+                raise ValueError(
+                    "--ep-dispatch-algorithm load_aware requires "
+                    "--ep-num-redundant-experts > 0."
+                )
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
