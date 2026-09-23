@@ -406,6 +406,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and moe_runner_backend.is_aiter()
+            and not _is_hcu
         ):
             with torch.no_grad():
                 # Pre-shuffle weights
