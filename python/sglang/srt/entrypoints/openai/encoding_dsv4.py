@@ -463,8 +463,12 @@ def render_message(
             )
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"]:
-        # Normal generation: append Assistant + thinking token
+    elif messages[index].get("role") in ["user", "developer", "system", "latest_reminder"]:
+        # Normal generation: append Assistant + thinking token.
+        # Also cover conversations terminated by a system / latest_reminder
+        # message (common in agentic multi-turn flows): without the explicit
+        # assistant prefix the prompt ends in bare instruction text and the
+        # model tends to repeat it or emit nothing usable.
         prompt += ASSISTANT_SP_TOKEN
         if not drop_thinking and thinking_mode == "thinking":
             prompt += thinking_start_token
