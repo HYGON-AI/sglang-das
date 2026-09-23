@@ -519,6 +519,16 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         elif is_humming:
             self.deprecate_flag = True
+        elif (
+            _is_hcu
+            and self.scheme is not None
+            and self.scheme.__class__.__name__
+            == "HCUCompressedTensorsW4A8Int8DynamicMoE"
+        ):
+            # This scheme owns the packed INT4 weights and executes through
+            # the modern quant-method path. The legacy DeepEP path assumes
+            # FP8 attributes such as w13_weight and bypasses the scheme.
+            self.deprecate_flag = True
         elif _is_hcu and _use_aiter:
             self.deprecate_flag = False
         elif _use_aiter:
@@ -771,11 +781,17 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
+        bias: Optional[torch.Tensor] = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
     ):
 
         if self.deprecate_flag:
             return super().run_moe_core(
                 dispatch_output,
+                bias=bias,
+                i_q=i_q,
+                i_s=i_s,
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

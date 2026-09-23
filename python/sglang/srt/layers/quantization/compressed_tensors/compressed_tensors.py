@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    HCUCompressedTensorsW4A8Int8DynamicMoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -75,9 +76,10 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
@@ -270,6 +272,23 @@ class CompressedTensorsConfig(QuantizationConfig):
             return
         self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
         self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
+
+    def _is_hcu_dsv41_w4a8_config(self) -> bool:
+        if not _is_hcu or not any("engram" in pattern for pattern in self.ignore):
+            return False
+
+        for target, scheme in self.target_scheme_map.items():
+            if "w[123]" not in target:
+                continue
+            weight_quant = scheme.get("weights")
+            input_quant = scheme.get("input_activations")
+            if (
+                weight_quant is not None
+                and input_quant is not None
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+            ):
+                return True
+        return False
 
     # @property
     # def weight_block_size(self) -> Optional[List[int]]:
@@ -821,7 +840,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
-        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        is_hcu_dsv41_w4a8 = self._is_hcu_dsv41_w4a8_config()
+        if is_hcu_dsv41_w4a8:
+            scheme_dict = None
+            with suppress(ValueError):
+                scheme_dict = self.get_scheme_dict(layer, layer_name)
+        else:
+            scheme_dict = self.get_scheme_dict(layer, layer_name)
         if scheme_dict is not None:
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
@@ -830,11 +855,23 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
 
         unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+            layer_name + projection_name
+            for projection_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
         ]
         # TODO: refactor this to use expert_mapping and check all layer numbers
-        all_scheme_dicts = [self.get_scheme_dict(layer, name) for name in unfused_names]
+        try:
+            all_scheme_dicts = [
+                self.get_scheme_dict(layer, name) for name in unfused_names
+            ]
+        except ValueError:
+            if not is_hcu_dsv41_w4a8:
+                raise
+            checkpoint_aliases = [".0.w1", ".0.w3", ".0.w2"]
+            all_scheme_dicts = [
+                self.get_scheme_dict(layer, layer_name + projection_name)
+                for projection_name in checkpoint_aliases
+            ]
+
         scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
 
         # multiple schemes found
@@ -923,15 +960,26 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            if _is_hcu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
+                logger.info_once("Using HCUCompressedTensorsW4A8Int8DynamicMoE")
+                return HCUCompressedTensorsW4A8Int8DynamicMoE(
+                    self, weight_quant=weight_quant
+                )
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            elif _is_hcu:
+                logger.info_once("Using HCUCompressedTensorsW4A8Int8DynamicMoE")
+                return HCUCompressedTensorsW4A8Int8DynamicMoE(
+                    self, weight_quant=weight_quant
+                )
             else:
                 raise NotImplementedError(
-                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W4A8Int8 Fused MoE scheme is currently implemented "
+                    "only for NPU and HCU."
                 )
         else:
             raise RuntimeError(
