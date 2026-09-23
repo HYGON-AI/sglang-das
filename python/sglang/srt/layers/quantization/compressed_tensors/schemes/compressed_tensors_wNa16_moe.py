@@ -105,6 +105,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         quant_config: CompressedTensorsConfig,
         weight_quant: QuantizationArgs,
         num_gpu_experts: int = -1,
+        use_int4_w4a8: bool = False,
     ):
         self.quant_config = quant_config
         # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
@@ -116,6 +117,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.group_size = config.group_size
         self.actorder = config.actorder
         self.sym = config.symmetric
+        # Packed INT4 + dynamic per-token INT8 activations (W4A8 compute on
+        # a W4A16 pack-quantized checkpoint). Default remains W4A16.
+        self.use_int4_w4a8 = bool(use_int4_w4a8) or get_bool_env_var(
+            "SGLANG_USE_INT4_W4A8"
+        )
 
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
@@ -585,15 +591,30 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     def get_triton_quant_info(self, layer):
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
+        # GPTQ/AWQ fused-MoE is selected only when block_shape[1] > 0.
+        # Channel-wise checkpoints store group_size=-1; the kernel indexes
+        # scales as offs_k // group_size, so any value >= K (w13 K=hidden,
+        # w2 K=intermediate) collapses to group 0.
+        group_size = (
+            self.group_size if self.group_size and self.group_size > 0 else (1 << 20)
+        )
+        use_w4a8 = bool(getattr(self, "use_int4_w4a8", False))
+        if use_w4a8 and not getattr(self, "_logged_int4_w4a8", False):
+            logger.info(
+                "CompressedTensorsWNA16TritonMoE: packed INT4 experts using "
+                "use_int4_w4a8 (dynamic per-token INT8 activations)"
+            )
+            self._logged_int4_w4a8 = True
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight_packed,
             w2_weight=layer.w2_weight_packed,
-            use_int4_w4a16=True,
+            use_int4_w4a16=not use_w4a8,
+            use_int4_w4a8=use_w4a8,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            block_shape=[0, self.group_size],
-            w13_zp=self.w13_zp,
-            w2_zp=self.w2_zp,
+            block_shape=[0, group_size],
+            w13_zp=None if self.sym else self.w13_zp,
+            w2_zp=None if self.sym else self.w2_zp,
         )
 
     def apply_weights(
