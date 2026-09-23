@@ -316,8 +316,7 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
-                    # Older HCU wheels expose the four-argument size hint.
-                    **({} if _is_hcu else {"num_topk": num_topk}),
+                    num_topk=num_topk
                 ),
                 num_rdma_bytes,
             )
