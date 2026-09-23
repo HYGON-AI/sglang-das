@@ -1634,10 +1634,27 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Validated gfx938 FlashMLA MSA128 Stage-3 path. The MiniMax lightning
+    # indexer remains the exact Top16 producer. The external kernels require
+    # BF16 Q/K/V, page128, and attention TP1 (64Q:4KV heads).
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 = EnvBool(False)
+    # Also replace the MiniMax score producer and exact Top16 selector with
+    # FlashMLA's MSA128 Stage-1/2 kernels. Kept separate from Stage-3 so each
+    # boundary can be differential-tested independently.
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_INDEXER = EnvBool(False)
+    # Decode has an independent gate so prefill and decode can be selected
+    # independently. The adapter is guarded by its runtime contract checks.
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_DECODE = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
+    # Validated gfx938 native E4M3FN MFMA path for MiniMax sparse main
+    # attention. Index Q/K remain BF16 so Top-K selection is unchanged.
+    SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM = EnvBool(False)
+    # Softmax-probability multiplier before the native E4M3 P x V dot. 448
+    # uses the full finite E4M3FN range and is the validated production value.
+    SGLANG_M3_TRITON_FP8_P_SCALE = EnvInt(448)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
     # MiniMax-M3 sparse decode score-kernel split-K controls. The selected
