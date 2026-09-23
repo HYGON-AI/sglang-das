@@ -1396,6 +1396,8 @@ class Envs:
     # Enabling this also requires the native LightOp INT8 Paged MQA consumer;
     # there is intentionally no BF16 dequantization fallback.
     SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
+    # Opt in to the persistent INT8 Paged MQA producer on HCU gfx936.
+    SGLANG_MQA_PERSISTENT = EnvBool(False)
     # Fuse C4 indexer Q RoPE, Hadamard, and INT8 quantization into one kernel.
     # This is independent from the INT8 K-cache switch but requires it at runtime.
     SGLANG_NSA_INDEX_Q_INT8 = EnvBool(False)
