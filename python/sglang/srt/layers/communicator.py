@@ -99,7 +99,8 @@ _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -198,7 +199,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
-        _use_aiter
+        _is_hip
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
@@ -905,7 +906,7 @@ class LayerCommunicator:
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
-                    _use_aiter
+                    _is_hip
                     and batch_size > 0
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
