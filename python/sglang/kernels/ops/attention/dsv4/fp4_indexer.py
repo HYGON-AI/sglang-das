@@ -11,6 +11,11 @@ from triton.language.extra import libdevice
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hcu
+
+# Cached at import time: LightOp paged_mqa_logits_fp4 is HCU-only, so the check
+# guards every decode call without repeated platform probes.
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
@@ -537,8 +542,10 @@ def fp4_index_logits_decode(
     """Decode index logits from the fp4 index-K pool. q [B, H, 128] bf16, weights
     [B, H], slots [B, L] int64, lens [B] int64, table = the layer's index-K page
     buffer (uint8, 2D). Returns [B, L] fp32 logits, -inf at positions >= lens.
-    LightOp is opt-in; its native dispatcher chooses BF16 or lossless FP8 MMAC
-    without converting the public BF16 query input to FP8 here."""
+    LightOp is enabled by default on HCU and can be disabled via
+    SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4=0; its native dispatcher chooses
+    BF16 or lossless FP8 MMAC without converting the public BF16 query input
+    to FP8 here."""
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     B, H, _ = q.shape
     L = slots.shape[1]
@@ -549,11 +556,9 @@ def fp4_index_logits_decode(
     out = torch.empty((B, L), dtype=torch.float32, device=q.device)
     if B == 0 or L == 0:
         return out
-    if lens.dtype != torch.int64 or not lens.is_contiguous():
-        lens = lens.to(dtype=torch.int64).contiguous()
-    # HIP/HCU PyTorch tensors intentionally report device type ``cuda`` and
-    # q.is_cuda=True, so this also selects the native path on DCU.
-    if q.is_cuda:
+    if _is_hcu:
+        if lens.dtype != torch.int64 or not lens.is_contiguous():
+            lens = lens.to(dtype=torch.int64).contiguous()
         native = _get_lightop_fp4_op()
         if native is not None:
             # LightOp owns validation and its BF16/FP8 choice. Do not add a
@@ -565,7 +570,7 @@ def fp4_index_logits_decode(
         q,
         weights,
         slots,
-        lens,
+        lens.to(torch.int64).contiguous(),
         table,
         out,
         L,
