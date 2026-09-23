@@ -143,6 +143,76 @@ def generate_draft_decode_kv_indices(
 
 
 @triton.jit
+def generate_draft_decode_kv_indices_windowed_topk1(
+    req_pool_indices,
+    req_to_token,
+    paged_kernel_lens,
+    kv_indices,
+    kv_indptr,
+    pool_len: tl.constexpr,
+    kv_indices_stride: tl.constexpr,
+    kv_indptr_stride: tl.constexpr,
+    bs_upper: tl.constexpr,
+    iter_upper: tl.constexpr,
+    window_size: tl.constexpr,
+):
+    """Pack only the live sliding-window tail for a linear EAGLE chain."""
+    BLOCK_SIZE: tl.constexpr = 128
+    step_id = tl.program_id(axis=0)
+    bid = tl.program_id(axis=1)
+    num_seqs = tl.num_programs(axis=1)
+
+    kv_indices += kv_indices_stride * step_id
+    kv_indptr += kv_indptr_stride * step_id
+    num_step_tokens = step_id + 1
+    max_prefix_len = window_size - num_step_tokens
+
+    seq_len = tl.load(paged_kernel_lens + bid)
+    prefix_len = tl.minimum(seq_len, max_prefix_len)
+    prefix_start = seq_len - prefix_len
+
+    # Pack variable-length window tails contiguously. bs_upper is the same
+    # compile-time reduction bound used by the generic planner.
+    prior = tl.arange(0, bs_upper)
+    prior_seq_lens = tl.load(paged_kernel_lens + prior, mask=prior < bid, other=0)
+    prior_prefix_lens = tl.minimum(prior_seq_lens, max_prefix_len)
+    packed_offset = tl.sum(prior_prefix_lens) + bid * num_step_tokens
+
+    kv_ptr = kv_indices + packed_offset
+    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
+    copy_offset = tl.arange(0, BLOCK_SIZE)
+    num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = copy_offset < prefix_len
+        data = tl.load(token_pool_ptr + prefix_start + copy_offset, mask=mask)
+        tl.store(kv_ptr + copy_offset, data, mask=mask)
+        copy_offset += BLOCK_SIZE
+
+    extend_offset = tl.arange(0, iter_upper)
+    extend_data = tl.load(
+        token_pool_ptr + seq_len + extend_offset,
+        mask=extend_offset < num_step_tokens,
+    )
+    tl.store(
+        kv_ptr + prefix_len + extend_offset,
+        extend_data,
+        mask=extend_offset < num_step_tokens,
+    )
+
+    # Bid 0 writes the final pointer while bids 1..N-1 write the interior
+    # pointers; kv_indptr[0] remains zero.
+    zid = bid
+    if zid == 0:
+        zid = num_seqs
+    indptr_seq_lens = tl.load(paged_kernel_lens + prior, mask=prior < zid, other=0)
+    indptr_prefix_lens = tl.minimum(indptr_seq_lens, max_prefix_len)
+    tl.store(
+        kv_indptr + zid,
+        tl.sum(indptr_prefix_lens) + zid * num_step_tokens,
+    )
+
+
+@triton.jit
 def align_evict_mask_to_page_size(
     seq_lens,
     evict_mask,
