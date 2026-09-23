@@ -51,12 +51,14 @@ from sglang.srt.utils import (
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
+    is_hcu,
     is_hip,
     is_npu,
     load_json_config,
 )
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
@@ -573,7 +575,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if use_groupgemm:
+        if use_groupgemm and not (
+            _is_hcu and self.deepep_output_dtype == DispatcherOutputDtype.BF16
+        ):
             if _use_fp8_w8a8_moe:
                 hidden_states = per_token_quant_fp8(hidden_states)
             elif _use_marlin_w16a16_moe:
@@ -684,6 +688,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         _deepep_precompile_tp_barrier()
         npu_quantization_opts = self._get_quantization_kwargs(buffer)
+        configured_expert_alignment = (
+            self.quant_config.get("normal_expert_alignment") if _is_hcu else None
+        )
         if use_groupgemm:
             (
                 recv_x,
@@ -705,13 +712,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 allocate_on_comm_stream=(previous_event is not None)
                 and self.async_finish,
                 expert_alignment=(
-                    256
-                    if (
-                        get_model().quantization == "slimquant_marlin"
-                        or _use_fp8_w8a8_moe
-                        or _use_marlin_w16a16_moe
+                    configured_expert_alignment
+                    if configured_expert_alignment is not None
+                    else (
+                        256
+                        if (
+                            get_model().quantization == "slimquant_marlin"
+                            or _use_fp8_w8a8_moe
+                            or _use_marlin_w16a16_moe
+                        )
+                        else 1
                     )
-                    else 1
                 ),
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
@@ -734,7 +745,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 previous_event=previous_event,
                 async_finish=self.async_finish,
                 allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-                expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+                expert_alignment=(
+                    configured_expert_alignment
+                    if configured_expert_alignment is not None
+                    else (128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1)
+                ),
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
                 **npu_quantization_opts,
             )
