@@ -171,8 +171,11 @@ def _set_kv_buffer_impl(
     v_row_bytes = v_row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and can_use_store_cache(row_bytes, v_row_bytes):
         return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, v_row_dim),
+            # flatten(1) preserves a non-contiguous row stride when the
+            # trailing head/dim axes are contiguous. This lets the packed
+            # query-sharded CP gather feed the strided store kernel directly.
+            k.flatten(1),
+            v.flatten(1),
             k_cache.view(-1, row_dim),
             v_cache.view(-1, v_row_dim),
             indices,
