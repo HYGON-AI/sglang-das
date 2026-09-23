@@ -709,6 +709,15 @@ class LayerCommunicator:
                                 _unq_bf16,
                             )
 
+                    elif quant_format == "lightop_fp8_per_token" and hasattr(
+                        self.input_layernorm,
+                        "forward_with_lightop_fp8_quant",
+                    ):
+                        hidden_states = (
+                            self.input_layernorm.forward_with_lightop_fp8_quant(
+                                hidden_states
+                            )
+                        )
                     elif _use_aiter and (quant_format == "fp8_per_token"):
                         hidden_states = _fused_rmsnorm_fp8_per_token_quant(
                             hidden_states,
@@ -776,6 +785,17 @@ class LayerCommunicator:
                                 hidden_states[1],
                                 _unq_bf16,
                             )
+                    elif quant_format == "lightop_fp8_per_token" and hasattr(
+                        self.input_layernorm,
+                        "forward_with_lightop_fp8_quant",
+                    ):
+                        hidden_states, residual = (
+                            self.input_layernorm.forward_with_lightop_fp8_quant(
+                                hidden_states,
+                                residual,
+                                post_residual_addition,
+                            )
+                        )
                     elif _use_aiter and (quant_format == "fp8_per_token"):
                         if post_residual_addition is not None:
                             residual = residual + post_residual_addition

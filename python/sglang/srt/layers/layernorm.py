@@ -60,6 +60,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_hcu = is_hcu()
+_use_hcu_lightop_gemma_rmsnorm = _is_hcu and get_bool_env_var(
+    "SGLANG_USE_LIGHTOP_GEMMA_RMSNORM"
+)
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
 
@@ -132,6 +135,11 @@ elif _is_hip:
 if _is_hcu:
     from lightop import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm_hcu
     from lightop import op
+
+if _use_hcu_lightop_gemma_rmsnorm:
+    from lightop import (
+        gemma_rms_norm_per_token_fp8_quant as gemma_rms_norm_fp8_quant_hcu,
+    )
 
 if _is_hip:
     try:
@@ -1345,6 +1353,40 @@ class GemmaRMSNorm(BaseFusedOp):
             self.gemma_weight,
             use_attn_tp_group=use_attn_tp_group,
         )
+
+    def forward_with_lightop_fp8_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        """Gemma RMSNorm + dynamic per-token OCP-FP8 quant for LightOp GEMM.
+
+        LightOp updates ``residual`` in place with ``x + residual`` when a
+        residual is supplied.  ``update_input=False`` avoids writing a BF16
+        normalized copy back to ``x`` because the following channel-FP8 GEMM
+        consumes only the returned ``(fp8, scale)`` tuple.
+        """
+        if not _use_hcu_lightop_gemma_rmsnorm:
+            raise RuntimeError(
+                "LightOp Gemma RMSNorm+FP8 quant requires "
+                "SGLANG_USE_LIGHTOP_GEMMA_RMSNORM=1 on HCU gfx93x"
+            )
+        if post_residual_addition is not None:
+            if residual is None:
+                residual = post_residual_addition
+            else:
+                residual = residual + post_residual_addition
+
+        quantized = gemma_rms_norm_fp8_quant_hcu(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+            fp8type=0,
+            residual=residual,
+            update_input=False,
+        )
+        return quantized if residual is None else (quantized, residual)
 
     def forward_with_allreduce_fusion_quant_per_group(
         self,
