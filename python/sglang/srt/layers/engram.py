@@ -289,6 +289,14 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if mode.is_idle():
+            # DP-attention may pad an otherwise empty rank so it can
+            # participate in MLP synchronization. These rows are not real
+            # requests: provide shape-correct dummy hashes without reading or
+            # committing per-request Engram history.
+            return input_ids.new_zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1])
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
