@@ -1,9 +1,11 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import json
 from unittest.mock import patch
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.entrypoints.openai.protocol import Function, Tool, ToolChoice
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -102,6 +104,181 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(len(result.calls), 2)
 
+    def test_malformed_parameter_closers_are_recovered(self):
+        """Known close-tag corruptions must not turn valid arguments into `{}`."""
+        for closer in (
+            f"</{DSML}parameterparameter>",
+            f"</{DSML}parameter_param>",
+            f'</{DSML}parameter string="true">',
+        ):
+            with self.subTest(closer=closer):
+                malformed = _weather_call().replace(f"</{DSML}parameter>", closer)
+
+                result = DeepSeekV4Detector().detect_and_parse(malformed, self.tools)
+
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"city": "SF"}
+                )
+
+    def test_malformed_parameter_closers_streaming_are_valid_json(self):
+        for closer in (
+            f"</{DSML}parameterparameter>",
+            f"</{DSML}parameter_param>",
+            f'</{DSML}parameter string="true">',
+        ):
+            with self.subTest(closer=closer):
+                malformed = _weather_call().replace(f"</{DSML}parameter>", closer)
+
+                _, calls = self._feed(
+                    [malformed[i : i + 3] for i in range(0, len(malformed), 3)]
+                )
+                arguments = "".join(
+                    call.parameters for call in calls if call.parameters
+                )
+
+                self.assertEqual(json.loads(arguments), {"city": "SF"})
+
+    def test_wrapped_arguments_are_unwrapped_from_direct_json(self):
+        text = _wrapped(
+            _invoke("get_weather", '{"arguments":{"city":"SF"}}')
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_wrapped_arguments_are_unwrapped_from_xml(self):
+        text = _wrapped(
+            _invoke(
+                "get_weather",
+                _param("arguments", "true", '{"city":"SF"}'),
+            )
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_scalar_is_wrapped_for_schema_declared_array(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "queries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            }
+                        },
+                        "required": ["queries"],
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"queries":"SGLang"}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"queries": ["SGLang"]}
+        )
+
+    def test_wrapped_scalar_maps_to_sole_array_property(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                        "required": ["queries"],
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"arguments":"SGLang"}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"queries": ["SGLang"]}
+        )
+
+    def test_json_encoded_array_string_is_decoded(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(
+            _invoke("search", _param("queries", "true", '["SGLang", "ROCm"]'))
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"queries": ["SGLang", "ROCm"]},
+        )
+
+    def test_array_repair_is_identical_in_streaming(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"queries":"SGLang"}'))
+        detector = DeepSeekV4Detector()
+        calls = []
+        for start in range(0, len(text), 4):
+            calls.extend(
+                detector.parse_streaming_increment(text[start : start + 4], tools).calls
+            )
+        arguments = "".join(call.parameters for call in calls if call.parameters)
+
+        self.assertEqual(json.loads(arguments), {"queries": ["SGLang"]})
+
+    def test_object_is_not_wrapped_as_array_without_item_proof(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"queries": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        text = _wrapped(_invoke("search", '{"queries":{"query":"SGLang"}}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"queries": {"query": "SGLang"}},
+        )
+
     def test_parse_error_neither_swallows_nor_duplicates(self):
         """An unexpected parse error must not empty the turn, and the dropped
         buffer must not come back on the next delta."""
@@ -121,6 +298,31 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         # No half-formed call: the failure can land between a tool's name and its
         # arguments, so an argument-less named call must not reach the client.
         self.assertEqual(first.calls, [])
+
+    def test_required_is_parsed_natively_without_any_grammar(self):
+        """PD must not compile a grammar for DeepSeek-V4 required calls."""
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+
+        self.assertTrue(
+            parser.detector.supports_structural_tag_for_tool_choice("auto")
+        )
+        self.assertFalse(
+            parser.detector.supports_structural_tag_for_tool_choice("required")
+        )
+        self.assertTrue(parser.detector.parses_required_natively())
+
+        self.assertIsNone(
+            parser.get_structure_constraint("required", parallel_tool_calls=False)
+        )
+
+    def test_named_parallel_choice_is_parsed_natively_without_any_grammar(self):
+        """Native DSML may contain repeated invokes of the selected function."""
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        choice = ToolChoice(function={"name": "get_weather"})
+
+        self.assertIsNone(
+            parser.get_structure_constraint(choice, parallel_tool_calls=True)
+        )
 
 
 if __name__ == "__main__":
