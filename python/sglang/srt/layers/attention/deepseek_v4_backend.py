@@ -3587,8 +3587,9 @@ class DeepseekV4AttnBackend(
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
 
-    # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
-    # top-k); move into the candidate indexer with the prefill paths.
+    # TODO(candidate): the candidate consumer still masks + torch top-ks inline
+    # (the fused kernel does not skip -inf); move into the candidate indexer with
+    # the prefill paths. The non-candidate path now shares the DeepGEMM fused top-k.
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
         """Hopper/DCU decode or verify indexer: one query per row, all rows scored at
         once against its visible compressed positions straight off the fp4 page
@@ -3651,19 +3652,20 @@ class DeepseekV4AttnBackend(
             assert torch.is_tensor(consume) and consume.shape[0] == bs, (
                 "candidate mask missing for decode"
             )
-            s = s.masked_fill(~consume[:, :lmax], -torch.inf)
-        k = min(indexer.index_topk, lmax)
-        idx = s.topk(k, dim=-1, sorted=False).indices
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            idx = mask_topk_scores(s, idx)
-            idx = idx.masked_fill(idx < 0, lmax)
-        idx = idx.sort(dim=-1).values
-        reach = idx < lens[:, None]
-        page_indices[:bs, :k] = torch.where(
-            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
-        ).to(torch.int32)
-        if raw_indices is not None:
-            raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
+            # Pass the candidate mask to the fused kernel: it suppresses non-candidate
+            # positions to -inf before running the radix top-k, so the output is
+            # equivalent to the old masked_fill + torch.topk + sort + gather sequence
+            # but in a single kernel launch.
+            topk_transform_paged_from_metadata(
+                s, metadata, page_indices, raw_indices,
+                candidate_mask=consume[:, :lmax],
+            )
+            return
+        # Fuse top-k + sort + paged slot lookup into the one kernel the DeepGEMM
+        # decode path already uses. metadata.page_table (expanded to the index-K
+        # pool's page granularity) yields the same compressed slots as the manual
+        # slots.gather above, so page_indices matches column for column.
+        topk_transform_paged_from_metadata(s, metadata, page_indices, raw_indices)
 
     # TODO(candidate): torch prefill still publishes / consumes masks inline; same
     # move as above.

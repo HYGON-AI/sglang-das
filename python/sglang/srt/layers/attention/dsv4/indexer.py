@@ -487,9 +487,21 @@ def topk_transform_paged_from_metadata(
     metadata,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor] = None,
+    candidate_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
-    positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
+    positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``.
+
+    ``candidate_mask``: optional bool tensor ``[bs, lmax]``; positions where the mask
+    is False are suppressed to ``-inf`` before the top-k so the kernel only selects
+    from candidate positions.  This lets candidate-consumer layers skip the separate
+    ``masked_fill + torch.topk + mask_topk_scores + sort + gather`` sequence and go
+    through the same fused kernel as the non-candidate path.
+    """
+    if candidate_mask is not None:
+        # Suppress non-candidate positions in-place on a clone so the caller's
+        # score tensor is not mutated.
+        logits = logits.masked_fill(~candidate_mask, -torch.inf)
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
