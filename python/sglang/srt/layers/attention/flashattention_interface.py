@@ -35,6 +35,8 @@ _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
 )
 
 if _is_hcu:
+    from flash_attn import varlen_fwd_unified as varlen_fwd_unified_interface
+
     from sglang.srt.layers.attention.triton_vllm_flash_attn import (
         triton_vllm_flash_attn_varlen_func,
         triton_vllm_flash_attn_with_kvcache,
@@ -109,9 +111,6 @@ def flash_attn_with_kvcache(
                 dtype=torch.int32,
                 device=q.device,
             )
-        cu_seqlens_k = torch.cat(
-            [cache_seqlens.new_zeros(1), torch.cumsum(cache_seqlens, dim=0)]
-        )
         if _is_hcu and _use_triton_vllm_fa and not return_softmax_lse:
             result = triton_vllm_flash_attn_varlen_func(
                 q=q,
@@ -133,23 +132,25 @@ def flash_attn_with_kvcache(
             )
             return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
-        result = flash_attn_varlen_func_interface(
+        result = varlen_fwd_unified_interface(
             q=q,
             k=k_cache,
             v=v_cache,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=page_table.shape[1] * k_cache.shape[2],
             seqused_k=cache_seqlens,
             block_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=page_table.shape[1] * k_cache.shape[2],
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
-            num_splits=num_splits,
+            out=out,
             return_softmax_lse=return_softmax_lse,
-            fa_version=ver,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            s_aux=sinks,
             layout="bhsd",
         )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
@@ -206,24 +207,47 @@ def flash_attn_with_kvcache(
                 layout="bshd" if layout is None else layout,
             )
             return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
-        result = flash_attn_varlen_func_interface(
-            q=q,
-            k=k_cache,
-            v=v_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=page_table.shape[1] * page_size,
-            seqused_k=cache_seqlens,
-            block_table=page_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            num_splits=num_splits,
-            return_softmax_lse=return_softmax_lse,
-            fa_version=ver,
-        )
+        if _is_hcu:
+            result = varlen_fwd_unified_interface(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=cache_seqlens,
+                block_table=page_table,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=page_table.shape[1] * page_size,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                out=out,
+                return_softmax_lse=return_softmax_lse,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                s_aux=sinks,
+                layout="bshd" if layout is None else layout,
+            )
+        else:
+            result = flash_attn_varlen_func_interface(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=page_table.shape[1] * page_size,
+                seqused_k=cache_seqlens,
+                block_table=page_table,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                num_splits=num_splits,
+                return_softmax_lse=return_softmax_lse,
+                fa_version=ver,
+            )
         return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
     if _is_hcu and _use_triton_vllm_fa and is_nmz_fp8(k_cache.dtype):
