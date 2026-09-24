@@ -231,6 +231,10 @@ if _use_lightop:
 _use_lightop_sqrtsoftplus_gate = (
     _use_lightop and _is_hcu and hasattr(op, "moe_fused_gate_sqrtsoftplus")
 )
+_use_lightop_sqrtsoftplus_v41_gate = (
+    _use_lightop_sqrtsoftplus_gate
+    and hasattr(op, "moe_fused_gate_sqrtsoftplus_v41_hcu")
+)
 
 
 def moe_fused_gate_hcu(
@@ -331,6 +335,35 @@ if _use_lightop_sqrtsoftplus_gate:
     direct_register_custom_op(
         op_name="moe_fused_gate_sqrtsoftplus_hcu",
         op_func=moe_fused_gate_sqrtsoftplus_hcu,
+        mutates_args=[],
+        fake_impl=moe_fused_gate_sqrtsoftplus_fake,
+    )
+
+
+if _use_lightop_sqrtsoftplus_v41_gate:
+
+    def moe_fused_gate_sqrtsoftplus_v41_hcu(
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk: int,
+        num_fused_shared_experts: int,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        apply_routed_scaling_factor_on_output: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return op.moe_fused_gate_sqrtsoftplus_v41_hcu(
+            gating_output,
+            correction_bias,
+            topk,
+            num_fused_shared_experts,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+
+    direct_register_custom_op(
+        op_name="moe_fused_gate_sqrtsoftplus_v41_hcu",
+        op_func=moe_fused_gate_sqrtsoftplus_v41_hcu,
         mutates_args=[],
         fake_impl=moe_fused_gate_sqrtsoftplus_fake,
     )
@@ -1586,9 +1619,14 @@ def _can_use_lightop_sqrtsoftplus_gate(
     topk: int,
     num_fused_shared_experts: int,
     routed_scaling_factor: Optional[float],
+    sqrtsoftplus_log1p: bool = False,
 ) -> bool:
     return (
-        _use_lightop_sqrtsoftplus_gate
+        (
+            _use_lightop_sqrtsoftplus_v41_gate
+            if sqrtsoftplus_log1p
+            else _use_lightop_sqrtsoftplus_gate
+        )
         and correction_bias is not None
         and gating_output.dtype == torch.float32
         and correction_bias.dtype == torch.float32
@@ -1616,12 +1654,18 @@ def biased_topk_lightop_impl(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    sqrtsoftplus_log1p: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     del num_token_non_padded, expert_location_dispatch_info
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert scoring_func == "sqrtsoftplus"
     assert routed_scaling_factor is not None
-    return torch.ops.sglang.moe_fused_gate_sqrtsoftplus_hcu(
+    gate_op = (
+        torch.ops.sglang.moe_fused_gate_sqrtsoftplus_v41_hcu
+        if sqrtsoftplus_log1p
+        else torch.ops.sglang.moe_fused_gate_sqrtsoftplus_hcu
+    )
+    return gate_op(
         gating_output,
         correction_bias,
         topk,
@@ -2831,13 +2875,14 @@ def select_experts(
                 _biased_topk = biased_topk_xpu
             elif (
                 scoring_func == "sqrtsoftplus"
-                and not _packed_kwargs
+                and "packed_out" not in _packed_kwargs
                 and _can_use_lightop_sqrtsoftplus_gate(
                     router_logits,
                     correction_bias,
                     num_routed_topk if _use_aiter else top_k,
                     num_fused_shared_experts,
                     routed_scaling_factor,
+                    topk_config.sqrtsoftplus_log1p,
                 )
             ):
                 _biased_topk = biased_topk_lightop_impl
