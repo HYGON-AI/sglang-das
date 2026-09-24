@@ -18,7 +18,7 @@ env:
   # 归档站地址走 RESOURCE_SERVER_URL 变量, 不在文件里暴露内网 IP
   BASE_IMAGE: ${{ vars.DEV_IMAGE_UBUNTU_PY310 || 'harbor.sourcefind.cn:5443/dcu/admin/base/dev:ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10' }}
   DTK_PKG_URL: ${{ vars.DTK_PKG_URL || format('{0}/dtk-pkg/dtk26.04.1/DTK-26.04.1-72cu-0911-ubuntu20.04-x86_64.tar.gz', vars.RESOURCE_SERVER_URL) }}
-  DTK_VERSION: "dtk2604-72cu-0911"
+  DTK_VERSION: "dtk26041-72cu-0911"
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
   SGLANG_VERSION: "0.5.18"
@@ -38,9 +38,9 @@ jobs:
         id: gen-tag
         run: |
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
-          echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=sglang:${SGLANG_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=sglang:${SGLANG_VERSION}-latest" >> "$GITHUB_ENV"
-          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/sglang:${SGLANG_VERSION}-ubuntu22.04-dtk2604-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/sglang:${SGLANG_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 构建镜像
         run: |
