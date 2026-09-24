@@ -245,7 +245,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
-                if is_deepseek_dsa(kvc.model_config.hf_config):
+                from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+                if is_glm5_next_hcu(kvc.model_config.hf_config):
+                    from sglang.srt.mem_cache.glm5_next import glm5_next_cache_cell_size
+
+                    self._cell_size = glm5_next_cache_cell_size(
+                        kvc, num_layers, draft_num_layers
+                    )
+                elif is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -298,6 +306,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+        if is_glm5_next_hcu(kvc.model_config.hf_config):
+            from sglang.srt.mem_cache.glm5_next import glm5_next_cache_cell_size
+
+            return glm5_next_cache_cell_size(kvc, num_layers)
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype

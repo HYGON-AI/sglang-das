@@ -241,7 +241,7 @@ def moe_fused_gate_hcu(
     topk: int,
     num_fused_shared_experts: int,
     routed_scaling_factor: float,
-    apply_routed_scaling_factor_on_output: bool = True,
+    apply_routed_scaling_factor_on_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk_weights, topk_ids = op.moe_fused_gate(
         gating_output,
@@ -264,15 +264,15 @@ def moe_fused_gate_fake(
     topk: int,
     num_fused_shared_experts: int,
     routed_scaling_factor: float,
-    apply_routed_scaling_factor_on_output: bool = True,
+    apply_routed_scaling_factor_on_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty(
         (gating_output.size(0), topk),
-        dtype=gating_output.dtype,
+        dtype=torch.float32,
         device=gating_output.device,
     ), torch.empty(
         (gating_output.size(0), topk),
-        dtype=gating_output.dtype,
+        dtype=torch.int32,
         device=gating_output.device,
     )
 

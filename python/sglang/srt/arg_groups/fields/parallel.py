@@ -158,6 +158,10 @@ class Parallel(msgspec.Struct):
         ),
     ] = None
     # Split DSA GPU KV/indexer cache layers across CP ranks.
+    mla_kv_prefetch_ring_size: A[
+        int,
+        "Number of remote Main-KV prefetch slots for DSA LayerSplit (at least one).",
+    ] = 1
     enable_dsa_cache_layer_split: A[
         bool,
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",

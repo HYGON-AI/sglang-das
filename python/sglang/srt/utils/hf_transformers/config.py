@@ -336,6 +336,18 @@ def get_config(
             else:
                 setattr(config, key, value)
 
+    if (
+        model_override_args
+        and (text_config := getattr(config, "text_config", None)) is not None
+    ):
+        for key in (
+            "index_kpool",
+            "index_kpool_compress",
+            "index_share_for_mtp_iteration",
+        ):
+            if key in model_override_args and hasattr(text_config, key):
+                setattr(text_config, key, model_override_args[key])
+
     if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(

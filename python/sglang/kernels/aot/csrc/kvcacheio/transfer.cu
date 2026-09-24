@@ -2185,3 +2185,377 @@ void hcu_align_evict_mask_to_page_size(
       seq_lens_ptr1, evict_mask_ptr1, page_size, num_draft_tokens, bs);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+#ifdef USE_ROCM
+constexpr int32_t MLA_PAGE_SIZE_HCU = 64;
+constexpr int32_t MLA_TOKEN_BYTES_HCU = 656;
+constexpr int32_t MLA_PAGE_BYTES_HCU = MLA_PAGE_SIZE_HCU * MLA_TOKEN_BYTES_HCU;
+
+inline bool is_layer_ptr_tbl(const at::Tensor& t) {
+  const auto dtype = t.scalar_type();
+  return dtype == at::kLong || dtype == at::kUInt64;
+}
+
+struct alignas(16) HcuCopy16B {
+  uint64_t x;
+  uint64_t y;
+};
+
+template <int32_t ThreadsPerBlock>
+__global__ __launch_bounds__(1024) void transfer_mla_656_page_lf_lf_h2d_kernel_hcu(
+    const void* __restrict__ src,
+    void* __restrict__ dst,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices) {
+  constexpr int32_t kVecBytes = sizeof(HcuCopy16B);
+  constexpr int32_t kPageVecs = MLA_PAGE_BYTES_HCU / kVecBytes;
+
+  const int32_t page_index = blockIdx.x;
+  const int32_t tid = threadIdx.x;
+  const int64_t src_page_id = src_indices[page_index * MLA_PAGE_SIZE_HCU] / MLA_PAGE_SIZE_HCU;
+  const int64_t dst_page_id = dst_indices[page_index * MLA_PAGE_SIZE_HCU] / MLA_PAGE_SIZE_HCU;
+  const char* src_page = static_cast<const char*>(src) + src_page_id * MLA_PAGE_BYTES_HCU;
+  char* dst_page = static_cast<char*>(dst) + dst_page_id * MLA_PAGE_BYTES_HCU;
+  const HcuCopy16B* __restrict__ src_vec = reinterpret_cast<const HcuCopy16B*>(src_page);
+  HcuCopy16B* __restrict__ dst_vec = reinterpret_cast<HcuCopy16B*>(dst_page);
+
+#pragma unroll
+  for (int32_t j = tid; j < kPageVecs; j += ThreadsPerBlock) {
+    dst_vec[j] = src_vec[j];
+  }
+}
+
+template <int32_t ThreadsPerBlock>
+void transfer_mla_656_page_lf_lf_h2d_launcher_hcu(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t num_pages) {
+  const void* src_ptr = get_rocm_kernel_accessible_ptr(src);
+  void* dst_ptr = get_rocm_kernel_accessible_ptr(dst);
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  transfer_mla_656_page_lf_lf_h2d_kernel_hcu<ThreadsPerBlock>
+      <<<dim3(num_pages, 1, 1), ThreadsPerBlock, 0, torch_current_stream>>>(
+          src_ptr, dst_ptr, src_indices.data_ptr<int64_t>(), dst_indices.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int32_t ThreadsPerBlock>
+__global__ __launch_bounds__(1024) void transfer_item_lf_lf_h2d_kernel_hcu(
+    const void* __restrict__ src,
+    void* __restrict__ dst,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices,
+    int64_t item_size) {
+  constexpr int32_t kVecBytes = sizeof(HcuCopy16B);
+  const int64_t item_index = blockIdx.x;
+  const int32_t tid = threadIdx.x;
+  const int64_t src_item_id = src_indices[item_index];
+  const int64_t dst_item_id = dst_indices[item_index];
+  const char* src_item = static_cast<const char*>(src) + src_item_id * item_size;
+  char* dst_item = static_cast<char*>(dst) + dst_item_id * item_size;
+  const HcuCopy16B* __restrict__ src_vec = reinterpret_cast<const HcuCopy16B*>(src_item);
+  HcuCopy16B* __restrict__ dst_vec = reinterpret_cast<HcuCopy16B*>(dst_item);
+  const int64_t item_vecs = item_size / kVecBytes;
+
+  for (int64_t j = tid; j < item_vecs; j += ThreadsPerBlock) {
+    dst_vec[j] = src_vec[j];
+  }
+}
+
+template <int32_t ThreadsPerBlock>
+void transfer_item_lf_lf_h2d_launcher_hcu(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size) {
+  const void* src_ptr = get_rocm_kernel_accessible_ptr(src);
+  void* dst_ptr = get_rocm_kernel_accessible_ptr(dst);
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  transfer_item_lf_lf_h2d_kernel_hcu<ThreadsPerBlock>
+      <<<dim3(src_indices.numel(), 1, 1), ThreadsPerBlock, 0, torch_current_stream>>>(
+          src_ptr, dst_ptr, src_indices.data_ptr<int64_t>(), dst_indices.data_ptr<int64_t>(), item_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void transfer_kv_per_layer_mla_lf_lf_H2D_hcu(
+    const at::Tensor& src,
+    at::Tensor dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t page_size,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(page_size > 0, "page_size must be positive");
+  const bool can_use_mla_656_specialized =
+      src_indices.is_cuda() && dst_indices.is_cuda() && src_indices.scalar_type() == at::kLong &&
+      dst_indices.scalar_type() == at::kLong && src_indices.numel() == dst_indices.numel() &&
+      src_indices.numel() % MLA_PAGE_SIZE_HCU == 0 && item_size == MLA_TOKEN_BYTES_HCU &&
+      page_size == MLA_PAGE_SIZE_HCU && reinterpret_cast<uintptr_t>(src.data_ptr()) % alignof(HcuCopy16B) == 0 &&
+      reinterpret_cast<uintptr_t>(dst.data_ptr()) % alignof(HcuCopy16B) == 0;
+
+  // Indexer callers pass indices that are already converted from token
+  // locations to page/item ids. For this path, page_size == 1 means one
+  // index entry addresses one item_size-byte indexer page; it does not change
+  // the model's configured KV cache page size.
+  const bool can_use_item_specialized =
+      src_indices.is_cuda() && dst_indices.is_cuda() && src_indices.scalar_type() == at::kLong &&
+      dst_indices.scalar_type() == at::kLong && src_indices.numel() == dst_indices.numel() &&
+      item_size % sizeof(HcuCopy16B) == 0 && page_size == 1 &&
+      reinterpret_cast<uintptr_t>(src.data_ptr()) % alignof(HcuCopy16B) == 0 &&
+      reinterpret_cast<uintptr_t>(dst.data_ptr()) % alignof(HcuCopy16B) == 0;
+
+  if (can_use_mla_656_specialized) {
+    const int64_t num_pages = src_indices.numel() / MLA_PAGE_SIZE_HCU;
+    if (num_pages == 0) {
+      return;
+    }
+    switch (num_warps_per_block) {
+      case 4:
+        transfer_mla_656_page_lf_lf_h2d_launcher_hcu<4 * WARP_SIZE>(src, dst, src_indices, dst_indices, num_pages);
+        return;
+      case 8:
+        transfer_mla_656_page_lf_lf_h2d_launcher_hcu<8 * WARP_SIZE>(src, dst, src_indices, dst_indices, num_pages);
+        return;
+      case 16:
+        transfer_mla_656_page_lf_lf_h2d_launcher_hcu<16 * WARP_SIZE>(src, dst, src_indices, dst_indices, num_pages);
+        return;
+      default:
+        break;
+    }
+  }
+
+  if (can_use_item_specialized) {
+    if (src_indices.numel() == 0) {
+      return;
+    }
+    switch (num_warps_per_block) {
+      case 4:
+        transfer_item_lf_lf_h2d_launcher_hcu<4 * WARP_SIZE>(src, dst, src_indices, dst_indices, item_size);
+        return;
+      case 8:
+        transfer_item_lf_lf_h2d_launcher_hcu<8 * WARP_SIZE>(src, dst, src_indices, dst_indices, item_size);
+        return;
+      case 16:
+        transfer_item_lf_lf_h2d_launcher_hcu<16 * WARP_SIZE>(src, dst, src_indices, dst_indices, item_size);
+        return;
+      default:
+        break;
+    }
+  }
+
+  // Fallback to the generic token-level MLA transfer. Keep the original int64
+  // indices and token-sized item stride; page-level conversion would change
+  // both the index dtype and the byte stride expected by transfer_kv_launcher.
+  if (src_indices.numel() == 0) {
+    return;
+  }
+
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_lf<const char>, get_global_offset_lf<char>, true>(
+      src,
+      dst,
+      empty,
+      empty,
+      src_indices,
+      dst_indices,
+      0,
+      1,
+      item_size,
+      0,
+      0,
+      empty,
+      empty,
+      empty,
+      empty,
+      2,
+      num_warps_per_block);
+}
+
+template <int32_t ThreadsPerBlock>
+__global__ __launch_bounds__(1024) void transfer_mla_656_page_all_layer_lf_lf_d2h_kernel_hcu(
+    const uintptr_t* __restrict__ src_layer_ptrs,
+    const uintptr_t* __restrict__ dst_layer_ptrs,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices) {
+  constexpr int32_t kPageVecs = MLA_PAGE_BYTES_HCU / static_cast<int32_t>(sizeof(HcuCopy16B));
+
+  const int32_t page_slot = blockIdx.x;
+  const int32_t layer_id = blockIdx.y;
+  const int32_t tid = threadIdx.x;
+
+  const int64_t src_page_id = src_indices[page_slot * MLA_PAGE_SIZE_HCU] / MLA_PAGE_SIZE_HCU;
+  const int64_t dst_page_id = dst_indices[page_slot * MLA_PAGE_SIZE_HCU] / MLA_PAGE_SIZE_HCU;
+
+  const HcuCopy16B* __restrict__ src_vec =
+      reinterpret_cast<const HcuCopy16B*>(src_layer_ptrs[layer_id]) + src_page_id * kPageVecs;
+  HcuCopy16B* __restrict__ dst_vec = reinterpret_cast<HcuCopy16B*>(dst_layer_ptrs[layer_id]) + dst_page_id * kPageVecs;
+
+  for (int32_t j = tid; j < kPageVecs; j += ThreadsPerBlock) {
+    const uint64_t* src_u64 = reinterpret_cast<const uint64_t*>(src_vec + j);
+    uint64_t* dst_u64 = reinterpret_cast<uint64_t*>(dst_vec + j);
+    uint64_t tmp0 = __builtin_nontemporal_load(src_u64);
+    uint64_t tmp1 = __builtin_nontemporal_load(src_u64 + 1);
+    __builtin_nontemporal_store(tmp0, dst_u64);
+    __builtin_nontemporal_store(tmp1, dst_u64 + 1);
+  }
+}
+
+template <int32_t ThreadsPerBlock>
+void transfer_mla_656_page_all_layer_lf_lf_d2h_launcher_hcu(
+    const at::Tensor& src_layers,
+    at::Tensor& dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t num_pages,
+    int64_t num_layers) {
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  transfer_mla_656_page_all_layer_lf_lf_d2h_kernel_hcu<ThreadsPerBlock>
+      <<<dim3(static_cast<uint32_t>(num_pages), static_cast<uint32_t>(num_layers), 1),
+         ThreadsPerBlock,
+         0,
+         torch_current_stream>>>(
+          src_layers.data_ptr<uintptr_t>(),
+          dst_layers.data_ptr<uintptr_t>(),
+          src_indices.data_ptr<int64_t>(),
+          dst_indices.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+__global__ __launch_bounds__(1024) void transfer_item_all_layer_lf_lf_d2h_kernel_hcu(
+    const uintptr_t* __restrict__ src_layer_ptrs,
+    const uintptr_t* __restrict__ dst_layer_ptrs,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices,
+    int64_t item_size) {
+  constexpr int32_t kVecBytes = sizeof(HcuCopy16B);
+
+  const int64_t item_slot = blockIdx.x;
+  const int32_t layer_id = blockIdx.y;
+  const int32_t tid = threadIdx.x;
+  const int64_t src_item_id = src_indices[item_slot];
+  const int64_t dst_item_id = dst_indices[item_slot];
+
+  const char* src_item = reinterpret_cast<const char*>(src_layer_ptrs[layer_id]) + src_item_id * item_size;
+  char* dst_item = reinterpret_cast<char*>(dst_layer_ptrs[layer_id]) + dst_item_id * item_size;
+  const HcuCopy16B* __restrict__ src_vec = reinterpret_cast<const HcuCopy16B*>(src_item);
+  HcuCopy16B* __restrict__ dst_vec = reinterpret_cast<HcuCopy16B*>(dst_item);
+  const int64_t item_vecs = item_size / kVecBytes;
+
+  for (int64_t j = tid; j < item_vecs; j += blockDim.x) {
+    const uint64_t* src_u64 = reinterpret_cast<const uint64_t*>(src_vec + j);
+    uint64_t* dst_u64 = reinterpret_cast<uint64_t*>(dst_vec + j);
+    uint64_t tmp0 = __builtin_nontemporal_load(src_u64);
+    uint64_t tmp1 = __builtin_nontemporal_load(src_u64 + 1);
+    __builtin_nontemporal_store(tmp0, dst_u64);
+    __builtin_nontemporal_store(tmp1, dst_u64 + 1);
+  }
+}
+
+void transfer_item_all_layer_lf_lf_d2h_launcher_hcu(
+    const at::Tensor& src_layers,
+    const at::Tensor& dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t num_warps_per_block) {
+  const int64_t item_vecs = item_size / static_cast<int64_t>(sizeof(HcuCopy16B));
+  int64_t waves_per_block = (item_vecs + static_cast<int64_t>(WARP_SIZE) - 1) / WARP_SIZE;
+  waves_per_block = waves_per_block < 1 ? 1 : waves_per_block;
+  waves_per_block = waves_per_block > num_warps_per_block ? num_warps_per_block : waves_per_block;
+  const int32_t threads_per_block = static_cast<int32_t>(waves_per_block * WARP_SIZE);
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  transfer_item_all_layer_lf_lf_d2h_kernel_hcu<<<
+      dim3(static_cast<uint32_t>(src_indices.numel()), static_cast<uint32_t>(num_layers), 1),
+      threads_per_block,
+      0,
+      torch_current_stream>>>(
+      src_layers.data_ptr<uintptr_t>(),
+      dst_layers.data_ptr<uintptr_t>(),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      item_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void transfer_kv_all_layer_mla_lf_lf_D2H_hcu(
+    const at::Tensor src_layers,
+    const at::Tensor dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(num_layers == src_layers.size(0), "Number of layers in source tensor does not match num_layers");
+
+  const bool can_use_mla_656_specialized =
+      src_indices.is_cuda() && dst_indices.is_cuda() && src_indices.scalar_type() == at::kLong &&
+      dst_indices.scalar_type() == at::kLong && src_indices.numel() == dst_indices.numel() &&
+      src_indices.numel() % MLA_PAGE_SIZE_HCU == 0 && item_size == MLA_TOKEN_BYTES_HCU && num_layers > 0 &&
+      is_layer_ptr_tbl(src_layers) && is_layer_ptr_tbl(dst_layers) && dst_layers.size(0) == num_layers;
+
+  const bool can_use_item_specialized =
+      src_indices.is_cuda() && dst_indices.is_cuda() && src_indices.scalar_type() == at::kLong &&
+      dst_indices.scalar_type() == at::kLong && src_indices.numel() == dst_indices.numel() && item_size > 0 &&
+      item_size % static_cast<int64_t>(sizeof(HcuCopy16B)) == 0 && num_layers > 0 && num_warps_per_block > 0 &&
+      num_warps_per_block <= 16 && is_layer_ptr_tbl(src_layers) && is_layer_ptr_tbl(dst_layers) &&
+      src_layers.size(0) == num_layers && dst_layers.size(0) == num_layers;
+
+  if (can_use_mla_656_specialized) {
+    const int64_t num_pages = src_indices.numel() / MLA_PAGE_SIZE_HCU;
+    if (num_pages == 0) {
+      return;
+    }
+    switch (num_warps_per_block) {
+      case 4:
+        transfer_mla_656_page_all_layer_lf_lf_d2h_launcher_hcu<4 * WARP_SIZE>(
+            src_layers, const_cast<at::Tensor&>(dst_layers), src_indices, dst_indices, num_pages, num_layers);
+        return;
+      case 8:
+        transfer_mla_656_page_all_layer_lf_lf_d2h_launcher_hcu<8 * WARP_SIZE>(
+            src_layers, const_cast<at::Tensor&>(dst_layers), src_indices, dst_indices, num_pages, num_layers);
+        return;
+      case 16:
+        transfer_mla_656_page_all_layer_lf_lf_d2h_launcher_hcu<16 * WARP_SIZE>(
+            src_layers, const_cast<at::Tensor&>(dst_layers), src_indices, dst_indices, num_pages, num_layers);
+        return;
+      default:
+        break;
+    }
+  }
+
+  if (can_use_item_specialized) {
+    if (src_indices.numel() == 0) {
+      return;
+    }
+    transfer_item_all_layer_lf_lf_d2h_launcher_hcu(
+        src_layers, dst_layers, src_indices, dst_indices, item_size, num_layers, num_warps_per_block);
+    return;
+  }
+
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_lf_tbl<char>, true>(
+      empty,
+      empty,
+      empty,
+      empty,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      0,
+      src_layers,
+      dst_layers,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block);
+}
+
+#endif

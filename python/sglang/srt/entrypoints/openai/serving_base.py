@@ -89,9 +89,10 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
-            )
+            (
+                adapted_request,
+                processed_request,
+            ) = await self._convert_to_internal_request_async(request, raw_request)
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
@@ -155,6 +156,34 @@ class OpenAIServingBase(ABC):
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
+
+    async def _convert_to_internal_request_async(
+        self,
+        request: OpenAIServingRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
+        """Convert a request on the tokenizer offload thread.
+
+        Conversion includes chat-template rendering and tokenization. Record
+        queue and execution timestamps for the entry-stage latency metrics.
+        """
+        queue_entry_ts = monotonic_time()
+        exec_ts = {}
+
+        def _timed_convert():
+            exec_ts["start"] = monotonic_time()
+            try:
+                return self._convert_to_internal_request(request, raw_request)
+            finally:
+                exec_ts["finish"] = monotonic_time()
+
+        result = await self.tokenizer_manager.run_tokenizer_offload(_timed_convert)
+        adapted_request = result[0] if isinstance(result, tuple) else result
+        if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
+            adapted_request.tokenize_queue_entry_ts = queue_entry_ts
+            adapted_request.tokenize_exec_start_ts = exec_ts["start"]
+            adapted_request.tokenize_exec_finish_ts = exec_ts["finish"]
+        return result
 
     async def _handle_streaming_request(
         self,

@@ -568,6 +568,19 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _observe_grammar_first_mask_fill(self: Scheduler, req: Req) -> None:
+        # GLM NOTE: the prefill engine samples exactly one token per request,
+        # so this is the per-request cost of one (possibly JIT) mask fill.
+        stats = req.grammar.grammar_stats
+        if (
+            self.metrics_reporter.enable_metrics
+            and stats is not None
+            and stats.first_mask_fill_time is not None
+        ):
+            self.metrics_reporter.metrics_collector.observe_grammar_first_mask_fill(
+                stats.first_mask_fill_time
+            )
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -862,6 +875,7 @@ class SchedulerDisaggregationPrefillMixin:
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
                     req.grammar.finished = req.finished()
+                    self._observe_grammar_first_mask_fill(req)
                     if is_aborted(req):
                         if self._retire_aborted_prefill_result(req):
                             req.time_stats.set_completion_time()

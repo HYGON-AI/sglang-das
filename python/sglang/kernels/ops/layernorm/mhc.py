@@ -77,40 +77,6 @@ def _resolve_lazy_tilelang_value(value):
     return value
 
 
-def _patch_tilelang_decouple_type_cast_for_rocm() -> None:
-    if torch.version.hip is None:
-        return
-    try:
-        from tilelang.transform import decouple_type_cast as _dtc
-    except Exception:
-        return
-    if getattr(_dtc, "_sglang_rocm_bool_alloc_patch", False):
-        return
-
-    original_allocate = _dtc.Allocate
-
-    def _is_bool_expr(expr) -> bool:
-        try:
-            dtype = expr.dtype
-            if callable(dtype):
-                dtype = dtype()
-            return str(dtype) == "bool8"
-        except Exception:
-            return False
-
-    def _allocate(data, dtype, extents, condition, body, annotations=None, span=None):
-        if not _is_bool_expr(condition):
-            condition = _dtc.tir.const(1) == _dtc.tir.const(1)
-        if annotations is None:
-            return original_allocate(data, dtype, extents, condition, body)
-        if span is None:
-            return original_allocate(data, dtype, extents, condition, body, annotations)
-        return original_allocate(data, dtype, extents, condition, body, annotations, span)
-
-    _dtc.Allocate = _allocate
-    _dtc._sglang_rocm_bool_alloc_patch = True
-
-
 def _load_tilelang():
     global _real_tilelang, _real_T, tilelang, T
     if _real_tilelang is None:
@@ -124,7 +90,6 @@ def _load_tilelang():
                         "tilelang is not installed; this kernel cannot run on the current platform"
                     ) from exc
                 new_tilelang.set_log_level("WARNING")
-                _patch_tilelang_decouple_type_cast_for_rocm()
                 tilelang = new_tilelang
                 T = new_T
                 _real_T = new_T
@@ -175,7 +140,11 @@ _mhc_pre_warmed = False
 _is_hcu = is_hcu()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 if _is_hcu and _use_aiter_tilelang_mhc:
-    from aiter.ops.tilelang import pre_big_fuse_tilelang
+    from aiter.ops.tilelang import (
+        mhc_post_fwd,
+        mhc_pre_big_fuse,
+        pre_big_fuse_tilelang,
+    )
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -480,9 +449,7 @@ def hc_split_sinkhorn_torch(
     batch, seq_len, _ = mixes.shape
     mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
 
-    pre = torch.sigmoid(
-        mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    ) + eps
+    pre = torch.sigmoid(mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
     post = 2 * torch.sigmoid(
         mixes_flat[:, hc_mult : 2 * hc_mult] * hc_scale[1]
         + hc_base[hc_mult : 2 * hc_mult]
@@ -528,9 +495,9 @@ def mhc_pre_torch(
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
     mixes = torch.matmul(x_flat, fn.t()) * rsqrt
 
-    pre = torch.sigmoid(
-        mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    ) + hc_pre_eps
+    pre = (
+        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + hc_pre_eps
+    )
     post = (
         2
         * torch.sigmoid(
@@ -543,9 +510,7 @@ def mhc_pre_torch(
     comb = comb + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
     comb = _sinkhorn_matrix_torch(comb, sinkhorn_repeat, hc_sinkhorn_eps)
 
-    layer_input = torch.einsum(
-        "nh,nhd->nd", pre, residual_flat.float()
-    )
+    layer_input = torch.einsum("nh,nhd->nd", pre, residual_flat.float())
     post_mix = post.view(*outer_shape, hc_mult, 1)
     comb_mix = comb.view(*outer_shape, hc_mult, hc_mult)
     layer_input = layer_input.view(*outer_shape, hidden_size).to(torch.bfloat16)
@@ -2064,6 +2029,23 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
+    if _is_hcu and _use_aiter_tilelang_mhc:
+        # The HCU implementation includes prenorm GEMM and leaves the model's
+        # output RMSNorm to the caller, as in the original GLM-Next path.
+        post_mix, comb_mix, layer_input = mhc_pre_big_fuse(
+            residual=residual,
+            fn=fn,
+            mhc_scale=hc_scale,
+            mhc_base=hc_base,
+            rms_eps=rms_eps,
+            mhc_pre_eps=hc_pre_eps,
+            mhc_sinkhorn_eps=hc_sinkhorn_eps,
+            mhc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            n_splits=16,
+        )
+        return post_mix, comb_mix, layer_input, False
+
     post_mix, comb_mix, layer_input = mhc_pre(
         residual=residual,
         fn=fn,
@@ -2091,6 +2073,8 @@ def _mhc_post_dispatch(
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+    if _is_hcu and _use_aiter_tilelang_mhc:
+        return mhc_post_fwd(x, residual, post_layer_mix.squeeze(-1), comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 

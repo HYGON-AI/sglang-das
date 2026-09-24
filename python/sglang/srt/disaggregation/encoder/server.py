@@ -22,6 +22,7 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.encoder.glm_rdma import GlmSourceBuffers
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
@@ -316,6 +317,7 @@ class EncodeContext(msgspec.Struct):
     str_mm_hashes: Optional[List[str]]
     use_global_cache: bool
     is_health_check: bool
+    item_hashes: Optional[List[int]] = None
 
 
 def _preprocess_layout_digest(ctx: EncodeContext) -> tuple[int, int]:
@@ -1093,7 +1095,10 @@ class MMEncoder:
             ]
 
         for key, value in mm_inputs.items():
-            if key in _mm_feature_attrs.get(modality, []):
+            if key in _mm_feature_attrs.get(modality, []) or key in {
+                "_reported_grid",
+                "_empty_video_shard",
+            }:
                 continue
             value = _convert(value)
             if key in _mm_grid_attrs.get(modality, []):
@@ -1192,6 +1197,18 @@ class MMEncoder:
                 # Embedding stores use string cache keys.
                 str_mm_hashes = [str(h) for h in mm_hashes]
 
+        item_hashes = None
+        if "glm" in self.model_type and modality != Modality.AUDIO and self.rank == 0:
+            if str_mm_hashes is not None and all(h.isdecimal() for h in str_mm_hashes):
+                item_hashes = [int(h) for h in str_mm_hashes]
+            else:
+                item_hashes = await asyncio.get_running_loop().run_in_executor(
+                    self.preprocessor.io_executor,
+                    lambda: self._calculate_hashes_from_features(
+                        mm_feature, grid_thw, modality, mm_inputs
+                    ),
+                )
+
         return EncodeContext(
             req_id=requests[0]["req_id"],
             modality=modality,
@@ -1204,6 +1221,7 @@ class MMEncoder:
             str_mm_hashes=str_mm_hashes,
             use_global_cache=use_global_cache,
             is_health_check=is_health_check,
+            item_hashes=item_hashes,
         )
 
     async def _prepare_encode_context_on_all_ranks(
@@ -1837,6 +1855,12 @@ class MMEncoder:
         keep_on_gpu: bool,
     ) -> Optional[torch.Tensor]:
         """Compute one flattened request with global cache as an optional stage."""
+        if ctx.preprocess_result.mm_inputs.get("_empty_video_shard"):
+            return torch.empty(
+                (0, self._embedding_dims[ctx.modality]),
+                dtype=self._embedding_dtype,
+                device=f"cuda:{self.gpu_id}" if keep_on_gpu else "cpu",
+            )
         if ctx.use_global_cache:
             mm_embedding = await self._compute_global_cache_embedding(
                 ctx, keep_on_gpu=keep_on_gpu
@@ -1897,6 +1921,17 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
+        if (
+            envs.SGLANG_ENCODER_CHECK_NAN.get()
+            and embedding is not None
+            and embedding.numel()
+            and not torch.isfinite(embedding).all()
+        ):
+            logger.error(
+                "Non-finite encoder embedding for req_id=%s shape=%s",
+                mm_data.req_id,
+                tuple(embedding.shape),
+            )
         if get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
             req_id = mm_data.req_id
@@ -1912,40 +1947,56 @@ class MMEncoder:
                 f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
 
-            # Fall back to a per-send registration only if the shared one failed.
-            mr_already_registered = mm_data._mr_ptr == embedding.data_ptr()
-            if not mr_already_registered:
-                self.engine.register(embedding.data_ptr(), embedding.nbytes)
-            transfer_error = None
-            try:
-                _t_xfer_start = time.monotonic()
-                xfer_ret = await self._run_mooncake_transfer(
-                    session_id,
-                    embedding.data_ptr(),
-                    buffer_address,
-                    embedding.nbytes,
+            _t_xfer_start = time.monotonic()
+            glm_transfer = "glm" in self.model_type
+            if glm_transfer:
+                if not hasattr(self, "_glm_source_buffers"):
+                    self._glm_source_buffers = GlmSourceBuffers(self.engine)
+                mr_already_registered = self._glm_source_buffers.pool is not None
+                xfer_ret = await _await_transfer_completion(
+                    asyncio.to_thread(
+                        self._glm_source_buffers.transfer,
+                        embedding,
+                        session_id,
+                        buffer_address,
+                    ),
+                    f"GLM Mooncake transfer for req_id={req_id}",
                 )
-            except BaseException as error:
-                transfer_error = error
-                raise
-            finally:
+            else:
+                # Fall back to a per-send registration only if the shared one failed.
+                mr_already_registered = mm_data._mr_ptr == embedding.data_ptr()
                 if not mr_already_registered:
-                    try:
-                        self.engine.deregister(embedding.data_ptr())
-                    except Exception:
-                        if transfer_error is None:
-                            raise
-                        logger.exception(
-                            "Per-send MR deregistration also failed for %s; "
-                            "preserving the transfer error",
-                            req_id,
-                        )
+                    self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                transfer_error = None
+                try:
+                    _t_xfer_start = time.monotonic()
+                    xfer_ret = await self._run_mooncake_transfer(
+                        session_id,
+                        embedding.data_ptr(),
+                        buffer_address,
+                        embedding.nbytes,
+                    )
+                except BaseException as error:
+                    transfer_error = error
+                    raise
+                finally:
+                    if not mr_already_registered:
+                        try:
+                            self.engine.deregister(embedding.data_ptr())
+                        except Exception:
+                            if transfer_error is None:
+                                raise
+                            logger.exception(
+                                "Per-send MR deregistration also failed for %s; "
+                                "preserving the transfer error",
+                                req_id,
+                            )
             xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
-            if xfer_ret < 0:
+            if xfer_ret != 0:
                 raise InternalError(
                     f"Mooncake transfer_sync failed for {req_id} "
                     f"(session={session_id}, nbytes={embedding.nbytes}, "
@@ -2144,6 +2195,8 @@ class MMEncoder:
                     # A view would pin the whole batch tensor until the last transfer.
                     embedding = embedding.clone()
                 req_aux_data = dict(ctx.aux_data)
+                if ctx.item_hashes is not None:
+                    req_aux_data["item_hashes"] = ctx.item_hashes[item_offset:item_end]
                 if ctx.aux_data.get("original_image_sizes") is not None:
                     req_aux_data["original_image_sizes"] = ctx.aux_data[
                         "original_image_sizes"
@@ -2152,13 +2205,21 @@ class MMEncoder:
                     req["req_id"],
                     req["num_parts"],
                     req["part_idx"],
-                    ctx.preprocess_result.grid_thw[item_offset:item_end],
+                    (
+                        ctx.preprocess_result.mm_inputs["_reported_grid"]
+                        if "_reported_grid" in ctx.preprocess_result.mm_inputs
+                        else ctx.preprocess_result.grid_thw[item_offset:item_end]
+                    ),
                     ctx.modality,
                     embedding,
                     **req_aux_data,
                 )
                 # Global-cache embeddings keep registering per /send instead.
-                if keep_on_gpu and not ctx.use_global_cache:
+                if (
+                    keep_on_gpu
+                    and not ctx.use_global_cache
+                    and "glm" not in self.model_type
+                ):
                     self._register_shared_mr(mm_data, embedding)
                 staged_embeddings.append(mm_data)
                 results.append(
@@ -2222,7 +2283,15 @@ class MMEncoder:
         )
         keep_on_gpu = self.use_mooncake and not is_health_check
         use_global_cache = self.mm_global_cache is not None and not is_health_check
+        permit = False
         try:
+            if "glm" in self.model_type:
+                if not hasattr(self, "_glm_vit_semaphore"):
+                    self._glm_vit_semaphore = asyncio.BoundedSemaphore(
+                        max(1, envs.SGLANG_ENCODER_MAX_PENDING_VIT.get())
+                    )
+                await self._glm_vit_semaphore.acquire()
+                permit = True
             if self.rank == 0:
                 async with encode_state_condition:
                     encode_state_condition.notify_all()
@@ -2244,6 +2313,8 @@ class MMEncoder:
         except Exception as e:
             return self._stage_errors(requests, modality, e)
         finally:
+            if permit:
+                self._glm_vit_semaphore.release()
             for state in states:
                 await self._release_encode_ref(state)
 

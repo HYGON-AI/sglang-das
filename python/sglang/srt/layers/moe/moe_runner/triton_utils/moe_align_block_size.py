@@ -304,35 +304,27 @@ def hcu_moe_align_block_size(
         )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    if expert_mask is not None:
-        op.moe_align_block_size_out(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            expert_map=expert_map,
-            expert_mask=expert_mask,
-            num_local_tokens=None,
-            is_ep=False,
-            is_fuse_fill=True,
-        )
-    else:
-        op.moe_align_block_size_out(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            expert_map=None,
-            expert_mask=None,
-            num_local_tokens=None,
-            is_ep=False,
-            is_fuse_fill=True,
-        )
-        if expert_map is not None:
-            expert_ids = expert_map[expert_ids]
+    # Newer LightOP builds expose the preallocated-output API with an ``_out``
+    # suffix, while the HCU runtime image still provides the same ABI under the
+    # original name. Use positional optional arguments because their keyword
+    # spelling also changed between the two builds (``Is_EP`` vs ``is_ep``).
+    align_op = getattr(op, "moe_align_block_size_out", None)
+    if align_op is None:
+        align_op = op.moe_align_block_size
+    align_op(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map if expert_mask is not None else None,
+        expert_mask,
+        None,
+        False,
+        True,
+    )
+    if expert_mask is None and expert_map is not None:
+        expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad

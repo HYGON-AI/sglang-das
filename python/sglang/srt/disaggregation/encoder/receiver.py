@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import itertools
 import logging
 import random
@@ -25,6 +26,11 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
+from sglang.srt.disaggregation.encoder.glm_rdma import defer_rdma_release
+from sglang.srt.disaggregation.encoder.glm_routing import (
+    build_glm_encode_requests,
+    encoder_part_routes,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
@@ -38,6 +44,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.multimodal.embedding_chunks import EmbeddingChunks
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -563,6 +570,21 @@ def _cat_grid(dims, flatten_items=False):
     return torch.cat(valid, dim=0) if valid else None
 
 
+def combine_ordered_item_hashes(item_hashes: List[int]) -> Optional[int]:
+    """Combine multiple item hashes without relying on Python's process hash."""
+    if not item_hashes:
+        return None
+    if len(item_hashes) == 1:
+        return item_hashes[0]
+
+    hasher = hashlib.sha256(b"sglang-epd-item-hashes-v1\0")
+    for item_hash in item_hashes:
+        encoded = str(item_hash).encode("ascii")
+        hasher.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(encoded)
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
 class MultiModalEmbeddingData(EmbeddingData):
     def __init__(
         self,
@@ -587,6 +609,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             **kwargs,
         )
         self.video_meta_attrs = video_meta_attrs_for(model_type)
+        self.item_hashes_by_part = [None] * num_parts
+        self.item_hashes_by_part[part_idx] = kwargs.get("item_hashes")
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
         self.audio_feature_lens = [None] * num_parts
@@ -651,6 +675,8 @@ class MultiModalEmbeddingData(EmbeddingData):
         _validate_embedding_part(embedding_data)
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
+        if getattr(embedding_data, "item_hashes", None) is not None:
+            extra["item_hashes"] = embedding_data.item_hashes
         for attr in video_meta_attrs_for(model_type):
             val = getattr(embedding_data, attr, None)
             if val is not None:
@@ -715,10 +741,67 @@ class MultiModalEmbeddingData(EmbeddingData):
                 kwargs[attr] = list(itertools.chain(*valid))
         return kwargs
 
+    def get_item_hashes_by_modality(self) -> Dict[Modality, List[int]]:
+        """Return ordered hashes for modalities whose non-empty parts are complete."""
+        hashes_by_modality = defaultdict(list)
+        invalid_modalities = set()
+
+        for part_idx, modality in enumerate(self.modality_list):
+            if modality is None:
+                continue
+
+            shape = self.embedding_shape_list[part_idx]
+            is_empty_part = bool(shape is not None and len(shape) > 0 and shape[0] == 0)
+            part_hashes = self.item_hashes_by_part[part_idx]
+            if part_hashes is None:
+                if not is_empty_part:
+                    invalid_modalities.add(modality)
+                continue
+            if not isinstance(part_hashes, (list, tuple)) or any(
+                not isinstance(item_hash, int) or isinstance(item_hash, bool)
+                for item_hash in part_hashes
+            ):
+                invalid_modalities.add(modality)
+                continue
+            hashes_by_modality[modality].extend(part_hashes)
+
+        return {
+            modality: hashes
+            for modality, hashes in hashes_by_modality.items()
+            if modality not in invalid_modalities and hashes
+        }
+
+    def inject_item_hashes(self, processor_output) -> None:
+        """Attach encoder hashes to rebuilt items, falling back per modality."""
+        hashes_by_modality = self.get_item_hashes_by_modality()
+        items_by_modality = defaultdict(list)
+        for item in processor_output.mm_items:
+            items_by_modality[item.modality].append(item)
+
+        for modality, item_hashes in hashes_by_modality.items():
+            items = items_by_modality.get(modality, [])
+            if len(items) == len(item_hashes):
+                assignments = list(zip(items, item_hashes))
+            elif len(items) == 1 and len(item_hashes) > 1:
+                assignments = [(items[0], combine_ordered_item_hashes(item_hashes))]
+            else:
+                logger.warning(
+                    "Ignoring encoder item hashes for %s: received %d hashes "
+                    "but rebuilt %d items",
+                    modality.name,
+                    len(item_hashes),
+                    len(items),
+                )
+                continue
+
+            for item, item_hash in assignments:
+                item.set_hash(item_hash)
+
     def add(self, embedding_data: EmbeddingData):
         _validate_embedding_part(embedding_data, current=self)
         pid = embedding_data.part_idx
         self.ready_list[pid] = True
+        self.item_hashes_by_part[pid] = getattr(embedding_data, "item_hashes", None)
         self.modality_list[pid] = embedding_data.modality
         self.embedding_list[pid] = embedding_data.get_embedding()
         self.embedding_shape_list[pid] = embedding_data.shape
@@ -1073,6 +1156,7 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        self.recv_embedding_data.inject_item_hashes(mm_inputs)
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
@@ -1605,6 +1689,172 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self.embeddings_buffer = None
 
 
+def _release_glm_received_part(pool, engine, buffer, slot):
+    if slot is not None:
+        pool.release(slot)
+    elif buffer.nbytes:
+        engine.deregister(buffer.data_ptr())
+
+
+class GlmWaitingRDMARequest(WaitingRDMARequest):
+    """Source GLM per-part pipeline on main's scheduler-owned GPU receive pool."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._part_buffers = {}
+        self._part_finalizers = []
+        self._posted_rdma = False
+        self._received_all_parts = False
+
+    def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
+        if recv_obj.dtype is not None and recv_obj.dtype != self.dtype:
+            raise ValueError(
+                f"Encoder embedding dtype {recv_obj.dtype} does not match {self.dtype}"
+            )
+        return super()._extract_embedding_from_buffer(recv_obj, parts)
+
+    async def _pull_meta_and_receive_embedding(self):
+        routes = self.recv_req.encoder_part_routes
+        if not routes:
+            # Requests emitted by older tokenizer workers retain main's layout.
+            return await super()._pull_meta_and_receive_embedding()
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
+        ) as session:
+
+            async def receive_part(route):
+                headers = {"Request-Id": route["req_id"]}
+                url = self.encoder_urls[route["encoder_idx"]]
+                try:
+                    async with session.post(
+                        f"{url}/scheduler_receive_meta_data",
+                        json={"req_id": route["req_id"], "part_idx": route["part_idx"]},
+                        headers=headers,
+                    ) as response:
+                        if not await self._check_encoder_responses(
+                            [response], "/scheduler_receive_meta_data"
+                        ):
+                            return False
+                        metadata = await response.json()
+                    nbytes = metadata["embedding_size"]
+                    if nbytes < 0:
+                        raise ValueError("Negative encoder embedding size")
+                    if self.embedding_pool is not None and nbytes:
+                        allocation = await asyncio.to_thread(
+                            self.embedding_pool.alloc, nbytes
+                        )
+                        if allocation is None:
+                            raise RuntimeError(
+                                f"EmbeddingPool cannot allocate {nbytes} bytes for {route['req_id']}"
+                            )
+                        buffer, address, slot = allocation
+                    else:
+                        buffer = torch.empty(
+                            nbytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                        )
+                        address, slot = (buffer.data_ptr() if nbytes else 0), None
+                        if nbytes:
+                            ret = self.embeddings_engine.register(address, nbytes)
+                            if ret not in (None, 0):
+                                raise RuntimeError(f"Mooncake register failed: {ret}")
+                    with self._buffer_lock:
+                        self._part_buffers[route["part_idx"]] = (buffer, slot, nbytes)
+                        if self._terminal:
+                            return False
+                        self._posted_rdma = True
+                    payload = {
+                        **metadata,
+                        "req_id": route["req_id"],
+                        "part_idx": route["part_idx"],
+                        "prefill_host": self.host_name,
+                        "embedding_port": self.embedding_port,
+                        "session_id": self.embeddings_engine.session_id,
+                        "buffer_address": address,
+                        "receive_count": self.receive_count,
+                    }
+                    async with session.post(
+                        f"{url}/send", json=payload, headers=headers
+                    ) as response:
+                        return await self._check_encoder_responses([response], "/send")
+                except Exception as error:
+                    # Report immediately; sibling transfers still own their buffers
+                    # until this receive thread drains, just like main's lifecycle.
+                    self._record_receive_error(str(error))
+                    return False
+
+            results = await asyncio.gather(*(receive_part(route) for route in routes))
+            self._received_all_parts = all(results)
+
+    def _assemble_mm_inputs_from_embeddings(self):
+        if not self.recv_req.encoder_part_routes:
+            return super()._assemble_mm_inputs_from_embeddings()
+        # ACK arrival alone does not prove every HTTP /send drained successfully.
+        if self._receive_running or not self._received_all_parts:
+            return False
+        try:
+            groups = defaultdict(list)
+            for idx, shape in enumerate(self.recv_embedding_data.embedding_shape_list):
+                buffer, _, nbytes = self._part_buffers[idx]
+                if shape is None or nbytes != int(np.prod(shape)) * self.dtype.itemsize:
+                    raise ValueError(f"Encoder part {idx} shape/byte length mismatch")
+                part = buffer[:nbytes].view(self.dtype).reshape(shape)
+                groups[self.recv_embedding_data.modality_list[idx]].append(part)
+            embeddings = {
+                modality: EmbeddingChunks(parts) for modality, parts in groups.items()
+            }
+            self._finish_assemble(embeddings)
+            self._cleanup_gpu_buffer()
+        except Exception as error:
+            self._fail_assemble(error)
+        return True
+
+    def _bind_pool_slot_to_mm_inputs(self, mm_inputs):
+        if not self.recv_req.encoder_part_routes:
+            return super()._bind_pool_slot_to_mm_inputs(mm_inputs)
+        # GPU views remain live through model consumption. Bind every part's
+        # allocation to the current main MM object; abort can still free it early.
+        for buffer, slot, nbytes in self._part_buffers.values():
+            if slot is not None:
+                finalizer = self.embedding_pool.release_on_gc(mm_inputs, slot)
+            elif nbytes:
+                finalizer = weakref.finalize(
+                    mm_inputs,
+                    _release_glm_received_part,
+                    self.embedding_pool,
+                    self.embeddings_engine,
+                    buffer,
+                    slot,
+                )
+            else:
+                continue
+            self._part_finalizers.append(finalizer)
+        _mark_keep_device_embedding(mm_inputs)
+        self._part_buffers.clear()
+        return True
+
+    def _release_part(self, buffer, slot):
+        if slot is not None:
+            self.embedding_pool.release(slot)
+        elif buffer.nbytes:
+            self.embeddings_engine.deregister(buffer.data_ptr())
+
+    def _release_buffer_locked(self):
+        super()._release_buffer_locked()
+        parts, self._part_buffers = self._part_buffers, {}
+        for buffer, slot, _ in parts.values():
+            if self._posted_rdma and not self._received_all_parts:
+                # A failed HTTP/transfer waiter can leave posted DMA writes.
+                defer_rdma_release(self._release_part, buffer, slot)
+            else:
+                self._release_part(buffer, slot)
+
+    def release_resources(self):
+        super().release_resources()
+        finalizers, self._part_finalizers = self._part_finalizers, []
+        for finalizer in finalizers:
+            finalizer()
+
+
 async def _extract_encoder_error(responses, endpoint, context, encode_requests=None):
     """Return the first ``(message, status)`` error, or None.
 
@@ -1895,6 +2145,16 @@ class MMReceiverBase(ABC):
         self.tp_rank = tp_rank
         self.tp_size = get_parallel().tp_size
         self.tp_group = tp_group
+        if (
+            scheduler is not None
+            and get_parallel().enable_dp_attention
+            and scheduler.ps.attn_cp_size == 1
+        ):
+            # Work requests are routed independently to each attention DP group.
+            # Global TP collectives would wait on ranks with different requests.
+            self.tp_group = scheduler.attn_tp_group
+            self.tp_size = scheduler.ps.attn_tp_size
+            self.tp_rank = scheduler.ps.attn_tp_rank
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
@@ -1946,6 +2206,12 @@ class MMReceiverBase(ABC):
                     ),
                 )
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
+            if (
+                "glm" in (self.model_type or "")
+                and not envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set()
+                and envs.SGLANG_MC_RDMA_POOL_MAX_MB.get() > 0
+            ):
+                pool_mb = envs.SGLANG_MC_RDMA_POOL_MAX_MB.get()
             if pool_mb and pool_mb > 0 and scheduler is not None:
                 try:
                     self.embedding_pool = EmbeddingPool(
@@ -2009,6 +2275,7 @@ class MMReceiverBase(ABC):
             trust_remote_code=get_model().trust_remote_code,
             revision=get_model().revision,
             image_processor_backend=resolve_image_processor_backend(get_mm()),
+            special_token_escape_seed=get_serving().glm_special_token_escape_seed,
             **extra_kwargs,
         )
 
@@ -2170,11 +2437,13 @@ class MMReceiverBase(ABC):
                 )
 
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
-            return mm_processor.get_validated_mm_data(
+            output = mm_processor.get_validated_mm_data(
                 prompt,
                 recv_embedding,
                 **recv_embedding_data.get_mm_extra_meta(),
             )
+            recv_embedding_data.inject_item_hashes(output)
+            return output
         except Exception:
             logger.exception(
                 "Failed to receive encoder embeddings for req_id=%s", req_id
@@ -2218,6 +2487,20 @@ class MMReceiverBase(ABC):
             # Freeze the encoder URL snapshot onto obj so the scheduler
             # subprocess uses the same list when indexing encoder_idx.
             obj.encoder_urls = encode_urls
+            prepared_requests = None
+            if self.encoder_transfer_backend == "mooncake" and "glm" in (
+                self.model_type or ""
+            ):
+                prepared_requests = build_glm_encode_requests(
+                    obj.rid,
+                    mm_data,
+                    num_items_assigned,
+                    encode_urls,
+                    self.host,
+                    time_stats_json,
+                )
+                obj.encoder_part_routes = encoder_part_routes(prepared_requests)
+
             scheduler_dispatch_ready = threading.Event()
 
             encode_thread = threading.Thread(
@@ -2231,9 +2514,14 @@ class MMReceiverBase(ABC):
                     time_stats_json,
                     scheduler_dispatch_ready,
                     on_dispatch_error,
+                    prepared_requests,
                 ),
                 daemon=True,
             )
+            # Only this dispatch thread still needs the raw media bytes.
+            # Keep truthy per-item markers until tokenization validates counts.
+            if "glm" in (self.model_type or ""):
+                self._release_raw_media_after_extract(obj)
             encode_thread.start()
             return scheduler_dispatch_ready
         else:
@@ -2483,10 +2771,14 @@ class MMReceiverBase(ABC):
         time_stats_json=None,
         scheduler_dispatch_ready=None,
         on_dispatch_error=None,
+        prepared_requests=None,
     ):
         # ``embedding_port`` is always None on this path: zmq_to_scheduler /
         # mooncake ranks register their receive ports with the encoder later
         # via /scheduler_receive_url, so the dispatch itself carries no port.
+        dispatch_kwargs = {}
+        if prepared_requests is not None:
+            dispatch_kwargs["prepared_requests"] = prepared_requests
         try:
             dispatch_error = asyncio.run(
                 self.encode(
@@ -2497,6 +2789,7 @@ class MMReceiverBase(ABC):
                     num_items_assigned=num_items_assigned,
                     encode_urls=encode_urls,
                     time_stats_json=time_stats_json,
+                    **dispatch_kwargs,
                 )
             )
         except Exception as e:
@@ -2596,21 +2889,60 @@ class MMReceiverBase(ABC):
 
         return num_items_assigned
 
+    _RAW_MM_RELEASED_MARKER = "<released-to-encoder>"
+
+    def _release_raw_media_after_extract(self, request_obj) -> None:
+        """Drop raw media payload references once _extract_url_data owns them.
+
+        _extract_url_data builds payloads that share (not copy) the base64/URL
+        string references, so after it returns the request object's raw fields
+        have no remaining reader on the encode path. Replacing them here frees
+        the media bytes for the whole encoder wait (up to
+        SGLANG_ENCODER_RECV_TIMEOUT) instead of holding them until scheduler
+        dispatch. A truthy, length-preserving marker per item keeps
+        contains_mm_input(), mm-limit validation and item counting truthful;
+        the tokenizer manager's _release_raw_multimodal_payload nulls the
+        fields for real after dispatch.
+        """
+        for attr in ("image_data", "video_data", "audio_data"):
+            data = getattr(request_obj, attr, None)
+            if data is None:
+                continue
+            if isinstance(data, list):
+                setattr(request_obj, attr, [self._RAW_MM_RELEASED_MARKER] * len(data))
+            else:
+                setattr(request_obj, attr, self._RAW_MM_RELEASED_MARKER)
+
     def _extract_url_data(self, request_obj: GenerateReqInput) -> List[Dict]:
-        def flatten_mm_items(items):
-            if not isinstance(items, list):
+        def is_frame_sequence(items):
+            return (
+                isinstance(items, (list, tuple))
+                and bool(items)
+                and all(
+                    isinstance(item, dict) and "url" in item and "timestamp" in item
+                    for item in items
+                )
+            )
+
+        def flatten_mm_items(items, preserve_video_frames=False):
+            if not isinstance(items, list) or (
+                preserve_video_frames and is_frame_sequence(items)
+            ):
                 return [items]
 
             flat = []
             for item in items:
                 if isinstance(item, (list, tuple)):
-                    flat.extend(flatten_mm_items(list(item)))
+                    if preserve_video_frames and is_frame_sequence(item):
+                        flat.append(item)
+                    else:
+                        flat.extend(flatten_mm_items(list(item), preserve_video_frames))
                 else:
                     flat.append(item)
             return flat
 
         def to_raw_url(mm_item):
-            if isinstance(mm_item, ImageData):
+            if isinstance(mm_item, ImageData) or hasattr(mm_item, "url"):
                 return mm_item.url
             if isinstance(mm_item, dict):
                 # tolerate {"url": ...} shaped payloads
@@ -2626,7 +2958,7 @@ class MMReceiverBase(ABC):
             (request_obj.audio_data, Modality.AUDIO),
         ]:
             if mm_items:
-                mm_items = flatten_mm_items(mm_items)
+                mm_items = flatten_mm_items(mm_items, modality == Modality.VIDEO)
                 for mm_item in mm_items:
                     if mm_item is None:
                         continue
@@ -2695,7 +3027,9 @@ class MMReceiverHTTP(MMReceiverBase):
         if self.encoder_transfer_backend == "mooncake":
             return self._process_waiting_requests(
                 recv_reqs,
-                WaitingRDMARequest,
+                GlmWaitingRDMARequest
+                if "glm" in (self.model_type or "")
+                else WaitingRDMARequest,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=self.gpu_id,
@@ -2717,64 +3051,70 @@ class MMReceiverHTTP(MMReceiverBase):
         num_items_assigned=None,
         encode_urls=None,
         time_stats_json=None,
+        prepared_requests=None,
     ):
         if len(mm_data) == 0:
             return
 
         effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
-        # get unique modalities with order preserved
-        modalities = [mm_item.get("modality") for mm_item in mm_data]
-        modalities = list(dict.fromkeys(modalities))
-        encode_requests = []
+        if prepared_requests is not None:
+            encode_requests = prepared_requests
+        else:
+            # get unique modalities with order preserved
+            modalities = [mm_item.get("modality") for mm_item in mm_data]
+            modalities = list(dict.fromkeys(modalities))
+            encode_requests = []
 
-        if num_items_assigned is None:
-            num_items_assigned = self._assign_items_by_modality(
-                mm_data, len(effective_urls)
+            if num_items_assigned is None:
+                num_items_assigned = self._assign_items_by_modality(
+                    mm_data, len(effective_urls)
+                )
+
+            # Calculate total num_parts across all modalities
+            total_num_parts, modality_num_parts = calculate_modality_num_parts(
+                modalities, num_items_assigned
             )
 
-        # Calculate total num_parts across all modalities
-        total_num_parts, modality_num_parts = calculate_modality_num_parts(
-            modalities, num_items_assigned
-        )
+            part_idx_offset = 0
+            for modality in modalities:
+                num_items_assigned_modality = num_items_assigned.get(modality)
+                mm_data_modality = [
+                    mm_item
+                    for mm_item in mm_data
+                    if mm_item.get("modality") == modality
+                ]
 
-        part_idx_offset = 0
-        for modality in modalities:
-            num_items_assigned_modality = num_items_assigned.get(modality)
-            mm_data_modality = [
-                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
-            ]
-
-            num_parts = modality_num_parts[modality]
-            cum_num_items = 0
-            cum_idx = 0
-            for idx, assigned_num in enumerate(num_items_assigned_modality):
-                if assigned_num == 0:
-                    continue
-                part_idx = part_idx_offset + cum_idx
-                part_req_id = create_part_req_id(req_id, part_idx)
-                encode_requests.append(
-                    {
-                        "encoder_idx": idx,
-                        "encoder_url": effective_urls[idx],
-                        "mm_items": [
-                            _encoder_media_item(mm_item)
-                            for mm_item in mm_data_modality[
-                                cum_num_items : cum_num_items + assigned_num
-                            ]
-                        ],
-                        "num_parts": total_num_parts,
-                        "part_idx": part_idx,
-                        "req_id": part_req_id,  # use part_req_id to avoid key collision
-                        "modality": modality.name,  # convert enum to string for json serialization
-                        "prefill_host": self.host,
-                        "embedding_port": embedding_port,
-                        "time_stats_json": time_stats_json,
-                    }
-                )
-                cum_idx += 1
-                cum_num_items += assigned_num
-            part_idx_offset += num_parts
+                num_parts = modality_num_parts[modality]
+                cum_num_items = 0
+                cum_idx = 0
+                for idx, assigned_num in enumerate(num_items_assigned_modality):
+                    if assigned_num == 0:
+                        continue
+                    part_idx = part_idx_offset + cum_idx
+                    part_req_id = create_part_req_id(req_id, part_idx)
+                    encode_requests.append(
+                        {
+                            "encoder_idx": idx,
+                            "encoder_url": effective_urls[idx],
+                            "mm_items": [
+                                _encoder_media_item(mm_item)
+                                for mm_item in mm_data_modality[
+                                    cum_num_items : cum_num_items + assigned_num
+                                ]
+                            ],
+                            "num_parts": total_num_parts,
+                            "part_idx": part_idx,
+                            "req_id": part_req_id,  # use part_req_id to avoid key collision
+                            "modality": modality.name,  # convert enum to string for json serialization
+                            "prefill_host": self.host,
+                            "embedding_port": embedding_port,
+                            "time_stats_json": time_stats_json,
+                        }
+                    )
+                    cum_idx += 1
+                    cum_num_items += assigned_num
+                part_idx_offset += num_parts
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
@@ -2785,6 +3125,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 session.post(
                     f"{effective_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
+                    headers={"Request-Id": encode_request["req_id"]},
                 )
                 for encode_request in encode_requests
             ]

@@ -61,6 +61,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
+        self.accepted_tokens = []
         self._matched_think_end_tokens = 0
         self._thinking_match_history: List[int] = []
 
@@ -138,9 +139,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # a ReasonerGrammarObject's current_token stays None forever (the inner
         # grammar's is updated, not the wrapper's), so the guard never fires and
         # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
+        token = int(token)
         self.current_token = token
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
+        self.accepted_tokens.append(token)
         self.transfer_state(token)
 
     def is_terminated(self):
@@ -153,6 +156,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
             steps_after = min(k, max(0, self.tokens_after_end))
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
+        if k > 0:
+            del self.accepted_tokens[-k:]
         for _ in range(k):
             self.rollback_state()
 
@@ -170,6 +175,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self._is_thinking():
             if not self.enable_token_filter:
+                vocab_mask[int(idx)].fill_(-1)
                 return
             if self._can_think_more():
                 if self.think_excluded_token_ids is not None:
@@ -209,6 +215,13 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self.grammar is not None:
             return self.grammar.apply_vocab_mask
         return self.apply_vocab_mask_fn
+
+    @property
+    def matcher(self):
+        # Native tree traversal is valid only after the reasoning terminator.
+        if self._is_thinking() or self.grammar is None:
+            return None
+        return getattr(self.grammar, "matcher", None)
 
     def copy(self):
         new_obj = ReasonerGrammarObject(

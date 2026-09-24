@@ -203,6 +203,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_non_idle_and_non_empty,
     is_sm90_supported,
     make_layers,
@@ -310,6 +311,7 @@ class DeepseekV2MLP(nn.Module):
         x,
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
@@ -340,7 +342,13 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
-        if gateup_pre_quant is not None:
+        if input_quant_args is not None:
+            if gateup_pre_quant is not None:
+                raise ValueError(
+                    "INT8 and FP8 prequantized MLP inputs are mutually exclusive"
+                )
+            gate_up, _ = self.gate_up_proj(x, input_quant_args=input_quant_args)
+        elif gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
             # inside the fp8 linear method. q rows may be padded to a multiple
@@ -359,6 +367,32 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+        if (
+            self.swiglu_limit is not None
+            and gate_up.dim() == 2
+            and gate_up.is_contiguous()
+            and self.down_proj.supports_fused_silu_mul_fp8_quant_input()
+        ):
+            output, _ = self.down_proj(
+                gate_up,
+                use_fused_silu_mul_fp8_quant=True,
+                swiglu_limit=float(self.swiglu_limit),
+            )
+            return output
+
+        if (
+            self.swiglu_limit is not None
+            and gate_up.dim() == 2
+            and gate_up.is_contiguous()
+            and self.down_proj.supports_fused_silu_mul_quant_input()
+        ):
+            output, _ = self.down_proj(
+                gate_up,
+                use_fused_silu_mul_quant=True,
+                swiglu_limit=float(self.swiglu_limit),
+            )
+            return output
+
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -470,14 +504,26 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_deepseek_v4 = is_deepseek_v4
+        is_glm_next = getattr(config, "model_type", "") in (
+            "glm5_next",
+            "glm5v_next",
+            "glm5next_text",
+            "glm5_next_text",
+        )
+        router_fp32 = (
+            (
+                envs.SGLANG_MOE_ROUTER_USE_CONFIG_DTYPE.get()
+                and getattr(config, "router_dtype", None) in ("float32", "fp32")
+            )
+            if is_glm_next
+            else getattr(config, "router_fp32", False)
+        )
         self.weight = nn.Parameter(
             torch.empty(
                 (config.n_routed_experts, config.hidden_size),
-                dtype=(
-                    torch.float32
-                    if getattr(config, "router_fp32", False)
-                    else torch.get_default_dtype()
-                ),
+                dtype=torch.float32
+                if router_fp32
+                else (torch.bfloat16 if is_glm_next else torch.get_default_dtype()),
             )
         )
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -521,6 +567,7 @@ class MoEGate(nn.Module):
     ):
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
+        hidden_states = hidden_states.to(self.weight.dtype)
 
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
@@ -848,11 +895,30 @@ class DeepseekV2MoE(nn.Module):
                     # This path does not consume shared_experts_weight_block_size.
                     pass
                 else:
-                    assert (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    # Some FP8 methods (notably the HCU w8a8_fp8 path) expose
+                    # their settings through ``quantization_config`` rather
+                    # than a legacy ``quant_config`` attribute.  The shared
+                    # expert block-size fast path only applies when both
+                    # methods actually provide block-size metadata.
+                    gate_up_quant_config = getattr(
+                        self.shared_experts.gate_up_proj.quant_method,
+                        "quant_config",
+                        None,
                     )
-                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    down_proj_quant_config = getattr(
+                        self.shared_experts.down_proj.quant_method,
+                        "quant_config",
+                        None,
+                    )
+                    gate_up_block_size = getattr(
+                        gate_up_quant_config, "weight_block_size", None
+                    )
+                    down_proj_block_size = getattr(
+                        down_proj_quant_config, "weight_block_size", None
+                    )
+                    if gate_up_block_size is not None or down_proj_block_size is not None:
+                        assert gate_up_block_size == down_proj_block_size
+                        self.shared_experts_weight_block_size = gate_up_block_size
 
         self.top_k = config.num_experts_per_tok
 
@@ -892,6 +958,8 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+        self._shared_expert_input_quant_args = None
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -899,9 +967,24 @@ class DeepseekV2MoE(nn.Module):
             self.experts.num_local_experts - self.num_fused_shared_experts
         )
 
+        weights = list(self.experts.named_parameters())
+        if getattr(self.experts, "_w8a8_int8_deepgemm_repacked", False):
+            # HCU packing releases the original parameters. EPLB must move
+            # every runtime layout together with its expert scales.
+            weights.extend(
+                (name, buf)
+                for name, buf in self.experts.named_buffers()
+                if name
+                in {
+                    "w13_weight_deepgemm",
+                    "w2_weight_deepgemm",
+                    "w13_weight_deepgemm_masked",
+                    "w2_weight_deepgemm_masked",
+                }
+            )
         return [
             x.data[:num_local_experts_for_eplb]
-            for name, x in self.experts.named_parameters()
+            for name, x in weights
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(
                 name, x, self.experts.num_local_experts
@@ -1668,6 +1751,14 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
+    def set_shared_expert_input_quant_args(self, input_quant_args):
+        if self._shared_expert_input_quant_args is not None:
+            raise RuntimeError("Shared-expert prequantized input is already set")
+        self._shared_expert_input_quant_args = input_quant_args
+
+    def clear_shared_expert_input_quant_args(self):
+        self._shared_expert_input_quant_args = None
+
     def _forward_shared_experts(
         self,
         hidden_states,
@@ -1684,7 +1775,9 @@ class DeepseekV2MoE(nn.Module):
                 )
                 return out[: hidden_states.shape[0]]
             return self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                input_quant_args=self._shared_expert_input_quant_args,
             )
         else:
             return None
@@ -2057,6 +2150,21 @@ class DeepseekV2AttentionMLA(
                 indexer_cls = (
                     IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
                 )
+                from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+                if is_glm5_next_hcu(config):
+                    from sglang.srt.layers.attention.glm5_next.indexer import (
+                        Indexer as GlmIndexer,
+                    )
+                    from sglang.srt.layers.attention.glm5_next.kpool.indexer import (
+                        IndexerKPool as GlmIndexerKPool,
+                    )
+
+                    indexer_cls = (
+                        GlmIndexerKPool
+                        if get_dsa_index_kpool(config) > 1
+                        else GlmIndexer
+                    )
                 indexer_kwargs = dict(
                     hidden_size=hidden_size,
                     index_n_heads=get_dsa_index_n_heads(config),
@@ -2076,7 +2184,7 @@ class DeepseekV2AttentionMLA(
                     alt_stream=alt_stream,
                     config=config,
                 )
-                if indexer_cls is IndexerKPool:
+                if get_dsa_index_kpool(config) > 1:
                     indexer_kwargs["skip_rope"] = skip_rope
                 self.indexer = indexer_cls(**indexer_kwargs)
 
@@ -2101,6 +2209,19 @@ class DeepseekV2AttentionMLA(
             tp_size=attn_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        from sglang.srt.layers.fused_rms_quant import (
+            is_lightop_sglang_mla_qkv_a_rms_quant_available,
+        )
+
+        self.use_lightop_mla_qkv_a_rms_quant = (
+            _is_hcu
+            and self.q_lora_rank is not None
+            and get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+            and is_lightop_sglang_mla_qkv_a_rms_quant_available()
+            and getattr(
+                self.q_b_proj.quant_method, "supports_prequantized_input", False
+            )
+        )
 
         if not skip_rope and qk_rope_head_dim > 0:
             is_neox_style = not getattr(config, "rope_interleave", True)
@@ -2448,9 +2569,16 @@ class DeepseekV2AttentionMLA(
             raise NotImplementedError
 
     def prepare_qkv_latent(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         assert self.q_lora_rank is not None
+        if input_quant_args is not None:
+            return self.fused_qkv_a_proj_with_mqa(
+                hidden_states, input_quant_args=input_quant_args
+            )[0]
         if hasattr(self, "q_a_proj"):
             return torch.cat(
                 (
@@ -2474,7 +2602,13 @@ class DeepseekV2AttentionMLA(
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
-    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+    def q_b_proj_forward(
+        self, q_lora: torch.Tensor, input_quant_args=None
+    ) -> torch.Tensor:
+        if input_quant_args is not None:
+            return self.q_b_proj(q_lora, input_quant_args=input_quant_args)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape

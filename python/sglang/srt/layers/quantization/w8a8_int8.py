@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
@@ -37,7 +38,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -51,8 +52,13 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.models.utils import WeightsMapper
 
 from lightop import gemm_ops as quant_ops
+
+from sglang.srt.layers.quantization.compressed_tensors import (
+    quant_ops as compressed_quant_ops,
+)
 
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
@@ -122,6 +128,12 @@ class W8A8Int8Config(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
 
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        if self.ignore:
+            self.ignore = list(
+                dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignore))
+            )
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -137,7 +149,7 @@ class W8A8Int8Config(QuantizationConfig):
             if should_ignore_layer(
                 prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
             ):
-                return UnquantizedEmbeddingMethod()
+                return UnquantizedLinearMethod()
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if should_ignore_layer(
@@ -192,8 +204,11 @@ class W8A8Int8Config(QuantizationConfig):
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
+    supports_prequantized_input = True
+
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
+        self.w8a8_strategy = int(os.getenv("W8A8_SUPPORT_METHODS", "1"))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
@@ -204,6 +219,8 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             else:
                 assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
         else:
+            if _is_hcu and self.w8a8_strategy == 3:
+                layer.weight.data = layer.weight.data.T
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
@@ -243,8 +260,13 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        input_quant_args=None,
     ):
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
+            if input_quant_args is not None:
+                raise NotImplementedError(
+                    "Prequantized W8A8 input is only supported by the GPU path"
+                )
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -253,20 +275,58 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        x_q, x_scale = per_token_quant_int8(x)
+        if input_quant_args is None:
+            x_q, x_scale = per_token_quant_int8(x)
+        else:
+            if (
+                not isinstance(input_quant_args, (tuple, list))
+                or len(input_quant_args) != 2
+            ):
+                raise ValueError("input_quant_args must be a (q_int8, scale_fp32) pair")
+            x_q, x_scale = input_quant_args
+            expected_scale_shape = (*x.shape[:-1], 1)
+            if x_q.shape != x.shape or x_q.dtype != torch.int8:
+                raise ValueError(
+                    f"Expected INT8 activation with shape {tuple(x.shape)}, got "
+                    f"shape={tuple(x_q.shape)}, dtype={x_q.dtype}"
+                )
+            if x_scale.shape != expected_scale_shape or x_scale.dtype != torch.float32:
+                raise ValueError(
+                    f"Expected FP32 scale with shape {expected_scale_shape}, got "
+                    f"shape={tuple(x_scale.shape)}, dtype={x_scale.dtype}"
+                )
+            if x_q.device != x.device or x_scale.device != x.device:
+                raise ValueError(
+                    "Prequantized activation and scale must be on x.device"
+                )
+            if not x_q.is_contiguous() or not x_scale.is_contiguous():
+                raise ValueError("Prequantized activation and scale must be contiguous")
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
-        output = quant_ops.triton_scaled_mm(
-            x_q_2d,
-            layer.weight,
-            x_scale_2d,
-            layer.weight_scale,
-            out_dtype=x.dtype,
-            bias=bias,
-        )
+        if _is_hcu and self.w8a8_strategy == 3:
+            output_shape = [*x_q.shape[:-1], layer.weight.shape[0]]
+            output = compressed_quant_ops.blaslt_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                scale_a=x_scale_2d,
+                scale_b=layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=None,
+            )
+            if bias is not None:
+                output = output + bias
+        else:
+            output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+            output = quant_ops.triton_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                x_scale_2d,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
 
         return output.view(output_shape)
 
@@ -348,7 +408,18 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_hcu and self.runner.runner_backend.is_lightop():
+        if getattr(layer, "use_int8_w8a8_deepgemm", False):
+            from sglang.srt.layers.quantization.hcu_deepgemm_w8a8_utils import (
+                prepare_w8a8_int8_deepgemm_weights,
+            )
+
+            prepare_w8a8_int8_deepgemm_weights(layer)
+            return
+
+        if (
+            _is_hcu
+            and self.runner.runner_backend.value == MoeRunnerBackend.LIGHTOP.value
+        ):
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,
             )
@@ -377,7 +448,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_aiter() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
-        elif moe_runner_backend.is_lightop() and _is_hcu:
+        elif moe_runner_backend.value == MoeRunnerBackend.LIGHTOP.value and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.LIGHTOP, moe_runner_config)
         elif moe_runner_backend.is_triton():
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
@@ -447,7 +518,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             )
 
             quant_info = get_aiter_w8a8_int8_quant_info(layer)
-        elif _is_hcu and self.runner.runner_backend.is_lightop():
+        elif (
+            _is_hcu
+            and self.runner.runner_backend.value == MoeRunnerBackend.LIGHTOP.value
+        ):
             from sglang.srt.layers.moe.moe_runner.lightop import get_lightop_quant_info
 
             quant_info = get_lightop_quant_info(layer)

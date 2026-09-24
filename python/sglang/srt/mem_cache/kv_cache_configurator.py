@@ -12,7 +12,6 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
-    kimi_linear_config,
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
@@ -271,6 +270,7 @@ class KVCacheConfigurator:
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+    glm5_next_layer_split_scratch_source: Optional[KVCache] = None
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
@@ -1081,7 +1081,7 @@ class KVCacheConfigurator:
                 get_exec().mamba.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
+                    or self.mambaish_config.mamba2_cache_params.is_kda
                 )
             ),
         )
@@ -1122,7 +1122,7 @@ class KVCacheConfigurator:
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
-            and kimi_linear_config(self.model_config) is None
+            and not self.mambaish_config.mamba2_cache_params.is_kda
         ):
             raise ValueError(
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
@@ -1162,7 +1162,7 @@ class KVCacheConfigurator:
                 get_exec().mamba.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
+                    or self.mambaish_config.mamba2_cache_params.is_kda
                 )
             ),
         )
@@ -1633,6 +1633,16 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+        if is_glm5_next_hcu(self.model_config.hf_config):
+            from sglang.srt.mem_cache.glm5_next import (
+                Glm5NextDSATokenToKVPool,
+                glm5_next_pool_kwargs,
+            )
+
+            PoolCls = Glm5NextDSATokenToKVPool
+            pool_kwargs = glm5_next_pool_kwargs(self)
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1746,6 +1756,10 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            override_kv_cache_dim=calculate_mla_kv_cache_dim(
+                model_config=self.model_config,
+                kv_cache_dtype=self.kv_cache_dtype,
+            ),
         )
         return token_to_kv_pool
 
@@ -1866,6 +1880,10 @@ class KVCacheConfigurator:
             extra_args = {
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                "kv_cache_dim": calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ),
             }
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
@@ -1894,6 +1912,12 @@ class KVCacheConfigurator:
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
                     )
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+        if is_glm5_next_hcu(self.model_config.hf_config):
+            from sglang.srt.mem_cache.glm5_next import glm5_next_pool_kwargs
+
+            extra_args["glm5_next_pool_kwargs"] = glm5_next_pool_kwargs(self)
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
@@ -2442,11 +2466,14 @@ class KVCacheConfigurator:
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
         # request scratch; KDA replay remains attached to each mamba slot.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+            self.hybrid_gdn_config is not None or config.mamba2_cache_params.is_kda
         )
         if replayssm_active:
-            record_len = get_exec().mamba.linear_replayssm_cache_len
+            record_len = (
+                max_speculative_num_draft_tokens()
+                if config.mamba2_cache_params.use_hcu_kda
+                else get_exec().mamba.linear_replayssm_cache_len
+            )
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
@@ -2455,7 +2482,7 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and kimi_linear_config(self.model_config) is None:
+        if replayssm_active and not config.mamba2_cache_params.is_kda:
             replay_req_slots = (
                 get_schedule().max_running_requests // self.ps.attn_dp_size + 1
             )
@@ -2589,7 +2616,22 @@ def calculate_mla_kv_cache_dim(
 
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
-        return kv_cache_dim
+        from sglang.kernels.ops.attention.utils import get_hcu_mla_fp8_kv_cache_dim
+
+        kernel = get_exec().kernel
+        return get_hcu_mla_fp8_kv_cache_dim(
+            kv_cache_dim,
+            qk_rope_head_dim,
+            kv_cache_dtype,
+            uses_hcu_mla=any(
+                getattr(kernel, name, None) == "hcu_mla"
+                for name in (
+                    "attention_backend",
+                    "prefill_attention_backend",
+                    "decode_attention_backend",
+                )
+            ),
+        )
 
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the

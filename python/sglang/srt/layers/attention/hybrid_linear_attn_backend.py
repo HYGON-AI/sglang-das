@@ -1384,6 +1384,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
+                use_hcu_kda=mamba_pool.use_hcu_kda,
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,
                 last_correct_step_indices=last_correct_step_indices,

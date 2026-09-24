@@ -11,7 +11,7 @@ from sglang.benchmark.datasets.longbench_v2 import LongBenchV2Dataset
 from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
-from sglang.benchmark.datasets.random import RandomDataset
+from sglang.benchmark.datasets.random import RandomDataset, RandomIdsRawDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
 from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
 
@@ -24,6 +24,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     # not two separate dataset names sharing the same class.
     "random": RandomDataset,
     "random-ids": RandomDataset,
+    "random-ids-raw": RandomIdsRawDataset,
     "generated-shared-prefix": GeneratedSharedPrefixDataset,
     "mmmu": MMMUDataset,
     "image": ImageDataset,

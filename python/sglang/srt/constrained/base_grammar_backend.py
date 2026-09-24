@@ -46,6 +46,7 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
+    first_mask_fill_time: Optional[float] = None
 
 
 class GrammarRow(NamedTuple):
@@ -294,6 +295,10 @@ class BaseGrammarBackend:
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
 
+    def get_cache_stats(self) -> Tuple[int, int]:
+        """Return (num cached grammar objects, backend-native cache bytes)."""
+        return len(self.cache), 0
+
     def reset(self):
         self.cache.clear()
 
@@ -423,7 +428,11 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if get_serving().reasoning_parser and think_end_ids:
+    if (
+        get_serving().reasoning_parser
+        and (think_end_ids or getattr(tokenizer, "think_end_id", None) is not None)
+        and not get_serving().glm_decoding_constraint_module
+    ):
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )

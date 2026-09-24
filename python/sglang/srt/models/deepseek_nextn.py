@@ -145,6 +145,17 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+        pool = get_token_to_kv_pool()
+        full_pool = getattr(pool, "full_kv_pool", pool)
+        if getattr(full_pool, "is_hcu_glm5_next_pool", False):
+            from sglang.srt.layers.communicator_glm5_next_cp import (
+                maybe_prefetch_full_attention_kv,
+            )
+
+            maybe_prefetch_full_attention_kv(forward_batch, self.decoder.layer_id)
+
         exit_stack = ExitStack()
         if (
             _is_npu

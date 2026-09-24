@@ -54,7 +54,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hcu
 
 _is_cuda = is_cuda()
 
@@ -498,3 +498,43 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
+
+
+HCU_MLA_FP8_PADDED_KV_CACHE_DIM = 576
+
+
+def is_hcu_mla_fp8_kv_dtype(kv_cache_dtype: torch.dtype) -> bool:
+    return kv_cache_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    )
+
+
+def should_pad_hcu_mla_fp8_kv_cache(
+    kv_cache_dim: int,
+    qk_rope_head_dim: int,
+    kv_cache_dtype: torch.dtype,
+    uses_hcu_mla: bool,
+) -> bool:
+    return (
+        is_hcu()
+        and uses_hcu_mla
+        and qk_rope_head_dim == 0
+        and kv_cache_dim == 512
+        and is_hcu_mla_fp8_kv_dtype(kv_cache_dtype)
+    )
+
+
+def get_hcu_mla_fp8_kv_cache_dim(
+    kv_cache_dim: int,
+    qk_rope_head_dim: int,
+    kv_cache_dtype: torch.dtype,
+    uses_hcu_mla: bool,
+) -> int:
+    if should_pad_hcu_mla_fp8_kv_cache(
+        kv_cache_dim, qk_rope_head_dim, kv_cache_dtype, uses_hcu_mla
+    ):
+        return HCU_MLA_FP8_PADDED_KV_CACHE_DIM
+    return kv_cache_dim

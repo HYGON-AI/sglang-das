@@ -1252,12 +1252,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
     @staticmethod
     def _use_bailing_rms_quant(forward_batch: ForwardBatch) -> bool:
-        return _use_fused_bailing_rms_quant and forward_batch.rms_quant_flag
+        return _use_fused_bailing_rms_quant and getattr(
+            forward_batch, "rms_quant_flag", False
+        )
 
     @staticmethod
     def _skip_layernorm(forward_batch: ForwardBatch) -> bool:
+        # Models opt into this legacy fusion explicitly; main ForwardBatch
+        # does not carry the flag by default.
         return (
-            _use_fused_rms_quant and forward_batch.rms_quant_flag
+            _use_fused_rms_quant and getattr(forward_batch, "rms_quant_flag", False)
         ) or CommunicateWithAllReduceAndLayerNormFn._use_bailing_rms_quant(
             forward_batch
         )

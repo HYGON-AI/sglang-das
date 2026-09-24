@@ -755,10 +755,11 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            (
+                adapted_request,
+                processed_request,
+            ) = await self.openai_serving_chat._convert_to_internal_request_async(
+                chat_request, raw_request
             )
             adapted_request.received_time = received_time
 
@@ -805,10 +806,11 @@ class AnthropicServing:
             )
 
         try:
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            (
+                adapted_request,
+                processed_request,
+            ) = await self.openai_serving_chat._convert_to_internal_request_async(
+                chat_request, raw_request
             )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
@@ -1445,19 +1447,21 @@ class AnthropicServing:
             )
 
         try:
-            is_multimodal = (
-                self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
-            )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
-            )
+            tokenizer_manager = self.openai_serving_chat.tokenizer_manager
+            is_multimodal = tokenizer_manager.model_config.is_multimodal
 
-            if isinstance(processed.prompt_ids, list):
-                input_tokens = len(processed.prompt_ids)
-            else:
-                # prompt_ids is a string (multimodal case) — tokenize it
-                tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+            def _count_input_tokens() -> int:
+                processed = self.openai_serving_chat._process_messages(
+                    chat_request, is_multimodal
+                )
+                if isinstance(processed.prompt_ids, list):
+                    return len(processed.prompt_ids)
+                # prompt_ids is a string (multimodal case) — tokenize it.
+                return len(tokenizer_manager.tokenizer.encode(processed.prompt_ids))
+
+            input_tokens = await tokenizer_manager.run_tokenizer_offload(
+                _count_input_tokens
+            )
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(

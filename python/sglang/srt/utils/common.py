@@ -1989,18 +1989,35 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
+    if not isinstance(image_file, str):
+        raise NotImplementedError(f"Invalid image: {image_file}")
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
-            return f.read()
-    if isinstance(image_file, str) and image_file.startswith("data:"):
+    if image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
-    if isinstance(image_file, str):
+    if image_file.startswith("file://"):
+        with open(unquote(urlparse(image_file).path), "rb") as f:
+            return f.read()
+    # Avoid passing a potentially multi-megabyte base64 payload to filesystem
+    # APIs. On some platforms this raises ENAMETOOLONG before base64 decoding.
+    if len(image_file) <= 4096:
+        try:
+            if os.path.isfile(image_file):
+                with open(image_file, "rb") as f:
+                    return f.read()
+        except OSError:
+            # It is not a usable local path; handle it as raw base64 below.
+            pass
+
+    try:
         return pybase64.b64decode(image_file, validate=True)
-    raise NotImplementedError(f"Invalid image: {image_file}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Invalid image data: expected a URL, file path, data URI, "
+            "or base64-encoded image"
+        ) from exc
 
 
 def _normalize_video_input(
@@ -2057,7 +2074,7 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if source is None:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
-    device = "cuda" if use_gpu else "cpu"
+    device = "cuda" if use_gpu and is_cuda() else "cpu"
     try:
         return VideoDecoderWrapper(source, device=device)
     except (ImportError, MemoryError):

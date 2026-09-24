@@ -39,6 +39,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     ConfigureLoggingReq,
+    DetokenizerCompletionReq,
     FreezeGCReq,
     sock_recv,
     sock_send,
@@ -122,10 +123,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.init_request_dispatcher()
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
-        context = zmq.Context(2)
+        context = zmq.Context(3)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
+        self.detokenizer_worker_ipc_name = port_args.detokenizer_ipc_name
+        self.send_to_detokenizer_router = None
+        if port_args.detokenizer_ack_ipc_name is not None:
+            self.send_to_detokenizer_router = get_zmq_socket(
+                context,
+                zmq.PUSH,
+                port_args.detokenizer_ack_ipc_name,
+                False,
+            )
         # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
         # directly via SocketMapping inside multi_http_worker_event_loop, so the
         # single send_to_tokenizer socket is unused.
@@ -145,6 +155,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 trust_remote_code=get_model().trust_remote_code,
                 revision=get_model().revision,
                 tokenizer_backend=get_serving().tokenizer_backend,
+                glm_special_token_escape_seed=get_serving().glm_special_token_escape_seed,
             )
             try:
                 self.vocab_size = len(self.tokenizer)
@@ -184,9 +195,38 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is not None:
+            if isinstance(output, list):
+                for chunk in output:
+                    sock_send(self.send_to_tokenizer, chunk)
+            elif output is not None:
                 sock_send(self.send_to_tokenizer, output)
+            if output is not None:
+                self.acknowledge_finished_requests(recv_obj)
             self.soft_watchdog.feed()
+
+    def acknowledge_finished_requests(self, recv_obj):
+        """Release router-side load only after final outputs have been sent."""
+        if self.send_to_detokenizer_router is None:
+            return
+
+        rids = getattr(recv_obj, "rids", None)
+        finished_reasons = getattr(recv_obj, "finished_reasons", None)
+        if not rids or not finished_reasons:
+            return
+
+        finished_rids = [
+            rid
+            for rid, finished_reason in zip(rids, finished_reasons)
+            if finished_reason is not None
+        ]
+        if finished_rids:
+            sock_send(
+                self.send_to_detokenizer_router,
+                DetokenizerCompletionReq(
+                    worker_ipc_name=self.detokenizer_worker_ipc_name,
+                    finished_rids=finished_rids,
+                ),
+            )
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool

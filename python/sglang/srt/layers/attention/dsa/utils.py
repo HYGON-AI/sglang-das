@@ -87,6 +87,20 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+    from sglang.srt.utils import is_hcu
+
+    if is_hcu():
+        config = process_model_config()
+        if is_glm5_next_hcu(config.hf_config):
+            from sglang.srt.layers.attention.glm5_next.runtime import (
+                get_glm5_next_runtime_args,
+            )
+            from sglang.srt.layers.attention.glm5_next.utils import (
+                should_remap_pd_dsa_seed_to_local_slots as hcu_should_remap,
+            )
+
+            return hcu_should_remap(get_glm5_next_runtime_args(), config)
     return (
         (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
@@ -112,6 +126,11 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     return envs.SGLANG_DSA_FUSE_TOPK.get() and (
         not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
     )
+
+
+def dsa_prefill_has_history(forward_batch: "ForwardBatch") -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    return prefix_lens is None or any(int(length) > 0 for length in prefix_lens)
 
 
 def is_dsa_enable_prefill_cp():

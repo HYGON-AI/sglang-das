@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.marlin_utils import (
     check_marlin_supported,
     check_marlin_supports_layer,
@@ -259,6 +260,7 @@ class AWQMarlinConfig(QuantizationConfig):
         lm_head_quantized: bool,
         modules_to_not_convert: Optional[list[str]],
         full_config: dict[str, Any],
+        linear_fp8_config: Optional[Any] = None,
     ) -> None:
         super().__init__()
         if _is_hip:
@@ -270,6 +272,7 @@ class AWQMarlinConfig(QuantizationConfig):
         self.weight_bits = weight_bits
         self.modules_to_not_convert = modules_to_not_convert or []
         self.full_config = full_config
+        self.linear_fp8_config = linear_fp8_config
 
         if self.weight_bits not in self.TYPE_MAP:
             raise ValueError(
@@ -320,6 +323,23 @@ class AWQMarlinConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
+
+        # GLM NOTE: Parse linear_fp8_config if present (for mixed quantization scenarios)
+        # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
+        #          "quant_method": "fp8", "weight_block_size": [128, 128]}
+        linear_fp8_config = None
+        if "linear_fp8_config" in config:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_cfg = config["linear_fp8_config"]
+            is_fp8 = fp8_cfg.get("quant_method") == "fp8"
+            linear_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=is_fp8,
+                activation_scheme=fp8_cfg.get("activation_scheme", "dynamic"),
+                ignored_layers=fp8_cfg.get("ignored_layers"),
+                weight_block_size=fp8_cfg.get("weight_block_size"),
+            )
+
         return cls(
             weight_bits,
             group_size,
@@ -327,6 +347,7 @@ class AWQMarlinConfig(QuantizationConfig):
             lm_head_quantized,
             modules_to_not_convert,
             config,
+            linear_fp8_config=linear_fp8_config,
         )
 
     @classmethod
@@ -364,6 +385,8 @@ class AWQMarlinConfig(QuantizationConfig):
         ):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
+            if self.linear_fp8_config is not None:
+                return Fp8LinearMethod(self.linear_fp8_config)
             # Check if the layer is supported by AWQMarlin.
             if not check_marlin_supports_layer(layer, self.group_size):
                 logger.warning_once(

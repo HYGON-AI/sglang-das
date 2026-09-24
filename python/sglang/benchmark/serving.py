@@ -2090,6 +2090,12 @@ def run_benchmark(args_: argparse.Namespace):
             "`--tokenize-prompt` not compatible with image dataset"
         )
 
+    if args.dataset_name == "random-ids-raw":
+        assert args.backend in ("sglang", "sglang-native"), (
+            "`--dataset-name random-ids-raw` sends raw token IDs as `input_ids`, "
+            "which requires the native /generate backend."
+        )
+
     if args.lora_request_distribution in ["distinct", "skewed"]:
         assert args.lora_name is not None and len(args.lora_name) > 1, (
             "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
@@ -2252,6 +2258,7 @@ def cli_main():
             "openai",
             "random",
             "random-ids",
+            "random-ids-raw",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2343,6 +2350,13 @@ def cli_main():
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
+    )
+    parser.add_argument(
+        "--random-ids-raw-shared-prefix-len",
+        type=int,
+        default=0,
+        help="Shared token-ID prefix length for random-ids-raw. Requires "
+        "--random-range-ratio 1.0; the remaining input tokens form the unique tail.",
     )
     # image dataset args
     parser.add_argument(

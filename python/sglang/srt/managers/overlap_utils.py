@@ -566,8 +566,11 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and not _is_hcu:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                # HCU does not use this workaround: synchronize() blocks the
+                # scheduler host thread until the previous speculative step
+                # finishes and defeats single-batch overlap.
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()

@@ -60,6 +60,7 @@ def apply_all():
     _patch_rope_parameters_validation()
     _patch_broken_torchaudio_availability()
     _patch_removed_symbols()
+    _patch_image_processing_utils_fast_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
     _patch_nemotron_h_pattern()
@@ -342,6 +343,25 @@ def _patch_image_processor_kwargs():
     except ImportError:
         logger.debug(
             "_patch_image_processor_kwargs: BaseImageProcessor not importable, patch skipped"
+        )
+
+
+def _patch_image_processing_utils_fast_symbols():
+    """Re-export fast image processor kwargs renamed in newer transformers.
+
+    Some remote model code imports ``DefaultFastImageProcessorKwargs`` directly
+    from ``transformers.image_processing_utils_fast``. In newer transformers,
+    the equivalent type is ``ImagesKwargs`` in ``processing_utils``.
+    """
+    try:
+        import transformers.image_processing_utils_fast as _fast
+        from transformers.processing_utils import ImagesKwargs
+
+        if not hasattr(_fast, "DefaultFastImageProcessorKwargs"):
+            _fast.DefaultFastImageProcessorKwargs = ImagesKwargs
+    except ImportError:
+        logger.debug(
+            "_patch_image_processing_utils_fast_symbols: required modules not importable, patch skipped"
         )
 
 

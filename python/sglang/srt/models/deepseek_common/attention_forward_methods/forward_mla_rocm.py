@@ -27,6 +27,10 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.fused_rms_quant import (
+    fused_mla_qkv_a_rms_norm_per_token_quant,
+    supports_fused_mla_qkv_a_rms_quant_input,
+)
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
@@ -388,18 +392,32 @@ class DeepseekMLARocmForwardMixin:
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
+            qkv_latent = get_attn_tp_context().fetch_qkv_latent()
+            q_input_quant_args = None
+            use_hcu_norm_quant = (
+                self.use_lightop_mla_qkv_a_rms_quant
+                and not q_replicate_active
+                and supports_fused_mla_qkv_a_rms_quant_input(
+                    qkv_latent, self.q_a_layernorm.weight, self.kv_a_layernorm.weight
                 )
+            )
+            if use_hcu_norm_quant:
+                q_input_quant_args = fused_mla_qkv_a_rms_norm_per_token_quant(
+                    packed_input=qkv_latent,
+                    q_weight=self.q_a_layernorm.weight,
+                    kv_weight=self.kv_a_layernorm.weight,
+                    q_epsilon=self.q_a_layernorm.variance_epsilon,
+                    kv_epsilon=self.kv_a_layernorm.variance_epsilon,
+                )
+            q, latent_cache = qkv_latent.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if use_hcu_norm_quant:
+                pass  # Both normalized views were written into packed qkv_latent.
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -479,7 +497,7 @@ class DeepseekMLARocmForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q, input_quant_args=q_input_quant_args)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -504,7 +522,7 @@ class DeepseekMLARocmForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q, input_quant_args=q_input_quant_args)
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):

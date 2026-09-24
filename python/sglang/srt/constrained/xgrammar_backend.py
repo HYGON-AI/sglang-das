@@ -16,6 +16,7 @@
 import dataclasses
 import json
 import logging
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -120,6 +121,12 @@ class XGrammarGrammar(BaseGrammarObject):
         return _allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        stats = self.grammar_stats
+        if stats is not None and stats.first_mask_fill_time is None:
+            s = time.perf_counter()
+            self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+            stats.first_mask_fill_time = time.perf_counter() - s
+            return
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
@@ -153,7 +160,13 @@ class XGrammarGrammar(BaseGrammarObject):
         )
         if grammar_stats := self.grammar_stats:
             grammar_stats = dataclasses.replace(
-                grammar_stats, is_cache_hit=True, tree_traversal_time=[]
+                grammar_stats,
+                is_cache_hit=True,
+                tree_traversal_time=[],
+                first_mask_fill_time=None,
+                compilation_time=None,
+                ebnf_size=None,
+                schema_count=None,
             )
         return XGrammarGrammar(
             matcher,
@@ -367,7 +380,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+        return self._from_context(
+            ctx,
+            key_string,
+            GrammarStats(dispatch_type="ebnf", ebnf_size=len(key_string)),
+        )
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -409,6 +426,12 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )
+
+    def get_cache_stats(self) -> Tuple[int, int]:
+        entries = len(self.cache)
+        # get_cache_size_bytes only exists in xgrammar >= 0.2.6.
+        get_bytes = getattr(self.grammar_compiler, "get_cache_size_bytes", None)
+        return entries, int(get_bytes()) if get_bytes is not None else 0
 
     def reset(self):
         super().reset()

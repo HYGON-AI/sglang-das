@@ -240,6 +240,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",

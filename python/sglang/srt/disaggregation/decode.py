@@ -2857,7 +2857,7 @@ class SchedulerDisaggregationDecodeMixin:
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,

@@ -65,6 +65,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "The number of tokens sampled from the draft model in eagle2 each step.",
     ] = None
+    speculative_draft_lm_head_vp_size: A[
+        int,
+        "Node-local vocabulary parallel size for EAGLE draft top-1. Requires attention TP=1 and DP LM-head.",
+    ] = 1
     speculative_num_draft_tokens: A[
         Optional[int],
         "The number of tokens sampled from the draft model in Speculative Decoding.",
@@ -249,9 +253,7 @@ class Spec(msgspec.Struct):
     speculative_ngram_capacity: A[
         int,
         "The cache capacity for ngram speculative decoding.",
-    ] = (
-        10 * 1000 * 1000
-    )
+    ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
         "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",

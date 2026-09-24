@@ -27,7 +27,6 @@ import pickle
 import signal
 import sys
 import threading
-import zlib
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
@@ -39,15 +38,20 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
+    DetokenizerCompletionReq,
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
+    TokenizerWarmupResultBroadcastReq,
+    TokenizerWarmupResultReq,
+    TokenizerWorkerRegistrationAckReq,
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
@@ -416,6 +420,17 @@ class MultiHttpWorkerDetokenizerMixin:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
+            if isinstance(output, list):
+                for chunk in output:
+                    for i, ipc_name in enumerate(chunk.http_worker_ipcs):
+                        self.socket_mapping.send_output(
+                            ipc_name,
+                            _handle_output_by_index(chunk, i),
+                            is_tokenizer=True,
+                        )
+                self.acknowledge_finished_requests(recv_obj)
+                self.soft_watchdog.feed()
+                continue
             if output is not None:
                 # Fan out the output back to the originating tokenizer worker(s).
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
@@ -434,6 +449,8 @@ class MultiHttpWorkerDetokenizerMixin:
                     raise ValueError(
                         f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
                     )
+            if output is not None:
+                self.acknowledge_finished_requests(recv_obj)
             self.soft_watchdog.feed()
 
 
@@ -462,6 +479,12 @@ class MultiTokenizerRouter:
         self.receive_from_worker = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
         )
+        self.all_worker_ipcs: set[str] = set()
+        self.socket_mapping = SocketMapping()
+        self.warmup_worker_ipc: Optional[str] = None
+        self.warmup_worker_pid: Optional[int] = None
+        self.warmup_result: Optional[bool] = None
+
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -486,10 +509,9 @@ class MultiTokenizerRouter:
 
         self.disaggregation_bootstrap_server = start_disagg_service()
 
-        # Worker IPC names for pause/continue broadcasting
-        self.all_worker_ipcs: set[str] = set()
-        # Shared socket mapping (both coroutines run on self._loop, so safe)
-        self.socket_mapping = SocketMapping()
+        self._warmup_watchdog_task = asyncio.run_coroutine_threadsafe(
+            print_exception_wrapper(self.monitor_warmup_worker), self._loop
+        )
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -519,10 +541,33 @@ class MultiTokenizerRouter:
             if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
                     self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
+                    if self.warmup_worker_ipc is None:
+                        self.warmup_worker_ipc = recv_obj.worker_ipc_name
+                        self.warmup_worker_pid = recv_obj.worker_pid
                     logger.info(
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
+                self.socket_mapping.send_output(
+                    recv_obj.worker_ipc_name,
+                    TokenizerWorkerRegistrationAckReq(
+                        is_warmup_worker=(
+                            recv_obj.worker_ipc_name == self.warmup_worker_ipc
+                        ),
+                        warmup_result=self.warmup_result,
+                    ),
+                    is_tokenizer=True,
+                )
+                continue
+
+            if isinstance(recv_obj, TokenizerWarmupResultReq):
+                if recv_obj.worker_ipc_name != self.warmup_worker_ipc:
+                    logger.warning(
+                        "Ignoring warmup result from non-owner worker %s",
+                        recv_obj.worker_ipc_name,
+                    )
+                    continue
+                self._publish_warmup_result(recv_obj.success)
                 continue
 
             if isinstance(
@@ -544,6 +589,60 @@ class MultiTokenizerRouter:
 
             await async_sock_send(self.send_to_scheduler, recv_obj)
 
+    def _publish_warmup_result(self, success: bool):
+        if self.warmup_result is not None:
+            if self.warmup_result != success:
+                logger.error(
+                    "Ignoring conflicting tokenizer warmup result: current=%s new=%s",
+                    self.warmup_result,
+                    success,
+                )
+            return
+
+        self.warmup_result = success
+        result = TokenizerWarmupResultBroadcastReq(success=success)
+        for ipc_name in self.all_worker_ipcs:
+            self.socket_mapping.send_output(ipc_name, result, is_tokenizer=True)
+
+    async def monitor_warmup_worker(self):
+        while self.warmup_result is None:
+            await asyncio.sleep(1)
+            worker_pid = self.warmup_worker_pid
+            if worker_pid is None:
+                continue
+
+            try:
+                process = psutil.Process(worker_pid)
+                is_alive = (
+                    process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+                )
+            except psutil.Error:
+                is_alive = False
+
+            if not is_alive:
+                logger.error(
+                    "Warmup owner pid=%s exited before reporting a result", worker_pid
+                )
+                self._publish_warmup_result(False)
+                return
+
+    def _broadcast_unrouted_abort(self, recv_obj: AbortReq) -> None:
+        """Deliver an abort without owner metadata to every registered worker."""
+        worker_ipcs = tuple(self.all_worker_ipcs)
+        if not worker_ipcs:
+            logger.warning(
+                "Cannot route AbortReq for rid=%s: no tokenizer workers registered",
+                recv_obj.rid,
+            )
+            return
+
+        for ipc_name in worker_ipcs:
+            self.socket_mapping.send_output(
+                ipc_name,
+                recv_obj,
+                is_tokenizer=True,
+            )
+
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
         while True:
@@ -551,6 +650,10 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
+        if isinstance(recv_obj, AbortReq) and recv_obj.http_worker_ipc is None:
+            self._broadcast_unrouted_abort(recv_obj)
+            return
+
         if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
@@ -564,30 +667,103 @@ class MultiTokenizerRouter:
 
 
 class MultiDetokenizerRouter:
-    """Route scheduler outputs to one of N DetokenizerManager workers.
+    """Route each request to the least-loaded detokenizer worker.
 
-    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
-    ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
-    always land on the same detokenizer and ``decode_status`` stays consistent.
+    A request stays pinned to one worker because incremental decoding state is
+    local to that worker. Load is released only after the worker acknowledges
+    that it processed and sent the request's final output.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
         self.ipc_name_list = ipc_name_list
         self.num_workers = len(ipc_name_list)
         self.socket_mapping = SocketMapping()
-        context = zmq.Context(2)
+        self.worker_loads: Dict[str, int] = {ipc: 0 for ipc in ipc_name_list}
+        self.rid_to_worker: Dict[str, str] = {}
+        self.next_worker_index = 0
+
+        context = zmq.Context(3)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
+        assert port_args.detokenizer_ack_ipc_name is not None
+        self.recv_from_detokenizers = get_zmq_socket(
+            context,
+            zmq.PULL,
+            port_args.detokenizer_ack_ipc_name,
+            True,
+        )
+        self.poller = zmq.Poller()
+        self.poller.register(self.recv_from_scheduler, zmq.POLLIN)
+        self.poller.register(self.recv_from_detokenizers, zmq.POLLIN)
 
-    def _pick(self, key: str) -> str:
-        return self.ipc_name_list[zlib.crc32(key.encode()) % self.num_workers]
+    def _pick_least_loaded(self) -> str:
+        min_load = min(self.worker_loads.values())
+        for offset in range(self.num_workers):
+            index = (self.next_worker_index + offset) % self.num_workers
+            ipc_name = self.ipc_name_list[index]
+            if self.worker_loads[ipc_name] == min_load:
+                self.next_worker_index = (index + 1) % self.num_workers
+                return ipc_name
+        raise RuntimeError("No detokenizer worker is available")
+
+    def _get_or_assign_worker(self, rid: str) -> str:
+        if rid in self.rid_to_worker:
+            return self.rid_to_worker[rid]
+
+        ipc_name = self._pick_least_loaded()
+        self.rid_to_worker[rid] = ipc_name
+        self.worker_loads[ipc_name] += 1
+        return ipc_name
+
+    def _complete_requests(self, ipc_name: str, rids: List[str]) -> None:
+        for rid in rids:
+            assigned_ipc = self.rid_to_worker.get(rid)
+            if assigned_ipc is None:
+                logger.warning(f"Ignoring completion for unknown {rid=}")
+                continue
+            if assigned_ipc != ipc_name:
+                logger.warning(
+                    f"Ignoring completion from wrong detokenizer for {rid=}: "
+                    f"expected={assigned_ipc}, actual={ipc_name}"
+                )
+                continue
+
+            del self.rid_to_worker[rid]
+            self.worker_loads[ipc_name] -= 1
+
+    def _drain_completions(self) -> None:
+        while True:
+            try:
+                completion = sock_recv(self.recv_from_detokenizers, flags=zmq.NOBLOCK)
+                if not isinstance(completion, DetokenizerCompletionReq):
+                    logger.warning(
+                        "Ignoring unexpected detokenizer completion %s",
+                        type(completion),
+                    )
+                    continue
+                ipc_name, rids = completion.worker_ipc_name, completion.finished_rids
+            except zmq.Again:
+                return
+
+            if ipc_name not in self.worker_loads:
+                logger.warning(
+                    f"Ignoring completion from unknown detokenizer {ipc_name=}, {rids=}"
+                )
+                continue
+            self._complete_requests(ipc_name, rids)
 
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
     def event_loop(self):
         while True:
+            events = dict(self.poller.poll())
+            if self.recv_from_detokenizers in events:
+                self._drain_completions()
+            if self.recv_from_scheduler not in events:
+                continue
+
             recv_obj = sock_recv(self.recv_from_scheduler)
 
             # FreezeGCReq must freeze every detokenizer process.
@@ -596,12 +772,10 @@ class MultiDetokenizerRouter:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Control requests other than FreezeGCReq do not own incremental
+            # decode state, so send them round-robin without changing load.
             if isinstance(recv_obj, BaseReq):
-                assert recv_obj.http_worker_ipc is not None, (
-                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
-                )
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                self._send(self._pick_least_loaded(), recv_obj)
                 continue
 
             # Batch request.
@@ -619,13 +793,14 @@ class MultiDetokenizerRouter:
                     and all(x is not None for x in ipcs)
                 ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
 
-                # Split per-item and route each by its own ipc.
-                for i, ipc_key in enumerate(ipcs):
+                # Split per item. New requests go to the least-loaded worker;
+                # subsequent chunks remain pinned to the same worker.
+                for i, (rid, ipc_key) in enumerate(zip(recv_obj.rids, ipcs)):
                     one = _handle_output_by_index(recv_obj, i)
                     if one is recv_obj:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
                     one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(ipc_key), one)
+                    self._send(self._get_or_assign_worker(rid), one)
                 continue
 
             raise ValueError(
@@ -681,8 +856,15 @@ class TokenizerWorker(TokenizerManager):
             get_disagg().disaggregation_transfer_backend
         )
 
+        self.is_warmup_worker = False
+        self._registration_ack_event = asyncio.Event()
+        self.server_warmup_result: Optional[bool] = None
+        self._server_warmup_result_event = threading.Event()
+
         # Register this worker with the router for pause/continue broadcasting
-        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        reg = TokenizerWorkerRegistrationReq(
+            worker_ipc_name=self.tokenizer_ipc_name, worker_pid=self.worker_id
+        )
         self._dispatch_to_scheduler(reg)
 
         # Future for awaiting pause/continue broadcast confirmation
@@ -693,8 +875,75 @@ class TokenizerWorker(TokenizerManager):
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
+            [
+                (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (
+                    TokenizerWorkerRegistrationAckReq,
+                    self._handle_tokenizer_worker_registration_ack,
+                ),
+                (
+                    TokenizerWarmupResultBroadcastReq,
+                    self._handle_tokenizer_warmup_result,
+                ),
+            ]
         )
+
+    async def wait_for_warmup_assignment(self) -> bool:
+        await self._registration_ack_event.wait()
+        return self.is_warmup_worker
+
+    def wait_for_server_warmup_result(self) -> bool:
+        self._server_warmup_result_event.wait()
+        return bool(self.server_warmup_result)
+
+    def report_server_warmup_result(self, success: bool):
+        message = TokenizerWarmupResultReq(
+            worker_ipc_name=self.tokenizer_ipc_name,
+            success=success,
+        )
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is self.event_loop:
+            self._dispatch_to_scheduler(message)
+            return
+
+        if self.event_loop is None:
+            raise RuntimeError("Tokenizer event loop is not initialized")
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_server_warmup_result(message), self.event_loop
+        )
+        future.result(timeout=10)
+
+    async def _send_server_warmup_result(self, message: TokenizerWarmupResultReq):
+        self._dispatch_to_scheduler(message)
+
+    def _handle_tokenizer_worker_registration_ack(
+        self, obj: TokenizerWorkerRegistrationAckReq
+    ):
+        self.is_warmup_worker = obj.is_warmup_worker
+        if obj.warmup_result is not None:
+            self._set_server_warmup_result(obj.warmup_result)
+        self._registration_ack_event.set()
+
+    def _handle_tokenizer_warmup_result(self, obj: TokenizerWarmupResultBroadcastReq):
+        self._set_server_warmup_result(obj.success)
+
+    def _set_server_warmup_result(self, success: bool):
+        if (
+            self.server_warmup_result is not None
+            and self.server_warmup_result != success
+        ):
+            logger.error(
+                "Received conflicting server warmup result: current=%s new=%s",
+                self.server_warmup_result,
+                success,
+            )
+            return
+        self.server_warmup_result = success
+        self._server_warmup_result_event.set()
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         loop = asyncio.get_event_loop()

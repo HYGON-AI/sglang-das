@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -52,7 +52,6 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -60,6 +59,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+from sglang.srt.mem_cache.layer_split import MainKVPagePlan
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,
@@ -112,7 +112,6 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
-_is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -123,9 +122,6 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 _is_hcu = is_hcu()
-
-if _is_xpu:
-    from sgl_kernel import store_cache_xpu
 
 
 def conv_window_dedup_enabled(
@@ -178,15 +174,6 @@ def _set_kv_buffer_impl(
             row_bytes=row_bytes,
             v_row_bytes=v_row_bytes,
             size_limit=size_limit,
-        )
-
-    if _is_xpu and v_row_dim == row_dim:
-        return store_cache_xpu(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
-            k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
-            indices,
         )
 
     # store_cache_cpu takes a single row_dim for both K and V, so it only serves
@@ -280,13 +267,6 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
-    # Extra pre-allocation headroom (reserved for in-transfer decode requests).
-    # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
-    # positive value. Declared here so callers can read it without getattr.
-    pre_alloc_size: int = 0
-    # Class default: some decode pools borrow another __init__ (see
-    # DecodeReqToTokenPool) but inherit alloc_rows.
-    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
 
     def __init__(
         self,
@@ -350,8 +330,6 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
-        if self._on_alloc_rows is not None:
-            self._on_alloc_rows(select_index)
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
@@ -376,10 +354,6 @@ class ReqToTokenPool:
     def attach_aux_cache(self, aux_cache: Any) -> None:
         assert self._aux_cache is None
         self._aux_cache = aux_cache
-
-    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
-        assert self._on_alloc_rows is None
-        self._on_alloc_rows = hook
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:
@@ -407,15 +381,6 @@ class MambaPool:
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
     conv_window_axis = -1
-
-    # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
-    # class-level default because UnifiedMambaPool skips MambaPool.__init__.
-    _slot_siblings: Tuple = ()
-
-    def register_slot_state(self, state) -> None:
-        """Attach a state that rides along on clear / copy / host round-trip,
-        so a slot never changes owner with a stale sibling row attached."""
-        self._slot_siblings = [*self._slot_siblings, state]
 
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -514,7 +479,7 @@ class MambaPool:
                 *physical_conv_shape,
             ),
             dtype=conv_dtype,
-            device=self.device,
+            device="cuda",
         )
         physical_conv_strides = phys.stride()[2:]
         window_stride = physical_conv_strides[window_axis]
@@ -571,6 +536,12 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        self.use_hcu_kda = cache_params.use_hcu_kda
+        self.use_hcu_kda_replayssm = bool(
+            enable_linear_replayssm_spec and self.use_hcu_kda
+        )
+        if self.use_hcu_kda_replayssm and ssm_dtype != torch.float32:
+            raise ValueError("GLM5-Next ReplaySSM requires float32 Mamba state")
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
@@ -680,7 +651,9 @@ class MambaPool:
                 # decode-ring), so skipping them would flip KDA decode to the
                 # fused path, a behavior change needing its own validation
                 # (memory follow-up).
-                if self.replayssm_spec_fold and not cache_params.is_kda:
+                if self.use_hcu_kda_replayssm or (
+                    self.replayssm_spec_fold and not cache_params.is_kda
+                ):
                     record_len = (
                         speculative_num_draft_tokens
                         if speculative_num_draft_tokens is not None
@@ -688,7 +661,9 @@ class MambaPool:
                     )
                 else:
                     record_len = L
-                if not self.replayssm_spec_fold or cache_params.is_kda:
+                if not self.replayssm_spec_fold or (
+                    cache_params.is_kda and not self.use_hcu_kda_replayssm
+                ):
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,
@@ -715,7 +690,9 @@ class MambaPool:
                 # KDA still uses raw-input fold-every-commit. GDN materializes
                 # its compact d/k/g history directly and needs no duplicate ring.
                 if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
+                    if not self.use_hcu_kda_replayssm and (
+                        cache_params.is_kda or not self.replayssm_spec_fold
+                    ):
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
@@ -761,8 +738,15 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
+                if _is_npu:
+                    temporal_state = temporal_state.transpose(-1, -2)
+                    temporal_state_shape = (
+                        *temporal_state_shape[:-2],
+                        temporal_state_shape[-1],
+                        temporal_state_shape[-2],
+                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
@@ -789,7 +773,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device=device,
+                        device="cuda",
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -857,7 +841,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device=device,
+                            device="cuda",
                         )
                         for conv_shape in dense_conv_shapes
                     ]
@@ -1004,8 +988,6 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
-        for sibling in self._slot_siblings:
-            sibling.reset_slots(indices)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
@@ -1076,8 +1058,6 @@ class MambaPool:
             ]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
-        for sibling in self._slot_siblings:
-            sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1088,19 +1068,10 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
-        siblings_cpu = [s.get_cpu_slots(indices) for s in self._slot_siblings]
         current_platform.synchronize()
-        if self._slot_siblings:
-            return conv_cpu, temporal_cpu, siblings_cpu
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        # The trailing element exists exactly when this instance registered siblings:
-        # the pool that saved the copy is the pool that loads it.
-        siblings_cpu = None
-        if self._slot_siblings:
-            siblings_cpu = mamba_cache_cpu[-1]
-            mamba_cache_cpu = mamba_cache_cpu[:-1]
         # Accept historical 3-tuples, but request-keyed replay scratch is not
         # restored with a physical checkpoint slot.
         if len(mamba_cache_cpu) == 3:
@@ -1113,9 +1084,6 @@ class MambaPool:
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
-        if siblings_cpu is not None:
-            for sibling, data in zip(self._slot_siblings, siblings_cpu):
-                sibling.load_cpu_slots(data, indices)
         current_platform.synchronize()
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
@@ -1131,8 +1099,8 @@ class MambaPool:
         }
     )
 
-    def _iter_transfer_state_entries(self):
-        """Yield ``[slot, ...]`` state entries and their transfer metadata."""
+    def _iter_transfer_state_tensors(self):
+        """Yield transferable state tensors with their per-slot slice axis."""
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
@@ -1143,20 +1111,20 @@ class MambaPool:
                 # empty. Advertising it fails the whole batch registration.
                 if state_tensor.numel() == 0:
                     continue
-                for layer_index, layer_id in enumerate(self.mamba_layer_ids):
-                    yield field, state_tensor[layer_index], slice_axis, layer_id
-
-        for sibling in self._slot_siblings:
-            yield from sibling.iter_transfer_state_entries()
+                yield field, state_tensor, slice_axis
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor, _, _ in self._iter_transfer_state_entries():
-            data_ptrs.append(state_tensor.data_ptr())
-            data_lens.append(state_tensor.nbytes)
-            item_lens.append(state_tensor[0].nbytes)
+        for _, state_tensor, _ in self._iter_transfer_state_tensors():
+            data_ptrs += [
+                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
+            ]
+            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
+            item_lens += [
+                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
+            ]
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
@@ -1166,17 +1134,13 @@ class MambaPool:
         while Kimi conv state uses the second per-slot axis.
         """
         dim_per_tensor = []
-        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
-            # Zero is a protocol marker for request state replicated across the
-            # attention-TP group. Heterogeneous PD copies the whole item from one
-            # elected source rank instead of slicing it as a TP-sharded tensor.
-            if slice_axis is None:
-                dim_per_tensor.append(0)
-                continue
-            # state_tensor shape: [size+1, sliceable_dim, ...]. Kimi conv state
-            # transposes the two per-slot axes to [K-1, dim].
-            axis = 1 + slice_axis
-            dim_per_tensor.append(state_tensor.shape[axis])
+        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
+            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
+            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
+            axis = 2 + slice_axis
+            sliceable_dim = state_tensor.shape[axis]
+            # Repeat for each layer since we have per-layer data_ptrs
+            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
 
     def get_state_layer_ids(self):
@@ -1186,18 +1150,15 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
-        return [layer_id for _, _, _, layer_id in self._iter_transfer_state_entries()]
+        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
+        return list(self.mamba_layer_ids) * state_tensor_count
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
         outer_counts = []
-        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
-            outer_count = (
-                1
-                if slice_axis is None
-                else math.prod(state_tensor.shape[1 : 1 + slice_axis])
-            )
-            outer_counts.append(outer_count)
+        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
+            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
+            outer_counts += [outer_count] * self.num_mamba_layers
         return outer_counts
 
     def get_state_conv_shard_groups(self):
@@ -1212,14 +1173,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field, _, _, _ in self._iter_transfer_state_entries():
+        for field, _, _ in self._iter_transfer_state_tensors():
             # Only conv_state carries a q/k/v decomposition.
             subdims = (
                 list(self.conv_shard_groups)
                 if field == "conv" and self.conv_shard_groups is not None
                 else None
             )
-            subdims_per_tensor.append(subdims)
+            subdims_per_tensor += [subdims] * self.num_mamba_layers
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
@@ -1252,10 +1213,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
-        short_conv_layer_ids: Optional[List[int]] = None,
-        short_conv_state_shape: Optional[Tuple[int, int]] = None,
-        ngram_context_len: int = 0,
-        ngram_eos_token_id: int = 0,
     ):
         super().__init__(
             size=size,
@@ -1270,7 +1227,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
-        self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1284,10 +1240,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            short_conv_layer_ids=short_conv_layer_ids,
-            short_conv_state_shape=short_conv_state_shape,
-            ngram_context_len=ngram_context_len,
-            ngram_eos_token_id=ngram_eos_token_id,
         )
 
     def _init_mamba_pool(
@@ -1304,10 +1256,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
-        short_conv_layer_ids: Optional[List[int]] = None,
-        short_conv_state_shape: Optional[Tuple[int, int]] = None,
-        ngram_context_len: int = 0,
-        ngram_eos_token_id: int = 0,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1329,36 +1277,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
-        # Qwen4-Exp PLE side states; built disabled rather than None without a config,
-        # so every hybrid model has both attributes.
-        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
-
-        self.short_conv_pool = ShortConvPool(
-            size=mamba_size,
-            spec_state_size=mamba_spec_state_size,
-            state_shape=short_conv_state_shape,
-            layer_ids=short_conv_layer_ids or [],
-            dtype=cache_params.dtype.conv,
-            device=device,
-            enable_memory_saver=self.enable_memory_saver,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        )
-        self.ngram_pool = NGramPool(
-            size=mamba_size,
-            spec_state_size=mamba_spec_state_size,
-            context_len=ngram_context_len,
-            eos_token_id=ngram_eos_token_id,
-            device=device,
-            enable_memory_saver=self.enable_memory_saver,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        )
-        # Disabled pools stay off the sibling list so the host-offload payload
-        # keeps its legacy shape for every non-PLE hybrid model.
-        if self.short_conv_pool.enabled:
-            self.mamba_pool.register_slot_state(self.short_conv_pool)
-        if self.ngram_pool.enabled:
-            self.mamba_pool.register_slot_state(self.ngram_pool)
-
         # Optional int8 checkpoint pool: the radix caches states here (int8) instead
         # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
         # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
@@ -1372,15 +1290,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_layer_ids=mamba_layer_ids,
             device=device,
         )
-        if self.mamba_ckpt_pool is not None and (
-            self.short_conv_pool.enabled or self.ngram_pool.enabled
-        ):
-            # The int8 checkpoint pool frees the bf16 slot after donating its state,
-            # taking the bf16-slot-indexed PLE side states with it.
-            raise ValueError(
-                "--enable-int8-mamba-checkpoint is incompatible with Qwen4-Exp "
-                "PLE side states"
-            )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
@@ -1496,28 +1405,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
-    @property
-    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
-        """The mamba virtual->physical slot table, or None when the ids this
-        pool hands out are already physical."""
-        return None
-
-    @property
-    def mamba_translate_is_fusable(self) -> bool:
-        """Whether `fused_replay_state_indices` can reproduce this pool's
-        `translate_mamba_indices` in its own launch.
-
-        The kernel expresses exactly two shapes: the identity, and one gather
-        through `mamba_v2p_table`. A subclass that replaces the translate with
-        anything else is excluded here rather than silently mis-served.
-        """
-        if self.mamba_v2p_table is not None:
-            return True
-        return (
-            type(self).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
-        )
-
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
         (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
@@ -1539,27 +1426,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
-
-    def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.short_conv_pool.layer_cache(layer_id)
-
-    def short_conv_layer_intermediate_cache(
-        self, layer_id: int
-    ) -> Optional[torch.Tensor]:
-        return self.short_conv_pool.layer_intermediate_cache(layer_id)
-
-    def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
-        return self.ngram_pool.get_context(ngram_indices)
-
-    def set_ngram_context(
-        self, ngram_indices: torch.Tensor, context: torch.Tensor
-    ) -> None:
-        self.ngram_pool.set_context(ngram_indices, context)
-
-    def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
-        self.ngram_pool.set_intermediate_context(context)
 
     def copy_mamba_state(
         self, src_index: torch.Tensor, dst_index: torch.Tensor
@@ -1730,8 +1596,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
-        self.short_conv_pool.clear()
-        self.ngram_pool.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a
         # flush/reset drops the radix tree, so its slots must be released too,
         # otherwise the (now unreferenced) slots leak and break the int8-pool
@@ -2151,8 +2015,6 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_scale_buffer = None
             self.v_scale_buffer = None
-            self.native_k_scale_buffer = None
-            self.native_v_scale_buffer = None
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
@@ -2181,8 +2043,6 @@ class MHATokenToKVPool(KVCache):
         self.v_buffer = buf["v_buffer"]
         self.k_scale_buffer = buf.get("k_scale_buffer")
         self.v_scale_buffer = buf.get("v_scale_buffer")
-        self.native_k_scale_buffer = buf.get("native_k_scale_buffer")
-        self.native_v_scale_buffer = buf.get("native_v_scale_buffer")
         self.dq_k_buffer = buf.get("dq_k_buffer")
         self.dq_v_buffer = buf.get("dq_v_buffer")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
@@ -2192,24 +2052,6 @@ class MHATokenToKVPool(KVCache):
         expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
         has_k_workspace = self.dq_k_buffer is not None
         has_v_workspace = self.dq_v_buffer is not None
-        has_k_native_scales = self.native_k_scale_buffer is not None
-        has_v_native_scales = self.native_v_scale_buffer is not None
-        requires_native_scales = (
-            self.quant_method.needs_native_fp4_scales()
-            if hasattr(self.quant_method, "needs_native_fp4_scales")
-            else False
-        )
-        if has_k_native_scales != has_v_native_scales:
-            raise RuntimeError(
-                f"KV cache method {self.quant_method.name!r} created only one "
-                "native FP4 scale buffer."
-            )
-        if requires_native_scales != has_k_native_scales:
-            expectation = "requires" if requires_native_scales else "does not require"
-            raise RuntimeError(
-                f"KV cache method {self.quant_method.name!r} {expectation} native "
-                f"FP4 scales, but buffer presence is {has_k_native_scales}."
-            )
         if has_k_workspace != has_v_workspace:
             raise RuntimeError(
                 f"KV cache method {self.quant_method.name!r} created only one "
@@ -2448,16 +2290,6 @@ class MHATokenToKVPool(KVCache):
             del self.k_scale_buffer
         if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
             del self.v_scale_buffer
-        if (
-            hasattr(self, "native_k_scale_buffer")
-            and self.native_k_scale_buffer is not None
-        ):
-            del self.native_k_scale_buffer
-        if (
-            hasattr(self, "native_v_scale_buffer")
-            and self.native_v_scale_buffer is not None
-        ):
-            del self.native_v_scale_buffer
         if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
             del self.dq_k_buffer
         if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
@@ -2474,9 +2306,6 @@ class MHATokenToKVPool(KVCache):
         if getattr(self, "k_scale_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
             v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
-        if getattr(self, "native_k_scale_buffer", None) is not None:
-            k_size_bytes += get_tensor_size_bytes(self.native_k_scale_buffer)
-            v_size_bytes += get_tensor_size_bytes(self.native_v_scale_buffer)
         if getattr(self, "dq_k_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
             v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
@@ -2673,21 +2502,21 @@ class MHATokenToKVPool(KVCache):
                 # Overlap the copy of K and V cache for small batch size
                 current_stream = self.device_module.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
+                self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = (
+                    cache_k
+                )
                 with self.device_module.stream(self.alt_stream):
                     self.v_buffer[layer_id - self.start_layer][
                         page_idxs, :, :, offsets
                     ] = cache_v
                 current_stream.wait_stream(self.alt_stream)
             else:
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
-                self.v_buffer[layer_id - self.start_layer][
-                    page_idxs, :, :, offsets
-                ] = cache_v
+                self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = (
+                    cache_k
+                )
+                self.v_buffer[layer_id - self.start_layer][page_idxs, :, :, offsets] = (
+                    cache_v
+                )
             return
 
         if dcp_kv_mask is not None:
@@ -2794,12 +2623,6 @@ class MHATokenToKVPool(KVCache):
         loc, _, _ = unwrap_write_loc(loc_info)
         local_layer_id = layer_id - self.start_layer
         k_scale, v_scale = self._quantized_scales(global_layer_id, k_scale, v_scale)
-        native_scale_kwargs = {}
-        if self.native_k_scale_buffer is not None:
-            native_scale_kwargs = {
-                "native_k_scale_buffer": self.native_k_scale_buffer[local_layer_id],
-                "native_v_scale_buffer": self.native_v_scale_buffer[local_layer_id],
-            }
         self.quant_method.quantize_and_store(
             self.k_buffer[local_layer_id],
             self.v_buffer[local_layer_id],
@@ -2818,7 +2641,6 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
-            **native_scale_kwargs,
         )
 
     def get_raw_kv_buffer(
@@ -3137,7 +2959,6 @@ class MHATokenToKVPool(KVCache):
             for kb, vb in zip(self.k_buffer, self.v_buffer):
                 kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
-            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
@@ -3151,7 +2972,6 @@ class MHATokenToKVPool(KVCache):
                 move_kv_cache_native(
                     self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
                 )
-            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         N = tgt_loc.numel()
@@ -3175,7 +2995,6 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(N),
                 cfg,
             )
-            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
@@ -3191,21 +3010,6 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(chunk_len),
                 cfg,
             )
-        self._move_native_fp4_scales(tgt_loc, src_loc)
-
-    def _move_native_fp4_scales(
-        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
-    ) -> None:
-        if self.native_k_scale_buffer is None:
-            return
-        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
-            move_nvfp4_native_scales,
-        )
-
-        for k_scale, v_scale in zip(
-            self.native_k_scale_buffer, self.native_v_scale_buffer
-        ):
-            move_nvfp4_native_scales(k_scale, v_scale, tgt_loc, src_loc)
 
 
 class NoOpMHATokenToKVPool(MHATokenToKVPool):
@@ -3947,6 +3751,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        glm5_next_pool_kwargs: Optional[dict] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -4016,7 +3821,12 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            self.full_kv_pool = DSATokenToKVPool(
+            dsa_pool_cls = DSATokenToKVPool
+            if glm5_next_pool_kwargs is not None:
+                from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
+
+                dsa_pool_cls = Glm5NextDSATokenToKVPool
+            self.full_kv_pool = dsa_pool_cls(
                 size=size,
                 page_size=self.page_size,
                 kv_lora_rank=kv_lora_rank,
@@ -4032,6 +3842,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                **(glm5_next_pool_kwargs or {}),
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -4054,6 +3865,11 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **(
+                    {"override_kv_cache_dim": kv_cache_dim}
+                    if TokenToKVPoolClass is MLATokenToKVPool
+                    else {}
+                ),
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -4063,6 +3879,10 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def is_hcu_glm5_next_pool(self) -> bool:
+        return getattr(self.full_kv_pool, "is_hcu_glm5_next_pool", False)
 
     @property
     def post_capture_active(self) -> bool:
@@ -4124,9 +3944,14 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
-        if self.use_mla and _is_npu and layer_ids:
-            data_ptrs, _, _ = self.get_contiguous_buf_infos()
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
+        if getattr(self.full_kv_pool, "is_hcu_glm5_next_pool", False):
+            layer_ids = [
+                layer_id
+                for layer_id in layer_ids
+                if self.full_kv_pool._is_layer_owned(
+                    self.full_attention_layer_id_mapping[layer_id]
+                )
+            ]
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4467,6 +4292,165 @@ class HybridLinearKVPool(KVCache):
             dst_logical_start=dst_logical_start,
         )
 
+    @property
+    def layer_shard_enabled(self) -> bool:
+        return bool(getattr(self.full_kv_pool, "layer_shard_enabled", False))
+
+    @property
+    def layer_shard_rank(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "layer_shard_rank", None)
+
+    @property
+    def layer_shard_size(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_size", 1)
+
+    @property
+    def layer_shard_rank_offset(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_rank_offset", 0)
+
+    @property
+    def layer_shard_start(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_start", 0)
+
+    def get_key_buffer_with_prefetch_history(self, layer_id: int, *, has_history: bool):
+        """Read one MLA layer while preserving the current batch's history state."""
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_buffer_with_prefetch_history(
+            layer_id, has_history=has_history
+        )
+
+    def configure_main_kv_page_plan(
+        self,
+        page_plan: Optional[MainKVPagePlan],
+        batch_marker: Any,
+    ) -> None:
+        if not self.use_mla:
+            return
+        configure = getattr(self.full_kv_pool, "configure_main_kv_page_plan", None)
+        if configure is not None:
+            configure(page_plan, batch_marker)
+
+    def translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
+        if not self.use_mla:
+            return loc
+        translate = getattr(self.full_kv_pool, "translate_main_kv_loc_to_compact", None)
+        return loc if translate is None else translate(loc)
+
+    def prefetch_mla_kv_buffer(
+        self, layer_id: int, *, has_history: bool = True
+    ) -> None:
+        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
+            return
+        if layer_id not in self.full_attention_layer_id_mapping:
+            return
+
+        full_layer_id = self._transfer_full_attention_id(layer_id)
+        from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
+
+        if not isinstance(self.full_kv_pool, Glm5NextDSATokenToKVPool):
+            self.full_kv_pool.prefetch_kv_buffer(
+                full_layer_id,
+                layer_transfer_counter=self.layer_transfer_counter,
+                layer_transfer_idx=layer_id - self.start_layer,
+            )
+            return
+        layer_transfer_idx = layer_id - self.start_layer
+        # The cold-chunk scratch fill is implemented by the HCU DSA write
+        # paths below. Preserve the existing broadcast behavior elsewhere.
+        has_history = has_history or not _is_hcu
+        if (
+            self.use_dsa
+            and _is_hcu
+            and hasattr(self.full_kv_pool, "prefetch_index_buffer")
+        ):
+            self.full_kv_pool.prefetch_index_buffer(
+                full_layer_id,
+                layer_transfer_counter=self.layer_transfer_counter,
+                layer_transfer_idx=layer_transfer_idx,
+                has_history=has_history,
+            )
+        self.full_kv_pool.prefetch_kv_buffer(
+            full_layer_id,
+            layer_transfer_counter=self.layer_transfer_counter,
+            layer_transfer_idx=layer_transfer_idx,
+            has_history=has_history,
+        )
+
+    def get_hcu_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_hcu_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id)
+        )
+
+    def get_kpool_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_kpool_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id)
+        )
+
+    def commit_hcu_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.commit_hcu_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id), loc
+        )
+
+    def commit_kpool_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.commit_kpool_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id), loc
+        )
+
+    def get_index_k_with_scale_buffer_broadcast(self, layer_id: int) -> torch.Tensor:
+        assert self.use_dsa, (
+            "get_index_k_with_scale_buffer_broadcast called when use_dsa is False"
+        )
+        return self.full_kv_pool.get_index_k_with_scale_buffer_broadcast(
+            self._get_dsa_layer_id(layer_id)
+        )
+
+    def get_index_k_scale_buffer_with_prefetch_history(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+        *,
+        has_history: bool,
+    ):
+        return self.full_kv_pool.get_index_k_scale_buffer_with_prefetch_history(
+            self._get_dsa_layer_id(layer_id),
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
+            has_history=has_history,
+        )
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        if not self.layer_shard_enabled:
+            return True
+        return self.full_kv_pool._is_layer_owned(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def _owned_local_layer_range(self) -> tuple[int, int]:
+        return self.full_kv_pool._owned_local_layer_range()
+
+    def get_tail_buffers(self, layer_id: int):
+        return self.full_kv_pool.get_tail_buffers(self._get_dsa_layer_id(layer_id))
+
+    def get_tail_buf_infos(self):
+        if not self.use_dsa:
+            return [], [], []
+        return self.full_kv_pool.get_tail_buf_infos()
+
+    def _get_dsa_layer_id(self, layer_id: int) -> int:
+        assert self.use_dsa, "DSA index cache called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        return self._transfer_full_attention_id(layer_id)
+
 
 class MLATokenToKVPool(KVCache):
     def __init__(
@@ -4507,7 +4491,7 @@ class MLATokenToKVPool(KVCache):
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if override_kv_cache_dim is not None
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -4644,6 +4628,10 @@ class MLATokenToKVPool(KVCache):
             "door means an attention backend took a write path that never "
             "declared which loc space it emits."
         )
+        if cache_k.shape[-1] < self.kv_cache_dim:
+            cache_k = torch.nn.functional.pad(
+                cache_k, (0, self.kv_cache_dim - cache_k.shape[-1])
+            )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4664,6 +4652,10 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_dsa and self.dsa_kv_cache_store_fp8)
         cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+        if cache_k.shape[-1] < self.kv_cache_dim:
+            cache_k = torch.nn.functional.pad(
+                cache_k, (0, self.kv_cache_dim - cache_k.shape[-1])
+            )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -4798,9 +4790,6 @@ class MLATokenToKVPool(KVCache):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        indices = maybe_dcp_kernel_indices(
-            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
-        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4820,9 +4809,6 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        indices = maybe_dcp_kernel_indices(
-            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
-        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -5120,7 +5106,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ]
 
     @property
-
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
         return not self.skip_topk_layers[local_layer_idx]
 
@@ -5476,6 +5461,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             req_pool_index,
         )
         torch.cuda.synchronize()
+
     def set_index_k_buffer(
         self,
         layer_id: int,

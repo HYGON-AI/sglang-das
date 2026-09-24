@@ -31,11 +31,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -56,6 +57,24 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         self.weight_block_size = self.weight_quant.block_structure
         if self.weight_block_size is not None:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+
+    @property
+    def supports_fp8_prequantized_input(self) -> bool:
+        """Whether this scheme can consume LightOp's per-token FP8 pair.
+
+        The HCU DeepGEMM tuple path expects channelwise weights in transposed
+        layout and dynamic per-token activation scales.  Keep the capability
+        narrow so block/static schemes and AITER's shuffled weight layout stay
+        on their existing quantization path.
+        """
+
+        return bool(
+            _is_hcu
+            and not _use_aiter
+            and self.strategy == QuantizationStrategy.CHANNEL
+            and not self.is_static_input_scheme
+            and self.weight_block_size is None
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -243,6 +262,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             # orig_dtype (when present) sets the GEMM output dtype.
             qx, x_scale = x[0], x[1]
             out_dtype = x[2] if len(x) > 2 else None
+            if _is_hcu:
+                # HCU's fused SwiGLU producer emits one dynamic scale per
+                # token. Preserve the pair so apply_fp8_linear selects its
+                # DeepGEMM prequantized-input path instead of the generic
+                # scalar-scale path (which only accepts scale.numel() == 1).
+                return apply_fp8_linear(
+                    input=(qx, x_scale),
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                    pre_quant_output_dtype=out_dtype,
+                )
             return apply_fp8_linear(
                 input=qx,
                 weight=layer.weight,

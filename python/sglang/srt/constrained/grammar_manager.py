@@ -8,13 +8,14 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
+    GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
 )
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -49,12 +50,50 @@ class GrammarManager:
             else False
         )
 
+        # When glm_decoding_constraint_module is set, create_grammar_backend skips
+        # the ReasonerGrammarBackend wrap. That leaves JSON grammars active from
+        # token 0, so reasoning ("<think>...") cannot open. Build a dedicated
+        # reasoner backend for JSON only; regex / ebnf / structural_tag keep
+        # the GLM-managed path unchanged.
+        self.json_reasoner_grammar_backend = None
+        if (
+            self.grammar_backend is not None
+            and get_serving().glm_decoding_constraint_module
+            and get_serving().reasoning_parser
+            and (
+                scheduler.model_config.think_end_ids
+                or getattr(scheduler.tokenizer, "think_end_id", None) is not None
+            )
+        ):
+            from sglang.srt.constrained.reasoner_grammar_backend import (
+                ReasonerGrammarBackend,
+            )
+            from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+            reasoning_parser = ReasoningParser(
+                model_type=get_serving().reasoning_parser,
+                stream_reasoning=False,
+                tokenizer=scheduler.tokenizer,
+            )
+            self.json_reasoner_grammar_backend = ReasonerGrammarBackend(
+                self.grammar_backend,
+                reasoning_parser,
+                scheduler.tokenizer,
+                enable_strict_thinking=get_serving().enable_strict_thinking,
+            )
+
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
         self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
-        self.pp_rank = get_parallel().pp_rank
-        self.pp_size = get_parallel().pp_size
+        self.grammar_cp_sync_group = scheduler.attn_cp_cpu_group
+        # With DP attention, dp_tp_group contains only attention-TP ranks.
+        # CP ranks share requests too and must admit compiled grammars together.
+        self.grammar_cp_sync_size = (
+            scheduler.ps.attn_cp_size if scheduler.enable_dp_attention else 1
+        )
+        self.pp_rank = scheduler.ps.pp_rank
+        self.pp_size = scheduler.ps.pp_size
         self.pp_group = scheduler.pp_group
         self.grammar_pp_sync_work_list = []
 
@@ -66,9 +105,34 @@ class GrammarManager:
     def __len__(self):
         return len(self.grammar_queue)
 
+    def _get_grammar_backend(self, key):
+        # Route JSON through the reasoner-wrapped backend when it exists;
+        # regex / structural_tag / ebnf keep the original grammar_backend.
+        if (
+            self.json_reasoner_grammar_backend is not None
+            and key is not None
+            and key[0] == "json"
+        ):
+            return self.json_reasoner_grammar_backend
+        return self.grammar_backend
+
+    def _log_grammar_stats(self, grammar_stats) -> None:
+        # GLM NOTE: emitted when the grammar attaches (cache hit / compile
+        # done / timeout); tree_traversal_time has no writers yet, so nothing
+        # is lost by not waiting for request finish.
+        if grammar_stats is not None and self.scheduler.metrics_reporter.enable_metrics:
+            self.scheduler.metrics_collector.log_grammar_stats(grammar_stats)
+
+    def get_cache_stats(self):
+        if self.grammar_backend is None:
+            return 0, 0
+        return self.grammar_backend.get_cache_stats()
+
     def clear(self):
         if self.grammar_backend:
             self.grammar_backend.reset()
+        if self.json_reasoner_grammar_backend is not None:
+            self.json_reasoner_grammar_backend.reset()
 
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
@@ -160,18 +224,13 @@ class GrammarManager:
                 elif req.sampling_params.regex is not None:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
-                    key_type = (
-                        "full_assistant_ebnf"
-                        if req.sampling_params.ebnf_full_assistant
-                        else "ebnf"
-                    )
-                    key = (key_type, req.sampling_params.ebnf)
+                    key = ("ebnf", req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
-                value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                    key, req.require_reasoning
-                )
+                value, cache_hit = self._get_grammar_backend(
+                    key
+                ).get_cached_or_future_value(key, req.require_reasoning)
                 req.grammar = value
 
                 if not cache_hit:
@@ -187,6 +246,7 @@ class GrammarManager:
                         req.set_finish_with_abort(error_msg)
                     else:
                         self._apply_request_reasoning_config(req)
+                        self._log_grammar_stats(value.grammar_stats)
         elif self._enable_strict_thinking:
             grammar_obj = self.grammar_backend.init_strict_reasoning_grammar(
                 req.require_reasoning
@@ -204,10 +264,9 @@ class GrammarManager:
         """
         Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
 
-        For PP0, DP/TP group rank i returns two sets ready_reqs_i,
-        failed_reqs_i. ready_reqs_all = all_gather(ready_reqs_i) within
-        PP0's DP/TP group. failed_reqs_all = all_gather(failed_reqs_i)
-        within PP0's DP/TP group.
+        For PP0, each attention TP/CP rank i returns two sets ready_reqs_i,
+        failed_reqs_i. Gather both sets across the ranks sharing each request,
+        first within the attention TP group, then within the CP group.
 
         ready_reqs = intersect(ready_reqs_all)
         failed_reqs = union(failed_reqs_all)
@@ -257,16 +316,20 @@ class GrammarManager:
                         # The actual waiting time is SGLANG_GRAMMAR_MAX_POLL_ITERATIONS * max(SGLANG_GRAMMAR_POLL_INTERVAL, GPU_forward_batch_latency)
                         failed_req_idxs.add(i)
 
-            # Sync ready and failed requests across all TP ranks in PP0.
-            if self.grammar_sync_size == 1:
-                synced_ready_req_idxs = ready_req_idxs
-                synced_failed_req_idxs = failed_req_idxs
-            else:
-                all_gather_output = [None] * self.grammar_sync_size
+            # Sync within each request's TP/CP shard without crossing DP replicas.
+            synced_ready_req_idxs = ready_req_idxs
+            synced_failed_req_idxs = failed_req_idxs
+            for group, size in (
+                (self.grammar_sync_group, self.grammar_sync_size),
+                (self.grammar_cp_sync_group, self.grammar_cp_sync_size),
+            ):
+                if size == 1:
+                    continue
+                all_gather_output = [None] * size
                 torch.distributed.all_gather_object(
                     all_gather_output,
-                    (ready_req_idxs, failed_req_idxs),
-                    group=self.grammar_sync_group,
+                    (synced_ready_req_idxs, synced_failed_req_idxs),
+                    group=group,
                 )
                 synced_ready_req_idxs = set.intersection(
                     *[x[0] for x in all_gather_output]
@@ -302,11 +365,15 @@ class GrammarManager:
                     f"grammar_key={req.grammar_key}"
                 )
                 req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+            self._get_grammar_backend(req.grammar_key).set_cache(
+                req.grammar_key, req.grammar.copy()
+            )
             self._apply_request_reasoning_config(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
+            else:
+                self._log_grammar_stats(req.grammar.grammar_stats)
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -315,11 +382,12 @@ class GrammarManager:
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
-            self.grammar_backend.set_cache(
+            self._get_grammar_backend(req.grammar_key).set_cache(
                 req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
+            self._log_grammar_stats(GrammarStats(num_timeout=1))
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [

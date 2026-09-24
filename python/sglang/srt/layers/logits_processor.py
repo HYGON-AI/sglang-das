@@ -204,6 +204,8 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    draft_top1_token_ids: Optional[torch.Tensor] = None
+    draft_top1_probs: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -492,6 +494,12 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
+        self.draft_lm_head_vp = None
+
+    def set_draft_lm_head_vp(self, draft_lm_head_vp) -> None:
+        """Install the draft-only vocabulary-parallel top-1 helper."""
+        self.draft_lm_head_vp = draft_lm_head_vp
+
     def forward(
         self,
         input_ids,
@@ -564,6 +572,35 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if (
+                self.draft_lm_head_vp is not None
+                and logits_metadata.forward_mode.is_decode_or_idle()
+            ):
+                if not hasattr(lm_head, "weight"):
+                    raise RuntimeError(
+                        "Draft LM-head VP requires an LM-head with a weight tensor."
+                    )
+                top1_scores, top1_token_ids = self.draft_lm_head_vp.project_top1(
+                    pruned_states,
+                    lm_head.weight,
+                    logit_scale=self.logit_scale,
+                    final_logit_softcapping=self.final_logit_softcapping,
+                )
+                top1_probs = torch.ones(
+                    (top1_token_ids.shape[0], 1),
+                    dtype=torch.float32,
+                    device=top1_token_ids.device,
+                )
+                return LogitsProcessorOutput(
+                    # Keep a compact tensor for generic output slicing and NaN
+                    # diagnostics. The EAGLE worker consumes draft_top1_*.
+                    next_token_logits=top1_scores.unsqueeze(-1),
+                    hidden_states=hidden_states_to_store,
+                    draft_top1_token_ids=top1_token_ids.unsqueeze(-1),
+                    draft_top1_probs=top1_probs,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

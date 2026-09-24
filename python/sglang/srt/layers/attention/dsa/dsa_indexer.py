@@ -251,8 +251,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.glm5_next_fp32_head_gates = getattr(config, "model_type", "") in (
+            "glm5_next",
+            "glm5v_next",
+            "glm5next_text",
+            "glm5_next_text",
+        )
         self.use_dsa_indexer_fusion = (
-            _is_cuda
+            not self.glm5_next_fp32_head_gates
+            and _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
@@ -300,7 +307,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.n_heads,
                 bias=False,
-                params_dtype=torch.bfloat16,
+                params_dtype=torch.float32
+                if self.glm5_next_fp32_head_gates
+                else torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
         if (
@@ -360,6 +369,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
+        if self.glm5_next_fp32_head_gates:
+            weights, _ = self.weights_proj(x.float())
+            return weights.float()
         if _is_cuda:
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
@@ -1554,7 +1566,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.alt_stream.wait_stream(current_stream)
             if not self.use_dsa_indexer_fusion:
                 if weights_proj_lora:
-                    weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+                    weights = (
+                        self.weights_proj(x.to(self.weights_proj.weight.dtype))[
+                            0
+                        ].float()
+                        * self.n_heads**-0.5
+                    )
                 else:
                     weights = self._project_and_scale_head_gates(x)
             query, key, weights_raw = self._get_q_k_bf16(
@@ -1663,7 +1680,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     if weights_proj_lora:
                         raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
                     weights = logits_head_gate_graph(
-                        x_for_gate,
+                        x_for_gate.to(self.weights_proj.weight.dtype),
                         self.weights_proj.weight,
                         self.n_heads**-0.5,
                         self.softmax_scale,
@@ -1672,7 +1689,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             elif self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
-                weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
+                weights = (
+                    self.weights_proj(x_for_gate.to(self.weights_proj.weight.dtype))[
+                        0
+                    ].float()
+                    * self.n_heads**-0.5
+                )
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
