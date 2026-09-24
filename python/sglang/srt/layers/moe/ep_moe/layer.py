@@ -1141,12 +1141,19 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
+        bias: Optional[torch.Tensor] = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
     ):
-
         if self.deprecate_flag:
             if is_in_breakable_cuda_graph() and _should_break_only_hcu_deepgemm_core():
                 return self.hcu_ll_moe_core(dispatch_output)
-            return super().run_moe_core(dispatch_output)
+            return super().run_moe_core(
+                dispatch_output,
+                bias=bias,
+                i_q=i_q,
+                i_s=i_s,
+            )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 

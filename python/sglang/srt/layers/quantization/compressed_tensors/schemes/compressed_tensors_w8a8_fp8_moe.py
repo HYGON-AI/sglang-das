@@ -621,7 +621,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         i_s: Optional[torch.Tensor] = None,
     ) -> CombineInput:
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        # DeepEP dispatch outputs carry their routed ids/weights directly and
+        # are consumed by the registered runner pre-permute.  Only the legacy
+        # standard-dispatch fallbacks below need a nested ``topk_output``.
+        topk_output = getattr(dispatch_output, "topk_output", None)
         moe_runner_config = self.moe_runner_config
 
         if self.runner.runner_backend.is_deep_gemm():
