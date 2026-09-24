@@ -123,6 +123,7 @@ def fused_moe_kernel_gptq_awq(
     b_ptr,
     c_ptr,
     b_scale_ptr,
+    a_scale_ptr,
     b_zp_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
@@ -144,6 +145,7 @@ def fused_moe_kernel_gptq_awq(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_asm,
     stride_bse,
     stride_bsk,
     stride_bsn,
@@ -161,6 +163,7 @@ def fused_moe_kernel_gptq_awq(
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
+    use_int4_w4a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
@@ -269,7 +272,20 @@ def fused_moe_kernel_gptq_awq(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if use_int4_w4a8:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+        a_scale = tl.load(
+            a_scale_ptr + (offs_token // top_k) * stride_asm,
+            mask=token_mask,
+            other=0.0,
+        )[:, None]
+        channel_scale = tl.load(
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+        )
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -286,18 +302,24 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        if use_int4_w4a8 and not even_Ks:
+            # Native compressed-tensors weights are not K-padded. 0x88 is
+            # packed (q + 8) zero for both nibbles, so masked lanes decode to 0.
+            b = tl.load(b_ptrs, mask=k_mask, other=0x88)
+        else:
+            b = tl.load(b_ptrs)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
-        b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[None, :] * stride_bsn
-            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
-        )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        if not use_int4_w4a8:
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+            )
+            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+            b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
@@ -322,11 +344,17 @@ def fused_moe_kernel_gptq_awq(
             b_zp = b_zp.to(tl.float32)
 
         # We accumulate along the K dimension.
-        if has_zp:
+        if use_int4_w4a8:
+            b = (b.to(tl.int16) - 8).to(tl.int8)
+            accumulator = tl.dot(
+                a, b, acc=accumulator, out_dtype=tl.int32
+            )
+        elif has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            accumulator = tl.dot(a, b, acc=accumulator)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+            accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -334,6 +362,9 @@ def fused_moe_kernel_gptq_awq(
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if use_int4_w4a8:
+        accumulator = accumulator.to(tl.float32) * a_scale * channel_scale
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -916,6 +947,9 @@ def invoke_fused_moe_kernel(
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
+        if use_int4_w4a16 and per_channel_quant:
+            assert B_zp is None, "dynamic W4A8 requires symmetric INT4 weights"
+            A, A_scale = per_token_quant_int8(A)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -953,10 +987,14 @@ def invoke_fused_moe_kernel(
         )
     # ===== END TO BE REFACTORED ====
 
+    use_int4_w4a8 = use_int4_w4a16 and per_channel_quant
     if (
-        (use_int8_w8a16 or use_int4_w4a16)
-        and block_shape is not None
-        and block_shape[1] > 0
+        use_int4_w4a8
+        or (
+            (use_int8_w8a16 or use_int4_w4a16)
+            and block_shape is not None
+            and block_shape[1] > 0
+        )
     ):
         assert not fuse_sum_all_reduce, (
             "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
@@ -964,11 +1002,14 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
+        if use_int4_w4a8:
+            assert A_scale is not None and A_scale.ndim == 2
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
             C,
             B_scale,
+            A_scale,
             B_zp,
             topk_weights,
             sorted_token_ids,
@@ -985,18 +1026,20 @@ def invoke_fused_moe_kernel(
             B.stride(1),
             C.stride(-2),
             C.stride(-1),
+            A_scale.stride(0) if A_scale is not None else 0,
             B_scale.stride(0),
             B_scale.stride(2),
             B_scale.stride(1),
             B_zp.stride(0) if B_zp is not None else 0,
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
-            group_size=block_shape[1],
+            group_size=A.shape[1] if use_int4_w4a8 else block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,

@@ -324,7 +324,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
 
 
 class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
-    """HCU DeepGEMM path for dynamic-activation compressed-tensors W4A8 MoE."""
+    """HCU backends for dynamic-activation compressed-tensors W4A8 MoE."""
 
     def __init__(self, *args, **kwargs) -> None:
         if not _is_hcu:
@@ -377,11 +377,16 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         backend = get_moe_runner_backend()
         if backend.is_auto():
             backend = MoeRunnerBackend.DEEP_GEMM
-        if not backend.is_deep_gemm():
+        if backend.is_deep_gemm():
+            self.runner = None
+        elif backend.is_triton():
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        else:
             raise ValueError(
-                "HCU compressed-tensors W4A8 MoE currently supports only the "
-                f"deep_gemm runner, got {backend.value!r}"
+                "HCU compressed-tensors W4A8 MoE supports only deep_gemm and "
+                f"triton runners, got {backend.value!r}"
             )
+        self.runner_backend = backend
         self.moe_runner_config = moe_runner_config
 
     @staticmethod
@@ -408,16 +413,13 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         return storage[: scale.numel()].view_as(scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Convert the checkpoint layout [E, K/8, N] int32 into the byte-packed
-        # [E, N, K/2] layout expected by HCU DeepGEMM.
+        # Convert checkpoint [E, K/8, N] int32 to byte-packed [E, N, K/2].
         w13 = (
             layer.w13_weight_packed.data.transpose(1, 2)
             .contiguous()
             .view(torch.uint8)
         )
         w2 = layer.w2_weight_packed.data.transpose(1, 2).contiguous().view(torch.uint8)
-        w13 = self._convert_packed_weight(w13)
-        w2 = self._convert_packed_weight(w2)
         # Canonicalize singleton-dimension strides because LightOp consumes
         # that stride directly for per-channel scales.
         w13_scale = (
@@ -435,6 +437,21 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             .unsqueeze(-1)
         )
 
+        if self.runner_backend.is_triton():
+            # Triton's packed-INT4 kernel consumes compressed-tensors' native
+            # unsigned (q + 8), low-nibble-first representation. Keeping it
+            # packed avoids doubling expert-weight memory during TP serving.
+            layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+            layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+            layer.w13_weight_scale = torch.nn.Parameter(
+                w13_scale, requires_grad=False
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+            layer.is_hcu_w4a8_triton_converted = True
+            return
+
+        w13 = self._convert_packed_weight(w13)
+        w2 = self._convert_packed_weight(w2)
         from sglang.srt.layers.quantization.w4a8_utils import (
             w4a8_weight_repack_impl,
         )
@@ -624,8 +641,29 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             topk_weights=topk_weights,
         )
 
+    def _get_triton_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            # per_channel_quant distinguishes dynamic W4A8 from W4A16 while
+            # reusing the packed-INT4 routing and shape contracts.
+            use_int4_w4a16=True,
+            per_channel_quant=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+        )
+
     def apply_weights(self, layer: torch.nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if self.runner_backend.is_triton():
+            if not DispatchOutputChecker.format_is_standard(dispatch_output):
+                raise ValueError(
+                    "HCU compressed-tensors W4A8 Triton requires standard dispatch"
+                )
+            return self.runner.run(dispatch_output, self._get_triton_quant_info(layer))
 
         if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             raise ValueError(

@@ -47,10 +47,14 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda, is_hcu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hcu
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+_use_hcu_fused_engram_gate = is_hcu() and get_bool_env_var(
+    "SGLANG_HCU_OPT_ENGRAM_GATE"
+)
 
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
@@ -903,7 +907,7 @@ def engram_gate(
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy."""
     if (
-        _cuda_kernels(x)
+        (_cuda_kernels(x) or (_use_hcu_fused_engram_gate and x.is_cuda))
         and x.ndim == 3
         and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype

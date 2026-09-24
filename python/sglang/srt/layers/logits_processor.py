@@ -57,6 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -474,7 +475,11 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=(
+                self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+                and not is_hcu()
+            ),
             skip_entry_sync=True,
         )
 
