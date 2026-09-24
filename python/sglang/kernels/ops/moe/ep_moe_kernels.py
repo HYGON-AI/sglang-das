@@ -1944,6 +1944,7 @@ def fused_build_m_indices_kernel(
     numel,
     E: tl.constexpr,
     BLOCK: tl.constexpr = 1024,
+    BLOCK_E: tl.constexpr = 256,
 ):
     pid = tl.program_id(0)
 
@@ -1957,7 +1958,7 @@ def fused_build_m_indices_kernel(
             )
             count = count + tl.sum((val == pid).to(tl.int32) & mask)
 
-        rng = tl.arange(0, E)
+        rng = tl.arange(0, BLOCK_E)
         vals = tl.load(num_recv_tokens_ptr + rng, mask=rng < E, other=0)
         start_pos = tl.sum(tl.where(rng < pid, vals, 0))
         my_padded = tl.load(num_recv_tokens_ptr + pid)
@@ -2064,6 +2065,7 @@ def _build_m_indices_and_ep_scatter_not_use_groupgemm(
         recv_topk.numel(),
         E=local_num_expert,
         BLOCK=BLOCK,
+        BLOCK_E=triton.next_power_of_2(local_num_expert),
     )
 
     num_warps = 8

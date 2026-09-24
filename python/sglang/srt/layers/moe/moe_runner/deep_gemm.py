@@ -1418,7 +1418,11 @@ def pre_permute_deepep_normal_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        ep_scatter,
+        fused_build_m_indices_kernel,
+        use_groupgemm,
+    )
 
     hidden_states = dispatch_output.hidden_states
     hidden_states_scale = dispatch_output.hidden_states_scale
@@ -1505,6 +1509,20 @@ def pre_permute_deepep_normal_to_deep_gemm(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         quant_block_size=(K if deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM else 128),
     )
+    # The GroupGEMM scatter branch only builds expert offsets; it deliberately
+    # leaves m_indices untouched.  HCU DeepGEMM's contiguous GEMM consumes
+    # m_indices directly, including -1 for alignment padding, so materialize
+    # them from the received top-k ids before launching the GEMM.
+    if deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM and use_groupgemm:
+        fused_build_m_indices_kernel[(len(num_recv_tokens_per_expert),)](
+            topk_ids,
+            num_recv_tokens_per_expert_gpu,
+            m_indices,
+            topk_ids.numel(),
+            E=len(num_recv_tokens_per_expert),
+            BLOCK=1024,
+            BLOCK_E=triton.next_power_of_2(len(num_recv_tokens_per_expert)),
+        )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
