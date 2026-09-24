@@ -76,19 +76,22 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
         )
         layer = SimpleNamespace(
             w13_weight_packed=torch.empty((2, 32, 8), dtype=torch.int8),
-            w13_weight_scale=torch.ones((2, 32, 1), dtype=torch.float32),
+            w13_weight_scale=torch.ones((2, 24, 1), dtype=torch.float32),
             w2_weight_packed=torch.empty((2, 16, 8), dtype=torch.int8),
             w2_weight_scale=torch.ones((2, 16, 1), dtype=torch.float32),
             w4a8_padded_intermediate_size=16,
         )
-        q_a2 = torch.empty((2, 8, 16), dtype=torch.int8)
+        q_a2 = torch.empty((2, 8, 12), dtype=torch.int8)
         q_a2_scale = torch.ones((2, 8, 1), dtype=torch.float32)
 
         with (
             patch(
                 "lightop.quant.per_token_quant_int8",
-                return_value=(q_a2, q_a2_scale),
             ) as quantize,
+            patch(
+                "lightop.fuse_silu_mul_clamp_quant_ep",
+                return_value=(q_a2, q_a2_scale),
+            ) as fused_activation,
             patch.object(
                 torch.ops.sglang,
                 "m_grouped_w4a8_gemm_nt_masked",
@@ -103,13 +106,23 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
                 hidden_states_scale=self.hidden_states_scale,
             )
 
-        quantize.assert_called_once()
+        quantize.assert_not_called()
         self.assertEqual(grouped_gemm.call_count, 2)
         first_gemm_args = grouped_gemm.call_args_list[0].args
         self.assertIs(first_gemm_args[0], self.hidden_states)
         self.assertIs(first_gemm_args[1], self.hidden_states_scale)
         self.assertEqual(first_gemm_args[4].dtype, torch.bfloat16)
         self.assertEqual(first_gemm_args[6], self.hidden_states.shape[1])
+        fused_activation.assert_called_once_with(
+            input=first_gemm_args[4],
+            limit=10.0,
+            mask_m=self.masked_m,
+            expect_m=self.hidden_states.shape[1],
+        )
+        second_gemm_args = grouped_gemm.call_args_list[1].args
+        self.assertEqual(second_gemm_args[0].shape, (2, 8, 16))
+        self.assertEqual(second_gemm_args[0][..., 12:].count_nonzero().item(), 0)
+        self.assertIs(second_gemm_args[1], q_a2_scale)
         self.assertEqual(output.dtype, torch.bfloat16)
 
     def test_low_latency_rejects_unquantized_activations(self):

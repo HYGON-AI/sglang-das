@@ -493,6 +493,10 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         expected_m: int,
         hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from lightop import (
+            fuse_silu_mul_clamp_quant_ep,
+            fuse_silu_mul_quant_ep,
+        )
         from lightop.quant import per_token_quant_int8
 
         if self.moe_runner_config.activation != "silu":
@@ -522,20 +526,29 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             expected_m,
         )
 
-        gate, up = gate_up.chunk(2, dim=-1)
         swiglu_limit = self.moe_runner_config.swiglu_limit
-        if swiglu_limit is not None:
-            gate.clamp_(max=swiglu_limit)
-            up.clamp_(min=-swiglu_limit, max=swiglu_limit)
-        activated = F.silu(gate) * up
-        padded_intermediate_size = layer.w4a8_padded_intermediate_size
-        if activated.shape[-1] != padded_intermediate_size:
-            # GEMM2 K must be 128-aligned. This is the only remaining layout
-            # copy; eliminating it requires a kernel that accepts K=288.
-            activated = F.pad(
-                activated, (0, padded_intermediate_size - activated.shape[-1])
+        if swiglu_limit is None:
+            q_a2, q_a2_scale = fuse_silu_mul_quant_ep(
+                gate_up,
+                tokens_per_expert=masked_m,
+                expect_m=expected_m,
             )
-        q_a2, q_a2_scale = per_token_quant_int8(activated)
+        else:
+            q_a2, q_a2_scale = fuse_silu_mul_clamp_quant_ep(
+                input=gate_up,
+                limit=swiglu_limit,
+                mask_m=masked_m,
+                expect_m=expected_m,
+            )
+        del gate_up
+
+        padded_intermediate_size = layer.w4a8_padded_intermediate_size
+        if q_a2.shape[-1] != padded_intermediate_size:
+            # GEMM2 K must be 128-aligned. Pad the quantized INT8 tensor instead
+            # of materializing a full-capacity BF16 activation.
+            q_a2 = F.pad(
+                q_a2, (0, padded_intermediate_size - q_a2.shape[-1])
+            )
 
         output = torch.empty(
             (
