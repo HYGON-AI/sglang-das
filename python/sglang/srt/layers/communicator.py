@@ -1313,7 +1313,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     if not CommunicateWithAllReduceAndLayerNormFn._skip_layernorm(
                         forward_batch
                     ):
-                        hidden_states = layernorm(hidden_states)
+                        hidden_states, residual = layernorm(hidden_states, residual)
                     elif CommunicateWithAllReduceAndLayerNormFn._use_bailing_rms_quant(
                         forward_batch
                     ):

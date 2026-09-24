@@ -1,3 +1,4 @@
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -58,6 +59,58 @@ def test_expanded_cp_dp_local_index_selects_dp_cp_slot():
 
     assert start.item() == 14
     assert count.item() == 3
+
+
+def test_dp_layernorm_before_gather_preserves_residual_addition():
+    hidden_states = torch.tensor([[1.0, 2.0]])
+    residual = torch.tensor([[10.0, 20.0]])
+    gathered = torch.empty_like(hidden_states)
+    forward_batch = SimpleNamespace()
+    context = SimpleNamespace(
+        attn_dp_size=2,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        force_layernorm_before_dp_gather=False,
+    )
+
+    class AddNorm:
+        def __call__(self, x, residual_input):
+            updated_residual = x + residual_input
+            return updated_residual * 2, updated_residual
+
+    def gather_replicate(output, local, _forward_batch):
+        output.copy_(local)
+
+    with (
+        patch.object(
+            communicator.CommunicateWithAllReduceAndLayerNormFn,
+            "_skip_layernorm",
+            return_value=False,
+        ),
+        patch.object(
+            communicator,
+            "use_symmetric_memory",
+            return_value=contextlib.nullcontext(),
+        ),
+        patch.object(communicator, "get_tp_group", return_value=object()),
+        patch.object(communicator, "get_global_dp_buffer", return_value=gathered),
+        patch.object(
+            communicator, "dp_gather_replicate", side_effect=gather_replicate
+        ),
+    ):
+        output, updated_residual = (
+            communicator.CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                hidden_states,
+                residual,
+                forward_batch,
+                AddNorm(),
+                context,
+                residual_input_mode=communicator.ScatterMode.TP_ATTN_FULL,
+            )
+        )
+
+    torch.testing.assert_close(updated_residual, torch.tensor([[11.0, 22.0]]))
+    torch.testing.assert_close(output, torch.tensor([[22.0, 44.0]]))
 
 
 def test_zigzag_cp_physical_count_handles_multi_sequence_skew():
