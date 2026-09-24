@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
@@ -491,20 +491,29 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         hidden_states: torch.Tensor,
         masked_m: torch.Tensor,
         expected_m: int,
+        hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from lightop import (
+            fuse_silu_mul_clamp_quant_ep,
+            fuse_silu_mul_quant_ep,
+        )
         from lightop.quant import per_token_quant_int8
 
         if self.moe_runner_config.activation != "silu":
             raise ValueError("HCU W4A8 DeepGEMM currently supports only SiLU")
 
-        q_a1, q_a1_scale = per_token_quant_int8(hidden_states)
+        if hidden_states_scale is None:
+            q_a1, q_a1_scale = per_token_quant_int8(hidden_states)
+        else:
+            q_a1, q_a1_scale = hidden_states, hidden_states_scale
+        expected_m = min(hidden_states.shape[1], expected_m)
         gate_up = torch.empty(
             (
                 hidden_states.shape[0],
                 hidden_states.shape[1],
                 layer.w13_weight_scale.shape[1],
             ),
-            dtype=hidden_states.dtype,
+            dtype=torch.bfloat16,
             device=hidden_states.device,
         )
         torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
@@ -517,20 +526,29 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             expected_m,
         )
 
-        gate, up = gate_up.chunk(2, dim=-1)
         swiglu_limit = self.moe_runner_config.swiglu_limit
-        if swiglu_limit is not None:
-            gate.clamp_(max=swiglu_limit)
-            up.clamp_(min=-swiglu_limit, max=swiglu_limit)
-        activated = F.silu(gate) * up
-        padded_intermediate_size = layer.w4a8_padded_intermediate_size
-        if activated.shape[-1] != padded_intermediate_size:
-            # GEMM2 K must be 128-aligned. This is the only remaining layout
-            # copy; eliminating it requires a kernel that accepts K=288.
-            activated = F.pad(
-                activated, (0, padded_intermediate_size - activated.shape[-1])
+        if swiglu_limit is None:
+            q_a2, q_a2_scale = fuse_silu_mul_quant_ep(
+                gate_up,
+                tokens_per_expert=masked_m,
+                expect_m=expected_m,
             )
-        q_a2, q_a2_scale = per_token_quant_int8(activated)
+        else:
+            q_a2, q_a2_scale = fuse_silu_mul_clamp_quant_ep(
+                input=gate_up,
+                limit=swiglu_limit,
+                mask_m=masked_m,
+                expect_m=expected_m,
+            )
+        del gate_up
+
+        padded_intermediate_size = layer.w4a8_padded_intermediate_size
+        if q_a2.shape[-1] != padded_intermediate_size:
+            # GEMM2 K must be 128-aligned. Pad the quantized INT8 tensor instead
+            # of materializing a full-capacity BF16 activation.
+            q_a2 = F.pad(
+                q_a2, (0, padded_intermediate_size - q_a2.shape[-1])
+            )
 
         output = torch.empty(
             (
@@ -538,7 +556,7 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
                 hidden_states.shape[1],
                 layer.w2_weight_scale.shape[1],
             ),
-            dtype=hidden_states.dtype,
+            dtype=torch.bfloat16,
             device=hidden_states.device,
         )
         torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked(
@@ -655,6 +673,69 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             w2_scale=layer.w2_weight_scale,
         )
 
+    def _apply_deepep_ll_deep_gemm(
+        self, layer: torch.nn.Module, dispatch_output
+    ):
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPLLCombineInput,
+        )
+
+        hidden_states = dispatch_output.hidden_states
+        hidden_states_scale = dispatch_output.hidden_states_scale
+        masked_m = dispatch_output.masked_m
+
+        if (
+            hidden_states.dtype != torch.int8
+            or hidden_states_scale is None
+            or hidden_states_scale.dtype != torch.float32
+        ):
+            raise RuntimeError(
+                "HCU W4A8 DeepGEMM low-latency dispatch requires INT8 "
+                "activations with FP32 per-token scales"
+            )
+        expected_scale_shape = hidden_states.shape[:-1] + (1,)
+        if hidden_states_scale.shape != expected_scale_shape:
+            raise RuntimeError(
+                "Unexpected DeepEP low-latency activation scale shape: "
+                f"{hidden_states_scale.shape} != {expected_scale_shape}"
+            )
+        if masked_m.dtype != torch.int32 or masked_m.shape != (
+            hidden_states.shape[0],
+        ):
+            raise RuntimeError(
+                "Unexpected DeepEP low-latency masked_m metadata: "
+                f"dtype={masked_m.dtype}, shape={masked_m.shape}"
+            )
+        if (
+            hidden_states.device != hidden_states_scale.device
+            or hidden_states.device != masked_m.device
+        ):
+            raise RuntimeError(
+                "DeepEP low-latency activations, scales, and masked_m must "
+                "be on the same device"
+            )
+        if (
+            not hidden_states.is_contiguous()
+            or not hidden_states_scale.is_contiguous()
+        ):
+            raise RuntimeError(
+                "HCU W4A8 DeepGEMM requires contiguous DeepEP low-latency "
+                "activations and scales"
+            )
+
+        output = self._run_deep_gemm_masked(
+            layer,
+            hidden_states,
+            masked_m,
+            dispatch_output.expected_m,
+            hidden_states_scale=hidden_states_scale,
+        )
+        return DeepEPLLCombineInput(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
     def apply_weights(self, layer: torch.nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
@@ -665,8 +746,11 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
                 )
             return self.runner.run(dispatch_output, self._get_triton_quant_info(layer))
 
-        if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            raise ValueError(
-                "HCU compressed-tensors W4A8 DeepGEMM requires DeepEP normal dispatch"
-            )
-        return self._apply_deepep_normal_deep_gemm(layer, dispatch_output)
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            return self._apply_deepep_normal_deep_gemm(layer, dispatch_output)
+        if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            return self._apply_deepep_ll_deep_gemm(layer, dispatch_output)
+        raise ValueError(
+            "HCU compressed-tensors W4A8 DeepGEMM requires DeepEP normal or "
+            "low-latency dispatch"
+        )
