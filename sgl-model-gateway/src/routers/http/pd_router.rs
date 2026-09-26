@@ -54,6 +54,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub enable_pd_token_relay: bool,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -185,6 +186,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            enable_pd_token_relay: ctx.router_config.enable_pd_token_relay,
         })
     }
 
@@ -318,6 +320,29 @@ impl PDRouter {
         Ok(Cow::Owned(decode_request))
     }
 
+    fn clear_decode_message_contents(request: &mut Value) {
+        let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
+            return;
+        };
+
+        for message in messages {
+            let Some(content) = message.get_mut("content") else {
+                continue;
+            };
+            match content {
+                Value::String(text) => text.clear(),
+                Value::Array(parts) => {
+                    for part in parts {
+                        if part.get("text").is_some_and(Value::is_string) {
+                            part["text"] = Value::String(String::new());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     async fn prepare_worker_request<'a>(
         route: &'static str,
         worker: &dyn Worker,
@@ -351,7 +376,40 @@ impl PDRouter {
         json_request: &'a Value,
         prefill: &dyn Worker,
         decode: &dyn Worker,
+        enable_pd_token_relay: bool,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        if enable_pd_token_relay
+            && route == "/v1/chat/completions"
+            && json_request
+                .get(Self::BOOTSTRAP_ROOM_KEY)
+                .is_some_and(Value::is_number)
+        {
+            let mut prefill_json = json_request.clone();
+            let mut decode_json = json_request.clone();
+            Self::clear_decode_message_contents(&mut decode_json);
+            let prefill_obj = prefill_json
+                .as_object_mut()
+                .ok_or_else(|| "Request must be a JSON object".to_string())?;
+            let decode_obj = decode_json
+                .as_object_mut()
+                .ok_or_else(|| "Request must be a JSON object".to_string())?;
+            prefill_obj.insert(
+                "pd_token_relay_url".to_string(),
+                Value::from(decode.url()),
+            );
+            decode_obj.insert(
+                "pd_deferred_tokenization".to_string(),
+                Value::from(true),
+            );
+            let prefill_request =
+                Self::prepare_worker_request(route, prefill, Cow::Owned(prefill_json)).await?;
+            let decode_json_request =
+                Self::inject_prefill_dp_rank_for_decode(Cow::Owned(decode_json), prefill)?;
+            let decode_request =
+                Self::prepare_worker_request(route, decode, decode_json_request).await?;
+            return Ok((prefill_request, decode_request));
+        }
+
         let prefill_request =
             Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
         let decode_json_request =
@@ -668,6 +726,7 @@ impl PDRouter {
             &json_request,
             prefill.as_ref(),
             decode.as_ref(),
+            self.enable_pd_token_relay,
         )
         .await
         {
@@ -1730,6 +1789,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            enable_pd_token_relay: false,
         }
     }
 
@@ -1871,7 +1931,7 @@ mod tests {
         });
 
         let (prefill_request, decode_request) =
-            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode, false)
                 .await
                 .unwrap();
 
@@ -1910,7 +1970,7 @@ mod tests {
         });
 
         let (prefill_request, decode_request) =
-            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode, false)
                 .await
                 .unwrap();
 
@@ -2022,4 +2082,96 @@ mod tests {
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }
+
+    #[tokio::test]
+    async fn test_prepare_pd_worker_requests_injects_token_relay_fields() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "bootstrap_room": 1234,
+        });
+
+        let (prefill_request, decode_request) = PDRouter::prepare_pd_worker_requests(
+            "/v1/chat/completions",
+            &request,
+            &prefill,
+            &decode,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            prefill_request.body["pd_token_relay_url"],
+            "http://decode:30001"
+        );
+        assert!(prefill_request
+            .body
+            .get("pd_deferred_tokenization")
+            .is_none());
+        assert_eq!(decode_request.body["pd_deferred_tokenization"], true);
+        assert!(decode_request.body.get("pd_token_relay_url").is_none());
+        assert_eq!(prefill_request.body["messages"][0]["content"], "hello");
+        assert_eq!(decode_request.body["messages"][0]["content"], "");
+
+        let (legacy_prefill, legacy_decode) = PDRouter::prepare_pd_worker_requests(
+            "/v1/chat/completions",
+            &request,
+            &prefill,
+            &decode,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(legacy_prefill.body.get("pd_token_relay_url").is_none());
+        assert!(legacy_decode
+            .body
+            .get("pd_deferred_tokenization")
+            .is_none());
+        assert_eq!(legacy_decode.body["messages"], request["messages"]);
+    }
+
+    #[test]
+    fn test_clear_decode_message_contents_preserves_structure() {
+        let mut request = json!({
+            "messages": [
+                {"role": "system", "content": "system prompt"},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "name": "caller"
+                },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call-1", "type": "function"}]
+                }
+            ],
+            "max_tokens": 1024,
+            "stream": true,
+            "temperature": 0.7
+        });
+        let original_tool_calls = request["messages"][2]["tool_calls"].clone();
+
+        PDRouter::clear_decode_message_contents(&mut request);
+
+        assert_eq!(request["messages"][0]["content"], "");
+        assert_eq!(request["messages"][1]["content"][0]["text"], "");
+        assert_eq!(request["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(request["messages"][1]["name"], "caller");
+        assert!(request["messages"][2]["content"].is_null());
+        assert_eq!(request["messages"][2]["tool_calls"], original_tool_calls);
+        assert_eq!(request["max_tokens"], 1024);
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["temperature"], 0.7);
+    }
+
 }

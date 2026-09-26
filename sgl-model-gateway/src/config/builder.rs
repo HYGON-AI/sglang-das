@@ -491,6 +491,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn enable_pd_token_relay(mut self, enable: bool) -> Self {
+        self.config.enable_pd_token_relay = enable;
+        self
+    }
+
     // ==================== Option Setters ====================
     // Accept Option<T> and only set if Some
 

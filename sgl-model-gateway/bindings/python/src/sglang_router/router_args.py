@@ -45,6 +45,7 @@ class RouterArgs:
     mini_lb: bool = False
     test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    enable_pd_token_relay: bool = False
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -382,6 +383,12 @@ class RouterArgs:
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}enable-pd-token-relay",
+            action="store_true",
+            default=RouterArgs.enable_pd_token_relay,
+            help="Enable experimental P-to-D token relay for text-only chat requests",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",

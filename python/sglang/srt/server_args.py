@@ -3665,6 +3665,12 @@ class ServerArgs:
         "Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
         NS("serving"),
     ] = False
+    enable_pd_token_relay: A[
+        bool,
+        "Enable the experimental P-to-D token relay for text-only PD chat requests. "
+        "When disabled (default), requests use the existing independent tokenizer path.",
+        NS("serving"),
+    ] = False
     disable_tokenizer_batch_decode: A[
         bool,
         "Disable batch decoding when decoding multiple completions.",
@@ -8682,6 +8688,16 @@ class ServerArgs:
         return json.dumps(normalized_mapping, separators=(",", ":"))
 
     def _handle_tokenizer_batching(self):
+        if (
+            self.enable_pd_token_relay
+            and self.disaggregation_mode == "decode"
+            and self.tokenizer_worker_num != 1
+        ):
+            raise ValueError(
+                "--enable-pd-token-relay currently requires decode servers "
+                "to use --tokenizer-worker-num 1"
+            )
+
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
             raise ValueError(
                 "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "

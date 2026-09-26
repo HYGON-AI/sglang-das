@@ -926,6 +926,11 @@ class ChatCompletionRequest(BaseModel):
     # and tool_call_constraint.
     input_ids: Optional[List[int]] = None
 
+    # Internal fields used by the optional PD token relay. The router sets
+    # exactly one of these on each side of a selected P/D pair.
+    pd_token_relay_url: Optional[str] = None
+    pd_deferred_tokenization: bool = False
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification

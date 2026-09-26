@@ -17,11 +17,13 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements HTTP APIs for the inference engine via fastapi.
 """
 
+import array
 import asyncio
 import dataclasses
 import logging
 import os
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -424,6 +426,11 @@ async def lifespan(fast_api_app: FastAPI):
             except Exception:
                 logger.exception("Failed to stop sidecar")
         _shutdown_native_grpc_server(grpc_handle)
+        serving_chat = getattr(fast_api_app.state, "openai_serving_chat", None)
+        if serving_chat is not None and hasattr(
+            serving_chat, "close_pd_token_relay"
+        ):
+            await serving_chat.close_pd_token_relay()
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
         if warmup_thread is not None:
@@ -1728,6 +1735,47 @@ async def openai_v1_chat_completions(
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
+
+
+@app.post("/internal/pd/token_ids", include_in_schema=False)
+async def receive_pd_token_ids(raw_request: Request):
+    content_type = raw_request.headers.get("content-type", "").split(";", 1)[0]
+    if content_type != "application/vnd.sglang.pd-token-ids.uint32":
+        raise HTTPException(
+            status_code=415,
+            detail="PD token relay requires a binary uint32 payload",
+        )
+
+    room_value = raw_request.headers.get("x-sglang-pd-bootstrap-room")
+    if room_value is None:
+        raise HTTPException(
+            status_code=400, detail="Missing PD bootstrap room header"
+        )
+    try:
+        bootstrap_room = int(room_value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="Invalid PD bootstrap room header"
+        ) from exc
+
+    body = await raw_request.body()
+    if not body or len(body) % 4:
+        raise HTTPException(
+            status_code=400, detail="Invalid uint32 token payload length"
+        )
+    token_array = array.array("I")
+    token_array.frombytes(body)
+    if token_array.itemsize != 4:
+        raise RuntimeError("Platform uint32 array item size is not 4 bytes")
+    if sys.byteorder != "little":
+        token_array.byteswap()
+    input_ids = token_array.tolist()
+
+    serving_chat = raw_request.app.state.openai_serving_chat
+    if not getattr(serving_chat, "enable_pd_token_relay", False):
+        raise HTTPException(status_code=404, detail="PD token relay is disabled")
+    await serving_chat.accept_pd_token_relay(bootstrap_room, input_ids)
+    return {"status": "ok"}
 
 
 @app.post(

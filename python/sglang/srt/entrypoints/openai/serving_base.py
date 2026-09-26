@@ -70,6 +70,21 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    async def _before_request_conversion(
+        self, request: OpenAIServingRequest, raw_request: Request
+    ) -> None:
+        """Optional async hook before synchronous OpenAI request conversion."""
+        return None
+
+    async def _after_request_conversion(
+        self,
+        request: OpenAIServingRequest,
+        adapted_request: Union[GenerateReqInput, EmbeddingReqInput],
+        raw_request: Request,
+    ) -> None:
+        """Optional async hook after synchronous OpenAI request conversion."""
+        return None
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -89,10 +104,14 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
+            await self._before_request_conversion(request, raw_request)
+
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+
+            await self._after_request_conversion(request, adapted_request, raw_request)
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them

@@ -59,6 +59,8 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
+    #[serde(default)]
+    pub enable_pd_token_relay: bool,
     /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
@@ -536,6 +538,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            enable_pd_token_relay: false,
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,

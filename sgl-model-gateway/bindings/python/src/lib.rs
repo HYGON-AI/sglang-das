@@ -409,6 +409,7 @@ struct Router {
     health_check_endpoint: String,
     disable_health_check: bool,
     enable_igw: bool,
+    enable_pd_token_relay: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
@@ -650,6 +651,7 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .enable_pd_token_relay(self.enable_pd_token_relay)
             .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
             .connect_timeout_secs(self.connect_timeout_secs)
             .pool_max_idle_per_host(self.pool_max_idle_per_host)
@@ -730,6 +732,7 @@ impl Router {
         health_check_endpoint = String::from("/health"),
         disable_health_check = false,
         enable_igw = false,
+        enable_pd_token_relay = false,
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
@@ -822,6 +825,7 @@ impl Router {
         health_check_endpoint: String,
         disable_health_check: bool,
         enable_igw: bool,
+        enable_pd_token_relay: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
@@ -927,6 +931,7 @@ impl Router {
             health_check_endpoint,
             disable_health_check,
             enable_igw,
+            enable_pd_token_relay,
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,

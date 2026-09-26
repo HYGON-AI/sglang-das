@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import array
+import asyncio
 import copy
 import json
 import logging
 import math
+import sys
 import time
 import uuid
 from enum import Enum
@@ -18,6 +21,7 @@ class ThinkingMode(str, Enum):
     THINKING = "thinking"
 
 
+import aiohttp
 import jinja2
 import orjson
 from fastapi import Request
@@ -99,6 +103,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+PD_TOKEN_RELAY_BINARY_CONTENT_TYPE = (
+    "application/vnd.sglang.pd-token-ids.uint32"
+)
+PD_TOKEN_RELAY_ROOM_HEADER = "X-SGLang-PD-Bootstrap-Room"
 
 
 def normalize_tool_content(role: str, content):
@@ -346,6 +354,243 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+
+        self.enable_pd_token_relay = (
+            self.tokenizer_manager.server_args.enable_pd_token_relay
+        )
+        self._pd_token_waiters: Dict[int, asyncio.Future[List[int]]] = {}
+        self._pd_early_tokens: Dict[int, tuple[float, List[int]]] = {}
+        self._pd_early_tokens_last_cleanup = time.monotonic()
+        self._pd_token_lock = asyncio.Lock()
+        self._pd_token_session: Optional[aiohttp.ClientSession] = None
+        self._pd_token_relay_tasks: set[asyncio.Task[None]] = set()
+        if self.enable_pd_token_relay:
+            logger.info(
+                "P-to-D token relay is enabled with asynchronous binary transfer"
+            )
+
+    def _pd_token_timeout(self) -> float:
+        timeout = envs.SGLANG_PD_TOKEN_RELAY_TIMEOUT.get()
+        if timeout is None:
+            timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        return float(timeout)
+
+    def _cleanup_expired_pd_early_tokens(self, now: float) -> None:
+        timeout = self._pd_token_timeout()
+        cleanup_interval = min(30.0, max(1.0, timeout))
+        if now - self._pd_early_tokens_last_cleanup < cleanup_interval:
+            return
+        expiry = now - timeout
+        self._pd_early_tokens = {
+            room: item
+            for room, item in self._pd_early_tokens.items()
+            if item[0] >= expiry
+        }
+        self._pd_early_tokens_last_cleanup = now
+
+    async def accept_pd_token_relay(
+        self, bootstrap_room: int, input_ids: List[int]
+    ) -> None:
+        if not self.enable_pd_token_relay:
+            raise ValueError("P-to-D token relay is not enabled on this server")
+        if not input_ids:
+            raise ValueError("P-to-D token relay received empty input_ids")
+
+        now = time.monotonic()
+        async with self._pd_token_lock:
+            self._cleanup_expired_pd_early_tokens(now)
+            waiter = self._pd_token_waiters.get(bootstrap_room)
+            if waiter is not None and not waiter.done():
+                waiter.set_result(list(input_ids))
+            else:
+                self._pd_early_tokens[bootstrap_room] = (now, list(input_ids))
+
+    async def _wait_for_pd_tokens(self, bootstrap_room: int) -> List[int]:
+        loop = asyncio.get_running_loop()
+        async with self._pd_token_lock:
+            early = self._pd_early_tokens.pop(bootstrap_room, None)
+            if early is not None:
+                return early[1]
+            if bootstrap_room in self._pd_token_waiters:
+                raise ValueError(
+                    f"Duplicate deferred PD request for bootstrap_room={bootstrap_room}"
+                )
+            waiter: asyncio.Future[List[int]] = loop.create_future()
+            self._pd_token_waiters[bootstrap_room] = waiter
+
+        try:
+            return await asyncio.wait_for(waiter, timeout=self._pd_token_timeout())
+        except asyncio.TimeoutError as exc:
+            raise ValueError(
+                f"Timed out waiting for P token IDs for bootstrap_room={bootstrap_room}"
+            ) from exc
+        finally:
+            async with self._pd_token_lock:
+                if self._pd_token_waiters.get(bootstrap_room) is waiter:
+                    self._pd_token_waiters.pop(bootstrap_room, None)
+
+    @staticmethod
+    def _has_pd_relay_media(request: ChatCompletionRequest) -> bool:
+        for message in request.messages:
+            content = getattr(message, "content", None)
+            if isinstance(content, list) and any(
+                getattr(part, "type", None) in _MEDIA_CONTENT_PART_TYPES
+                for part in content
+            ):
+                return True
+        return False
+
+    async def _before_request_conversion(
+        self, request: ChatCompletionRequest, raw_request: Request
+    ) -> None:
+        if not self.enable_pd_token_relay or not request.pd_deferred_tokenization:
+            return
+        if request.input_ids is not None:
+            return
+        if self._has_pd_relay_media(request):
+            raise ValueError(
+                "P-to-D token relay phase 1 supports text-only chat requests"
+            )
+        if not isinstance(request.bootstrap_room, int):
+            raise ValueError(
+                "Deferred PD tokenization requires a scalar bootstrap_room"
+            )
+        request.input_ids = await self._wait_for_pd_tokens(
+            request.bootstrap_room
+        )
+
+    @staticmethod
+    def _is_connection_reset_error(exc: BaseException) -> bool:
+        current: Optional[BaseException] = exc
+        while current is not None:
+            if isinstance(current, ConnectionResetError):
+                return True
+            next_error = current.__cause__ or current.__context__
+            if next_error is current:
+                break
+            current = next_error
+        return False
+
+    @staticmethod
+    async def _post_pd_tokens(
+        session: aiohttp.ClientSession,
+        endpoint: str,
+        body: bytes,
+        headers: Dict[str, str],
+    ) -> None:
+        async with session.post(
+            endpoint,
+            data=body,
+            headers=headers,
+        ) as response:
+            if response.status != HTTPStatus.OK:
+                body = await response.text()
+                raise RuntimeError(
+                    f"Failed to relay token IDs to D: status={response.status}, "
+                    f"body={body[:256]}"
+                )
+
+    async def _relay_pd_tokens(
+        self,
+        endpoint: str,
+        body: bytes,
+        headers: Dict[str, str],
+        bootstrap_room: int,
+    ) -> None:
+        try:
+            await self._post_pd_tokens(
+                self._pd_token_session, endpoint, body, headers
+            )
+        except aiohttp.ClientConnectionError as exc:
+            if not self._is_connection_reset_error(exc):
+                raise
+            logger.warning(
+                "PD token relay connection reset; retrying once with a new "
+                "connection: room=%s endpoint=%s",
+                bootstrap_room,
+                endpoint,
+            )
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self._pd_token_timeout()),
+                connector=aiohttp.TCPConnector(force_close=True),
+            ) as retry_session:
+                await self._post_pd_tokens(
+                    retry_session, endpoint, body, headers
+                )
+
+    def _pd_token_relay_task_done(self, task: asyncio.Task[None]) -> None:
+        self._pd_token_relay_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("Asynchronous PD token relay failed")
+
+    async def _after_request_conversion(
+        self,
+        request: ChatCompletionRequest,
+        adapted_request: GenerateReqInput,
+        raw_request: Request,
+    ) -> None:
+        if not self.enable_pd_token_relay or not request.pd_token_relay_url:
+            return
+        if self._has_pd_relay_media(request):
+            raise ValueError(
+                "P-to-D token relay phase 1 supports text-only chat requests"
+            )
+        if not isinstance(request.bootstrap_room, int):
+            raise ValueError("PD token relay requires a scalar bootstrap_room")
+        if adapted_request.input_ids is None:
+            raise ValueError("Prefill request did not produce input_ids for token relay")
+
+        if self._pd_token_session is None or self._pd_token_session.closed:
+            self._pd_token_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self._pd_token_timeout())
+            )
+        endpoint = (
+            request.pd_token_relay_url.rstrip("/") + "/internal/pd/token_ids"
+        )
+        token_array = array.array("I", adapted_request.input_ids)
+        if token_array.itemsize != 4:
+            raise RuntimeError("Platform uint32 array item size is not 4 bytes")
+        if sys.byteorder != "little":
+            token_array.byteswap()
+        body = token_array.tobytes()
+        headers = {
+            "Content-Type": PD_TOKEN_RELAY_BINARY_CONTENT_TYPE,
+            PD_TOKEN_RELAY_ROOM_HEADER: str(request.bootstrap_room),
+        }
+        relay = self._relay_pd_tokens(
+            endpoint,
+            body,
+            headers,
+            request.bootstrap_room,
+        )
+        task = asyncio.create_task(
+            relay, name=f"pd-token-relay-{request.bootstrap_room}"
+        )
+        self._pd_token_relay_tasks.add(task)
+        task.add_done_callback(self._pd_token_relay_task_done)
+
+    async def _cancel_pd_token_relay_tasks(self) -> None:
+        tasks = list(self._pd_token_relay_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pd_token_relay_tasks.clear()
+
+    async def close_pd_token_relay(self) -> None:
+        await self._cancel_pd_token_relay_tasks()
+        if self._pd_token_session is not None and not self._pd_token_session.closed:
+            await self._pd_token_session.close()
+        async with self._pd_token_lock:
+            for waiter in self._pd_token_waiters.values():
+                if not waiter.done():
+                    waiter.cancel()
+            self._pd_token_waiters.clear()
+            self._pd_early_tokens.clear()
 
     def _handle_last_assistant_message(
         self,

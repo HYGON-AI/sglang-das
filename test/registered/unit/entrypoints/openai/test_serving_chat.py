@@ -3641,5 +3641,59 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
+class PDTokenRelayTest(unittest.TestCase):
+    def setUp(self):
+        self.chat = object.__new__(OpenAIServingChat)
+        self.chat._pd_early_tokens = {}
+        self.chat._pd_early_tokens_last_cleanup = 100.0
+
+    def test_timeout_defaults_to_bootstrap_timeout_and_can_be_overridden(self):
+        with (
+            patch.object(
+                envs.SGLANG_PD_TOKEN_RELAY_TIMEOUT,
+                "get",
+                return_value=None,
+            ),
+            patch.object(
+                envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT,
+                "get",
+                return_value=42,
+            ),
+        ):
+            self.assertEqual(self.chat._pd_token_timeout(), 42.0)
+
+        with patch.object(
+            envs.SGLANG_PD_TOKEN_RELAY_TIMEOUT,
+            "get",
+            return_value=7,
+        ):
+            self.assertEqual(self.chat._pd_token_timeout(), 7.0)
+
+    def test_early_token_cleanup_is_throttled(self):
+        self.chat._pd_early_tokens = {
+            1: (0.0, [1]),
+            2: (125.0, [2]),
+        }
+        with patch.object(self.chat, "_pd_token_timeout", return_value=120.0):
+            self.chat._cleanup_expired_pd_early_tokens(129.0)
+            self.assertIn(1, self.chat._pd_early_tokens)
+
+            self.chat._cleanup_expired_pd_early_tokens(130.0)
+            self.assertNotIn(1, self.chat._pd_early_tokens)
+            self.assertIn(2, self.chat._pd_early_tokens)
+            self.assertEqual(self.chat._pd_early_tokens_last_cleanup, 130.0)
+
+    def test_connection_reset_is_found_in_exception_chain(self):
+        try:
+            try:
+                raise ConnectionResetError("peer closed")
+            except ConnectionResetError as cause:
+                raise RuntimeError("request body failed") from cause
+        except RuntimeError as wrapped:
+            self.assertTrue(self.chat._is_connection_reset_error(wrapped))
+
+        self.assertFalse(self.chat._is_connection_reset_error(ValueError("bad")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
