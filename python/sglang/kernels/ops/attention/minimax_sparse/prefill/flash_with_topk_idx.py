@@ -638,8 +638,14 @@ def _topk_index_kernel(
         + pid_h * stride_ti_h
         + off_t * stride_ti_t
     )
-    topk_mask = tl.arange(0, BLOCK_SIZE_T) < min(topk, valid_blocks)
-    tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=topk_mask)
+    output_mask = off_t < topk
+    valid_topk_mask = off_t < min(topk, valid_blocks)
+    # ``topk_idx`` is allocated with torch.empty. Always initialize the full
+    # logical row so short sequences have the right-padded -1 contract
+    # required by sparse-attention consumers. Leaving this tail unwritten can
+    # turn allocator garbage into out-of-range block ids and a device VMFault.
+    output = tl.where(valid_topk_mask, topk_idx, -1)
+    tl.store(ti_ptrs, output.to(ti_ptrs.dtype.element_ty), mask=output_mask)
 
 
 @triton.jit

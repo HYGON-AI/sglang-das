@@ -10,6 +10,7 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
+    _topk_index_kernel,
     _prune_prefill_score_configs,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
@@ -19,6 +20,46 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_prefill_topk_right_pads_short_rows_with_minus_one():
+    device = torch.device("cuda")
+    topk = 16
+    score = torch.arange(64, device=device, dtype=torch.float32).reshape(1, 1, 64)
+    topk_idx = torch.full((1, 1, topk), 12345, device=device, dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    cu_seqblocks_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    prefix_lens = torch.tensor([0], device=device, dtype=torch.int32)
+
+    _topk_index_kernel[(1, 1, 1)](
+        score,
+        topk_idx,
+        1,
+        0,
+        64,
+        cu_seqlens,
+        cu_seqblocks_q,
+        prefix_lens,
+        topk,
+        1,
+        0,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        MASK_INIT=False,
+        MASK_LOCAL=False,
+        SCORES_COMPACT=False,
+    )
+
+    torch.cuda.synchronize()
+    assert topk_idx[0, 0, 0].item() == 0
+    assert torch.equal(
+        topk_idx[0, 0, 1:], torch.full_like(topk_idx[0, 0, 1:], -1)
+    )
 
 
 def test_prefill_score_override_is_limited_to_long_context_exact_q1(monkeypatch):
