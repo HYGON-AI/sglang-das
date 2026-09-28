@@ -23,16 +23,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_hcu_ci,
 )
-
-# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
-register_hcu_ci(
-    est_time=120,
-    suite="nightly-hcu",
-    nightly=True,
-    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
-)
-
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -46,6 +37,14 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=295, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
+
+# HCU_CSV_COVERED_UNVERIFIED: Enabled from sglang.csv historical HCU coverage; not re-tested in this framework pass.
+register_hcu_ci(
+    est_time=120,
+    suite="nightly-hcu",
+    nightly=True,
+    disabled="HCU Full Enabled run 26941698027 failed; keep disabled until BW1100 failure is fixed or revalidated.",
+)
 
 
 class TestPPAccuracy(unittest.TestCase):
@@ -75,12 +74,11 @@ class TestPPAccuracy(unittest.TestCase):
             base_url=self.base_url,
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_amd_ci():
@@ -150,7 +148,7 @@ class TestDPAttentionDP2PP2(CustomTestCase):
             num_threads=1024,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
 
@@ -185,12 +183,11 @@ class TestPPMixedChunk(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_amd_ci():
