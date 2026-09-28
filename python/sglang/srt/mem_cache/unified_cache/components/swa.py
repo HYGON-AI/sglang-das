@@ -298,24 +298,23 @@ class SWAComponent(TreeComponent):
         node: UnifiedTreeNode,
         root_node: UnifiedTreeNode,
     ) -> None:
-        match phase:
-            case LRURefreshPhase.WALKDOWN:
-                # Walk-down would refresh every visited ancestor to MRU,
-                # but most are outside the active sliding window and must
-                # stay evictable. Window-bounded refresh runs at
-                # MATCH_END / INSERT_END instead.
-                return
-            case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
-                self.tree_core.lru_lists[
-                    self.component_type
-                ].reset_node_and_window_ancestors_mru(
-                    node,
-                    root_node,
-                    self.sliding_window_size + self.tree_core.page_size,
-                    self.node_has_component_data,
-                )
-            case _:
-                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+        if phase == LRURefreshPhase.WALKDOWN:
+            # Walk-down would refresh every visited ancestor to MRU,
+            # but most are outside the active sliding window and must
+            # stay evictable. Window-bounded refresh runs at
+            # MATCH_END / INSERT_END instead.
+            return
+        elif phase == LRURefreshPhase.MATCH_END or phase == LRURefreshPhase.INSERT_END:
+            self.tree_core.lru_lists[
+                self.component_type
+            ].reset_node_and_window_ancestors_mru(
+                node,
+                root_node,
+                self.sliding_window_size + self.tree_core.page_size,
+                self.node_has_component_data,
+            )
+        else:
+            raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def create_match_validator(
         self, match_device_only: bool = False

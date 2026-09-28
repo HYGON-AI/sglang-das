@@ -335,21 +335,20 @@ class TreeComponent(ABC):
         root_node: UnifiedTreeNode,
     ) -> None:
         ct = self.component_type
-        match phase:
-            case LRURefreshPhase.WALKDOWN:
-                if node.component_data[ct].value is None:
-                    return
-                self.tree_core.lru_lists[ct].reset_node_mru(node)
-            case LRURefreshPhase.MATCH_END:
-                self.tree_core.lru_lists[ct].reset_node_and_parents_mru(
-                    node, root_node, self.node_has_component_data
-                )
-            case LRURefreshPhase.INSERT_END:
-                # WALKDOWN already refreshed every node on the insert path
-                # (including the new leaf), so there is nothing more to do.
+        if phase == LRURefreshPhase.WALKDOWN:
+            if node.component_data[ct].value is None:
                 return
-            case _:
-                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+            self.tree_core.lru_lists[ct].reset_node_mru(node)
+        elif phase == LRURefreshPhase.MATCH_END:
+            self.tree_core.lru_lists[ct].reset_node_and_parents_mru(
+                node, root_node, self.node_has_component_data
+            )
+        elif phase == LRURefreshPhase.INSERT_END:
+            # WALKDOWN already refreshed every node on the insert path
+            # (including the new leaf), so there is nothing more to do.
+            return
+        else:
+            raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     @abstractmethod
     def create_match_validator(

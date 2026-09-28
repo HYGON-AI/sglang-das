@@ -129,16 +129,15 @@ class MambaComponent(TreeComponent):
         # only the used state. New leaf states enter the LRU via
         # commit_insert_component_data, so the insert walk (WALKDOWN) is a no-op here.
         ct = self.component_type
-        match phase:
-            case LRURefreshPhase.WALKDOWN:
-                return
-            case LRURefreshPhase.MATCH_END:
-                if node.component_data[ct].value is not None:
-                    self.tree_core.lru_lists[ct].reset_node_mru(node)
-            case LRURefreshPhase.INSERT_END:
-                return
-            case _:
-                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+        if phase == LRURefreshPhase.WALKDOWN:
+            return
+        elif phase == LRURefreshPhase.MATCH_END:
+            if node.component_data[ct].value is not None:
+                self.tree_core.lru_lists[ct].reset_node_mru(node)
+        elif phase == LRURefreshPhase.INSERT_END:
+            return
+        else:
+            raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def create_match_validator(
         self, match_device_only: bool = False

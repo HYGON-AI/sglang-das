@@ -157,28 +157,28 @@ class ScriptedSchedulerHook:
             sock_send(socket, wrap_as_pickle(HookReady()))
             while True:
                 msg = sock_recv(socket)
-                match msg:
-                    case Shutdown():
-                        return
-                    case RunScript(fn_path=fn_path, args=args):
-                        fn = resolve_fn(fn_path)
-                        ctx = self._context
-                        yield from _reset_engine_state(ctx)
-                        self._batch_log.clear()
-                        sub_gen = fn(ctx, *args)
-                        try:
-                            yield from sub_gen
-                        except Exception:
-                            sock_send(
-                                socket,
-                                wrap_as_pickle(
-                                    ScriptFailed(traceback=traceback.format_exc())
-                                ),
-                            )
-                        else:
-                            sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
-                    case _:
-                        raise ValueError(f"dispatch loop: unknown command {msg!r}")
+                if isinstance(msg, Shutdown):
+                    return
+                elif isinstance(msg, RunScript):
+                    fn_path, args = msg.fn_path, msg.args
+                    fn = resolve_fn(fn_path)
+                    ctx = self._context
+                    yield from _reset_engine_state(ctx)
+                    self._batch_log.clear()
+                    sub_gen = fn(ctx, *args)
+                    try:
+                        yield from sub_gen
+                    except Exception:
+                        sock_send(
+                            socket,
+                            wrap_as_pickle(
+                                ScriptFailed(traceback=traceback.format_exc())
+                            ),
+                        )
+                    else:
+                        sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
+                else:
+                    raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:
             close_zmq_socket(socket, ctx_zmq)
             self._http_poster.close()
