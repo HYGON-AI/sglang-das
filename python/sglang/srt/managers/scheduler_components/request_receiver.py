@@ -150,6 +150,31 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
+    @staticmethod
+    def _local_control_broadcast() -> bool:
+        return (
+            get_parallel().enable_dp_attention_local_control_broadcast
+            or is_ep_scale_joiner()
+        )
+
+    def ingress_sync_groups(self) -> List[Any]:
+        """CPU groups spanned by this rank's recv_requests broadcasts.
+
+        A loop that decides on each rank whether to call recv_requests again
+        must agree on exactly these groups, or ranks would enter a different
+        number of broadcasts. Empty when this rank broadcasts to nobody.
+        """
+        if get_parallel().enable_dp_attention and self._local_control_broadcast():
+            groups = []
+            if self.ps.attn_tp_size != 1:
+                groups.append(self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size != 1:
+                groups.append(self.attn_cp_cpu_group)
+            return groups
+        # Without DP attention everything, and with it the control requests,
+        # are broadcast over the full TP group.
+        return [self.tp_cpu_group] if self.ps.tp_size != 1 else []
+
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
         if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -179,11 +204,7 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = (
-                get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
-            )
-            if _local_ctrl:
+            if self._local_control_broadcast():
                 if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,

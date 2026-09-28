@@ -1820,7 +1820,22 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if getattr(self, "_host_resources_done", False):
+            return
+        self._host_resources_done = True
         executor = getattr(self, "_forward_launch_executor", None)
+        # The background prefetch worker submits into the linker and store:
+        # stop it before they close. The 30 s bound covers this join only.
+        if not self._stop_bg_prefetch_worker():
+            logger.error(
+                "Background DFS prefetch worker did not stop; leaving host "
+                "resources to process exit instead of closing them under it."
+            )
+            if executor is not None:
+                # Returns at once; a running forward is not interrupted, and
+                # interpreter exit still waits for the executor thread.
+                executor.shutdown(wait=False)
+            return
         if executor is not None:
             executor.shutdown(wait=True)
         if self.hisparse_coordinator is not None:
@@ -2304,11 +2319,31 @@ class Scheduler(
     def _request_bg_prefetch_epoch(self) -> None:
         if not self.enable_waiting_queue_dfs_prefetch:
             return
+        # A failed round also sets the stop flag: report the failure first.
         if self._bg_error is not None:
             raise RuntimeError("Background DFS prefetch is unusable") from self._bg_error
         with self._bg_condition:
+            if self._bg_stop_flag:
+                return
             self._bg_requested_epoch += 1
             self._bg_condition.notify()
+
+    def _stop_bg_prefetch_worker(self, timeout_s: float = 30.0) -> bool:
+        """Best-effort stop of the background prefetch worker.
+
+        Returns True once the worker has exited. Shutting ranks do not agree
+        on a last round, so a worker blocked in a round whose peers already
+        stopped may not exit within timeout_s; the caller must then leave
+        every resource that worker may still use untouched.
+        """
+        thread = getattr(self, "_bg_thread", None)
+        if thread is None:
+            return True
+        with self._bg_condition:
+            self._bg_stop_flag = True
+            self._bg_condition.notify_all()
+        thread.join(timeout_s)
+        return not thread.is_alive()
 
     def _drain_bg_prefetch_acks(self) -> None:
         while True:
@@ -4506,13 +4541,26 @@ class Scheduler(
                 )
             )
 
+        sync_groups = self.request_receiver.ingress_sync_groups()
         while True:
-            # CP and TP ranks must enter the same number of receive broadcasts,
-            # even when their local model launch finishes at different times.
+            # A failed launch or background round is fatal: raise it here, at
+            # the next checkpoint, instead of after every rank has finished.
+            # The other ranks then depend on this node's fatal path (SIGQUIT to
+            # the local process tree), remote timeouts or external supervision.
+            if future.done() and future.exception() is not None:
+                future.result()
+            if self._bg_error is not None:
+                raise RuntimeError(
+                    "Background DFS prefetch is unusable"
+                ) from self._bg_error
+
+            # Every rank that shares a receive broadcast must enter the same
+            # number of them, even when its model launch finishes earlier.
             active = torch.tensor([int(not future.done())], dtype=torch.int)
-            self.tree_cache._all_reduce_attn_groups(
-                active, op=torch.distributed.ReduceOp.MAX
-            )
+            for group in sync_groups:
+                torch.distributed.all_reduce(
+                    active, op=torch.distributed.ReduceOp.MAX, group=group
+                )
             if not int(active.item()):
                 break
 
@@ -4532,6 +4580,12 @@ class Scheduler(
                             reason="ordered_after_deferred",
                             deferred_count=len(deferred_reqs),
                             forward_iter=self.forward_ct,
+                        )
+                    elif is_health_check_generate_req(recv_req):
+                        # A forward is running, so the server is busy: answer
+                        # as process_input_requests does when not fully idle.
+                        self.return_health_check_ipcs.append(
+                            getattr(recv_req, "http_worker_ipc", None)
                         )
                     elif (
                         isinstance(recv_req, TokenizedGenerateReqInput)
