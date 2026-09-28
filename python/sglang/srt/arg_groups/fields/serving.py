@@ -126,9 +126,7 @@ class Serving(msgspec.Struct):
         int,
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
-    ] = (
-        1024 * 1024
-    )
+    ] = 1024 * 1024
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -306,3 +304,30 @@ class Serving(msgspec.Struct):
     disable_tokenizer_batch_decode: A[
         bool, "Disable batch decoding when decoding multiple completions."
     ] = False
+
+    # GLM serving extensions, opt-in for compatibility with existing clients.
+    glm_adaptive_max_tokens: A[
+        bool, "Reduce requested completion tokens to fit the GLM context budget."
+    ] = False
+    glm_check_chat_prompt_length: A[
+        bool,
+        "Return HTTP 413 when the GLM prompt and completion exceed the context budget.",
+    ] = False
+    glm_check_total_num_tokens: A[
+        bool,
+        "Check that the KV token capacity can hold the configured GLM context length.",
+    ] = False
+    glm_decoding_constraint_module: A[
+        Optional[str],
+        "Module exporting GLM generation_constraint and get_special_token_config.",
+    ] = None
+    glm_disable_nothink: A[
+        bool, "Reject requests that disable thinking for thinking-only GLM models."
+    ] = False
+    glm_ignore_decoding_constraint_exception: A[
+        bool, "Log GLM constraint errors and continue without the constraint."
+    ] = False
+    glm_special_token_escape_seed: A[
+        Optional[int],
+        "Seed used to escape GLM special token strings while preserving token IDs.",
+    ] = None

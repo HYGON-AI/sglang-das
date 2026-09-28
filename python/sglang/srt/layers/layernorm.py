@@ -742,7 +742,7 @@ class RMSNorm(BaseFusedOp):
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Fallback to native implementation if vllm is not available
-        if not _has_vllm_rms_norm:
+        if not (_is_hcu or _has_vllm_rms_norm):
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():

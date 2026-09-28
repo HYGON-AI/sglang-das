@@ -827,6 +827,69 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
+    def _match_prefix_helper_readonly(
+        self, key: RadixKey
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+        """Traverse fully matched nodes without splitting or updating LRU state."""
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        value: list[torch.Tensor] = []
+        best_match_node = node
+        best_match_device_node = node
+        best_match_device_value_len = 0
+        separate_device_match = self.enable_hicache
+        if separate_device_match:
+            validators = tuple(
+                comp.create_match_validator() for comp in self.components
+            )
+            device_validators = tuple(
+                comp.create_match_validator(match_device_only=True)
+                for comp in self.components
+            )
+        else:
+            validators = tuple(
+                comp.create_match_validator(match_device_only=True)
+                for comp in self.components
+            )
+
+        def _all_valid(match_validators, match_node):
+            return all(validator(match_node) for validator in match_validators)
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            if child.evicted and not child.backuped:
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                break
+
+            if not child.evicted:
+                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+            node = child
+
+            matched = _all_valid(validators, node)
+            if matched:
+                best_match_node = node
+            if not separate_device_match:
+                if matched:
+                    best_match_device_value_len = len(value)
+                    best_match_device_node = node
+            elif _all_valid(device_validators, node):
+                best_match_device_value_len = len(value)
+                best_match_device_node = node
+
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        return (
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_match_device_value_len,
+        )
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> tuple[

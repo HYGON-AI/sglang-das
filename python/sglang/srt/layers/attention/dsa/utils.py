@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import triton
@@ -18,15 +18,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_cuda,
-    is_hcu,
-    is_hip,
-    is_musa,
-    is_npu,
-)
-from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip, is_musa
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 
 @lru_cache(maxsize=1)
@@ -94,6 +87,20 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+    from sglang.srt.utils import is_hcu
+
+    if is_hcu():
+        config = process_model_config()
+        if is_glm5_next_hcu(config.hf_config):
+            from sglang.srt.layers.attention.glm5_next.runtime import (
+                get_glm5_next_runtime_args,
+            )
+            from sglang.srt.layers.attention.glm5_next.utils import (
+                should_remap_pd_dsa_seed_to_local_slots as hcu_should_remap,
+            )
+
+            return hcu_should_remap(get_glm5_next_runtime_args(), config)
     return (
         (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
@@ -121,11 +128,15 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     )
 
 
-def is_dsa_enable_prefill_cp():
-    if get_parallel().attn_cp_size <= 1:
-        return False
+def dsa_prefill_has_history(forward_batch: "ForwardBatch") -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    return prefix_lens is None or any(int(length) > 0 for length in prefix_lens)
 
-    if (is_hip() and not is_hcu()) or is_npu() or is_musa():
+
+def is_dsa_enable_prefill_cp():
+    if is_hcu():
+        return get_parallel().enable_dsa_prefill_context_parallel
+    if is_hip() or is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model
@@ -142,8 +153,13 @@ def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
 
 
-# Retain the name imported by the unchanged HIP radix attention backend.
-is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
+def is_dsa_prefill_cp_round_robin_split():
+    if is_hcu():
+        return (
+            is_dsa_enable_prefill_cp()
+            and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
+        )
+    return is_dsa_prefill_cp_interleave()
 
 
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
@@ -172,10 +188,45 @@ def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
     )
 
 
+def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
+    if not forward_batch.forward_mode.is_context_parallel_extend():
+        return False
+    cp_size = get_parallel().attn_cp_size
+    seq_len = sum(forward_batch.extend_seq_lens_cpu)
+    return (
+        is_dsa_prefill_cp_round_robin_split()
+        and seq_len > 0
+        and seq_len >= cp_size
+        and cp_size > 1
+    )
+
+
+def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    if isinstance(input_, (tuple, list)):
+        indices = range(cp_rank, len(input_), cp_size)
+        return input_[indices]
+
+    tokens = len(input_)
+    if tokens % cp_size != 0:
+        cur_len = tokens // cp_size + (tokens % cp_size > cp_rank)
+        if cur_len == 0:
+            return input_.new_empty(0, *input_.shape[1:])
+        indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
+        return input_[indices]
+
+    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
+    if shard.stride(0) != input_.stride(0):
+        shard = shard.clone(memory_format=torch.contiguous_format)
+    return shard
+
+
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
-    from sglang.srt.layers.cp.utils import is_cp_active
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_active
 
     # CP-v2 already pads each rank-local shard to its physical size
     if is_cp_active(forward_batch):
@@ -184,9 +235,12 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
+    sync_group_size = len(global_num_tokens)
     attn_cp_size = get_parallel().attn_cp_size
-    # Non-CP forwards (including speculative forwards) use attention-TP padding
-    # only, matching ForwardBatch.prepare_mlp_sync_batch.
+    if not enable_cp_v2():
+        cp_align_size = get_cp_padding_align_size()
+        for i in range(sync_group_size):
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:
@@ -199,14 +253,16 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
         tokens = global_num_tokens[0]
-    if can_dsa_prefill_cp_interleave(forward_batch):
+    if can_dsa_prefill_cp_round_robin_split(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     attn_cp_size = get_parallel().attn_cp_size
-    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_interleave(forward_batch)
+    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_round_robin_split(
+        forward_batch
+    )
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     if not needs_cp_pad and not needs_dp_pad:
         return dsa_cache_seqlens
@@ -220,6 +276,65 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
             ]
         )
     return dsa_cache_seqlens
+
+
+def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_dsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_dsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
+    if is_dsa_prefill_cp_round_robin_split():
+        cur_cp_seq_len = seq_len // cp_size
+        assert seq_len % cp_size == 0, (
+            f"Expect seq len can divided by cp size, but got seq len {seq_len}, cp size {cp_size}"
+        )
+    else:
+        cur_cp_seq_len = seq_len // (cp_size * 2)
+    return cur_cp_seq_len != 0
+
+
+from sglang.kernels.ops.attention.dsa.cp_split import (
+    dsa_cp_interleave_q_seqs_kernel as dsa_cp_round_robin_split_q_seqs_kernel,
+)
+
+
+def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    extra_seq = 0
+    q_seqs = []
+    for cur_len in extend_seqs:
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
+        q_seqs.append(cur_seq)
+        extra_seq = cur_len - cur_seq * cp_size
+    bs_idx = [i for i, q_len in enumerate(q_seqs) if q_len > 0]
+    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+    return q_seqs, bs_idx
+
+
+def dsa_cp_round_robin_split_q_seqs(
+    extend_seqs_cpu, extend_seqs
+) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(
+        extend_seqs_cpu
+    )
+    ret_q_lens = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
+    )
+    bs_idx = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
+    )
+    dsa_cp_round_robin_split_q_seqs_kernel[(1,)](
+        extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+    )
+    return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
 
 def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):

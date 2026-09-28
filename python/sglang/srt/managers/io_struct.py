@@ -334,6 +334,7 @@ class GenerateReqInput:
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
+    encoder_part_routes: Optional[List[Dict[str, Any]]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -1067,6 +1068,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
     encoder_urls: Optional[List[str]] = None
+    encoder_part_routes: Optional[List[Dict[str, Any]]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -1775,10 +1777,39 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = True
 
 
+class DetokenizerCompletionReq(BaseReq, kw_only=True):
+    """Release a detokenizer worker's load after its final output was sent."""
+
+    worker_ipc_name: str
+    finished_rids: List[str]
+
+
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
+
+    worker_pid: int = 0
+
+
+class TokenizerWorkerRegistrationAckReq(BaseReq, kw_only=True):
+    """Assign startup-only responsibilities to a tokenizer worker."""
+
+    is_warmup_worker: bool
+    warmup_result: Optional[bool] = None
+
+
+class TokenizerWarmupResultReq(BaseReq, kw_only=True):
+    """Report the warmup owner's terminal result to the tokenizer router."""
+
+    worker_ipc_name: str
+    success: bool
+
+
+class TokenizerWarmupResultBroadcastReq(BaseReq, kw_only=True):
+    """Broadcast the terminal server warmup result to tokenizer workers."""
+
+    success: bool
 
 
 class PauseContinueBroadcastReq(BaseReq, kw_only=True):

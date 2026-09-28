@@ -19,13 +19,16 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.glm5_next import (
+    get_dsa_host_pool_cls,
+    get_mla_host_pool_cls,
+    is_hcu_glm_pool,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import (
     get_memory,
@@ -151,7 +154,7 @@ def build_kv_host_pool(
     pool_label: str = "kv",
 ):
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost
+        get_mla_host_pool_cls(kv_pool)
         if use_mla
         else get_mha_host_pool_cls(kv_pool, get_memory().hicache_mem_layout)
     )
@@ -997,9 +1000,35 @@ def build_hybrid_mamba_stack(
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        if is_hcu_glm_pool(kv_pool):
+            from sglang.srt.mem_cache.pool_host.glm5_next import index_bytes_per_page
+
+            budget_layers = sum(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+                for pool in (kv_pool, *mtp_draft_device_pools)
+            )
+            kv_bytes = (
+                kv_pool.size
+                * budget_layers
+                * (
+                    kv_pool.kv_cache_dim * kv_pool.store_dtype.itemsize
+                    + index_bytes_per_page(kv_pool) / kv_pool.page_size
+                )
+            )
+            mamba_bytes = mamba_pool.get_kv_size_bytes()
+            mamba_bytes = (
+                sum(mamba_bytes) if isinstance(mamba_bytes, tuple) else mamba_bytes
+            )
+            kv_host_size = (
+                get_memory().hicache_size * kv_bytes / (kv_bytes + mamba_bytes)
+            )
+            mamba_host_size = get_memory().hicache_size - kv_host_size
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (kv_pool, mamba_pool)
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1020,7 +1049,9 @@ def build_hybrid_mamba_stack(
     # KDA hybrid on NPU); the Mamba/KDA state pool has no separate K/V
     # buffers, so kv_split does not apply -- override to page_first_direct.
     mamba_layout = get_memory().hicache_mem_layout
-    if mamba_layout == "layout_hcu":
+    if mamba_layout == "layout_hcu" or (
+        mamba_layout == "layer_first" and is_hcu_glm_pool(kv_pool)
+    ):
         mamba_layout = "page_first"
     elif mamba_layout == "page_first_kv_split":
         mamba_layout = "page_first_direct"
@@ -1055,6 +1086,22 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if is_hcu_glm_pool(kv_pool):
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=get_dsa_host_pool_cls(kv_pool)(
+                    kv_pool,
+                    kv_host_pool,
+                    get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                ),
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+                packed_draft_device_pools=mtp_draft_device_pools,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1212,7 +1259,9 @@ def build_anchor_sidecar_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     mtp_draft_device_pools = tuple(
-        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+        pool
+        for pool in params.mtp_draft_device_pools
+        if is_hcu_glm_pool(pool) or pool.index_k_with_scale_buffer
     )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -1299,7 +1348,7 @@ def _build_mha_mla_host_pool(
     )
     if isinstance(pool, MHATokenToKVPool):
         return get_mha_host_pool_cls(pool)(pool, **kwargs)
-    return MLATokenToKVPoolHost(
+    return get_mla_host_pool_cls(pool)(
         pool,
         override_kv_cache_dim=pool.kv_cache_dim,
         **kwargs,
@@ -1321,7 +1370,11 @@ def build_full_draft_pools(
     if isinstance(pool, HybridLinearKVPool):
         # Hybrid draft runners keep their sole attention layer in this sub-pool.
         pool = pool.full_kv_pool
-    if pool.layer_num == 0:
+    if pool.layer_num == 0 or (
+        is_hcu_glm_pool(pool)
+        and pool.layer_shard_enabled
+        and pool._owned_local_layer_range()[0] == pool._owned_local_layer_range()[1]
+    ):
         return [], []
 
     controller = tree_cache.cache_controller
@@ -1355,8 +1408,10 @@ def build_full_draft_pools(
         )
     ]
 
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        indexer_host_pool = DSAIndexerPoolHost(
+    if isinstance(pool, DSATokenToKVPool) and (
+        is_hcu_glm_pool(pool) or pool.index_k_with_scale_buffer
+    ):
+        indexer_host_pool = get_dsa_host_pool_cls(pool)(
             pool,
             draft_host_pool,
             get_memory().hicache_mem_layout,
@@ -1682,6 +1737,13 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=[
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV
+                )
+            ]
+            if is_hcu_glm_pool(kvcache.full_kv_pool)
+            else [],
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
             pools_desc="KV + MAMBA",
@@ -1877,7 +1939,9 @@ class _DsaStrategy(StackStrategy):
             storage_backend=storage_backend,
             use_mla=use_mla,
             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: get_dsa_host_pool_cls(
+                full_kv_pool
+            )(
                 full_kv_pool,
                 kv_host_pool,
                 get_memory().hicache_mem_layout,
@@ -2306,7 +2370,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: get_dsa_host_pool_cls(kv)(
                 kv,
                 kv_host_pool,
                 get_memory().hicache_mem_layout,

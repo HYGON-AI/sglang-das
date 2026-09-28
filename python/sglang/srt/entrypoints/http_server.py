@@ -303,6 +303,15 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    _global_state.tokenizer_manager.auto_create_handle_loop()
+    wait_for_assignment = getattr(
+        _global_state.tokenizer_manager, "wait_for_warmup_assignment", None
+    )
+    is_warmup_owner = (
+        await wait_for_assignment() if wait_for_assignment is not None else True
+    )
+    warmup_thread_kwargs = dict(warmup_thread_kwargs, is_warmup_owner=is_warmup_owner)
+
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -381,14 +390,23 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
-    # Execute custom warmups
-    if get_serving().warmups is not None:
-        await execute_warmups(
-            get_disagg().disaggregation_mode,
-            get_serving().warmups.split(","),
-            _global_state.tokenizer_manager,
+    try:
+        # Execute custom warmups
+        if get_serving().warmups is not None and is_warmup_owner:
+            await execute_warmups(
+                get_disagg().disaggregation_mode,
+                get_serving().warmups.split(","),
+                _global_state.tokenizer_manager,
+            )
+            logger.info("Warmup ended")
+
+    except BaseException:
+        report = getattr(
+            _global_state.tokenizer_manager, "report_server_warmup_result", None
         )
-        logger.info("Warmup ended")
+        if is_warmup_owner and report is not None:
+            report(False)
+        raise
 
     # Start the native gRPC server and warmup inside the try so a failure in
     # either still runs the finally cleanup below. Native gRPC is enabled via
@@ -417,7 +435,15 @@ async def lifespan(fast_api_app: FastAPI):
             target=_wait_and_warmup,
             kwargs=warmup_thread_kwargs,
         )
-        warmup_thread.start()
+        try:
+            warmup_thread.start()
+        except BaseException:
+            report = getattr(
+                _global_state.tokenizer_manager, "report_server_warmup_result", None
+            )
+            if is_warmup_owner and report is not None:
+                report(False)
+            raise
 
         # Start the HTTP server
         yield
@@ -681,6 +707,11 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
+    if (
+        getattr(_global_state.tokenizer_manager, "server_warmup_result", True)
+        is not True
+    ):
+        return Response(status_code=503)
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
@@ -2426,37 +2457,71 @@ def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    is_warmup_owner: bool = True,
 ):
-    if get_model().checkpoint_engine_wait_weights_before_ready:
-        _wait_weights_ready()
-
-    # Joiner schedulers are served through the primary after adoption.
-    skip_elastic_joiner_warmup = get_exec().moe.is_ep_scale_joiner
-    if skip_elastic_joiner_warmup:
-        logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
-            get_exec().moe.ep_join_mode,
+    tokenizer_manager = _global_state.tokenizer_manager
+    if not is_warmup_owner:
+        wait_for_warmup_result = getattr(
+            tokenizer_manager, "wait_for_server_warmup_result", None
         )
-
-    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
-        if not execute_warmup_func(server_args):
+        if wait_for_warmup_result is None:
+            tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.error("Tokenizer worker cannot receive the server warmup result")
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
-    _freeze_gc_after_server_warmup(server_args)
+        success = wait_for_warmup_result()
+        tokenizer_manager.server_status = (
+            ServerStatus.Up if success else ServerStatus.UnHealthy
+        )
+        return
 
-    # The server is ready for requests
-    logger.info("The server is fired up and ready to roll!")
+    success = False
+    try:
+        if get_model().checkpoint_engine_wait_weights_before_ready:
+            _wait_weights_ready()
 
-    if get_model().delete_ckpt_after_loading:
-        delete_directory(get_model().model_path)
+        # Joiner schedulers are served through the primary after adoption.
+        skip_elastic_joiner_warmup = get_exec().moe.is_ep_scale_joiner
+        if skip_elastic_joiner_warmup:
+            logger.debug(
+                "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
+                get_exec().moe.ep_join_mode,
+            )
 
-    if get_observability().debug_tensor_dump_input_file:
-        kill_process_tree(os.getpid())
+        if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
+            if (
+                not execute_warmup_func(server_args)
+                or tokenizer_manager.server_status != ServerStatus.Up
+            ):
+                tokenizer_manager.server_status = ServerStatus.UnHealthy
+                return
+        else:
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
-    if launch_callback is not None:
-        launch_callback()
+        _freeze_gc_after_server_warmup(server_args)
+
+        # The server is ready for requests
+        logger.info("The server is fired up and ready to roll!")
+
+        if get_model().delete_ckpt_after_loading:
+            delete_directory(get_model().model_path)
+
+        if get_observability().debug_tensor_dump_input_file:
+            kill_process_tree(os.getpid())
+
+        if launch_callback is not None:
+            launch_callback()
+
+        success = True
+    except BaseException:
+        tokenizer_manager.server_status = ServerStatus.UnHealthy
+        raise
+    finally:
+        report_warmup_result = getattr(
+            tokenizer_manager, "report_server_warmup_result", None
+        )
+        if report_warmup_result is not None:
+            report_warmup_result(success)
 
 
 def _wait_weights_ready():
@@ -2779,22 +2844,33 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                uvicorn.run(
-                    "sglang.srt.entrypoints.http_server:app",
-                    host=get_serving().host,
-                    port=get_serving().port,
-                    root_path=get_serving().fastapi_root_path,
-                    log_level=get_observability().log_level_http
-                    or get_observability().log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
-                    loop="uvloop",
-                    workers=get_serving().tokenizer_worker_num,
-                    ssl_keyfile=get_serving().ssl_keyfile,
-                    ssl_certfile=get_serving().ssl_certfile,
-                    ssl_ca_certs=get_serving().ssl_ca_certs,
-                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                from sglang.srt.entrypoints.multiprocessing_spawn import (
+                    use_multiprocessing_spawn_bootstrap,
+                    use_uvicorn_worker_startup_wait,
                 )
+
+                with (
+                    use_multiprocessing_spawn_bootstrap(),
+                    use_uvicorn_worker_startup_wait(
+                        envs.SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT.get()
+                    ),
+                ):
+                    uvicorn.run(
+                        "sglang.srt.entrypoints.http_server:app",
+                        host=get_serving().host,
+                        port=get_serving().port,
+                        root_path=get_serving().fastapi_root_path,
+                        log_level=get_observability().log_level_http
+                        or get_observability().log_level,
+                        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                        timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
+                        loop="uvloop",
+                        workers=get_serving().tokenizer_worker_num,
+                        ssl_keyfile=get_serving().ssl_keyfile,
+                        ssl_certfile=get_serving().ssl_certfile,
+                        ssl_ca_certs=get_serving().ssl_ca_certs,
+                        ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                    )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

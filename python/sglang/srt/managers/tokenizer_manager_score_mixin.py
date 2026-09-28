@@ -527,8 +527,8 @@ class TokenizerManagerScoreMixin:
                 # delimiter. Positions come from item lengths (delimiter_indices),
                 # not from scanning for this token — it's for FlashInfer compat only.
                 delimiter_token_id = MIS_DELIMITER_TOKEN_ID
-                query_ids, items_ids = self._batch_tokenize_query_and_items(
-                    query, items_list
+                query_ids, items_ids = await self.run_tokenizer_offload(
+                    self._batch_tokenize_query_and_items, query, items_list
                 )
                 combined_input_ids, delimiter_indices = (
                     self._build_multi_item_token_sequence(
@@ -564,7 +564,9 @@ class TokenizerManagerScoreMixin:
             )
         elif has_embeds:
             # Text inputs with embed overrides — need to tokenize first to resolve positions
-            query_ids, items_ids = self._batch_tokenize_query_and_items(query, items)
+            query_ids, items_ids = await self.run_tokenizer_offload(
+                self._batch_tokenize_query_and_items, query, items
+            )
             _, input_ids, positional_embed_overrides, delimiter_indices = (
                 self._build_token_id_inputs(
                     query_ids,

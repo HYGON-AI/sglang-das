@@ -118,8 +118,21 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
+def enable_cp_v2() -> bool:
+    """Return whether the strategy-based generic prefill CP path is available."""
+    from sglang.srt.utils import is_hip, is_musa, is_npu
+
+    return not (is_hip() or is_npu() or is_musa())
+
+
 def is_cp_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP."""
+    # HIP/NPU/MUSA retain their platform CP implementations.  Treating those
+    # batches as strategy-CP here shards the model inputs a second time while
+    # their attention backends still use the legacy layout.
+    if not enable_cp_v2():
+        return False
+
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
         return False
@@ -135,9 +148,29 @@ def is_cp_active(forward_batch) -> bool:
     return strategy.can_apply(len(input_ids), forward_batch)
 
 
+# Compatibility name retained for pre-generic-CP callers.
+is_cp_v2_active = is_cp_active
+
+
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
     return is_cp_enabled() and uses_mla_backend()
+
+
+def is_mla_prefill_cp_enabled() -> bool:
+    """Compatibility name used by the CUDA-graph runner."""
+    return is_mla_cp_enabled()
+
+
+def mla_use_prefill_cp(forward_batch) -> bool:
+    """Compatibility predicate for platform-specific MLA prefill CP."""
+    if enable_cp_v2():
+        return is_mla_prefill_cp_enabled() and is_cp_active(forward_batch)
+    return (
+        getattr(forward_batch, "attn_cp_metadata", None) is not None
+        and is_mla_prefill_cp_enabled()
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
 
 
 def is_mla_cp_active(forward_batch) -> bool:
@@ -258,6 +291,12 @@ def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
     """Materialize a CP tensor in the global logical token order."""
+    if not enable_cp_v2():
+        from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+        return cp_all_gather_rerange_output(
+            x, get_parallel().attn_cp_size, forward_batch, stream
+        )
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
@@ -332,7 +371,9 @@ __all__ = [
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
     "get_cp_strategy",
+    "enable_cp_v2",
     "is_cp_active",
+    "is_cp_v2_active",
     "is_mla_cp_enabled",
     "is_mla_cp_active",
     "cp_gather_after_forward",

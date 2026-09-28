@@ -762,7 +762,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     else (
                         256
                         if (
-                            get_model().quantization == "slimquant_marlin"
+                            (get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE") if is_hcu() else get_model().quantization == "slimquant_marlin")
                             or _use_fp8_w8a8_moe
                             or _use_marlin_w16a16_moe
                         )

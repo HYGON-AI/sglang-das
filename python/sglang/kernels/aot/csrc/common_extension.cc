@@ -89,6 +89,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   m.def(
+      "kpool_write_plan(Tensor write_start, Tensor req_pool_indices, Tensor real_page_table, Tensor! req_out, "
+      "Tensor! write_start_out, Tensor! tail_logical_start_out, Tensor! write_loc_out, "
+      "Tensor!? pool_seqlens_per_q_out, Tensor!? seqlens_per_q_out, int pool_size, int num_draft_tokens, "
+      "int slots_per_page) -> ()");
+  m.impl("kpool_write_plan", torch::kCUDA, &kpool_write_plan);
+
+  m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");

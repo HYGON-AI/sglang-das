@@ -493,6 +493,27 @@ def traverse_tree(
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
 
+    matcher = getattr(grammar, "matcher", None)
+    if matcher is not None and hasattr(matcher, "traverse_draft_tree"):
+        # xgrammar >= 0.2.0 requires int64 tensors for the C++ traversal.
+        rnt = (
+            retrieve_next_token
+            if retrieve_next_token.dtype == torch.int64
+            else retrieve_next_token.to(torch.int64)
+        )
+        rns = (
+            retrieve_next_sibling
+            if retrieve_next_sibling.dtype == torch.int64
+            else retrieve_next_sibling.to(torch.int64)
+        )
+        dts = (
+            draft_tokens
+            if draft_tokens.dtype == torch.int64
+            else draft_tokens.to(torch.int64)
+        )
+        matcher.traverse_draft_tree(rnt, rns, dts, allocate_token_bitmask)
+        return
+
     def dfs(
         curr: int,
         retrieve_next_token: torch.Tensor,
@@ -1052,7 +1073,9 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -1084,8 +1107,11 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
+        if mamba_track_indices is not None:
+            mamba_track_indices = req_pool.translate_mamba_indices(mamba_track_indices)
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
+            use_hcu_kda=mamba_pool.use_hcu_kda,
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,

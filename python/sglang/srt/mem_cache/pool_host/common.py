@@ -4,18 +4,15 @@ import json
 import logging
 import os
 from collections import defaultdict
-from functools import lru_cache
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hcu
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
@@ -160,7 +157,7 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            rc = int(cudart.cudaHostRegister(ptr, size, 2 if is_hcu() else 0))
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
@@ -254,31 +251,53 @@ def alloc_with_pin_memory(
     return buffer
 
 
-@lru_cache(maxsize=1)
-def _resolve_device_accessible_ptr_fn():
-    try:
-        from sgl_kernel.kvcacheio import get_device_accessible_ptr
-    except ImportError:
-        get_device_accessible_ptr = None
-    else:
-        if not hasattr(torch.ops.sgl_kernel, "get_device_accessible_ptr"):
-            get_device_accessible_ptr = None
+ALLOC_MEMORY_FUNCS = defaultdict(
+    lambda: alloc_with_host_register,
+    {
+        "npu": alloc_with_pin_memory,
+        "musa": alloc_with_pin_memory,
+    },
+)
 
-    if get_device_accessible_ptr is None:
-        # CUDA's UVA makes host and device addresses equal; on HIP they differ.
-        if _is_hip:
-            raise ImportError(
-                "sgl_kernel.kvcacheio.get_device_accessible_ptr is missing from the "
-                "installed sglang-kernel. It is required on ROCm, where registered "
-                "host memory carries a distinct device address. Rebuild sglang-kernel "
-                "from python/sglang/kernels/aot (setup_rocm.py)."
+_HIP_RT = None
+
+
+def _hip_host_get_device_pointer(host_ptr: int) -> int:
+    import ctypes
+
+    global _HIP_RT
+    if _HIP_RT is None:
+        last_err = None
+        for lib in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+            try:
+                _HIP_RT = ctypes.CDLL(lib)
+                break
+            except OSError as e:  # noqa: PERF203
+                last_err = e
+        if _HIP_RT is None:
+            raise RuntimeError(
+                f"Failed to load the HIP runtime for hipHostGetDevicePointer: {last_err}"
             )
-        logger.warning(
-            "sgl_kernel.kvcacheio.get_device_accessible_ptr is missing from the "
-            "installed sglang-kernel; using raw host addresses for kernel pointer "
-            "tables. Build sglang-kernel from python/sglang/kernels/aot to enable it."
+
+    dev_ptr = ctypes.c_void_p()
+    # hipError_t hipHostGetDevicePointer(void** devPtr, void* hstPtr, unsigned int flags)
+    err = _HIP_RT.hipHostGetDevicePointer(
+        ctypes.byref(dev_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"hipHostGetDevicePointer failed (hipError={err}) while building the "
+            f"kernel hicache device-pointer table; the host buffer must be "
+            f"registered with hipHostRegisterMapped (see alloc_with_host_register)."
         )
-    return get_device_accessible_ptr
+    return int(dev_ptr.value)
+
+
+def kernel_accessible_host_ptr(tensor: torch.Tensor) -> int:
+    """Translate registered HCU host storage without overlapping registrations."""
+    if is_hcu() and not tensor.is_cuda:
+        return _hip_host_get_device_pointer(tensor.data_ptr())
+    return tensor.data_ptr()
 
 
 def make_kernel_ptr_table(
@@ -288,32 +307,9 @@ def make_kernel_ptr_table(
     host_memory_registered: bool,
 ) -> torch.Tensor:
     device = torch.device(target_device)
-    get_device_accessible_ptr = (
-        _resolve_device_accessible_ptr_fn()
+    pointers = (
+        [kernel_accessible_host_ptr(tensor) for tensor in tensors]
         if host_memory_registered and device.type == "cuda"
-        else None
+        else [tensor.data_ptr() for tensor in tensors]
     )
-    if get_device_accessible_ptr is not None:
-        if device.index is None:
-            device_index = torch.cuda.current_device()
-        else:
-            device_index = device.index
-        pointers = [
-            get_device_accessible_ptr(tensor, device_index) for tensor in tensors
-        ]
-    else:
-        pointers = [tensor.data_ptr() for tensor in tensors]
-    return torch.tensor(
-        pointers,
-        dtype=torch.uint64,
-        device=device,
-    )
-
-
-ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
-    {
-        "npu": alloc_with_pin_memory,
-        "musa": alloc_with_pin_memory,
-    },
-)
+    return torch.tensor(pointers, dtype=torch.uint64, device=device)

@@ -638,6 +638,9 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=self.draft_model_idx,
+            glm5_next_layer_split_scratch_source=getattr(
+                self, "glm5_next_layer_split_scratch_source", None
+            ),
         )
 
     def init_mindspore_runner(self):
@@ -1679,6 +1682,16 @@ class ModelRunner:
     ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
+            self.attn_backend.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=len(forward_batch.input_ids)
+            )
+            from sglang.srt.model_executor.runner_utils import (
+                maybe_publish_prefill_shared_read_done,
+            )
+
+            maybe_publish_prefill_shared_read_done(
+                self, forward_batch, torch.get_device_module(self.device)
+            )
         next_split_index = min(
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,

@@ -52,6 +52,7 @@ sources = [
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
+    "csrc/elementwise/kpool_write_plan.cu",
     "csrc/elementwise/l2norm_kernel.cu",
     # Fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write on HIP/ROCm.
     "csrc/elementwise/rope_fp4.hip",
@@ -65,7 +66,7 @@ sources = [
     "csrc/attention/merge_attn_states.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
-    #"csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
+    # "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
 cxx_flags = ["-O3", "-w"]

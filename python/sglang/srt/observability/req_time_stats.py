@@ -107,16 +107,32 @@ class RequestStage:
     TOKENIZE = RequestStageConfig(
         "tokenize",
         level=1,
+        metrics_is_observed=True,
+    )
+    # Sub-slices of TOKENIZE (level 3, diagnostic): queue = waiting for the
+    # tokenize executor (zero when tokenization runs inline on the event
+    # loop), exec = the blocking encode call itself.
+    TOKENIZE_QUEUE = RequestStageConfig(
+        "tokenize_queue",
+        level=3,
+        metrics_is_observed=True,
+    )
+    TOKENIZE_EXEC = RequestStageConfig(
+        "tokenize_exec",
+        level=3,
+        metrics_is_observed=True,
     )
     API_SERVER_DISPATCH = RequestStageConfig(
         "api_server_dispatch",
         level=2,
+        metrics_is_observed=True,
     )
 
     # DP controller
     DPC_DISPATCH = RequestStageConfig(
         "dpc_dispatch",
         level=2,
+        metrics_is_observed=True,
     )
 
     # common/non-disaggregation
@@ -386,18 +402,26 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     first_token_time: float = 0.0
     last_time: float = 0.0
     tokenize_finish_time: float = 0.0
+    tokenize_queue_entry_time: float = 0.0
+    tokenize_exec_start_time: float = 0.0
+    tokenize_exec_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
 
     def __getstate__(self) -> object:
-        state = {}
-        # send to DP controller or Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #    "created_time": self.created_time,
-        #    "api_server_dispatch_time": self.api_server_dispatch_time,
-        # }
+        # Propagated to the DP controller / scheduler. The base __setstate__
+        # converts every "*time" key into the receiving process's
+        # perf_counter() domain, so the scheduler can observe the entry-side
+        # stages (tokenize / API dispatch / DPC dispatch) against its own clock.
+        state = {
+            "created_time": self.created_time,
+            "tokenize_finish_time": self.tokenize_finish_time,
+            "tokenize_queue_entry_time": self.tokenize_queue_entry_time,
+            "tokenize_exec_start_time": self.tokenize_exec_start_time,
+            "tokenize_exec_finish_time": self.tokenize_exec_finish_time,
+            "api_server_dispatch_time": self.api_server_dispatch_time,
+        }
         state.update(super().__getstate__())
         return state
 
@@ -447,6 +471,31 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 RequestStage.TOKENIZE.stage_name,
                 RequestStage.TOKENIZE.level,
                 convert_time_to_realtime_ns(ts),
+            )
+
+    def set_tokenize_queue_entry_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.tokenize_queue_entry_time = ts
+
+    def set_tokenize_exec_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.tokenize_exec_start_time = ts
+
+    def set_tokenize_exec_finish_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.tokenize_exec_finish_time = ts
+
+        if self.tokenize_queue_entry_time > 0 and self.tokenize_exec_start_time > 0:
+            self.trace_slice(
+                RequestStage.TOKENIZE_QUEUE,
+                self.tokenize_queue_entry_time,
+                self.tokenize_exec_start_time,
+            )
+            self.trace_slice(
+                RequestStage.TOKENIZE_EXEC, self.tokenize_exec_start_time, ts
             )
 
     def set_api_server_dispatch_time(self, ts=None):
@@ -554,20 +603,27 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
     # propagated from tokenizer/grpc_server, get by time.perf_counter()
     created_time: float = 0.0
     api_server_dispatch_time: float = 0.0
+    tokenize_finish_time: float = 0.0
+    tokenize_queue_entry_time: float = 0.0
+    tokenize_exec_start_time: float = 0.0
+    tokenize_exec_finish_time: float = 0.0
 
     # new timestamp, get by time.perf_counter()
     dpc_dispatch_time: float = 0.0
     dpc_dispatch_finish_time: float = 0.0
 
     def __getstate__(self) -> object:
-        state = {}
-        # send to Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #     "created_time": self.created_time,
-        #     "api_server_dispatch_time": self.api_server_dispatch_time,
-        #     "dpc_dispatch_time": self.dpc_dispatch_time,
-        # }
+        # Propagated to the scheduler; "*time" keys are clock-converted on
+        # arrival (see ReqTimeStatsBase.__setstate__).
+        state = {
+            "created_time": self.created_time,
+            "tokenize_finish_time": self.tokenize_finish_time,
+            "tokenize_queue_entry_time": self.tokenize_queue_entry_time,
+            "tokenize_exec_start_time": self.tokenize_exec_start_time,
+            "tokenize_exec_finish_time": self.tokenize_exec_finish_time,
+            "api_server_dispatch_time": self.api_server_dispatch_time,
+            "dpc_dispatch_time": self.dpc_dispatch_time,
+        }
         state.update(super().__getstate__())
         return state
 
@@ -605,11 +661,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
     """
 
-    # Placeholder: not used currently
-    # propagated from tokenizer/grpc_server or dp controller
+    # propagated from tokenizer/grpc_server or dp controller, converted into
+    # this process's perf_counter() domain by __setstate__
     created_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     dpc_dispatch_time: float = 0.0
+    tokenize_finish_time: float = 0.0
+    tokenize_queue_entry_time: float = 0.0
+    tokenize_exec_start_time: float = 0.0
+    tokenize_exec_finish_time: float = 0.0
+
+    # stamped at serialization time when the scheduler emits an output batch;
+    # consumed by the API server to observe the outbound path latency
+    output_emit_time: float = 0.0
 
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
@@ -652,22 +716,77 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not (self.enable_metrics or self.has_timing_data):
-            return {}
-
+        # output_emit_time rides outside the enable_metrics guard: the copy
+        # that travels detokenizer -> router -> http worker carries
+        # enable_metrics=False and would otherwise drop the stamp before the
+        # API server can observe the outbound latency. The first pickle (in
+        # the scheduler) stamps "now"; later hops forward the
+        # already-clock-converted value unchanged.
         state = {
-            "has_timing_data": True,
-            "wait_queue_entry_time": self.wait_queue_entry_time,
-            "forward_entry_time": self.forward_entry_time,
-            "prefill_finished_time": self.prefill_finished_time,
+            "output_emit_time": (
+                self.output_emit_time
+                if self.output_emit_time > 0
+                else time.perf_counter()
+            ),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        if not (self.enable_metrics or self.has_timing_data):
+            return state
+
+        state.update(
+            {
+                "has_timing_data": True,
+                "wait_queue_entry_time": self.wait_queue_entry_time,
+                "forward_entry_time": self.forward_entry_time,
+                "prefill_finished_time": self.prefill_finished_time,
+            }
+        )
         return state
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+        self._observe_entry_stages(ts)
+
+    def _observe_entry_stages(self, ts: float):
+        """Observe the entry-side stages from stamps propagated by the API
+        server / DP controller (already converted into this process's
+        perf_counter() domain by __setstate__).
+
+        Contiguous split of [created_time, scheduler_recv]:
+          tokenize:    created -> tokenize_finish (conversion + encode incl.
+                       executor queue); queue/exec sub-slices when available
+          dispatch:    tokenize_finish -> dpc_dispatch (zmq + DP controller
+                       inbox; ends at scheduler recv when no DP controller)
+          dpc_dispatch: dpc_dispatch -> scheduler recv
+        """
+        if not self.enable_metrics:
+            return
+        if self.created_time > 0 and self.tokenize_finish_time > 0:
+            self.observe_per_stage_req_latency(
+                RequestStage.TOKENIZE, self.tokenize_finish_time - self.created_time
+            )
+        if self.tokenize_queue_entry_time > 0 and self.tokenize_exec_start_time > 0:
+            self.observe_per_stage_req_latency(
+                RequestStage.TOKENIZE_QUEUE,
+                self.tokenize_exec_start_time - self.tokenize_queue_entry_time,
+            )
+        if self.tokenize_exec_start_time > 0 and self.tokenize_exec_finish_time > 0:
+            self.observe_per_stage_req_latency(
+                RequestStage.TOKENIZE_EXEC,
+                self.tokenize_exec_finish_time - self.tokenize_exec_start_time,
+            )
+        if self.tokenize_finish_time > 0:
+            dispatch_end = self.dpc_dispatch_time if self.dpc_dispatch_time > 0 else ts
+            self.observe_per_stage_req_latency(
+                RequestStage.API_SERVER_DISPATCH,
+                dispatch_end - self.tokenize_finish_time,
+            )
+        if self.dpc_dispatch_time > 0:
+            self.observe_per_stage_req_latency(
+                RequestStage.DPC_DISPATCH, ts - self.dpc_dispatch_time
+            )
 
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()

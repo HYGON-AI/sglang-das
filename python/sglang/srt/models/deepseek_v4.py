@@ -78,6 +78,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
+    enable_cp_v2,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -119,6 +120,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -792,6 +800,9 @@ class MqaAttentionBase(nn.Module):
         if attn_tp_rank is None or attn_tp_size is None:
             attn_tp_rank = get_parallel().attn_tp_rank
             attn_tp_size = get_parallel().attn_tp_size
+            if self.dsa_enable_prefill_cp:
+                self.cp_size = get_parallel().attn_cp_size
+                attn_tp_rank, attn_tp_size = 0, 1
         self.attn_tp_rank: int = attn_tp_rank
         self.attn_tp_size: int = attn_tp_size
 
@@ -4384,6 +4395,10 @@ class DeepseekV4Model(nn.Module):
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
 
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_size = get_parallel().attn_cp_size
+
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
         # Decoder SWA bounded replay: layers past the last kv_source layer run over
@@ -4813,6 +4828,14 @@ class DeepseekV4Model(nn.Module):
 
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
 
+        use_platform_cp = not enable_cp_v2() and dsa_use_prefill_cp(forward_batch)
+        if use_platform_cp and not run_tbo:
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
+
         if _is_npu and not run_tbo:
             # Rope cos/sin for the whole forward: one bf16 gather per rope
             # config on the current stream, before the layer loop forks the
@@ -4882,6 +4905,21 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
+
+        # Platform CP keeps tensors rank-local through PP and restores the
+        # global token order only on the last PP rank.
+        if self.pp_group.is_last_rank and use_platform_cp and not run_tbo:
+            stream = torch.cuda.current_stream()
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states, self.cp_size, forward_batch, stream
+            )
+            if capture_dspark:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -5005,6 +5043,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
+
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -5210,6 +5253,26 @@ class DeepseekV4ForCausalLM(nn.Module):
             input_ids = input_ids.masked_fill(
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
+
+        if not enable_cp_v2() and self.dsa_enable_prefill_cp:
+            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                )
+                if is_dsa_prefill_cp_round_robin_split():
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related(is_prefill=True)
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            attn_backend.init_forward_metadata_indexer(core_meta)
+                        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(

@@ -10,6 +10,7 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Callable, List, Optional, Tuple, Union
@@ -49,13 +50,18 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    is_cuda,
     load_audio,
     load_image,
     load_video,
 )
+from sglang.srt.utils.hf_transformers.processor import adapt_glm5next_image_processor
 from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 
 logger = logging.getLogger(__name__)
+_GPU_ADMIT_POLL_S = 0.2
+_GPU_ADMIT_IDLE_SLACK = 1.1
+_VIDEO_ADMIT_BYTES_FACTOR = 2.0
 
 
 _mm_grid_attrs = {
@@ -156,11 +162,25 @@ class EncoderPreprocessor:
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
 
+        self.device_module = torch.get_device_module(self.device)
+        self.gpu_id = (
+            self.device_module.current_device() if self.device == "cuda" else 0
+        )
+        self._admit_lock = asyncio.Lock()
+        self._admit_reserved_bytes = 0
+        self._admit_baseline_bytes = (
+            self.device_module.memory_allocated(self.gpu_id) if is_cuda() else 0
+        )
+        initializer = None
+        if self.device == "cuda":
+            initializer = lambda: self.device_module.set_device(self.gpu_id)
         self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+            initializer=initializer,
+            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get(),
         )
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=envs.SGLANG_ENCODER_MM_LOAD_WORKERS.get()
+            initializer=initializer,
+            max_workers=envs.SGLANG_ENCODER_MM_LOAD_WORKERS.get(),
         )
 
     # ------------------------------------------------------------------
@@ -183,6 +203,7 @@ class EncoderPreprocessor:
                 revision=get_model().revision,
                 **image_processor_kwargs,
             )
+            adapt_glm5next_image_processor(self.image_processor)
         except Exception as e:
             logger.warning(f"Failed to load image processor: {e}")
             self.image_processor = None
@@ -349,7 +370,19 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                vid = load_video(data, frame_count_limit)
+                vid = load_video(data, use_gpu=is_cuda())
+                if "glm" in self.model_type:
+                    if hasattr(vid, "_num_decode_threads"):
+                        vid._num_decode_threads = (
+                            envs.SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS.get()
+                        )
+                    if isinstance(vid, list):
+                        vid = [
+                            {**frame, "frame_image": load_image(frame["url"])[0]}
+                            if "frame_image" not in frame
+                            else frame
+                            for frame in vid
+                        ]
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
@@ -430,6 +463,188 @@ class EncoderPreprocessor:
             close = getattr(video, "close", None)
             if callable(close):
                 close()
+
+    @staticmethod
+    def _video_decode_uses_cuda(video) -> bool:
+        device = getattr(video, "device", getattr(video, "_device", "cpu"))
+        return is_cuda() and str(device).startswith("cuda")
+
+    def _estimate_video_decode_bytes(self, video_items, video_configs) -> int:
+        """Estimate the native RGB frame footprint for a video request."""
+        total = 0
+        for idx, video in enumerate(video_items):
+            if not self._video_decode_uses_cuda(video):
+                continue
+            config = video_configs[idx] if idx < len(video_configs) else {}
+            try:
+                frame_count = len(video)
+                fps = video.avg_fps
+                duration = frame_count / fps if fps else 0
+                indices = glm_sample_frame_indices(
+                    frame_count,
+                    fps,
+                    duration,
+                    target_fps=config.get("fps"),
+                    max_frame_count=config.get("max_frames"),
+                )
+                height, width = video.frame_shape
+                total += len(indices) * height * width * 3
+            except Exception as exc:
+                logger.warning(
+                    "[video-admit] could not estimate item %d: %s; treating as 0",
+                    idx,
+                    exc,
+                )
+        return total
+
+    async def await_gpu_bytes(self, need_bytes: int) -> Tuple[Optional[str], int]:
+        """Wait until the current device can admit a parallel video decode."""
+        if not is_cuda() or need_bytes <= 0:
+            return None, 0
+        need = int(need_bytes * _VIDEO_ADMIT_BYTES_FACTOR)
+        idle_ceiling = self._admit_baseline_bytes * _GPU_ADMIT_IDLE_SLACK
+        max_wait = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+        deadline = time.monotonic() + max_wait
+        async with self._admit_lock:
+            while True:
+                try:
+                    free, total = self.device_module.mem_get_info(self.gpu_id)
+                    allocated = self.device_module.memory_allocated(self.gpu_id)
+                    cached = self.device_module.memory_reserved(self.gpu_id)
+                except Exception:
+                    # Devices without CUDA-style memory accounting keep the
+                    # pre-existing unrestricted decode behavior.
+                    return None, 0
+                available = (cached - allocated) + free - self._admit_reserved_bytes
+                idle = allocated <= idle_ceiling and self._admit_reserved_bytes == 0
+                if total <= 0 or available >= need or idle:
+                    self._admit_reserved_bytes += need
+                    return None, need
+                if time.monotonic() >= deadline:
+                    return (
+                        f"GPU busy: video decode needs ~{need / 1e9:.1f}GB "
+                        f"(est {need_bytes / 1e9:.1f}GB "
+                        f"x{_VIDEO_ADMIT_BYTES_FACTOR:g}), available "
+                        f"{available / 1e9:.1f}GB of {total / 1e9:.1f}GB after "
+                        f"{max_wait:.0f}s"
+                    ), 0
+                await asyncio.sleep(_GPU_ADMIT_POLL_S)
+
+    def _release_admit_bytes(self, reserved: int) -> None:
+        if reserved:
+            self._admit_reserved_bytes = max(0, self._admit_reserved_bytes - reserved)
+
+    async def _shard_decode_single_video(
+        self,
+        vr,
+        video_config,
+        *,
+        shard_idx,
+        num_shards,
+        video_processor_kwargs,
+        precomputed_indices=None,
+    ):
+        """Decode one contiguous temporal shard of a single GLM-V video."""
+        from sglang.srt.disaggregation.encoder.server import MMError
+
+        video_config = video_config or {}
+        video_fps = vr.avg_fps
+        total_num_frames = len(vr)
+        duration = total_num_frames / video_fps if video_fps else 0
+
+        global_indices = (
+            precomputed_indices
+            if precomputed_indices is not None
+            else glm_sample_frame_indices(
+                total_num_frames,
+                video_fps,
+                duration,
+                target_fps=video_config.get("fps"),
+                max_frame_count=video_config.get("max_frames"),
+            )
+        )
+        # GLM-V groups every two sampled frames into one temporal unit. Split
+        # only on unit boundaries so concatenating Encoder outputs is lossless.
+        n_units = len(global_indices) // 2
+        base, remainder = divmod(n_units, num_shards)
+        shard_counts = [
+            base + (1 if index < remainder else 0) for index in range(num_shards)
+        ]
+        start = sum(shard_counts[:shard_idx])
+        count = shard_counts[shard_idx]
+        local_frame_indices = list(global_indices[2 * start : 2 * (start + count)])
+
+        if (
+            local_frame_indices
+            and global_indices
+            and video_config.get("_presize_budget")
+        ):
+            video_config = dict(video_config)
+            budget = dict(video_config["_presize_budget"])
+            if budget.get("max_pixels") is not None:
+                budget["max_pixels"] = max(
+                    1,
+                    int(
+                        budget["max_pixels"]
+                        * len(local_frame_indices)
+                        / len(global_indices)
+                    ),
+                )
+            video_config["_presize_budget"] = budget
+        frames = None
+        reserved = 0
+        try:
+            if local_frame_indices:
+                if self._video_decode_uses_cuda(vr):
+                    height, width = vr.frame_shape
+                    estimate = len(local_frame_indices) * height * width * 3
+                    admit_error, reserved = await self.await_gpu_bytes(estimate)
+                    if admit_error is not None:
+                        raise MMError(admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE)
+                loop = asyncio.get_running_loop()
+                frames = await loop.run_in_executor(
+                    self.io_executor,
+                    glm_decode_frames_at,
+                    vr,
+                    local_frame_indices,
+                    video_config,
+                )
+        finally:
+            self._release_admit_bytes(reserved)
+
+        if frames is not None:
+            videos = [frames]
+        else:
+            # _process_mm_items consumes the empty-shard marker before invoking
+            # the HF processor, so no synthetic frame tensor is necessary.
+            videos = []
+
+        video_processor_kwargs["do_sample_frames"] = False
+        video_processor_kwargs["return_metadata"] = True
+
+        # Scale the token budget by shard ratio so every shard selects the same
+        # spatial resolution as the whole video.
+        n_global_frames = len(global_indices)
+        n_local_frames = len(local_frame_indices)
+        if n_local_frames > 0 and n_global_frames > 0:
+            ratio = n_local_frames / n_global_frames
+            user_budget = video_config.get("max_image_tokens") if video_config else None
+            budget = (
+                int(user_budget)
+                if user_budget is not None
+                else self.video_processor.max_image_tokens
+            )
+            video_processor_kwargs["max_image_tokens"] = max(1, int(budget * ratio))
+
+        video_processor_kwargs["_shard_meta"] = {
+            "global_indices": global_indices,
+            "fps": video_fps,
+            "shard_idx": shard_idx,
+            "start_unit": start,
+            "count": count,
+            "n_units": n_units,
+        }
+        return videos, video_processor_kwargs
 
     async def _dp_sharded_decode_single_video(
         self,
@@ -518,6 +733,15 @@ class EncoderPreprocessor:
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
 
+        shard = (
+            mm_items[0].get("_glm_video_shard")
+            if len(mm_items) == 1 and isinstance(mm_items[0], dict)
+            else None
+        )
+        if shard is not None:
+            shard_idx, num_shards = map(int, shard)
+            if num_shards <= 0 or not 0 <= shard_idx < num_shards:
+                raise ValueError(f"Invalid GLM video shard: {shard}")
         video_configs = [{} for _ in mm_items]
         if "glm" in self.model_type:
             mm_items, video_configs = split_glm_video_items(mm_items)
@@ -533,100 +757,126 @@ class EncoderPreprocessor:
         async_futures = [asyncio.wrap_future(f) for f in futures]
         video_items = await asyncio.gather(*async_futures)
 
-        video_processor_kwargs = {}
-        if "qwen" in self.model_type:
-            video_processed = [
-                await preprocess_video(
-                    video, video_config=self.vision_config.get("video", {})
-                )
-                for video in video_items
-            ]
-            videos, video_metadata = map(list, zip(*video_processed))
-            video_processor_kwargs["do_sample_frames"] = False
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
-            return videos, video_processor_kwargs
-
-        if "glm" in self.model_type:
-            budget_kwargs = glm_budget_kwargs(
-                self.video_processor,
-                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
-                count=len(video_items),
-                split=True,
-            )
-            if budget_kwargs is not None:
-                video_processor_kwargs.update(budget_kwargs)
-                video_configs = [
-                    _glm_effective_presize_budget(
-                        config, budget_kwargs.get("max_image_tokens")
+        try:
+            video_processor_kwargs = {}
+            if "qwen" in self.model_type:
+                video_processed = [
+                    await preprocess_video(
+                        video, video_config=self.vision_config.get("video", {})
                     )
-                    for config in video_configs
+                    for video in video_items
                 ]
+                videos, video_metadata = map(list, zip(*video_processed))
+                video_processor_kwargs["do_sample_frames"] = False
+                if video_metadata:
+                    video_processor_kwargs["video_metadata"] = video_metadata
+                return videos, video_processor_kwargs
 
-            framed = any(isinstance(video, list) for video in video_items)
-            if framed:
-                processed = await asyncio.gather(
-                    *[
-                        asyncio.get_running_loop().run_in_executor(
-                            self.io_executor, preprocess_video_frames_sync, video
-                        )
-                        for video in video_items
-                    ]
+            if "glm" in self.model_type:
+                budget_kwargs = glm_budget_kwargs(
+                    self.video_processor,
+                    user_max_image_tokens=glm_max_image_tokens_from_configs(
+                        video_configs
+                    ),
+                    count=len(video_items),
+                    split=True,
                 )
-            else:
-                parallel = get_parallel()
-                tp_size = parallel.attn_tp_size
-                sampled = None
-                if len(video_items) == 1:
-                    vr = video_items[0]
-                    config = video_configs[0]
-                    sampled = glm_sample_frame_indices(
-                        len(vr),
-                        vr.avg_fps,
-                        len(vr) / vr.avg_fps if vr.avg_fps else 0,
-                        target_fps=config.get("fps"),
-                        max_frame_count=config.get("max_frames"),
-                    )
-                if (
-                    self.server_args.mm_enable_dp_encoder
-                    and tp_size > 1
-                    and sampled is not None
-                    and len(sampled) >= max(32, tp_size * 2)
-                ):
-                    result = await self._dp_sharded_decode_single_video(
+                if budget_kwargs is not None:
+                    video_processor_kwargs.update(budget_kwargs)
+                    video_configs = [
+                        _glm_effective_presize_budget(
+                            config, budget_kwargs.get("max_image_tokens")
+                        )
+                        for config in video_configs
+                    ]
+
+                if shard is not None:
+                    return await self._shard_decode_single_video(
                         video_items[0],
                         video_configs[0],
-                        tp_rank=parallel.attn_tp_rank,
-                        tp_size=tp_size,
+                        shard_idx=shard_idx,
+                        num_shards=num_shards,
                         video_processor_kwargs=video_processor_kwargs,
-                        precomputed_indices=sampled,
                     )
-                    self._close_video_decoders(video_items)
-                    return result
 
-                processed = await asyncio.gather(
-                    *[
-                        asyncio.get_running_loop().run_in_executor(
-                            self.io_executor,
-                            glm_sample_and_decode_sync,
-                            video,
-                            video_configs[index],
+                framed = any(isinstance(video, list) for video in video_items)
+                if framed:
+                    processed = await asyncio.gather(
+                        *[
+                            asyncio.get_running_loop().run_in_executor(
+                                self.io_executor, preprocess_video_frames_sync, video
+                            )
+                            for video in video_items
+                        ]
+                    )
+                else:
+                    parallel = get_parallel()
+                    tp_size = parallel.attn_tp_size
+                    sampled = None
+                    if len(video_items) == 1:
+                        vr = video_items[0]
+                        config = video_configs[0]
+                        sampled = glm_sample_frame_indices(
+                            len(vr),
+                            vr.avg_fps,
+                            len(vr) / vr.avg_fps if vr.avg_fps else 0,
+                            target_fps=config.get("fps"),
+                            max_frame_count=config.get("max_frames"),
                         )
-                        for index, video in enumerate(video_items)
-                    ]
-                )
-            videos, video_metadata = map(list, zip(*processed))
-            video_processor_kwargs["do_sample_frames"] = False
-            video_processor_kwargs["return_metadata"] = True
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
-            self._close_video_decoders(video_items)
-            return videos, video_processor_kwargs
+                    if (
+                        self.server_args.mm_enable_dp_encoder
+                        and self.model_type not in {"glm5_next", "glm5v_next"}
+                        and tp_size > 1
+                        and sampled is not None
+                        and len(sampled) >= max(32, tp_size * 2)
+                    ):
+                        result = await self._dp_sharded_decode_single_video(
+                            video_items[0],
+                            video_configs[0],
+                            tp_rank=parallel.attn_tp_rank,
+                            tp_size=tp_size,
+                            video_processor_kwargs=video_processor_kwargs,
+                            precomputed_indices=sampled,
+                        )
+                        return result
 
-        self._close_video_decoders(video_items)
-        raise NotImplementedError(
-            f"Video processing is not supported for {self.model_type} model."
-        )
+                    estimate = self._estimate_video_decode_bytes(
+                        video_items, video_configs
+                    )
+                    error, reserved = await self.await_gpu_bytes(estimate)
+                    if error is not None:
+                        from sglang.srt.disaggregation.encoder.server import MMError
+
+                        raise MMError(error, code=HTTPStatus.SERVICE_UNAVAILABLE)
+                    try:
+                        processed = await asyncio.gather(
+                            *[
+                                asyncio.get_running_loop().run_in_executor(
+                                    self.io_executor,
+                                    glm_sample_and_decode_sync,
+                                    video,
+                                    video_configs[index],
+                                )
+                                for index, video in enumerate(video_items)
+                            ]
+                        )
+                    finally:
+                        self._release_admit_bytes(reserved)
+                videos, video_metadata = map(list, zip(*processed))
+                video_processor_kwargs["do_sample_frames"] = False
+                video_processor_kwargs["return_metadata"] = True
+                if framed and envs.SGLANG_SKIP_VIDEO_PREPROCESS.get():
+                    video_processor_kwargs["do_resize"] = False
+                if video_metadata:
+                    video_processor_kwargs["video_metadata"] = video_metadata
+                return videos, video_processor_kwargs
+
+            raise NotImplementedError(
+                f"Video processing is not supported for {self.model_type} model."
+            )
+
+        finally:
+            self._close_video_decoders(video_items)
 
     async def _flatten_and_load_audios(self, mm_items):
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
@@ -687,7 +937,11 @@ class EncoderPreprocessor:
         flat_items = []
         items_per_req = []
         for req in requests:
-            leaves = self._flatten_nested_items(req["mm_items"])
+            leaves = (
+                list(req["mm_items"])
+                if modality == Modality.VIDEO
+                else self._flatten_nested_items(req["mm_items"])
+            )
             flat_items.extend(leaves)
             items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
         return flat_items, items_per_req
@@ -736,6 +990,15 @@ class EncoderPreprocessor:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
+        shard_meta = video_processor_kwargs.pop("_shard_meta", None)
+        if shard_meta is not None and not shard_meta["count"]:
+            return {
+                "_empty_video_shard": True,
+                "_reported_grid": None,
+                "video_grid_thw": torch.zeros((1, 3), dtype=torch.long),
+                "pixel_values_videos": torch.empty((0, 0)),
+                "video_timestamps": None,
+            }
         processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(
@@ -771,6 +1034,46 @@ class EncoderPreprocessor:
                 )
                 video_timestamps.append(timestamps)
             processor_input["video_timestamps"] = video_timestamps
+        elif "glm" in self.model_type:
+            if shard_meta is not None:
+                # Shard 0 reports whole-video metadata once. Every Encoder
+                # still feeds its local grid into the ViT.
+                processor_input.pop("video_metadata", None)
+                local_grid = processor_input.get("video_grid_thw")
+                if shard_meta["shard_idx"] == 0:
+                    global_indices = shard_meta["global_indices"]
+                    fps = shard_meta["fps"]
+                    global_timestamps = [i / fps for i in global_indices][::2]
+                    processor_input["video_timestamps"] = [global_timestamps]
+                    if local_grid is not None and len(local_grid) > 0:
+                        height = int(local_grid[0][1])
+                        width = int(local_grid[0][2])
+                        processor_input["_reported_grid"] = torch.tensor(
+                            [[shard_meta["n_units"], height, width]]
+                        )
+                else:
+                    processor_input["video_timestamps"] = None
+                    processor_input["_reported_grid"] = None
+            else:
+                video_metadata = processor_input.get("video_metadata", None)
+                video_timestamps = []
+                if video_metadata is not None:
+                    for metadata in video_metadata:
+                        ts = getattr(metadata, "timestamps", None)
+                        if ts is None and isinstance(metadata, dict):
+                            ts = metadata.get("timestamps", None)
+                        if ts is None and isinstance(metadata, dict):
+                            fps = metadata.get("fps", 0)
+                            indices = metadata.get("frames_indices")
+                            if fps and indices is not None:
+                                ts = [index / fps for index in indices]
+                        if ts is None:
+                            raise ValueError(
+                                f"GLM-V video metadata missing timestamps: {metadata}"
+                            )
+                        video_timestamps.append(list(ts)[::2])
+                processor_input["video_timestamps"] = video_timestamps
+                processor_input.pop("video_metadata", None)
         elif (
             self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
             and processor_input.get("video_grid_thw", None) is not None

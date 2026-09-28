@@ -199,6 +199,8 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
             "Glm5NextForConditionalGenerationNextN",
+            "Glm5NextForCausalLMNextN",
+            "Glm5NextForCausalLM",
             "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
@@ -897,11 +899,11 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ):
-            self.hf_config.architectures[0] = "Glm5NextForConditionalGenerationNextN"
+            self.hf_config.architectures[0] += "NextN"
             self.hf_text_config.architectures = list(self.hf_config.architectures)
             self.hf_text_config.num_nextn_predict_layers = 1
             self.hf_text_config.linear_attn_config = None
@@ -1177,6 +1179,8 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
+            or "Glm5NextForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForCausalLMNextN" in self.hf_config.architectures
             or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
             or "Glm5NextForConditionalGenerationNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -1303,6 +1307,8 @@ class ModelConfig:
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif (
             "SarvamMLAForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForCausalLMNextN" in self.hf_config.architectures
             or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = (
@@ -1364,8 +1370,14 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        is_glm5_next = getattr(self.hf_config, "model_type", None) == "glm5_next" or (
-            getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
+        is_glm5_next = getattr(self.hf_config, "model_type", None) in (
+            "glm5_next",
+            "glm5v_next",
+            "glm5next_text",
+            "glm5_next_text",
+        ) or (
+            getattr(self.hf_text_config, "model_type", None)
+            in ("glm5next_text", "glm5_next_text")
         )
         if is_glm5_next and not getattr(self.hf_text_config, "mhc", False):
             hc_mult = 1

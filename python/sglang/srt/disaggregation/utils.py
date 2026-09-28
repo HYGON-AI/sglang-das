@@ -994,7 +994,9 @@ def build_kv_layer_ids(
     """
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not isinstance(token_to_kv_pool, HybridLinearKVPool) and not getattr(
+        token_to_kv_pool, "is_hcu_glm5_next_pool", False
+    ):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1012,7 +1014,9 @@ def build_kv_layer_ids(
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if isinstance(pool, HybridLinearKVPool):
+    if isinstance(pool, HybridLinearKVPool) or getattr(
+        pool, "is_hcu_glm5_next_pool", False
+    ):
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1126,7 +1130,7 @@ def append_state_component(
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
-    if getattr(pool, "use_dsa", False):
+    if hasattr(pool, "full_kv_pool") and getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
     if not pool.kpool_use_compress:
         return []
@@ -1338,7 +1342,10 @@ def setup_state_kv_args(
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
+    kv_args.hcu_kda_state_sharded = False
     kv_args.state_conv_shard_groups = []
+
+    from sglang.srt.disaggregation.glm5_next import append_hcu_dsa_state
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)
@@ -1430,6 +1437,7 @@ def setup_state_kv_args(
                         c128_item_lens,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+            kv_args.hcu_kda_state_sharded = token_to_kv_pool.mamba_pool.use_hcu_kda
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
@@ -1464,7 +1472,11 @@ def setup_state_kv_args(
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.
-            if getattr(token_to_kv_pool, "use_dsa", False):
+            if getattr(token_to_kv_pool.full_kv_pool, "is_hcu_glm5_next_pool", False):
+                append_hcu_dsa_state(
+                    kv_args, token_to_kv_pool, draft_token_to_kv_pool, total_kv_layers
+                )
+            elif getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
                 append_state_component(
@@ -1498,6 +1510,10 @@ def setup_state_kv_args(
                     compressed_item_lens,
                     layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
                 )
+        elif getattr(token_to_kv_pool, "is_hcu_glm5_next_pool", False):
+            append_hcu_dsa_state(
+                kv_args, token_to_kv_pool, draft_token_to_kv_pool, total_kv_layers
+            )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
             if isinstance(token_to_kv_pool, DSATokenToKVPool):

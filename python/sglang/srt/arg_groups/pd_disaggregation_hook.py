@@ -280,6 +280,7 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "

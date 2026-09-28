@@ -85,6 +85,14 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     )
 
 
+def get_attention_dp_size() -> int:
+    return get_parallel().attn_dp_size
+
+
+def get_attention_dp_rank() -> int:
+    return get_parallel().attn_dp_rank
+
+
 _is_hip = is_hip()
 _is_hcu = is_hcu()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -1027,6 +1035,10 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
 
 

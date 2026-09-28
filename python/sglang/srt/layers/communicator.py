@@ -496,8 +496,11 @@ def enable_moe_dense_fully_dp():
 
 def _generic_prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
+    # Local import: module-level CP helper imports here are circular (#27014).
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+
     parallel = get_parallel()
-    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
+    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp and enable_cp_v2()
 
 
 def enable_dwdp():
@@ -1252,12 +1255,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
     @staticmethod
     def _use_bailing_rms_quant(forward_batch: ForwardBatch) -> bool:
-        return _use_fused_bailing_rms_quant and forward_batch.rms_quant_flag
+        return _use_fused_bailing_rms_quant and getattr(
+            forward_batch, "rms_quant_flag", False
+        )
 
     @staticmethod
     def _skip_layernorm(forward_batch: ForwardBatch) -> bool:
+        # Models opt into this legacy fusion explicitly; main ForwardBatch
+        # does not carry the flag by default.
         return (
-            _use_fused_rms_quant and forward_batch.rms_quant_flag
+            _use_fused_rms_quant and getattr(forward_batch, "rms_quant_flag", False)
         ) or CommunicateWithAllReduceAndLayerNormFn._use_bailing_rms_quant(
             forward_batch
         )

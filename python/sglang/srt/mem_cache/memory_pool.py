@@ -60,6 +60,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+from sglang.srt.mem_cache.layer_split import MainKVPagePlan
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,
@@ -571,6 +572,12 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        self.use_hcu_kda = cache_params.use_hcu_kda
+        self.use_hcu_kda_replayssm = bool(
+            enable_linear_replayssm_spec and self.use_hcu_kda
+        )
+        if self.use_hcu_kda_replayssm and ssm_dtype != torch.float32:
+            raise ValueError("GLM5-Next ReplaySSM requires float32 Mamba state")
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
@@ -680,7 +687,9 @@ class MambaPool:
                 # decode-ring), so skipping them would flip KDA decode to the
                 # fused path, a behavior change needing its own validation
                 # (memory follow-up).
-                if self.replayssm_spec_fold and not cache_params.is_kda:
+                if self.use_hcu_kda_replayssm or (
+                    self.replayssm_spec_fold and not cache_params.is_kda
+                ):
                     record_len = (
                         speculative_num_draft_tokens
                         if speculative_num_draft_tokens is not None
@@ -688,7 +697,9 @@ class MambaPool:
                     )
                 else:
                     record_len = L
-                if not self.replayssm_spec_fold or cache_params.is_kda:
+                if not self.replayssm_spec_fold or (
+                    cache_params.is_kda and not self.use_hcu_kda_replayssm
+                ):
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,
@@ -715,7 +726,9 @@ class MambaPool:
                 # KDA still uses raw-input fold-every-commit. GDN materializes
                 # its compact d/k/g history directly and needs no duplicate ring.
                 if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
+                    if not self.use_hcu_kda_replayssm and (
+                        cache_params.is_kda or not self.replayssm_spec_fold
+                    ):
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
@@ -1000,7 +1013,11 @@ class MambaPool:
         return build_conv_slot_descriptor(self.mamba_cache.conv)
 
     def _should_fuse_slot_ops(self) -> bool:
-        return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
+        return (
+            not _is_hcu
+            and self._conv_fuse_ok
+            and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
+        )
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
@@ -2673,21 +2690,21 @@ class MHATokenToKVPool(KVCache):
                 # Overlap the copy of K and V cache for small batch size
                 current_stream = self.device_module.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
+                self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = (
+                    cache_k
+                )
                 with self.device_module.stream(self.alt_stream):
                     self.v_buffer[layer_id - self.start_layer][
                         page_idxs, :, :, offsets
                     ] = cache_v
                 current_stream.wait_stream(self.alt_stream)
             else:
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
-                self.v_buffer[layer_id - self.start_layer][
-                    page_idxs, :, :, offsets
-                ] = cache_v
+                self.k_buffer[layer_id - self.start_layer][page_idxs, :, offsets, :] = (
+                    cache_k
+                )
+                self.v_buffer[layer_id - self.start_layer][page_idxs, :, :, offsets] = (
+                    cache_v
+                )
             return
 
         if dcp_kv_mask is not None:
@@ -3947,6 +3964,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        glm5_next_pool_kwargs: Optional[dict] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -4016,7 +4034,12 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            self.full_kv_pool = DSATokenToKVPool(
+            dsa_pool_cls = DSATokenToKVPool
+            if glm5_next_pool_kwargs is not None:
+                from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
+
+                dsa_pool_cls = Glm5NextDSATokenToKVPool
+            self.full_kv_pool = dsa_pool_cls(
                 size=size,
                 page_size=self.page_size,
                 kv_lora_rank=kv_lora_rank,
@@ -4032,6 +4055,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                **(glm5_next_pool_kwargs or {}),
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -4054,6 +4078,11 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **(
+                    {"override_kv_cache_dim": kv_cache_dim}
+                    if TokenToKVPoolClass is MLATokenToKVPool
+                    else {}
+                ),
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -4063,6 +4092,10 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def is_hcu_glm5_next_pool(self) -> bool:
+        return getattr(self.full_kv_pool, "is_hcu_glm5_next_pool", False)
 
     @property
     def post_capture_active(self) -> bool:
@@ -4124,7 +4157,15 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
-        if self.use_mla and _is_npu and layer_ids:
+        if getattr(self.full_kv_pool, "is_hcu_glm5_next_pool", False):
+            layer_ids = [
+                layer_id
+                for layer_id in layer_ids
+                if self.full_kv_pool._is_layer_owned(
+                    self.full_attention_layer_id_mapping[layer_id]
+                )
+            ]
+        elif self.use_mla and _is_npu and layer_ids:
             data_ptrs, _, _ = self.get_contiguous_buf_infos()
             return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
@@ -4467,6 +4508,165 @@ class HybridLinearKVPool(KVCache):
             dst_logical_start=dst_logical_start,
         )
 
+    @property
+    def layer_shard_enabled(self) -> bool:
+        return bool(getattr(self.full_kv_pool, "layer_shard_enabled", False))
+
+    @property
+    def layer_shard_rank(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "layer_shard_rank", None)
+
+    @property
+    def layer_shard_size(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_size", 1)
+
+    @property
+    def layer_shard_rank_offset(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_rank_offset", 0)
+
+    @property
+    def layer_shard_start(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_start", 0)
+
+    def get_key_buffer_with_prefetch_history(self, layer_id: int, *, has_history: bool):
+        """Read one MLA layer while preserving the current batch's history state."""
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_buffer_with_prefetch_history(
+            layer_id, has_history=has_history
+        )
+
+    def configure_main_kv_page_plan(
+        self,
+        page_plan: Optional[MainKVPagePlan],
+        batch_marker: Any,
+    ) -> None:
+        if not self.use_mla:
+            return
+        configure = getattr(self.full_kv_pool, "configure_main_kv_page_plan", None)
+        if configure is not None:
+            configure(page_plan, batch_marker)
+
+    def translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
+        if not self.use_mla:
+            return loc
+        translate = getattr(self.full_kv_pool, "translate_main_kv_loc_to_compact", None)
+        return loc if translate is None else translate(loc)
+
+    def prefetch_mla_kv_buffer(
+        self, layer_id: int, *, has_history: bool = True
+    ) -> None:
+        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
+            return
+        if layer_id not in self.full_attention_layer_id_mapping:
+            return
+
+        full_layer_id = self._transfer_full_attention_id(layer_id)
+        from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
+
+        if not isinstance(self.full_kv_pool, Glm5NextDSATokenToKVPool):
+            self.full_kv_pool.prefetch_kv_buffer(
+                full_layer_id,
+                layer_transfer_counter=self.layer_transfer_counter,
+                layer_transfer_idx=layer_id - self.start_layer,
+            )
+            return
+        layer_transfer_idx = layer_id - self.start_layer
+        # The cold-chunk scratch fill is implemented by the HCU DSA write
+        # paths below. Preserve the existing broadcast behavior elsewhere.
+        has_history = has_history or not _is_hcu
+        if (
+            self.use_dsa
+            and _is_hcu
+            and hasattr(self.full_kv_pool, "prefetch_index_buffer")
+        ):
+            self.full_kv_pool.prefetch_index_buffer(
+                full_layer_id,
+                layer_transfer_counter=self.layer_transfer_counter,
+                layer_transfer_idx=layer_transfer_idx,
+                has_history=has_history,
+            )
+        self.full_kv_pool.prefetch_kv_buffer(
+            full_layer_id,
+            layer_transfer_counter=self.layer_transfer_counter,
+            layer_transfer_idx=layer_transfer_idx,
+            has_history=has_history,
+        )
+
+    def get_hcu_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_hcu_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id)
+        )
+
+    def get_kpool_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_kpool_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id)
+        )
+
+    def commit_hcu_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.commit_hcu_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id), loc
+        )
+
+    def commit_kpool_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.commit_kpool_index_k_with_scale_write_buffer(
+            self._get_dsa_layer_id(layer_id), loc
+        )
+
+    def get_index_k_with_scale_buffer_broadcast(self, layer_id: int) -> torch.Tensor:
+        assert self.use_dsa, (
+            "get_index_k_with_scale_buffer_broadcast called when use_dsa is False"
+        )
+        return self.full_kv_pool.get_index_k_with_scale_buffer_broadcast(
+            self._get_dsa_layer_id(layer_id)
+        )
+
+    def get_index_k_scale_buffer_with_prefetch_history(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+        *,
+        has_history: bool,
+    ):
+        return self.full_kv_pool.get_index_k_scale_buffer_with_prefetch_history(
+            self._get_dsa_layer_id(layer_id),
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
+            has_history=has_history,
+        )
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        if not self.layer_shard_enabled:
+            return True
+        return self.full_kv_pool._is_layer_owned(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def _owned_local_layer_range(self) -> tuple[int, int]:
+        return self.full_kv_pool._owned_local_layer_range()
+
+    def get_tail_buffers(self, layer_id: int):
+        return self.full_kv_pool.get_tail_buffers(self._get_dsa_layer_id(layer_id))
+
+    def get_tail_buf_infos(self):
+        if not self.use_dsa:
+            return [], [], []
+        return self.full_kv_pool.get_tail_buf_infos()
+
+    def _get_dsa_layer_id(self, layer_id: int) -> int:
+        assert self.use_dsa, "DSA index cache called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        return self._transfer_full_attention_id(layer_id)
+
 
 class MLATokenToKVPool(KVCache):
     def __init__(
@@ -4507,7 +4707,7 @@ class MLATokenToKVPool(KVCache):
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if override_kv_cache_dim is not None
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -4644,6 +4844,10 @@ class MLATokenToKVPool(KVCache):
             "door means an attention backend took a write path that never "
             "declared which loc space it emits."
         )
+        if cache_k.shape[-1] < self.kv_cache_dim:
+            cache_k = torch.nn.functional.pad(
+                cache_k, (0, self.kv_cache_dim - cache_k.shape[-1])
+            )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4664,6 +4868,10 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_dsa and self.dsa_kv_cache_store_fp8)
         cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+        if cache_k.shape[-1] < self.kv_cache_dim:
+            cache_k = torch.nn.functional.pad(
+                cache_k, (0, self.kv_cache_dim - cache_k.shape[-1])
+            )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -5120,7 +5328,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ]
 
     @property
-
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
         return not self.skip_topk_layers[local_layer_idx]
 
@@ -5476,6 +5683,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             req_pool_index,
         )
         torch.cuda.synchronize()
+
     def set_index_k_buffer(
         self,
         layer_id: int,
