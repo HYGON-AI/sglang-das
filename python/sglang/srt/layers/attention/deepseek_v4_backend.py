@@ -357,7 +357,25 @@ def _every_request_fits() -> bool:
 
 @functools.cache
 def _has_dense_fp4_indexer() -> bool:
-    if not torch.cuda.is_available() or torch.version.cuda is None:
+    if not torch.cuda.is_available():
+        return False
+    if _is_hcu:
+        try:
+            from lightop import op as lightop_op
+            from lightop.attention import fp8_fp4_mqa_logits
+        except (ImportError, AttributeError):
+            return False
+        arch = getattr(
+            torch.cuda.get_device_properties(torch.cuda.current_device()),
+            "gcnArchName",
+            "",
+        ).split(":", 1)[0]
+        return (
+            arch in ("gfx936", "gfx938")
+            and callable(fp8_fp4_mqa_logits)
+            and hasattr(lightop_op, "fp8_fp4_mqa_logits")
+        )
+    if torch.version.cuda is None:
         return False
     try:
         import deep_gemm
@@ -379,6 +397,25 @@ def _dense_fp4_mqa_logits(
     # q (int8 [T, H, 64], int32 [T, H]) x kv (int8 [L, 64], int32 [L]) -> fp32
     # [T, max_seqlen_k]; row t column j is k[ks_t + j], garbage past ke_t - ks_t.
     return fn(q_fp4, kv_fp4, weights, ks, ke, False, max_seqlen_k)
+
+
+def _hcu_dense_fp4_mqa_logits(
+    q: Tuple[torch.Tensor, Optional[torch.Tensor]],
+    kv_fp4: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    from lightop.attention import fp8_fp4_mqa_logits as fn
+
+    _log_lightop_dense_fp4_indexer_once()
+    return fn(q, kv_fp4, weights, ks, ke, False, max_seqlen_k)
+
+
+@functools.cache
+def _log_lightop_dense_fp4_indexer_once() -> None:
+    logger.info("Using LightOp BF16-Q/FP4-K dense prefill indexer logits")
 
 
 def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
@@ -3260,7 +3297,8 @@ class DeepseekV4AttnBackend(
             else:
                 self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
         elif (
-            self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
+            self._use_dense_fp4_prefill_indexer(forward_batch)
+            and (_is_hcu or _is_sm100_or_newer())
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         else:
@@ -3338,26 +3376,39 @@ class DeepseekV4AttnBackend(
         k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
 
         q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
-        num_heads = q.shape[1]
-        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
-        q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
-        q_sf = q_sf.view(num_tokens, num_heads)
-        weights = indexer.head_weights(x).float()
         compress_lens = ((pos + 1) // ratio).to(torch.int32)
         ks = torch.repeat_interleave(
             torch.tensor(starts, dtype=torch.int32, device=device),
             q_lens.to(torch.int64),
             output_size=num_tokens,
         )
-        logits = _dense_fp4_mqa_logits(
-            (q_fp4, q_sf),
-            (k_fp4, k_sf),
-            weights,
-            ks,
-            ks + compress_lens,
-            # the fused top-k reads score rows through 16-byte vectors
-            ceil_align(max(lc_per_req), 4),
-        )
+        if _is_hcu:
+            weights = indexer.head_weights(x).float().contiguous()
+            ke = ks + compress_lens
+            logits = _hcu_dense_fp4_mqa_logits(
+                (q.contiguous(), None),
+                (k_fp4.contiguous(), k_sf.contiguous()),
+                weights,
+                ks.contiguous(),
+                ke.contiguous(),
+                # the fused top-k reads score rows through 16-byte vectors
+                ceil_align(max(lc_per_req), 4),
+            )
+        else:
+            num_heads = q.shape[1]
+            q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+            q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
+            q_sf = q_sf.view(num_tokens, num_heads)
+            weights = indexer.head_weights(x).float()
+            logits = _dense_fp4_mqa_logits(
+                (q_fp4, q_sf),
+                (k_fp4, k_sf),
+                weights,
+                ks,
+                ks + compress_lens,
+                # the fused top-k reads score rows through 16-byte vectors
+                ceil_align(max(lc_per_req), 4),
+            )
         if indexer.is_candidate_source or indexer.uses_candidates:
             self._publish_or_consume_candidates(
                 indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
