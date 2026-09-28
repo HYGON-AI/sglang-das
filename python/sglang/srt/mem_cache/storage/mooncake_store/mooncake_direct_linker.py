@@ -506,6 +506,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self.host_prefetch_enabled
 
+    def disable_waiting_queue_prefetch(self) -> None:
+        # The scheduler found a rank without prefetch before any submission;
+        # the idle host-prefetch workers stay parked on an empty queue.
+        self.host_prefetch_enabled = False
+
     def register_buffers(self) -> None:
         seen = set()
         for pool in self.pools.values():

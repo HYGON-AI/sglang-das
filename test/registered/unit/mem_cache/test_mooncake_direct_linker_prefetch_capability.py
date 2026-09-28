@@ -257,25 +257,25 @@ def _scheduler(*, flag, tree_cache):
 
 
 class TestSchedulerPrefetchSwitch(CustomTestCase):
+    """The scheduler's startup decision follows the user flag, then the
+    linker's resolved capability (single rank: no reduction)."""
+
     def test_user_flag_off_never_touches_tree_cache(self):
         tree_cache = MagicMock()
         tree_cache.waiting_queue_prefetch_enabled.side_effect = AssertionError(
             "tree cache must not be consulted without the user flag"
         )
-        self.assertFalse(
-            _scheduler(
-                flag=False, tree_cache=tree_cache
-            )._waiting_queue_prefetch_active()
-        )
+        s = _scheduler(flag=False, tree_cache=tree_cache)
+        self.assertEqual(s._resolve_prefetch_startup_switches(None), (False, False))
 
     def test_follows_resolved_linker_switch(self):
         tree_cache = MagicMock()
         tree_cache.waiting_queue_prefetch_enabled.return_value = False
         s = _scheduler(flag=True, tree_cache=tree_cache)
-        self.assertFalse(s._waiting_queue_prefetch_active())
+        self.assertEqual(s._resolve_prefetch_startup_switches(None), (False, False))
 
         tree_cache.waiting_queue_prefetch_enabled.return_value = True
-        self.assertTrue(s._waiting_queue_prefetch_active())
+        self.assertEqual(s._resolve_prefetch_startup_switches(None), (True, True))
 
 
 if __name__ == "__main__":

@@ -76,6 +76,8 @@ def _distributed_round_worker(rank, world_size, port):
         scheduler._bg_prefetch_join_age = {}
         scheduler._bg_attn_cp_cpu_group = bg_cp_group
         scheduler._bg_attn_tp_cpu_group = bg_tp_group
+        # Set by Scheduler.__init__, which this fixture bypasses.
+        scheduler._bg_completed_epoch = 0
 
         linker = _FakeLinker()
 
@@ -254,6 +256,9 @@ def _distributed_round_worker(rank, world_size, port):
             def __init__(self):
                 self.sent = False
 
+            def ingress_sync_groups(self):
+                return [ingress_group]
+
             def recv_requests(self):
                 ready = (
                     rank == 0
@@ -280,6 +285,9 @@ def _distributed_round_worker(rank, world_size, port):
 
         ingress_scheduler = Scheduler.__new__(Scheduler)
         ingress_scheduler.enable_waiting_queue_dfs_prefetch = True
+        ingress_scheduler._forward_ingress_enabled = True
+        ingress_scheduler._bg_error = None
+        ingress_scheduler.forward_ct = 0
         ingress_scheduler.enable_overlap = False
         ingress_scheduler.device = "cpu"
         ingress_scheduler.device_module = SimpleNamespace(

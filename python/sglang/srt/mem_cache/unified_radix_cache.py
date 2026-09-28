@@ -546,6 +546,10 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.linker.cache_linker.waiting_queue_prefetch_enabled()
         )
 
+    def disable_waiting_queue_prefetch(self) -> None:
+        if self.linker is not None:
+            self.linker.cache_linker.disable_waiting_queue_prefetch()
+
     def prefetch_external_linker_to_host(self, req) -> bool:
         if self.linker is None:
             return False
