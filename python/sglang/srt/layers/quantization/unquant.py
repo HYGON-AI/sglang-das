@@ -120,10 +120,61 @@ _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
+_flashinfer_pr4266_splitk_tactic = None
+_flashinfer_pr4266_run_splitk_dense = None
+_enable_bf16_splitk_gemm = False
+_bf16_gemm_logged_shapes: set[tuple[int, int, int]] = set()
+
+# GB300 TP16 tactics measured under CUDA graph replay with PDL and cold
+# weights. Unlisted shapes retain the existing CuTe DSL/cuBLAS path.
+_FLASHINFER_PR4266_TUNED_TACTICS = {
+    (1, 256, 8192): (64, 8, 4, 11),
+    (2, 256, 8192): (64, 8, 4, 11),
+    (4, 256, 8192): (64, 8, 4, 11),
+    (8, 256, 8192): (64, 8, 4, 11),
+    (16, 256, 8192): (64, 8, 4, 10),
+    (24, 256, 8192): (64, 8, 4, 11),
+    (32, 256, 8192): (64, 8, 4, 12),
+    (1, 512, 8192): (64, 8, 4, 11),
+    (2, 512, 8192): (64, 8, 4, 12),
+    (4, 512, 8192): (64, 8, 4, 10),
+    (8, 512, 8192): (64, 8, 4, 12),
+    (16, 512, 8192): (64, 8, 4, 12),
+    (24, 512, 8192): (64, 8, 4, 12),
+    (32, 512, 8192): (64, 16, 4, 9),
+    (1, 2304, 8192): (128, 8, 4, 6),
+    (2, 2304, 8192): (64, 8, 2, 12),
+    (4, 2304, 8192): (128, 8, 4, 6),
+    (8, 2304, 8192): (64, 8, 4, 10),
+    (16, 2304, 8192): (64, 16, 4, 9),
+    (24, 2304, 8192): (64, 32, 2, 9),
+    (32, 2304, 8192): (64, 32, 2, 9),
+    (1, 2560, 8192): (64, 8, 2, 10),
+    (2, 2560, 8192): (64, 8, 2, 10),
+    (4, 2560, 8192): (64, 8, 2, 10),
+    (8, 2560, 8192): (64, 8, 2, 10),
+    (16, 2560, 8192): (64, 16, 2, 11),
+    (24, 2560, 8192): (64, 32, 2, 9),
+    (32, 2560, 8192): (64, 32, 2, 9),
+}
+
+
+def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
+    return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
+
+
+def _log_bf16_gemm_shape(m: int, n: int, k: int) -> None:
+    shape = (m, n, k)
+    if shape not in _bf16_gemm_logged_shapes:
+        _bf16_gemm_logged_shapes.add(shape)
+        logger.info("BF16 GEMM shape: M=%s, N=%s, K=%s", m, n, k)
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _enable_bf16_splitk_gemm
+    global _flashinfer_pr4266_run_splitk_dense
+    global _flashinfer_pr4266_splitk_tactic
 
     from sglang.srt.utils import is_sm100_supported
 
@@ -198,13 +249,9 @@ def _precompile_splitk_tactics() -> None:
     torch.cuda.synchronize()
 
 
-def _flashinfer_pr4266_bf16_gemm(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
+def _flashinfer_pr4266_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x_2d = x.view(-1, x.shape[-1])
-    out = torch.empty(
-        (x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
-    )
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     tactic = _flashinfer_pr4266_splitk_tactic(
         *_FLASHINFER_PR4266_TUNED_TACTICS[
             (x_2d.shape[0], weight.shape[0], weight.shape[1])
