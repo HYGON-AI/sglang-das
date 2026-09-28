@@ -84,6 +84,9 @@ class UnifiedCacheLinker(ABC):
         """Whether waiting-queue host prefetch is enabled on every rank."""
         return False
 
+    def disable_waiting_queue_prefetch(self) -> None:
+        """Turn waiting-queue host prefetch off before any job is submitted."""
+
     def submit_host_prefetch(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> bool:

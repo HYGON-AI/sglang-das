@@ -1429,53 +1429,7 @@ class Scheduler(
                     timeout_s,
                 )
 
-        self.enable_waiting_queue_dfs_prefetch = self._waiting_queue_prefetch_active()
-        self._bg_attn_cp_cpu_group = None
-        self._bg_attn_tp_cpu_group = None
-        self._ingress_attn_cp_cpu_group = self.attn_cp_cpu_group
-        self._ingress_attn_tp_cpu_group = self.attn_tp_cpu_group
-        self._ingress_tp_cpu_group = self.tp_cpu_group
-        self._forward_launch_executor = None
-        self._forward_deferred_reqs = []
-        self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
-        if self.enable_waiting_queue_dfs_prefetch:
-            # Every rank creates groups in the same order. The helper
-            # gathers each rank's local subgroup membership on the default
-            # group, then creates all subgroups in a deterministic order.
-            # Runtime prefetch collectives use only these duplicate Gloo PGs.
-            for attr_name, group in (
-                ("_bg_attn_cp_cpu_group", self.attn_cp_cpu_group),
-                ("_bg_attn_tp_cpu_group", self.attn_tp_cpu_group),
-            ):
-                if torch.distributed.get_world_size(group=group) > 1:
-                    ranks = torch.distributed.get_process_group_ranks(group)
-                    setattr(
-                        self,
-                        attr_name,
-                        create_custom_parallel_group(ranks, backend="gloo"),
-                    )
-
-            # A forward launched on another Python thread can use the model's
-            # original CPU groups. Receive/lookup must never enter those groups
-            # concurrently, nor share the background prefetch round's groups.
-            for attr_name, group in (
-                ("_ingress_attn_cp_cpu_group", self.attn_cp_cpu_group),
-                ("_ingress_attn_tp_cpu_group", self.attn_tp_cpu_group),
-                ("_ingress_tp_cpu_group", self.tp_cpu_group),
-            ):
-                if group is not None and torch.distributed.get_world_size(group) > 1:
-                    ranks = torch.distributed.get_process_group_ranks(group)
-                    setattr(
-                        self,
-                        attr_name,
-                        create_custom_parallel_group(ranks, backend="gloo"),
-                    )
-            self.tree_cache.attn_cp_group = self._ingress_attn_cp_cpu_group
-            self.tree_cache.attn_tp_group = self._ingress_attn_tp_cpu_group
-            self.tree_cache.tp_group = self._ingress_tp_cpu_group
-            self._forward_launch_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="prefetch-forward"
-            )
+        self._init_waiting_queue_prefetch_runtime()
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
@@ -3273,9 +3227,67 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _waiting_queue_prefetch_active(self) -> bool:
-        """Whether the configured waiting-queue prefetch is available on every rank."""
-        return (
+    def _init_waiting_queue_prefetch_runtime(self) -> None:
+        """Decide the prefetch switches world-wide, then create the prefetch
+        process groups and the forward executor they need."""
+        (
+            self.enable_waiting_queue_dfs_prefetch,
+            self._forward_ingress_enabled,
+        ) = self._resolve_prefetch_startup_switches(
+            self.world_group.cpu_group if self.world_group.world_size > 1 else None
+        )
+        self._bg_attn_cp_cpu_group = None
+        self._bg_attn_tp_cpu_group = None
+        self._ingress_attn_cp_cpu_group = self.attn_cp_cpu_group
+        self._ingress_attn_tp_cpu_group = self.attn_tp_cpu_group
+        self._ingress_tp_cpu_group = self.tp_cpu_group
+        self._forward_launch_executor = None
+        self._forward_deferred_reqs = []
+        self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
+        if self.enable_waiting_queue_dfs_prefetch:
+            # Every rank creates groups in the same order. The helper
+            # gathers each rank's local subgroup membership on the default
+            # group, then creates all subgroups in a deterministic order.
+            # Runtime prefetch collectives use only these duplicate Gloo PGs.
+            for attr_name, group in (
+                ("_bg_attn_cp_cpu_group", self.attn_cp_cpu_group),
+                ("_bg_attn_tp_cpu_group", self.attn_tp_cpu_group),
+            ):
+                if torch.distributed.get_world_size(group=group) > 1:
+                    ranks = torch.distributed.get_process_group_ranks(group)
+                    setattr(
+                        self,
+                        attr_name,
+                        create_custom_parallel_group(ranks, backend="gloo"),
+                    )
+
+            # A forward launched on another Python thread can use the model's
+            # original CPU groups. Receive/lookup must never enter those groups
+            # concurrently, nor share the background prefetch round's groups.
+            for attr_name, group in (
+                ("_ingress_attn_cp_cpu_group", self.attn_cp_cpu_group),
+                ("_ingress_attn_tp_cpu_group", self.attn_tp_cpu_group),
+                ("_ingress_tp_cpu_group", self.tp_cpu_group),
+            ):
+                if group is not None and torch.distributed.get_world_size(group) > 1:
+                    ranks = torch.distributed.get_process_group_ranks(group)
+                    setattr(
+                        self,
+                        attr_name,
+                        create_custom_parallel_group(ranks, backend="gloo"),
+                    )
+            self.tree_cache.attn_cp_group = self._ingress_attn_cp_cpu_group
+            self.tree_cache.attn_tp_group = self._ingress_attn_tp_cpu_group
+            self.tree_cache.tp_group = self._ingress_tp_cpu_group
+            if self._forward_ingress_enabled:
+                self._forward_launch_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="prefetch-forward"
+                )
+
+    def _waiting_queue_prefetch_configured(self) -> bool:
+        """This rank's own conditions for waiting-queue prefetch, before the
+        linker's capability."""
+        return bool(
             getattr(
                 self.server_args,
                 "mooncake_enable_waiting_queue_dfs_prefetch",
@@ -3287,8 +3299,83 @@ class Scheduler(
             in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
             and self.schedule_policy == "fcfs"
             and self.ps.pp_size == 1
+        )
+
+    def _resolve_prefetch_startup_switches(
+        self, group: Optional[torch.distributed.ProcessGroup]
+    ) -> Tuple[bool, bool]:
+        """Agree on (prefetch, forward ingress) before any prefetch group exists.
+
+        create_custom_parallel_group gathers on the whole world, so every
+        scheduler rank joins this one reduction unconditionally: a rank whose
+        own flags, Mooncake capability or KV canary mode disagree turns the
+        feature off everywhere instead of skipping the group creation alone.
+        The same reduction requires SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS to be
+        on or off everywhere (positive values may differ); otherwise ranks
+        would disagree on the supplemental poll collective. That poll only runs
+        on a PD prefill with pp_size == 1 (final chunks are recorded only
+        there), so other roles do not read the variable and report it off.
+        """
+
+        prefetch_local = (
+            self._waiting_queue_prefetch_configured()
             and self.tree_cache.waiting_queue_prefetch_enabled()
         )
+        # Forward ingress matches (and may split) radix nodes while the
+        # forward runs; KV canary's sweep walks them from the forward thread.
+        ingress_local = (
+            str(getattr(self.server_args, "kv_canary", "none")).strip().lower()
+            == "none"
+        )
+        final_poll_on, final_poll_valid = False, True
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.ps.pp_size == 1
+        ):
+            try:
+                final_poll_on = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+            except Exception:
+                final_poll_on, final_poll_valid = False, False
+
+        flags = torch.tensor(
+            [
+                int(prefetch_local),
+                int(ingress_local),
+                int(final_poll_on),
+                -int(final_poll_on),
+                int(final_poll_valid),
+            ],
+            dtype=torch.int64,
+        )
+        if group is not None:
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+        prefetch, ingress, final_poll_min, neg_final_poll_max, final_poll_valid = (
+            int(value) for value in flags
+        )
+        if not final_poll_valid or final_poll_min != -neg_final_poll_max:
+            raise ValueError(
+                "SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS must be valid and either "
+                "positive on every rank or <= 0 on every rank; this rank has "
+                f"on={final_poll_on}, valid={final_poll_valid}"
+            )
+
+        enabled = bool(prefetch)
+        if prefetch_local and not enabled:
+            # Before any job exists: keep the linker consistent with the world.
+            self.tree_cache.disable_waiting_queue_prefetch()
+            logger.warning(
+                "Waiting-queue DFS prefetch disabled: another rank is not "
+                "configured for it or lacks the Mooncake capability."
+            )
+        forward_ingress = enabled and bool(ingress)
+        if enabled and not forward_ingress:
+            logger.info(
+                "Waiting-queue DFS prefetch runs without receiving requests "
+                "during forward because KV canary is enabled."
+            )
+        return enabled, forward_ingress
 
     def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
         if (
@@ -4387,7 +4474,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     def _forward_with_waiting_queue_ingress(self, batch, **fwd_kwargs):
-        if not self.enable_waiting_queue_dfs_prefetch:
+        if not self._forward_ingress_enabled:
             return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
 
         # Keep the scheduler as the sole owner of its sockets, requests, and
