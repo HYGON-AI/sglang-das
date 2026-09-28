@@ -1560,9 +1560,9 @@ echo "[drive_batch] \$(hostname) rank \${SPUR_NODEID:-?} elected driver"
 # records: a leg that failed in the monitor loop left an sbatch.out that simply
 # stopped mid-run, with the teardown lines never visible.
 #
-# A plain redirect, deliberately NOT `| tee`. With a pipeline, drive_batch waits
+# A plain redirect, deliberately NOT '| tee'. With a pipeline, drive_batch waits
 # for the whole pipeline, and that does not finish when drive.sh does -- the
-# backgrounded `tail -F` on bench.log inherits drive.sh's stdout and holds the
+# backgrounded 'tail -F' on bench.log inherits drive.sh's stdout and holds the
 # pipe's write end open. drive.sh exited 0 and drive_exit was still unwritten
 # 11 minutes later, so the standby tasks kept the allocation alive and the leg
 # looked hung after it had actually passed.

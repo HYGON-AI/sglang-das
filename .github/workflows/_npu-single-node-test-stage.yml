@@ -18,7 +18,7 @@ on:
         default: ''
         description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
       image:
-        required: true
+        required: false
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3"
