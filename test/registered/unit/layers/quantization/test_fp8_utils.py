@@ -1,8 +1,10 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import (
@@ -26,6 +28,100 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestCompressedTensorsFp8FusionCapability(CustomTestCase):
+    def test_only_dynamic_channelwise_hcu_scheme_accepts_fused_pair(self):
+        import sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 as compressed_fp8
+
+        scheme = compressed_fp8.CompressedTensorsW8A8Fp8.__new__(
+            compressed_fp8.CompressedTensorsW8A8Fp8
+        )
+        scheme.strategy = QuantizationStrategy.CHANNEL
+        scheme.is_static_input_scheme = False
+        scheme.weight_block_size = None
+
+        with (
+            patch.object(compressed_fp8, "_is_hcu", True),
+            patch.object(compressed_fp8, "_use_aiter", False),
+        ):
+            self.assertTrue(scheme.supports_fp8_prequantized_input)
+
+            scheme.is_static_input_scheme = True
+            self.assertFalse(scheme.supports_fp8_prequantized_input)
+            scheme.is_static_input_scheme = False
+
+            scheme.strategy = QuantizationStrategy.BLOCK
+            scheme.weight_block_size = [128, 128]
+            self.assertFalse(scheme.supports_fp8_prequantized_input)
+
+            scheme.strategy = QuantizationStrategy.CHANNEL
+            scheme.weight_block_size = None
+            with patch.object(compressed_fp8, "_use_aiter", True):
+                self.assertFalse(scheme.supports_fp8_prequantized_input)
+
+    def test_row_parallel_dispatches_fused_pair_through_quant_scheme(self):
+        import sglang.srt.layers.linear as linear
+
+        fused_call = {}
+        apply_call = {}
+
+        def fake_fused_swiglu(input, **kwargs):
+            fused_call.update(kwargs)
+            kwargs["output"].zero_()
+            kwargs["scales"].fill_(1.0)
+            return kwargs["output"], kwargs["scales"]
+
+        def fake_apply(layer, x, bias=None):
+            apply_call["input"] = x
+            apply_call["bias"] = bias
+            return torch.zeros((x[0].shape[0], 8), dtype=torch.bfloat16)
+
+        @contextmanager
+        def fake_symmetric_memory(*args, **kwargs):
+            yield None
+
+        layer = object.__new__(linear.RowParallelLinear)
+        layer.input_is_parallel = True
+        layer.tp_rank = 0
+        layer.skip_bias_add = False
+        layer.bias = None
+        layer.use_dp_attention_reduce = False
+        layer.reduce_results = False
+        layer.use_decode_attn_tp = False
+        layer.scheme = SimpleNamespace(supports_fp8_prequantized_input=True)
+        layer.quant_method = SimpleNamespace(apply=fake_apply)
+
+        gate_up = torch.randn((4, 32), dtype=torch.bfloat16)
+        with (
+            patch.object(linear, "_use_fused_silu_mul_fp8_quant", True),
+            patch.object(
+                linear,
+                "_lightop_fuse_silu_mul_fp8_quant",
+                fake_fused_swiglu,
+            ),
+            patch.object(
+                linear, "get_forward", return_value=SimpleNamespace(sp_active=False)
+            ),
+            patch.object(linear, "get_tp_group", return_value=None),
+            patch.object(linear, "is_allocation_symmetric", return_value=False),
+            patch.object(linear, "use_symmetric_memory", fake_symmetric_memory),
+        ):
+            output, output_bias = layer.forward(
+                gate_up,
+                use_fused_silu_mul_fp8_quant=True,
+                swiglu_limit=7.0,
+            )
+
+        self.assertEqual(tuple(output.shape), (4, 8))
+        self.assertIsNone(output_bias)
+        self.assertEqual(fused_call["limit"], 7.0)
+        self.assertEqual(tuple(fused_call["output"].shape), (4, 16))
+        self.assertEqual(fused_call["output"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(fused_call["scales"].shape), (4, 1))
+        self.assertIs(apply_call["input"][0], fused_call["output"])
+        self.assertIs(apply_call["input"][1], fused_call["scales"])
+        self.assertEqual(apply_call["input"][2], torch.bfloat16)
 
 
 class TestMxfp8MoeScaleLayout(CustomTestCase):
@@ -367,6 +463,19 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 compressed_apply.call_args.kwargs["pre_quant_output_dtype"],
                 input.dtype,
             )
+
+        with (
+            patch.object(compressed_fp8, "_is_hcu", True),
+            patch.object(compressed_fp8, "apply_fp8_linear") as compressed_apply,
+        ):
+            compressed_apply.return_value = torch.empty(
+                (qinput.shape[0], weight.shape[1]), dtype=input.dtype
+            )
+            compressed_method.apply_weights(layer, fused_input)
+            hcu_input = compressed_apply.call_args.kwargs["input"]
+            self.assertIs(hcu_input[0], qinput)
+            self.assertIs(hcu_input[1], input_scale)
+            self.assertNotIn("input_scale", compressed_apply.call_args.kwargs)
 
 
 class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):

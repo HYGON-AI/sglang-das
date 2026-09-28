@@ -153,6 +153,14 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
+    from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+    if is_glm5_next_hcu(runner.model_config.hf_config):
+        from sglang.srt.layers.attention.glm5_next.dsa_backend import (
+            NativeSparseAttnBackend,
+        )
+
+        return NativeSparseAttnBackend(runner)
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     return DeepseekSparseAttnBackend(runner)

@@ -20,12 +20,18 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+)
+from sglang.srt.layers.fused_rms_quant import (
+    fused_mla_qkv_a_rms_norm_per_token_quant,
+    supports_fused_mla_qkv_a_rms_quant_input,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -33,6 +39,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -52,6 +59,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla imp
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
+    should_defer_dsa_cp_kv_gather,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -467,18 +475,32 @@ class DeepseekMLARocmForwardMixin:
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
+            qkv_latent = get_attn_tp_context().fetch_qkv_latent()
+            q_input_quant_args = None
+            use_hcu_norm_quant = (
+                self.use_lightop_mla_qkv_a_rms_quant
+                and not q_replicate_active
+                and supports_fused_mla_qkv_a_rms_quant_input(
+                    qkv_latent, self.q_a_layernorm.weight, self.kv_a_layernorm.weight
                 )
+            )
+            if use_hcu_norm_quant:
+                q_input_quant_args = fused_mla_qkv_a_rms_norm_per_token_quant(
+                    packed_input=qkv_latent,
+                    q_weight=self.q_a_layernorm.weight,
+                    kv_weight=self.kv_a_layernorm.weight,
+                    q_epsilon=self.q_a_layernorm.variance_epsilon,
+                    kv_epsilon=self.kv_a_layernorm.variance_epsilon,
+                )
+            q, latent_cache = qkv_latent.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if use_hcu_norm_quant:
+                pass  # Both normalized views were written into packed qkv_latent.
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -558,7 +580,7 @@ class DeepseekMLARocmForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q, input_quant_args=q_input_quant_args)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -583,7 +605,7 @@ class DeepseekMLARocmForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q, input_quant_args=q_input_quant_args)
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
@@ -710,6 +732,32 @@ class DeepseekMLARocmForwardMixin:
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
+        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
+            dsa_prefill_cp=dsa_prefill_cp,
+            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+        )
+        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
+            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
+
+            k_nope, k_pe = materialize_full_kv_cp(
+                self,
+                forward_batch,
+                latent_cache,
+                k_nope,
+                k_pe,
+            )
+        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
+            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
+            # backend via the strategy (materialize_full_mla_kv).
+            k_nope, k_pe = self.rebuild_cp_kv_cache(
+                latent_cache,
+                forward_batch,
+                k_nope,
+                k_pe,
+            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:

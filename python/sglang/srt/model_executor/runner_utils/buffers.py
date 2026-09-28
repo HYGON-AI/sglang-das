@@ -33,8 +33,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.utils import is_hcu
 
-_has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_has_foreach_copy = hasattr(torch, "_foreach_copy_") and not is_hcu()
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:

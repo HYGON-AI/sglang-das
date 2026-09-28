@@ -3110,7 +3110,7 @@ class SchedulerDisaggregationDecodeMixin:
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
                 # `pop_preallocated` matched and locked new requests; a retracted or
                 # rebootstrapped one owns its row, and a re-match here takes no lock.

@@ -49,6 +49,15 @@ def _should_auto_enable_hip_rejection_sampling(
     runs the real EAGLE verify then overwrites accept length, so the Triton
     chain sampler is paid for and thrown away.
     """
+    if is_hip:
+        # HCU reports itself through PyTorch's HIP runtime but uses its own
+        # top-1 MTP target sampler; the generic ROCm rejection path requires
+        # draft probabilities that the HCU draft backend does not produce.
+        from sglang.srt.utils.common import is_hcu
+
+        if is_hcu():
+            return False
+
     return (
         is_hip
         and not use_rejection_sampling
@@ -252,6 +261,63 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # itself: handed the stand-in, its `declare_resolution` calls would
             # stash on that instead.
             algo.handle_server_args(server_args)
+
+    _validate_draft_lm_head_vp(server_args)
+
+
+def _validate_draft_lm_head_vp(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_lm_head_vp_size < 1:
+        raise ValueError(
+            "--speculative-draft-lm-head-vp-size must be positive, got "
+            f"{cfg.speculative_draft_lm_head_vp_size}."
+        )
+    if cfg.speculative_draft_lm_head_vp_size > 1:
+        vp_size = cfg.speculative_draft_lm_head_vp_size
+        if cfg.speculative_algorithm != "EAGLE":
+            raise ValueError(
+                "--speculative-draft-lm-head-vp-size > 1 currently requires "
+                "speculative_algorithm == EAGLE."
+            )
+        if cfg.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--speculative-draft-lm-head-vp-size > 1 currently requires "
+                "--speculative-eagle-topk 1."
+            )
+        if cfg.speculative_token_map is not None:
+            raise ValueError(
+                "--speculative-draft-lm-head-vp-size and "
+                "--speculative-token-map cannot be enabled together."
+            )
+        if not cfg.enable_dp_attention or not cfg.enable_dp_lm_head:
+            raise ValueError(
+                "--speculative-draft-lm-head-vp-size > 1 requires both "
+                "--enable-dp-attention and --enable-dp-lm-head."
+            )
+        if cfg.tp_size != cfg.dp_size * cfg.attn_cp_size:
+            raise ValueError(
+                "Draft LM-head VP currently requires attention TP size 1, "
+                "i.e. tp_size == dp_size * attn_cp_size. Got "
+                f"tp_size={cfg.tp_size}, dp_size={cfg.dp_size}, "
+                f"attn_cp_size={cfg.attn_cp_size}."
+            )
+        if cfg.tp_size % vp_size != 0:
+            raise ValueError(
+                f"tp_size={cfg.tp_size} must be divisible by draft LM-head "
+                f"vp_size={vp_size}."
+            )
+        if cfg.enable_fp32_lm_head:
+            raise ValueError(
+                "Draft LM-head VP does not currently support --enable-fp32-lm-head."
+            )
+
+    if (
+        cfg.speculative_draft_lm_head_vp_size > 1
+        and cfg.speculative_use_rejection_sampling
+    ):
+        raise ValueError(
+            "Draft LM-head VP top-1 cannot provide full proposal probabilities for rejection sampling."
+        )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:

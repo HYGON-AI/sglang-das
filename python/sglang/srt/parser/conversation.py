@@ -425,9 +425,22 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
+    def append_image(
+        self,
+        image: str,
+        detail: Literal["auto", "low", "high"],
+        max_image_tokens: Optional[int] = None,
+    ):
         """Append a new image."""
-        self.image_data.append(ImageData(url=image, detail=detail))
+        self.image_data.append(
+            ImageData(
+                url=image,
+                detail=detail,
+                preprocess_kwargs={"max_image_tokens": max_image_tokens}
+                if max_image_tokens is not None
+                else None,
+            )
+        )
 
     def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
         """Append a new video."""
@@ -682,10 +695,22 @@ def generate_chat_conv(
                         else:
                             real_content += image_token
                         conv.append_image(
-                            content.image_url.url, content.image_url.detail
+                            content.image_url.url,
+                            content.image_url.detail,
+                            content.image_url.max_image_tokens,
                         )
                     elif content.type == "video_url":
                         real_content += video_token
+                        if content.video_frame_url is not None:
+                            conv.append_video(
+                                [
+                                    frame.model_dump()
+                                    for frame in content.video_frame_url
+                                ]
+                            )
+                            continue
+                        if content.video_url is None:
+                            raise ValueError("video_url or video_frame_url is required")
                         preprocess_kwargs = {
                             key: value
                             for key in GLM_MEDIA_CONFIG_KEYS

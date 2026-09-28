@@ -147,6 +147,20 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
+void kpool_write_plan(
+    const torch::Tensor& write_start,
+    const torch::Tensor& req_pool_indices,
+    const torch::Tensor& real_page_table,
+    torch::Tensor& req_out,
+    torch::Tensor& write_start_out,
+    torch::Tensor& tail_logical_start_out,
+    torch::Tensor& write_loc_out,
+    std::optional<torch::Tensor> pool_seqlens_per_q_out,
+    std::optional<torch::Tensor> seqlens_per_q_out,
+    int64_t pool_size,
+    int64_t num_draft_tokens,
+    int64_t slots_per_page);
+
 void rotary_embedding(
     torch::Tensor& positions,
     torch::Tensor& query,
@@ -915,3 +929,22 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+void transfer_kv_per_layer_mla_lf_lf_H2D_hcu(
+    const at::Tensor& src,
+    at::Tensor dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t page_size,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla_lf_lf_D2H_hcu(
+    const at::Tensor src_layers,
+    const at::Tensor dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);

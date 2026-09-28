@@ -457,3 +457,33 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+
+def kpool_write_plan(
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    req_out: torch.Tensor,
+    write_start_out: torch.Tensor,
+    tail_logical_start_out: torch.Tensor,
+    write_loc_out: torch.Tensor,
+    pool_seqlens_per_q_out: Optional[torch.Tensor],
+    seqlens_per_q_out: Optional[torch.Tensor],
+    pool_size: int,
+    num_draft_tokens: int,
+    slots_per_page: int,
+) -> None:
+    torch.ops.sgl_kernel.kpool_write_plan.default(
+        write_start,
+        req_pool_indices,
+        real_page_table,
+        req_out,
+        write_start_out,
+        tail_logical_start_out,
+        write_loc_out,
+        pool_seqlens_per_q_out,
+        seqlens_per_q_out,
+        pool_size,
+        num_draft_tokens,
+        slots_per_page,
+    )

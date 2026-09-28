@@ -944,8 +944,8 @@ class TokenizerManagerScoreMixin:
                 # delimiter. Positions come from item lengths (delimiter_indices),
                 # not from scanning for this token — it's for FlashInfer compat only.
                 delimiter_token_id = MIS_DELIMITER_TOKEN_ID
-                query_ids, items_ids = self._batch_tokenize_query_and_items(
-                    query, items_list
+                query_ids, items_ids = await self.run_tokenizer_offload(
+                    self._batch_tokenize_query_and_items, query, items_list
                 )
                 combined_input_ids, delimiter_indices = (
                     self._build_multi_item_token_sequence(
@@ -994,14 +994,11 @@ class TokenizerManagerScoreMixin:
             input_ids = self._build_score_extraction_text_inputs(
                 query or "", items, score_extraction_token_id
             )
-        elif has_embeds or use_score_extraction:
-            # Tokenize text inputs to token IDs, then build via the token-id path
-            # (embed overrides need positions; score extraction needs token IDs).
-            query_ids, items_ids = self._batch_tokenize_query_and_items(
-                query or "" if use_multi_item_scoring else query, items
+        elif has_embeds:
+            # Text inputs with embed overrides — need to tokenize first to resolve positions
+            query_ids, items_ids = await self.run_tokenizer_offload(
+                self._batch_tokenize_query_and_items, query, items
             )
-            if use_score_extraction and not use_multi_item_scoring:
-                self._reject_query_prefix_anchor(query_ids, score_extraction_token_id)
             _, input_ids, positional_embed_overrides, delimiter_indices = (
                 self._build_token_id_inputs(
                     query_ids,

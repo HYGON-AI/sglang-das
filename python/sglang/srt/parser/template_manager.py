@@ -51,6 +51,7 @@ from sglang.srt.parser.template_detection import (
     match_rules,
 )
 from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils.tokenizer_escape import escape_chat_template
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,11 @@ class TemplateManager:
                     # override the chat template
                     if tokenizer_manager.tokenizer:
                         tokenizer_manager.tokenizer.chat_template = hf_template
+                        tokenizer_manager.tokenizer.chat_template = (
+                            escape_chat_template(
+                                tokenizer_manager.tokenizer.chat_template
+                            )
+                        )
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
                     )
@@ -280,6 +286,9 @@ class TemplateManager:
         with open(template_path, "r") as f:
             chat_template = "".join(f.readlines()).strip("\n")
         tokenizer_manager.tokenizer.chat_template = chat_template.replace("\\n", "\n")
+        tokenizer_manager.tokenizer.chat_template = escape_chat_template(
+            tokenizer_manager.tokenizer.chat_template
+        )
         self._chat_template_name = None
         # Detect content format from the loaded template
         self._jinja_template_content_format = detect_jinja_template_content_format(

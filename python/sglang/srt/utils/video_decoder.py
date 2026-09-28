@@ -54,6 +54,7 @@ class VideoDecoderWrapper:
             1 = single decoder. Set > 1 to split frame indices across
             multiple decoders in parallel threads.
         """
+        self.device = "cpu"
         self._source = source
         self._num_decode_threads = num_decode_threads
         self._source_bytes = source if isinstance(source, bytes) else None
@@ -61,9 +62,12 @@ class VideoDecoderWrapper:
         self._tmp_path = None
         if _BACKEND == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
-            if device == "cuda" and _try_cuda_backend():
+            from sglang.srt.utils.common import is_cuda
+
+            if str(device).startswith("cuda") and is_cuda() and _try_cuda_backend():
                 kwargs["device"] = "cuda"
             self._tc_kwargs = kwargs
+            self.device = kwargs.get("device", "cpu")
             try:
                 self._decoder = VideoDecoder(source, **kwargs)
             except RuntimeError:
@@ -71,6 +75,7 @@ class VideoDecoderWrapper:
                     logger.warning("CUDA video decoding failed, falling back to CPU.")
                     kwargs.pop("device")
                     self._tc_kwargs = kwargs
+                    self.device = "cpu"
                     self._decoder = VideoDecoder(source, **kwargs)
                 else:
                     raise

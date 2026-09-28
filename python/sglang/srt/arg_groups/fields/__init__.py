@@ -39,7 +39,10 @@ def collect_input_fields(
             if field.default is not msgspec.NODEFAULT:
                 defaults[field.name] = field.default
             elif field.default_factory is not msgspec.NODEFAULT:
-                defaults[field.name] = msgspec.field(
+                # ``ServerArgs`` is assembled as a dataclass below. Keep the
+                # factory semantics, but do not leak msgspec's ``Field``
+                # descriptor into the dataclass instance as a runtime value.
+                defaults[field.name] = dataclasses.field(
                     default_factory=field.default_factory
                 )
     known = [n for n in POSITIONAL_FIELD_ORDER if n in annotations]

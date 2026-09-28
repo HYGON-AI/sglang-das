@@ -419,6 +419,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and _use_deepgemm_moe
             and _is_hcu
+            and self.use_deepep
         ):
             self._prepare_dsv4_channel_fp8_deepgemm_weights(layer)
 

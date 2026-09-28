@@ -139,6 +139,7 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    pre_allocated_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -167,6 +168,9 @@ class SchedulerStats:
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
     routing_key_all_req_counts: List[int] = field(default_factory=list)
+
+    num_grammar_cache_entries: int = 0
+    grammar_backend_cache_bytes: int = 0
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
@@ -546,6 +550,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.pre_allocated_token_usage = Gauge(
+            name="sglang:pre_allocated_token_usage",
+            documentation="The token usage for pre-allocated tokens (already allocated, transferring KV).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1110,6 +1120,45 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             multiprocess_mode="mostrecent",
         )
 
+        self.num_grammar_cache_entries = Gauge(
+            name="sglang:num_grammar_cache_entries",
+            documentation="Entries in the per-rank grammar object cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.grammar_backend_cache_bytes = Gauge(
+            name="sglang:grammar_backend_cache_bytes",
+            documentation=(
+                "Bytes held by the xgrammar compiler caches "
+                "(grammar-level + rule-level)."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.grammar_first_mask_fill_time = Histogram(
+            name="sglang:grammar_first_mask_fill_seconds",
+            documentation="Duration of a request's first grammar vocab-mask fill "
+            "(where the deferred cost of dynamic compilation lands).",
+            labelnames=labels.keys(),
+            buckets=[
+                0.0,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1,
+                2,
+                5,
+            ],
+        )
+
     @classmethod
     def init_new(
         cls,
@@ -1436,6 +1485,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        self._log_gauge(self.pre_allocated_token_usage, stats.pre_allocated_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1481,6 +1531,39 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.last_log_time = time.perf_counter()
+
+        self._log_gauge(self.num_grammar_cache_entries, stats.num_grammar_cache_entries)
+        self._log_gauge(
+            self.grammar_backend_cache_bytes, stats.grammar_backend_cache_bytes
+        )
+
+    def log_grammar_stats(self, grammar_stats) -> None:
+        if grammar_stats.compilation_time is not None:
+            self._log_histogram(
+                self.grammar_compilation_time, grammar_stats.compilation_time
+            )
+        if grammar_stats.schema_count is not None:
+            self._log_histogram(self.grammar_schema_count, grammar_stats.schema_count)
+        if grammar_stats.ebnf_size is not None:
+            self._log_histogram(self.grammar_ebnf_size, grammar_stats.ebnf_size)
+        tree_times = grammar_stats.tree_traversal_time
+        if tree_times:
+            max_time = max(tree_times)
+            avg_time = sum(tree_times) / len(tree_times)
+            self._log_histogram(self.grammar_tree_traversal_time_max, max_time)
+            self._log_histogram(self.grammar_tree_traversal_time_avg, avg_time)
+        if grammar_stats.is_cache_hit:
+            self.num_grammar_cache_hit.labels(**self.labels).inc(1)
+        if grammar_stats.is_grammar_aborted:
+            self.num_grammar_aborted.labels(**self.labels).inc(1)
+        if grammar_stats.num_timeout > 0:
+            self.num_grammar_timeout.labels(**self.labels).inc(
+                grammar_stats.num_timeout
+            )
+        self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def observe_grammar_first_mask_fill(self, duration: float) -> None:
+        self._log_histogram(self.grammar_first_mask_fill_time, duration)
 
     def emit_constants(
         self,
@@ -1735,6 +1818,34 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 8.000,
             ]
 
+        self.histogram_outbound_latency = Histogram(
+            name="sglang:outbound_latency_seconds",
+            documentation=(
+                "Latency from scheduler output-batch emit to first-token "
+                "observation in the API server (detokenizer + router + http "
+                "worker event loop)."
+            ),
+            labelnames=labels.keys(),
+            buckets=[
+                0.001,
+                0.002,
+                0.005,
+                0.010,
+                0.020,
+                0.050,
+                0.100,
+                0.200,
+                0.500,
+                1.000,
+                2.000,
+                5.000,
+                10.000,
+                20.000,
+                40.000,
+                60.000,
+            ],
+        )
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
@@ -1833,6 +1944,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.generation_tokens_histogram.labels(**labels).observe(
             float(generation_tokens)
         )
+
+    def observe_outbound_latency(self, labels: Dict[str, str], value: float):
+        self.histogram_outbound_latency.labels(**labels).observe(value)
 
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool

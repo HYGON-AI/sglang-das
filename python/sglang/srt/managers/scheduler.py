@@ -887,6 +887,7 @@ class Scheduler(
                     image_processor_backend=resolve_image_processor_backend(get_mm()),
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
+                    glm_special_token_escape_seed=get_serving().glm_special_token_escape_seed,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -896,6 +897,7 @@ class Scheduler(
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
                     tokenizer_backend=get_serving().tokenizer_backend,
+                    glm_special_token_escape_seed=get_serving().glm_special_token_escape_seed,
                 )
 
         # Load multimodal processor for M-RoPE fallback computation.
@@ -1186,6 +1188,15 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        if (
+            get_serving().glm_check_total_num_tokens
+            and not get_serving().allow_auto_truncate
+            and self.max_total_num_tokens < self.model_config.context_len
+        ):
+            raise ValueError(
+                f"KV token capacity {self.max_total_num_tokens} is smaller than "
+                f"the GLM context length {self.model_config.context_len}"
+            )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1480,11 +1491,11 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.pp_size != 1:
+            if self.ps.pp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.attn_tp_size != 1 or self.attn_cp_size != 1:
+            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports attn_tp_size=1 and "
                     "attn_cp_size=1 only"
@@ -1492,7 +1503,7 @@ class Scheduler(
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.server_args.dp_size * self.attn_tp_size * self.attn_cp_size
+                self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
@@ -1519,7 +1530,7 @@ class Scheduler(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_s),
             )
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 logger.info(
                     "PD Decode single-clock enabled: dedicated Gloo scheduler "
                     "group, world=%s timeout=%.1fs",
@@ -4474,6 +4485,7 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
+        forward_generation = self.model_worker.forward_batch_generation
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -4512,9 +4524,7 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        batch_result = forward_generation(batch, **fwd_kwargs)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4632,7 +4642,7 @@ class Scheduler(
                             verify_forward_batch.out_cache_loc
                         )
                     else:
-                        batch_result = self.model_worker.forward_batch_generation(
+                        batch_result = forward_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
                     batch.input_ids = None
@@ -4645,7 +4655,7 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
-                        batch_result = self.model_worker.forward_batch_generation(
+                        batch_result = forward_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;
@@ -4686,9 +4696,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                batch_result = forward_generation(batch, **kwargs)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -4962,7 +4970,13 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        if not self.return_health_check_ipcs:
+            return
+
+        # GLM NOTE: Drain one health IPC by default; opt in to drain all for
+        # multi-tokenizer health checks.
+        drain_all = envs.SGLANG_ENABLE_HEALTH_CHECK_IPC_DRAIN_ALL.get()
+        while self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
@@ -4971,6 +4985,9 @@ class Scheduler(
                     http_worker_ipc=self.return_health_check_ipcs.popleft()
                 )
             )
+
+            if not drain_all:
+                break
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput

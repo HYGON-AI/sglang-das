@@ -135,6 +135,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -261,8 +262,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.is_neox_style = is_neox_style
         self.block_size = block_size
         self.scale_fmt = scale_fmt
+        self.glm5_next_fp32_head_gates = getattr(config, "model_type", "") in (
+            "glm5_next",
+            "glm5v_next",
+            "glm5next_text",
+            "glm5_next_text",
+        )
         self.use_dsa_indexer_fusion = (
-            _is_cuda
+            not self.glm5_next_fp32_head_gates
+            and _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
@@ -327,7 +335,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.n_heads,
                 bias=False,
-                params_dtype=torch.bfloat16,
+                params_dtype=torch.float32
+                if self.glm5_next_fp32_head_gates
+                else torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
         if index_k_uses_rmsnorm:
@@ -410,6 +420,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
+        if self.glm5_next_fp32_head_gates:
+            weights, _ = self.weights_proj(x.float())
+            return weights.float()
         if _is_cuda:
             return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
@@ -647,7 +660,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with torch.cuda.stream(self.alt_stream):
                 key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
-        elif self.alt_stream is not None and is_cp_active(forward_batch):
+        elif self.alt_stream is not None and (
+            is_cp_active(forward_batch)
+            or (
+                forward_batch.attn_cp_metadata is not None
+                and self.dsa_enable_prefill_cp
+            )
+        ):
             key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -656,9 +675,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Gather the full key on alt_stream so the CP all-gather overlaps
             # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                key = get_cp_strategy().materialize_full_indexer_k_cache(
-                    key, forward_batch
-                )
+                if is_cp_active(forward_batch):
+                    key = get_cp_strategy().materialize_full_indexer_k_cache(
+                        key, forward_batch
+                    )
+                else:
+                    key = cp_all_gather_rerange_output(
+                        key.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
@@ -668,6 +695,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # allgather+rerrange
         if is_cp_active(forward_batch):
             key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
+        elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
+            key = cp_all_gather_rerange_output(
+                key.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         return query, key, weights_raw
 
     def _get_k_bf16(
@@ -1716,7 +1750,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.alt_stream.wait_stream(current_stream)
             if not self.use_dsa_indexer_fusion:
                 if weights_proj_lora:
-                    weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+                    weights = (
+                        self.weights_proj(x.to(self.weights_proj.weight.dtype))[
+                            0
+                        ].float()
+                        * self.n_heads**-0.5
+                    )
                 else:
                     weights = self._project_and_scale_head_gates(x)
             query, key, weights_raw = self._get_q_k_bf16(
@@ -1825,7 +1864,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     if weights_proj_lora:
                         raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
                     weights = logits_head_gate_graph(
-                        x_for_gate,
+                        x_for_gate.to(self.weights_proj.weight.dtype),
                         self.weights_proj.weight,
                         self.n_heads**-0.5,
                         self.softmax_scale,
@@ -1834,7 +1873,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             elif self.use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
-                weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
+                weights = (
+                    self.weights_proj(x_for_gate.to(self.weights_proj.weight.dtype))[
+                        0
+                    ].float()
+                    * self.n_heads**-0.5
+                )
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)

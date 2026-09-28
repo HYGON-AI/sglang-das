@@ -570,6 +570,7 @@ class ChatCompletionMessageContentThinkingPart(BaseModel):
 
 
 class ChatCompletionMessageContentImageURL(BaseModel):
+    max_image_tokens: Optional[int] = None
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
@@ -604,9 +605,19 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentVideoFrameURL(BaseModel):
+    url: str
+    timestamp: str
+    detail: Optional[str] = None
+    sampled_index: Optional[int] = None
+    source_fps: Optional[float] = None
+    source_total_num_frames: Optional[int] = None
+
+
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
-    video_url: ChatCompletionMessageContentVideoURL
+    video_url: Optional[ChatCompletionMessageContentVideoURL] = None
+    video_frame_url: Optional[List[ChatCompletionMessageContentVideoFrameURL]] = None
 
 
 class ChatCompletionMessageContentInputAudio(BaseModel):
@@ -848,6 +859,8 @@ def _has_message_level_tools(messages: Any) -> bool:
 
 
 class ChatCompletionRequest(BaseModel):
+    return_constraint: bool = False
+    enable_constraint: bool = True
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -1296,6 +1309,7 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    metadata: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

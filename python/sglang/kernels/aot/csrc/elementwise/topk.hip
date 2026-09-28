@@ -494,11 +494,11 @@ void fast_topk_transform_interface(
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
   if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
-   hipLaunchKernelGGL(( topk_transform_decode_kernel), dim3(grid), dim3(block), kSmem, stream, 
+   hipLaunchKernelGGL(( topk_transform_decode_kernel), dim3(grid), dim3(block), kSmem, stream,
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
   } else {
     setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
-   hipLaunchKernelGGL(( topk_transform_prefill_kernel), dim3(grid), dim3(block), kSmem, stream, 
+   hipLaunchKernelGGL(( topk_transform_prefill_kernel), dim3(grid), dim3(block), kSmem, stream,
         params,
         dst_page_table.data_ptr<int32_t>(),
         src_page_table.data_ptr<int32_t>(),
@@ -540,7 +540,7 @@ void fast_topk_transform_ragged_interface(
   const auto block = dim3{kThreadsPerBlock};
 
   setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
- hipLaunchKernelGGL(( topk_transform_prefill_ragged_kernel), dim3(grid), dim3(block), kSmem, stream, 
+ hipLaunchKernelGGL(( topk_transform_prefill_ragged_kernel), dim3(grid), dim3(block), kSmem, stream,
       params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
 
   const auto result = hipGetLastError();

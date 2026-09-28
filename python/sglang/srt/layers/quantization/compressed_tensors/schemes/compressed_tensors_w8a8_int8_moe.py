@@ -294,6 +294,14 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "use_int8_w8a8_deepgemm", False):
+            from sglang.srt.layers.quantization.hcu_deepgemm_w8a8_utils import (
+                prepare_w8a8_int8_deepgemm_weights,
+            )
+
+            prepare_w8a8_int8_deepgemm_weights(layer)
+            return
+
         layer.w13_weight_scale = torch.nn.Parameter(
             layer.w13_weight_scale.data, requires_grad=False
         )
@@ -331,7 +339,7 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         topk_weights, topk_ids, router_logits = dispatch_output.topk_output
 
         if _use_aiter_moe:
-            from aiter.moe import get_aiter_moe_config, aiter_moe, MoeQuantType
+            from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
 
             E = layer.w13_weight.size(0)
             K = x.size(-1)

@@ -37,6 +37,10 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
+# When capturing dual DSA decode graphs (dense/sparse), tracks which variant is
+# being captured.
+_capture_dsa_variant: Optional[str] = None
+
 # Attention execution variant active through metadata preparation and capture.
 _capture_attention_variant: Optional[str] = None
 
@@ -66,6 +70,15 @@ def get_capture_lora_variant() -> Optional[str]:
 def _set_capture_lora_variant(variant: Optional[str]) -> None:
     global _capture_lora_variant
     _capture_lora_variant = variant
+
+
+def get_capture_dsa_variant() -> Optional[str]:
+    return _capture_dsa_variant
+
+
+def _set_capture_dsa_variant(variant: Optional[str]) -> None:
+    global _capture_dsa_variant
+    _capture_dsa_variant = variant
 
 
 def get_capture_attention_variant() -> Optional[str]:

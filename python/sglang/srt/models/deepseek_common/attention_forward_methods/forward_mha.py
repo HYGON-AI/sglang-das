@@ -622,6 +622,10 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            # HCU's dense FlashMLA cache may pad no-rope rows from 512 to 576.
+            latent_cache = latent_cache[
+                ..., : self.kv_lora_rank + self.qk_rope_head_dim
+            ]
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

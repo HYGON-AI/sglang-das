@@ -19,13 +19,16 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.glm5_next import (
+    get_dsa_host_pool_cls,
+    get_mla_host_pool_cls,
+    is_hcu_glm_pool,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
@@ -149,7 +152,7 @@ def build_kv_host_pool(
     pool_label: str = "kv",
 ):
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost
+        get_mla_host_pool_cls(kv_pool)
         if use_mla
         else get_mha_host_pool_cls(kv_pool, get_memory().hicache_mem_layout)
     )
@@ -1137,6 +1140,8 @@ def build_hybrid_mamba_stack(
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
+    # The HCU GLM5-Next indexer entry below sizes its transfer by layer count.
+    transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
@@ -1146,9 +1151,35 @@ def build_hybrid_mamba_stack(
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        if is_hcu_glm_pool(kv_pool):
+            from sglang.srt.mem_cache.pool_host.glm5_next import index_bytes_per_page
+
+            budget_layers = sum(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+                for pool in (kv_pool, *mtp_draft_device_pools)
+            )
+            kv_bytes = (
+                kv_pool.size
+                * budget_layers
+                * (
+                    kv_pool.kv_cache_dim * kv_pool.store_dtype.itemsize
+                    + index_bytes_per_page(kv_pool) / kv_pool.page_size
+                )
+            )
+            mamba_bytes = mamba_pool.get_kv_size_bytes()
+            mamba_bytes = (
+                sum(mamba_bytes) if isinstance(mamba_bytes, tuple) else mamba_bytes
+            )
+            kv_host_size = (
+                get_memory().hicache_size * kv_bytes / (kv_bytes + mamba_bytes)
+            )
+            mamba_host_size = get_memory().hicache_size - kv_host_size
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (kv_pool, mamba_pool)
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1169,7 +1200,9 @@ def build_hybrid_mamba_stack(
     # KDA hybrid on NPU); the Mamba/KDA state pool has no separate K/V
     # buffers, so kv_split does not apply -- override to page_first_direct.
     mamba_layout = get_memory().hicache_mem_layout
-    if mamba_layout == "layout_hcu":
+    if mamba_layout == "layout_hcu" or (
+        mamba_layout == "layer_first" and is_hcu_glm_pool(kv_pool)
+    ):
         mamba_layout = "page_first"
     elif mamba_layout == "page_first_kv_split":
         mamba_layout = "page_first_direct"
@@ -1204,6 +1237,22 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if is_hcu_glm_pool(kv_pool):
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=get_dsa_host_pool_cls(kv_pool)(
+                    kv_pool,
+                    kv_host_pool,
+                    get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                ),
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+                packed_draft_device_pools=mtp_draft_device_pools,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1373,7 +1422,9 @@ def build_anchor_sidecar_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = len(full_layer_mapping)
     mtp_draft_device_pools = tuple(
-        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+        pool
+        for pool in params.mtp_draft_device_pools
+        if is_hcu_glm_pool(pool) or pool.index_k_with_scale_buffer
     )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -1460,7 +1511,7 @@ def _build_mha_mla_host_pool(
     )
     if isinstance(pool, MHATokenToKVPool):
         return get_mha_host_pool_cls(pool, layout)(pool, **kwargs)
-    return MLATokenToKVPoolHost(
+    return get_mla_host_pool_cls(pool)(
         pool,
         override_kv_cache_dim=pool.kv_cache_dim,
         **kwargs,
@@ -1479,7 +1530,11 @@ def build_full_draft_pools(
     if isinstance(pool, HybridLinearKVPool):
         # Hybrid draft runners keep their sole attention layer in this sub-pool.
         pool = pool.full_kv_pool
-    if pool.layer_num == 0:
+    if pool.layer_num == 0 or (
+        is_hcu_glm_pool(pool)
+        and pool.layer_shard_enabled
+        and pool._owned_local_layer_range()[0] == pool._owned_local_layer_range()[1]
+    ):
         return [], []
 
     controller = tree_cache.cache_controller
@@ -1513,8 +1568,10 @@ def build_full_draft_pools(
         )
     ]
 
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        indexer_host_pool = DSAIndexerPoolHost(
+    if isinstance(pool, DSATokenToKVPool) and (
+        is_hcu_glm_pool(pool) or pool.index_k_with_scale_buffer
+    ):
+        indexer_host_pool = get_dsa_host_pool_cls(pool)(
             pool,
             draft_host_pool,
             get_memory().hicache_mem_layout,
@@ -1844,6 +1901,13 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=[
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV
+                )
+            ]
+            if is_hcu_glm_pool(kvcache.full_kv_pool)
+            else [],
             register_req_to_token_counter=True,
             pools_desc="KV + MAMBA",
         )
@@ -2031,7 +2095,9 @@ class _DsaStrategy(StackStrategy):
             storage_backend=storage_backend,
             use_mla=use_mla,
             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: get_dsa_host_pool_cls(
+                full_kv_pool
+            )(
                 full_kv_pool,
                 kv_host_pool,
                 get_memory().hicache_mem_layout,
@@ -2357,3 +2423,124 @@ def build_minimax_sparse_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
+
+
+def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
+    radix_cache: HiRadixCache,
+    params: CacheInitParams,
+    *,
+    extra_config: dict,
+    prefetch_threshold: int,
+    enable_storage_metrics: bool,
+    load_cache_event,
+) -> None:
+    """Attach HostPoolGroup (KV + index K) + HybridCacheController for HiRadixCache."""
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+    try:
+        sparse_pool = radix_cache.kv_cache
+        if not isinstance(sparse_pool, MiniMaxSparseKVPool):
+            raise TypeError(
+                f"Expected MiniMaxSparseKVPool, got {type(sparse_pool).__name__}"
+            )
+        if sparse_pool.index_kv_pool is not None:
+            raise ValueError(
+                "MiniMax M3 HiCache L2 currently supports index-k-only sparse layers "
+                "(sparse_disable_index_value=1 for all sparse layers). "
+                "This model has index_kv_pool layers; INDEXER_KV sidecar is not "
+                "implemented yet."
+            )
+
+        main_pool = sparse_pool.main_pool
+        if sparse_pool.index_k_pool is None:
+            host_pool_group, cache_controller = build_kv_only_stack(
+                params=params,
+                kv_pool=main_pool,
+                full_layer_mapping={
+                    layer_id: layer_id for layer_id in range(main_pool.layer_num)
+                },
+                load_cache_event=load_cache_event,
+                storage_backend=get_memory().hicache_storage_backend,
+                use_mla=False,
+                prefetch_threshold=prefetch_threshold,
+                model_name=get_serving().served_model_name,
+                storage_backend_extra_config=extra_config,
+                enable_storage_metrics=enable_storage_metrics,
+            )
+            pools_desc = "KV"
+        else:
+            host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
+                params=params,
+                sparse_pool=sparse_pool,
+                load_cache_event=load_cache_event,
+                storage_backend=get_memory().hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=get_serving().served_model_name,
+                storage_backend_extra_config=extra_config,
+                enable_storage_metrics=enable_storage_metrics,
+            )
+            pools_desc = "KV + INDEXER(k-only)"
+
+        sparse_pool.register_layer_transfer_counter(cache_controller.layer_done_counter)
+        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+        radix_cache.token_to_kv_pool_host = host_pool_group
+        radix_cache.cache_controller = cache_controller
+        logger.info(
+            "Attached hybrid MiniMax sparse pool stack to HiRadixCache: pools=%s, "
+            "transfer_layer_num=%s, sparse_index_k_layers=%s",
+            pools_desc,
+            main_pool.layer_num,
+            len(sparse_pool.index_k_layer_id_mapping),
+        )
+    except Exception:
+        logger.exception("attach_hybrid_minimax_sparse_pool_to_hiradix_cache failed")
+        raise
+
+
+def attach_hybrid_dsa_pool_to_hiradix_cache(
+    radix_cache: HiRadixCache,
+    params: CacheInitParams,
+    *,
+    extra_config: dict,
+    prefetch_threshold: int,
+    enable_storage_metrics: bool,
+    load_cache_event,
+) -> None:
+    """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
+
+    This entrypoint is currently intended only for HiRadixCache's DSA path.
+    """
+    try:
+        kv = radix_cache.kv_cache
+        layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        host_pool_group, cache_controller = build_anchor_sidecar_stack(
+            params=params,
+            kv_pool=kv,
+            sidecar_pool_name=PoolName.INDEXER,
+            full_layer_mapping=layer_mapping,
+            load_cache_event=load_cache_event,
+            storage_backend=get_memory().hicache_storage_backend,
+            use_mla=True,
+            override_kv_cache_dim=kv.kv_cache_dim,
+            prefetch_threshold=prefetch_threshold,
+            sidecar_host_pool_factory=lambda kv_host_pool: get_dsa_host_pool_cls(kv)(
+                kv,
+                kv_host_pool,
+                get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+            ),
+            model_name=get_serving().served_model_name,
+            storage_backend_extra_config=extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+        radix_cache.token_to_kv_pool_host = host_pool_group
+        radix_cache.cache_controller = cache_controller
+        logger.info(
+            "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
+            "transfer_layer_num=%s",
+            len(layer_mapping),
+        )
+    except Exception:
+        logger.exception("attach_hybrid_dsa_pool_to_hiradix_cache failed")
+        raise
