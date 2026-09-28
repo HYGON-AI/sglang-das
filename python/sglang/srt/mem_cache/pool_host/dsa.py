@@ -252,14 +252,14 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
-            return
-        # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
+        if not self._is_device_layer_owned(device_pool, device_layer_id):
+            return
+        # Packed draft host offsets differ from the draft device layer (zero).
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
-            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            if _is_hcu and self._is_device_layer_sharded(device_pool)
             else {}
         )
 
@@ -324,12 +324,12 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        # MTP draft layers do not participate in CP layer sharding.
+        # Packed draft host offsets differ from the draft device layer (zero).
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
-            if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
+            if _is_hcu and self._is_device_layer_sharded(device_pool)
             else {}
         )
 

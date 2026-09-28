@@ -33,7 +33,7 @@ import torch
 class LightOpSparseMQARoute:
     """Validated sparse-MQA dispatch choice.
 
-    ``group_size == 1`` selects independent rows. Values 3, 4, and 5 select
+    ``group_size == 1`` selects independent rows. Values 3, 4, 5, and 6 select
     the MTP grouped implementation, after the caller has proved that each
     consecutive group shares one request's page table.
     """
@@ -90,8 +90,9 @@ def select_lightop_sparse_mqa_route(
 ) -> Optional[LightOpSparseMQARoute]:
     """Choose the native gfx938 sparse-MQA route, or return ``None``.
 
-    The validated target is deliberately narrow: gfx938/64CU, E4M3FN Q,
-    packed FP8 KV, 32 heads, page size 64, and paged TopK=2048.
+    The route targets gfx938 with 64 or 72 CUs, E4M3FN Q, packed FP8 KV,
+    32 heads, page size 64, and paged TopK=2048. The 72-CU route requires
+    a matching LightOp build with 72-CU Python and native dispatch support.
     """
 
     if not (
@@ -104,7 +105,7 @@ def select_lightop_sparse_mqa_route(
         and topk == 2048
         and page_size == 64
         and arch_name.startswith("gfx938")
-        and num_cus == 64
+        and num_cus in (64, 72)
     ):
         return None
 
@@ -154,7 +155,7 @@ def select_lightop_sparse_mqa_route(
         return None
 
     if is_target_verify or is_draft_extend_v2:
-        if mtp_group_size not in (3, 4, 5):
+        if mtp_group_size not in (3, 4, 5, 6):
             return None
         if rows != batch_size * mtp_group_size:
             return None

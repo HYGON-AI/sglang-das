@@ -98,6 +98,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
+        and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
 
@@ -236,6 +237,7 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
+    dsa_layer_split_scratch_source: Optional[KVCache] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
@@ -1126,7 +1128,17 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        pool_kwargs = {}
+        if self.server_args.enable_cp_cache_layer_split and not self.is_draft_worker:
+            from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+                CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+            )
+
+            pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool
+            pool_kwargs = dict(cp_rank=self.ps.attn_cp_rank, cp_size=self.ps.attn_cp_size)
+
         token_to_kv_pool = pool_cls(
+            **pool_kwargs,
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
             # past max_running_requests (pre-alloc), so size to the real capacity.
@@ -1355,6 +1367,12 @@ class KVCacheConfigurator:
             use_layer_split_pool = True
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            pool_kwargs["layer_shard_rank_offset"] = (
+                dsa_cp_layer_shard_size - 1 if self.is_draft_worker else 0
+            )
+            pool_kwargs["layer_split_scratch_source"] = (
+                self.dsa_layer_split_scratch_source
+            )
         else:
             PoolCls = DSATokenToKVPool
         full_indexer_layer_ids = get_dsa_full_indexer_layer_ids(
@@ -1986,6 +2004,15 @@ class KVCacheConfigurator:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        if self.server_args.enable_cp_cache_layer_split and not self.is_draft_worker:
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_parallel().attn_cp_group.cpu_group,
             )
             token_capacity = tensor.item()
 

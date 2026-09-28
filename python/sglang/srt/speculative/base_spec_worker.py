@@ -237,6 +237,7 @@ class BaseSpecWorker(ABC):
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             get_memory().enable_hierarchical_cache
+            or get_memory().enable_unified_cache_external_linker
             or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
         ):
             return HiCacheDraftPlan()
@@ -254,10 +255,24 @@ class BaseSpecWorker(ABC):
             )
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            # Single-layer draft LayerSplit has persistent KV only on its CP
+            # owner. Non-owners must not allocate or restore a packed host
+            # entry pointing at the draft's zero-row placeholder.
+            draft_pools = tuple(
+                pool
+                for pool in draft_pools
+                if not getattr(pool, "layer_shard_enabled", False)
+                or pool.get_kv_layer_ids()
+            )
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
+            )
+
+        if get_memory().enable_unified_cache_external_linker:
+            raise NotImplementedError(
+                "The external linker only supports packed draft KV caches."
             )
 
         return HiCacheDraftPlan(

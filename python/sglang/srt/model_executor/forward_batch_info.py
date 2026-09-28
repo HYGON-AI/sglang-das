@@ -41,11 +41,11 @@ import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
-from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -549,6 +549,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
+
+    # Prefill body-CUDA-graph context limit. Attention backends that allocate
+    # context-shaped metadata use this fixed maximum instead of deriving a
+    # shape from the live batch. None preserves eager/default graph behavior.
+    max_seq_len_override: Optional[int] = None
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
@@ -1715,9 +1720,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
-        if not input_scattered:
+        model_sp = (
+            model_runner.server_args.minimax_opt or model_runner.server_args.hy3_sp
+        )
+
+        if not input_scattered and not model_sp:
             return
-        assert self.forward_mode.is_extend()
+
+        if model_sp and not self.forward_mode.is_extend():
+            return
+
+        if input_scattered:
+            assert self.forward_mode.is_extend()
+
         tokens = self.input_ids.shape[0]
         rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
@@ -1754,6 +1769,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :num_tokens
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if getattr(logits_output, "draft_top1_token_ids", None) is not None:
+                    logits_output.draft_top1_token_ids = (
+                        logits_output.draft_top1_token_ids[:num_tokens]
+                    )
+                    logits_output.draft_top1_probs = logits_output.draft_top1_probs[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:

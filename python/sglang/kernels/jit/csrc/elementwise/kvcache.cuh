@@ -87,7 +87,10 @@ SGL_DEVICE void copy_kv_warp(
 
   const auto gmem = tile::Memory<vec_t>::warp();
 
-#pragma unroll kLoopCount
+  // HIP clang rejects "#pragma unroll 0"; asymmetric KV tails can have zero
+  // full iterations and are handled by the epilogue below.
+  // Original: #pragma unroll kLoopCount
+#pragma unroll
   for (int64_t i = 0; i < kLoopCount; ++i) {
     const auto k = gmem.load(k_src, i);
     const auto v = gmem.load(v_src, i);
@@ -123,7 +126,10 @@ SGL_DEVICE void copy_row_warp(const void* __restrict__ src, void* __restrict__ d
 
   const auto gmem = tile::Memory<vec_t>::warp();
 
-#pragma unroll kLoopCount
+  // HIP clang rejects "#pragma unroll 0"; asymmetric KV tails can have zero
+  // full iterations and are handled by the epilogue below.
+  // Original: #pragma unroll kLoopCount
+#pragma unroll
   for (int64_t i = 0; i < kLoopCount; ++i) {
     gmem.store(dst, gmem.load(src, i), i);
   }

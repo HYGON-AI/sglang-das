@@ -54,6 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -103,6 +104,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Draft decode VP returns a deterministic top-1 proposal without full logits.
+    draft_top1_token_ids: Optional[torch.Tensor] = None
+    draft_top1_probs: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -193,6 +197,10 @@ class LogitsMetadata:
     # EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # IDLE occurs in both draft decode and draft extend. Preserve the phase so
+    # decode-only VP collectives are paired across active and idle ranks.
+    spec_input_type: Optional[SpecInputType] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -249,6 +257,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            spec_input_type=getattr(forward_batch.spec_info, "spec_input_type", None),
         )
 
     def compute_dp_attention_metadata(self):
@@ -334,6 +343,11 @@ class LogitsProcessor(nn.Module):
         )
 
         self.input_logprob_processor = InputLogprobProcessor()
+        self.draft_lm_head_vp = None
+
+    def set_draft_lm_head_vp(self, draft_lm_head_vp) -> None:
+        """Install the draft-decode vocabulary-parallel top-1 helper."""
+        self.draft_lm_head_vp = draft_lm_head_vp
 
     def forward(
         self,
@@ -398,6 +412,29 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if (
+                self.draft_lm_head_vp is not None
+                and logits_metadata.forward_mode.is_decode_or_idle()
+                and logits_metadata.spec_input_type == SpecInputType.EAGLE_DRAFT
+            ):
+                top1_scores, top1_token_ids = self.draft_lm_head_vp.project_top1(
+                    pruned_states,
+                    lm_head.weight,
+                    logit_scale=self.logit_scale,
+                    final_logit_softcapping=self.final_logit_softcapping,
+                )
+                top1_token_ids = top1_token_ids.unsqueeze(-1)
+                return LogitsProcessorOutput(
+                    # Compact scores keep ordinary slicing and NaN probes valid.
+                    next_token_logits=top1_scores.unsqueeze(-1),
+                    hidden_states=hidden_states_to_store,
+                    draft_top1_token_ids=top1_token_ids,
+                    draft_top1_probs=torch.ones_like(
+                        top1_token_ids, dtype=torch.float32
+                    ),
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

@@ -75,20 +75,32 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+# from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend, get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
+    is_hcu,
     ceil_align,
     is_non_idle_and_non_empty,
     make_layers,
 )
+_is_hcu = is_hcu()
+if _is_hcu:
+    from lightop.attention import mimo_v2_split_rope_vscale_kv_store
+
+    _use_lightop_rotary_embedding_fuse = get_bool_env_var(
+        "SGLANG_USE_FUSED_RMSNORM_ROPE"
+    )
 
 MiMoV2Config = None
 
@@ -692,7 +704,43 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
+        if get_global_server_args().kv_cache_dtype == "fp8_e4m3":
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        elif get_global_server_args().kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_dtype = torch.float8_e5m2
+        elif get_global_server_args().kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
+        else:
+            self.kv_cache_dtype = torch.bfloat16
+        self.page_size = get_global_server_args().page_size
+        self.layer_id = layer_id
 
+    def _get_lightop_mha_kv_args(self, forward_batch: ForwardBatch):
+        # v0.5.18 adaptation: KV pool is provided by the forward context.
+        # pool = forward_batch.token_to_kv_pool
+        pool = get_token_to_kv_pool()
+        loc = forward_batch.out_cache_loc
+
+        if hasattr(pool, "layers_mapping"):
+            layer_id_pool, is_swa_layer = pool.layers_mapping[self.layer_id]
+            if is_swa_layer:
+                # v0.5.18 adaptation: SWA write locations live in attention metadata.
+                # if pool.swa_loc is not None:
+                #     loc = pool.swa_loc
+                # else:
+                #     if pool.full_to_swa_index_mapping is not None:
+                #         loc = pool.translate_loc_from_full_to_swa(loc)
+                swa_loc = get_attn_backend().forward_metadata.swa_out_cache_loc
+                assert swa_loc is not None, "MiMo SWA write locations are missing"
+                loc = swa_loc[: loc.shape[0]]
+                k_buffer, v_buffer = pool.swa_kv_pool.get_kv_buffer(layer_id_pool)
+            else:
+                k_buffer, v_buffer = pool.full_kv_pool.get_kv_buffer(layer_id_pool)
+        else:
+            logger.error("mimo v2 kv pool is not healthy: missing layers_mapping")
+            return None
+        return k_buffer, v_buffer, loc
+    
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -741,14 +789,46 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        if _is_hcu and _use_lightop_rotary_embedding_fuse:
+            kv_args = self._get_lightop_mha_kv_args(forward_batch)
+            if kv_args is None:
+                return None
+            k_buffer, v_buffer, kv_cache_loc = kv_args
 
-        # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
-        # [t, h, d]
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            if cos_sin_cache.device != qkv.device or cos_sin_cache.dtype != qkv.dtype:
+                cos_sin_cache = cos_sin_cache.to(
+                    qkv.device, dtype=qkv.dtype, non_blocking=True
+                )
+                self.rotary_emb.cos_sin_cache = cos_sin_cache
 
-        if self.v_scale is not None:
-            v = v * self.v_scale
+            q, k, v = mimo_v2_split_rope_vscale_kv_store(
+                positions,
+                qkv,
+                self.q_size,
+                self.k_size,
+                self.v_size,
+                cos_sin_cache,
+                head_dim=self.head_dim,
+                v_head_dim=self.v_head_dim,
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                kv_cache_loc=kv_cache_loc,
+                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                value_scale=self.v_scale if self.v_scale is not None else 1.0,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=self.attn.k_scale,
+                v_cache_scale=self.attn.v_scale,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+
+            # [t, h, dr]
+            q, k = self.rotary_emb(positions, q, k)
+            # [t, h, d]
+
+            if self.v_scale is not None:
+                v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output

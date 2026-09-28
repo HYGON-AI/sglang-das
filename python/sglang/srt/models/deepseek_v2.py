@@ -157,6 +157,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -523,6 +526,11 @@ class MoEGate(nn.Module):
         if get_exec().deterministic.enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
+        if self.weight.dtype == torch.float32:
+            # HYV4 keeps the router in fp32 (config.router_fp32): upcast the
+            # activations so the router GEMM runs entirely in fp32.
+            return F.linear(hidden_states.float(), self.weight)
+
         if (
             not self.is_deepseek_v4
             and forward_batch is not None
@@ -548,6 +556,16 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
+            elif (
+                _is_hcu
+                and self.is_deepseek_v4
+                and envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "auto"
+            ):
+                # Route auto before the broad AITER branch so HCU DSV4 router
+                # logits use the per-shape selector.
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+
+                logits = linear_bf16_fp32(hidden_states, self.weight)
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_hcu and self.is_deepseek_v4:
@@ -564,6 +582,37 @@ class MoEGate(nn.Module):
                 logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
+
+
+def _mega_moe_eager_body(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global,
+) -> torch.Tensor:
+    from sglang.srt.layers.moe.mega_moe import forward_mega_moe
+
+    return forward_mega_moe(
+        moe, hidden_states, forward_batch, input_ids_global=input_ids_global
+    )
+
+
+def _mega_moe_capture_stub(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global,
+) -> torch.Tensor:
+    # Capture pass only: record the bridge buffer's address and shape, skip the
+    # rank-coupled MegaMoE dispatch. Warmup and replay run the real body, which
+    # sees get_is_capture_mode() == False and therefore sizes its output by the
+    # live token count -- the shape this stub must match.
+    return torch.zeros_like(hidden_states)
+
+
+_bcg_forward_mega_moe = eager_on_graph(True, capture_stub=_mega_moe_capture_stub)(
+    _mega_moe_eager_body
+)
 
 
 class DeepseekV2MoE(nn.Module):
@@ -911,6 +960,17 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
+            if is_in_breakable_cuda_graph():
+                # MegaMoE drives rank-coupled symmetric-buffer collectives whose
+                # token count and expert routing change per batch, so capturing
+                # it bakes in one batch's dispatch (garbled replay output). Run
+                # it as an eager node, same as DeepEP NORMAL.
+                return _bcg_forward_mega_moe(
+                    self,
+                    hidden_states,
+                    forward_batch,
+                    input_ids_global,
+                )
             return forward_mega_moe(
                 self,
                 hidden_states,
@@ -2966,7 +3026,9 @@ class DeepseekV2Model(nn.Module):
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
-    packed_modules_mapping = {}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,

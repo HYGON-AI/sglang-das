@@ -579,7 +579,14 @@ def _compute_logical_to_all_physical_map(
     # without an a2a backend, where all EP ranks must agree on the pick: this
     # collapse is per-rank, and the full candidate list is what lets the dispatch
     # spread a hot expert over its replicas. See ExpertLocationDispatchInfo.
-    if moe_ep_rank is not None and get_exec().moe.moe_a2a_backend != "none":
+    # LP and locality_fair need the complete replica set. Collapsing it here
+    # makes LP probabilities ineffective and prevents fair source-rank choices.
+    if (
+        moe_ep_rank is not None
+        and get_exec().moe.moe_a2a_backend != "none"
+        and get_exec().moe.ep_dispatch_algorithm == "static"
+        and get_exec().moe.ep_static_dispatch_policy == "nearest"
+    ):
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         prefer_same_node = _prefer_same_node_experts()
         num_gpus_per_node = (

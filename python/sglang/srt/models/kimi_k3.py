@@ -28,6 +28,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import (
     k3_ar_fusion,
     k3_gemm_ar,
@@ -38,6 +40,8 @@ from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    attn_tp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_global_dp_buffer,
@@ -67,6 +71,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -130,7 +135,8 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-
+_k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
+_k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -152,6 +158,7 @@ _KIMI_K3_PACKED_MODULES_MAPPING: Dict[str, List[str]] = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
 }
+
 
 def kimi_k3_fuse_g_into_qkvg(quant_config: Optional[QuantizationConfig]) -> bool:
     """Whether full-rank KDA may fuse g into ``fused_qkvg_proj``.
@@ -318,6 +325,17 @@ class KimiK3MLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        # Opt-in K3 dense MLP: shard inside each attention-TP replica.
+        # Explicit TP overrides (e.g. shared experts) retain their own layout.
+        self._dense_attn_tp = (
+            _k3_dense_mlp_attn_tp
+            and is_dp_attention_enabled()
+            and tp_rank is None
+            and tp_size is None
+        )
+        if self._dense_attn_tp:
+            tp_rank = get_parallel().attn_tp_rank
+            tp_size = get_parallel().attn_tp_size
         _tp_kwargs = (
             dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
         )
@@ -335,6 +353,7 @@ class KimiK3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            use_dp_attention_reduce=self._dense_attn_tp,
             prefix=f"{prefix}.down_proj",
             **_tp_kwargs,
         )
@@ -359,7 +378,11 @@ class KimiK3MLP(nn.Module):
         # DP attention only when driven from the decoder layer (forward_batch
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
-        use_dp = self._dp_attention and forward_batch is not None
+        # Default is unchanged; attention-TP dense weights consume local DP rows.
+        use_dp = (
+            self._dp_attention and forward_batch is not None
+            and not self._dense_attn_tp
+        )
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
@@ -417,6 +440,17 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
+    def get_moe_weights(self):
+        # Resolve after loading, which replaces Parameters during packing.
+        return [
+            parameter.data
+            for name, parameter in self.experts.named_parameters()
+            if name != "correction_bias"
+            and filter_moe_weight_param_global_expert(
+                name, parameter, self.experts.num_local_experts
+            )
+        ]
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -464,7 +498,10 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=(
+                (getattr(config, "n_routed_experts", None) or config.num_experts)
+                + get_exec().moe.ep_num_redundant_experts
+            ),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -485,6 +522,7 @@ class KimiK3MoE(nn.Module):
         )
 
         self.topk = TopK(
+            layer_id=self.layer_idx,
             top_k=config.num_experts_per_token,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
@@ -557,7 +595,28 @@ class KimiK3MoE(nn.Module):
         # a2a: the block runs on partial batches (shard / DP-local rows), and
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
-        self._shared_experts_tp1 = self._ep_a2a
+        # Opt-in shared branch: gather/scatter only inside attention TP.
+        if _k3_shared_experts_attn_tp and not self._ep_a2a:
+            raise ValueError(
+                "K3 shared-experts attention TP requires EP A2A to be enabled."
+            )
+        self._shared_experts_attn_tp_comm = (
+            _k3_shared_experts_attn_tp
+            and self._ep_a2a
+            and self._dp_attention
+            and get_parallel().attn_tp_size > 1
+        )
+        self._shared_experts_tp1 = (
+            self._ep_a2a and not self._shared_experts_attn_tp_comm
+        )
+        shared_experts_tp_kwargs = {}
+        if self._shared_experts_tp1:
+            shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
+        elif self._shared_experts_attn_tp_comm:
+            shared_experts_tp_kwargs = dict(
+                tp_rank=get_parallel().attn_tp_rank,
+                tp_size=get_parallel().attn_tp_size,
+            )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiK3MLP(
@@ -569,7 +628,7 @@ class KimiK3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                **(dict(tp_rank=0, tp_size=1) if self._shared_experts_tp1 else {}),
+                **shared_experts_tp_kwargs,
             )
         else:
             self.shared_experts = None
@@ -589,6 +648,7 @@ class KimiK3MoE(nn.Module):
         # overlap than two streams.
         self._sbo_shared_overlap = (
             self._ep_a2a
+            and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
         )
@@ -602,6 +662,7 @@ class KimiK3MoE(nn.Module):
         # ModelSlim W4A8: latent 投影是量化的，必须带 quant_config。
         # MXFP4 / compressed-tensors: latent 投影是 bf16，必须 UnquantizedLinearMethod。
         from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+
         latent_quant_config = (
             quant_config if isinstance(quant_config, ModelSlimConfig) else None
         )
@@ -855,6 +916,9 @@ class KimiK3MoE(nn.Module):
         # select_experts' post-processing collapses to the capture hook and the
         # recorder -- both of which build_precomputed_topk_output runs. Bail out
         # if that ever stops holding rather than silently dropping the remap.
+        # Fused routing does not apply logical-to-physical expert remapping.
+        if get_exec().moe.ep_dispatch_algorithm is not None:
+            return False
         if not precomputed_topk_postprocess_is_noop(cfg):
             return False
         if get_exec().deterministic.enable_deterministic_inference:
@@ -944,7 +1008,13 @@ class KimiK3MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
@@ -962,6 +1032,18 @@ class KimiK3MoE(nn.Module):
         if not self._routed_needs_reduce:
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run TP-sharded shared experts and restore this rank's token rows."""
+        if not self._shared_experts_attn_tp_comm:
+            return self.shared_experts(hidden_states)
+        group = get_parallel().attn_tp_group
+        gathered_hidden_states = get_local_dp_buffer(group)
+        attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+        gathered_shared_output = self.shared_experts(gathered_hidden_states)
+        shared_output = torch.empty_like(hidden_states)
+        attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+        return shared_output
 
     def _forward_unfused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
@@ -987,10 +1069,10 @@ class KimiK3MoE(nn.Module):
             if self._sbo_shared_overlap:
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self.shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(hidden_states)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self.shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(hidden_states)
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -1007,7 +1089,13 @@ class KimiK3MoE(nn.Module):
             # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
 
         issue_shared()
 
@@ -1047,7 +1135,11 @@ class KimiK3MoE(nn.Module):
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
-            if self.tp_size > 1 and not self._shared_experts_tp1:
+            if (
+                self.tp_size > 1
+                and not self._shared_experts_tp1
+                and not self._shared_experts_attn_tp_comm
+            ):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
@@ -1094,7 +1186,13 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1110,7 +1208,13 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_idx
+                ),
+            )
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1727,6 +1831,7 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
+
             def _fused_qkv_and_g():
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 if self.fuse_g_into_qkvg:
@@ -2732,7 +2837,27 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
+
     packed_modules_mapping = _KIMI_K3_PACKED_MODULES_MAPPING
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=getattr(config, "n_routed_experts", None)
+            or config.num_experts,
+            num_groups=getattr(config, "n_group", None)
+            or getattr(config, "num_expert_group", None),
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(self.model.start_layer, self.model.end_layer)
+            if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)
+        }
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3163,6 +3288,18 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if name.startswith("language_model."):
             name = name[len("language_model.") :]
         return name.replace("block_sparse_moe", "mlp")
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        if self.language_model is None:
+            return {}
+        return self.language_model.routed_experts_weights_of_layer
 
     def __init__(
         self,

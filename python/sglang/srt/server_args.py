@@ -75,6 +75,7 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_media_url_security,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -262,7 +263,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
-    "hcu_mla"
+    "hcu_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -1197,6 +1198,11 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    enable_cp_cache_layer_split: A[
+        bool,
+        "Split DeepSeek V4 prefill KV and compressor-state layers across CP ranks (CUDA/HCU, interleave, Mooncake). Draft caches remain replicated.",
+        NS("parallel"),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -1272,6 +1278,11 @@ class ServerArgs:
     minimax_opt: A[
         bool,
         "Enable MiniMax M2 sequence-parallel prefill optimization over TP ranks.",
+        NS("parallel"),
+    ] = False
+    hy3_sp: A[
+        bool,
+        "Enable Hunyuan V3 sequence parallelism over TP ranks.",
         NS("parallel"),
     ] = False
     enable_p2p_check: A[
@@ -2108,6 +2119,22 @@ class ServerArgs:
         ),
         NS("exec.comm"),
     ] = False
+    custom_all_reduce_backend: A[
+        str,
+        Arg(
+            help=(
+                "Choose the custom all-reduce backend. "
+                "'auto' picks aiter on HIP/HCU when available otherwise the "
+                "native SGLang implementation; 'native' forces the SGLang "
+                "kernel; 'aiter' forces the Hygon/HCU aiter kernel and, when "
+                "AITER_AR_TRANSPORT=fabric, fails hard rather than silently "
+                "falling back; 'off' disables custom all-reduce entirely. "
+                "--disable-custom-all-reduce overrides this and forces 'off'."
+            ),
+            choices=["auto", "native", "aiter", "off"],
+        ),
+        NS("exec.comm"),
+    ] = "auto"
     enable_mscclpp: A[
         bool,
         "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
@@ -2216,6 +2243,16 @@ class ServerArgs:
         "The number of tokens sampled from the draft model in eagle2 each step.",
         NS("spec"),
     ] = None
+    speculative_draft_lm_head_vp_size: A[
+        int,
+        Arg(
+            help="Node-local vocabulary parallel group size for EAGLE draft decode "
+            "LM-head top-1. Requires DP attention, DP LM head, and eagle topk=1. "
+            "Use 1 to disable; target verify and draft extend keep their existing paths.",
+            choices=[1, 4, 8, 16],
+        ),
+        NS("spec"),
+    ] = 1
     speculative_num_draft_tokens: A[
         Optional[int],
         "The number of tokens sampled from the draft model in Speculative Decoding.",
@@ -2893,6 +2930,35 @@ class ServerArgs:
         NS("memory"),
     ] = None
 
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+        NS("memory"),
+    ] = 10
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+        NS("memory"),
+    ] = False
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
@@ -5708,6 +5774,10 @@ class ServerArgs:
                     "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
                 )
 
+        if self.enable_cp_cache_layer_split:
+            if model_arch != "DeepseekV4ForCausalLM":
+                raise ValueError("--enable-cp-cache-layer-split requires DeepSeek V4")
+
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
                 "--enable-dsa-cache-layer-split is only supported for DSA "
@@ -5726,6 +5796,28 @@ class ServerArgs:
                     f"(attn_tp_size=1). Got {model_arch}; supported: "
                     f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
                 )
+
+        if self.hy3_sp:
+            if model_arch != "HYV3ForCausalLM":
+                raise ValueError(
+                    "--hy3-sp is only supported for HYV3ForCausalLM, "
+                    f"but the loaded architecture is {model_arch}."
+                )
+            if self.dp_size != 1 or self.enable_dp_attention:
+                raise ValueError(
+                    "--hy3-sp requires pure tensor parallelism: set --dp-size 1 "
+                    "and remove --enable-dp-attention."
+                )
+            if self.pp_size != 1:
+                raise ValueError("--hy3-sp does not support pipeline parallelism.")
+            if self.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "--hy3-sp requires --moe-a2a-backend deepep so routed experts "
+                    "can process sequence-sharded tokens."
+                )
+            if self.moe_dense_tp_size not in (None, 1):
+                raise ValueError("--hy3-sp requires --moe-dense-tp-size 1.")
+            self.moe_dense_tp_size = 1
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
@@ -5932,15 +6024,9 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
-                if is_deepseek_dsa(hf_config):
-                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
-                    # CUDA/Hopper-only path: its JIT source includes
-                    # <cooperative_groups.h> and uses cg::this_cluster()
-                    # (thread-block clusters), neither of which exists on ROCm,
-                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                    # here for the rest of the DSA family (DeepSeek-V3.2 /
-                    # GLM-5.x) that shares the same decode top-k path.
+                if is_deepseek_dsa(hf_config) and not is_hcu():
+                    # Generic ROCm keeps the registered top-k path; HCU uses
+                    # the HIP-compatible non-cluster TopK v2 implementation.
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
@@ -5969,6 +6055,12 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
+            if self.enable_cp_cache_layer_split:
+                from sglang.srt.mem_cache.cp_cache_layer_split.validation import (
+                    validate_cp_cache_layer_split,
+                )
+
+                validate_cp_cache_layer_split(self, hf_config)
 
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
@@ -5990,7 +6082,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                if not is_hcu():
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
@@ -6369,6 +6462,10 @@ class ServerArgs:
                 if model_config.has_asymmetric_kv:
                     return "fa4"
                 return "trtllm_mha"
+            elif is_hcu():
+                # HCU is detected as HIP at the PyTorch level, but it uses its
+                # own kernels (LightOp/flashattention) rather than aiter.
+                return "fa3"
             elif is_hip():
                 return "aiter"
             elif is_mps():
@@ -6384,6 +6481,10 @@ class ServerArgs:
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
+            elif is_hcu():
+                # HCU is detected as HIP at the PyTorch level, but it uses its
+                # own MLA kernels rather than aiter.
+                return "hcu_mla"
             elif is_hip():
                 head_num = model_config.get_num_kv_heads(self.tp_size)
                 # TODO current aiter only support head number 16 or 128 head number
@@ -8010,6 +8111,19 @@ class ServerArgs:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
+        if self.enable_unified_cache_external_linker:
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-unified-cache-external-linker and "
+                    "--enable-hierarchical-cache are mutually exclusive."
+                )
+            if self.hicache_storage_backend is not None:
+                raise ValueError(
+                    "--enable-unified-cache-external-linker does not use "
+                    "--hicache-storage-backend."
+                )
+            return
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -8794,6 +8908,32 @@ class ServerArgs:
         )
         if self.enable_deterministic_inference:
             envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+        # Normalize custom_all_reduce_backend: --disable-custom-all-reduce wins,
+        # else on HIP with legacy SGLANG_USE_AITER_AR=1 promote auto -> aiter.
+        if self.disable_custom_all_reduce:
+            if self.custom_all_reduce_backend != "off":
+                logger.info(
+                    "--disable-custom-all-reduce overrides "
+                    "--custom-all-reduce-backend=%s to 'off'.",
+                    self.custom_all_reduce_backend,
+                )
+            self._declare(
+                "_handle_environment_variables",
+                custom_all_reduce_backend="off",
+            )
+        elif (
+            self.custom_all_reduce_backend == "auto"
+            and is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_AR", default="false")
+        ):
+            logger.info(
+                "Promoting custom_all_reduce_backend from 'auto' to 'aiter' "
+                "because SGLANG_USE_AITER_AR=1 is set on HIP."
+            )
+            self._declare(
+                "_handle_environment_variables",
+                custom_all_reduce_backend="aiter",
+            )
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
@@ -8868,6 +9008,12 @@ class ServerArgs:
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if self.enable_unified_cache_external_linker and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
@@ -9955,13 +10101,12 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert self.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
+            assert (
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
             pp_dspark_prefill = (
-                (self.speculative_algorithm or "").upper() == "DSPARK"
-                and self.disaggregation_mode == "prefill"
-            )
+                self.speculative_algorithm or ""
+            ).upper() == "DSPARK" and self.disaggregation_mode == "prefill"
             assert self.speculative_algorithm is None or pp_dspark_prefill, (
                 "Pipeline parallelism with speculative decoding is only supported "
                 "for DSPARK on a PD prefill server"

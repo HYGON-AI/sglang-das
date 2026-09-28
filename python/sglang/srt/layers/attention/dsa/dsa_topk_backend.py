@@ -6,8 +6,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hcu
+from sglang.srt.utils import is_hip, is_hcu
 
+_is_hip = is_hip()
 _is_hcu = is_hcu()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
@@ -38,7 +39,14 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        # The HIP implementation is intentionally limited to HCU: generic
+        # ROCm devices retain the registered top-k path until they have a
+        # validated JIT implementation.
+        return (
+            self.is_sgl_kernel()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and (not _is_hip or _is_hcu)
+        )
 
     def topk_func(
         self,

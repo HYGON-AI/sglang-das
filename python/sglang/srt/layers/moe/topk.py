@@ -97,6 +97,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.ep_balance import make_ep_balanced_expert_ids
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
@@ -136,8 +137,8 @@ _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_lightop_topk_ids_postprocess = get_bool_env_var(
     "SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS", "false"
 )
-simulated_expert_balance = get_bool_env_var("SGLANG_SIMULATED_EXPERT_BALANCE")
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
+_simulated_expert_balance = envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -554,6 +555,23 @@ class TopK(BaseFusedOp):
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
+        if _simulated_expert_balance:
+            from sglang.srt.server_args import get_global_server_args
+
+            try:
+                server_args = get_global_server_args()
+            except ValueError:
+                # Isolated tests may construct TopK before publishing server args.
+                server_args = None
+            if server_args is not None and server_args.ep_num_redundant_experts != 0:
+                raise ValueError(
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with "
+                    "redundant physical experts"
+                )
+            if self.enable_waterfill:
+                raise ValueError(
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with " "waterfill"
+                )
 
         self.waterfill_balancer = None
         if self.enable_waterfill:
@@ -655,6 +673,12 @@ class TopK(BaseFusedOp):
         else:
             output_format = TopKOutputFormat.STANDARD
 
+        if _simulated_expert_balance and output_format != TopKOutputFormat.STANDARD:
+            raise ValueError(
+                "SGLANG_SIMULATED_EXPERT_BALANCE only supports STANDARD TopK "
+                f"output, got {output_format.name}"
+            )
+
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             (
@@ -724,6 +748,12 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+
+        if _simulated_expert_balance:
+            raise ValueError(
+                "SGLANG_SIMULATED_EXPERT_BALANCE does not support the "
+                "NPU-specific TopK path"
+            )
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
@@ -2371,6 +2401,26 @@ def _post_process_topk_ids(
             # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
             # the post-shared-expert mask below for the explicitly forced fused
             # shared-expert configuration.
+            if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
+                # LP dispatch uses a separate HIP kernel. Resolve probabilities
+                # before entering the compiled padding/dtype postprocess.
+                from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+                solver = get_global_lplb_solver(layer_id)
+                if solver is None:
+                    raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
+                probabilities = solver.solve(topk_ids)
+                if hasattr(solver, "static_dispatch_map"):
+                    from sglang.kernels.ops.lplb import cuda_solver
+
+                    topk_ids = cuda_solver.dispatch_probability(
+                        topk_ids, probabilities, solver.static_dispatch_map
+                    )
+                else:
+                    topk_ids = topk_ids_logical_to_physical(
+                        topk_ids, remap_info, probabilities
+                    )
+                remap_info = None  # IDs are physical; do not remap a second time.
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,
                 remap_info,
@@ -2521,6 +2571,12 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
+    if _simulated_expert_balance and expert_location_dispatch_info is not None:
+        raise ValueError(
+            "SGLANG_SIMULATED_EXPERT_BALANCE requires contiguous expert "
+            "placement and cannot be used with EPLB"
+        )
+
     # Set by the fused-gating+pack branch below; None everywhere else.
     packed_topk = None
 
@@ -2650,6 +2706,7 @@ def select_experts(
                 and correction_bias is None
                 and expert_location_dispatch_info is None
                 and num_fused_shared_experts == 0
+                and not _simulated_expert_balance
                 and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
                 and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
             ):
@@ -2710,13 +2767,47 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if _simulated_expert_balance and (
+        simulate_uniform_experts or simulate_round_robin_experts
+    ):
+        raise ValueError(
+            "SGLANG_SIMULATED_EXPERT_BALANCE cannot be combined with "
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS or "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+        )
     if simulate_uniform_experts and simulate_round_robin_experts:
         raise ValueError(
             "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
         )
 
-    if simulate_uniform_experts:
+    if _simulated_expert_balance:
+        if topk_ids.shape[1] < num_routed_topk:
+            raise ValueError(
+                f"Top-k output has {topk_ids.shape[1]} columns, but "
+                f"{num_routed_topk} routed expert columns are required"
+            )
+
+        num_tokens = topk_ids.shape[0]
+        parallel = get_parallel()
+        balanced_routed_ids = make_ep_balanced_expert_ids(
+            num_tokens,
+            num_routed_topk,
+            router_logits.shape[1],
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+            device=topk_ids.device,
+            dtype=topk_ids.dtype,
+            layer_id=layer_id,
+        )
+        if topk_ids.shape[1] == num_routed_topk:
+            topk_ids = balanced_routed_ids
+        else:
+            # Keep fused shared-expert columns, if this backend appended them.
+            topk_ids = torch.cat(
+                (balanced_routed_ids, topk_ids[:, num_routed_topk:]), dim=1
+            )
+    elif simulate_uniform_experts:
         # Benchmark-only: override gating with random-offset uniform expert assignment
         # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
         num_tokens, k = topk_ids.shape
@@ -2809,6 +2900,7 @@ def precomputed_topk_postprocess_is_noop(
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        and not envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
     )
 
 

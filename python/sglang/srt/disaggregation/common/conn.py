@@ -151,6 +151,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    cp_cache_layer_split: bool = False
     kv_cache_layout: Optional[str] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -205,6 +206,7 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.cp_cache_layer_split = bool(getattr(args, "cp_cache_layer_split", False))
         self.kv_cache_layout = getattr(args, "kv_cache_layout", None)
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
@@ -245,6 +247,7 @@ class CommonKVManager(BaseKVManager):
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
+            or self.cp_cache_layer_split
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -741,7 +744,10 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --page-size value."
             )
 
-        if info.kv_cache_layout != self.kv_cache_layout:
+        if (
+            info.kv_cache_layout is not None
+            and info.kv_cache_layout != self.kv_cache_layout
+        ):
             raise RuntimeError(
                 f"KV cache layout mismatch: prefill server has kv_cache_layout={info.kv_cache_layout}, "
                 f"but decode server has kv_cache_layout={self.kv_cache_layout}."
@@ -831,6 +837,7 @@ class CommonKVManager(BaseKVManager):
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
                 or info.enable_dsa_cache_layer_split
+                or info.cp_cache_layer_split
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
@@ -921,6 +928,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "cp_cache_layer_split": self.cp_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1687,6 +1695,7 @@ class CommonKVSender(BaseKVSender):
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not get_parallel().enable_dsa_cache_layer_split
+            and not getattr(self.kv_mgr, "cp_cache_layer_split", False)
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
@@ -2055,8 +2064,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.kv_cache_layout: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.cp_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2124,6 +2135,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        kv_cache_layout = data.get("kv_cache_layout")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -2144,6 +2156,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
 
+        if self.kv_cache_layout is None and kv_cache_layout is not None:
+            self.kv_cache_layout = kv_cache_layout
+
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
 
@@ -2153,6 +2168,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
+        if self.cp_cache_layer_split is None:
+            self.cp_cache_layer_split = bool(data.get("cp_cache_layer_split", False))
         if self.enable_dsa_cache_layer_split is None:
             self.enable_dsa_cache_layer_split = bool(
                 data.get("enable_dsa_cache_layer_split", False)
@@ -2216,12 +2233,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_layout=self.kv_cache_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                cp_cache_layer_split=bool(self.cp_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)

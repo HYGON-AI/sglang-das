@@ -13,6 +13,7 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -53,7 +54,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
-        self._mtp_input_fusion = self._init_mtp_input_fusion(config)
+        self._mtp_input_fusion = self._init_mtp_input_fusion(config, prefix)
 
         self.model = Qwen4ExpModel(
             config,
@@ -81,33 +82,61 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         )
         self.pre_fc_norm_hidden = GemmaRMSNorm(hidden_norm_size, eps=config.rms_norm_eps)
 
-    def _init_linear_projections(self, config: PretrainedConfig) -> None:
-        self.fc_embedding = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.fc_hidden = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+    def _init_linear_projections(
+        self, config: PretrainedConfig, prefix: str
+    ) -> None:
+        # These projections are quantized in INT8-w8a8-ngram checkpoints.
+        # Building plain nn.Linear modules silently copies the raw int8 values
+        # into BF16 weights and drops their weight_scale tensors in load_weights.
+        self.fc_embedding = ReplicatedLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=add_prefix("mtp.fc_embedding", prefix),
+        )
+        self.fc_hidden = ReplicatedLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=add_prefix("mtp.fc_hidden", prefix),
+        )
 
-    def _init_standard_fusion(self, config: PretrainedConfig):
+    def _init_standard_fusion(self, config: PretrainedConfig, prefix: str):
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self._init_pre_fc_norms(config)
         return self._fuse_standard
 
-    def _init_mtp_input_fusion(self, config: PretrainedConfig):
+    def _init_mtp_input_fusion(self, config: PretrainedConfig, prefix: str):
         if self.hc_count <= 1:
-            return self._init_standard_fusion(config)
+            return self._init_standard_fusion(config, prefix)
 
-        self._init_linear_projections(config)
+        self._init_linear_projections(config, prefix)
         self._init_pre_fc_norms(config)
         return self._fuse_residual_linear_shared
 
     def _fuse_residual_linear_shared(
         self, input_embeds: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
+        input_embeds, _ = self.fc_embedding(
+            self.pre_fc_norm_embedding(input_embeds)
+        )
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         decoder_view = hidden_states.view(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
-        encoder_inputs = self.fc_hidden(decoder_view)
+        # Quantized Linear backends are not required to preserve arbitrary
+        # leading dimensions.  In particular, the HCU hipBLASLt W8A8 wrapper
+        # takes ``shape[-2]`` as GEMM M, so passing [tokens, hc_count, hidden]
+        # would only project one hc_count-wide slice and then broadcast it over
+        # tokens.  Flatten every logical row explicitly and restore the HC
+        # layout after the projection.
+        encoder_inputs, _ = self.fc_hidden(
+            decoder_view.reshape(-1, self.hidden_size)
+        )
+        encoder_inputs = encoder_inputs.view_as(decoder_view)
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
     def _fuse_standard(

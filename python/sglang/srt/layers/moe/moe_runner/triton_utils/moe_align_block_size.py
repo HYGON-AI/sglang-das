@@ -37,6 +37,13 @@ if _is_cuda or _is_hip or _is_xpu or _is_musa:
 if _is_hcu:
     from lightop import op
 
+    # New LightOp exposes the output-buffer wrapper in its public MoE API.
+    # Keep the legacy binding when present; the native argument order is unchanged.
+    if hasattr(op, "moe_align_block_size_out"):
+        _hcu_moe_align_block_size_out = op.moe_align_block_size_out
+    else:
+        from lightop.moe import moe_align_block_size_out as _hcu_moe_align_block_size_out
+
 if _is_cuda:
     from sglang.kernels.ops.moe.moe_align_small_numel import (
         SMALL_NUMEL_LIMIT,
@@ -415,7 +422,7 @@ def hcu_moe_align_block_size(
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
     if expert_mask is not None:
-        op.moe_align_block_size_out(
+        _hcu_moe_align_block_size_out(
             topk_ids,
             num_experts,
             block_size,
@@ -429,7 +436,7 @@ def hcu_moe_align_block_size(
             is_fuse_fill=True,
         )
     else:
-        op.moe_align_block_size_out(
+        _hcu_moe_align_block_size_out(
             topk_ids,
             num_experts,
             block_size,

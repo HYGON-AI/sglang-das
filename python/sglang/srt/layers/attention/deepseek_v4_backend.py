@@ -92,6 +92,11 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    cp_cache_layer_split_resolve_store_swa_loc,
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prepare_cp_cache_layer_split_forward,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -852,6 +857,12 @@ class DeepseekV4AttnBackend(
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
 
+        # BCG replay restores the captured out_cache_loc length, so the global
+        # (compressor write) fields must be sized by it rather than the live rows.
+        num_write_tokens = (
+            out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
+        )
+
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -871,10 +882,10 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
             dspark_block_size=dspark_block_size,
-            num_tokens=num_tokens if cp_v2_active else None,
+            num_tokens=num_write_tokens if cp_v2_active else None,
         )
         if cp_v2_active:
-            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            core_attn_metadata.apply_cp_reindex(num_tokens=num_write_tokens)
             core_attn_metadata.init_flashmla_related(is_prefill=True)
         indexer_metadata = (
             self.init_forward_metadata_indexer(
@@ -1456,6 +1467,7 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
+        maybe_prepare_cp_cache_layer_split_forward(self.token_to_kv_pool, forward_batch)
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
@@ -1480,6 +1492,13 @@ class DeepseekV4AttnBackend(
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         if max_seq_len_override is not None:
             max_seq_len = max_seq_len_override
+            if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                actual_max_seq_len = int(seq_lens_cpu.max().item())
+                if actual_max_seq_len > max_seq_len:
+                    raise ValueError(
+                        "Prefill CUDA graph max context size is smaller than the "
+                        f"live context: {max_seq_len=} < {actual_max_seq_len=}"
+                    )
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
@@ -1570,9 +1589,13 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        max_seq_len = (
+            getattr(forward_batch, "max_seq_len_override", None)
+            or self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         return self.forward_metadata
@@ -1587,9 +1610,16 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
+        metadata_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        max_seq_len = (
+            getattr(metadata_batch, "max_seq_len_override", None)
+            or self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
         static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            metadata_batch,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
@@ -1713,10 +1743,113 @@ class DeepseekV4AttnBackend(
             torch.int32
         )
 
+    def get_swa_out_cache_loc_cp_rank_major(
+        self, layer_id: int, forward_batch: ForwardBatch, cp_size: int, raw_kv: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Return paired destinations for an unpadded HCU LayerSplit gather.
+
+        Ordinary paged prefill allocates distinct real SWA locations. Whole-row
+        permutation then preserves the existing per-token quantization exactly.
+        Padded, speculative, ring, graph and unknown layouts keep the old path.
+        Never mutate the globally ordered locations used by other consumers.
+        """
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+        from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+            effective_forward_mode,
+        )
+        from sglang.srt.layers.attention.dsa.utils import (
+            dsa_use_prefill_cp,
+            is_dsa_prefill_cp_round_robin_split,
+        )
+        from sglang.srt.layers.cp.utils import enable_cp_v2
+        from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+            CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4SingleKVPool,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+        from sglang.srt.utils import is_hcu
+
+        pool = self.token_to_kv_pool
+        if (
+            not is_hcu()
+            or not isinstance(pool, CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+            or is_unified_kv_triton()
+            or getattr(pool, "_unified_kv", True)
+            or type(pool.swa_kv_pool) is not DeepSeekV4SingleKVPool
+            or pool.is_bf16_attention_kv_cache
+            or not envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or effective_forward_mode(forward_batch) != ForwardMode.EXTEND
+            or not dsa_use_prefill_cp(forward_batch)
+            or not is_dsa_prefill_cp_round_robin_split()
+            or enable_cp_v2()
+            or get_is_capture_mode()
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            or getattr(forward_batch, "tbo_children", None)
+            or cp_size <= 1
+            or cp_size != pool.cp_size
+            or raw_kv.ndim != 2
+            or raw_kv.shape[1] != 512
+            or raw_kv.dtype != torch.bfloat16
+            or not raw_kv.is_contiguous()
+        ):
+            return None
+        num_tokens = raw_kv.shape[0]
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        out_loc = forward_batch.out_cache_loc
+        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        if (
+            num_tokens == 0
+            or num_tokens % cp_size != 0
+            or not isinstance(extend_lens, (list, tuple))
+            or not all(isinstance(n, int) and n >= 0 for n in extend_lens)
+            or sum(extend_lens) != num_tokens
+            or not isinstance(core, DSV4AttnMetadata)
+            or not isinstance(out_loc, torch.Tensor)
+            or out_loc.ndim != 1
+            or out_loc.shape[0] != num_tokens
+            or out_loc.device != raw_kv.device
+        ):
+            return None
+        if pool.should_skip_swa_write(layer_id):
+            # Empty view marks an eligible non-owner without translating or
+            # permuting locations. The pool setter checks ownership before
+            # reading this marker; the helper still waits, records and prefetches.
+            # None is reserved for the unchanged full-KV fallback.
+            return out_loc[:0]
+        # Match the LayerSplit branch in store_cache: its global-length fast
+        # path translates out_cache_loc directly, without using cached metadata
+        # locations or any additional all-gather.
+        swa_loc = pool.translate_loc_from_full_to_swa(out_loc).to(torch.int32)
+        if (
+            swa_loc.ndim != 1
+            or swa_loc.shape[0] != num_tokens
+            or swa_loc.device != raw_kv.device
+            or swa_loc.dtype not in (torch.int32, torch.int64)
+            or not swa_loc.is_contiguous()
+        ):
+            return None
+        return swa_loc.view(-1, cp_size).transpose(0, 1).reshape(num_tokens)
+
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        pool = self.token_to_kv_pool
+        if is_cp_cache_layer_split_deepseek_v4_pool(pool):
+            swa_loc = cp_cache_layer_split_resolve_store_swa_loc(
+                pool, layer_id, forward_batch, forward_batch.out_cache_loc,
+                swa_k.shape[0],
+            )
+            if swa_loc is None:
+                return
+        else:
+            swa_loc = self.get_swa_out_cache_loc(forward_batch)
         if self.token_to_kv_pool.is_bf16_attention_kv_cache or (
             envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
         ):
@@ -2171,7 +2304,12 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-
+        is_cp_cache_layer_split = is_cp_cache_layer_split_deepseek_v4_pool(
+            token_to_kv_pool
+        )
+        use_cp_cache_layer_split_prefill = (
+            is_cp_cache_layer_split and dsa_use_prefill_cp(forward_batch)
+        )
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
@@ -2209,6 +2347,14 @@ class DeepseekV4AttnBackend(
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+            if use_cp_cache_layer_split_prefill:
+                swa_page_indices = token_to_kv_pool.remap_swa_indices_for_read(
+                    layer_id, swa_page_indices
+                )
+                if extra_indices is not None:
+                    extra_indices = token_to_kv_pool.remap_extra_indices_for_read(
+                        layer_id, extra_indices
+                    )
 
             def match_num_queries(x, value):
                 if x is None or x.shape[0] == q.shape[0]:
@@ -2510,19 +2656,47 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+        swa_token_ids = cache.swa_token_ids
+        if is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool):
+            swa_token_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                layer_id, swa_token_ids, family="swa"
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+            if flat_token_ids is not None:
+                flat_token_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                    layer_id, flat_token_ids, family="extra"
+                )
+
+        if envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get():
+            from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
+
+            # Match the original wrapper's byte view; keep the caller's slices.
+            if compressed_slice is not None:
+                dsv4_dequantize_k_cache_paged_out(
+                    extra_k_cache.view(torch.uint8),
+                    flat_token_ids,
+                    compressed_slice,
+                    extra_page_size,
+                )
+            dsv4_dequantize_k_cache_paged_out(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id).view(torch.uint8),
+                swa_token_ids,
+                swa_slice,
+                cache.swa_page_size,
+            )
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(

@@ -3843,7 +3843,11 @@ def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer(server_args) or server_args.minimax_opt:
+    if (
+        require_gathered_buffer(server_args)
+        or server_args.minimax_opt
+        or server_args.hy3_sp
+    ):
         alignment *= get_parallel().attn_tp_size
     if alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size

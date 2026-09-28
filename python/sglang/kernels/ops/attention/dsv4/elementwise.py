@@ -99,6 +99,19 @@ def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
 
 
 @cache_once
+def _jit_main_q_indexer_rope_hadamard_module(dtype: torch.dtype):
+    args = make_cpp_args(dtype, is_arch_support_pdl(), False, True, False)
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_bf16"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
@@ -157,6 +170,37 @@ def fused_q_norm_rope(
     else:
         module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
         module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
+def fused_q_indexer_rope_hadamard(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return BF16 C4 Q and FP32 head weights without Q quantization.
+
+    RoPE and normalized Hadamard retain the FP32 arithmetic of the FP8
+    kernel. Only the output changes: BF16 Q and weight * weight_scale.
+    """
+    if q_input.dtype != torch.bfloat16:
+        raise ValueError("unquantized C4 indexer Q requires BF16 input")
+    q_output = torch.empty_like(q_input, memory_format=torch.contiguous_format)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_module(q_input.dtype)
+    module.forward(
+        q_input,
+        q_output,
+        weight,
+        weights_out,
+        float(weight_scale),
+        torch.view_as_real(freqs_cis).flatten(-2),
+        positions,
+    )
+    return q_output, weights_out
 
 
 def fused_q_indexer_rope_hadamard_quant(

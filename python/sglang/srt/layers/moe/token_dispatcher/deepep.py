@@ -52,11 +52,13 @@ from sglang.srt.utils import (
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
+    is_hcu,
     is_hip,
     is_npu,
     load_json_config,
 )
 
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
@@ -274,8 +276,7 @@ class DeepEPBuffer:
                     "Target and speculative DeepEP cannot create independent "
                     "low-latency buffers in one process. Make their DeepEP "
                     "layouts compatible or use a non-DeepEP speculative MoE "
-                    "backend. Incompatibilities: "
-                    + "; ".join(incompatible)
+                    "backend. Incompatibilities: " + "; ".join(incompatible)
                 )
             return state.buffer
 

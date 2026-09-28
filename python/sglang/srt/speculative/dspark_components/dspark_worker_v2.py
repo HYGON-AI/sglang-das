@@ -819,6 +819,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         pp_proxy_tensors,
         capture_hidden_mode: CaptureHiddenMode,
     ) -> GenerationBatchResult:
+        expert_distribution_metrics = None
         if get_parallel().enable_dp_attention:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -827,7 +828,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if self._is_context_only_pp_prefill_rank:
                 return batch_output
-        return self._decode_idle_result(on_publish=on_publish)
+            expert_distribution_metrics = batch_output.expert_distribution_metrics
+        return self._decode_idle_result(
+            on_publish=on_publish,
+            expert_distribution_metrics=expert_distribution_metrics,
+        )
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
@@ -882,6 +887,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         *,
         on_publish,
+        expert_distribution_metrics=None,
     ) -> GenerationBatchResult:
         next_draft_input = make_next_draft_input(
             bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
@@ -890,6 +896,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(next_draft_input.new_seq_lens)
         return GenerationBatchResult(
+            expert_distribution_metrics=expert_distribution_metrics,
             logits_output=None,
             next_token_ids=torch.empty((0,), dtype=torch.int64, device=self.device),
             accept_lens=torch.empty((0,), dtype=torch.int32, device=self.device),
@@ -913,14 +920,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
+            expert_distribution_metrics = None
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
                     with self._draft_context():
                         self._proposer.run_idle_participation(batch)
-                self._verify_executor.run_idle_participation(
+                target_verify = self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
-            return self._decode_idle_result(on_publish=on_publish)
+                expert_distribution_metrics = target_verify.expert_distribution_metrics
+            return self._decode_idle_result(
+                on_publish=on_publish,
+                expert_distribution_metrics=expert_distribution_metrics,
+            )
 
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -1126,6 +1138,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
         return GenerationBatchResult(
+            expert_distribution_metrics=target_verify.expert_distribution_metrics,
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,

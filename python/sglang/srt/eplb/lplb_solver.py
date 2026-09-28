@@ -2,7 +2,8 @@
 LPLBSolver — Linear-Programming Load Balancer for Expert Parallelism.
 
 Encapsulates LP matrix construction (offline, at init/rebalance) and
-per-batch solving (online, per MoE layer forward pass).
+per-batch solving (online, per MoE layer forward pass). Alternatively,
+precomputed probabilities bypass both counting and solving at runtime.
 
 Design for DP-attention:
     Each EP rank counts its local tokens, then all ranks participate in an
@@ -91,6 +92,8 @@ class LPLBSolver:
         num_gpus: int,
         ep_group=None,
         logical_to_all_physical_map_num_valid=None,
+        static_probabilities: Optional[torch.Tensor] = None,
+        static_max_copies: Optional[int] = None,
     ):
         """
         Args:
@@ -99,7 +102,26 @@ class LPLBSolver:
             num_gpus: Number of GPUs in the EP group.
             ep_group: GroupCoordinator for EP communication (all-reduce).
             logical_to_all_physical_map_num_valid: (num_logical_experts,) number of valid physical copies.
+            static_probabilities: Optional precomputed replica weights for this layout.
+            static_max_copies: Compact width retaining every valid replica.
         """
+        self._static_probabilities = static_probabilities
+        if static_probabilities is not None:
+            if static_probabilities.shape != log2phy.shape:
+                raise ValueError("Static LP probabilities must match the replica map")
+            if static_probabilities.device != phy2log.device:
+                raise ValueError("Static LP probabilities must be on the expert device")
+            width = static_max_copies or log2phy.shape[1]
+            if not 0 < width <= log2phy.shape[1]:
+                raise ValueError("Invalid compact LP replica width")
+            if bool((log2phy[:, width:] >= 0).any()):
+                raise ValueError("Compact LP table would drop valid replicas")
+            self._static_probabilities = static_probabilities[:, :width].contiguous()
+            # Metadata pads every row to all physical experts. Keep the LP
+            # dispatch table compact and convert its index dtype once at init.
+            self.static_dispatch_map = log2phy[:, :width].to(torch.int32).contiguous()
+            return
+
         device = phy2log.device
         self.num_gpus = num_gpus
         self.ep_group = ep_group
@@ -222,6 +244,9 @@ class LPLBSolver:
         Returns:
             log2phy_prob: (num_logical, max_copies) float32 probability tensor.
         """
+        if self._static_probabilities is not None:
+            return self._static_probabilities
+
         device = topk_ids.device
 
         # Step 1: Count local tokens per logical expert.

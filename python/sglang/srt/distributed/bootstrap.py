@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_custom_all_reduce_backend,
     set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
@@ -35,6 +36,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_hcu,
     is_hip,
     is_host_cpu_arm64,
     is_npu,
@@ -189,6 +191,7 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
 
 def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
+    set_custom_all_reduce_backend(get_exec().comm.custom_all_reduce_backend)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
     set_flashinfer_allreduce_only(
@@ -260,7 +263,10 @@ def _init_parallel_groups(
         duplicate_tp_group=server_args.enable_pdmux,
         duplicate_attn_cp_group=(
             is_hip()
-            and server_args.enable_two_batch_overlap
+            and (
+                server_args.enable_two_batch_overlap
+                or (is_hcu() and server_args.enable_cp_cache_layer_split)
+            )
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,

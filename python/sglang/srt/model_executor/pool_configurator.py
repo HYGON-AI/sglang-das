@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_hcu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -213,7 +214,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    self._cell_size += draft_kv_size + draft_indexer_size
+                    if (
+                        kvc.server_args.enable_dsa_cache_layer_split
+                        and kvc.server_args.disaggregation_mode == "prefill"
+                        and is_hcu()
+                        and kvc.ps.pp_size == 1
+                        and get_parallel().attn_cp_size > 1
+                        and kvc.spec_algorithm.is_eagle()
+                        and not kvc.spec_algorithm.is_eagle3()
+                        and not kvc.server_args.enable_multi_layer_eagle
+                        and draft_num_layers == 1
+                        and kvc.model_config.num_nextn_predict_layers == 1
+                        and kvc.use_mla_backend
+                        and not get_memory().enable_hisparse
+                    ):
+                        self._cell_size = self._compute_dsa_layer_split_draft_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                            main_kv_bytes_per_layer=target_kv_size
+                            // target_kv_num_layers,
+                        )
+                    else:
+                        self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
@@ -405,6 +427,40 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim=qsa_profile.head_dim,
             num_layers=num_layers,
         )
+
+    @staticmethod
+    def _compute_dsa_layer_split_draft_cell_size(
+        *, kvc: KVCacheConfigurator, num_layers: int, main_kv_bytes_per_layer: int
+    ) -> int:
+        """Worst-rank bytes/token for a target and its single sharded NextN."""
+        from sglang.srt.layers.cp.utils import get_layer_shard_range
+
+        shard_size = get_parallel().attn_cp_size
+        cache_mode = resolve_index_k_cache_mode(
+            kvc.kv_cache_dtype,
+            kvc.page_size,
+            get_dsa_index_head_dim(kvc.model_config.hf_config),
+        )
+        index_bytes = index_k_cache_bytes_per_token(cache_mode)
+        # Each pool has its own INT8 workspace, irrespective of layer ownership.
+        workspace_bytes = 2 * index_k_workspace_bytes_per_token(cache_mode)
+        rank_costs = []
+        for rank in range(shard_size):
+            start, end = get_layer_shard_range(rank, shard_size, num_layers)
+            draft_start, draft_end = get_layer_shard_range(
+                (rank - (shard_size - 1)) % shard_size, shard_size, 1
+            )
+            owned = end - start + draft_end - draft_start
+            # PD allocates dense Index-K storage even for skip-topk layers.
+            # Main-KV shares one target scratch; Index-K has two independent
+            # scratches. Take the maximum combined cost, not separate maxima
+            # for target and draft, whose heaviest ranks can differ.
+            rank_costs.append(
+                (owned + 1) * main_kv_bytes_per_layer
+                + (owned + 2) * index_bytes
+                + workspace_bytes
+            )
+        return math.ceil(max(rank_costs))
 
     def _compute_dsa_indexer_cell_size(
         self,
@@ -829,6 +885,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.context_len = kvc.model_config.context_len
+        self.use_cp_cache_layer_split = (
+            kvc.server_args.enable_cp_cache_layer_split and not kvc.is_draft_worker
+        )
+        self.cp_cache_layer_split_layout = None
+        if self.use_cp_cache_layer_split:
+            from sglang.srt.mem_cache.cp_cache_layer_split import (
+                build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout,
+            )
+
+            self.cp_cache_layer_split_layout = (
+                build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout(
+                    kvc.ps.attn_cp_size, kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer, cfg.compress_ratios,
+                )
+            )
+            logger.info("CP Cache LayerSplit layout=%s", self.cp_cache_layer_split_layout)
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
@@ -879,8 +951,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 kvc.server_args.max_speculative_num_draft_tokens or 0
             )
 
+        if self.use_cp_cache_layer_split:
+            hf_config = cfg.hf_config
+            self.cp_draft_layers = (
+                len(getattr(hf_config, "dspark_target_layer_ids", []))
+                if get_spec().speculative_algorithm == "DSPARK"
+                else getattr(hf_config, "num_nextn_predict_layers", 1)
+            )
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and not self.use_cp_cache_layer_split:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
@@ -968,6 +1047,33 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
+        if self.use_cp_cache_layer_split:
+            layout = self.cp_cache_layer_split_layout
+            # SWA and indexer have separate staging pools. C4/C128 extra KV
+            # share storage because a layer consumes only one of those families.
+            # Charge the larger PP-local family, even on a non-owning CP rank.
+            extra_staging_bytes = max(
+                c4_frac * kv_bytes if self.num_layers_ca4 else 0,
+                kv_bytes / 128 if self.num_layers_ca128 else 0,
+            )
+            # State is persisted only on its owner and is never broadcast.
+            result = (
+                self.swa_ratio * kv_bytes * (layout.swa_layer_num + 1)
+                + c4_frac * kv_bytes * layout.c4_layer_num
+                + kv_bytes / 128 * layout.c128_layer_num
+                + extra_staging_bytes
+                + indexer_bytes / 4 * (layout.c4_indexer_layer_num + 1)
+                + self.swa_ratio * c4_state_ratio * (
+                    c4_state_bytes * layout.c4_state_layer_num
+                    + c4_indexer_state_bytes * layout.c4_indexer_state_layer_num
+                )
+            )
+            if self.is_speculative:
+                # Flash0731 DSPARK has three SWA-only draft layers. They keep
+                # their original replicated pools on every CP rank.
+                draft_layers = getattr(self, "cp_draft_layers", 1)
+                result += self.swa_ratio * kv_bytes * draft_layers
+            return result
         return (
             self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac * kv_bytes * self.num_layers_ca4
@@ -1016,9 +1122,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows = ceil_div(state_rows, 128) * 128
             state_last_dim = 2 * attn_head_dim
 
-        return (
-            state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
+        num_layers = (
+            self.cp_cache_layer_split_layout.c128_state_layer_num
+            if self.use_cp_cache_layer_split else self.num_layers_ca128
         )
+        return state_rows * state_last_dim * c128_state_dtype_size * num_layers
 
     def _get_c128_state_fixed_bytes_for_token_capacity(
         self, token_capacity: int

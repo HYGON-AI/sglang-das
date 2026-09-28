@@ -44,6 +44,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 )
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_hcu_fa,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
@@ -2958,6 +2959,37 @@ class MHATokenToKVPool(KVCache):
             loc_2d = loc_2d.to(torch.int64)
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
+
+        # Gate prefix rows on device instead of materializing a dynamic nonzero
+        # result. Other layouts and the default-off path retain the old behavior.
+        if (
+            envs.SGLANG_ENABLE_HCU_FA_PREFIX_VALID.get()
+            and _kv_layout_hcu_fa
+            and not self.use_hnd
+            and (_is_cuda or _is_hip)
+        ):
+            if cache_k.dtype != self.dtype:
+                # The fallback scales index-selected copies, not the input KV.
+                if k_scale is not None:
+                    cache_k = cache_k / k_scale
+                if v_scale is not None:
+                    cache_v = cache_v / v_scale
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.contiguous().view(self.store_dtype)
+                cache_v = cache_v.contiguous().view(self.store_dtype)
+
+            set_kv_buffer_prefix_valid_hcu_fa(
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                cache_k,
+                cache_v,
+                loc_2d,
+                commit_lens,
+                page_size=self.page_size,
+            )
+            return
 
         # HND slots aren't contiguous ROW_BYTES spans — the tiled kernel's
         # `loc * row_bytes` walks off the buffer. Fall back to set_kv_buffer.
