@@ -1786,6 +1786,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+
 class MiniMaxM3Model(nn.Module):
     """MiniMax Model implementation."""
 

@@ -5,6 +5,9 @@ import torch
 
 from sglang.srt.eplb import expert_distribution as ed
 from sglang.srt.runtime_context import get_context
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 def test_deepep_auto_selects_mode_switching_gatherer():

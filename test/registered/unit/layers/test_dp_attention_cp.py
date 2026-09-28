@@ -7,6 +7,9 @@ import torch
 from sglang.srt.layers import communicator, dp_attention
 from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp.zigzag import compute_zigzag_cp_physical_token_count
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-c-test-cpu")
 
 
 def test_max_len_cp_gather_uses_full_tp_all_reduce():
@@ -94,9 +97,7 @@ def test_dp_layernorm_before_gather_preserves_residual_addition():
         ),
         patch.object(communicator, "get_tp_group", return_value=object()),
         patch.object(communicator, "get_global_dp_buffer", return_value=gathered),
-        patch.object(
-            communicator, "dp_gather_replicate", side_effect=gather_replicate
-        ),
+        patch.object(communicator, "dp_gather_replicate", side_effect=gather_replicate),
     ):
         output, updated_residual = (
             communicator.CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(

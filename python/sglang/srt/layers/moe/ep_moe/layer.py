@@ -131,9 +131,10 @@ except ImportError:
     m_grouped_w4a8_gemm_nt_contiguous_hipc = None
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
+from lightop import fuse_silu_mul_clamp_quant
+from lightop import fuse_situ_mul_quant_contiguous as fuse_situ_mul_quant
 from lightop import fuse_situ_mul_quant_ep
+from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,

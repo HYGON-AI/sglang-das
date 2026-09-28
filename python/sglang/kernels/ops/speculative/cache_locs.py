@@ -27,7 +27,6 @@ _is_xpu = is_xpu()
 if _is_hcu:
     from sgl_kernel.kvcacheio import (
         hcu_assign_extend_cache_locs,
-        hcu_assign_req_to_token_pool,
     )
 
 if _is_cpu:

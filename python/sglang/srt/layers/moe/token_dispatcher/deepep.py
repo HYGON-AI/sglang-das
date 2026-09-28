@@ -463,7 +463,7 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
-                    num_topk=num_topk
+                    num_topk=num_topk,
                 ),
                 num_rdma_bytes,
             )

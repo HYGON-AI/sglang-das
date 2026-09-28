@@ -359,13 +359,9 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             return
         spec = get_spec()
         if spec.speculative_eagle_topk not in (None, 1):
-            raise RuntimeError(
-                "EAGLE3 draft Top-1 requires --speculative-eagle-topk 1"
-            )
+            raise RuntimeError("EAGLE3 draft Top-1 requires --speculative-eagle-topk 1")
         if spec.speculative_use_rejection_sampling:
-            raise RuntimeError(
-                "draft Top-1 is incompatible with rejection sampling"
-            )
+            raise RuntimeError("draft Top-1 is incompatible with rejection sampling")
         weight = getattr(self.lm_head, "weight", None)
         if weight is None or weight.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(

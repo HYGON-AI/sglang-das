@@ -516,11 +516,7 @@ class GroupCoordinator:
 
             # aiter+fabric silently landing on disabled=True is treated as a
             # strict-Fabric failure.
-            if (
-                self.ca_comm is not None
-                and strict_fabric
-                and self.ca_comm.disabled
-            ):
+            if self.ca_comm is not None and strict_fabric and self.ca_comm.disabled:
                 raise RuntimeError(
                     f"[AR] Strict Fabric requested but aiter CA is disabled "
                     f"(ranks={self.ranks}). AITER_AR_TRANSPORT=fabric must not "
@@ -556,9 +552,7 @@ class GroupCoordinator:
                 if self.ca_comm is not None
                 else "n/a"
             )
-            disabled = (
-                True if self.ca_comm is None else self.ca_comm.disabled
-            )
+            disabled = True if self.ca_comm is None else self.ca_comm.disabled
             logger.info(
                 "[AR] custom_all_reduce_backend=%s requested_transport=%s "
                 "selected_transport=%s disabled=%s tp_ranks=%s world_size=%s",
@@ -1161,7 +1155,9 @@ class GroupCoordinator:
                         ca_comm.reduce_scatter(
                             input,
                             output,
-                            registered=getattr(ca_comm, "enable_register_for_capturing", False),
+                            registered=getattr(
+                                ca_comm, "enable_register_for_capturing", False
+                            ),
                         )
                         return output
                 else:
@@ -1252,18 +1248,15 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if (
-                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                    or not getattr(ca_comm, "enable_register_for_capturing", True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(
+                    ca_comm, "enable_register_for_capturing", True
                 ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
-            elif get_bool_env_var(
-                "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
-            ):
+            elif get_bool_env_var("SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"):
                 # Registered AITER buffers are valid only during real HIP graph
                 # capture. Keep eager warmup on the same collective so consumers
                 # never observe a synthetic zero result.
@@ -1404,7 +1397,11 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if (_is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(ca_comm, "enable_register_for_capturing", True)):
+                    if (
+                        _is_hcu
+                        or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or not getattr(ca_comm, "enable_register_for_capturing", True)
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
@@ -3246,11 +3243,7 @@ def destroy_model_parallel():
 
     global _ATTN_TP
     global _ATTN_DP_TP
-    if (
-        _ATTN_DP_TP
-        and _ATTN_DP_TP is not _TP
-        and _ATTN_DP_TP is not _ATTN_TP
-    ):
+    if _ATTN_DP_TP and _ATTN_DP_TP is not _TP and _ATTN_DP_TP is not _ATTN_TP:
         _ATTN_DP_TP.destroy()
     _ATTN_DP_TP = None
     if _ATTN_TP:

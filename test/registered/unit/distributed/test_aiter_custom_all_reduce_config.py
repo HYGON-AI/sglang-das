@@ -4,6 +4,9 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce import (
     _aiter_enable_register_for_capturing,
     _aiter_max_size_bytes,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 @pytest.mark.parametrize(

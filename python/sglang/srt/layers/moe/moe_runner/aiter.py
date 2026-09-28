@@ -342,6 +342,7 @@ class AiterRunnerCore(MoeRunnerCore):
             MoeSolutionType,
             get_aiter_moe_config,
         )
+
         from sglang.srt.environ import envs
 
         w1 = quant_info.w13_weight

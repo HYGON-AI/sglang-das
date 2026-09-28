@@ -334,7 +334,8 @@ def prepare_mlp_sync_batch_raw(
                     lora_ineligible=prefill_graph_runner.enable_lora,
                     batch_max_context_len=(
                         int(local_batch.seq_lens_cpu.max().item())
-                        if getattr(prefill_graph_runner, "max_context_size", None) is not None
+                        if getattr(prefill_graph_runner, "max_context_size", None)
+                        is not None
                         and local_batch.seq_lens_cpu is not None
                         and local_batch.seq_lens_cpu.numel() > 0
                         else None

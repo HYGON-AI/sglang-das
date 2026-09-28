@@ -1,6 +1,9 @@
 from unittest.mock import patch
 
 from sglang.kernels.ops.attention import verify_mla
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 def _policy(*, head_dim: int, kv_group_num: int, n_head_blocks: int):

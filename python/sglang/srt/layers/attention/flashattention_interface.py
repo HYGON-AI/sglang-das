@@ -486,7 +486,8 @@ def vllm_flash_attn_varlen_func(
         and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
         and q.dtype == torch.bfloat16
         and k.dtype == v.dtype
-        and k.dtype in (
+        and k.dtype
+        in (
             torch.bfloat16,
             torch.float8_e5m2,
         )
@@ -523,23 +524,53 @@ def vllm_flash_attn_varlen_func(
         if use_dflash_native_draft:
             out.zero_()  # Native attention skips empty graph-padding rows.
             flash_attn_cuda.paged_attention(
-                out, queries, k, v, scale, block_table, seqused_k,
-                None, "", q_descale, k_descale, v_descale, kv_bound,
-                None, 0, window_size[0], window_size[1], causal,
+                out,
+                queries,
+                k,
+                v,
+                scale,
+                block_table,
+                seqused_k,
+                None,
+                "",
+                q_descale,
+                k_descale,
+                v_descale,
+                kv_bound,
+                None,
+                0,
+                window_size[0],
+                window_size[1],
+                causal,
             )
         else:
             outputs = out.reshape(batch_size, max_seqlen_q, *q.shape[1:])
             for begin in range(0, max_seqlen_q, 4):
-                chunk_q = queries[:, begin:begin + 4].contiguous()
+                chunk_q = queries[:, begin : begin + 4].contiguous()
                 chunk_out = torch.zeros_like(chunk_q)
                 # Preserve bottom-right causal positions within the full block.
                 chunk_lengths = (seqused_k - (max_seqlen_q - 4 - begin)).clamp_min(0)
                 flash_attn_cuda.paged_attention(
-                    chunk_out, chunk_q, k, v, scale, block_table, chunk_lengths,
-                    None, "", q_descale, k_descale, v_descale, kv_bound,
-                    None, 0, -1, -1, True,
+                    chunk_out,
+                    chunk_q,
+                    k,
+                    v,
+                    scale,
+                    block_table,
+                    chunk_lengths,
+                    None,
+                    "",
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    kv_bound,
+                    None,
+                    0,
+                    -1,
+                    -1,
+                    True,
                 )
-                outputs[:, begin:begin + 4].copy_(chunk_out)
+                outputs[:, begin : begin + 4].copy_(chunk_out)
         return out
     if (
         use_hcu_fp8_swa_fallback

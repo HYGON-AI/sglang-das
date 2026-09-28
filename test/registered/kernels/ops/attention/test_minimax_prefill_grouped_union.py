@@ -10,8 +10,8 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
-    _topk_index_kernel,
     _prune_prefill_score_configs,
+    _topk_index_kernel,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     build_query_group_topk_union,
@@ -57,9 +57,7 @@ def test_prefill_topk_right_pads_short_rows_with_minus_one():
 
     torch.cuda.synchronize()
     assert topk_idx[0, 0, 0].item() == 0
-    assert torch.equal(
-        topk_idx[0, 0, 1:], torch.full_like(topk_idx[0, 0, 1:], -1)
-    )
+    assert torch.equal(topk_idx[0, 0, 1:], torch.full_like(topk_idx[0, 0, 1:], -1))
 
 
 def test_prefill_score_override_is_limited_to_long_context_exact_q1(monkeypatch):

@@ -919,10 +919,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
-            if (
-                _is_hip
-                and self.quant_format == CompressionFormat.pack_quantized.value
-            ):
+            if _is_hip and self.quant_format == CompressionFormat.pack_quantized.value:
                 logger.info_once(
                     "Using CompressedTensorsWNA16TritonMoE use_int4_w4a8 "
                     "(packed INT4 + dynamic per-token INT8 activations)"

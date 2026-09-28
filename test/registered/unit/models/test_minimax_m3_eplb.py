@@ -4,6 +4,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.models.minimax_m3 import MiniMaxM3MoE
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 def test_standard_ep_router_applies_expert_location_dispatch():

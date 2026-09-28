@@ -6,6 +6,9 @@ from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.minimax_m3_vl import (
     MiniMaxM3SparseForConditionalGeneration,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 def _make_target(cls, config):

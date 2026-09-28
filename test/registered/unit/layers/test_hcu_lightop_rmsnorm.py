@@ -1,6 +1,9 @@
 import torch
 
 import sglang.srt.layers.layernorm as layernorm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 def test_hcu_rmsnorm_does_not_require_vllm_ops(monkeypatch):

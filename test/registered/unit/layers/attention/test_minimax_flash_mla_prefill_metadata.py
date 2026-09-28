@@ -4,6 +4,9 @@ from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
     FlashMLAGfx938UnavailableError,
     build_flash_mla_sparse_prefill_k_end,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 def _reference_k_end(q_lens, prefix_lens):

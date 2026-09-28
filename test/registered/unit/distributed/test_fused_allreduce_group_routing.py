@@ -2,6 +2,9 @@ import torch
 
 from sglang.srt.distributed import communication_op
 from sglang.srt.layers import layernorm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
 
 
 class _FakeGroup:
