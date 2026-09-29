@@ -2085,6 +2085,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"got {tuple(loaded_weight.shape)}"
             )
         buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+        if buffer_name == "weight_scale":
+            # Offloaded PLE keeps a device replica of a scalar scale for graph
+            # capture; it was built from the placeholder, so refresh it here.
+            owner = self.get_submodule(name.rsplit(".", 1)[0])
+            replica = getattr(owner, "_device_scalar_scale", None)
+            if replica is not None:
+                replica.copy_(buffer.view_as(replica))
         loaded_buffers.add(name)
         return True
 
