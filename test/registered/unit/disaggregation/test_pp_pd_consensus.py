@@ -186,7 +186,7 @@ class TestPPPDConsensus(CustomTestCase):
             return_logprob=False,
             time_stats=SimpleNamespace(set_completion_time=Mock()),
         )
-        handle_failure = Mock()
+        handle_failure = Mock(return_value=(None, False))
         scheduler = SimpleNamespace(
             disagg_prefill_inflight_queue=[req],
             attn_cp_cpu_group=object(),
@@ -195,7 +195,11 @@ class TestPPPDConsensus(CustomTestCase):
             handle_inflight_transfer_failure=handle_failure,
             output_streamer=SimpleNamespace(stream_output=Mock()),
             req_to_metadata_buffer_idx_allocator=object(),
+            _external_kv_abort_rids=set(),
+            prefill_abort_sender_terminal=Mock(return_value=False),
         )
+        req.external_kv_response_sent = False
+        req.external_kv_metadata_released = False
 
         def mark_abort(target_req, message, status_code):
             del message, status_code
@@ -219,7 +223,10 @@ class TestPPPDConsensus(CustomTestCase):
 
         self.assertEqual(done_reqs, [])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
-        handle_failure.assert_not_called()
+        handle_failure.assert_called_once_with(req, sender_terminal=False)
+        handle_failure.reset_mock()
+        handle_failure.return_value = (None, True)
+        scheduler.prefill_abort_sender_terminal.return_value = True
 
         with (
             patch(
@@ -236,7 +243,7 @@ class TestPPPDConsensus(CustomTestCase):
 
         self.assertEqual(done_reqs, [req])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
-        handle_failure.assert_called_once_with(req)
+        handle_failure.assert_called_once_with(req, sender_terminal=True)
 
     def test_only_last_pp_registers_draft_kv_for_transfer(self):
         layer_ids_by_rank = []
