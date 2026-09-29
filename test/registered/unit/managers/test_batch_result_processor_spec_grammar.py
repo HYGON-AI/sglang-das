@@ -189,7 +189,7 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         self.assertEqual(result.num_correct_drafts_per_req_cpu, [0])
         self.assertEqual(req.spec_num_correct_drafts, 0)
         self.assertEqual(req.spec_correct_drafts_histogram, [1])
-        self.assertEqual(req.kv_committed_len, 0)
+        self.assertEqual(req.kv.kv_committed_len, 0)
 
 
 class TestReasoningTokenAccounting(CustomTestCase):

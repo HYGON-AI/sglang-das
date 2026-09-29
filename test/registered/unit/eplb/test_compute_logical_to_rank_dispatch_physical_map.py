@@ -17,6 +17,7 @@ from sglang.srt.eplb.expert_location import (
     compute_logical_to_rank_dispatch_physical_map,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.arg_groups.parallel_hook import handle_eplb_and_dispatch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -316,7 +317,7 @@ class TestLocalityFairStaticDispatch(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "requires.*static"):
-            server_args._handle_eplb_and_dispatch()
+            handle_eplb_and_dispatch(server_args)
 
     def test_server_args_accepts_static_opt_in(self):
         server_args = ServerArgs(
@@ -326,7 +327,7 @@ class TestLocalityFairStaticDispatch(CustomTestCase):
             ep_static_dispatch_policy="locality_fair",
         )
 
-        server_args._handle_eplb_and_dispatch()
+        handle_eplb_and_dispatch(server_args)
 
     def test_single_rank_topology(self):
         assignment = _assign_locality_fair_experts(
