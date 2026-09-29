@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -159,11 +160,24 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
 
     def test_only_megamoe_is_admitted(self):
         """Both sides of the allowlist: megamoe passes, others raise by name."""
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch("sglang.srt.utils.common.is_hcu", return_value=False),
+        ):
             _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_hcu_admits_deepep_with_its_own_runners(self):
+        """HCU serves DeepEP with its own MoE runners, so the gate admits it."""
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch("sglang.srt.utils.common.is_hcu", return_value=True),
+        ):
+            _handle_dspark(self._dp_server_args(moe_a2a_backend="deepep"))
+            with self.assertRaisesRegex(ValueError, "pplx"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend="pplx"))
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")
