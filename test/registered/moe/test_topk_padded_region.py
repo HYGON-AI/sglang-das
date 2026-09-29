@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -185,11 +185,19 @@ class TestDeepEPPaddedTokenMasking(unittest.TestCase):
         return mask_ids, zero_weights, topk_ids, num_token_non_padded
 
     def test_hcu_deepep_deepgemm_masks_ids_to_negative_one(self):
-        mask_ids, zero_weights, topk_ids, num_token_non_padded = self._run_post_process(
-            skip_deepep_padded_tokens=True
-        )
+        # HCU DeepEP folds the -1 padded mask and the int64 cast into
+        # _biased_grouped_topk_postprocess, so the standalone mask helper must
+        # not run a second time on that path.
+        post = MagicMock(side_effect=lambda ids, _info, _n, output_int64: ids.long())
+        with patch.object(topk_mod, "_biased_grouped_topk_postprocess", post):
+            mask_ids, zero_weights, topk_ids, num_token_non_padded = (
+                self._run_post_process(skip_deepep_padded_tokens=True)
+            )
 
-        mask_ids.assert_called_once_with(topk_ids, num_token_non_padded, fill_value=-1)
+        post.assert_called_once()
+        self.assertIs(post.call_args.args[2], num_token_non_padded)
+        self.assertTrue(post.call_args.kwargs["output_int64"])
+        mask_ids.assert_not_called()
         zero_weights.assert_not_called()
 
     def test_other_hip_paths_keep_in_range_ids_and_zero_weights(self):
