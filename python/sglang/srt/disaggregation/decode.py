@@ -635,6 +635,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.mem_cache.cp_cache_layer_split.transfer import (
+                configure_v4_transfer,
+            )
+
+            configure_v4_transfer(
+                kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool
+            )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
