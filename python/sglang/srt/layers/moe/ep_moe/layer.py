@@ -33,7 +33,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.distributed import (
+from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
 )

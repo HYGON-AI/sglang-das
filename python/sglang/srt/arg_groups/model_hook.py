@@ -137,7 +137,6 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 
 
 def handle_model_specific_adjustments(server_args: Any):
-
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
@@ -414,7 +413,21 @@ def handle_model_specific_adjustments(server_args: Any):
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
-                logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
+
+                if model_arch == "GlmMoeDsaForCausalLM":
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        enable_aiter_allreduce_fusion=True,
+                    )
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        disable_aiter_allreduce_fusion_in_prefill=True,
+                    )
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
+                    )
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the
             # resolution pipeline (arg_groups/overrides.py:
@@ -507,7 +520,9 @@ def handle_model_specific_adjustments(server_args: Any):
         ):
             # TODO (Hubert): Put this back later
             # server_args.enable_aiter_allreduce_fusion = True
-            logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            pass
+
         quantization_config = getattr(hf_config, "quantization_config", None)
         is_mxfp4_quant_format = (
             quantization_config is not None
@@ -957,7 +972,6 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
 
 
 def handle_language_model_only(server_args: Any):
-
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return

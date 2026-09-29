@@ -22,13 +22,15 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_tensor_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.parallel_state import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
@@ -37,7 +39,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -710,7 +712,7 @@ class HYV3DecoderLayer(nn.Module):
                 and layer_id + 1 >= first_k_dense_replace
             )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_layer_sparse,
@@ -718,11 +720,10 @@ class HYV3DecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -751,37 +752,21 @@ class HYV3DecoderLayer(nn.Module):
             forward_batch,
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        if self.block_type == "moe":
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states,
-                should_allreduce_fusion=should_allreduce_fusion,
-                use_reduce_scatter=use_reduce_scatter,
-            )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states,
-                residual,
-                forward_batch,
-            )
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            if self.block_type == "moe":
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    ffn_exit.fuse_mlp_allreduce,
+                    ffn_exit.mlp_reduce_scatter,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    should_allreduce_fusion=ffn_exit.fuse_mlp_allreduce,
+                    use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
+                )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

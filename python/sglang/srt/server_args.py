@@ -11,25 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Server argument declarations, resolution, and CLI registration.
-
-Keep this file in the following top-level order:
-
-1. Imports and the module logger.
-2. Public extension-point choice lists, with each legacy ``add_*`` alias
-   immediately below the choice list it extends.
-3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
-   aliases. A choice list used by only one field belongs inline in that field.
-4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
-   registration and small query helpers. New resolution steps are appended at
-   the end of ``arg_groups.pipeline.run_resolution_pipeline``, immediately
-   marked complete, unless an earlier dependency is documented explicitly.
-5. Module-level ``ServerArgs`` construction/runtime shims.
-6. Networking constants and ``PortArgs``.
-
-Model- or vendor-specific utilities belong in ``sglang.srt.arg_groups`` (or
-their owning subsystem), not before ``ServerArgs`` in this module.
-"""
+"""Server argument construction, resolution, CLI registration, and network ports."""
 
 from __future__ import annotations
 
@@ -37,13 +19,14 @@ import argparse
 import copy
 import dataclasses
 import functools
+import importlib
 import logging
+import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
 from typing import Any
 
-from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
 )
@@ -73,16 +56,40 @@ from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_av
 
 logger = logging.getLogger(__name__)
 
-# Re-exported. These were importable from this module while the field
-# declarations that used them lived here; the declarations moved to
-# `arg_groups/fields/` but out-of-tree code -- and `tokenizer_control_mixin`
-# for `LoRARef` -- still reaches them through `sglang.srt.server_args`.
+
+def _reasoning_parser_choices():
+    # Importing the registry here costs seconds in every process that parses
+    # arguments; a plugin that registered a parser has already imported it.
+    module = sys.modules.get("sglang.srt.parser.reasoning_parser")
+    if module is not None:
+        return list(module.ReasoningParser.DetectorMap)
+    from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+    return list(REASONING_PARSER_NAMES)
+
+
+def _tool_call_parser_choices():
+    module = sys.modules.get("sglang.srt.function_call.function_call_parser")
+    if module is not None:
+        return list(module.FunctionCallParser.ToolCallParserEnum)
+    from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+
+    return list(TOOL_CALL_PARSER_NAMES)
+
+
+def _real_kv_hash_modes():
+    # Lazy: this pulls the whole sglang.kernels package (~2 s) into every
+    # process that imports server_args, most of which never use it.
+    from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+
+    return list(RealKvHashMode)
+
+
+# Compatibility re-exports for callers importing through server_args.
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
 from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 
-# Re-exported for out-of-tree plugins, which have always reached these
-# through `sglang.srt.server_args`. The lists and their adders moved to
-# `arg_groups/choices.py` with the field declarations that name them.
+# Public choice lists and plugin registration helpers.
 from sglang.srt.arg_groups.choices import (  # noqa: F401
     ATTENTION_BACKEND_CHOICES,
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -178,6 +185,23 @@ from sglang.srt.utils.common import (  # noqa: F401
     nullable_str,
 )
 
+# Re-exported like the imports above, but resolved on first use: importing them
+# eagerly is what the choices helpers avoid, and most processes never read them.
+_LAZY_REEXPORTS = {
+    "FunctionCallParser": "sglang.srt.function_call.function_call_parser",
+    "ReasoningParser": "sglang.srt.parser.reasoning_parser",
+    "RealKvHashMode": "sglang.kernels.ops.kv_canary.consts",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _LAZY_REEXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
 
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -227,26 +251,13 @@ class ServerArgs:
     """
 
     def __post_init__(self):
-        """Construction leaves the record at what the caller asked for.
-
-        Resolution is a separate act, entered through ``resolve_once``: the
-        launcher runs it once per engine, and every publishing process asks the
-        gate on the way in. A record that is only constructed -- a fixture, a
-        config being inspected, one being handed to a subprocess that will
-        resolve it itself -- stays raw.
-        """
+        """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
 
     def resolve_once(self) -> None:
-        """Run the resolution pipeline, unless this record has been through it.
+        """Resolve once, preserving declarations across pickling to child processes.
 
-        Resolution is a deterministic function of the raw inputs -- two records
-        built from the same arguments declare the same things -- but the
-        handlers do not survive a second pass over their own output: DP
-        attention halves ``chunked_prefill_size`` again on every re-entry.
-
-        The publishing entry of every process calls this. In a child the record
-        arrived by pickle and brought its declarations along, so the child has
-        nothing left to derive and projects what the parent decided.
+        Handlers are not idempotent over their own output. A failed resolution
+        cannot be retried on the same record.
         """
         if getattr(self, "_resolution_finished", False):
             return
@@ -267,32 +278,16 @@ class ServerArgs:
         try:
             run_resolution_pipeline(self)
         except BaseException:
-            # The handlers that ran already declared, and they are not
-            # idempotent over their own output.
             self._resolution_failed = True
             raise
         finally:
             self._input_frozen = False
-        # Set here too, because the dummy/absent-model path returns before the
-        # end of the pipeline that normally sets it: the gate is about whether
-        # the handlers ran, not how far they got.
+        # Also mark the dummy/absent-model path, which returns early from the pipeline.
         self._resolution_finished = True
 
     @property
     def launch_command(self) -> str | None:
-        """How this record was created, verbatim.
-
-        `resolved_dict` answers with what resolution decided; this answers with
-        what the operator asked for, which is a different question and the one
-        "why is this server configured like this?" usually means. The two are
-        not derivable from each other: a field the operator never set reads the
-        same as one they set to the value resolution would have picked anyway.
-
-        The launcher stores the arguments it parsed; the in-process `Engine`
-        stores the call that built the record, since there was no command line.
-        `None` on a record built directly (a fixture, a subprocess copy that
-        predates this, a config being inspected).
-        """
+        """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
         return getattr(self, "_launch_command", None)
 
     def resolved_dict(self) -> dict[str, Any]:
@@ -359,12 +354,6 @@ class ServerArgs:
         object.__setattr__(replacement, "_resolution_finished", True)
         return replacement
 
-    # ------------------------------------------------------------------
-    # CUDA graph configuration resolution
-    # ------------------------------------------------------------------
-
-    # ===== END TO BE REFACTORED ====
-
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
@@ -379,7 +368,6 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
-        # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
@@ -394,7 +382,7 @@ class ServerArgs:
             help="Choose the kernels for sampling layers.",
         )
 
-        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
+        reasoning_parser_choices = _reasoning_parser_choices()
         parser.add_argument(
             "--reasoning-parser",
             type=str,
@@ -404,7 +392,7 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
+        tool_call_parser_choices = _tool_call_parser_choices()
         parser.add_argument(
             "--tool-call-parser",
             type=str,
@@ -414,6 +402,8 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {tool_call_parser_choices}.",
         )
+        from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+
         parser.add_argument(
             "--kv-canary-real-data",
             type=str,
@@ -709,12 +699,7 @@ class ServerArgs:
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
 
-# The namespaces whose *input* fields make up the record. A namespace declares
-# its input and derived fields side by side; only the input half is collected,
-# which is why this is a call and not a base-class list.
-#
-# A set, not an order: `collect_input_fields` orders by `field_order.py`, which
-# is what keeps the positional constructor stable.
+# Collect input fields only; field_order.py preserves positional argument order.
 
 
 _INPUT_NAMESPACES = [
@@ -743,11 +728,7 @@ _INPUT_NAMESPACES = [
 
 _annotations, _defaults, _namespaces = collect_input_fields(_INPUT_NAMESPACES)
 ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
-# The assembled record has no base classes, so it carries the map the classes
-# used to answer through their `_NS_PATH`.
 ServerArgs._NS_BY_FIELD = _namespaces
-# The classes themselves, so the bag projection can find the declarations
-# that are not fields -- the derived half of each namespace.
 ServerArgs._NAMESPACES = _INPUT_NAMESPACES
 for _name, _value in _defaults.items():
     setattr(ServerArgs, _name, _value)
@@ -810,14 +791,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # Imports are in-function so the two modules stay cycle-free at import time.
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:
-    """Real dataclass fields whose names start with an underscore.
-
-    The read-only guard exempts underscore names because they are the record's
-    own bookkeeping (the stash, the flags, the cache keys). A *field* that
-    happens to start with an underscore is still resolved configuration --
-    `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
-    by spelling would leave exactly one leaf writable on a read-only record.
-    """
+    """Configuration fields that must stay sealed despite their underscore prefix."""
     return frozenset(
         field.name
         for field in dataclasses.fields(ServerArgs)

@@ -8,7 +8,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.communicator.legacy import (
     AttentionInputs,
     LayerCommunicator,
     LayerScatterModes,

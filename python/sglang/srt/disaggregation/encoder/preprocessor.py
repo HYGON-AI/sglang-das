@@ -651,11 +651,11 @@ class EncoderPreprocessor:
         vr,
         video_config,
         *,
-        tp_rank: int,
-        tp_size: int,
         video_processor_kwargs: dict,
         precomputed_indices: Optional[List[int]] = None,
     ):
+        parallel = get_parallel()
+        tp_rank, tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
         video_config = video_config or {}
         video_fps = vr.avg_fps
         duration = len(vr) / video_fps if video_fps else 0

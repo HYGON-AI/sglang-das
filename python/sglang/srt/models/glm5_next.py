@@ -43,7 +43,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.communicator.legacy import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,

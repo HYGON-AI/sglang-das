@@ -100,7 +100,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.glm5_next.runtime import (
     get_glm5_next_runtime_args as get_global_server_args,
 )
-from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.communicator.legacy import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper

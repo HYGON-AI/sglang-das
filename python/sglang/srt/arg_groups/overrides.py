@@ -48,8 +48,7 @@ from sglang.srt.arg_groups.arg_utils import (
     with_fallback,
 )
 
-# Re-exported for the callers that already import these names from here; the
-# declarations under ``model_overrides/`` import them from the base directly.
+# Compatibility re-exports; model providers import model_override_base directly.
 from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _MODEL_OVERRIDE_FNS,
     _PREDICATE_OVERRIDE_FNS,
@@ -317,20 +316,9 @@ def declare_direct_writes(
 
 
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
-    """What resolution decided for ``field``: the declaration if there is one,
-    otherwise what the caller supplied, otherwise the field's declared
-    fallback.
+    """Read the last declaration, then raw input, then the declared fallback.
 
-    The fallback is last because it is what the field means when nobody said
-    anything -- an operator who types a value and a pass that decides one both
-    sit above it. It is read from the declaration rather than filled in by a
-    pass, so there is no slot to place and no second call to make idempotent.
-
-    This is what the config projection reads. Reading the field instead would
-    work whatever the caller passed onto the record -- and
-    the point of declaring is that they will not, so the projection must not
-    depend on it. A config that never ran the pipeline (a mock, a partial
-    fixture) carries no raw snapshot; its fields are all it has.
+    Records without a raw-input snapshot fall back to their current fields.
     """
     for _source, declared in reversed(
         getattr(server_args, "_resolved_overrides", None) or ()
@@ -378,12 +366,7 @@ def _plain(value: Any) -> Any:
 
 
 def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
-    """The activation working-set reserve held back before cuda-graph capture.
-
-    The config-shaped half of the pair; `runtime_context` carries the
-    published-bag half, and `TestDerivedPredicatesAgreeAcrossTiers` pins the
-    two equal.
-    """
+    """Return the activation reserve in MB before CUDA graph capture."""
     if cfg.disaggregation_mode == "decode":
         running_requests = (
             cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
@@ -493,13 +476,6 @@ def collect_model_override_declarations(
     return declarations
 
 
-# ---------------------------------------------------------------------------
-# Derived per-family declarations (faithful ports of legacy arch branches).
-# Callables read the PRISTINE server_args, never write; logging is kept
-# verbatim from the legacy branch for operator-visible fidelity.
-# ---------------------------------------------------------------------------
-
-
 # Importing the package is what registers the per-model declarations.
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
@@ -541,9 +517,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-# Architectures whose monolith branch routes through the mamba radix cache
-# handling (hybrid linear-attention models). Keep in sync with the branch
-# guards in _handle_model_specific_adjustments.
+# Keep this hybrid-model set in sync with model_hook.handle_model_specific_adjustments.
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -613,15 +587,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
 
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
-    """Resolve the hybrid-mamba radix cache fields (pure).
-
-    Slot pass: invoked at each legacy ``_handle_mamba_radix_cache`` slot —
-    the hybrid-spec call at the head of the monolith and the per-arch branch
-    calls — where it reads the mid-resolution ``page_size`` /
-    ``disable_overlap_schedule`` exactly as the legacy helper did. The arch
-    guard replicates the union of the legacy call-site guards so the pass is
-    self-sufficient in the end-state pass list.
-    """
+    """Resolve hybrid-Mamba cache settings using the current page size and overlap policy."""
     from sglang.srt.configs.linear_attn_model_registry import (
         get_linear_attn_spec_by_arch,
     )
@@ -658,10 +624,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
-    """Slot pass in the DSA arm, ordered before the split-backend
-    resolution: default the kv-cache dtype from the device capability
-    (Blackwell FP8, Hopper bf16) and normalize the bf16 alias. Reads the
-    PRISTINE dsa split backends (their resolution runs after this pass)."""
+    """Default DSA KV-cache dtype before resolving split attention backends."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -744,9 +707,10 @@ def _check_tilelang_dsa_fp8_kv(
 
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
-    """Slot pass in the DSA arm: default the DSA prefill/decode split
-    backends from the mid-resolution kv-cache dtype and the device
-    capability. The hisparse arm takes precedence under --enable-hisparse."""
+    """Resolve DSA split backends from KV-cache dtype and device capability.
+
+    HiSparse settings take precedence when enabled.
+    """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -897,10 +861,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
 
 @register_post_process
 def _deepseek_moe_quant_resolution(view: Any) -> dict:
-    """Slot pass invoked from inside the DeepSeek arch branch ("Set moe
-    backend for DeepSeek"), NOT a dispatch-time declaration: the DSA
-    kv-cache-dtype default earlier in the branch must read the PRISTINE
-    quantization, so this resolution has to stay at its legacy slot."""
+    """Resolve DeepSeek MoE quantization after DSA has read the input quantization."""
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
@@ -983,10 +944,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_spec_moe_resolution(view: Any) -> dict:
-    """Slot pass at the DeepSeek branch's HIP arm: draft (nextn) spec-MoE
-    backends for the DeepSeek fp4 checkpoint. Reads the mid-resolution
-    quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
-    ep_size, exactly like the legacy in-branch writes."""
+    """Resolve HIP draft MoE backends after quantization and before A2A adjusts EP size."""
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
@@ -1166,8 +1124,7 @@ def _deterministic_sampling_backend(view: Any) -> dict:
 
 
 def _deterministic_is_deepseek_model(view: Any) -> bool:
-    """Faithful copy of the deterministic handler's arch probe (pure read;
-    the handler keeps its own copy for the later deepseek validation)."""
+    """Check the model architecture for deterministic DeepSeek backend selection."""
     from sglang.srt.connector import ConnectorType
     from sglang.srt.utils.common import parse_connector_type
 
@@ -1254,10 +1211,7 @@ def _attention_backend_default(view: Any) -> dict:
 
 @register_post_process
 def _mla_backend_page_constraints(view: Any) -> dict:
-    """Page-size constraints of the MLA/TRTLLM backend family (the raises and
-    the cutedsl prefill fallback stay in the handler; only the page snaps are
-    declared). The snaps chain on a local value exactly as the legacy blocks
-    chained on self.page_size."""
+    """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
     page_size = view.page_size
     if (
         view.attention_backend == "flashmla"
@@ -1336,10 +1290,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
-    """Read-only validation pass in the attention-backend compatibility
-    handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
-    kv-cache dtype (declarations never reach the field, so the checks read
-    the view)."""
+    """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
@@ -1348,9 +1299,9 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"
@@ -1381,10 +1332,7 @@ def _hisparse_validation(view: Any) -> dict:
 
 @register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
-    """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
-    is decode-only, so validate the combination and default the prefill side
-    to trtllm_mla. The trtllm_mha check that follows at the legacy slot reads
-    the resolved value through the view."""
+    """Validate decode-only CuteDSL MLA and default its prefill backend to trtllm_mla."""
     if not (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
@@ -1597,9 +1545,7 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 
 @register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
-    """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
-    values through the view."""
+    """Require DP attention for DP LM head and TP LM-head all-to-all."""
     if view.enable_dp_lm_head:
         assert view.enable_dp_attention, (
             "Please enable dp attention when setting enable_dp_lm_head. "
@@ -1625,10 +1571,7 @@ def _dp_lm_head_validation(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
-    """The quantization-driven moe_runner_backend resolutions at the head of
-    _handle_moe_kernel_config. The backend-compatibility asserts and the
-    disable_shared_experts_fusion writes (post-publish writers exist for that
-    field) stay in the handler."""
+    """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
         if not get_platform().is_sm100:
@@ -1659,7 +1602,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        # Every other entry is CUDA-only. Honor an explicit triton request on ROCm
+        # instead of sending it back to flashinfer_trtllm, whose MoE apply path
+        # imports flashinfer.
+        if is_gfx95_mxfp8 or (get_platform().is_hip and moe_runner_backend == "triton"):
             allowed.append("triton")
         mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
@@ -1688,10 +1634,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
-    shared-experts fusion disabled; declared at the legacy write slots in
-    _handle_moe_kernel_config (before the deprecated cutlass env override, so
-    the runner value observed is the pre-override one)."""
+    """Disable shared-expert fusion for incompatible MoE runners.
+
+    Runs before the deprecated cutlass environment override.
+    """
     runner = view.moe_runner_backend
     if runner == "flashinfer_cutedsl":
         logger.warning(
@@ -1812,6 +1758,23 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if backend := algorithm_cls.required_attention_backend:
+        fields = (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        overrides = {
+            field: backend for field in fields if getattr(view, field, None) != backend
+        }
+        if overrides:
+            logger.warning(
+                "%s requires the %s attention backend", view.dllm_algorithm, backend
+            )
+        return overrides
     if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             if is_hcu():
@@ -1863,8 +1826,7 @@ def _dllm_page_size(view: Any) -> dict:
         )
         return {"page_size": config.block_size}
     if view.page_size > config.block_size:
-        # Legacy scheduler-init fallback, folded into the pass: the page
-        # size must not exceed the dllm block size.
+        # The page size must not exceed the DLLM block size.
         logger.warning(
             "WARNING: "
             f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
@@ -1878,10 +1840,7 @@ def validate_declarations(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
 ) -> None:
-    """Fail-fast whitelist check at declaration time: a registry typo or a
-    not-yet-resolvable field must be rejected at its slot, not only at
-    publish time. Declarations never mutate ``server_args``.
-    """
+    """Reject unknown or non-resolvable fields before publication."""
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
     # resolvable_fields escape); only real ServerArgs is validated.
     if not dataclasses.is_dataclass(type(server_args)):
@@ -1899,10 +1858,7 @@ def validate_declarations(
 
 @register_post_process
 def _hrm_text_attention_force(view: Any) -> dict:
-    """HRM-Text's bidirectional prefix attention only works on the Triton
-    backend. Invoked as the last attention declaration of the resolution
-    (mirroring the legacy runner-side force, which ran after the whole
-    pipeline)."""
+    """Force Triton for HRM-Text bidirectional prefix attention after backend resolution."""
     if view.attention_backend not in (None, "triton"):
         logger.warning(
             f"Overriding --attention-backend "
@@ -1932,13 +1888,18 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if mla_enabled:
         return False
-    if cfg.kv_cache_dtype == "fp4_e2m1":
-        return False
     if cfg.prefill_only_disable_kv_cache:
         return False
     if cfg.enable_memory_saver:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+        return False
+    # Mooncake over EFA cannot register the CUDA VMM allocation used by
+    # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
+    if (
+        cfg.disaggregation_transfer_backend == "mooncake"
+        and envs.MOONCAKE_PROTOCOL.get().lower() == "efa"
+    ):
         return False
 
     if (
