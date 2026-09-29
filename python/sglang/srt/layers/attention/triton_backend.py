@@ -666,6 +666,25 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            # Draft-extend uses prefix-only KV metadata, just like the full-attention
+            # path above. Build the matching SWA view in the preallocated graph
+            # buffers so SWA layers never receive a None kv_indices pointer.
+            (
+                _,
+                _,
+                _,
+                self.cuda_graph_window_kv_offsets[:bs],
+            ) = update_sliding_window_buffer(
+                self.window_kv_indptr,
+                self.req_to_token,
+                self.sliding_window_size,
+                kv_lens,
+                req_pool_indices,
+                bs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                window_kv_indices=self.cuda_graph_window_kv_indices,
+            )
         return qo_indptr, kv_indptr, num_tokens_per_req
 
     def init_forward_metadata_out_graph(
@@ -1248,10 +1267,16 @@ class TritonAttnBackend(AttentionBackend):
                 qo_indptr=self.qo_indptr[: bs + 1],
                 custom_mask=None,
                 mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr,
-                window_kv_indices=None,
+                window_kv_indptr=(
+                    self.window_kv_indptr[: bs + 1] if swa else None
+                ),
+                window_kv_indices=(
+                    self.cuda_graph_window_kv_indices if swa else None
+                ),
                 window_num_kv_splits=None,
-                window_kv_offsets=None,
+                window_kv_offsets=(
+                    self.cuda_graph_window_kv_offsets if swa else None
+                ),
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
