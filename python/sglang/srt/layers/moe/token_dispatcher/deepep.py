@@ -971,7 +971,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif _use_marlin_w16a16_moe or _use_marlin_w4a16_moe:
+            elif (
+                self.deepep_output_dtype == DispatcherOutputDtype.BF16
+                or _use_marlin_w16a16_moe
+                or _use_marlin_w4a16_moe
+            ):
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
