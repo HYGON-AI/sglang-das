@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.attention.dsa import dsa_indexer as indexer_module
 from sglang.srt.layers.attention.dsa import paged_mqa_logits_backend as backend_module
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import IndexKCacheMode
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -50,7 +51,6 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
     def test_qk_prepare_uses_lightop_fused_layernorm_rope(self):
         indexer = object.__new__(Indexer)
         indexer.wq_b = MagicMock(return_value=(sentinel.query_projection, None))
-        indexer.wk = MagicMock(return_value=(sentinel.key_projection, None))
         indexer.head_dim = 128
         indexer.k_norm = SimpleNamespace(
             weight=sentinel.norm_weight,
@@ -61,6 +61,8 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
         indexer.dsa_enable_prefill_cp = False
         query = MagicMock()
         key = MagicMock(ndim=3)
+        # The key projection is used directly once it is already [T, H, D].
+        indexer.wk = MagicMock(return_value=(key, None))
         forward_batch = SimpleNamespace(attn_cp_metadata=None)
         lightop_attention = MagicMock()
 
@@ -70,7 +72,7 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
             patch.object(
                 indexer_module, "rotate_activation", side_effect=lambda x, **_: x
             ),
-            patch.object(indexer_module, "is_cp_v2_active", return_value=False),
+            patch.object(indexer_module, "is_cp_active", return_value=False),
             patch.object(
                 indexer_module,
                 "lightop_attention",
@@ -163,22 +165,22 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
         indexer.head_dim = 128
         bf16_cache = torch.empty((2, 64, 1, 128), dtype=torch.bfloat16)
         bf16_pool = SimpleNamespace(
-            use_fp8_index_k_cache=False,
+            index_k_cache_mode=IndexKCacheMode.BF16,
             get_index_k_buffer=MagicMock(return_value=bf16_cache),
         )
         fp8_raw = torch.empty((2, 64 * 132), dtype=torch.uint8)
         fp8_pool = SimpleNamespace(
-            use_fp8_index_k_cache=True,
+            index_k_cache_mode=IndexKCacheMode.FP8_SCALED,
             page_size=64,
             get_index_k_with_scale_buffer=MagicMock(return_value=fp8_raw),
         )
 
         with patch.object(indexer_module, "_is_hcu", True):
             got_bf16, is_bf16 = indexer._get_hcu_paged_index_k_cache(
-                bf16_pool, layer_id=3
+                bf16_pool, layer_id=3, block_tables=None, context_lens=None
             )
             got_fp8, is_fp8_bf16 = indexer._get_hcu_paged_index_k_cache(
-                fp8_pool, layer_id=3
+                fp8_pool, layer_id=3, block_tables=None, context_lens=None
             )
 
         self.assertIs(got_bf16, bf16_cache)
@@ -193,13 +195,15 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
         forward_batch = SimpleNamespace(out_cache_loc=MagicMock())
         key = sentinel.key
         bf16_pool = SimpleNamespace(
-            use_fp8_index_k_cache=False,
+            index_k_cache_mode=IndexKCacheMode.BF16,
             set_index_k_buffer=MagicMock(),
         )
         fp8_pool = SimpleNamespace(
-            use_fp8_index_k_cache=True,
+            index_k_cache_mode=IndexKCacheMode.FP8_SCALED,
             page_size=64,
-            get_index_k_with_scale_buffer=MagicMock(return_value=sentinel.fp8_cache),
+            get_index_k_with_scale_write_buffer=MagicMock(
+                return_value=sentinel.fp8_cache
+            ),
         )
         lightop_kvcache = MagicMock()
 
@@ -256,7 +260,9 @@ class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
         indexer.softmax_scale = 0.125
         pool = SimpleNamespace(
             page_size=64,
-            get_index_k_with_scale_buffer=MagicMock(return_value=sentinel.fp8_cache),
+            get_index_k_with_scale_write_buffer=MagicMock(
+                return_value=sentinel.fp8_cache
+            ),
         )
         out_cache_loc = MagicMock()
         out_cache_loc.contiguous.return_value = sentinel.contiguous_loc
