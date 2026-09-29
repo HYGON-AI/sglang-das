@@ -1364,6 +1364,19 @@ class KVCacheConfigurator:
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )
+            if (
+                getattr(get_parallel(), "enable_cp_cache_layer_split", False)
+                and not self.is_draft_worker
+            ):
+                from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+                    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+                )
+
+                pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool
+                kv_layout_kwargs.update(
+                    cp_rank=get_parallel().attn_cp_rank,
+                    cp_size=get_parallel().attn_cp_size,
+                )
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -2292,6 +2305,18 @@ class KVCacheConfigurator:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_parallel().world_group.cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        if (
+            getattr(get_parallel(), "enable_cp_cache_layer_split", False)
+            and not self.is_draft_worker
+        ):
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_parallel().attn_cp_group.cpu_group,
             )
             token_capacity = tensor.item()
 
