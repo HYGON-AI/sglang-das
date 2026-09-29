@@ -999,16 +999,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_parameter("weight", cpu_weight)
         source_scale = embedding.weight_scale
         if source_scale.numel() <= 1:
-            if source_scale.device.type == "cpu" and source_scale.is_pinned():
-                cpu_scale = source_scale
-            else:
-                with torch.device("cpu"):
-                    cpu_scale = torch.empty(
-                        source_scale.shape,
-                        dtype=source_scale.dtype,
-                        pin_memory=True,
-                    )
-                cpu_scale.copy_(source_scale.detach().to("cpu"))
+            # A scalar scale stays where the layer built it (the device under
+            # the model loader), so graph capture never H2D-copies it.
+            cpu_scale = source_scale
         elif source_scale.device.type == "cpu" and source_scale.is_pinned():
             cpu_scale = source_scale
         else:
@@ -1021,8 +1014,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             cpu_scale.copy_(source_scale.to("cpu"))
         self.register_buffer("weight_scale", cpu_scale, persistent=True)
         self._device_scalar_scale = None
-        if cpu_scale.numel() <= 1 and torch.cuda.is_available():
-            # Graph capture cannot H2D-copy an unpinned CPU scalar.
+        if (
+            cpu_scale.numel() <= 1
+            and cpu_scale.device.type == "cpu"
+            and torch.cuda.is_available()
+        ):
+            # A layer built on the host keeps its scalar scale there; graph
+            # capture cannot H2D-copy an unpinned CPU scalar, so keep a replica.
             self._device_scalar_scale = cpu_scale.to(
                 device=f"cuda:{torch.cuda.current_device()}",
                 dtype=cpu_scale.dtype,
