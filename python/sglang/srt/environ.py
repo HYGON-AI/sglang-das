@@ -997,6 +997,9 @@ class Envs:
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
+    # ModelSlim W4A8 MoE ablation: drop the float *_scale_bias from the grouped
+    # matmul dequant. Read by the Ascend-op path on NPU and on the HCU Triton port.
+    SGLANG_W4A8_MOE_SKIP_SCALE_BIAS = EnvBool(False)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
