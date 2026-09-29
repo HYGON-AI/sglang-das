@@ -159,6 +159,10 @@ def linear_bf16_fp32(
         if output is not None:
             return output
         return _linear_bf16_fp32_cublas(x, y)
+    elif _linear_bf16_fp32_algo == "lightop":
+        from lightop import gemm_ops
+
+        return gemm_ops.gemm(x, y, out_dtype=torch.float32)
     elif _linear_bf16_fp32_algo == "deep_gemm" and y.dtype == torch.bfloat16:
         from sglang.srt.layers import deep_gemm_wrapper
 
