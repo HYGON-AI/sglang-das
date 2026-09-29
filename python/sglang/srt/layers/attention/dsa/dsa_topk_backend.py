@@ -132,8 +132,18 @@ class DSATopKBackend(Enum):
         # output transform. `batch_idx_list` is not None only on the prefill-CP
         # path, whose `topk_indices_offset` is built from cu_seqlens_q rather
         # than the KV bases -- leave that one on the legacy kernel.
+        #
+        # HCU is excluded on purpose: the v2 ragged kernel is CUDA-only
+        # (topk_v2.cuh sets kDLCUDA and #ifndef USE_ROCM's out its body) and
+        # requires score_stride % 4 == 0, which the DeepGEMM contiguous-KV output
+        # satisfies by construction but the HCU lightop mqa_logits output does
+        # not (k_offset is the raw flattened-KV length, any value). The paged v2
+        # path above stays on for HCU: its row stride comes from the page table
+        # and is aligned. HCU RAGGED falls through to lightop's
+        # fast_topk_transform_ragged_fused below, whose args are identical.
         if (
             self.should_use_topk_v2()
+            and not _is_hcu
             and topk_transform_method == TopkTransformMethod.RAGGED
             and topk_indices_offset is not None
             and batch_idx_list is None
