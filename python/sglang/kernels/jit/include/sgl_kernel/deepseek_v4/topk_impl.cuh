@@ -150,7 +150,19 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+  #ifdef USE_ROCM
+  // wave64: HIP has no __ballot_sync (it is gated behind
+  // HIP_ENABLE_WARP_SYNC_BUILTINS and takes a 64-bit mask), and plain __ballot
+  // spans the full 64-lane wave -- which here holds TWO of the file's logical
+  // kWarpSize == 32 warps. Keep only this thread's half before the popcount;
+  // counting the sibling warp's lanes would silently corrupt every handle_tie
+  // rank. `mask` stays a width-32 lane mask, same as the CUDA side.
+  const unsigned long long ballot = __ballot(pred);
+  const uint32_t half = (__lane_id() >= 32u) ? static_cast<uint32_t>(ballot >> 32) : static_cast<uint32_t>(ballot);
+  return __popc(half & mask);
+#else
   return __popc(__ballot_sync(mask, pred));
+#endif  
 }
 
 struct alignas(8) TieValue {
