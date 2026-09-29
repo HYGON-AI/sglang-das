@@ -2,13 +2,15 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
+    _DeepEPDispatcherImplLowLatency,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_int8_moe import (
@@ -51,7 +53,7 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
     def test_low_latency_reuses_dispatch_quantization_and_returns_ll_combine(
         self,
     ):
-        layer = SimpleNamespace()
+        layer = SimpleNamespace(dispatcher=Mock())
         output = torch.empty((2, 8, 16), dtype=torch.bfloat16)
         self.method._run_deep_gemm_masked = Mock(return_value=output)
         dispatch_output = self.make_dispatch_output()
@@ -69,6 +71,88 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
             12,
             hidden_states_scale=self.hidden_states_scale,
         )
+        layer.dispatcher.record_combine_input_ready_event.assert_called_once_with()
+
+    def test_maybe_tbo_dispatcher_forwards_ready_event_to_its_only_inner(self):
+        dispatcher = MaybeTboDeepEPDispatcher.__new__(MaybeTboDeepEPDispatcher)
+        inner = Mock()
+        dispatcher._inners = [inner]
+
+        dispatcher.record_combine_input_ready_event()
+
+        inner.record_combine_input_ready_event.assert_called_once_with()
+
+    def test_maybe_tbo_dispatcher_rejects_ambiguous_tbo_inner(self):
+        dispatcher = MaybeTboDeepEPDispatcher.__new__(MaybeTboDeepEPDispatcher)
+        dispatcher._inners = [Mock(), Mock()]
+
+        with self.assertRaisesRegex(RuntimeError, "do not support TBO"):
+            dispatcher.record_combine_input_ready_event()
+
+    def test_low_latency_combine_waits_for_w4a8_producer_event(self):
+        impl = _DeepEPDispatcherImplLowLatency.__new__(
+            _DeepEPDispatcherImplLowLatency
+        )
+        producer_event = Mock()
+        finish_event = Mock()
+        finish_hook = Mock()
+        compute_stream = Mock()
+        timeline = Mock()
+        compute_stream.wait_event = timeline.wait_event
+        device_module = SimpleNamespace(
+            current_stream=Mock(return_value=compute_stream)
+        )
+        combined = torch.empty((3, 16), dtype=torch.bfloat16)
+        handle = object()
+        buffer = Mock()
+        buffer.low_latency_combine = timeline.low_latency_combine
+        timeline.low_latency_combine.return_value = (
+            combined,
+            finish_event,
+            finish_hook,
+        )
+
+        impl.device_module = device_module
+        impl._combine_input_ready_event = producer_event
+        impl._combine_input_ready_event_pending = False
+        impl._get_buffer = Mock(return_value=buffer)
+        impl.handle = handle
+        impl.overlap_args = None
+        impl.meta_overlap_args = None
+        impl.return_recv_hook = False
+        impl.packed_recv_count = None
+
+        impl.record_combine_input_ready_event()
+        with patch(
+            "sglang.srt.layers.moe.token_dispatcher.deepep."
+            "_deepep_precompile_tp_barrier"
+        ):
+            result = impl._combine_core(
+                combined,
+                self.topk_ids,
+                self.topk_weights,
+            )
+
+        producer_event.record.assert_called_once_with(compute_stream)
+        self.assertEqual(
+            timeline.mock_calls[:2],
+            [
+                call.wait_event(producer_event),
+                call.low_latency_combine(
+                    x=combined,
+                    topk_idx=self.topk_ids,
+                    topk_weights=self.topk_weights,
+                    handle=handle,
+                    zero_copy=False,
+                    async_finish=True,
+                    return_recv_hook=False,
+                ),
+            ],
+        )
+        self.assertIs(result[0], combined)
+        self.assertIs(result[1], finish_event)
+        self.assertIs(result[2], finish_hook)
+        self.assertFalse(impl._combine_input_ready_event_pending)
 
     def test_masked_gemm_reuses_int8_dispatch_input_and_returns_bf16(self):
         self.method.moe_runner_config = SimpleNamespace(
