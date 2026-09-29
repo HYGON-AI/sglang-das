@@ -1070,7 +1070,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             dtype=torch.int64,
             device=self.device,
         )
-        req_pool_idx = int(req.req_pool_idx)
+        req_pool_idx = int(req.kv.req_pool_idx)
         cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
         return self._kv_injector.inject_target_hidden(
             target_hidden=hidden,

@@ -374,7 +374,7 @@ def _release_donated_swa_slots(req: Req, tree_cache: BasePrefixCache) -> None:
     step. swa_evicted_seqlen marks what the window-aware path already took.
     """
     donated = int(getattr(req, "dsv4_donated_swa_len", 0) or 0)
-    if donated <= 0 or req.kv is None or req.req_pool_idx is None:
+    if donated <= 0 or not req.kv.holds_kv:
         return
     # Clear first: this must run once even if the free below is a no-op.
     req.dsv4_donated_swa_len = 0
@@ -384,7 +384,7 @@ def _release_donated_swa_slots(req: Req, tree_cache: BasePrefixCache) -> None:
     # Deliberately not bounded by swa_evicted_seqlen: free_swa_out_of_window_slots
     # raises that watermark to cache_protected_len without freeing anything, so
     # for the donated prefix it reads as evicted while the slots are still held.
-    indices = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx, :donated]
+    indices = tree_cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :donated]
     allocator.free_swa(indices)
 
 
