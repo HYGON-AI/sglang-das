@@ -304,11 +304,12 @@ class ModelSlimConfig(QuantizationConfig):
         proj_name = prefix.split(".")[-1]
         shard_names = fused_mapping.get(proj_name)
         if not shard_names:
-            return prefix
+            return self._resolve_quant_prefix(prefix)
 
         first_existing = None
         for shard_name in shard_names:
-            candidate = prefix.replace(proj_name, shard_name)
+            # Checkpoint names may keep block_sparse_moe / language_model.
+            candidate = self._resolve_quant_prefix(prefix.replace(proj_name, shard_name))
             scheme = self.quant_description.get(candidate + ".weight", "")
             if not scheme:
                 continue
