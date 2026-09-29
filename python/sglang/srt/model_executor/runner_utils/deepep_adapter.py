@@ -26,6 +26,7 @@ class DeepEPCudaGraphRunnerAdapter:
     def __init__(self) -> None:
         # Record DeepEP mode used during capture to ensure replay consistency.
         self._captured_deepep_mode = None
+        self._captured_low_latency_layout = None
 
     def capture(self, is_extend_in_batch: bool) -> None:
         if not get_moe_a2a_backend().is_deepep():
@@ -35,8 +36,16 @@ class DeepEPCudaGraphRunnerAdapter:
         )
         DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
 
+    def capture_end(self) -> None:
+        if self._captured_deepep_mode is not None:
+            self._captured_low_latency_layout = DeepEPBuffer.get_low_latency_layout()
+
     def replay(self) -> None:
         if not get_moe_a2a_backend().is_deepep():
             return
         assert self._captured_deepep_mode is not None
+        # Graph replay bypasses the Python dispatcher. Restore the layout
+        # recorded after warmup/capture, not the preceding model's layout.
+        if self._captured_low_latency_layout is not None:
+            DeepEPBuffer.set_low_latency_layout(*self._captured_low_latency_layout)
         DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
