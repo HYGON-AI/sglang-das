@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_mps,
     is_musa,
@@ -38,6 +39,7 @@ _HCU_ROPE_MAX_THREADS = 256
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -117,7 +119,7 @@ def _launch_rotary_embedding(
     rot_dim = int(cos_sin_cache.shape[-1])
     nq = query.numel() // num_tokens // head_size
     nk = 0 if key is None else key.numel() // num_tokens // head_size
-    if nq * rot_dim // 2 <= _HCU_ROPE_MAX_THREADS:
+    if not _is_hcu or nq * rot_dim // 2 <= _HCU_ROPE_MAX_THREADS:
         fn(positions, query, key, head_size, cos_sin_cache, is_neox)
         return
 
