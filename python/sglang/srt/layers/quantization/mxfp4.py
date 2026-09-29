@@ -686,7 +686,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if (
+            # HCU runs the MXFP4 Marlin path without the SM90+ requirement.
+            if not _is_hcu and (
                 not get_platform().is_sm90
                 and not get_platform().is_sm100
                 and not get_platform().is_sm120
@@ -1150,27 +1151,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the kernel accumulates them). Crucially there is no bf16 upcast of
             # the weights -- the whole point of MXFP4 on XPU.
             return
-        else:
+        elif not _is_hcu:
+            # HCU keeps the packed MXFP4 checkpoint layout: its Triton MoE
+            # kernels decode E2M1 in-register (use_mxfp4_w4a16 / use_mxfp4_w4a8).
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
-        #     w13_weight = upcast_from_mxfp(
-        #         layer.w13_weight,
-        #         layer.w13_weight_scale,
-        #         target_dtype=torch.bfloat16,
-        #         axis=-1,
-        #     )
-        #     w2_weight = upcast_from_mxfp(
-        #         layer.w2_weight,
-        #         layer.w2_weight_scale,
-        #         target_dtype=torch.bfloat16,
-        #         axis=-1,
-        #     )
-        #     del layer.w13_weight
-        #     del layer.w2_weight
-        #     del layer.w13_weight_scale
-        #     del layer.w2_weight_scale
-        #     layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-        #     layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+            w13_weight = upcast_from_mxfp(
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+            w2_weight = upcast_from_mxfp(
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
