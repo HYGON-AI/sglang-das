@@ -218,7 +218,8 @@ class KVArgsRegisterInfo:
                 if len(msg) > 20 and msg[20] != b""
                 else []
             ),
-            dst_state_types=unpack_state_types(msg[19]) if len(msg) > 19 else [],
+            # Index 19 carries kv_item_lens; state types follow the data formats.
+            dst_state_types=unpack_state_types(msg[21]) if len(msg) > 21 else [],
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -3920,12 +3921,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
                             packed_state_data_formats,
+                            packed_state_types,
                         ]
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
-                            packed_state_types,
                     f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
                 self.conclude_state = KVPoll.Failed
