@@ -21,6 +21,7 @@
 #     (gated MLA) and learnable attention sinks.
 
 import logging
+from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -28,6 +29,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_attn_tp_group, get_pp_group
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -66,6 +71,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
@@ -81,7 +91,7 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
+from sglang.srt.utils import BumpAllocator, LazyValue, add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -719,14 +729,27 @@ class HYV4Model(nn.Module):
         # Shared-indexer layers reuse the previous layer's topk, so carry it
         # through the loop the same way DeepseekV2Model.forward does.
         index_topk_share = IndexTopKShareState(forward_batch, None)
-        for layer in self.layers:
-            hidden_states, topk_indices = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                zero_allocator,
-                prev_topk_indices=index_topk_share.topk_indices,
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            # HYV4 reuses DeepseekV2MoE, whose forward paths do NOT wrap the
+            # expert selection in a layer context of their own -- they rely on
+            # the model loop to set the current layer for expert-distribution
+            # recording (dynamic EPLB dump). Mirror DeepseekV4Model.forward:
+            # skip the context under the TC_PIECEWISE piecewise-cuda-graph
+            # backend, where a context manager would force a dynamo graph break.
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            with ctx:
+                hidden_states, topk_indices = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    prev_topk_indices=index_topk_share.topk_indices,
+                )
             index_topk_share.update(topk_indices)
         index_topk_share.publish()
         if forward_batch.forward_mode.is_idle():
@@ -775,6 +798,26 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=getattr(config, "n_group", None),
+        )
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
