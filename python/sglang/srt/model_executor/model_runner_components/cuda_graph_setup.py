@@ -317,12 +317,21 @@ def refresh_deep_gemm_layout_memory_budget(
         set_masked_standard_layout_memory_budget,
     )
 
-    world_group = get_parallel().world_group
+    parallel = get_parallel()
+    if parallel.pp_size > 1:
+        # The speculative draft runner exists only on the last PP stage, so a
+        # world-group all-reduce here would deadlock against the collectives
+        # the other stages enter. Every rank of this TP group runs this branch.
+        memory_group = parallel.tp_group
+        distributed = memory_group.world_size > 1
+    else:
+        memory_group = parallel.world_group
+        distributed = parallel.launch_world_size > 1
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_parallel().launch_world_size > 1,
-        cpu_group=world_group.cpu_group,
+        distributed=distributed,
+        cpu_group=memory_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(
         int(available_memory_gb * (1 << 30))
