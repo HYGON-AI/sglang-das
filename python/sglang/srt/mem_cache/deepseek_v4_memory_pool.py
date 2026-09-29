@@ -49,6 +49,14 @@ from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
 
+DSV4_TRANSFER_C4_KV = "dsv4_c4_kv"
+DSV4_TRANSFER_C4_INDEXER_KV = "dsv4_c4_indexer_kv"
+DSV4_TRANSFER_C128_KV = "dsv4_c128_kv"
+DSV4_TRANSFER_SWA_KV = "dsv4_swa_kv"
+DSV4_TRANSFER_ATTENTION_STATE = "dsv4_attention_state"
+DSV4_TRANSFER_INDEXER_STATE = "dsv4_indexer_state"
+DSV4_TRANSFER_C128_STATE = "dsv4_c128_state"
+
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
@@ -973,6 +981,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        cp_cache_layer_split_layout=None,
     ):
         super().__init__(
             swa_size,
@@ -1112,6 +1121,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_head_dim = indexer_head_dim
 
         stage_layer_num = len(stage_ratios)
+        self.cp_cache_layer_split_layout = cp_cache_layer_split_layout
+        swa_layer_num = (
+            cp_cache_layer_split_layout.swa_layer_num
+            if cp_cache_layer_split_layout is not None
+            else stage_layer_num
+        )
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
@@ -1193,7 +1208,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 size=swa_size,
                 page_size=swa_kv_page_size,
                 dtype=dtype,
-                layer_num=stage_layer_num,
+                layer_num=swa_layer_num,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
@@ -1329,6 +1344,64 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_kv_transfer_layout(self) -> List[Tuple[str, int]]:
+        """One descriptor for every page buffer in get_contiguous_buf_infos."""
+        if self._unified_kv:
+            return []
+        layout: List[Tuple[str, int]] = []
+        for ratio, kv_pool in self.kv_pools.items():
+            sources = self.sources_by_ratio.get(ratio, ())
+            if kv_pool is not None:
+                family = {
+                    4: DSV4_TRANSFER_C4_KV,
+                    128: DSV4_TRANSFER_C128_KV,
+                }.get(ratio, f"c{ratio}_kv")
+                layout.extend((family, source) for source in sources)
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is None:
+                continue
+            family = (
+                DSV4_TRANSFER_C4_INDEXER_KV
+                if ratio == 4
+                else f"c{ratio}_indexer"
+            )
+            layout.extend((family, source) for source in sources)
+            if indexer_pool.index_k_with_scale_buffer is None:
+                layout.extend(
+                    (f"c{ratio}_indexer_scale", source) for source in sources
+                )
+        return layout
+
+    def get_state_transfer_layout(self) -> List[Tuple[str, int]]:
+        """Descriptors for SWA and token-addressed compression state."""
+        layout: List[Tuple[str, int]] = []
+        if self.swa_kv_pool is not None:
+            layout.extend(
+                (DSV4_TRANSFER_SWA_KV, layer_id)
+                for layer_id in range(
+                    self._stage_start,
+                    self._stage_start + len(self.swa_kv_pool.kv_buffer),
+                )
+            )
+        layout.extend(
+            (DSV4_TRANSFER_ATTENTION_STATE, layer_id)
+            for layer_id, pool in enumerate(self.compress_state_pools)
+            if pool is not None and not pool.request_scoped
+        )
+        layout.extend(
+            (DSV4_TRANSFER_INDEXER_STATE, layer_id)
+            for layer_id, pool in enumerate(self.indexer_compress_state_pools)
+            if pool is not None and not pool.request_scoped
+        )
+        return layout
+
+    def get_request_state_transfer_layout(self) -> List[Tuple[str, int]]:
+        return [
+            (f"c{pool.ratio}_request_state", layer_id)
+            for layer_id, pool in enumerate(self.compress_state_pools)
+            if pool is not None and pool.request_scoped
+        ]
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
@@ -1480,6 +1553,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         slot = full-pool loc // ratio, page = page_size // ratio, so pages line up."""
         configs = self.compressed_pool_configs
         layer_counts = {ratio: stage_ratios.count(ratio) for ratio in configs}
+        split_layout = self.cp_cache_layer_split_layout
+        if split_layout is not None:
+            layer_counts.update(
+                {4: split_layout.c4_layer_num, 128: split_layout.c128_layer_num}
+            )
         # Keep empty pools and allocation order for PP stages without a given ratio.
         self.kv_pools: dict[int, Optional[DeepSeekV4SingleKVPool]] = {
             ratio: None for ratio in configs
@@ -1516,11 +1594,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
             for ratio, sources in low_ratio_sources.items():
+                source_count = len(sources)
+                if split_layout is not None:
+                    source_count = (
+                        split_layout.c1_layer_num
+                        if ratio == 1
+                        else split_layout.c2_layer_num
+                    )
                 self.kv_pools[ratio] = self._make_kv_pool(
                     size=self.full_size // ratio,
                     page_size=page_size // ratio,
                     dtype=dtype,
-                    layer_num=len(sources),
+                    layer_num=source_count,
                     device=device,
                     enable_memory_saver=enable_memory_saver,
                     global_page_size=page_size,

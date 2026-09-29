@@ -162,6 +162,10 @@ class Parallel(msgspec.Struct):
         bool,
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
     ] = False
+    enable_cp_cache_layer_split: A[
+        bool,
+        "Split DeepSeek V4.1 prefill SWA and compressed KV layers across CP ranks. Requires interleave CP and Mooncake PD transfer.",
+    ] = False
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",

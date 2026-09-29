@@ -181,6 +181,12 @@ def handle_model_specific_adjustments(server_args: Any):
             "--enable-dsa-cache-layer-split is only supported for DSA "
             "(DeepSeek Sparse Attention) models."
         )
+    if cfg.enable_cp_cache_layer_split:
+        from sglang.srt.mem_cache.cp_cache_layer_split.validation import (
+            validate_cp_cache_layer_split,
+        )
+
+        validate_cp_cache_layer_split(cfg, hf_config)
 
     if cfg.enable_cp_decode_attn_tp:
         from sglang.srt.layers.cp.cp_decode_attn_tp import (

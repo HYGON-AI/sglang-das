@@ -1060,6 +1060,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
 
         self.num_layers_total = len(self.compression_ratios)
+        self.use_cp_cache_layer_split = bool(
+            getattr(get_parallel(), "enable_cp_cache_layer_split", False)
+        )
+        self.swa_priced_layers = self.num_layers_total
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
         # The low-ratio indexer pools are built with force_fp4=True
@@ -1073,6 +1077,44 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
             and cfg.compress_ratios[l] in (1, 2)
         )
+        if self.use_cp_cache_layer_split:
+            from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
+                build_cp_cache_layer_split_deepseek_v4_pool_layout,
+            )
+
+            cp_size = get_parallel().attn_cp_size
+            layouts = [
+                build_cp_cache_layer_split_deepseek_v4_pool_layout(
+                    rank,
+                    cp_size,
+                    kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer,
+                    cfg.compress_ratios,
+                    cfg.hf_config.kv_source_layer_ids,
+                )
+                for rank in range(cp_size)
+            ]
+            self.swa_priced_layers = max(l.swa_layer_num for l in layouts) + 1
+            owner_kv_bytes = max(
+                (l.c1_layer_num + l.c2_layer_num / 2) * self.kv_bytes
+                for l in layouts
+            )
+            replicated_indexer_bytes = sum(
+                low_ratio_index_bytes / cfg.compress_ratios[l]
+                for l in cfg.hf_config.kv_source_layer_ids
+                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+                and cfg.compress_ratios[l] in (1, 2)
+            )
+            staging_kv_bytes = max(
+                (self.kv_bytes / cfg.compress_ratios[l]
+                 for l in cfg.hf_config.kv_source_layer_ids
+                 if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+                 and cfg.compress_ratios[l] in (1, 2)),
+                default=0,
+            )
+            self.low_ratio_bytes_per_full_token = (
+                owner_kv_bytes + replicated_indexer_bytes + staging_kv_bytes
+            )
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             dsv4_unified_row_bytes,
         )
@@ -1258,7 +1300,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         return (
-            self.kv_bytes * self.num_layers_total
+            self.kv_bytes * self.swa_priced_layers
             + c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers_ca4

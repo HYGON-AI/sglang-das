@@ -126,6 +126,12 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prefetch_cp_kv_extra,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1789,6 +1795,10 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        layer_split_cp = (
+            is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -1835,9 +1845,10 @@ class MQALayer(MqaAttentionBase):
             and not is_decode
             and not forward_batch.forward_mode.is_target_verify()
         )
-        do_fused_qk_norm_rope = (
-            unified and (is_decode or fuse_verify or fuse_prefill)
-        ) or (not unified and self.use_fused_qk_norm_rope)
+        do_fused_qk_norm_rope = not layer_split_cp and (
+            (unified and (is_decode or fuse_verify or fuse_prefill))
+            or (not unified and self.use_fused_qk_norm_rope)
+        )
 
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
@@ -2122,7 +2133,15 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant=None,
     ) -> torch.Tensor:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+        layer_split_prefill = (
+            is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
+        if (
+            not get_attn_tp_context().input_scattered
+            and x.shape[0] == 0
+            and not layer_split_prefill
+        ):
             return x
 
         attn_backend = get_attn_backend()
@@ -2328,6 +2347,15 @@ class MQALayer(MqaAttentionBase):
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
             )
+
+        if layer_split_prefill:
+            pool = get_token_to_kv_pool()
+            maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
+            if self.compress_ratio in (1, 2):
+                maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            maybe_wait_cp_kv_swa_prefetch(pool, self.layer_id, forward_batch)
+            if x.shape[0] == 0 and not get_attn_tp_context().input_scattered:
+                return x
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or

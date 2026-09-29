@@ -129,6 +129,10 @@ from sglang.srt.layers.dp_attention import (
     set_local_dp_buffer_len,
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prepare_cp_cache_layer_split_forward,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -2503,6 +2507,7 @@ class DeepseekV4AttnBackend(
             return
 
         self.encoder_replay = forward_batch.encoder_swa_replay
+        maybe_prepare_cp_cache_layer_split_forward(self.token_to_kv_pool, forward_batch)
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -3409,9 +3414,28 @@ class DeepseekV4AttnBackend(
             )
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        topk_transform_ragged_v2(
-            logits, compress_lens, out_offsets=ks, out_indices=selected
-        )
+        if _is_hcu and is_cp_cache_layer_split_deepseek_v4_pool(
+            self.token_to_kv_pool
+        ):
+            # The HIP topk_v2 JIT launcher has no .config() API. Keep this
+            # correctness fallback scoped to LayerSplit until its JIT kernel is
+            # supported on HCU; the normal V4.1 path remains unchanged.
+            columns = torch.arange(logits.shape[1], device=device)[None, :]
+            valid = (columns >= ks[:, None]) & (
+                columns < (ks + compress_lens)[:, None]
+            )
+            count = min(topk, logits.shape[1])
+            ranked = logits.masked_fill(~valid, -torch.inf).topk(
+                count, dim=-1
+            ).indices
+            selected.fill_(-1)
+            selected[:, :count] = torch.where(
+                valid.gather(1, ranked), ranked, -1
+            ).to(torch.int32)
+        else:
+            topk_transform_ragged_v2(
+                logits, compress_lens, out_offsets=ks, out_indices=selected
+            )
         if indexer.uses_candidates and not indexer.is_candidate_source:
             selected = mask_topk_scores(logits, selected, ks)
         # ascending positions, padding last: the layout the consumers expect
@@ -4132,6 +4156,14 @@ class DeepseekV4AttnBackend(
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+            if is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool):
+                swa_page_indices = token_to_kv_pool.remap_swa_indices_for_read(
+                    layer_id, swa_page_indices
+                )
+                if extra_indices is not None:
+                    extra_indices = token_to_kv_pool.remap_extra_indices_for_read(
+                        layer_id, extra_indices
+                    )
 
             def match_num_queries(x, value):
                 if x is None or x.shape[0] == q.shape[0]:
@@ -4436,6 +4468,16 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
+        swa_token_ids = cache.swa_token_ids
+        if is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool):
+            swa_token_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                layer_id, swa_token_ids, family="swa"
+            )
+            if flat_token_ids is not None:
+                flat_token_ids = token_to_kv_pool.remap_flat_token_ids_for_read(
+                    layer_id, flat_token_ids, family="extra"
+                )
+
         if compressed_slice is not None:
             dequantize_k_cache_paged(
                 extra_k_cache,
@@ -4446,7 +4488,7 @@ class DeepseekV4AttnBackend(
             )
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
+            swa_token_ids,
             page_size=cache.swa_page_size,
             out=swa_slice,
             layout=token_to_kv_pool.get_swa_key_layout(),
