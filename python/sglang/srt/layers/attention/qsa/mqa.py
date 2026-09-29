@@ -309,7 +309,14 @@ def tilelang_qsa_mqa_prefill(
             torch.ones_like(logits, dtype=torch.bool), -float("inf")
         )
     heads, head_dim = q.shape[1:]
-    block_q = max(1, 128 // heads)
+    # HIP LDS is 64KB. The CUDA launch (threads=512, num_stages=3,
+    # block_q=128//heads) pipelines three K tiles and overflows (~80KB).
+    # Keep GEMM N = block_q * heads = 128 (MFMA-aligned), drop the pipeline
+    # replicas and match the decode kernel's 128-thread CTA.
+    if is_hip():
+        threads, num_stages, block_q = 128, 1, 32
+    else:
+        threads, num_stages, block_q = 512, 3, max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
     # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
@@ -323,7 +330,13 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
+    _tilelang_qsa_mqa_prefill_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        num_stages=num_stages,
+        threads=threads,
+    )(
         q_padded.reshape(-1, head_dim),
         k[:, 0].to(torch.bfloat16).contiguous(),
         logits,
