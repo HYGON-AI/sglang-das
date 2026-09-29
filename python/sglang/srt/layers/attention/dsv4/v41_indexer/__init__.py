@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.srt.utils import is_hcu
+
 from .full_topk import FullTopKIndexer
 from .types import (
     CandidateMetadata,
@@ -42,12 +44,21 @@ __all__ = [
 @functools.cache
 def is_sm100_or_newer() -> bool:
     # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper takes the torch indexer.
-    return torch.cuda.get_device_capability()[0] >= 10
+    return torch.version.cuda is not None and torch.cuda.get_device_capability()[0] >= 10
 
 
 @functools.cache
 def has_dense_fp4_indexer() -> bool:
-    if not torch.cuda.is_available() or torch.version.cuda is None:
+    if not torch.cuda.is_available():
+        return False
+    if is_hcu():
+        try:
+            from lightop import op as lightop_op
+            from lightop.attention import fp8_fp4_mqa_logits
+        except (ImportError, AttributeError):
+            return False
+        return callable(fp8_fp4_mqa_logits) and hasattr(lightop_op, "fp8_fp4_mqa_logits")
+    if torch.version.cuda is None:
         return False
     try:
         import deep_gemm
@@ -63,7 +74,7 @@ def _use_deep_gemm_prefill() -> bool:
     from sglang.srt.runtime_context import get_parallel
 
     return (
-        is_sm100_or_newer()
+        (is_hcu() or is_sm100_or_newer())
         and has_dense_fp4_indexer()
         and (
             get_parallel().attn_cp_size > 1

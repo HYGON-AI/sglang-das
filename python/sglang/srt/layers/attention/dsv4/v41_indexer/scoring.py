@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.utils import is_hcu
+
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 
@@ -44,7 +46,7 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     rows_per_request: List[int]  # query rows of each request
     compress_lens: torch.Tensor  # [rows] int32, compressed positions the row sees
     q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
+    q_sf: Optional[torch.Tensor]  # HCU uses BF16 Q without a separate scale
     weights: torch.Tensor  # [rows, heads] fp32 head weights
 
     @property
@@ -169,8 +171,8 @@ def get_deep_gemm_prefill_data(
         return None
     k_slots = torch.cat(slot_chunks)
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    q_fp4, q_sf = quantize_index_q(q)
-    weights = indexer.head_weights(inputs.x).float()
+    q_fp4, q_sf = (q.contiguous(), None) if is_hcu() else quantize_index_q(q)
+    weights = indexer.head_weights(inputs.x).float().contiguous()
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     request_starts = torch.repeat_interleave(
         torch.tensor(starts, dtype=torch.int32, device=device),

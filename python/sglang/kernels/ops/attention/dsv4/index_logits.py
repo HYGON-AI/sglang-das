@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_hcu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
@@ -35,7 +35,7 @@ def flat_index_logits_rows_per_tile(
 
 def flat_index_logits_tiles(
     *,
-    q: tuple[torch.Tensor, torch.Tensor],
+    q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     starts: torch.Tensor,
@@ -48,7 +48,10 @@ def flat_index_logits_tiles(
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
     aligned to ``width_align``."""
-    from deep_gemm import fp8_fp4_mqa_logits
+    if is_hcu():
+        from lightop.attention import fp8_fp4_mqa_logits
+    else:
+        from deep_gemm import fp8_fp4_mqa_logits
 
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), width_align)
@@ -63,7 +66,7 @@ def flat_index_logits_tiles(
         yield (
             tile,
             fp8_fp4_mqa_logits(
-                (q[0][tile], q[1][tile]),
+                (q[0][tile].contiguous(), q[1][tile] if q[1] is not None else None),
                 kv,
                 weights[tile],
                 tile_starts,
