@@ -365,14 +365,8 @@ def _has_dense_fp4_indexer() -> bool:
             from lightop.attention import fp8_fp4_mqa_logits
         except (ImportError, AttributeError):
             return False
-        arch = getattr(
-            torch.cuda.get_device_properties(torch.cuda.current_device()),
-            "gcnArchName",
-            "",
-        ).split(":", 1)[0]
         return (
-            arch in ("gfx936", "gfx938")
-            and callable(fp8_fp4_mqa_logits)
+            callable(fp8_fp4_mqa_logits)
             and hasattr(lightop_op, "fp8_fp4_mqa_logits")
         )
     if torch.version.cuda is None:
