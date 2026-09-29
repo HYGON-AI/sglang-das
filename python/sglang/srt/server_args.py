@@ -67,48 +67,6 @@ def _reasoning_parser_choices():
 
     return list(REASONING_PARSER_NAMES)
 
-# TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
-# Some of the choices here do NOT support online quantization.
-QUANTIZATION_CHOICES = [
-    "awq",
-    "fp8",  # MOE + linear online quantization.
-    "mxfp8",  # MOE + linear online quantization.
-    "gptq",
-    "marlin",
-    "gptq_marlin",
-    "awq_marlin",
-    "bitsandbytes",
-    "gguf",
-    # Modelopt has some online quantization support through ModelOptModelLoader.
-    "modelopt",
-    "modelopt_fp8",
-    "modelopt_fp4",
-    "nvfp4_online",
-    "modelopt_mixed",
-    "petit_nvfp4",
-    "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
-    "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
-    "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
-    "w4afp8",
-    "mxfp4",  # MOE-only.
-    "auto-round",
-    "auto-round-int8",
-    "compressed-tensors",  # for Ktransformers
-    "modelslim",  # for NPU
-    "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
-    "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
-    "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
-    # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
-    # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
-    "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
-    "mlx_q8",  # 8 bits, group_size=64
-    "unquant",
-    "slimquant_marlin",
-    "humming",
-    "slimquant_w4a8_marlin",
-]
-
 def _tool_call_parser_choices():
     module = sys.modules.get("sglang.srt.function_call.function_call_parser")
     if module is not None:

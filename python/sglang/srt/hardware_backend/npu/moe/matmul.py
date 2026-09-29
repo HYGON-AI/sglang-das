@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from typing import Tuple
 from typing import Any, Optional
@@ -6,6 +7,8 @@ import torch
 from sglang.srt.environ import envs
 
 from sglang.kernels.npu_kernels.npu_grouped_matmul_triton import grouped_matmul_triton
+
+logger = logging.getLogger(__name__)
 
 
 def _unwrap(v: Any) -> Optional[torch.Tensor]:
