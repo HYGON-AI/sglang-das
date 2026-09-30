@@ -124,6 +124,7 @@ def _run_causal_conv1d_update(
         conv_state_indices=conv_state_indices,
     )
 
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
@@ -360,6 +361,7 @@ class KDAKernelDispatcher:
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"verify={self.verify_kernel.__class__.__name__}, "
+            f"verify_impl={getattr(self.verify_kernel, 'verify_impl_name', 'native')} "
             f"extend={self.extend_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
@@ -1196,41 +1198,51 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         has_initial_state = forward_batch.extend_prefix_lens > 0
         if _hcu_causal_conv1d_fn is not None:
-                # The HCU library accepts each Q/K/V group separately; preserve the
-                # main packed path on other devices.
-                splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-                q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-                q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-                    splits, dim=0
-                )
-                q_conv_state, k_conv_state, v_conv_state = conv_states.split(
-                    splits, dim=-2
-                )
-                if layer.bias is not None:
-                    q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-                else:
-                    q_bias, k_bias, v_bias = None, None, None
-                q = _run_causal_conv1d_fn(
-                    q, q_conv_weight, q_bias,
-                    activation="silu", conv_states=q_conv_state,
-                    has_initial_state=has_initial_state, cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                ).transpose(0, 1)
-                k = _run_causal_conv1d_fn(
-                    k, k_conv_weight, k_bias,
-                    activation="silu", conv_states=k_conv_state,
-                    has_initial_state=has_initial_state, cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                ).transpose(0, 1)
-                v = _run_causal_conv1d_fn(
-                    v, v_conv_weight, v_bias,
-                    activation="silu", conv_states=v_conv_state,
-                    has_initial_state=has_initial_state, cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                ).transpose(0, 1)
+            # The HCU library accepts each Q/K/V group separately; preserve the
+            # main packed path on other devices.
+            splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+            q = _run_causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = _run_causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = _run_causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
         else:
             qkv = self._convolve_prefill(
                 layer, forward_batch, mixed_qkv, conv_states, cache_indices
