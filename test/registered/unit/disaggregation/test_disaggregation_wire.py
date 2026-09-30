@@ -194,7 +194,7 @@ class TestDisaggregationWire(unittest.TestCase):
 
     def test_state_component_matching_uses_type_occurrence(self):
         src_state_types = [StateType.SWA, StateType.SWA]
-        dst_state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
+        dst_state_types = [StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA]
 
         self.assertEqual(
             resolve_state_component_dst_index(src_state_types, dst_state_types, 0),
@@ -206,7 +206,7 @@ class TestDisaggregationWire(unittest.TestCase):
         )
 
     def test_state_types_roundtrip(self):
-        state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA_RING]
+        state_types = [StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA_RING]
 
         self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
 

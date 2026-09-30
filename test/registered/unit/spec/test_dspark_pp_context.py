@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -35,6 +36,9 @@ from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa:
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class _TupleLinear(torch.nn.Module):
@@ -192,11 +196,15 @@ class TestDSparkPPContext(CustomTestCase):
             enable_mamba_track=False,
             hc_hidden_size=16,
         )
-        eager_buffers = _allocate_decode_buffers(vocab_size=8, **common_kwargs)
-        graph_buffers = DecodeInputBuffers.create(
-            next_token_logits_buffer=torch.zeros((max_num_token, 8)),
-            **common_kwargs,
-        )
+        eager_kwargs = {
+            k: v for k, v in common_kwargs.items() if k not in ("dp_size", "pp_size")
+        }
+        with get_parallel().override(dp_size=1, pp_size=8, moe_ep_size=1):
+            eager_buffers = _allocate_decode_buffers(vocab_size=8, **eager_kwargs)
+            graph_buffers = DecodeInputBuffers.create(
+                next_token_logits_buffer=torch.zeros((max_num_token, 8)),
+                **common_kwargs,
+            )
 
         self.assertEqual(
             eager_buffers.pp_proxy_tensors["hidden_states"].shape,
@@ -213,12 +221,15 @@ class TestDSparkPPContext(CustomTestCase):
         model = DFlashDraftModel.__new__(DFlashDraftModel)
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(hidden_size=hidden_size)
+        model.is_nemotron_35_draft = False
         model.num_context_features = 3
         model.fc = torch.nn.Linear(3 * hidden_size, hidden_size, bias=False)
         model.hidden_norm = RMSNorm(hidden_size, eps=1e-6)
+        model.to(_DEVICE)
 
         feature_hidden = [
-            torch.randn(5, hidden_size, dtype=torch.float32) for _ in range(3)
+            torch.randn(5, hidden_size, dtype=torch.float32, device=_DEVICE)
+            for _ in range(3)
         ]
         full_hidden = torch.cat(feature_hidden, dim=-1)
         full_projected = model.project_target_hidden(full_hidden)
@@ -237,8 +248,11 @@ class TestDSparkPPContext(CustomTestCase):
         hidden_size = 4
         model = _make_deepseek_v4_dspark_projection_model(
             hidden_size=hidden_size, num_target_features=3
-        )
-        features = [torch.randn(5, hidden_size, dtype=torch.float32) for _ in range(3)]
+        ).to(_DEVICE)
+        features = [
+            torch.randn(5, hidden_size, dtype=torch.float32, device=_DEVICE)
+            for _ in range(3)
+        ]
         full_projected = model.project_target_hidden(torch.cat(features, dim=-1))
 
         stage_0 = model.project_target_hidden_partial(
@@ -299,6 +313,7 @@ class TestDSparkPPContext(CustomTestCase):
     def test_context_only_rank_does_not_require_draft_attention_backend(self):
         target_backend = object()
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._is_context_only_pp_prefill_rank = True
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=target_backend)
@@ -309,6 +324,7 @@ class TestDSparkPPContext(CustomTestCase):
 
     def test_lifecycle_only_rank_does_not_allocate_draft_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._draft_worker = Mock()
         worker._is_lifecycle_only_pp_prefill_rank = True
 
@@ -318,11 +334,13 @@ class TestDSparkPPContext(CustomTestCase):
 
     def test_lifecycle_only_rank_does_not_publish_draft_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._is_lifecycle_only_pp_prefill_rank = True
         self.assertEqual(worker._draft_model_runners(), ())
 
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
@@ -346,6 +364,7 @@ class TestDSparkPPContext(CustomTestCase):
 
     def test_last_pp_prefill_keeps_full_draft_kv_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
         worker._draft_is_moe = True

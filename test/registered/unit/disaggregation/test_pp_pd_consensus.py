@@ -19,7 +19,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     _pp_merge_transfer_status,
 )
-from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.runtime_context import get_context, get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -65,6 +65,7 @@ class TestPPPDConsensus(CustomTestCase):
         queue.pp_size = 2
         queue.scheduler = SimpleNamespace(
             ps=SimpleNamespace(dp_rank=0, gpu_id=0),
+            rust_server=None,
             server_args=SimpleNamespace(disaggregation_ib_device=None),
             tp_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(kv_cache_dtype_str="auto")
@@ -72,6 +73,7 @@ class TestPPPDConsensus(CustomTestCase):
             model_config=SimpleNamespace(
                 num_hidden_layers=8,
                 get_total_num_kv_heads=lambda: 1,
+                hf_text_config=SimpleNamespace(),
             ),
             req_to_token_pool=None,
         )
@@ -195,6 +197,7 @@ class TestPPPDConsensus(CustomTestCase):
             handle_inflight_transfer_failure=handle_failure,
             output_streamer=SimpleNamespace(stream_output=Mock()),
             req_to_metadata_buffer_idx_allocator=object(),
+            scheduler_stage_metrics=None,
         )
 
         def mark_abort(target_req, message, status_code):
@@ -255,6 +258,7 @@ class TestPPPDConsensus(CustomTestCase):
                     "sglang.srt.disaggregation.prefill.setup_state_kv_args",
                 ),
                 get_context().override_server_args(disaggregation_ib_device=None),
+                get_parallel().override(dp_rank=0),
             ):
                 manager = queue._init_kv_manager()
             layer_ids_by_rank.append(manager.kv_args.kv_layer_ids)
