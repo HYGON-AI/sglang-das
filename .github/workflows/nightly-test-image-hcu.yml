@@ -31,7 +31,7 @@ env:
 
 jobs:
   citest:
-    runs-on: nmz4
+    runs-on: [ci, bw1100]
     container:
       image: ${{ inputs.docker_image }}
       options: --privileged --cap-add=SYS_PTRACE --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri

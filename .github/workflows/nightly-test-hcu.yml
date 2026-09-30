@@ -11,7 +11,7 @@ on:
         type: string
         default: ""
       runner_label:
-        description: "HCU runner label override"
+        description: "Deprecated; ignored. HCU jobs use the ci and bw1100 labels."
         required: false
         type: string
         default: ""
@@ -60,34 +60,26 @@ concurrency:
 jobs:
   validate-config:
     name: Validate HCU nightly config
-    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
+    runs-on: [ci, bw1100]
     outputs:
-      runner_label: ${{ steps.resolve.outputs.runner_label }}
       image: ${{ steps.resolve.outputs.image }}
       continue_on_error_flag: ${{ steps.resolve.outputs.continue_on_error_flag }}
       job_filter: ${{ steps.resolve.outputs.job_filter }}
       target_ref: ${{ steps.resolve.outputs.target_ref }}
       target_sha: ${{ steps.checkout.outputs.target_sha }}
     steps:
-      - name: Resolve HCU runner, image, ref, and filters
+      - name: Resolve HCU image, ref, and filters
         id: resolve
         env:
-          INPUT_RUNNER_LABEL: ${{ inputs.runner_label || '' }}
           INPUT_IMAGE: ${{ inputs.image || '' }}
           INPUT_REF: ${{ inputs.ref || '' }}
           INPUT_JOB_FILTER: ${{ inputs.job_filter || 'all' }}
-          VAR_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
           VAR_IMAGE: ${{ vars.HCU_CI_IMAGE_0518 || '' }}
           DEFAULT_IMAGE: 10.16.1.152:5000/jenkins/model_test_env/sglang:0.5.18-latest
           CONTINUE_ON_ERROR: ${{ inputs.continue_on_error || '' }}
           DEFAULT_TEST_REF: release/20260825_v0.5.18
         run: |
           set -euo pipefail
-          runner_label="${INPUT_RUNNER_LABEL:-${VAR_RUNNER_LABEL}}"
-          if [[ "${runner_label}" == "hcu-ci-pr" ]]; then
-            echo "Routing validation runner label hcu-ci-pr to hcu-ci-pr-2 for nmz4 test runner."
-            runner_label="hcu-ci-pr-2"
-          fi
           image="${INPUT_IMAGE:-${VAR_IMAGE:-${DEFAULT_IMAGE}}}"
           target_ref="${INPUT_REF:-${DEFAULT_TEST_REF}}"
           continue_on_error="${CONTINUE_ON_ERROR:-true}"
@@ -105,11 +97,6 @@ jobs:
               ;;
           esac
 
-          if [[ -z "${runner_label}" ]]; then
-            echo "::error::HCU runner label is required. Set vars.HCU_CI_RUNNER_LABEL or workflow input runner_label."
-            exit 1
-          fi
-
           if [[ -z "${image}" ]]; then
             echo "::error::HCU CI image is required. Set vars.HCU_CI_IMAGE_0518 or workflow input image."
             exit 1
@@ -120,7 +107,6 @@ jobs:
             continue_on_error_flag="--continue-on-error"
           fi
 
-          echo "runner_label=${runner_label}" >> "${GITHUB_OUTPUT}"
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
           echo "continue_on_error_flag=${continue_on_error_flag}" >> "${GITHUB_OUTPUT}"
@@ -181,7 +167,7 @@ jobs:
     name: Probe staged HCU wheels
     needs: validate-config
     if: needs.validate-config.result == 'success'
-    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    runs-on: [ci, bw1100]
     outputs:
       full_sha: ${{ steps.probe.outputs.full_sha }}
       short_sha: ${{ steps.probe.outputs.short_sha }}
@@ -308,7 +294,7 @@ jobs:
       - validate-config
       - probe-hcu-wheels
     if: needs.validate-config.result == 'success' && needs.probe-hcu-wheels.outputs.wheel_available != 'true'
-    runs-on: [self-hosted, hcu, nmz4]
+    runs-on: [ci, bw1100]
     timeout-minutes: 180
     defaults:
       run:
@@ -532,7 +518,7 @@ jobs:
       needs.validate-config.result == 'success' &&
       needs.probe-hcu-wheels.result == 'success' &&
       (needs.build-hcu-wheels.result == 'success' || needs.build-hcu-wheels.result == 'skipped')
-    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    runs-on: [ci, bw1100]
     outputs:
       wheel_urls: ${{ steps.wait.outputs.wheel_urls }}
     env:
@@ -658,7 +644,7 @@ jobs:
       needs.probe-hcu-wheels.result == 'success' &&
       (needs.build-hcu-wheels.result == 'success' || needs.build-hcu-wheels.result == 'skipped') &&
       needs.wait-hcu-wheels.result == 'success'
-    runs-on: ${{ needs.validate-config.outputs.runner_label }}
+    runs-on: [ci, bw1100]
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -1207,7 +1193,7 @@ jobs:
       - wait-hcu-wheels
       - nightly-hcu
     if: always()
-    runs-on: ${{ needs.validate-config.outputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
+    runs-on: [ci, bw1100]
     steps:
       - name: Check all dependent job statuses
         run: |
@@ -1244,7 +1230,7 @@ jobs:
       needs.validate-config.result == 'success' &&
       (needs.validate-config.outputs.job_filter == 'all' ||
        needs.validate-config.outputs.job_filter == 'nightly-hcu-accuracy-text')
-    runs-on: ${{ needs.validate-config.outputs.runner_label || vars.HCU_CI_RUNNER_LABEL }}
+    runs-on: [ci, bw1100]
     environment: hcu-ci-notify
     steps:
       - name: Checkout notification source
