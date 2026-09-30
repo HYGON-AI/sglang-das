@@ -5,14 +5,20 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
         DeepGemmCandidateIndexer,
     )
+
+# HIP/DCU resolves the block-level top-k to a prebuilt lightop op; NVIDIA to JIT.
+_IS_HCU = is_hcu()
 
 
 class CandidateMetadata:
@@ -75,12 +81,69 @@ def published_masks(candidate) -> CandidateMasks:
     return candidate
 
 
+@triton.jit
+def _mask_topk_kernel(
+    indices_ptr,
+    scores_ptr,
+    offsets_ptr,
+    out_ptr,
+    W,
+    K,
+    stride_ir,
+    stride_ik,
+    stride_sr,
+    stride_sc,
+    stride_or,
+    stride_ok,
+    HAS_OFF: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program per row: fuses the whole valid-mask + gather + masked_fill of
+    ``mask_topk_scores`` into a single kernel instead of ~10 eager elementwise
+    ops (cast, sub, clamp, gather, three compares, two ands, not, masked_fill)."""
+    r = tl.program_id(0)
+    k = tl.arange(0, BLOCK)
+    m = k < K
+    idx = tl.load(indices_ptr + r * stride_ir + k * stride_ik, mask=m, other=0)
+    col = idx.to(tl.int64)
+    if HAS_OFF:
+        col = col - tl.load(offsets_ptr + r).to(tl.int64)
+    in_range = (col >= 0) & (col < W)
+    col_c = tl.minimum(tl.maximum(col, 0), W - 1)
+    s = tl.load(
+        scores_ptr + r * stride_sr + col_c * stride_sc, mask=m, other=-float("inf")
+    )
+    valid = in_range & (s > -float("inf"))
+    tl.store(out_ptr + r * stride_or + k * stride_ok, tl.where(valid, idx, -1), mask=m)
+
+
 def mask_topk_scores(
     scores: torch.Tensor,
     indices: torch.Tensor,
     offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Keep masked indexer scores out of attention even when top-k underfills."""
+    if indices.is_cuda and indices.ndim == 2 and scores.ndim == 2:
+        rows, k_width = indices.shape
+        out = torch.empty_like(indices)
+        if rows and k_width:
+            _mask_topk_kernel[(rows,)](
+                indices,
+                scores,
+                indices if offsets is None else offsets,
+                out,
+                scores.shape[1],
+                k_width,
+                indices.stride(0),
+                indices.stride(1),
+                scores.stride(0),
+                scores.stride(1),
+                out.stride(0),
+                out.stride(1),
+                HAS_OFF=offsets is not None,
+                BLOCK=triton.next_power_of_2(k_width),
+            )
+        return out
     columns = indices.to(torch.int64)
     if offsets is not None:
         columns = columns - offsets[:, None]
@@ -89,6 +152,154 @@ def mask_topk_scores(
         (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
     )
     return indices.masked_fill(~valid, -1)
+
+
+# HCU lightop top-k reads a per-row identity page table and a cu_seqlens; both
+# depend only on (bs, wq), so cache them instead of rebuilding two aranges per
+# decode step. Never evicted: a captured graph replays the buffers it saw, so a
+# new (bs, wq) may not be materialised mid-capture -- warm the shape up first.
+_HCU_TOPK_TABLES: dict[
+    tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _hcu_topk_tables(
+    bs: int, wq: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Contiguous ``[bs, wq]`` identity page table (row-repeated ``arange(wq)``; the
+    native op indexes it by raw offset, so a stride-0 broadcast would read past
+    row 0) and ``arange(bs + 1)`` cu_seqlens, both int32."""
+    key = (bs, wq, device)
+    cached = _HCU_TOPK_TABLES.get(key)
+    if cached is not None:
+        return cached
+    assert not torch.cuda.is_current_stream_capturing(), (
+        f"HCU top-k tables for bs={bs}, wq={wq} built inside a CUDA graph capture; "
+        "warm up this shape before capture"
+    )
+    identity = torch.arange(wq, dtype=torch.int32, device=device).repeat(bs, 1)
+    cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device=device)
+    tables = (identity, cu_seqlens_q)
+    _HCU_TOPK_TABLES[key] = tables
+    return tables
+
+
+def _topk_block_ids(
+    keys: torch.Tensor, nblocks: torch.Tensor, topk_blocks: int
+) -> torch.Tensor:
+    """Top-k over the ``[bs, nblocks_amax]`` block-amax keys -> ``[bs, K]`` int32
+    raw block ids, ``-1`` past each row's ``nblocks[i]``.
+
+    HIP/DCU uses lightop's prebuilt exact-adaptive Top2048 op (no JIT); NVIDIA the
+    JIT v2 kernel with ``page_tables=None``. ``K`` is ``topk_blocks`` on HIP (the
+    lightop op is fixed width), ``min(topk_blocks, nblocks_amax)`` on NVIDIA."""
+    bs, nblocks_amax = keys.shape
+    if _IS_HCU:
+        import lightop
+
+        # SGL_USE_LIGHTOP_TOPK_BACKAND unset/0 selects the exact adaptive Top2048.
+        # The op needs a score width >= topk and reads each row only up to
+        # nblocks[i]; pad so an identity page table spans [0, topk) with an
+        # unread -inf tail, page_size 1 mapping selected index i to raw block i.
+        wq = max((nblocks_amax + 3) & ~3, topk_blocks)
+        if wq != nblocks_amax:
+            keys = F.pad(keys, (0, wq - nblocks_amax), value=-torch.inf)
+        identity, cu_seqlens_q = _hcu_topk_tables(bs, wq, keys.device)
+        return lightop.fast_topk_transform_fused(
+            keys, nblocks, identity, cu_seqlens_q, topk_blocks
+        )
+
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+
+    # v2 needs the score row stride to be a multiple of 4; pad with -inf.
+    key_pad = (-nblocks_amax) % 4
+    if key_pad:
+        keys = F.pad(keys, (0, key_pad), value=-torch.inf)
+    k = min(topk_blocks, nblocks_amax)
+    block_ids = torch.full((bs, k), -1, dtype=torch.int32, device=keys.device)
+    # page_tables=None yields raw block ids; the plan must precede the kernel.
+    plan = plan_topk_v2(nblocks)
+    topk_transform_paged_v2(keys, nblocks, None, block_ids, 1, plan)
+    return block_ids
+
+
+def _select_candidate_blocks_fused(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    topk_blocks: int,
+) -> torch.Tensor:
+    """Fast path for block_size==8: replaces the block-level ``torch.topk`` (which
+    lowers to the multi-kernel mbtopk radix reduction) with a fused top-k, then
+    expands the selected block ids to a position-level bool mask.
+
+    The block-amax step stays in torch: ``amax`` over a size-8 dim is a plain
+    reduction and never triggers mbtopk."""
+    bs, width = logits.shape
+
+    # Per-block amax: pad to a block boundary, then max over each group of 8.
+    pad = (-width) % 8
+    logits_aligned = (
+        F.pad(logits, (0, pad), value=-torch.inf) if pad else logits
+    )
+    # [bs, nblocks_amax]; the kernel needs fp32, contiguous on dim 1.
+    keys = logits_aligned.unflatten(-1, (-1, 8)).amax(dim=-1).to(torch.float32)
+
+    # Per-row block count; the top-k reads each row only up to nblocks[i].
+    lens1d = compress_lens.reshape(-1).to(torch.int32)  # [bs]
+    nblocks = lens1d.add(7).div(8, rounding_mode="floor").to(torch.int32)  # [bs]
+
+    # Force the newest block (+inf sentinel) so it is always selected.
+    last_block = (nblocks - 1).clamp(min=0).to(torch.int64)  # [bs]
+    keys.scatter_(1, last_block.unsqueeze(1), torch.inf)
+
+    block_ids = _topk_block_ids(keys, nblocks, topk_blocks)  # [bs, K] int32
+
+    # Expand block ids back to a position-level bool mask [bs, width].
+    k = block_ids.shape[1]
+    mask = torch.zeros(bs, width, dtype=torch.bool, device=logits.device)
+    valid = block_ids >= 0  # [bs, K]
+    _expand_blocks_kernel[(bs,)](
+        mask,
+        block_ids,
+        valid,
+        k,
+        width,
+        mask.stride(0),
+        block_ids.stride(0),
+        valid.stride(0),
+        BLOCK_K=triton.next_power_of_2(k),
+    )
+    return mask
+
+
+@triton.jit
+def _expand_blocks_kernel(
+    mask_ptr,
+    block_ids_ptr,
+    valid_ptr,
+    K,
+    W,
+    stride_mr,
+    stride_br,
+    stride_vr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 8,
+):
+    """One program per row: scatter each valid block id into 8 consecutive bool positions."""
+    r = tl.program_id(0)
+    k = tl.arange(0, BLOCK_K)
+    m = k < K
+    bid = tl.load(block_ids_ptr + r * stride_br + k, mask=m, other=-1)
+    ok = tl.load(valid_ptr + r * stride_vr + k, mask=m, other=0).to(tl.int1)
+    pos_base = bid * BLOCK_SIZE
+    # For each of the k blocks write 8 True entries; unroll over inner dim.
+    for i in tl.static_range(BLOCK_SIZE):
+        pos = pos_base + i  # [BLOCK_K]
+        in_range = ok & m & (pos >= 0) & (pos < W)
+        tl.store(mask_ptr + r * stride_mr + pos, tl.full([BLOCK_K], 1, tl.int1), mask=in_range)
 
 
 def select_candidate_blocks(
@@ -101,6 +312,17 @@ def select_candidate_blocks(
     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
     in logits, so an all -inf block means not reachable yet; the block holding the
     query's newest position is always kept."""
+    # Fast path: block_size==8 replaces the block-level torch.topk (mbtopk) with
+    # a fused top-k -- lightop's prebuilt Top2048 on HIP/DCU, the JIT v2 kernel
+    # on NVIDIA -- to avoid the multi-kernel reduction over the position dim.
+    if (
+        block_size == 8
+        and logits.is_cuda
+        and logits.ndim == 2
+        and isinstance(compress_lens, torch.Tensor)
+    ):
+        return _select_candidate_blocks_fused(logits, compress_lens, topk_blocks)
+
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
