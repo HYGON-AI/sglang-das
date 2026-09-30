@@ -25,7 +25,7 @@ jobs:
       group: release-nightly-hcu-${{ github.ref }}-py${{ matrix.python-version }}
       cancel-in-progress: true
     # ---- 自托管 HCU runner，在 Docker 容器内执行 ----
-    runs-on: [self-hosted, hcu]
+    runs-on: [ci, bw1100]
     timeout-minutes: 180
     defaults:
       run:
