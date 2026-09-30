@@ -283,13 +283,7 @@ gfx93::fwd::sparse_attn_fwd_kernel<...512...>
 - 只有 FlashMLA：可能开关未生效、KV 已经是 BF16，或走了其他输入路径。
 - P 和 D 都需要单独抓 trace；只验证 D 不能证明 P 的 Prefill 已启用。
 
-2026-08-22 的 5-step GPU trace 记录位于：
-
-```text
-/public/home/xdb4_10676/flash0731/w4a8/prof/BF16_FlashMLA_5steps_20260822_202941
-```
-
-该次 trace 的事件计数为：
+2026-08-22 抓取了一份 5-step GPU trace（存于内部归档，路径从略），其事件计数为：
 
 | 端 | 每 rank gather | 每 rank FlashMLA | 折算每 step |
 | --- | ---: | ---: | ---: |
