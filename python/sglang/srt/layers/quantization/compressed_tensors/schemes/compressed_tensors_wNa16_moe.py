@@ -70,9 +70,7 @@ _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_marlin_w4a16_moe = (
-    get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT") and _is_hcu
-)
+_use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT") and _is_hcu
 
 if _use_aiter:
     pass
@@ -320,12 +318,28 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
 
         if self.w13_zp is None:
-            self.w13_zp = torch.ones((num_experts, 2 * intermediate_size_per_partition, num_groups_w13 // 2 ), dtype=torch.uint8) * 136
+            self.w13_zp = (
+                torch.ones(
+                    (
+                        num_experts,
+                        2 * intermediate_size_per_partition,
+                        num_groups_w13 // 2,
+                    ),
+                    dtype=torch.uint8,
+                )
+                * 136
+            )
         if self.w2_zp is None:
-            self.w2_zp = torch.ones((num_experts, hidden_size, num_groups_w13 // 2), dtype=torch.uint8) * 136
+            self.w2_zp = (
+                torch.ones(
+                    (num_experts, hidden_size, num_groups_w13 // 2), dtype=torch.uint8
+                )
+                * 136
+            )
         if not self.sym:
             layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
             layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
@@ -612,8 +626,8 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, group_size],
-            w13_zp=None if self.sym else self.w13_zp,
-            w2_zp=None if self.sym else self.w2_zp,
+            w13_zp=None if (self.sym and (not _is_hcu or use_w4a8)) else self.w13_zp,
+            w2_zp=None if (self.sym and (not _is_hcu or use_w4a8)) else self.w2_zp,
         )
 
     def apply_weights(
