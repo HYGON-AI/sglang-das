@@ -111,7 +111,11 @@ def qk_gemma_rmsnorm_rope(
     """Return normalized+rotated Q/K tensors with the same shapes as ``q``/``k``."""
     assert q.dim() == 2 and k.dim() == 2
     assert positions.dim() == 1
-    assert q.shape[0] == k.shape[0] == positions.shape[0]
+    assert q.shape[0] == k.shape[0] == positions.shape[0], (
+        "MiniMax M3 fused QK-norm/RoPE token mismatch: "
+        f"q={tuple(q.shape)}, k={tuple(k.shape)}, "
+        f"positions={tuple(positions.shape)}"
+    )
     assert q.shape[1] % head_dim == 0
     assert k.shape[1] % head_dim == 0
     assert rotary_dim <= head_dim and rotary_dim % 2 == 0

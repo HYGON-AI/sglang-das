@@ -1,0 +1,86 @@
+import pytest
+import torch
+
+import sglang.srt.layers.layernorm as layernorm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-c-test-cpu")
+
+
+def test_hcu_rmsnorm_does_not_require_vllm_ops(monkeypatch):
+    class FakeLightOp:
+        @staticmethod
+        def fused_add_rms_norm_opt(x, residual, weight, eps):
+            residual.add_(x)
+            x.copy_(residual)
+
+        @staticmethod
+        def rms_norm_opt(out, x, weight, eps):
+            out.copy_(x + 1)
+
+    monkeypatch.setattr(layernorm, "_is_hcu", True)
+    monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", False)
+    monkeypatch.setattr(layernorm, "op", FakeLightOp(), raising=False)
+    norm = layernorm.RMSNorm(4, eps=1e-6)
+    x = torch.ones((1, 4))
+    residual = torch.full_like(x, 2)
+
+    out, residual_out = norm.forward_hip(x, residual)
+
+    assert out is x
+    assert residual_out is residual
+    torch.testing.assert_close(out, torch.full_like(out, 3))
+
+
+def test_hcu_gemma_rmsnorm_does_not_require_vllm_ops(monkeypatch):
+    def fake_gemma(x, residual, weight, eps):
+        return x + 1, residual + x
+
+    monkeypatch.setattr(layernorm, "_is_hcu", True)
+    monkeypatch.setattr(layernorm, "_has_vllm_rms_norm", False)
+    monkeypatch.setattr(layernorm, "_use_aiter", False)
+    monkeypatch.setattr(
+        layernorm, "gemma_fused_add_rmsnorm_hcu", fake_gemma, raising=False
+    )
+    norm = layernorm.GemmaRMSNorm(4, eps=1e-6)
+    x = torch.ones((1, 4))
+    residual = torch.full_like(x, 2)
+
+    out, residual_out = norm.forward_hip(x, residual)
+
+    torch.testing.assert_close(out, torch.full_like(out, 2))
+    torch.testing.assert_close(residual_out, torch.full_like(residual_out, 3))
+
+
+def test_gemma_lightop_fp8_quant_preserves_residual_contract(monkeypatch):
+    calls = []
+
+    def fake_quant(x, weight, eps, fp8type, residual, update_input):
+        calls.append((fp8type, update_input))
+        if residual is not None:
+            residual.add_(x)
+            source = residual
+        else:
+            source = x
+        scale = source.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-6)
+        return source / scale, scale
+
+    monkeypatch.setattr(layernorm, "_use_hcu_lightop_gemma_rmsnorm", True)
+    monkeypatch.setattr(
+        layernorm, "gemma_rms_norm_fp8_quant_hcu", fake_quant, raising=False
+    )
+    norm = layernorm.GemmaRMSNorm(4, eps=1e-6)
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    residual = torch.tensor([[0.5, 0.5, 0.5, 0.5]])
+    post = torch.tensor([[0.25, 0.25, 0.25, 0.25]])
+
+    quantized, residual_out = norm.forward_with_lightop_fp8_quant(x, residual, post)
+
+    assert calls == [(0, False)]
+    assert residual_out is not residual
+    torch.testing.assert_close(residual_out, torch.tensor([[1.75, 2.75, 3.75, 4.75]]))
+    assert len(quantized) == 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

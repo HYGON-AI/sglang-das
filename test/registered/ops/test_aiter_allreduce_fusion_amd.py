@@ -1,3 +1,6 @@
+from contextlib import ExitStack
+from unittest import mock
+from sglang.test.test_utils import CustomTestCase
 import csv
 import os
 import subprocess
@@ -17,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.communicator_patch import patch_communicator
-from sglang.test.test_utils import CustomTestCase, publish_build_topology
+from sglang.test.test_utils import publish_build_topology
 
 register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 
@@ -377,6 +380,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         disable_in_prefill=False,
         disable_in_decode=False,
         matching_group=True,
+        is_hcu=False,
     ):
         group = object()
         norm = types.SimpleNamespace(
@@ -389,6 +393,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
             patch_communicator("flashinfer_ar_fusion_applies", return_value=False),
             patch_communicator("post_experts_reduction_group", return_value=group),
             patch_communicator("_use_aiter", use_aiter),
+            patch_communicator("_is_hcu", is_hcu),
             get_parallel().override(tp_size=tp_world_size),
             get_context().override_server_args(
                 enable_aiter_allreduce_fusion=aiter_enabled,
@@ -491,6 +496,55 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                         forward_mode=mode,
                     )
                 )
+
+    def test_tp1_disables_fusion(self):
+        self._check_no_sum_deferred(tp_size=1, terminal=False)
+
+    def test_last_layer_disables_fusion(self):
+        self._check_no_sum_deferred(tp_size=8, terminal=True)
+
+    def _check_no_sum_deferred(self, *, tp_size, terminal):
+        from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
+        from sglang.srt.layers.layer_boundary.exit import exit_facts
+
+        plan = types.SimpleNamespace(finishes_directly=False, terminal=terminal)
+        output = types.SimpleNamespace(
+            may_reduce_scatter=False, may_defer_to_next=False
+        )
+        path = types.SimpleNamespace(
+            output=output, returns_over_dp=False, output_move_completes_sum=False
+        )
+        with get_parallel().override(tp_size=tp_size):
+            facts = exit_facts(StageKind.FFN, plan, BatchVariant.ORDINARY, path)
+        self.assertFalse(facts.may_defer_sum)
+        self.assertFalse(facts.single_sum)
+
+    def test_compute_aiter_flag_is_independent_from_custom_ar(self):
+        for is_hcu in (False, True):
+            with self.subTest(is_hcu=is_hcu):
+                self.assertEqual(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        use_aiter=False,
+                        aiter_enabled=True,
+                        is_hcu=is_hcu,
+                    ),
+                    is_hcu,
+                )
+
+    def test_dp_attention_and_ep_disables_fusion(self):
+        backend = types.SimpleNamespace(is_none=lambda: False)
+        for dp_enabled in (False, True):
+            with (
+                patch.object(moe_utils, "get_moe_a2a_backend", return_value=backend),
+                get_flags().dp.override(enabled=dp_enabled),
+            ):
+                self.assertFalse(moe_utils.post_experts_sum_is_one_all_reduce())
+
+    def test_ep_backend_disables_fusion(self):
+        backend = types.SimpleNamespace(is_none=lambda: False)
+        with patch.object(moe_utils, "get_moe_a2a_backend", return_value=backend):
+            self.assertFalse(moe_utils.post_experts_sum_is_one_all_reduce())
 
 
 if __name__ == "__main__":

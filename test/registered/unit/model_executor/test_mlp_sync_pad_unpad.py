@@ -96,6 +96,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         batch = SimpleNamespace(
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
+            global_cp_num_tokens=None,
             can_run_decode_cuda_graph=True,
             can_run_dp_draft_cuda_graph=False,
             dp_spec_prefill_coordination_applied=False,
@@ -297,6 +298,72 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+    def test_draft_input_without_hidden_states_can_be_padded(self):
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        spec_info = EagleDraftInput(hidden_states=None)
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            input_ids=torch.tensor([11]),
+            req_pool_indices=torch.tensor([5]),
+            seq_lens=torch.tensor([7]),
+            out_cache_loc=torch.tensor([0]),
+            seq_lens_sum=7,
+            positions=torch.tensor([6]),
+            seq_lens_cpu=torch.tensor([7]),
+            lora_ids=[None],
+            spec_info=spec_info,
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=2, bs=1)
+
+        self.assertIsNone(spec_info.hidden_states)
+
+    def test_deferred_mlp_sync_metadata_materializes_only_for_eager_fallback(self):
+        spec_info = SimpleNamespace(
+            num_tokens_per_req=4,
+            num_tokens_for_logprob_per_req=2,
+        )
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=2,
+            input_ids=torch.arange(8),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+            out_cache_loc=torch.arange(8),
+            seq_lens_sum=11,
+            positions=torch.arange(8),
+            spec_info=spec_info,
+        )
+        batch = SimpleNamespace(
+            global_num_tokens=[2, 0, 3],
+            global_num_tokens_for_logprob=[2, 0, 3],
+            global_cp_num_tokens=None,
+            can_run_decode_cuda_graph=True,
+            can_run_dp_draft_cuda_graph=False,
+            dp_spec_prefill_coordination_applied=False,
+        )
+
+        fb.init_mlp_sync_metadata(
+            batch,
+            torch.device("cpu"),
+            materialize_device_tensors=False,
+        )
+
+        self.assertEqual(fb.original_global_num_tokens_cpu, [2, 0, 3])
+        self.assertEqual(fb.global_num_tokens_cpu, [8, 0, 12])
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [4, 0, 6])
+        self.assertIsNone(fb.global_num_tokens_gpu)
+        self.assertIsNone(fb.global_num_tokens_for_logprob_gpu)
+
+        fb.materialize_deferred_device_metadata(torch.device("cpu"))
+
+        torch.testing.assert_close(fb.global_num_tokens_gpu, torch.tensor([8, 0, 12]))
+        torch.testing.assert_close(
+            fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
+        )
 
 
 class TestDraftScopeMlpSync(CustomTestCase):

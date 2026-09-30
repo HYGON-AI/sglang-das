@@ -27,9 +27,10 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_spec,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, is_hcu
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 from sglang.srt.utils.common import log_info_on_rank0
 
@@ -53,9 +54,7 @@ _dspark_w4a8_tpmoe_backend_override = ContextVar(
 )
 
 
-def normalize_w4a8_tpmoe_backend(
-    requested_backend: str, *, env_name: str
-) -> str:
+def normalize_w4a8_tpmoe_backend(requested_backend: str, *, env_name: str) -> str:
     backend = requested_backend.strip().lower()
     if backend not in W4A8_TPMOE_BACKENDS:
         supported = ", ".join(repr(value) for value in sorted(W4A8_TPMOE_BACKENDS))
@@ -630,7 +629,6 @@ def will_use_aiter_moe() -> bool:
     ) and get_moe_a2a_backend().supports_aiter()
 
 
-
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
     moe = get_flags().moe
     if moe.speculative_runner_backend is None:
@@ -826,13 +824,13 @@ def get_tbo_token_distribution_threshold() -> float:
     return moe.tbo_token_distribution_threshold
 
 
-
 def should_use_flashinfer_trtllm_moe():
     return get_moe_runner_backend().is_flashinfer_trtllm() and (
         not importlib.util.find_spec("flashinfer")
         or pkg_version.parse(__import__("flashinfer").__version__)
         >= pkg_version.parse("0.2.9rc1")
     )
+
 
 def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     """
@@ -856,6 +854,25 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_flags().moe.quantization == "modelopt_fp4"
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
+    )
+
+
+def hcu_moe_tp_matches_attention_tp() -> bool:
+    """Standard TP MoE can keep attention-local rows when group membership agrees.
+
+    EP or CP layouts are excluded: matching sizes alone do not prove membership.
+    The output still owes a MoE-TP sum; it is not an A2A-complete output.
+    """
+    if not _is_hcu or not is_dp_attention_enabled():
+        return False
+    parallel = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and parallel.attn_cp_size == 1
+        and parallel.moe_ep_size == 1
+        and parallel.attn_dp_size > 1
+        and parallel.moe_dp_size == parallel.attn_dp_size
+        and parallel.moe_tp_size == parallel.attn_tp_size
     )
 
 

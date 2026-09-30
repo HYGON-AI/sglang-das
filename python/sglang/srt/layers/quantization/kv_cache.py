@@ -7,6 +7,7 @@ import logging
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -57,6 +58,21 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                 k_scale *= 2
                 v_scale *= 2
         elif layer.k_scale <= 0.0 and layer.v_scale <= 0.0:
+            kv_cache_scheme = getattr(self.quant_config, "kv_cache_scheme", None)
+            require_checkpoint_scales = (
+                bool(
+                    isinstance(kv_cache_scheme, dict)
+                    and kv_cache_scheme.get("require_checkpoint_scales", False)
+                )
+                or envs.SGLANG_REQUIRE_KV_CACHE_SCALES.get()
+            )
+            if require_checkpoint_scales:
+                raise RuntimeError(
+                    "FP8 KV cache requires calibrated k_scale/v_scale tensors, "
+                    "but neither scale was loaded for attention layer "
+                    f"{getattr(layer, 'layer_id', '<unknown>')}. Refusing to "
+                    "fall back to the implicit scale=1.0 path."
+                )
             # If no scales were loaded (both scales are invalid non-positive
             # values), use the default value of 1.0
             k_scale = 1.0

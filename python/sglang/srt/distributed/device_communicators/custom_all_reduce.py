@@ -30,12 +30,42 @@ from sglang.srt.utils import (
     is_musa,
     log_info_on_rank0,
 )
+from sglang.srt.utils.common import get_bool_env_var
+
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
+
+
+def _aiter_enable_register_for_capturing(tms_cudagraph: bool) -> bool:
+    """Resolve AITER's direct graph-input registration mode.
+
+    Memory-saver graphs require copy-in mode.  Outside memory-saver mode,
+    honor AITER's documented environment switch instead of forcing direct
+    registration unconditionally.
+    """
+    return not tms_cudagraph and get_bool_env_var(
+        "AITER_AR_ENABLE_REG_CAPTURE", default="true"
+    )
+
+
+def _aiter_max_size_bytes() -> Optional[int]:
+    """Translate AITER_AR_MAX_SIZE_MB into the constructor's byte limit."""
+    raw = os.environ.get("AITER_AR_MAX_SIZE_MB")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        size_mb = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"AITER_AR_MAX_SIZE_MB must be an integer, got {raw!r}"
+        ) from exc
+    if size_mb <= 0:
+        raise ValueError(f"AITER_AR_MAX_SIZE_MB must be positive, got {size_mb}")
+    return size_mb * 1024 * 1024
 
 
 class CustomAllreduce:
@@ -341,6 +371,7 @@ class CustomAllreduce:
     def __del__(self):
         self.close()
 
+
 def dispatch_custom_allreduce(
     group: ProcessGroup,
     device: torch.device,
@@ -399,9 +430,72 @@ def dispatch_custom_allreduce(
             CustomAllreduce as AiterCustomAllreduce,
         )
 
+        class GraphSafeAiterCustomAllreduce(AiterCustomAllreduce):
+            """Run real collectives during graph warmup, before HIP capture."""
+
+            def _needs_real_graph_warmup(self) -> bool:
+                return (
+                    get_bool_env_var(
+                        "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+                    )
+                    and self._IS_CAPTURING
+                    and not torch.cuda.is_current_stream_capturing()
+                    and not is_in_tc_piecewise_cuda_graph()
+                )
+
+            def custom_all_reduce(
+                self,
+                input: torch.Tensor,
+                use_new: bool = True,
+                open_fp8_quant: bool = False,
+            ):
+                if self._needs_real_graph_warmup():
+                    if self.disabled or not self.should_custom_ar(input):
+                        return None
+                    return self.all_reduce(
+                        input,
+                        use_new=use_new,
+                        open_fp8_quant=open_fp8_quant,
+                        registered_input=False,
+                    )
+                return super().custom_all_reduce(
+                    input,
+                    use_new=use_new,
+                    open_fp8_quant=open_fp8_quant,
+                )
+
+            def custom_fused_ar_rms(
+                self,
+                input: torch.Tensor,
+                residual_inp: torch.Tensor,
+                weight: torch.Tensor,
+                eps: float,
+                use_1stage: bool = False,
+            ):
+                if self._needs_real_graph_warmup():
+                    if self.disabled or not self.should_custom_ar(input):
+                        return None
+                    return self.fused_ar_rms(
+                        input,
+                        residual_inp,
+                        w=weight,
+                        eps=eps,
+                        registered=False,
+                        use_1stage=use_1stage,
+                    )
+                return super().custom_fused_ar_rms(
+                    input,
+                    residual_inp,
+                    weight,
+                    eps,
+                    use_1stage,
+                )
+
         transport = os.environ.get("AITER_AR_TRANSPORT", "ipc").lower()
         if transport == "ipc":
-            enable_reg = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            enable_reg = _aiter_enable_register_for_capturing(
+                envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            )
         elif transport in ("fabric", "auto"):
             # Fabric cannot register arbitrary graph allocations; auto may
             # resolve to Fabric, so also force copy-in mode.
@@ -419,10 +513,12 @@ def dispatch_custom_allreduce(
             transport,
             enable_reg,
         )
-        return partial(
-            AiterCustomAllreduce,
-            enable_register_for_capturing=enable_reg,
-        )
+        constructor_kwargs = {"enable_register_for_capturing": enable_reg}
+        max_size = _aiter_max_size_bytes()
+        if max_size is not None:
+            constructor_kwargs["max_size"] = max_size
+            logger.info("[AR] AITER max workspace size: %d MiB", max_size >> 20)
+        return partial(GraphSafeAiterCustomAllreduce, **constructor_kwargs)
 
     if backend == "native":
         return _native()

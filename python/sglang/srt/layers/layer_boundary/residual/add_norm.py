@@ -46,9 +46,11 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_hcu,
 )
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and get_platform().is_sm90
 _is_sm100_supported = _is_cuda and get_platform().is_sm100
@@ -174,7 +176,7 @@ def aiter_ar_fusion_applies(input_tensor: torch.Tensor, forward_batch: ForwardBa
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
-        _use_aiter
+        (_use_aiter or _is_hcu)
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
@@ -256,11 +258,23 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
+def _update_and_read_residual_lightop_fp8_per_token(
+    norm, hidden_states, residual, post_residual_addition
+):
+    if residual is None:
+        return norm.forward_with_lightop_fp8_quant(hidden_states), hidden_states
+    return norm.forward_with_lightop_fp8_quant(
+        hidden_states, residual, post_residual_addition
+    )
+
+
 def _norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
+    if _is_hcu and quant_format == "lightop_fp8_per_token":
+        return _update_and_read_residual_lightop_fp8_per_token
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":

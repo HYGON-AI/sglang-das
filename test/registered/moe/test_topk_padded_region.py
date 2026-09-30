@@ -1,5 +1,7 @@
+from types import SimpleNamespace
+from unittest.mock import patch
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -275,6 +277,71 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
 
         self.assertTrue(torch.all(out_ids[n_valid:, :k] == 0))
         self.assertTrue(torch.all(out_weights[n_valid:] > 0))
+
+    def test_deepep_drop_mode_masks_after_eplb_remap(self):
+        n, k, n_valid = 16, 8, 3
+        topk_weights = torch.ones((n, k), device=self.DEVICE)
+        topk_ids = torch.randint(0, 127, (n, k), device=self.DEVICE, dtype=torch.int32)
+        valid_ids = topk_ids[:n_valid].clone()
+        router_logits = torch.rand((n, 128), device=self.DEVICE)
+        pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(top_k=k, num_fused_shared_experts=0)
+        dispatch_info = SimpleNamespace(ep_dispatch_algorithm="static")
+
+        with (
+            patch.object(topk_mod, "_eplb_remap_enabled", return_value=True),
+            patch.object(topk_mod, "get_moe_a2a_backend") as get_a2a,
+            patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
+            patch.object(
+                topk_mod,
+                "topk_ids_logical_to_physical",
+                side_effect=lambda ids, *_args, **_kwargs: ids + 1,
+            ),
+        ):
+            get_a2a.return_value.is_deepep.return_value = True
+            get_runner.return_value.is_deep_gemm.return_value = True
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+                expert_location_dispatch_info=dispatch_info,
+            )
+
+        self.assertTrue(torch.equal(out_ids[:n_valid], valid_ids + 1))
+        self.assertTrue(torch.all(out_ids[n_valid:] == -1))
+        self.assertTrue(torch.all(out_weights[n_valid:] > 0.0))
+
+    def test_deepep_drop_mode_uses_negative_one_ids(self):
+        n, k, n_valid = 32, 8, 5
+        topk_weights = torch.rand((n, k), device=self.DEVICE, dtype=torch.float32) + 0.5
+        topk_ids = torch.randint(0, 128, (n, k), device=self.DEVICE, dtype=torch.int32)
+        valid_ids = topk_ids[:n_valid].clone()
+        router_logits = torch.rand((n, 128), device=self.DEVICE, dtype=torch.float32)
+        pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(top_k=k, num_fused_shared_experts=0)
+
+        with (
+            patch.object(topk_mod, "_eplb_remap_enabled", return_value=False),
+            patch.object(topk_mod, "get_moe_a2a_backend") as get_a2a,
+            patch.object(topk_mod, "get_moe_runner_backend") as get_runner,
+        ):
+            get_a2a.return_value.is_deepep.return_value = True
+            get_runner.return_value.is_deep_gemm.return_value = True
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+            )
+
+        self.assertTrue(torch.equal(out_ids[:n_valid], valid_ids))
+        self.assertTrue(torch.all(out_ids[n_valid:] == -1))
+        self.assertTrue(torch.all(out_weights[n_valid:] > 0.0))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")

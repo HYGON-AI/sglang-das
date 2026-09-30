@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hcu, is_npu
 from sglang.srt.utils.common import (
     calc_diff,
     get_bool_env_var,
@@ -19,6 +19,7 @@ from sglang.srt.utils.common import (
 )
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 if _is_npu:
     import torch_npu
 
@@ -224,6 +225,12 @@ def _matmul_persistent_triton(
             "num_warps": 8,
         },
     }
+    if _is_hcu:
+        # gfx938 exposes 64 KiB LDS per workgroup.  Three pipeline stages for
+        # the 128x128x64 BF16 tile require 96 KiB and fail during MiniMax-VL
+        # warmup before serving starts.  A single stage is deterministic and
+        # keeps BF16/FP16/FP32 variants below the hardware limit.
+        configs[a.dtype]["num_stages"] = 1
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,

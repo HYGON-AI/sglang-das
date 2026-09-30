@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.lplb_solver import (
+    LoadAwareReplicaSolver,
     LPLBSolver,
     assert_lplb_supported_model,
     clear_global_lplb_solvers,
@@ -97,12 +98,14 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_exec
 
-    # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
-    # don't participate in the EP all-reduce (would deadlock under DP-
-    # attention). Failure here happens before any forward pass.
+    dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
+    # Gate: refuse the Hopper LP solver for non-DeepSeek MoE families whose
+    # empty-token paths don't participate in its EP all-reduce. The ROCm
+    # load-aware path explicitly wires empty MiniMax ranks through solve().
     architectures = getattr(model_config.hf_config, "architectures", None)
-    if architectures:
+    if dispatch_algorithm == "lp" and architectures:
         assert_lplb_supported_model(architectures[0])
 
     metadata = get_global_expert_location_metadata()
@@ -150,7 +153,10 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
             replica_map = metadata.logical_to_all_physical_map[lid]
             static_probabilities = static_mass[lid][replica_map.clamp_min(0).long()]
             static_probabilities = static_probabilities * (replica_map >= 0)
-        solver = LPLBSolver(
+        solver_cls = (
+            LoadAwareReplicaSolver if dispatch_algorithm == "load_aware" else LPLBSolver
+        )
+        solver = solver_cls(
             phy2log=metadata.physical_to_logical_map[lid],
             log2phy=metadata.logical_to_all_physical_map[lid],
             num_gpus=metadata.ep_size,
@@ -162,7 +168,11 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
             static_max_copies=static_max_copies,
         )
         set_global_lplb_solver(lid, solver)
-    logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+    logger.info(
+        "Initialized %s replica-dispatch solvers for %d layers",
+        dispatch_algorithm,
+        metadata.num_layers,
+    )
 
 
 def check_quantized_moe_compatibility(

@@ -220,13 +220,21 @@ SGL_DEVICE T inclusive_reduce(T val, uint32_t lane_id = get_lane_id<kWidth>(), m
   if constexpr (kStart < kFinish) {
 #pragma unroll
     for (uint32_t offset = kStart; offset < kFinish; offset *= 2) {
+#ifndef USE_ROCM
       const auto n = __shfl_up_sync(active_mask, val, offset, kWidth);
+#else
+      const auto n = __shfl_up(val, offset, kWidth);
+#endif
       if (lane_id >= offset) val = Trait::reduce(val, n);
     }
   } else {
 #pragma unroll
     for (uint32_t offset = kFinish; offset < kStart; offset *= 2) {
+#ifndef USE_ROCM
       const auto n = __shfl_down_sync(active_mask, val, offset, kWidth);
+#else
+      const auto n = __shfl_down(val, offset, kWidth);
+#endif
       if (lane_id < kStart - offset) val = Trait::reduce(val, n);
     }
   }

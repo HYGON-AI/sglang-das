@@ -307,9 +307,6 @@ class ForwardMode(IntEnum):
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
 
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
-
 
 @total_ordering
 class CaptureHiddenMode(IntEnum):
@@ -725,6 +722,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether this forward's sequence is sharded across the attn-TP group (SP on)
     # vs. replicated; stamped per forward, defaults to replicated.
     attn_tp_sequence_sharded: bool = False
+    global_cp_num_tokens_cpu: Optional[List[int]] = None
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # Preallocated piecewise-graph attention output, set by RadixAttention.
@@ -768,6 +766,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
+    # CP-v2 expands the DP buffer into one slot per (attention-DP, CP) shard.
+    dp_local_token_index: Optional[int] = None
+    cp_local_dp_layout: bool = False
     global_dp_buffer_len: Optional[int] = None
     # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
     # under MAX_LEN, padded to the max. None when the raw list already is.
@@ -910,6 +911,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         device: Union[str, torch.device],
         *,
         is_draft_worker: bool = False,
+        materialize_device_tensors: bool = True,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
         self.dp_spec_prefill_coordination_applied = (
@@ -951,18 +953,60 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
-        pin_memory = is_pin_memory_available(device)
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=pin_memory,
-        ).to(device, non_blocking=True)
+        if materialize_device_tensors:
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=_pin_host_metadata(device),
+            ).to(device, non_blocking=True)
+        else:
+            # Draft-extend CUDA Graph replay consumes its own persistent token
+            # count buffers.  Building these transient tensors from pageable
+            # host memory can block the CPU behind the target stream and leave
+            # a launch bubble before replay.  Preserve the CPU values needed
+            # for graph selection and materialize the tensors only if the
+            # caller ultimately falls back to eager execution.
+            self.global_num_tokens_gpu = None
+            self.global_num_tokens_for_logprob_gpu = None
+        self.global_cp_num_tokens_cpu = batch.global_cp_num_tokens
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
+
+    def materialize_deferred_device_metadata(
+        self, device: Union[str, torch.device]
+    ) -> None:
+        """Materialize device metadata deferred by a graph-first prepare path."""
+        if (
+            self.global_num_token_non_padded is None
+            and self.global_num_token_non_padded_cpu is not None
+            and enable_num_token_non_padded()
+        ):
+            self.global_num_token_non_padded = torch.tensor(
+                self.global_num_token_non_padded_cpu, dtype=torch.int32, device=device
+            )
+
+        if (
+            self.global_num_tokens_cpu is not None
+            and self.global_num_tokens_gpu is None
+        ):
+            self.global_num_tokens_gpu = torch.tensor(
+                self.global_num_tokens_cpu, dtype=torch.int64, device=device
+            )
+        if (
+            self.global_num_tokens_for_logprob_cpu is not None
+            and self.global_num_tokens_for_logprob_gpu is None
+        ):
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                self.global_num_tokens_for_logprob_cpu,
+                dtype=torch.int64,
+                device=device,
+            )
 
     @classmethod
     def init_new(
@@ -976,6 +1020,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         spec_mrope_positions: Optional[torch.Tensor] = None,
         kv_loc_plan: Optional[KVLocPlan] = None,
         write_cols: Optional[Cols] = None,
+        defer_device_metadata: bool = False,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -1207,15 +1252,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
+            if not defer_device_metadata:
+                ret.global_num_token_non_padded = torch.tensor(
+                    num_tokens,
+                    dtype=torch.int32,
+                    pin_memory=pin_host_metadata,
+                ).to(device, non_blocking=True)
         ret.global_num_token_non_padded_cpu = num_tokens
 
         ret.init_mlp_sync_metadata(
-            batch, device, is_draft_worker=model_runner.is_draft_worker
+            batch,
+            device,
+            is_draft_worker=model_runner.is_draft_worker,
+            materialize_device_tensors=not defer_device_metadata,
         )
 
         if ret.forward_mode.is_idle():

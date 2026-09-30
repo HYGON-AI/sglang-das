@@ -48,6 +48,7 @@ sources = [
     "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/attention/decode_metadata.cu",
+    "csrc/attention/merge_attn_states.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
@@ -83,7 +84,9 @@ else:
 # Build-time HCU detection cannot import sglang before its wheel is installed.
 _is_hcu = amdgpu_target in ("gfx936", "gfx938", "gfx928")
 if _is_hcu:
-    sources[sources.index("csrc/elementwise/topk.hip")] = "csrc/elementwise/topk_hcu.hip"
+    sources[sources.index("csrc/elementwise/topk.hip")] = (
+        "csrc/elementwise/topk_hcu.hip"
+    )
 
 if not _is_hcu and amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
     print(

@@ -165,6 +165,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    cp_num_tokens: int = 0
     prefill_cuda_graph_max_prefix_len: int = 0
     # Every request in the local batch is a health-check probe.
     is_health_check: bool = False
@@ -178,6 +179,7 @@ class MLPSyncBatchInfo:
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_attention_pairs: list[int] = None
+    global_cp_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -196,6 +198,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                self.cp_num_tokens,
             ],
             device=device,
             dtype=dtype,
@@ -215,6 +218,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # cp_num_tokens
             ],
             device=device,
             dtype=dtype,
@@ -226,6 +230,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
+        self.global_cp_num_tokens = [self.cp_num_tokens]
         self.any_health_check = self.is_health_check
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -296,6 +301,13 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.global_cp_num_tokens = tp0_info_cpu[:, 11].tolist()
+        if self.cp_size > 1:
+            from sglang.srt.layers.cp.utils import normalize_dp_cp_token_counts
+
+            self.global_cp_num_tokens = normalize_dp_cp_token_counts(
+                self.global_num_tokens, self.global_cp_num_tokens
+            )
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -320,11 +332,16 @@ def _update_gather_batch(
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.global_cp_num_tokens = [mlp_sync_info.cp_num_tokens]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.global_cp_num_tokens = mlp_sync_info.global_cp_num_tokens
+    if get_parallel().enable_cp_tp_group_sharing:
+        batch.global_cp_num_tokens = None
+
     # Reuse the same all-gather result for a draft model whose A2A backend
     # requires a different local/full token-count representation.
     if draft_require_mlp_tp_gather is not None:
@@ -571,13 +588,25 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
+    cp_num_tokens = 0
+    if local_batch is not None and local_batch.forward_mode.is_extend():
+        from sglang.srt.layers.cp.utils import get_cp_v2_physical_token_count
+
+        cp_num_tokens = get_cp_v2_physical_token_count(
+            num_tokens=num_tokens,
+            extend_seq_lens=local_batch.extend_lens,
+            cp_size=get_parallel().attn_cp_size,
+        )
+
     # With a single DP replica and no residual attention-TP/MLP-TP gather,
     # every CP rank receives the same work through the CP control broadcast.
     # The scheduler metadata all-gather is therefore redundant and can hang
     # on HCU CPU process groups during the idle loop.  Reuse the established
     # skip path, which records each rank's local token count as required by CP.
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or (
-        get_parallel().num_dp_ranks == 1 and attn_tp_size == 1 and not require_mlp_tp_gather
+        get_parallel().num_dp_ranks == 1
+        and attn_tp_size == 1
+        and not require_mlp_tp_gather
     )
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
@@ -647,6 +676,7 @@ def prepare_mlp_sync_batch_raw(
         cp_size=parallel.attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        cp_num_tokens=cp_num_tokens,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_draft_cuda_graph=can_run_draft_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,

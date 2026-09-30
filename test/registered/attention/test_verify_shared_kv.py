@@ -1,5 +1,6 @@
 """Correctness tests for grouped-head target-verify attention."""
 
+from sglang.kernels.ops.attention.verify_mla import block_config, verify_shared_kv_fwd
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,7 +8,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
 from sglang.srt.layers.attention.triton_backend import (
     _should_use_verify_shared_kv,
 )
@@ -246,6 +246,20 @@ class TestVerifySharedKV(CustomTestCase):
             return_value=False,
         ):
             self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, True))
+
+    def test_minimax_m3_multiple_local_kv_heads(self):
+        # MiniMax M3 TP2 exposes 32 local Q heads and 2 local KV heads.
+        self._run_parity(
+            head_dim=128,
+            v_head_dim=128,
+            h_q=32,
+            h_kv=2,
+            l_ext=2,
+        )
+
+    def test_minimax_m3_gqa16_uses_full_group_tile(self):
+        self.assertEqual(block_config(128, 16), (16, 64, 4))
+        self.assertEqual(block_config(128, 8), (4, 64, 8))
 
 
 if __name__ == "__main__":

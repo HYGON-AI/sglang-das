@@ -1254,11 +1254,6 @@ class GroupCoordinator:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)
         return output
 
-    def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor
-    ) -> torch.Tensor:
-        return self._all_to_all_single(output, input)
-
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             assert input.numel() == output.numel() * self.world_size
@@ -1322,32 +1317,24 @@ class GroupCoordinator:
                 if (
                     envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
                     or _AITER_CAPTURE_COPY_IN
-                    or (
-                        _is_hcu
-                        and (
-                            not getattr(ca_comm, "enable_register_for_capturing", True)
-                        )
-                    )
+                    or not getattr(ca_comm, "enable_register_for_capturing", True)
                 ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
+            elif get_bool_env_var("SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"):
+                # Registered AITER buffers are valid only during real HIP graph
+                # capture. Keep eager warmup on the same collective so consumers
+                # never observe a synthetic zero result.
+                ca_comm.reduce_scatter(input, output, registered=False)
             else:
-                # True CUDA graph warmup: avoid a different host collective.
+                # Compatibility escape hatch for older AITER runtimes.
                 output.zero_()
             return True
         ca_comm.reduce_scatter(input, output, registered=False)
         return True
-
-    def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_to_all_single(output, input)
-        else:
-            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(
         self,
@@ -1494,14 +1481,19 @@ class GroupCoordinator:
                         envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
                         or _AITER_CAPTURE_COPY_IN
                         or _is_hcu
+                        or not getattr(ca_comm, "enable_register_for_capturing", True)
                     ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
+                elif get_bool_env_var(
+                    "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+                ):
+                    ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
-                    # True CUDA graph warmup: avoid a different host collective.
+                    # Compatibility escape hatch for older AITER runtimes.
                     output.zero_()
                 return
             else:
@@ -2395,6 +2387,8 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_DP_TP: Optional[GroupCoordinator] = None
+_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -2431,6 +2425,61 @@ def get_attn_cp_group() -> GroupCoordinator:
     return get_parallel().attn_cp_group
 
 
+def get_attn_dp_tp_group() -> GroupCoordinator:
+    """Return ranks sharing a CP index across attention DP and attention TP."""
+    assert _ATTN_DP_TP is not None, "attention DP-TP group is not initialized"
+    return _ATTN_DP_TP
+
+
+def get_attn_cp_overlap_group() -> GroupCoordinator:
+    return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
+
+
+def _init_attn_cp_overlap_group(
+    *,
+    world_size: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    backend: Optional[str],
+    recovered_rank: bool,
+    rank_offset: int,
+    max_world_size: Optional[int],
+) -> None:
+    """Second communicator over the attention CP ranks; RCCL deadlocks when one
+    communicator is driven from two streams at once."""
+    global _ATTN_CP_OVERLAP
+    assert _ATTN_CP_OVERLAP is None, (
+        "attention context parallel overlap group is already initialized"
+    )
+    if attn_cp_size <= 1:
+        return
+
+    span = attn_tp_size * attn_cp_size
+    group_ranks = [
+        list(range(base + i, base + i + span, attn_tp_size))
+        for base in range(0, world_size, span)
+        for i in range(attn_tp_size)
+    ]
+    rank = torch.distributed.get_rank()
+    mine = next(ranks for ranks in group_ranks if rank in ranks)
+    assert mine == _ATTN_CP.ranks, (
+        f"attn_cp_overlap partition {mine} does not match attn_cp "
+        f"{_ATTN_CP.ranks}; the two communicators must span the "
+        "same ranks or the overlapped collectives will not pair up"
+    )
+
+    _ATTN_CP_OVERLAP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=False,
+        group_name="attn_cp_overlap",
+        recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
+    )
+
+
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
     return _DCP
 
@@ -2450,6 +2499,22 @@ def get_moe_dp_group() -> GroupCoordinator:
 
 def get_moe_ep_group() -> GroupCoordinator:
     return get_parallel().moe_ep_group
+
+
+def should_reuse_tp_group_for_full_moe_ep(
+    moe_ep_size: int, tensor_model_parallel_size: int
+) -> bool:
+    """Whether full-stage MoE EP may alias the TP process group.
+
+    DeepEP communicator isolation deliberately creates another process group
+    with the same rank membership.  Keeping this decision in one helper makes
+    the otherwise subtle full-EP aliasing behavior regression-testable.
+    """
+    return (
+        moe_ep_size == tensor_model_parallel_size
+        and not _is_npu
+        and not envs.SGLANG_DEEPEP_USE_MOE_EP_GROUP.get()
+    )
 
 
 def get_moe_tp_group() -> GroupCoordinator:
@@ -2766,6 +2831,7 @@ def init_distributed_environment(
 def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2987,6 +3053,17 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    if duplicate_attn_cp_group and _is_hcu:
+        _init_attn_cp_overlap_group(
+            world_size=world_size,
+            attn_cp_size=attn_cp_size,
+            attn_tp_size=attn_tp_size,
+            backend=backend,
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
@@ -3055,6 +3132,35 @@ def initialize_model_parallel(
                 max_world_size=max_world_size,
             )
 
+    # CP-v2 DP gather: for each CP index, span all attention-DP replicas and
+    # their attention-TP ranks, while excluding the other CP token shards.
+    global _ATTN_DP_TP
+    assert _ATTN_DP_TP is None, "attention DP-TP group is already initialized"
+    if attn_cp_size == 1:
+        _ATTN_DP_TP = _TP
+    elif attn_dp_size == 1:
+        _ATTN_DP_TP = _ATTN_TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            tp_base = tp_group_idx * tensor_model_parallel_size
+            for cp_idx in range(attn_cp_size):
+                ranks = []
+                for dp_idx in range(attn_dp_size):
+                    start = tp_base + (dp_idx * attn_cp_size + cp_idx) * attn_tp_size
+                    ranks.extend(range(start, start + attn_tp_size))
+                group_ranks.append(ranks)
+        _ATTN_DP_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="attention_dp_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = derived_widths["moe_tp_size"]
@@ -3090,8 +3196,13 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    # NPU requires a standalone group for MOE expert parallelism
-    if moe_ep_size == tensor_model_parallel_size and not _is_npu:
+    # NPU requires a standalone group for MOE expert parallelism.  DeepEP can
+    # request the same isolation on GPU: full EP otherwise aliases _TP, which
+    # makes DeepEP and context-parallel collectives share one ordering domain.
+    # CP implementations may enqueue collectives from auxiliary streams, so an
+    # independent group is required to prevent a large CP gather from being
+    # ordered against a DeepEP dispatch/bootstrap collective.
+    if should_reuse_tp_group_for_full_moe_ep(moe_ep_size, tensor_model_parallel_size):
         _MOE_EP = _TP
     else:
         group_ranks = []
@@ -3477,60 +3588,33 @@ def destroy_model_parallel():
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
-    global _SHARED_EXPERTS_TP
-    global _ATTN_TP
-    global _TP
-    if (
-        _SHARED_EXPERTS_TP is not None
-        and _SHARED_EXPERTS_TP is not _ATTN_TP
-        and _SHARED_EXPERTS_TP is not _TP
-    ):
-        _SHARED_EXPERTS_TP.destroy()
-    _SHARED_EXPERTS_TP = None
-
-    if _TP:
-        _TP.destroy()
-    _TP = None
-
-    global _PP
-    if _PP:
-        _PP.destroy()
-    _PP = None
-
-    global _DCP
-    if _DCP:
-        _DCP.destroy()
-    _DCP = None
-
-    global _MOE_EP
-    if _MOE_EP:
-        _MOE_EP.destroy()
-    _MOE_EP = None
-
-    global _MOE_TP
-    if _MOE_TP:
-        _MOE_TP.destroy()
-    _MOE_TP = None
-
-    global _ATTN_CP
-    global _MOE_DP
-    # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
-    # Only destroy if not aliasing another group.
-    if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
-        _MOE_DP.destroy()
-    _MOE_DP = None
-    if _ATTN_CP:
-        _ATTN_CP.destroy()
-    _ATTN_CP = None
-
-    if _ATTN_TP:
-        _ATTN_TP.destroy()
-    _ATTN_TP = None
-
+    global _SHARED_EXPERTS_TP, _ATTN_TP, _TP, _PP, _DCP
+    global _MOE_EP, _MOE_TP, _MOE_DP, _ATTN_CP, _ATTN_CP_OVERLAP, _ATTN_DP_TP
     global _PDMUX_PREFILL_TP_GROUP
-    if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
-        _PDMUX_PREFILL_TP_GROUP.destroy()
-    _PDMUX_PREFILL_TP_GROUP = None
+    # Several logical groups alias TP/attention groups. Snapshot all identities
+    # before clearing any global so an alias is destroyed exactly once.
+    groups = (
+        _SHARED_EXPERTS_TP,
+        _TP,
+        _PP,
+        _DCP,
+        _MOE_EP,
+        _MOE_TP,
+        _MOE_DP,
+        _ATTN_CP_OVERLAP,
+        _ATTN_CP,
+        _ATTN_DP_TP,
+        _ATTN_TP,
+        _PDMUX_PREFILL_TP_GROUP,
+    )
+    destroyed = set()
+    for group in groups:
+        if group is not None and id(group) not in destroyed:
+            group.destroy()
+            destroyed.add(id(group))
+    _SHARED_EXPERTS_TP = _ATTN_TP = _TP = _PP = _DCP = None
+    _MOE_EP = _MOE_TP = _MOE_DP = _ATTN_CP = None
+    _ATTN_CP_OVERLAP = _ATTN_DP_TP = _PDMUX_PREFILL_TP_GROUP = None
 
 
 def destroy_distributed_environment():

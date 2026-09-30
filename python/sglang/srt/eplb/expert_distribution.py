@@ -417,6 +417,17 @@ class _SinglePassGatherer(ABC):
         if get_exec().moe.moe_a2a_backend == "deepep":
             if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+            elif get_exec().moe.deepep_mode == "auto":
+                # ``auto`` switches between normal dispatch for extend/prefill
+                # and low-latency dispatch for decode.  Use the dispatch counts
+                # from both paths: on HIP, CUDA-graph padding has a valid expert
+                # id with zero routing weight, so counting top-k ids directly
+                # would incorrectly attribute padded rows to expert 0.
+                return _DeepepAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
+                )
             elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata,
@@ -686,6 +697,30 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
                     (0, n - local_physical_count_of_layer.shape[0]),
                 )
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeepepAutoSinglePassGatherer(_DeepepLowLatencySinglePassGatherer):
+    """Collect exact local dispatch counts across DeepEP auto-mode switches."""
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        local_count = torch.as_tensor(
+            local_physical_count_of_layer,
+            dtype=self._data.dtype,
+            device=self._data.device,
+        )
+        if local_count.shape != self._data[layer_idx].shape:
+            raise ValueError(
+                "DeepEP normal dispatch count shape mismatch in auto recorder: "
+                f"{tuple(local_count.shape)} vs {tuple(self._data[layer_idx].shape)}"
+            )
+        self._data[layer_idx, :] += local_count
 
 
 def _convert_per_token_to_global_physical_count(
@@ -1007,9 +1042,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
-        ).squeeze(
-            0
-        )
+        ).squeeze(0)
 
         if self._first_dump:
             self._first_dump = False

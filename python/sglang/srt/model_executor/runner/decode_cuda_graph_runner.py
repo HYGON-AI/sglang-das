@@ -1099,9 +1099,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         if (
-            _is_hcu and self.capture_forward_mode.is_target_verify()
+            _is_hcu
+            and self.capture_forward_mode.is_target_verify()
             and not self.model_runner.is_draft_worker
-            and getattr(self.model_runner.model_config, "hc_hidden_size", None) is not None
+            and getattr(self.model_runner.model_config, "hc_hidden_size", None)
+            is not None
         ):
             forward_batch.return_hidden_states_before_norm = True
 
@@ -1572,7 +1574,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(fb_view)
 
         if _is_hcu and get_moe_a2a_backend().is_megamoe():
-            from sglang.srt.layers.moe.mega_moe import set_mega_moe_cuda_graph_num_tokens
+            from sglang.srt.layers.moe.mega_moe import (
+                set_mega_moe_cuda_graph_num_tokens,
+            )
+
             set_mega_moe_cuda_graph_num_tokens(raw_num_token)
 
         self.raw_bs = raw_bs
@@ -1662,6 +1667,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                draft_topk_index=(
+                    output.draft_topk_index[: self.raw_num_token]
+                    if output.draft_topk_index is not None
+                    else None
+                ),
+                customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)

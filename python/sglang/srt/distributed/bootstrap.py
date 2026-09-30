@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
+    is_hcu,
     monkey_patch_p2p_access_check,
 )
 from sglang.srt.utils.network import NetworkAddress
@@ -51,6 +52,7 @@ from sglang.srt.utils.patch_torch import register_sgl_tp_rank
 
 logger = logging.getLogger(__name__)
 
+_is_hcu = is_hcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
@@ -328,6 +330,14 @@ def _init_parallel_groups(
     )
     initialize_model_parallel(
         duplicate_tp_group=get_disagg().enable_pdmux,
+        duplicate_attn_cp_group=(
+            _is_hcu
+            and (
+                get_exec().overlap.enable_two_batch_overlap
+                or getattr(get_parallel(), "enable_cp_cache_layer_split", False)
+            )
+            and get_parallel().enable_dsa_prefill_context_parallel
+        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
         # groups are fixed groups local to its launch cohort.

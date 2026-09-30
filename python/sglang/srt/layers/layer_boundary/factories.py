@@ -58,6 +58,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.row_transport import RowTransport
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
+from sglang.srt.layers.moe.utils import hcu_moe_tp_matches_attention_tp
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -185,7 +186,7 @@ def _resolve_ffn(
         not sparse
         and dense_tp_size == parallel.attn_tp_size
         and dense_tp_size not in (1, parallel.tp_size)
-    )
+    ) or (sparse and hcu_moe_tp_matches_attention_tp())
     if sparse:
         group = SumGroup.MOE_OUTPUT
     else:
@@ -211,11 +212,12 @@ def _resolve_ffn(
         returned = local if scattered_residual and not terminal else attention
         return (
             StageContract(
-                InputContract(full, read=read),
+                InputContract(attention if on_attention_rows else full, read=read),
                 OutputContract(
                     attention,
                     group=None if complete else group,
                     may_reduce_scatter=not complete
+                    and not on_attention_rows
                     and use_reduce_scatter
                     and (scattered_residual or not terminal),
                     update=update,

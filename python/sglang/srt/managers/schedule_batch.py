@@ -2648,6 +2648,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_cp_num_tokens: Optional[List[int]] = None
     # The draft model can use a different MoE A2A backend than the target.
     draft_global_num_tokens: Optional[List[int]] = None
     draft_global_num_tokens_for_logprob: Optional[List[int]] = None
@@ -3970,6 +3971,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
+            global_cp_num_tokens=self.global_cp_num_tokens,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,

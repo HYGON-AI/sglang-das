@@ -14,16 +14,16 @@ indexer, non-unit k_scale/v_scale semantics, and bf16-path regression.
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
 
@@ -434,6 +434,48 @@ def test_indexer_prefill_all_fp8_vs_dequant_ref():
     assert o8.dtype == torch.bfloat16
     torch.testing.assert_close(o8.float(), oref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
     assert _topk_overlap(tidx8, tidxref) >= 0.9
+
+
+def test_indexer_prefill_compact_block_score_matches_full(monkeypatch):
+    """Score-only prefill must preserve the sampled top-k exactly.
+
+    With block_size_q > 1, the main sparse attention consumes one top-k row
+    per query block.  The compact path computes only those sampled rows; the
+    legacy path computes every token row and then discards the rest.
+    """
+    torch.manual_seed(9)
+    q, k, _, r2t, sids, cu, seq_lens, prefix, max_q, max_k = build_prefill_inputs(
+        batch_size=2,
+        num_q_heads=1,
+        num_kv_heads=1,
+        seq_lens_list=(513, 769),
+        prefix_lens_list=(17, 258),
+    )
+    kwargs = dict(
+        q=q,
+        k_cache=k,
+        v_cache=None,
+        sink=None,
+        req_to_token=r2t,
+        slot_ids=sids,
+        cu_seqlens=cu,
+        seq_lens=seq_lens,
+        prefix_lens=prefix,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        block_size_q=16,
+        block_size_k=128,
+        topk=4,
+        init_blocks=1,
+        local_blocks=1,
+        disable_index_value=True,
+    )
+    monkeypatch.setenv("SGLANG_MINIMAX_COMPACT_BLOCK_SCORE", "0")
+    full_o, full_topk = flash_prefill_with_topk_index(**kwargs)
+    monkeypatch.setenv("SGLANG_MINIMAX_COMPACT_BLOCK_SCORE", "1")
+    compact_o, compact_topk = flash_prefill_with_topk_index(**kwargs)
+    assert full_o is None and compact_o is None
+    torch.testing.assert_close(compact_topk, full_topk, atol=0, rtol=0)
 
 
 def test_dtype_contract_rejects_e5m2_q():

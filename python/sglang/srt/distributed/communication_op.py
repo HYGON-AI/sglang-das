@@ -33,6 +33,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     residual_inp_: torch.Tensor,
     weight_: torch.Tensor,
     eps: float,
+    group: str = "tp",
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Fused TP all-reduce + RMSNorm.
 
@@ -40,7 +41,14 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     it may dispatch to communicator-native fused APIs, custom fused kernels,
     or return None so callers can run generic fallback paths.
     """
-    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+    coordinator = {
+        "tp": get_tp_group,
+        "attn_tp": get_attn_tp_group,
+        "moe_tp": get_moe_tp_group,
+    }.get(group)
+    if coordinator is None:
+        raise ValueError(f"Unsupported fused all-reduce group: {group}")
+    return coordinator().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
@@ -51,6 +59,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     group_size: int = 128,
     emit_bf16: bool = False,
     transpose_scale: bool = False,
+    group: str = "tp",
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """Fused TP all-reduce + RMSNorm + per-group FP8 quant (ROCm/aiter).
 
@@ -66,7 +75,14 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     column-major layout the gfx95 bpreshuffle GEMM consumes, so callers can skip
     the post-kernel ``materialize_bpreshuffle_fp8_scale`` transpose.
     """
-    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+    coordinator = {
+        "tp": get_tp_group,
+        "attn_tp": get_attn_tp_group,
+        "moe_tp": get_moe_tp_group,
+    }.get(group)
+    if coordinator is None:
+        raise ValueError(f"Unsupported fused all-reduce group: {group}")
+    return coordinator().fused_allreduce_rmsnorm_quant_per_group(
         input_,
         residual_inp_,
         weight_,

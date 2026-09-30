@@ -895,11 +895,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             num_dp_ranks = self.elastic_worker_count
-            if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
+            routed_dp_ranks = (
+                obj.routed_dp_rank
+                if isinstance(obj.routed_dp_rank, list)
+                else [obj.routed_dp_rank]
+            )
+            if num_dp_ranks <= 1 and all(rank == 0 for rank in routed_dp_ranks):
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
                 )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+            elif any(rank < 0 or rank >= num_dp_ranks for rank in routed_dp_ranks):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
@@ -1870,8 +1875,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
         - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
         """
+        explicit_dp_batch = self.server_args.enable_dp_attention and isinstance(
+            getattr(requests, "routed_dp_rank", None), list
+        )
         return batch_size > 0 and (
             get_serving().enable_tokenizer_batch_encode
+            or explicit_dp_batch
             or (
                 (not get_parallel().attn_dp_enabled)
                 and (not self._batch_has_text(batch_size, requests))

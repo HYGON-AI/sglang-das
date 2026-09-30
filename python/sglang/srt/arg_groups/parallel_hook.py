@@ -188,8 +188,20 @@ def handle_context_parallelism(server_args: Any):
         )
 
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert cfg.moe_dp_size == 1, (
-            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        # DP attention and MoE-DP may use the same DP partition while CP is
+        # disabled. In that layout (EP=1, attn-DP == MoE-DP), attention TP
+        # and MoE TP are identical contiguous rank groups, so no CP token
+        # sharing is required.
+        moe_dp_matches_attn_dp = (
+            cfg.enable_dp_attention
+            and view.attn_cp_size == 1
+            and cfg.moe_dp_size == cfg.dp_size
+            and view.ep_size == 1
+        )
+        assert cfg.moe_dp_size == 1 or moe_dp_matches_attn_dp, (
+            "attn_cp_size != moe_dp_size requires moe_dp_size == 1, or "
+            "the aligned DP-attention layout: attn_cp_size=1, ep_size=1, "
+            "and moe_dp_size=dp_size"
         )
 
     from sglang.srt.layers.cp.base import init_cp_strategy
@@ -741,8 +753,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
         raise ValueError(
-            "--ep-static-dispatch-policy must be one of "
-            "'nearest' or 'locality_fair'."
+            "--ep-static-dispatch-policy must be one of 'nearest' or 'locality_fair'."
         )
 
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
@@ -785,6 +796,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
         "static",
         "lp",
+        "load_aware",
     ):
         raise ValueError(
             f"--ep-dispatch-algorithm {cfg.ep_dispatch_algorithm} picks a "
@@ -793,6 +805,18 @@ def handle_eplb_and_dispatch(server_args: Any):
             "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
         )
 
+    if cfg.ep_dispatch_algorithm == "load_aware":
+        if not get_platform().is_hip:
+            raise ValueError(
+                "--ep-dispatch-algorithm load_aware is currently supported "
+                "only on ROCm."
+            )
+        if cfg.ep_num_redundant_experts <= 0:
+            raise ValueError(
+                "--ep-dispatch-algorithm load_aware requires "
+                "--ep-num-redundant-experts > 0."
+            )
+
     if cfg.enable_eplb and cfg.ep_join_mode != "scale":
         assert resolved_view(server_args).ep_size > 1
 
@@ -800,9 +824,7 @@ def handle_eplb_and_dispatch(server_args: Any):
 def handle_platform_cp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     platform = get_platform()
-    is_protected_platform = (
-        platform.is_hip or platform.is_npu or platform.is_musa
-    )
+    is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
     if not is_protected_platform:
         if (
             cfg.enable_prefill_context_parallel

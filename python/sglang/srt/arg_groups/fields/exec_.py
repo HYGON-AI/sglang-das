@@ -928,7 +928,7 @@ class ExecMoe(msgspec.Struct):
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        Optional[Literal["static", "dynamic", "fake", "lp", "load_aware"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
     ] = None
     ep_static_dispatch_policy: A[

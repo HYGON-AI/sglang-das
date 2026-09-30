@@ -12,6 +12,8 @@ score(h,i,t) = q_nope[i,h] · c_KV[t]  +  q_pe[i,h] · k_pe[t]      # 512 dot + 
 out(h,i)     = Σ_t softmax_t · c_KV[t]                            # V = c_KV
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -20,6 +22,12 @@ from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
 
 MAX_N_SPLITS = 32  # Grid split dim upper bound
 TARGET_PROGRAMS = 512  # Target total stage-1 programs
+MINIMAX_GQA16_TARGET_PROGRAMS = int(
+    os.environ.get("SGLANG_MINIMAX_GQA16_VERIFY_TARGET_PROGRAMS", "128")
+)
+MINIMAX_GQA16_MAX_SPLITS_MIN_BS = int(
+    os.environ.get("SGLANG_MINIMAX_GQA16_VERIFY_MAX_SPLITS_MIN_BS", "0")
+)
 
 DEFAULT_BLOCK_H = (
     4  # BLOCK_H must be a power of 2 (tl.arange); heads beyond H_Q are masked.
@@ -34,11 +42,13 @@ _BLOCK_CONFIG = {
 }
 
 
-def block_config(head_dim):
+def block_config(head_dim, kv_group_num=None):
     """
     Return (BLOCK_H, BLOCK_N, num_warps) for a head_dim; default for untuned
     dims. BLOCK_H must be a power of 2 (heads beyond H_Q are masked).
     """
+    if head_dim == 128 and kv_group_num == 16:
+        return (16, 64, 4)
     return _BLOCK_CONFIG.get(
         head_dim, (DEFAULT_BLOCK_H, DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS)
     )
@@ -432,7 +442,17 @@ class VerifyMLA:
             self._alloc(max_bs)
 
     def _num_splits(self, bs):
-        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
+        is_minimax_gqa16 = self.head_dim == 128 and self.kv_group_num == 16
+        if (
+            is_minimax_gqa16
+            and MINIMAX_GQA16_MAX_SPLITS_MIN_BS > 0
+            and bs >= MINIMAX_GQA16_MAX_SPLITS_MIN_BS
+        ):
+            return MAX_N_SPLITS
+        target_programs = (
+            MINIMAX_GQA16_TARGET_PROGRAMS if is_minimax_gqa16 else TARGET_PROGRAMS
+        )
+        budget = target_programs // max(1, bs * self.n_head_blocks)
         return max(1, min(MAX_N_SPLITS, budget))
 
     def _run_prefix_kernel(
@@ -606,7 +626,7 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
     key = (h_q, head_dim, v_head_dim, l_ext, str(device), kv_group_num)
     vk = _VMLA_CACHE.get(key)
     if vk is None:
-        block_h, block_n, num_warps = block_config(head_dim)
+        block_h, block_n, num_warps = block_config(head_dim, kv_group_num)
         if (
             kv_group_num is not None
             and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live

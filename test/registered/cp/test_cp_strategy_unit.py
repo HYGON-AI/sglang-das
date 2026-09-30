@@ -98,24 +98,36 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
-    def test_hip_dsa_cp_is_deepseek_v4_only(self):
-        utils = "sglang.srt.layers.attention.dsa.utils"
-        model_config = "sglang.srt.configs.model_config"
-        parallel = SimpleNamespace(attn_cp_size=2)
-        config = SimpleNamespace(hf_config=SimpleNamespace())
-        for is_v4 in (True, False):
+    def test_dsa_cp_uses_resolved_parallel_flag(self):
+        for enabled in (True, False):
             with (
-                self.subTest(is_v4=is_v4),
-                patch(f"{utils}.get_parallel", return_value=parallel),
-                patch(f"{utils}.process_model_config", return_value=config),
-                patch(f"{utils}.is_hip", return_value=True),
-                patch(f"{model_config}.is_deepseek_dsa", return_value=not is_v4),
-                patch(f"{model_config}.is_deepseek_v4", return_value=is_v4),
+                self.subTest(enabled=enabled),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                    return_value=SimpleNamespace(
+                        enable_dsa_prefill_context_parallel=enabled
+                    ),
+                ),
             ):
-                self.assertEqual(is_dsa_enable_prefill_cp(), is_v4)
+                self.assertEqual(is_dsa_enable_prefill_cp(), enabled)
+
+    def test_hcu_strategy_cp_requires_explicit_opt_in(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.cp.utils import enable_cp_v2
+
+        with patch("sglang.srt.utils.is_hcu", return_value=True):
+            for enabled in (False, True):
+                with envs.SGLANG_ENABLE_CP_V2.override(enabled):
+                    self.assertEqual(enable_cp_v2(), enabled)
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
+    def setUp(self):
+        # These CPU tests exercise the generic strategy graph contract.
+        patcher = patch("sglang.srt.utils.is_hcu", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
 
@@ -264,6 +276,9 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
 class TestCPZigzagStrategy(CustomTestCase):
     def setUp(self):
+        patcher = patch("sglang.srt.utils.is_hcu", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,
@@ -305,6 +320,32 @@ class TestCPZigzagStrategy(CustomTestCase):
         with patch.dict("os.environ", {"SGLANG_ENABLE_CP_V2": "0"}):
             self.assertTrue(is_cp_active(active_batch))
             self.assertFalse(is_cp_active(inactive_batch))
+
+    def test_cp_v2_min_tokens_is_enforced_per_sequence(self):
+        strategy = ZigzagCPStrategy(cp_size=4)
+        mode = _ExtendMode()
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+            return_value=4096,
+        ):
+            self.assertFalse(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4095, 4097],
+                    ),
+                )
+            )
+            self.assertTrue(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4096, 4096],
+                    ),
+                )
+            )
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
@@ -572,6 +613,87 @@ class TestCPZigzagStrategy(CustomTestCase):
 
             self.assertTrue(torch.equal(gathered, kv))
 
+    def test_zigzag_generic_gathers_return_independent_outputs(self):
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        rank = 0
+        local_x = padded_rank_tensors[rank][: metas[rank].per_rank_actual_token[rank]]
+        fb = self._forward_batch(metas[rank], extend_seq_lens)
+
+        with get_parallel().override(attn_cp_group=_FakeCPGroup(padded_rank_tensors)):
+            first = strategy.gather_kv_cache(local_x, fb)
+            second = strategy.gather_kv_cache(local_x, fb)
+
+        self.assertTrue(torch.equal(first, x))
+        self.assertTrue(torch.equal(second, x))
+        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+        # Generic gathers must not reserve an unused persistent output.
+        self.assertTrue(
+            all(buffers[2] is None for buffers in strategy._gather_buffers.values())
+        )
+
+    def test_zigzag_reusable_gather_reuses_output_explicitly(self):
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        x = torch.arange(sum(extend_seq_lens) * 2).view(sum(extend_seq_lens), 2)
+        metas, padded_rank_tensors = self._padded_rank_tensors(
+            x,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        rank = 0
+        local_x = padded_rank_tensors[rank][: metas[rank].per_rank_actual_token[rank]]
+        fb = self._forward_batch(metas[rank], extend_seq_lens)
+
+        with get_parallel().override(attn_cp_group=_FakeCPGroup(padded_rank_tensors)):
+            first = strategy.gather_kv_cache_reusable(local_x, fb)
+            second = strategy.gather_kv_cache_reusable(local_x, fb)
+
+        self.assertTrue(torch.equal(second, x))
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+
+    def test_zigzag_gather_index_cache_is_bounded(self):
+        cp_size = 4
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+
+        for length in range(16, 16 + strategy._MAX_GATHER_INDEX_CACHE_ENTRIES + 3):
+            seq_lens = [length]
+            extend_seq_lens = [length]
+            x = torch.arange(length * 2).view(length, 2)
+            metas, padded_rank_tensors = self._padded_rank_tensors(
+                x,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            rank = 0
+            local_x = padded_rank_tensors[rank][
+                : metas[rank].per_rank_actual_token[rank]
+            ]
+            fb = self._forward_batch(metas[rank], extend_seq_lens)
+            with get_parallel().override(
+                attn_cp_group=_FakeCPGroup(padded_rank_tensors)
+            ):
+                gathered = strategy.gather_hidden_states(local_x, fb)
+            self.assertTrue(torch.equal(gathered, x))
+
+        self.assertEqual(
+            len(strategy._gather_index_cache),
+            strategy._MAX_GATHER_INDEX_CACHE_ENTRIES,
+        )
+
     def test_zigzag_padding_aligns_local_tensors(self):
         cp_size = 2
         metadata = SimpleNamespace(
@@ -788,6 +910,9 @@ class TestCPZigzagStrategy(CustomTestCase):
 
 class TestCPInterleaveStrategy(CustomTestCase):
     def setUp(self):
+        patcher = patch("sglang.srt.utils.is_hcu", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,
@@ -891,7 +1016,43 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertEqual(metadata.per_rank_actual_token, [4, 4, 4, 4])
         self.assertEqual(metadata.max_rank_len, [4, 4, 4, 4])
 
-    def test_prepare_cp_forward_sizes_gather_buffer_for_all_cp_ranks(self):
+    def test_prepare_cp_forward_keeps_dp_buffer_until_model_body(self):
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(10),
+            positions=torch.arange(10),
+            forward_mode=_ExtendMode(),
+            seq_lens_cpu=[10],
+            extend_seq_lens_cpu=[10],
+            attn_cp_metadata=None,
+            global_num_tokens_cpu=[10],
+            global_cp_num_tokens_cpu=[4],
+            out_cache_loc=None,
+        )
+
+        with (
+            get_parallel().override(
+                attn_cp_rank=2,
+                attn_cp_size=4,
+                attn_dp_rank=0,
+                enable_cp_tp_group_sharing=False,
+            ),
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=4,
+            ),
+            patch(
+                "sglang.srt.layers.dp_attention.set_local_dp_buffer_len"
+            ) as set_buffer_len,
+        ):
+            prepare_cp_forward(forward_batch)
+
+        self.assertEqual(
+            forward_batch.attn_cp_metadata.per_rank_actual_token,
+            [4, 4, 4, 4],
+        )
+        set_buffer_len.assert_not_called()
+
+    def test_prepare_cp_forward_without_cp_vote_sizes_full_gather_buffer(self):
         forward_batch = SimpleNamespace(
             input_ids=torch.arange(10),
             positions=torch.arange(10),
