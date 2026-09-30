@@ -1472,7 +1472,7 @@ class SchedulerDisaggregationPrefillMixin:
             chunk_local_end = write_end - chunk_start
             req_hidden_to_write = req_hidden
             pp_slices = meta.get("pp_slices") or {}
-            pp_rank = int(self.ps.pp_rank)
+            pp_rank = int(get_parallel().pp_rank)
             local_pp_slice = pp_slices.get(str(pp_rank)) if pp_slices else None
             local_slice_len = (
                 int(local_pp_slice.get("slice_len", 0))

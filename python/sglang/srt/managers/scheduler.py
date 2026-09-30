@@ -1493,11 +1493,11 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.ps.pp_size != 1:
+            if get_parallel().pp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            # if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
+            # if get_parallel().attn_tp_size != 1 or get_parallel().attn_cp_size != 1:
             #     raise RuntimeError(
             #         "PD Decode DP sync currently supports attn_tp_size=1 and "
             #         "attn_cp_size=1 only"
@@ -1505,7 +1505,7 @@ class Scheduler(
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.ps.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
+                get_parallel().dp_size * get_parallel().attn_tp_size * get_parallel().attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
@@ -1532,7 +1532,7 @@ class Scheduler(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_s),
             )
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 logger.info(
                     "PD Decode single-clock enabled: dedicated Gloo scheduler "
                     "group, world=%s timeout=%.1fs",
@@ -1593,9 +1593,9 @@ class Scheduler(
                 model_config=self.model_config,
                 server_args=self.server_args,
                 model_runner=self.tp_worker.model_runner,
-                pp_rank=self.ps.pp_rank,
-                pp_size=self.ps.pp_size,
-                gpu_id=self.ps.gpu_id,
+                pp_rank=get_parallel().pp_rank,
+                pp_size=get_parallel().pp_size,
+                gpu_id=get_device().gpu_id,
                 max_prefill_tokens=self.max_prefill_tokens,
             )
             disagg_hidden_size = disagg_metadata_config.hidden_size

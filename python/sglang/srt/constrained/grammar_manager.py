@@ -15,7 +15,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -90,10 +90,10 @@ class GrammarManager:
         # With DP attention, dp_tp_group contains only attention-TP ranks.
         # CP ranks share requests too and must admit compiled grammars together.
         self.grammar_cp_sync_size = (
-            scheduler.ps.attn_cp_size if scheduler.enable_dp_attention else 1
+            get_parallel().attn_cp_size if scheduler.enable_dp_attention else 1
         )
-        self.pp_rank = scheduler.ps.pp_rank
-        self.pp_size = scheduler.ps.pp_size
+        self.pp_rank = get_parallel().pp_rank
+        self.pp_size = get_parallel().pp_size
         self.pp_group = scheduler.pp_group
         self.grammar_pp_sync_work_list = []
 

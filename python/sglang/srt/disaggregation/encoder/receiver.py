@@ -2149,13 +2149,13 @@ class MMReceiverBase(ABC):
         if (
             scheduler is not None
             and get_parallel().enable_dp_attention
-            and scheduler.ps.attn_cp_size == 1
+            and get_parallel().attn_cp_size == 1
         ):
             # Work requests are routed independently to each attention DP group.
             # Global TP collectives would wait on ranks with different requests.
             self.tp_group = scheduler.attn_tp_group
-            self.tp_size = scheduler.ps.attn_tp_size
-            self.tp_rank = scheduler.ps.attn_tp_rank
+            self.tp_size = get_parallel().attn_tp_size
+            self.tp_rank = get_parallel().attn_tp_rank
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
