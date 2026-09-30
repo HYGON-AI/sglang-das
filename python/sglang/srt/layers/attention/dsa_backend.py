@@ -203,6 +203,11 @@ def _check_attn_sink_supported(
 ) -> None:
     if attn_sink is None:
         return
+    # HCU's native flash_mla_with_kvcache (dsa impl "flashmla_kv") accepts the
+    # per-head attn_sink argument directly, so it can host HYV4's learnable
+    # sinks with an fp8 KV cache. The plumbing lives in _forward_flashmla_kv.
+    if dsa_impl == "flashmla_kv" and _is_hcu:
+        return
     if dsa_impl not in _ATTN_SINK_SUPPORTED_IMPLS:
         raise NotImplementedError(
             f"learnable attention sinks (HYV4) are only implemented for DSA impls "
@@ -2303,6 +2308,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2463,6 +2469,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2994,6 +3001,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
         forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         flash_mla_with_kvcache = get_flashmla_op(
             "flash_mla_with_kvcache", is_hcu=_is_hcu
@@ -3047,6 +3055,13 @@ class DeepseekSparseAttnBackend(
         if needs_repad and num_valid == 0:
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
         else:
+            attn_sink_kv = attn_sink
+            if attn_sink_kv is not None and target_q_heads != num_q_heads:
+                # Match the padded q-head count; the padded heads' output is
+                # trimmed after the kernel, so the pad sink value is inert.
+                sink_padded = attn_sink_kv.new_zeros(target_q_heads)
+                sink_padded[:num_q_heads] = attn_sink_kv
+                attn_sink_kv = sink_padded
             o, _ = flash_mla_with_kvcache(
                 q=q_input,
                 k_cache=kv_cache,
@@ -3061,6 +3076,7 @@ class DeepseekSparseAttnBackend(
                     (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
                 ),
                 is_fp8_kvcache=True,
+                attn_sink=attn_sink_kv,
             )
 
         if needs_repad:
