@@ -188,6 +188,13 @@ void deepseek_v4_topk_transform_512(
     at::Tensor& page_indices,
     int64_t page_size,
     std::optional<at::Tensor> raw_indices_opt = std::nullopt);
+
+// Fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write (HIP/DCU).
+at::Tensor rope_fp4_fake_quant_hip(
+    const at::Tensor& x,
+    const at::Tensor& freqs,
+    int64_t rope_dim,
+    bool compressed_kv);
 #endif
 
 /*

@@ -48,12 +48,15 @@ sources = [
     "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/attention/decode_metadata.cu",
+    "csrc/attention/merge_attn_states.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
     # HCU-only kernel, no upstream counterpart.
     "csrc/elementwise/l2norm_kernel.cu",
+    # Fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write on HIP/DCU.
+    "csrc/elementwise/rope_fp4.hip",
     # Native HIP implementation of the same three ops exposed by topk.cu.
     "csrc/elementwise/topk.hip",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",

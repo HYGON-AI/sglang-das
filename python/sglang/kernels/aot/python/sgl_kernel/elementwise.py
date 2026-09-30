@@ -342,6 +342,25 @@ if torch.version.hip is not None:
         torch.ops.sgl_kernel.gelu_quick(out, input)
         return out
 
+    def rope_fp4_fake_quant(
+        x: torch.Tensor,
+        freqs: torch.Tensor,
+        rope_dim: int,
+        compressed_kv: bool = False,
+    ) -> torch.Tensor:
+        """Fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write (HIP/DCU).
+
+        Parameters
+        ----------
+        x           : [N, D] or [B, H, D] bfloat16 on HIP device.
+        freqs       : [T, rope_dim/2] complex64; position-gathered before call.
+        rope_dim    : number of features rotated by RoPE (must be 64).
+        compressed_kv: true -> per-16 E4M3FN scale; false -> per-32 UE8M0 scale.
+        """
+        return torch.ops.sgl_kernel.rope_fp4_fake_quant.default(
+            x, freqs, rope_dim, compressed_kv
+        )
+
 
 def dsv4_fused_q_norm_rope(
     q_input: torch.Tensor,

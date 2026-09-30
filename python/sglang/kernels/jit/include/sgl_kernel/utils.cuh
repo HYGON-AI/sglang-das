@@ -405,6 +405,23 @@ struct LaunchKernel {
     return *this;
   }
 
+  // Mirror the CUDA LaunchKernel::config so kernels can share one call site.
+  // PDL and clusters are no-ops on HIP; this just accepts the same options.
+  struct KernelConfig {
+    bool use_pdl = false;
+    std::optional<dim3> cluster_dim = std::nullopt;
+  };
+
+  auto config(const KernelConfig& config) -> LaunchKernel& {
+    (void)config;  // use_pdl / cluster_dim unsupported in HIP
+    return *this;
+  }
+
+  template <typename T, typename... Args>
+  auto launch(T&& kernel, Args&&... args) const -> void {
+    return (*this)(std::forward<T>(kernel), std::forward<Args>(args)...);
+  }
+
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
     void* kernel_args[] = {const_cast<void*>(static_cast<const void*>(std::addressof(args)))...};

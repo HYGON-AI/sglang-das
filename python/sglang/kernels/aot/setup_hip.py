@@ -53,6 +53,8 @@ sources = [
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
     "csrc/elementwise/l2norm_kernel.cu",
+    # Fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write on HIP/ROCm.
+    "csrc/elementwise/rope_fp4.hip",
     "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
