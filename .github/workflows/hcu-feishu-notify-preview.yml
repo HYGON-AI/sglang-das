@@ -24,7 +24,7 @@ concurrency:
 jobs:
   preview:
     name: Send HCU accuracy card preview
-    runs-on: hcu-ci-pr-2
+    runs-on: [ci, bw1100]
     environment: hcu-ci-notify
     timeout-minutes: 10
     steps:
