@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sglang.srt.eplb.load_aware_dispatch import (
@@ -88,3 +89,7 @@ def test_largest_replicated_expert_is_balanced_first():
     )
     loads = _expected_rank_loads(counts, mapping, probabilities, 2)
     assert float(loads.max() - loads.min()) < 1e-3
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

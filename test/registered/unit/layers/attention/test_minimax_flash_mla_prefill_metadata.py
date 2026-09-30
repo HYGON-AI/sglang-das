@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
@@ -49,3 +50,7 @@ def test_build_flash_mla_sparse_prefill_k_end_rejects_row_mismatch():
         assert "query rows" in str(err)
     else:
         raise AssertionError("expected mismatched query rows to be rejected")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

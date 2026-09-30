@@ -74,3 +74,7 @@ def test_hcu_scaled_fp8_quant_static_supports_padding():
         fp8_kernel.fp8_dtype
     )
     torch.testing.assert_close(x_q[: x.shape[0]].float(), expected.float())
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

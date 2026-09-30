@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.eplb import expert_distribution as ed
@@ -46,3 +47,7 @@ def test_deepep_auto_collects_normal_and_low_latency_counts():
 
     expected = torch.tensor([[0, 0, 0, 1, 2, 3], [0, 0, 0, 4, 5, 6]], dtype=torch.int32)
     assert torch.equal(gatherer.collect()["global_physical_count"], expected)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

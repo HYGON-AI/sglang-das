@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -77,3 +78,7 @@ def test_lightop_channel_fp8_qkv_index_fusion_rejects_static_input(monkeypatch):
     attention = _make_attention(static_input=True)
     assert not attention.maybe_build_fused_qkv_index()
     assert attention._fused_qkv_index is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

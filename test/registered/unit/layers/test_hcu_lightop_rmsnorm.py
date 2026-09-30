@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 import sglang.srt.layers.layernorm as layernorm
@@ -79,3 +80,7 @@ def test_gemma_lightop_fp8_quant_preserves_residual_contract(monkeypatch):
     assert residual_out is not residual
     torch.testing.assert_close(residual_out, torch.tensor([[1.75, 2.75, 3.75, 4.75]]))
     assert len(quantized) == 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

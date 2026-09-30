@@ -319,3 +319,7 @@ def test_deepep_ll_aiter_compacts_minimax_grouped_input(monkeypatch):
     assert captured["sink"] == 0
     assert result.uses_local_expert_ids is True
     assert running_state["aiter_deepep_ll_compact"] is True
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,5 +1,6 @@
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher import deepep
@@ -91,3 +92,7 @@ def test_hcu_deepgemm_dispatch_requires_explicit_runner(monkeypatch):
 
     assert deepep._hcu_deepgemm_is_selected()
     assert deepep._deepgemm_is_selected()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

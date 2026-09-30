@@ -47,3 +47,7 @@ def test_select_decode_score_num_kv_chunks_rejects_invalid_values(
             target_grid=target_grid,
             max_chunks=max_chunks,
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from sglang.srt.models.minimax_m3 import MiniMaxM3MoE
@@ -36,3 +37,7 @@ def test_standard_ep_router_applies_expert_location_dispatch():
     )
     moe.experts.assert_called_once_with(hidden_states, topk_output)
     assert output is expected_output
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

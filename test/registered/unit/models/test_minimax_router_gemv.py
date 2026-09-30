@@ -24,3 +24,7 @@ def test_minimax_router_gemv_rejects_wrong_shape_before_launch():
     router_weight = torch.empty((128, 6144), dtype=torch.bfloat16)
 
     assert not can_use_minimax_router_gemv(hidden_states, router_weight)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

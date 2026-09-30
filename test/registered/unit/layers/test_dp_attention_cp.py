@@ -2,6 +2,7 @@ import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.layers import communicator, dp_attention
@@ -328,3 +329,7 @@ def test_moe_full_gathers_and_scatters_dp1_cp_v2_tokens():
 
     assert gathered.shape == (8, 3)
     torch.testing.assert_close(scattered, hidden_states + 200)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

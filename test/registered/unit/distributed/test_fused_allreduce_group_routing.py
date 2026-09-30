@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.srt.distributed import communication_op
@@ -68,3 +69,7 @@ def test_gemma_allreduce_fusion_preserves_requested_group(monkeypatch):
     norm.forward_with_allreduce_fusion(x, residual, use_attn_tp_group=False)
 
     assert requested == [False]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

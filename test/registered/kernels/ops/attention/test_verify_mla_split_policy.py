@@ -1,5 +1,7 @@
 from unittest.mock import patch
 
+import pytest
+
 from sglang.kernels.ops.attention import verify_mla
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -32,3 +34,7 @@ def test_adaptive_override_is_minimax_gqa16_only():
         patch.object(verify_mla, "MINIMAX_GQA16_MAX_SPLITS_MIN_BS", 8),
     ):
         assert policy._num_splits(8) == 16
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

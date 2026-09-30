@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -26,3 +27,7 @@ def test_breakable_cuda_graph_supports_logits_processor_output():
     sliced = backend._slice_output(buffer, num_tokens=3)
     torch.testing.assert_close(sliced.next_token_logits, output.next_token_logits)
     torch.testing.assert_close(sliced.hidden_states, output.hidden_states)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import sglang.srt.distributed.parallel_state as parallel_state
@@ -82,3 +83,7 @@ def test_aiter_all_gather_graph_warmup_runs_real_collective(monkeypatch) -> None
     GroupCoordinator._all_gather_into_tensor(group, output, input)
     assert ca_comm.all_gather_calls == [0]
     assert torch.equal(output, torch.full_like(output, 9))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

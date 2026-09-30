@@ -47,3 +47,7 @@ def test_aiter_max_size_bytes_rejects_invalid(
     monkeypatch.setenv("AITER_AR_MAX_SIZE_MB", value)
     with pytest.raises(ValueError):
         _aiter_max_size_bytes()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

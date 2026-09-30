@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 import sglang.srt.layers.layernorm as layernorm
@@ -125,3 +126,7 @@ def test_rmsnorm_hip_supports_legacy_six_argument_contract(monkeypatch):
     assert out is not x
     assert residual_out is not residual
     torch.testing.assert_close(residual_out, torch.tensor([[1.5, 2.5, 3.5, 4.5]]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

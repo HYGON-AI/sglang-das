@@ -225,3 +225,7 @@ def test_grouped_union_preserves_q1_output_bit_exact(monkeypatch, fused_union):
 
     torch.cuda.synchronize()
     assert torch.equal(grouped, reference)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
