@@ -516,11 +516,7 @@ class GroupCoordinator:
 
             # aiter+fabric silently landing on disabled=True is treated as a
             # strict-Fabric failure.
-            if (
-                self.ca_comm is not None
-                and strict_fabric
-                and self.ca_comm.disabled
-            ):
+            if self.ca_comm is not None and strict_fabric and self.ca_comm.disabled:
                 raise RuntimeError(
                     f"[AR] Strict Fabric requested but aiter CA is disabled "
                     f"(ranks={self.ranks}). AITER_AR_TRANSPORT=fabric must not "
@@ -556,9 +552,7 @@ class GroupCoordinator:
                 if self.ca_comm is not None
                 else "n/a"
             )
-            disabled = (
-                True if self.ca_comm is None else self.ca_comm.disabled
-            )
+            disabled = True if self.ca_comm is None else self.ca_comm.disabled
             logger.info(
                 "[AR] custom_all_reduce_backend=%s requested_transport=%s "
                 "selected_transport=%s disabled=%s tp_ranks=%s world_size=%s",
@@ -1161,7 +1155,9 @@ class GroupCoordinator:
                         ca_comm.reduce_scatter(
                             input,
                             output,
-                            registered=getattr(ca_comm, "enable_register_for_capturing", False),
+                            registered=getattr(
+                                ca_comm, "enable_register_for_capturing", False
+                            ),
                         )
                         return output
                 else:
@@ -1252,17 +1248,21 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if (
-                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                    or not getattr(ca_comm, "enable_register_for_capturing", True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(
+                    ca_comm, "enable_register_for_capturing", True
                 ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
+            elif get_bool_env_var("SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"):
+                # Registered AITER buffers are valid only during real HIP graph
+                # capture. Keep eager warmup on the same collective so consumers
+                # never observe a synthetic zero result.
+                ca_comm.reduce_scatter(input, output, registered=False)
             else:
-                # True CUDA graph warmup: avoid a different host collective.
+                # Compatibility escape hatch for older AITER runtimes.
                 output.zero_()
             return True
         ca_comm.reduce_scatter(input, output, registered=False)
@@ -1397,14 +1397,22 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if (_is_hcu or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or not getattr(ca_comm, "enable_register_for_capturing", True)):
+                    if (
+                        _is_hcu
+                        or envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or not getattr(ca_comm, "enable_register_for_capturing", True)
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
+                elif get_bool_env_var(
+                    "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+                ):
+                    ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
-                    # True CUDA graph warmup: avoid a different host collective.
+                    # Compatibility escape hatch for older AITER runtimes.
                     output.zero_()
                 return
             else:
@@ -2126,6 +2134,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_DP_TP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -2162,6 +2171,12 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_attn_dp_tp_group() -> GroupCoordinator:
+    """Return ranks sharing a CP index across attention DP and attention TP."""
+    assert _ATTN_DP_TP is not None, "attention DP-TP group is not initialized"
+    return _ATTN_DP_TP
 
 
 def get_attn_cp_overlap_group() -> GroupCoordinator:
@@ -2235,6 +2250,22 @@ def get_moe_dp_group() -> GroupCoordinator:
 def get_moe_ep_group() -> GroupCoordinator:
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
     return _MOE_EP
+
+
+def should_reuse_tp_group_for_full_moe_ep(
+    moe_ep_size: int, tensor_model_parallel_size: int
+) -> bool:
+    """Whether full-stage MoE EP may alias the TP process group.
+
+    DeepEP communicator isolation deliberately creates another process group
+    with the same rank membership.  Keeping this decision in one helper makes
+    the otherwise subtle full-EP aliasing behavior regression-testable.
+    """
+    return (
+        moe_ep_size == tensor_model_parallel_size
+        and not _is_npu
+        and not envs.SGLANG_DEEPEP_USE_MOE_EP_GROUP.get()
+    )
 
 
 def get_moe_tp_group() -> GroupCoordinator:
@@ -2795,6 +2826,35 @@ def initialize_model_parallel(
             custom_all_reduce_backend="off",
         )
 
+    # CP-v2 DP gather: for each CP index, span all attention-DP replicas and
+    # their attention-TP ranks, while excluding the other CP token shards.
+    global _ATTN_DP_TP
+    assert _ATTN_DP_TP is None, "attention DP-TP group is already initialized"
+    if attn_cp_size == 1:
+        _ATTN_DP_TP = _TP
+    elif attn_dp_size == 1:
+        _ATTN_DP_TP = _ATTN_TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            tp_base = tp_group_idx * tensor_model_parallel_size
+            for cp_idx in range(attn_cp_size):
+                ranks = []
+                for dp_idx in range(attn_dp_size):
+                    start = tp_base + (dp_idx * attn_cp_size + cp_idx) * attn_tp_size
+                    ranks.extend(range(start, start + attn_tp_size))
+                group_ranks.append(ranks)
+        _ATTN_DP_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="attention_dp_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
@@ -2830,8 +2890,13 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    # NPU requires a standalone group for MOE expert parallelism
-    if moe_ep_size == tensor_model_parallel_size and not _is_npu:
+    # NPU requires a standalone group for MOE expert parallelism.  DeepEP can
+    # request the same isolation on GPU: full EP otherwise aliases _TP, which
+    # makes DeepEP and context-parallel collectives share one ordering domain.
+    # CP implementations may enqueue collectives from auxiliary streams, so an
+    # independent group is required to prevent a large CP gather from being
+    # ordered against a DeepEP dispatch/bootstrap collective.
+    if should_reuse_tp_group_for_full_moe_ep(moe_ep_size, tensor_model_parallel_size):
         _MOE_EP = _TP
     else:
         group_ranks = []
@@ -3177,6 +3242,10 @@ def destroy_model_parallel():
     _ATTN_CP = None
 
     global _ATTN_TP
+    global _ATTN_DP_TP
+    if _ATTN_DP_TP and _ATTN_DP_TP is not _TP and _ATTN_DP_TP is not _ATTN_TP:
+        _ATTN_DP_TP.destroy()
+    _ATTN_DP_TP = None
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None

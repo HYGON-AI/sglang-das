@@ -128,11 +128,39 @@ def load_kv_cache_scales(
                     model.__class__,
                 )
         else:
-            logger.warning(
-                "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
-            )
+            embedded = []
+            candidates = []
+            for module in model.modules():
+                if not hasattr(module, "k_scale_float") or not hasattr(
+                    module, "v_scale_float"
+                ):
+                    continue
+                candidates.append(module)
+                k_scale = getattr(module, "k_scale_float", None)
+                v_scale = getattr(module, "v_scale_float", None)
+                if k_scale is not None and v_scale is not None:
+                    embedded.append((float(k_scale), float(v_scale)))
+            if embedded:
+                if len(embedded) != len(candidates):
+                    raise RuntimeError(
+                        "FP8 KV checkpoint loaded embedded scales for only "
+                        f"{len(embedded)}/{len(candidates)} attention layers."
+                    )
+                values = [value for pair in embedded for value in pair]
+                logger.info(
+                    "Using embedded per-layer FP8 KV cache scales for %d "
+                    "attention layers (range %.9g..%.9g); implicit scale=1.0 "
+                    "fallback is not active.",
+                    len(embedded),
+                    min(values),
+                    max(values),
+                )
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but no scaling factors "
+                    "provided. Defaulting to scaling factors of 1.0. "
+                    "This may lead to less accurate results!"
+                )
 
 
 def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
@@ -290,8 +318,7 @@ def load_model_with_memory_saver(
         is_qwen4_exp = model_type == "qwen4_exp"
     if server_args.ple_offload_embedding and not is_qwen4_exp:
         raise ValueError(
-            "--ple-offload-embedding only supports "
-            "Qwen4ExpForConditionalGeneration"
+            "--ple-offload-embedding only supports " "Qwen4ExpForConditionalGeneration"
         )
     if is_qwen4_exp:
         model_config.hf_text_config.ple_offload_embedding = (

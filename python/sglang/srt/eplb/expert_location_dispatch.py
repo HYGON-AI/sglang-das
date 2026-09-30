@@ -18,12 +18,12 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp", "load_aware"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -37,6 +37,8 @@ class ExpertLocationDispatchInfo:
     # logical expert several times. With one, each rank dispatches only its own
     # tokens and is free to disagree.
     rank_invariant: bool = False
+    layer_id: int = 0
+    source_rank: int = 0
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -49,6 +51,8 @@ class ExpertLocationDispatchInfo:
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
+            layer_id=layer_id,
+            source_rank=get_parallel().moe_ep_rank,
             rank_invariant=get_exec().moe.moe_a2a_backend == "none",
             partial_logical_to_rank_dispatch_physical_map=(
                 expert_location_metadata.logical_to_rank_dispatch_physical_map[
@@ -92,11 +96,21 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
-    if info.ep_dispatch_algorithm == "lp":
+    if info.ep_dispatch_algorithm in ("lp", "load_aware"):
         if log2phy_prob is None:
             raise RuntimeError(
-                "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
+                f"ep_dispatch_algorithm={info.ep_dispatch_algorithm!r} but "
+                "log2phy_prob is None at dispatch "
                 f"time (topk_ids.shape={tuple(topk_ids.shape)})."
+            )
+        if info.ep_dispatch_algorithm == "load_aware":
+            from sglang.srt.eplb.load_aware_dispatch import dispatch_load_aware
+
+            return dispatch_load_aware(
+                topk_ids,
+                log2phy_prob,
+                info.partial_logical_to_all_physical_map,
+                seed=0x5EED + info.layer_id * 131 + info.source_rank * 8191,
             )
         return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")

@@ -226,6 +226,62 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 input.dtype,
             )
 
+    def test_hipblaslt_no_solution_falls_back_to_triton_and_caches_shape(self):
+        import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+
+        input, qinput, weight, _, weight_scale = self._make_inputs()
+        x_scale = torch.full(
+            (qinput.shape[0], 1),
+            0.05,
+            dtype=torch.float32,
+            device=qinput.device,
+        )
+        expected = torch.full(
+            (qinput.shape[0], weight.shape[1]),
+            2.0,
+            dtype=input.dtype,
+            device=qinput.device,
+        )
+        fp8_utils._HIPBLASLT_UNSUPPORTED_FP8_SHAPES.clear()
+
+        with patch.object(
+            torch,
+            "_scaled_mm",
+            side_effect=RuntimeError("could not find valid hipblaslt solution"),
+        ) as scaled_mm, patch.object(
+            fp8_utils,
+            "triton_scaled_mm",
+            return_value=expected,
+        ) as triton_mm, patch.object(
+            fp8_utils, "_is_hip", True
+        ):
+            first = fp8_utils._apply_fallback_scaled_mm(
+                qinput=qinput,
+                weight=weight,
+                x_scale=x_scale,
+                weight_scale=weight_scale,
+                input_2d_shape=input.shape,
+                output_shape=(input.shape[0], weight.shape[1]),
+                bias=None,
+                input_dtype=input.dtype,
+            )
+            second = fp8_utils._apply_fallback_scaled_mm(
+                qinput=qinput,
+                weight=weight,
+                x_scale=x_scale,
+                weight_scale=weight_scale,
+                input_2d_shape=input.shape,
+                output_shape=(input.shape[0], weight.shape[1]),
+                bias=None,
+                input_dtype=input.dtype,
+            )
+
+        self.assertEqual(scaled_mm.call_count, 1)
+        self.assertEqual(triton_mm.call_count, 2)
+        self.assertTrue(torch.equal(first, expected))
+        self.assertTrue(torch.equal(second, expected))
+        fp8_utils._HIPBLASLT_UNSUPPORTED_FP8_SHAPES.clear()
+
 
 class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
     """apply_fp8_linear with a pre-quantized fp8 activation must emit the

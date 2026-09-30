@@ -79,6 +79,17 @@ if _is_musa:
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 if _is_hip:
+    try:
+        from sgl_kernel import sgl_per_token_quant_fp8 as _hip_per_token_quant_fp8
+
+        # Some sgl_kernel wheels ship the Python wrapper without registering
+        # its backing torch operator.  Treat that combination as unavailable
+        # so sglang_per_token_quant_fp8 can use its existing Triton fallback.
+        if not hasattr(torch.ops.sgl_kernel, "sgl_per_token_quant_fp8"):
+            _hip_per_token_quant_fp8 = None
+    except (ImportError, AttributeError):
+        _hip_per_token_quant_fp8 = None
+
     _has_vllm = False
     if _use_aiter:
         try:
@@ -1093,6 +1104,16 @@ def sglang_per_token_quant_fp8(
 ):
     assert x.is_contiguous(), "`x` is not contiguous"
 
+    # Some ROCm/HCU wheels omit this AOT op. Prefer it when the installed wheel
+    # actually exports it, and fall back to Triton only for that missing-op
+    # case instead of changing the quantization path for every HIP platform.
+    if _is_hip and _hip_per_token_quant_fp8 is None:
+        return _per_token_group_quant_8bit_raw(
+            x=x,
+            group_size=x.shape[-1],
+            dtype=dtype,
+        )
+
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     x_s = torch.empty(
         x.shape[0],
@@ -1101,7 +1122,10 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+    if _is_hip:
+        _hip_per_token_quant_fp8(x, x_q, x_s)
+    else:
+        sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 
@@ -2042,20 +2066,19 @@ Returns:
 Raises:
     AssertionError: If input is not 2D or if static scale's numel != 1
 """
-if _is_hip and not _is_hcu:
+if _is_hip:
 
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
-        M, N = input.shape
         eps = 1e-12
         # Compute per-token scale
         absmax = input.abs().max(dim=1, keepdim=True).values
         absmax = torch.clamp(absmax, min=eps)
         scale_val = absmax / fp8_max
-        scale.copy_(scale_val)
+        scale[: input.shape[0]].copy_(scale_val)
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[: input.shape[0]].copy_(output_data)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
@@ -2067,13 +2090,16 @@ if _is_hip and not _is_hcu:
         scale.view(-1).copy_(scale_val.view(-1))
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[: input.shape[0]].copy_(output_data)
 
     def _native_static_quant_fp8(output, input, scale):
         """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[: input.shape[0]].copy_(output_data)
+
+
+if _is_hip and not _is_hcu:
 
     def scaled_fp8_quant(
         input: torch.Tensor,
@@ -2123,7 +2149,7 @@ if _is_hip and not _is_hcu:
 
         return output, scale
 
-else:
+elif _is_hcu:
 
     def scaled_fp8_quant(
         input: torch.Tensor,
@@ -2161,17 +2187,45 @@ else:
                 )
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                sgl_per_tensor_quant_fp8(
-                    input, output, scale, is_static=False
-                )  # False for dynamic
+                _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
             assert (
                 scale.numel() == 1
             ), f"Expected scalar scale, got numel={scale.numel()}"
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=True
-            )  # True for static
+            _native_static_quant_fp8(output, input, scale)
+
+        return output, scale
+
+else:
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                sgl_per_token_quant_fp8(input, output, scale)
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                sgl_per_tensor_quant_fp8(input, output, scale, is_static=False)
+        else:
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            sgl_per_tensor_quant_fp8(input, output, scale, is_static=True)
 
         return output, scale
 

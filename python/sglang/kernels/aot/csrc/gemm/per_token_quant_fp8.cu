@@ -1,9 +1,20 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/util/Float8_e4m3fn.h>
 
 #include <cmath>
-#include <flashinfer/vec_dtypes.cuh>
+#include <limits>
 
 #include "utils.h"
+
+#ifdef USE_ROCM
+namespace fp8_vec = sgl_hip;
+#else
+#include <flashinfer/vec_dtypes.cuh>
+namespace fp8_vec = flashinfer;
+#endif
+
+using FP8_TYPE = c10::Float8_e4m3fn;
+C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 
 static constexpr int kWarpSize = 32;
 static constexpr int DEFAULT_SHARED_MEM_THRESHOLD_KB = 48;  // Default shared memory quota in KB
@@ -41,7 +52,7 @@ __global__ void per_token_quant_fp8_kernel(
   // Pass-1: Load data and compute max_value
   //
   float max_value = 0.f;
-  using vec_t = flashinfer::vec_t<T, kVecSize>;
+  using vec_t = fp8_vec::vec_t<T, kVecSize>;
   const int32_t num_vec_elems = hidden_dim / kVecSize;
 
   for (int32_t i = lane_id; i < num_vec_elems; i += kWarpSize) {
@@ -59,7 +70,7 @@ __global__ void per_token_quant_fp8_kernel(
     // Compute max value in parallel
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
-      max_value = fmaxf(max_value, fabsf(static_cast<float>(input_vec[j])));
+      max_value = fmaxf(max_value, fabsf(castToFloat(input_vec[j])));
     }
   }
 
@@ -99,15 +110,9 @@ __global__ void per_token_quant_fp8_kernel(
     DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
-      float val = static_cast<float>(input_vec[j]) * scale_inv;
+      float val = castToFloat(input_vec[j]) * scale_inv;
       val = fmaxf(fminf(val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
       output_arr[j] = static_cast<DST_DTYPE>(val);
-#else
-      output_arr[j] = c10::Float8_e4m3fnuz(
-          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
-          c10::Float8_e4m3fnuz::from_bits());
-#endif
     }
     if constexpr (kVecSize == 16) {
       *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
@@ -142,7 +147,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   float max_value = 0.0f;
 
   // Use template parameter for vector size
-  using vec_t = flashinfer::vec_t<T, kVecSize>;
+  using vec_t = fp8_vec::vec_t<T, kVecSize>;
   const int32_t num_vec_elems = hidden_dim / kVecSize;
 
   // Find max using vectorized loads
@@ -152,12 +157,27 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
-      float val = static_cast<float>(input_vec[j]);
+      float val = castToFloat(input_vec[j]);
       max_value = fmaxf(max_value, fabsf(val));
     }
   }
 
-  max_value = blockReduceMax(max_value);
+  // Do not use utils.h:blockReduceMax here. On gfx9 it uses a physical
+  // wavefront size of 64 while warpReduceMax intentionally reduces logical
+  // 32-lane groups, which can drop half of a wavefront for this kernel.
+  // A CTA-wide shared-memory reduction is portable across CUDA warp32 and
+  // ROCm wave32/wave64 execution.
+  __shared__ float block_max[256];
+  block_max[tid] = max_value;
+  __syncthreads();
+#pragma unroll
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      block_max[tid] = fmaxf(block_max[tid], block_max[tid + stride]);
+    }
+    __syncthreads();
+  }
+  max_value = block_max[0];
 
   __shared__ float scale;
   if (tid == 0) {
@@ -166,7 +186,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
   __syncthreads();
 
-  const float scale_inv = 1.0f / scale;
+  const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
   // Quantize using vectorized loads
   for (int32_t i = tid; i < num_vec_elems; i += block_dim) {
@@ -176,14 +196,8 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
     DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
-      float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
+      float val = fmaxf(fminf(castToFloat(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
       output_arr[j] = static_cast<DST_DTYPE>(val);
-#else
-      output_arr[j] = c10::Float8_e4m3fnuz(
-          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
-          c10::Float8_e4m3fnuz::from_bits());
-#endif
     }
 
     if constexpr (kVecSize == 16) {
@@ -213,36 +227,43 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
   const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
 
   if (use_vec16) {
-    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
-        <<<grid, block, smem_size, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            hidden_dim,
-            num_tokens);
+    per_token_quant_fp8_kernel<scalar_t, FP8_TYPE, TOKENS_PER_CTA, 16, USE_SMEM><<<grid, block, smem_size, stream>>>(
+        static_cast<const scalar_t*>(input.data_ptr()),
+        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        hidden_dim,
+        num_tokens);
   } else if (use_vec8) {
-    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
-        <<<grid, block, smem_size, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            hidden_dim,
-            num_tokens);
+    per_token_quant_fp8_kernel<scalar_t, FP8_TYPE, TOKENS_PER_CTA, 8, USE_SMEM><<<grid, block, smem_size, stream>>>(
+        static_cast<const scalar_t*>(input.data_ptr()),
+        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        hidden_dim,
+        num_tokens);
   } else {
-    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
-        <<<grid, block, smem_size, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            hidden_dim,
-            num_tokens);
+    per_token_quant_fp8_kernel<scalar_t, FP8_TYPE, TOKENS_PER_CTA, 4, USE_SMEM><<<grid, block, smem_size, stream>>>(
+        static_cast<const scalar_t*>(input.data_ptr()),
+        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        hidden_dim,
+        num_tokens);
   }
 }
 
 void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
-  CHECK_INPUT(input);
-  CHECK_INPUT(output_q);
-  CHECK_INPUT(output_s);
+  TORCH_CHECK(input.is_cuda() && input.is_contiguous(), "input must be a contiguous CUDA tensor");
+  TORCH_CHECK(output_q.is_cuda() && output_q.is_contiguous(), "output_q must be a contiguous CUDA tensor");
+  TORCH_CHECK(output_s.is_cuda() && output_s.is_contiguous(), "output_s must be a contiguous CUDA tensor");
+  TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor, but got ", input.dim(), " dimensions");
+  TORCH_CHECK(output_q.sizes() == input.sizes(), "output_q shape must match input shape");
+  TORCH_CHECK(
+      output_s.numel() == input.size(0),
+      "output_s must contain one scale per token, expected ",
+      input.size(0),
+      ", got ",
+      output_s.numel());
+  TORCH_CHECK(output_q.scalar_type() == at::ScalarType::Float8_e4m3fn, "output_q must be float8_e4m3fn on this device");
+  TORCH_CHECK(output_s.scalar_type() == torch::kFloat32, "output_s must be float32");
   const auto input_sizes = input.sizes();
   const int64_t num_tokens = input_sizes[0];
   const int64_t hidden_dim = input_sizes[1];
@@ -262,7 +283,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
   bool use_smem = (hidden_dim < 2048);
 
-  if (dynamicSmemSz >= DEFAULT_SHARED_MEM_THRESHOLD_KB) {
+  if (dynamicSmemSz >= DEFAULT_SHARED_MEM_THRESHOLD_KB * 1024) {
     use_smem = false;  // Disable shared memory if >= 48KB to avoid allocation failures
   }
 
@@ -287,23 +308,23 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
       dim3 block(THREADS);
 
       if (use_vec16) {
-        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 16><<<grid, block, 0, stream>>>(
+        per_token_quant_fp8_small_batch_kernel<scalar_t, FP8_TYPE, 16><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<FP8_TYPE*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
       } else if (use_vec8) {
-        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 8><<<grid, block, 0, stream>>>(
+        per_token_quant_fp8_small_batch_kernel<scalar_t, FP8_TYPE, 8><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<FP8_TYPE*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
       } else {
-        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
+        per_token_quant_fp8_small_batch_kernel<scalar_t, FP8_TYPE, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<FP8_TYPE*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);

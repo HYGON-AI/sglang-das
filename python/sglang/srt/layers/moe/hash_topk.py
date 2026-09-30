@@ -307,18 +307,21 @@ class HashTopK(nn.Module):
 
         num_fused_shared_experts = self.num_fused_shared_experts
         log2phy_prob = None
-        if (
-            expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
-        ):
+        if expert_location_dispatch_info is not None and getattr(
+            expert_location_dispatch_info, "ep_dispatch_algorithm", None
+        ) in ("lp", "load_aware"):
             if self.layer_id is None:
                 raise RuntimeError("HashTopK LP dispatch requires layer_id.")
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 
             lplb_solver = get_global_lplb_solver(self.layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
+                log2phy_prob = (
+                    lplb_solver.solve(topk_ids, num_token_non_padded)
+                    if expert_location_dispatch_info.ep_dispatch_algorithm
+                    == "load_aware"
+                    else lplb_solver.solve(topk_ids)
+                )
 
         recorder_topk_ids = None
         if has_per_rank_fused_shared_slots(num_fused_shared_experts):

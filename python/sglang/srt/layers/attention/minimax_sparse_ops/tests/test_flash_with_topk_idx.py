@@ -358,6 +358,71 @@ def test_flash_decode_score_only(
             ).all(), f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
 
 
+@pytest.mark.parametrize("verify_group_size", [2, 3, 4, 5])
+@pytest.mark.parametrize("score_type", ["max", "lse"])
+def test_flash_decode_multi_q_verify_score_matches_independent_decode(
+    verify_group_size, score_type
+):
+    """Grouped TARGET_VERIFY must preserve every query's causal Top-K."""
+
+    torch.manual_seed(20260901 + verify_group_size)
+    request_batch, nqh, nkh, hd = 2, 1, 1, 128
+    block_size, topk = 64, 1
+    max_kv_len = 384
+    max_slots = request_batch * max_kv_len
+
+    q = torch.randn(
+        request_batch * verify_group_size,
+        nqh,
+        hd,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    k_cache = torch.randn(max_slots, nkh, hd, dtype=torch.bfloat16, device=DEVICE)
+    req_to_token = torch.empty(
+        request_batch, max_kv_len, dtype=torch.int32, device=DEVICE
+    )
+    for request_id in range(request_batch):
+        begin = request_id * max_kv_len
+        req_to_token[request_id] = torch.arange(
+            begin, begin + max_kv_len, dtype=torch.int32, device=DEVICE
+        )
+
+    # Cross a block boundary in one request so the grouped producer must use
+    # distinct valid-block counts and causal masks within the same K tile.
+    prefix_lens = torch.tensor([126, 253], dtype=torch.int32, device=DEVICE)
+    offsets = torch.arange(1, verify_group_size + 1, dtype=torch.int32, device=DEVICE)
+    seq_lens = (prefix_lens[:, None] + offsets[None, :]).reshape(-1)
+    slot_ids = torch.arange(
+        request_batch, dtype=torch.int64, device=DEVICE
+    ).repeat_interleave(verify_group_size)
+
+    common_args = dict(
+        q=q,
+        sink=None,
+        k_cache=k_cache,
+        v_cache=None,
+        req_to_token=req_to_token,
+        seq_lens=seq_lens,
+        max_seqlen=max_kv_len,
+        slot_ids=slot_ids,
+        block_size=block_size,
+        topk=topk,
+        init_blocks=0,
+        local_blocks=0,
+        disable_index_value=True,
+        score_type=score_type,
+        verify_group_size=verify_group_size,
+    )
+
+    with envs.SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE.override(False):
+        _, independent_topk, _ = flash_decode_with_topk_idx(**common_args)
+    with envs.SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE.override(True):
+        _, grouped_topk, _ = flash_decode_with_topk_idx(**common_args)
+
+    assert torch.equal(grouped_topk, independent_topk)
+
+
 def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
     torch.manual_seed(123)
     bs, nqh, nkh, hd, blk, tk = 4, 8, 1, 128, 64, 32

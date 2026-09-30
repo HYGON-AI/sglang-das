@@ -30,13 +30,13 @@ After all-gather, the blocks are reranged back to their original order:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Any, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -102,12 +102,57 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
 ContextParallelMetadata = ZigzagContextParallelMetadata
 
 
+def compute_zigzag_cp_physical_token_count(
+    extend_seq_lens: List[int], cp_size: int
+) -> int:
+    """Return the padded row count held by one zigzag-CP rank.
+
+    The scheduler needs this value before ``ForwardBatch`` construction so it
+    can publish CP-local DP-attention buffer sizes to every DP replica.  Keep
+    the arithmetic here in lockstep with ``build_metadata`` and
+    ``pad_logical_token_to_physical`` without allocating any device tensors.
+    """
+    if cp_size <= 1:
+        return sum(int(length) for length in extend_seq_lens)
+
+    cp_segment_num = cp_size * 2
+    per_rank_tokens = [0] * cp_size
+    for raw_length in extend_seq_lens:
+        length = int(raw_length)
+        base, rem = divmod(length, cp_segment_num)
+        for rank in range(cp_size):
+            per_rank_tokens[rank] += (
+                2 * base + int(rank < rem) + int(cp_segment_num - 1 - rank < rem)
+            )
+
+    # Zigzag padding aligns the largest logical shard to 2 * cp_size.
+    max_tokens = max(per_rank_tokens, default=0)
+    return (max_tokens + cp_segment_num - 1) // cp_segment_num * cp_segment_num
+
+
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
+    _MAX_GATHER_INDEX_CACHE_ENTRIES = 16
+
+    def __init__(self, cp_size: int):
+        super().__init__(cp_size)
+        # Reuse collective staging buffers across CP gathers. Output reuse is
+        # opt-in because generic callers own the tensor returned to them.
+        self._gather_buffers: dict[
+            tuple,
+            tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        ] = {}
+        self._gather_index_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
-        if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
+        from sglang.srt.environ import envs
+
+        min_tokens = max(
+            self.cp_size * 2,
+            int(envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get()),
+        )
+        if self.cp_size <= 1 or num_tokens < min_tokens:
             return False
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
@@ -116,7 +161,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        # Do not let a large co-batched request pull short requests into CP.
+        # Requiring the threshold per sequence keeps all ranks on the same path
+        # and preserves the unsharded execution used for short-request accuracy.
+        return all(int(length) >= min_tokens for length in extend_lens)
 
     def build_metadata(
         self,
@@ -315,24 +363,24 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
-        chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-        return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
-        )
+        return self._all_gather_reorganized(x, forward_batch, reuse_output=False)
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
-        chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-        return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
-        )
+        return self._all_gather_reorganized(x, forward_batch, reuse_output=False)
+
+    def gather_kv_cache_reusable(
+        self, x: Any, forward_batch, stream: Optional[Any] = None
+    ) -> Any:
+        """Gather into a strategy-owned output workspace.
+
+        The returned tensor is valid only until the next reusable gather with
+        the same layout. This is intentionally separate from ``gather_kv_cache``
+        so the generic CP interface keeps returning independently owned tensors.
+        Callers must consume the result on the current stream before reuse.
+        """
+        return self._all_gather_reorganized(x, forward_batch, reuse_output=True)
 
     def get_supported_attention_backend(self):
         return [
@@ -438,41 +486,135 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             latent_full[..., kv_lora_rank:],
         )
 
-    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
+    def _all_gather_reorganized(
+        self,
+        x: torch.Tensor,
+        forward_batch,
+        *,
+        reuse_output: bool,
+    ):
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
-        max_len = max(per_rank_token)
+        per_rank_token = [int(v) for v in per_rank_token]
+        max_len = max(per_rank_token, default=0)
+        if max_len == 0:
+            return x.new_empty((0, *x.shape[1:]))
+
         if per_rank_token == meta.per_rank_actual_token:
-            local_len = x.shape[0]
+            local_len = int(x.shape[0])
         else:
             local_len = per_rank_token[self.cp_rank]
-        assert x.shape[0] >= local_len
-        x = x[:local_len]
-        pad_size = max_len - x.shape[0]
-        if pad_size > 0:
-            padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
-            x = F.pad(x, padding, mode="constant", value=0)
+        if x.shape[0] < local_len:
+            raise RuntimeError(
+                "Zigzag CP gather received an unexpected local token count: "
+                f"rank={self.cp_rank}, got={x.shape[0]}, expected_at_least="
+                f"{local_len}"
+            )
+
+        required_gathered_rows = max_len * self.cp_size
+        required_output_rows = sum(per_rank_token)
+        layout_key = (
+            x.device.type,
+            x.device.index,
+            x.dtype,
+            tuple(x.shape[1:]),
+        )
+        buffers = self._gather_buffers.get(layout_key)
+        padded = gathered = cached_output = None
+        if buffers is not None:
+            padded, gathered, cached_output = buffers
+
+        gather_capacity_too_small = (
+            padded is None
+            or gathered is None
+            or padded.shape[0] < max_len
+            or gathered.shape[0] < required_gathered_rows
+        )
+        if gather_capacity_too_small:
+            group = get_parallel().attn_cp_group
+            ctx = (
+                use_symmetric_memory(group, disabled=not is_allocation_symmetric())
+                if x.is_cuda
+                else nullcontext()
+            )
+            with ctx:
+                padded = x.new_empty((max_len, *x.shape[1:]))
+                gathered = x.new_empty((required_gathered_rows, *x.shape[1:]))
+        old_cached_output = cached_output
+        if reuse_output and (
+            cached_output is None or cached_output.shape[0] < required_output_rows
+        ):
+            cached_output = x.new_empty((required_output_rows, *x.shape[1:]))
+        if (
+            buffers is None
+            or gather_capacity_too_small
+            or cached_output is not old_cached_output
+        ):
+            self._gather_buffers[layout_key] = (
+                padded,
+                gathered,
+                cached_output,
+            )
+
+        padded = padded[:max_len]
+        gathered = gathered[:required_gathered_rows]
+        output = (
+            cached_output[:required_output_rows]
+            if reuse_output
+            else x.new_empty((required_output_rows, *x.shape[1:]))
+        )
+
+        # Equal-length shards are already collective-compatible. Skip the local
+        # pad and copy in the common CP8 winner shape.
+        if local_len == max_len and x.shape[0] == max_len and x.is_contiguous():
+            gather_input = x
+        else:
+            if local_len:
+                padded[:local_len].copy_(x[:local_len])
+            if local_len < max_len:
+                padded[local_len:max_len].zero_()
+            gather_input = padded
+
+        index_key = (
+            x.device.type,
+            x.device.index,
+            self.cp_size,
+            tuple(per_rank_token),
+            tuple(meta.reverse_split_len or ()),
+            tuple(meta.cp_reverse_index or ()),
+        )
+        gather_indices = self._gather_index_cache.get(index_key)
+        if gather_indices is None:
+            rank_order_indices = torch.cat(
+                [
+                    rank * max_len
+                    + torch.arange(per_rank_len, device=x.device, dtype=torch.long)
+                    for rank, per_rank_len in enumerate(per_rank_token)
+                ],
+                dim=0,
+            )
+            reverse_split_len = meta.reverse_split_len
+            cp_reverse_index = meta.cp_reverse_index
+            if reverse_split_len and cp_reverse_index:
+                offsets = [0]
+                for length in reverse_split_len:
+                    offsets.append(offsets[-1] + int(length))
+                gather_indices = torch.cat(
+                    [
+                        rank_order_indices[offsets[chunk_id] : offsets[chunk_id + 1]]
+                        for chunk_id in cp_reverse_index
+                    ],
+                    dim=0,
+                )
+            else:
+                gather_indices = rank_order_indices
+            self._gather_index_cache[index_key] = gather_indices
+            if len(self._gather_index_cache) > self._MAX_GATHER_INDEX_CACHE_ENTRIES:
+                self._gather_index_cache.popitem(last=False)
+        else:
+            self._gather_index_cache.move_to_end(index_key)
 
         group = get_parallel().attn_cp_group
-        ctx = (
-            use_symmetric_memory(group, disabled=not is_allocation_symmetric())
-            if x.is_cuda
-            else nullcontext()
-        )
-        with ctx:
-            gathered = torch.empty(
-                max_len * self.cp_size,
-                *x.shape[1:],
-                device=x.device,
-                dtype=x.dtype,
-            )
-        group.all_gather_into_tensor(gathered, x)
-
-        chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
-        return torch.cat(
-            [
-                chunks[rank][:per_rank_len]
-                for rank, per_rank_len in enumerate(per_rank_token)
-            ],
-            dim=0,
-        )
+        group.all_gather_into_tensor(gathered, gather_input)
+        torch.index_select(gathered, 0, gather_indices, out=output)
+        return output

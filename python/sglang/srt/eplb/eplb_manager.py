@@ -349,7 +349,7 @@ def update_expert_location_with_recovery(
             )
 
     # Re-init LPLB solvers after expert location update
-    if ep_dispatch_algorithm == "lp":
+    if ep_dispatch_algorithm in ("lp", "load_aware"):
         init_lplb_solvers_callable()
 
 

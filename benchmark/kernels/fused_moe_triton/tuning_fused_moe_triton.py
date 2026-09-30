@@ -21,6 +21,7 @@ from common_utils import (
     sort_config,
 )
 from ray.experimental.tqdm_ray import tqdm
+from tqdm.auto import tqdm as local_tqdm
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -241,12 +242,14 @@ def benchmark_config(
     return avg
 
 
-@ray.remote(num_gpus=1)
-class BenchmarkWorker:
-    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+class _BenchmarkWorkerImpl:
+    def __init__(
+        self, seed: int, server_args: ServerArgs, *, local_mode: bool = False
+    ) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
+        self.local_mode = local_mode
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. Ray isolates each worker to a single visible
         # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
@@ -345,7 +348,8 @@ class BenchmarkWorker:
             if _is_xpu or _is_hip
             else nullcontext()
         ):
-            for config in tqdm(search_space):
+            progress = local_tqdm if self.local_mode else tqdm
+            for config in progress(search_space):
                 try:
                     kernel_time = benchmark_config(
                         config,
@@ -374,6 +378,9 @@ class BenchmarkWorker:
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
         assert best_config is not None
         return best_config
+
+
+BenchmarkWorker = ray.remote(num_gpus=1)(_BenchmarkWorkerImpl)
 
 
 def main(args: argparse.Namespace):
@@ -405,20 +412,33 @@ def main(args: argparse.Namespace):
     else:
         batch_sizes = get_default_batch_sizes()
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+    if args.local:
+        # Some ROCm/HCU installations crash Ray's dashboard agent while it probes
+        # AmdGpuProvider. The tuner does not require Ray for one visible GPU, so
+        # provide a direct in-process path for that environment.
+        worker = _BenchmarkWorkerImpl(args.seed, server_args, local_mode=True)
 
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
             worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+            return [worker_method(*input_args) for input_args in inputs]
+
+    else:
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        workers = [
+            BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)
+        ]
+
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+            outputs = []
+            worker_idx = 0
+            for input_args in inputs:
+                worker = workers[worker_idx]
+                worker_method = getattr(worker, method)
+                output = worker_method.remote(*input_args)
+                outputs.append(output)
+                worker_idx = (worker_idx + 1) % num_gpus
+            return ray.get(outputs)
 
     if args.tune:
         if args.search_space_file:
@@ -547,6 +567,11 @@ if __name__ == "__main__":
         help="JSON file containing an explicit list of Triton configs to evaluate with --tune.",
     )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Run in the current process on one visible GPU instead of using Ray.",
+    )
     args = parser.parse_args()
 
     main(args)

@@ -104,6 +104,9 @@ class RequestFuncOutput:
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
+    # Prompt length reported by the server. ``prompt_len`` starts with the
+    # dataset's nominal length and is replaced with this value when available.
+    server_prompt_len: Optional[int] = None
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
@@ -701,6 +704,7 @@ async def async_request_sglang_generate(
         output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
+        stream_failed = False
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -724,7 +728,36 @@ async def async_request_sglang_generate(
                         else:
                             data = orjson.loads(sse_data)
 
+                            # Native /generate creates the StreamingResponse
+                            # before scheduler-side validation completes. A
+                            # rejected request can therefore have HTTP 200 and
+                            # carry the actual error inside an SSE chunk.
+                            if "error" in data:
+                                error = data["error"]
+                                output.error = (
+                                    error.get("message", str(error))
+                                    if isinstance(error, dict)
+                                    else str(error)
+                                )
+                                stream_failed = True
+                                break
+
                             _meta_info = data.get("meta_info") or {}
+                            server_prompt_len = _meta_info.get("prompt_tokens")
+                            if isinstance(server_prompt_len, int):
+                                output.server_prompt_len = server_prompt_len
+                                output.prompt_len = server_prompt_len
+
+                            finish_reason = _meta_info.get("finish_reason") or {}
+                            if (
+                                isinstance(finish_reason, dict)
+                                and finish_reason.get("type") == "abort"
+                            ):
+                                output.error = finish_reason.get(
+                                    "message", "Generation aborted."
+                                )
+                                stream_failed = True
+                                break
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -762,10 +795,15 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
-                    output.generated_text = generated_text
-                    output.success = True
                     output.latency = latency
-                    output.output_len = output_len
+                    if stream_failed:
+                        output.generated_text = ""
+                        output.success = False
+                        output.output_len = 0
+                    else:
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.output_len = output_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -1128,7 +1166,7 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
+                total_input += outputs[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
@@ -1873,6 +1911,7 @@ async def benchmark(
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
+        "server_prompt_lens": [output.server_prompt_len for output in outputs],
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],

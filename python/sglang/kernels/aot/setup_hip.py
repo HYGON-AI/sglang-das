@@ -46,6 +46,7 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
+    "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/concat_mla_absorb_q_hcu.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
@@ -61,10 +62,11 @@ sources = [
     "csrc/attention/merge_attn_states.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
-    #"csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
+    # "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
-cxx_flags = ["-O3", "-w"]
+hcu_defines = ["-DSGLANG_HCU_AOT_FP8_QUANT=1"]
+cxx_flags = ["-O3", "-w", *hcu_defines]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
@@ -78,6 +80,7 @@ hipcc_flags = [
     "-std=c++17",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
+    *hcu_defines,
     "-w",
 ]
 

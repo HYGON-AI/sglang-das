@@ -277,7 +277,7 @@ struct TopKTrait {
 // MSA fmha_sm100 consumer (kv_block_indexes must be strictly ascending; its
 // sorted-order early-exit otherwise mis-masks the partial last block).
 template <typename SeqLenT, bool kUsePDL>
-__global__ void minimax_decode_topk_block_kernel(
+__global__ __launch_bounds__(TopKTrait::kCTASize) void minimax_decode_topk_block_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
     int32_t* __restrict__ topk_idx,
@@ -362,7 +362,7 @@ __global__ void minimax_decode_topk_block_kernel(
 // free view when the cache is contiguous HND). num_heads == 1 (h == 0) reproduces
 // the single-kv-head TP>=4 behavior (page index == base_page).
 template <typename SeqLenT, bool kUsePDL>
-__global__ void minimax_decode_topk_page_table_kernel(
+__global__ __launch_bounds__(TopKTrait::kCTASize) void minimax_decode_topk_page_table_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
     const int32_t* __restrict__ req_to_token,
