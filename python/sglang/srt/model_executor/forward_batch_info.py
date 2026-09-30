@@ -438,6 +438,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # (QSA's fill is 1, a legal real length); None outside replay.
     num_padding: Optional[int] = None
 
+    # === Forward-local HCU state ===
+    # Enables fused RMSNorm + quantization for the current layer.
+    rms_quant_flag: bool = False
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
