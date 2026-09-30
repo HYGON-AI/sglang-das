@@ -93,13 +93,15 @@ class TestKimiK3EPLB(unittest.TestCase):
         executor = SimpleNamespace(
             target_worker=SimpleNamespace(
                 forward_batch_generation=lambda **kwargs: target
-            )
+            ),
+            _target_is_dsv41=False,
         )
         result = TargetVerifyExecutor._forward_prepared_verify(
             executor,
             batch=SimpleNamespace(),
             verify_input=SimpleNamespace(
-                prepare_for_verify=lambda *args: (object(), None)
+                prepare_for_verify=lambda *args: (object(), None),
+                live_seq_lens_cpu=None,
             ),
             seq_lens_cpu_backup=None,
             seq_lens_sum_backup=0,

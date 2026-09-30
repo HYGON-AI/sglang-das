@@ -20,6 +20,7 @@ from sglang.srt.models.qwen4_exp import (
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.network import get_open_port
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="4-gpu-b200")
 
@@ -55,11 +56,14 @@ def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
         local_rank=local_rank,
         backend="nccl",
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world_size,
-        backend="nccl",
+    # main reads group widths from the published parallel context.
+    publish_build_topology(
+        tp_size=world_size,
+        world_rank=local_rank,
+        disable_custom_all_reduce=True,
         enable_symm_mem=enable_symm_mem,
     )
+    initialize_model_parallel(backend="nccl", enable_symm_mem=enable_symm_mem)
 
     try:
         for embedding_dim in (7, 257):
