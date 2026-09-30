@@ -945,7 +945,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Localize the count when this bucket is attn-TP sharded (SP on).
         attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
-        buffers.num_token_non_padded[...] = num_tokens
+        # The buffer exists only when enable_num_token_non_padded() (EP / DP
+        # gather); plain TP decode graphs have none to fill.
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
         if (
             enable_num_token_non_padded()
             and not self.enable_prefill_cp
