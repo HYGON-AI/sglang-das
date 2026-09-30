@@ -10,6 +10,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hcu
+
+_IS_HCU = is_hcu()
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -143,6 +147,75 @@ def amax_topk_blocks(
     return blocks
 
 
+_HCU_TOPK_TABLES: dict[
+    tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _hcu_topk_tables(
+    bs: int, wq: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Contiguous ``[bs, wq]`` identity page table (row-repeated ``arange(wq)``; the
+    native op indexes it by raw offset, so a stride-0 broadcast would read past
+    row 0) and ``arange(bs + 1)`` cu_seqlens, both int32."""
+    key = (bs, wq, device)
+    cached = _HCU_TOPK_TABLES.get(key)
+    if cached is not None:
+        return cached
+    assert not torch.cuda.is_current_stream_capturing(), (
+        f"HCU top-k tables for bs={bs}, wq={wq} built inside a CUDA graph capture; "
+        "warm up this shape before capture"
+    )
+    identity = torch.arange(wq, dtype=torch.int32, device=device).repeat(bs, 1)
+    cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device=device)
+    tables = (identity, cu_seqlens_q)
+    _HCU_TOPK_TABLES[key] = tables
+    return tables
+
+
+def _topk_block_ids(
+    keys: torch.Tensor, nblocks: torch.Tensor, topk_blocks: int
+) -> torch.Tensor:
+    """Top-k over the ``[bs, nblocks_amax]`` block-amax keys -> ``[bs, K]`` int32
+    raw block ids, ``-1`` past each row's ``nblocks[i]``.
+
+    HIP/DCU uses lightop's prebuilt exact-adaptive Top2048 op (no JIT); NVIDIA the
+    JIT v2 kernel with ``page_tables=None``. ``K`` is ``topk_blocks`` on HIP (the
+    lightop op is fixed width), ``min(topk_blocks, nblocks_amax)`` on NVIDIA."""
+    bs, nblocks_amax = keys.shape
+    if _IS_HCU:
+        import lightop
+
+        # SGL_USE_LIGHTOP_TOPK_BACKAND unset/0 selects the exact adaptive Top2048.
+        # The op needs a score width >= topk and reads each row only up to
+        # nblocks[i]; pad so an identity page table spans [0, topk) with an
+        # unread -inf tail, page_size 1 mapping selected index i to raw block i.
+        wq = max((nblocks_amax + 3) & ~3, topk_blocks)
+        if wq != nblocks_amax:
+            keys = F.pad(keys, (0, wq - nblocks_amax), value=-torch.inf)
+        identity, cu_seqlens_q = _hcu_topk_tables(bs, wq, keys.device)
+        return lightop.fast_topk_transform_fused(
+            keys, nblocks, identity, cu_seqlens_q, topk_blocks
+        )
+
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+
+    # v2 needs the score row stride to be a multiple of 4; pad with -inf.
+    key_pad = (-nblocks_amax) % 4
+    if key_pad:
+        keys = F.pad(keys, (0, key_pad), value=-torch.inf)
+    k = min(topk_blocks, nblocks_amax)
+    block_ids = torch.full((bs, k), -1, dtype=torch.int32, device=keys.device)
+    # page_tables=None yields raw block ids; the plan must precede the kernel.
+    plan = plan_topk_v2(nblocks)
+    topk_transform_paged_v2(keys, nblocks, None, block_ids, 1, plan)
+    return block_ids
+
+
+
 def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
@@ -162,6 +235,12 @@ def select_candidate_block_ids(
     scores = scores.masked_fill(
         torch.arange(num_blocks, device=logits.device) == last, torch.inf
     )
+    if (
+        _IS_HCU and logits.is_cuda and block_size == 8
+        and isinstance(compress_lens, torch.Tensor) and num_blocks > 0
+    ):
+        nblocks = ((compress_lens.reshape(-1).to(torch.int32) + 7) // 8).contiguous()
+        return _topk_block_ids(scores.float().contiguous(), nblocks, topk_blocks)
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
 

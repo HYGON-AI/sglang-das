@@ -429,16 +429,6 @@ struct LaunchKernel {
     return *this;
   }
 
-  struct KernelConfig {
-    bool use_pdl = false;
-    std::optional<dim3> cluster_dim = std::nullopt;
-  };
-
-  // Same surface as the CUDA launcher so shared kernels build on HIP; both options are no-ops.
-  auto config(const KernelConfig&) -> LaunchKernel& {
-    return *this;
-  }
-
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
     void* kernel_args[] = {const_cast<void*>(static_cast<const void*>(std::addressof(args)))...};
