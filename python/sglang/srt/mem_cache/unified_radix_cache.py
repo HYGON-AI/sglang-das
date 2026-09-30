@@ -771,6 +771,13 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             # release_session has run the tree-lock release this needs.
+            logger.debug(
+                "Reclaim failed linker chain after request release: "
+                "rid=%s last_node=%s cache_protected_len=%s",
+                req.rid,
+                getattr(req, "last_node", None),
+                getattr(req, "cache_protected_len", None),
+            )
             self._reclaim_failed_linker_chain(req.rid)
             return
 
@@ -2818,6 +2825,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 "when its other owner releases",
                 stranded,
             )
+
+    def retry_stranded_failed_linker_chains(self) -> None:
+        """Retry reclaiming stranded failed linker chains.
+
+        When a failed load's chain cannot be immediately reclaimed (because
+        another request still holds it), the nodes are marked as stranded.
+        This method provides a way to periodically retry the reclaim without
+        waiting for a specific request to call cache_finished_req().
+
+        Called from the scheduler's idle loop or after processing disagg queues.
+        """
+        if self.linker is None:
+            return
+
+        if not self._stranded_linker_nodes:
+            return
+
+        # Pass empty rid to trigger retry of stranded nodes only
+        self._reclaim_failed_linker_chain("")
 
     def has_outstanding_failed_linker_chains(self) -> bool:
         """Whether any failed load's chain is still in the tree.
