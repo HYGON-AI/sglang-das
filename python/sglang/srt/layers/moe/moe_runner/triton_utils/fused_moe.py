@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_hcu,
     is_musa,
     is_xpu,
 )
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -97,7 +99,7 @@ elif _is_hip:
                 aiter_moe,
                 get_aiter_moe_config,
                 aiter_moe_shfl_weight,
-                aiter_moe_shfl_scale
+                aiter_moe_shfl_scale,
             )
         except ImportError:
             raise ImportError(
@@ -140,6 +142,7 @@ class _CodePathChecker:
 
 
 deepseek_v4_moe_code_path_checker = _CodePathChecker()
+
 
 def _validate_fused_swiglu_interleaved(
     *,
@@ -196,6 +199,10 @@ def _activation_row_filter(
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    # Inductor autotune of this epilogue hangs on HCU/HIP: benchmark
+    # synchronize never returns, and the stalled rank tears down NCCL.
+    if _is_hcu:
+        return False
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
@@ -489,7 +496,10 @@ def fused_experts(
         )
         else 1
     )
-    if isinstance(moe_runner_config.activation, str) and moe_runner_config.activation.lower() == "situ":
+    if (
+        isinstance(moe_runner_config.activation, str)
+        and moe_runner_config.activation.lower() == "situ"
+    ):
         act_id = 2
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
@@ -719,7 +729,11 @@ def fused_experts_impl_aiter(
             activation = "situ"
         else:
             activation = "gelu"
-    is_channelwise_w4a8_w8a8 = (quant_type == MoeQuantType.FP8_W8A8 or quant_type == MoeQuantType.W4A8) and block_shape is None
+    is_channelwise_w4a8_w8a8 = (
+        quant_type == MoeQuantType.FP8_W8A8
+        or quant_type == MoeQuantType.W8A8
+        or quant_type == MoeQuantType.W4A8
+    ) and block_shape is None
     if not is_channelwise_w4a8_w8a8 and (block_shape is None or len(block_shape) < 2):
         raise ValueError(
             "AITER MoE requires block_shape with two dimensions for this "
@@ -750,9 +764,9 @@ def fused_experts_impl_aiter(
     force_w4a16_moec = _should_force_aiter_w4a16_moec(quant_type)
     status, moe_cfg = _get_aiter_moe_config_w4a16(config_kwargs, force_w4a16_moec)
     if status:
-        assert (
-            moe_cfg.solution_type is not None
-        ), "status=True but solution_type is None"
+        assert moe_cfg.solution_type is not None, (
+            "status=True but solution_type is None"
+        )
         assert moe_cfg.config is not None, "status=True but config is None"
         assert moe_cfg.solution_type in (
             MoeSolutionType.MOE_C,
@@ -763,6 +777,7 @@ def fused_experts_impl_aiter(
         assert moe_cfg.quant_type in (
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
+            MoeQuantType.W8A8,
             MoeQuantType.WFP4A16,
             MoeQuantType.W4A8,
         ), f"Unexpected quant_type: {moe_cfg.quant_type}"
@@ -772,9 +787,9 @@ def fused_experts_impl_aiter(
         #     f"config keys={list(moe_cfg.config.keys())}"
         # )
     else:
-        assert (
-            moe_cfg.solution_type is None
-        ), "status=False but solution_type is not None"
+        assert moe_cfg.solution_type is None, (
+            "status=False but solution_type is not None"
+        )
         assert moe_cfg.config is None, "status=False but config is not None"
         print(
             f"[get_config_aiter_moe] M={M}, K={K}, N1={N1}, N2={N2}, E={E}, top_k={topk_ids.shape[1]}, block_size={block_size}, dtype={hidden_states.dtype}, quant_type={quant_type} "
@@ -782,7 +797,7 @@ def fused_experts_impl_aiter(
         )
 
     if (
-        (quant_type == MoeQuantType.W4A16 or quant_type ==MoeQuantType.WFP4A16)
+        (quant_type == MoeQuantType.W4A16 or quant_type == MoeQuantType.WFP4A16)
         and status
         and _aiter_moec_solution_type(moe_cfg)
         and getattr(moe_cfg, "need_shuffle_scale", False)
@@ -794,7 +809,7 @@ def fused_experts_impl_aiter(
     #     w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
     # if status and getattr(moe_cfg, "need_shuffle_scale", False):
     #     w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
-    
+
     return aiter_moe(
         hidden_states,
         w1,
@@ -851,7 +866,9 @@ def _prepare_fused_moe_run(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=(use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8),
+        use_int4_w4a16=(
+            use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8
+        ),
         dtype=hidden_states.dtype,
     )
 
@@ -1027,7 +1044,14 @@ def _fused_moe_kernel_sequence(
             ),
             has_bias=b1 is not None,
             is_quantized=any(
-                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16, use_mxfp4_w4a16, use_mxfp4_w4a8)
+                (
+                    use_fp8_w8a8,
+                    use_int8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    use_mxfp4_w4a16,
+                    use_mxfp4_w4a8,
+                )
             ),
             apply_router_weight_on_input=apply_router_weight_on_input,
             has_hooks=hooks is not None,
@@ -1466,12 +1490,21 @@ def fused_experts_impl(
         # AITER expects a complete expert weight set. EP-local shards keep
         # global expert ids and require Triton's filter_expert path.
         and not filter_expert
-        and (use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8 or use_int8_w8a8 or use_fp8_w8a8)
+        and (
+            use_int4_w4a16
+            or use_int4_w4a8
+            or use_mxfp4_w4a16
+            or use_mxfp4_w4a8
+            or use_int8_w8a8
+            or use_fp8_w8a8
+        )
         and hidden_states.dtype == torch.bfloat16
     ):
         if use_mxfp4_w4a8:
             if not hasattr(MoeQuantType, "WFP4A8"):
-                raise RuntimeError("The installed AITER package does not support MoeQuantType.WFP4A8.")
+                raise RuntimeError(
+                    "The installed AITER package does not support MoeQuantType.WFP4A8."
+                )
             quant_type = MoeQuantType.WFP4A8
         elif use_mxfp4_w4a16:
             quant_type = MoeQuantType.WFP4A16
@@ -1488,6 +1521,8 @@ def fused_experts_impl(
                 quant_type = MoeQuantType.W4A16
         elif use_int4_w4a8:
             quant_type = MoeQuantType.W4A8
+        elif use_int8_w8a8:
+            quant_type = MoeQuantType.W8A8
         else:
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(
@@ -1508,7 +1543,7 @@ def fused_experts_impl(
             routed_scaling_factor,
             quant_type,
             gemm1_alpha,
-            gemm1_limit
+            gemm1_limit,
         )
 
     if isinstance(activation, int):
@@ -1518,12 +1553,7 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if (
-        use_int4_w4a16
-        or use_int4_w4a8
-        or use_mxfp4_w4a16
-        or use_mxfp4_w4a8
-    ):
+    if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert hidden_states.shape[1] == w1.shape[2] - padded_size, (

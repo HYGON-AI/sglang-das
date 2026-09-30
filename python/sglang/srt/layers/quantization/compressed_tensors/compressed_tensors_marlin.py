@@ -14,10 +14,15 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig, CompressedTensorsLinearMethod, CompressedTensorsKVCacheMethod
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import CompressedTensorsMarlinMoEMethod
-from sglang.srt.layers.quantization.compressed_tensors.utils import (
-    should_ignore_layer)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+    CompressedTensorsLinearMethod,
+    CompressedTensorsKVCacheMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+    CompressedTensorsMarlinMoEMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 import os
 
@@ -57,16 +62,18 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
             linear_fp8_config,
         )
 
-
     @classmethod
-    def override_quantization_method(
-            cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
-                and hf_quant_cfg.get("format") == "int-quantized" \
-                and user_quant == "slimquant_marlin":
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if (
+            hf_quant_cfg.get("quant_method") == "compressed-tensors"
+            and hf_quant_cfg.get("format") == "int-quantized"
+            and user_quant == "slimquant_marlin"
+        ):
             return cls.get_name()
-        if hf_quant_cfg.get("quant_method") == "compressed-tensors" \
-                and user_quant == "slimquant_marlin":
+        if (
+            hf_quant_cfg.get("quant_method") == "compressed-tensors"
+            and user_quant == "slimquant_marlin"
+        ):
             logger.info(
                 "Using compressed-tensors quantization instead of "
                 "slimquant_marlin for model with format=%s.",
@@ -74,17 +81,21 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
             )
             return "compressed-tensors"
         return None
+
     @classmethod
     def get_name(cls) -> str:
         return "slimquant_marlin"
 
     def get_quant_method(
-            self,
-            layer: torch.nn.Module,
-            prefix: str,
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE  # Avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            FusedMoE,
+        )  # Avoid circular import
         from sglang.srt.layers.radix_attention import RadixAttention
+
         # Check if the layer is skipped for quantization.
         if isinstance(layer, RadixAttention):
             if self.kv_cache_scheme is None:
@@ -100,16 +111,35 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
                 )
                 return None
             return CompressedTensorsKVCacheMethod(self)
-        if should_ignore_layer(prefix,
-                               ignore=self.ignore,
-                               fused_mapping=self.packed_modules_mapping):
-            return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return UnquantizedEmbeddingMethod()  # UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
-                return UnquantizedEmbeddingMethod()#UnquantizedLinearMethod()
+                return UnquantizedEmbeddingMethod()  # UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
         if isinstance(layer, FusedMoE):
+            # The minimax int8-marlin pack is numerically wrong for DeepSeek
+            # channel W8A8 on HCU. Use the compressed-tensors INT8 MoE path,
+            # which selects the HCU AITER/Triton kernel.
+            from sglang.srt.utils import is_hcu
+
+            _is_hcu = is_hcu()
+            if _is_hcu:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsFusedMoEMethod,
+                )
+
+                layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+                if layer.scheme is None:
+                    from sglang.srt.layers.quantization.unquant import (
+                        UnquantizedFusedMoEMethod,
+                    )
+
+                    return UnquantizedFusedMoEMethod()
+                return CompressedTensorsFusedMoEMethod(self)
             return CompressedTensorsMarlinMoEMethod.get_moe_method(self, layer)
         return None
