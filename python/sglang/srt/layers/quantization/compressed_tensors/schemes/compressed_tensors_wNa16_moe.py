@@ -613,8 +613,8 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, group_size],
-            w13_zp=None if self.sym else self.w13_zp,
-            w2_zp=None if self.sym else self.w2_zp,
+            w13_zp=None if (self.sym and use_w4a8) else self.w13_zp,
+            w2_zp=None if (self.sym and use_w4a8) else self.w2_zp,
         )
 
     def apply_weights(
