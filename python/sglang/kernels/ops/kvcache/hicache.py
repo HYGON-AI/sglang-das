@@ -13,11 +13,13 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hcu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _is_hip = is_hip_runtime()
+_is_hcu = is_hip_runtime() and is_hcu()
 
 # ROCm needs a wider grid to saturate mapped-host transfers; CUDA keeps the legacy quota.
 DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
@@ -152,6 +154,11 @@ def can_use_hicache_jit_kernel(
     page_size: int | None = None,
 ) -> bool:
     logger = logging.getLogger(__name__)
+    if _is_hcu:
+        # hicache.cuh does not build on HCU, and with the build fixed the register
+        # kernel mis-copies MHA/page_first transfers there. Use the non-JIT path
+        # instead of recompiling (and failing) on every rank at server start.
+        return False
     if use_hicache_tma_kernel(
         element_size=element_size,
         block_quota=block_quota or TMA_BLOCK_QUOTA,
@@ -182,6 +189,11 @@ def can_use_write_back_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
+    if _is_hcu:
+        # hicache.cuh does not build on HCU, and with the build fixed the staged
+        # write-back kernel mis-copies page_first transfers there. Use the non-JIT path
+        # instead of recompiling (and failing) on every rank at server start.
+        return False
     if element_size % 16 != 0:
         logger.warning(f"Unsupported {element_size = } for staged JIT HiCache kernel")
         return False
