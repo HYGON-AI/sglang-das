@@ -84,7 +84,7 @@ on:
         type: boolean
         default: true
       runner_label:
-        description: "HCU runner label. Empty uses vars.HCU_CI_RUNNER_LABEL, then hcu-ci-pr-2."
+        description: "Deprecated; ignored. HCU jobs use the ci and bw1100 labels."
         required: false
         type: string
         default: ""
@@ -118,10 +118,10 @@ env:
 jobs:
   manual-hcu-model-test:
     name: Manual HCU model validation
-    runs-on: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-pr-2' }}
+    runs-on: [ci, bw1100]
     timeout-minutes: 720
     env:
-      SELECTED_RUNNER_LABEL: ${{ inputs.runner_label || vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-pr-2' }}
+      SELECTED_RUNNER_LABEL: "ci,bw1100"
       INPUT_TEST_BRANCH: ${{ inputs.test_branch || '' }}
       INPUT_SUITE: ${{ inputs.suite || '' }}
       INPUT_INCLUDE_FILE: ${{ inputs.include_file || '' }}

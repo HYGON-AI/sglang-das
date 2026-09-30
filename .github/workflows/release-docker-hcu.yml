@@ -20,7 +20,7 @@ env:
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    runs-on: [self-hosted, hcu]
+    runs-on: [ci, bw1100]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
