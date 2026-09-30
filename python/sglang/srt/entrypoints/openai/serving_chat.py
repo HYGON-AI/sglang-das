@@ -874,6 +874,34 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # The native DSV4 encoder treats a non-leading system message as raw
+        # continuation text and may omit the assistant generation prefix. The
+        # upstream-safe behavior is to reject that unsupported shape. General-
+        # FC-style datasets can opt into the semantically closest supported
+        # representation: a developer message with the same content.
+        if (
+            self.chat_encoding_spec == "dsv4"
+            and request.input_ids is None
+            and self.template_manager.chat_template_name is None
+        ):
+            non_leading_system_indices = [
+                index
+                for index, message in enumerate(request.messages)
+                if index > 0 and getattr(message, "role", None) == "system"
+            ]
+            if non_leading_system_indices:
+                if not envs.SGLANG_DSV4_REMAP_NON_LEADING_SYSTEM_TO_DEVELOPER.get():
+                    indices = ", ".join(map(str, non_leading_system_indices))
+                    return (
+                        "DeepSeek-V4 chat encoding only supports a system message "
+                        "in the leading position; found non-leading system message "
+                        f"at index(es): {indices}."
+                    )
+                for index in non_leading_system_indices:
+                    request.messages[index] = request.messages[index].model_copy(
+                        update={"role": "developer"}
+                    )
+
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
@@ -1135,6 +1163,8 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_stop = None
         required_parsed_natively = False
         effective_tools = self._effective_tools(request)
+        constraint_tool_choice = request.tool_choice
+        constraint_tools = effective_tools
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -1147,12 +1177,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(
-                    effective_tools,
+                    constraint_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
                 tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice,
+                    constraint_tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
@@ -1167,13 +1197,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     and self.tool_call_parser == "kimi_k3"
                 )
                 and (
-                    request.tool_choice == "required"
-                    or isinstance(request.tool_choice, ToolChoice)
+                    constraint_tool_choice == "required"
+                    or isinstance(constraint_tool_choice, ToolChoice)
                 )
             ):
                 json_schema = get_json_schema_constraint(
-                    effective_tools,
-                    request.tool_choice,
+                    constraint_tools,
+                    constraint_tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
@@ -2110,7 +2140,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
             )
             detector_owns_format = (
-                parser.detector.supports_structural_tag()
+                parser.detector.supports_structural_tag_for_tool_choice(tool_choice)
                 or parser.detector.parses_required_natively()
             )
             should_try_parser = not is_required or detector_owns_format
@@ -2561,7 +2591,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     use_native_parser = (
-                        probe.detector.supports_structural_tag()
+                        probe.detector.supports_structural_tag_for_tool_choice(
+                            request.tool_choice
+                        )
                         or probe.detector.parses_required_natively()
                     )
                 if use_native_parser:

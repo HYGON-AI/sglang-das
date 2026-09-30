@@ -291,7 +291,9 @@ class FunctionCallParser:
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
 
-            if is_required or should_constrain_auto:
+            if (
+                is_required or should_constrain_auto
+            ) and self.detector.supports_structural_tag_for_tool_choice(tool_choice):
                 structural_tag_tools = self.tools
                 if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
                     structural_tag_tools = [
