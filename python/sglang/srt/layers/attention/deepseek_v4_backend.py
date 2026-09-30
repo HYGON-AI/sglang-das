@@ -3414,23 +3414,18 @@ class DeepseekV4AttnBackend(
             )
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        if _is_hcu and is_cp_cache_layer_split_deepseek_v4_pool(
-            self.token_to_kv_pool
-        ):
-            # The HIP topk_v2 JIT launcher has no .config() API. Keep this
-            # correctness fallback scoped to LayerSplit until its JIT kernel is
-            # supported on HCU; the normal V4.1 path remains unchanged.
+        if _is_hcu:
+            # topk_v2 has no HCU kernel. Keep the CUDA path unchanged and use
+            # the correctness fallback for both normal and LayerSplit pools.
             columns = torch.arange(logits.shape[1], device=device)[None, :]
-            valid = (columns >= ks[:, None]) & (
-                columns < (ks + compress_lens)[:, None]
-            )
+            valid = columns < compress_lens[:, None]
             count = min(topk, logits.shape[1])
             ranked = logits.masked_fill(~valid, -torch.inf).topk(
                 count, dim=-1
             ).indices
             selected.fill_(-1)
             selected[:, :count] = torch.where(
-                valid.gather(1, ranked), ranked, -1
+                valid.gather(1, ranked), ranked + ks[:, None], -1
             ).to(torch.int32)
         else:
             topk_transform_ragged_v2(
