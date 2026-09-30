@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.hy4_ihc_tilelang import (
@@ -104,7 +105,7 @@ class HYV4HCPreLayer(nn.Module):
         rms_weight: torch.Tensor | None = None,
         rms_eps: float = 0.0,
     ):
-        if rms_weight is None:
+        if rms_weight is None and envs.SGLANG_OPT_HY4_IHC_TILELANG.get():
             # Opt-in HCU TileLang iHC (SGLANG_OPT_HY4_IHC_TILELANG); it does not
             # fuse the RMSNorm, so it only serves the unfused-norm call.
             fused = try_tilelang_ihc_pre(
