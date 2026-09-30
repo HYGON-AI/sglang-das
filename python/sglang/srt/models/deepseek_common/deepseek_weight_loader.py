@@ -309,34 +309,31 @@ class DeepseekV2WeightLoaderMixin:
 
                 weight_names.append(name)
 
-                match nextn_conf:
-                    case NextNEnabledConfig(
-                        nextn_layer_prefix=layer_prefix,
-                        nextn_spec_weight_names=spec_weight_names,
-                    ):
-                        if not name.startswith(layer_prefix):
-                            continue
+                if isinstance(nextn_conf, NextNEnabledConfig):
+                    layer_prefix = nextn_conf.nextn_layer_prefix
+                    spec_weight_names = nextn_conf.nextn_spec_weight_names
+                    if not name.startswith(layer_prefix):
+                        continue
 
-                        # Use shared head and embed weights from target model
-                        if "shared_head.head" in name or "embed_tokens" in name:
-                            continue
+                    # Use shared head and embed weights from target model
+                    if "shared_head.head" in name or "embed_tokens" in name:
+                        continue
 
-                        # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
-                        if any(s in name for s in spec_weight_names):
-                            name = name.replace(layer_prefix, "model")
-                        else:
-                            name = name.replace(layer_prefix, "model.decoder")
-                    case NextNDisabledConfig():
-                        if hasattr(self.config, "num_nextn_predict_layers"):
-                            num_nextn_layers = self.config.num_nextn_predict_layers
-                            if num_nextn_layers > 0 and name.startswith("model.layers"):
-                                name_list = name.split(".")
-                                if (
-                                    len(name_list) >= 3
-                                    and int(name_list[2])
-                                    >= self.config.num_hidden_layers
-                                ):
-                                    continue
+                    # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
+                    if any(s in name for s in spec_weight_names):
+                        name = name.replace(layer_prefix, "model")
+                    else:
+                        name = name.replace(layer_prefix, "model.decoder")
+                elif isinstance(nextn_conf, NextNDisabledConfig):
+                    if hasattr(self.config, "num_nextn_predict_layers"):
+                        num_nextn_layers = self.config.num_nextn_predict_layers
+                        if num_nextn_layers > 0 and name.startswith("model.layers"):
+                            name_list = name.split(".")
+                            if (
+                                len(name_list) >= 3
+                                and int(name_list[2]) >= self.config.num_hidden_layers
+                            ):
+                                continue
 
                 if _load_fused_expert_tensor(name, loaded_weight, params_dict):
                     continue
@@ -888,31 +885,28 @@ class DeepseekV2WeightLoaderMixin:
         weight_block_size = [128, 128]
         partial_names = []
 
-        match nextn_conf:
-            case NextNEnabledConfig(nextn_layer_id=layer_id):
-                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+        if isinstance(nextn_conf, NextNEnabledConfig):
+            layer_id = nextn_conf.nextn_layer_id
+            if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+                for stem in attn_quant_modules:
+                    partial_names.append(f"model.layers.{layer_id}.self_attn.{stem}")
+
+            if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+                expert_sub_names = ["shared_experts"] + [
+                    f"experts.{i}" for i in range(self.config.n_routed_experts)
+                ]
+                for expert_sub_name in expert_sub_names:
+                    for stem in ["gate_proj", "up_proj", "down_proj"]:
+                        partial_names.append(
+                            f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
+                        )
+        elif isinstance(nextn_conf, NextNDisabledConfig):
+            if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+                for layer_id in range(self.config.num_hidden_layers):
                     for stem in attn_quant_modules:
                         partial_names.append(
                             f"model.layers.{layer_id}.self_attn.{stem}"
                         )
-
-                if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-                    expert_sub_names = ["shared_experts"] + [
-                        f"experts.{i}" for i in range(self.config.n_routed_experts)
-                    ]
-                    for expert_sub_name in expert_sub_names:
-                        for stem in ["gate_proj", "up_proj", "down_proj"]:
-                            partial_names.append(
-                                f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
-                            )
-
-            case NextNDisabledConfig():
-                if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
-                    for layer_id in range(self.config.num_hidden_layers):
-                        for stem in attn_quant_modules:
-                            partial_names.append(
-                                f"model.layers.{layer_id}.self_attn.{stem}"
-                            )
 
         # Early return if no quantization needed - avoid materializing all weights into memory
         if not partial_names:
