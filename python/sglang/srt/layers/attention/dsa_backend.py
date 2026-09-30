@@ -2293,9 +2293,13 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if (
+            attn_sink is not None
+            and dsa_impl != "flashmla_sparse"
+            and not (_is_hcu and dsa_impl == "flashmla_kv")
+        ):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"Learnable attention sinks require flashmla_sparse or HCU flashmla_kv, got {dsa_impl}"
             )
 
         phase = (
@@ -2630,6 +2634,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2694,9 +2699,13 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if (
+            attn_sink is not None
+            and dsa_impl != "flashmla_sparse"
+            and not (_is_hcu and dsa_impl == "flashmla_kv")
+        ):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"Learnable attention sinks require flashmla_sparse or HCU flashmla_kv, got {dsa_impl}"
             )
 
         if dsa_impl == "trtllm":
@@ -2807,6 +2816,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -3475,6 +3485,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
         forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         flash_mla_with_kvcache = get_flashmla_op(
             "flash_mla_with_kvcache", is_hcu=_is_hcu
@@ -3528,6 +3539,13 @@ class DeepseekSparseAttnBackend(
         if needs_repad and num_valid == 0:
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
         else:
+            attn_sink_kv = attn_sink
+            if attn_sink_kv is not None and target_q_heads != num_q_heads:
+                # Match the padded q-head count; the padded heads' output is
+                # trimmed after the kernel, so the pad sink value is inert.
+                sink_padded = attn_sink_kv.new_zeros(target_q_heads)
+                sink_padded[:num_q_heads] = attn_sink_kv
+                attn_sink_kv = sink_padded
             o, _ = flash_mla_with_kvcache(
                 q=q_input,
                 k_cache=kv_cache,
@@ -3542,7 +3560,11 @@ class DeepseekSparseAttnBackend(
                     (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
                 ),
                 is_fp8_kvcache=True,
-                **({} if _is_hcu else {"kv_format": self.flashmla_kv_format}),
+                **(
+                    {"attn_sink": attn_sink_kv}
+                    if _is_hcu
+                    else {"kv_format": self.flashmla_kv_format}
+                ),
             )
 
         if needs_repad:
