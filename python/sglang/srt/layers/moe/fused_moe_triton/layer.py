@@ -90,6 +90,10 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
+from sglang.srt.layers.moe.utils import (
+    is_sbo_enabled,
+    is_tbo_enabled,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
@@ -199,7 +203,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=is_tbo_enabled() or is_sbo_enabled(),
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
