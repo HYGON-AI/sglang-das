@@ -19,13 +19,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
-
 from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.cleanup import run_cleanup_step
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
@@ -165,7 +165,6 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
-
 def retraction_backup(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -224,6 +223,8 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if getattr(req, "external_kv_abort_requested", False):
+        return _release_aborted_kv_cache(req, tree_cache, is_insert)
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache
@@ -267,6 +268,64 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     _release_donated_swa_slots(req, tree_cache)
     tree_cache.req_to_token_pool.free(req)
+    req.kv = None
+
+
+def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool):
+    """Resume successful substeps without re-entering completed allocator calls."""
+
+    def snapshot():
+        assert (req.req_pool_idx is None) == (req.kv is None)
+        if req.req_pool_idx is None:
+            return None
+        return req.effective_kv_committed_len(), req.kv.kv_allocated_len
+
+    layout = run_cleanup_step(req, "kv.layout", snapshot)
+    if layout is None:
+        assert tree_cache.supports_mamba()
+        if req.mamba_pool_idx is not None:
+            run_cleanup_step(
+                req,
+                "kv.early_mamba",
+                lambda: tree_cache.req_to_token_pool.mamba_allocator.free(
+                    req.mamba_pool_idx.unsqueeze(-1)
+                ),
+            )
+            req.mamba_pool_idx = None
+        return
+
+    committed, allocated = layout
+    run_cleanup_step(
+        req,
+        "kv.cache_finished",
+        lambda: tree_cache.cache_finished_req(
+            req,
+            is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+            kv_len_to_handle=committed,
+        ),
+    )
+    # Streaming sessions can take responsibility for all resources here.
+    if req.req_pool_idx is None and req.kv is None:
+        return
+    run_cleanup_step(
+        req,
+        "kv.overallocated",
+        lambda: _release_overallocated_kv_indices(
+            req, committed, allocated, tree_cache
+        ),
+    )
+    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+        not tree_cache.supports_mamba()
+    ):
+        run_cleanup_step(
+            req, "kv.mamba", lambda: tree_cache.req_to_token_pool.free_mamba_cache(req)
+        )
+    run_cleanup_step(
+        req, "kv.donated_swa", lambda: _release_donated_swa_slots(req, tree_cache)
+    )
+    run_cleanup_step(
+        req, "kv.request_slot", lambda: tree_cache.req_to_token_pool.free(req)
+    )
     req.kv = None
 
 

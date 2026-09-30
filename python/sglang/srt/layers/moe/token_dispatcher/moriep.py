@@ -10,6 +10,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.moe.token_dispatcher.aiter_utils import should_use_aiter_runner
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -52,6 +53,28 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
+
+
+def _build_mori_aiter_expert_metadata(
+    num_experts: int,
+    num_local_experts: int,
+    ep_rank: int,
+    device: torch.device | int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return Mori legacy membership mask and unified global-to-local map."""
+    start = ep_rank * num_local_experts
+    end = start + num_local_experts
+    if start < 0 or end > num_experts:
+        raise ValueError(
+            f"invalid Mori EP expert range [{start}, {end}) for E={num_experts}"
+        )
+    expert_mask = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    expert_mask[start:end] = 1
+    expert_map = torch.full((num_experts,), -1, device=device, dtype=torch.int32)
+    expert_map[start:end] = torch.arange(
+        num_local_experts, device=device, dtype=torch.int32
+    )
+    return expert_mask, expert_map
 
 
 def _should_record_expert_distribution() -> bool:
@@ -1066,16 +1089,21 @@ class MoriEPDispatcher(BaseDispatcher):
         # Mori dispatch produces global topk_ids in [0, num_experts); mask out
         # experts that are not local to this rank.
         self.expert_mask_gpu = None
-        if _use_aiter and num_experts is not None and num_local_experts is not None:
+        self.aiter_expert_map_gpu = None
+        if (
+            should_use_aiter_runner()
+            and num_experts is not None
+            and num_local_experts is not None
+        ):
             ep_rank = get_parallel().moe_ep_rank
-            expert_mask = torch.zeros(
-                num_experts,
-                device=torch.cuda.current_device(),
-                dtype=torch.int32,
+            self.expert_mask_gpu, self.aiter_expert_map_gpu = (
+                _build_mori_aiter_expert_metadata(
+                    num_experts,
+                    num_local_experts,
+                    ep_rank,
+                    torch.cuda.current_device(),
+                )
             )
-            start = ep_rank * num_local_experts
-            expert_mask[start : start + num_local_experts] = 1
-            self.expert_mask_gpu = expert_mask
 
     def dispatch(
         self,

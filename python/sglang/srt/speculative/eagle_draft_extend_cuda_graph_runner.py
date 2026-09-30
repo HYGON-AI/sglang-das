@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -82,7 +83,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
-    next_token_logits_buffer: torch.Tensor
+    next_token_logits_buffer: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
@@ -240,7 +241,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 vocab_size = self.model_runner.model_config.vocab_size
 
             next_token_logits_buffer = (
-                self.model_runner.graph_shared_output.get_logits_buffer(
+                None
+                if getattr(self.model_runner.model, "use_fp8_lm_head_top1", False)
+                else self.model_runner.graph_shared_output.get_logits_buffer(
                     vocab_size, rows=self.max_bs * self.captured_req_width
                 )
             )
@@ -278,6 +281,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
         self.buffers.share_buffers()
+        # Keep the capture-time ForwardBatch/SpecInput objects alive and reuse
+        # them for every replay.  Their tensor members point at the persistent
+        # buffers above; only tensor contents change between requests.
+        self._static_forward_batches = {}
 
         self.backend = resolve_decode_backend(self)
 
@@ -355,7 +362,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = (
+            buffers.next_token_logits_buffer[:num_tokens]
+            if buffers.next_token_logits_buffer is not None
+            else None
+        )
 
         # pruned_states = num_tokens (all tokens)
         num_tokens_for_logprob = num_tokens
@@ -393,6 +404,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.captured_req_width,
         )
+        # The in-graph Triton metadata kernel must capture the persistent
+        # extend-length buffer address, not a capture-only zero fallback.
+        spec_info.extend_seq_lens_tensor = extend_seq_lens
 
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -417,6 +431,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        self._static_forward_batches[bs] = forward_batch
 
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
@@ -510,10 +525,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
-        # Batch the small per-field device copies into a grouped foreach copy
-        # (one foreach call per dtype pair) to cut launch overhead. hidden_states
-        # is handled separately below (see note), and seq_lens_cpu is handled
-        # further down since it lives on host.
         copy_dsts = [
             buffers.input_ids[:num_tokens],
             buffers.seq_lens[:raw_bs],
@@ -559,51 +570,44 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 bs * self.captured_req_width
             )
 
-        if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-
-        if forward_batch.extend_seq_lens_cpu is not None:
-            self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
-        else:
-            self.extend_seq_lens_cpu[:raw_bs] = [self.captured_req_width] * raw_bs
-        if bs > raw_bs:
-            self.extend_seq_lens_cpu[raw_bs:bs] = [self.captured_req_width] * (
-                bs - raw_bs
-            )
-        forward_batch.spec_info.extend_seq_lens_cpu = list(
-            self.extend_seq_lens_cpu[:bs]
-        )
-        forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
-
-        if bs != raw_bs:
-            forward_batch.spec_info.positions = buffers.positions[:num_tokens]
-            forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
-            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
-
-        from types import SimpleNamespace
-
         seq_lens_sum = forward_batch.seq_lens_sum
         if seq_lens_sum is not None:
             seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-        fb_view = SimpleNamespace(
-            batch_size=bs,
-            forward_mode=self.forward_mode,
-            input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            # Mirror absence must survive replay (stale buffer defeats None-guards).
-            seq_lens_cpu=(
-                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
-            ),
-            encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-            spec_info=forward_batch.spec_info,
-        )
-        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+        static_forward_batch = self._static_forward_batches[bs]
+        static_forward_batch.seq_lens_sum = seq_lens_sum
+        static_forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[
+            :bs
+        ]
+        # Triton does not consume the CPU mirrors during graph replay. Keep
+        # those Python/list updates off the HIP hot path; other backends retain
+        # their legacy mirrors until they opt into the same resident contract.
+        if isinstance(self.draft_extend_attn_backend, TritonAttnBackend):
+            static_forward_batch.seq_lens_cpu = None
+            static_forward_batch.spec_info.extend_seq_lens_cpu = None
+        else:
+            if forward_batch.seq_lens_cpu is not None:
+                if bs != raw_bs:
+                    buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+                buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+                static_forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+            else:
+                static_forward_batch.seq_lens_cpu = None
+            if forward_batch.extend_seq_lens_cpu is not None:
+                self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
+            else:
+                self.extend_seq_lens_cpu[:raw_bs] = [self.captured_req_width] * raw_bs
+            if bs > raw_bs:
+                self.extend_seq_lens_cpu[raw_bs:bs] = [self.captured_req_width] * (
+                    bs - raw_bs
+                )
+            static_forward_batch.spec_info.extend_seq_lens_cpu = (
+                self.extend_seq_lens_cpu[:bs]
+            )
+
+        if not self.draft_extend_attn_backend.draft_extend_metadata_captured_in_graph():
+            self.draft_extend_attn_backend.init_forward_metadata_out_graph(
+                static_forward_batch
+            )
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
@@ -616,10 +620,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.bs = bs
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
-            out = self._replay_graph(shape_key, forward_batch)
+            out = self._replay_graph(shape_key, static_forward_batch)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_tokens],
+            next_token_logits=(
+                out.next_token_logits[:num_tokens]
+                if out.next_token_logits is not None
+                else None
+            ),
             hidden_states=out.hidden_states[:num_tokens],
+            draft_topk_index=(
+                out.draft_topk_index[:num_tokens]
+                if out.draft_topk_index is not None
+                else None
+            ),
         )
         return out

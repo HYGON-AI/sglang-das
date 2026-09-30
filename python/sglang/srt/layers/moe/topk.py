@@ -2346,21 +2346,25 @@ def _post_process_topk_ids(
         and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
     )
     hip_deepep_postprocessed = False
+    log2phy_prob = None
+    dispatch_algorithm = (
+        getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+        if expert_location_dispatch_info is not None
+        else None
+    )
+    if dispatch_algorithm in ("lp", "load_aware"):
+        from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+        lplb_solver = get_global_lplb_solver(layer_id)
+        if lplb_solver is not None:
+            log2phy_prob = (
+                lplb_solver.solve(topk_ids, num_token_non_padded)
+                if dispatch_algorithm == "load_aware"
+                else lplb_solver.solve(topk_ids)
+            )
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
-        log2phy_prob = None
-        if (
-            expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
-        ):
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
-
         if log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
@@ -2401,7 +2405,10 @@ def _post_process_topk_ids(
             # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
             # the post-shared-expert mask below for the explicitly forced fused
             # shared-expert configuration.
-            if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
+            if remap_info is not None and remap_info.ep_dispatch_algorithm in (
+                "lp",
+                "load_aware",
+            ):
                 # LP dispatch uses a separate HIP kernel. Resolve probabilities
                 # before entering the compiled padding/dtype postprocess.
                 from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
@@ -2409,7 +2416,7 @@ def _post_process_topk_ids(
                 solver = get_global_lplb_solver(layer_id)
                 if solver is None:
                     raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
-                probabilities = solver.solve(topk_ids)
+                probabilities = log2phy_prob
                 if hasattr(solver, "static_dispatch_map"):
                     from sglang.kernels.ops.lplb import cuda_solver
 
@@ -2444,7 +2451,7 @@ def _post_process_topk_ids(
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
         if remap_info is not None and not hip_deepep_postprocessed:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info, log2phy_prob)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a

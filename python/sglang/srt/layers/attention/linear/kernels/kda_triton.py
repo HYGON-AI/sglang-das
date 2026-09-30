@@ -22,9 +22,16 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update,
-    )
+    if is_hcu() and _USE_KDA_HCU:
+        # The SGLang-compatible decode/verify ABI lives in BoltOPs fla.common.
+        # The same-named fla.gdn facade exposes the vLLM GDN decode ABI.
+        from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+    else:
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
@@ -32,6 +39,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    verify_impl_name: str = (
+        "boltops_common" if is_hcu() and _USE_KDA_HCU else "sglang_triton"
+    )
 
     def packed_decode(
         self,

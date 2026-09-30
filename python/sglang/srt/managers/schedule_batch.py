@@ -77,7 +77,6 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -977,6 +976,21 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+
+        # External KV abort cleanup state. Each action is independently
+        # retryable so a request can move between scheduler queues without
+        # losing progress when an asynchronous cleanup step fails.
+        self.external_kv_abort_requested = False
+        self.external_kv_pending_chunk_cleared = False
+        self.external_kv_linker_released = False
+        self.external_kv_sender_abort_requested = False
+        self.external_kv_metadata_released = False
+        self.external_kv_cache_released = False
+        self.external_kv_finish_state_applied = False
+        self.external_kv_response_sent = False
+        self.external_kv_abort_response_via_chunked = False
+        self.external_kv_cleanup_done = False
+        self.external_kv_cleanup_steps = {}
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1282,6 +1296,16 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         return self.finished_reason is not None
+
+    def finishes_after_pending_token(self) -> bool:
+        """Whether one already-launched token will reach the length cap.
+
+        The overlap scheduler plans the next iteration before processing the
+        current forward result.  For a final Prefill chunk, that result already
+        contains one sampled token.  Requests at the cap must not be promoted
+        into a speculative one-token decode batch while that result is pending.
+        """
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
 
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
@@ -2200,6 +2224,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_cp_num_tokens: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
@@ -3342,6 +3367,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            global_cp_num_tokens=self.global_cp_num_tokens,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,

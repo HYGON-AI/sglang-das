@@ -308,3 +308,136 @@ class LPLBSolver:
             self.log2phy,
         )
         return self._log2phy_prob
+
+
+class LoadAwareReplicaSolver:
+    """Fast per-layer load-aware dispatch for ROCm redundant experts.
+
+    Unlike the Hopper-only LP backend, this solver uses a single small Triton
+    water-fill kernel. It balances this source rank's current expert-M over EP
+    destination ranks and returns probabilities over each logical expert's
+    physical copies. Applying the same invariant independently at every source
+    balances the aggregate load without a latency-sensitive EP collective.
+    """
+
+    def __init__(
+        self,
+        phy2log: torch.Tensor,
+        log2phy: torch.Tensor,
+        num_gpus: int,
+        ep_group=None,
+        logical_to_all_physical_map_num_valid=None,
+    ):
+        if phy2log.numel() % num_gpus != 0:
+            raise ValueError(
+                "Load-aware dispatch requires an equal contiguous physical "
+                f"expert allocation, got {phy2log.numel()} experts over "
+                f"{num_gpus} ranks."
+            )
+        self.num_logical = log2phy.shape[0]
+        self.max_copies = log2phy.shape[1]
+        self.num_gpus = num_gpus
+        self.ep_group = ep_group
+        self.logical_to_all_physical_map = log2phy.contiguous()
+        self.num_valid_copies = (
+            (
+                logical_to_all_physical_map_num_valid
+                if logical_to_all_physical_map_num_valid is not None
+                else log2phy.ge(0).sum(dim=1)
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
+
+        physical_per_rank = phy2log.numel() // num_gpus
+        self.copy_ranks = (
+            torch.where(
+                log2phy >= 0,
+                torch.div(log2phy, physical_per_rank, rounding_mode="floor"),
+                -1,
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
+
+        replicated_ids_cpu = torch.nonzero(self.num_valid_copies.cpu() > 1).flatten()
+        self.num_replicated = int(replicated_ids_cpu.numel())
+        if self.num_replicated == 0:
+            # Solver objects are initialized for every model layer, including
+            # dense/no-replica layers.  Keep an identity probability table so
+            # those layers remain valid without paying for a count/solve.
+            self._probabilities = torch.zeros(
+                log2phy.shape, dtype=torch.float32, device=log2phy.device
+            )
+            self._probabilities[:, 0] = 1.0
+            self._local_counts = None
+            self.replicated_logical_ids = None
+            self.replicated_candidate_ranks = None
+            self.replicated_candidate_multiplicity = None
+            return
+        block_replicated = 1 << max(0, (self.num_replicated - 1).bit_length())
+        block_ranks = 1 << max(0, (num_gpus - 1).bit_length())
+        replicated_ids = torch.zeros(
+            block_replicated, dtype=torch.int32, device=log2phy.device
+        )
+        replicated_ids[: self.num_replicated].copy_(
+            replicated_ids_cpu.to(device=log2phy.device, dtype=torch.int32)
+        )
+        self.replicated_logical_ids = replicated_ids
+
+        candidate_ranks = torch.full(
+            (block_replicated, block_ranks),
+            -1,
+            dtype=torch.int32,
+            device=log2phy.device,
+        )
+        candidate_multiplicity = torch.zeros_like(candidate_ranks)
+        copy_ranks_cpu = self.copy_ranks.cpu()
+        num_valid_cpu = self.num_valid_copies.cpu()
+        for replicated_index, logical_id_tensor in enumerate(replicated_ids_cpu):
+            logical_id = int(logical_id_tensor)
+            ranks = copy_ranks_cpu[logical_id, : int(num_valid_cpu[logical_id])]
+            unique_ranks, multiplicity = torch.unique(
+                ranks, sorted=True, return_counts=True
+            )
+            candidate_ranks[replicated_index, : unique_ranks.numel()].copy_(
+                unique_ranks.to(candidate_ranks.device, dtype=torch.int32)
+            )
+            candidate_multiplicity[replicated_index, : multiplicity.numel()].copy_(
+                multiplicity.to(candidate_ranks.device, dtype=torch.int32)
+            )
+        self.replicated_candidate_ranks = candidate_ranks
+        self.replicated_candidate_multiplicity = candidate_multiplicity
+        self._local_counts = torch.empty(
+            self.num_logical, dtype=torch.float32, device=log2phy.device
+        )
+        self._probabilities = torch.empty(
+            log2phy.shape, dtype=torch.float32, device=log2phy.device
+        )
+
+    def solve(
+        self,
+        topk_ids: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.num_replicated == 0:
+            return self._probabilities
+
+        from sglang.srt.eplb.load_aware_dispatch import (
+            build_load_aware_probabilities,
+            count_logical_experts,
+        )
+
+        local_counts = count_logical_experts(
+            topk_ids, self._local_counts, num_token_non_padded
+        )
+        return build_load_aware_probabilities(
+            local_counts,
+            self.num_valid_copies,
+            self.copy_ranks,
+            self.replicated_logical_ids,
+            self.replicated_candidate_ranks,
+            self.replicated_candidate_multiplicity,
+            self._probabilities,
+            self.num_replicated,
+        )

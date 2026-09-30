@@ -3,7 +3,11 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -59,6 +63,57 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+
+class TestAlignedMoeDpLayout(CustomTestCase):
+    def _modes(self, **parallel_overrides):
+        values = dict(
+            tp_size=8,
+            attn_dp_size=4,
+            attn_tp_size=2,
+            attn_cp_size=1,
+            moe_dp_size=4,
+            moe_tp_size=2,
+            moe_ep_size=1,
+        )
+        values.update(parallel_overrides)
+        with (
+            patch.object(comm, "is_dp_attention_enabled", return_value=True),
+            patch.object(
+                comm,
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: True),
+            ),
+            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
+            patch.object(
+                comm,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            ),
+            patch.object(comm, "enable_dwdp", return_value=False),
+            get_parallel().override(**values),
+        ):
+            return LayerScatterModes.init_new(
+                num_layers=60,
+                layer_id=10,
+                is_layer_sparse=True,
+                is_previous_layer_sparse=True,
+                is_next_layer_sparse=True,
+            )
+
+    def test_matching_dp_and_tp_keep_attention_local_layout(self):
+        modes = self._modes()
+        self.assertEqual(modes.mlp_mode, ScatterMode.TP_ATTN_FULL)
+        self.assertEqual(modes.middle_residual_mode, ScatterMode.TP_ATTN_FULL)
+        self.assertEqual(modes.layer_output_mode, ScatterMode.TP_ATTN_FULL)
+
+    def test_mismatched_moe_dp_falls_back_to_global_full(self):
+        modes = self._modes(moe_dp_size=1, moe_tp_size=8)
+        self.assertEqual(modes.mlp_mode, ScatterMode.FULL)
+
+    def test_ep_layout_is_not_assumed_to_match(self):
+        modes = self._modes(moe_dp_size=2, moe_tp_size=2, moe_ep_size=2)
+        self.assertEqual(modes.mlp_mode, ScatterMode.FULL)
 
 
 if __name__ == "__main__":

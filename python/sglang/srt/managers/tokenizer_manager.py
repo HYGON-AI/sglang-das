@@ -409,7 +409,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         ensure_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().dp_size
+        # The tokenizer/HTTP process does not join the model-parallel groups,
+        # so its runtime parallel context may retain dp_size=1.  The launch
+        # arguments are authoritative for request validation and direct DP
+        # routing until an elastic-scale update replaces this count.
+        self.elastic_worker_count = server_args.dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -786,11 +790,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
+            routed_dp_ranks = (
+                obj.routed_dp_rank
+                if isinstance(obj.routed_dp_rank, list)
+                else [obj.routed_dp_rank]
+            )
+            if dp_size <= 1 and all(rank == 0 for rank in routed_dp_ranks):
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+            elif any(rank < 0 or rank >= dp_size for rank in routed_dp_ranks):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
@@ -1543,8 +1552,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
         - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
         """
+        explicit_dp_batch = self.server_args.enable_dp_attention and isinstance(
+            getattr(requests, "routed_dp_rank", None), list
+        )
         return batch_size > 0 and (
             get_serving().enable_tokenizer_batch_encode
+            or explicit_dp_batch
             or (
                 (not get_parallel().enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))

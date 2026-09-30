@@ -53,9 +53,20 @@ class RecentPrefillBatchSizeTracker:
 class _State:
     delayed_count: int = 0
     start_time: float = field(default_factory=time.perf_counter)
+    max_waiting_queue_len: int = 0
+    last_queue_growth_time: float = field(default_factory=time.perf_counter)
 
     def bump_delayed_count(self) -> "_State":
         return dataclasses.replace(self, delayed_count=self.delayed_count + 1)
+
+    def observe_waiting_queue_len(self, waiting_queue_len: int, now: float) -> "_State":
+        if waiting_queue_len <= self.max_waiting_queue_len:
+            return self
+        return dataclasses.replace(
+            self,
+            max_waiting_queue_len=waiting_queue_len,
+            last_queue_growth_time=now,
+        )
 
 
 class _NegotiateOutput(NamedTuple):
@@ -77,6 +88,7 @@ class PrefillDelayer:
         self,
         dp_size: int,
         attn_tp_size: int,
+        attn_cp_size: int,
         cpu_group,
         server_args,
         max_delay_passes: int,
@@ -97,6 +109,41 @@ class PrefillDelayer:
         self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
+        self._enable_idle_coalescing = getattr(
+            server_args, "enable_prefill_idle_coalescing", False
+        )
+        self._idle_coalesce_max_delay_ms = getattr(
+            server_args, "prefill_idle_coalesce_max_delay_ms", 50.0
+        )
+        self._idle_coalesce_settle_ms = getattr(
+            server_args, "prefill_idle_coalesce_settle_ms", 10.0
+        )
+        self._idle_coalesce_burst_max_delay_ms = getattr(
+            server_args, "prefill_idle_coalesce_burst_max_delay_ms", 500.0
+        )
+        self._idle_coalesce_max_batch_size = getattr(
+            server_args, "prefill_idle_coalesce_max_batch_size", 32
+        )
+        if self._idle_coalesce_max_delay_ms <= 0:
+            raise ValueError(
+                "prefill_idle_coalesce_max_delay_ms must be positive, got "
+                f"{self._idle_coalesce_max_delay_ms}"
+            )
+        if self._idle_coalesce_settle_ms <= 0:
+            raise ValueError(
+                "prefill_idle_coalesce_settle_ms must be positive, got "
+                f"{self._idle_coalesce_settle_ms}"
+            )
+        if self._idle_coalesce_burst_max_delay_ms <= 0:
+            raise ValueError(
+                "prefill_idle_coalesce_burst_max_delay_ms must be positive, got "
+                f"{self._idle_coalesce_burst_max_delay_ms}"
+            )
+        if self._idle_coalesce_max_batch_size < 2:
+            raise ValueError(
+                "prefill_idle_coalesce_max_batch_size must be at least 2, got "
+                f"{self._idle_coalesce_max_batch_size}"
+            )
         self._queue_trigger_enabled = self._queue_min_ratio is not None
         self._prefill_max_requests = server_args.prefill_max_requests
         logger.info(
@@ -105,6 +152,12 @@ class PrefillDelayer:
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
             f"max_delay_ms={self._max_delay_ms} "
+            f"idle_coalescing={self._enable_idle_coalescing} "
+            f"idle_coalesce_max_delay_ms={self._idle_coalesce_max_delay_ms} "
+            f"idle_coalesce_settle_ms={self._idle_coalesce_settle_ms} "
+            f"idle_coalesce_burst_max_delay_ms="
+            f"{self._idle_coalesce_burst_max_delay_ms} "
+            f"idle_coalesce_max_batch_size={self._idle_coalesce_max_batch_size} "
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
         self.dp_size = dp_size
@@ -130,9 +183,13 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, wait_elapsed_us, queue_quiet_elapsed_us.
+        # The gather group contains every attention TP *and* CP rank for each
+        # DP replica.  Keep those dimensions folded together and select one
+        # representative below, matching MLPSyncBatchInfo's layout.  Omitting
+        # CP here makes all_gather_into_tensor undersized for DP+CP topologies.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size * attn_cp_size, 7),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -186,18 +243,47 @@ class PrefillDelayer:
         )
 
         # Gather global states
+        # Never use each worker's local clock directly for a scheduling
+        # decision.  Around the deadline one CP/TP worker can cross the
+        # threshold one scheduler pass before another; allowing on only a
+        # subset of ranks forks collective ordering and deadlocks the model.
+        # Publish the local observation in the existing all-gather and make
+        # every worker consume the same representative-rank decision below.
+        now = time.perf_counter()
+        local_observed_state = prev_state
+        if local_observed_state is not None:
+            local_observed_state = local_observed_state.observe_waiting_queue_len(
+                waiting_queue_len, now
+            )
+        local_wait_elapsed_us = int(
+            (now - local_observed_state.start_time) * 1_000_000
+            if local_observed_state is not None
+            else 0
+        )
+        local_queue_quiet_elapsed_us = int(
+            (now - local_observed_state.last_queue_growth_time) * 1_000_000
+            if local_observed_state is not None
+            else 0
+        )
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
             local_token_watermark_force_allow=local_token_watermark_force_allow,
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            wait_elapsed_us=local_wait_elapsed_us,
+            queue_quiet_elapsed_us=local_queue_quiet_elapsed_us,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        # Wait for every DP representative to reach its deadline.  All
+        # TP/CP workers see the same gathered tensor and therefore take the
+        # same release path.  For the common DP=1 case this is rank 0's clock.
+        global_wait_elapsed_ms = tp0_info[:, 5].min().item() / 1000.0
+        global_queue_quiet_elapsed_ms = tp0_info[:, 6].min().item() / 1000.0
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -247,6 +333,22 @@ class PrefillDelayer:
             global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
 
+            # Keep every rank's local wait state synchronized to the same
+            # global queue high-watermark. If any DP replica observed growth,
+            # all ranks reset their quiet window on this scheduler pass.
+            idle_state = local_observed_state
+            if idle_state is None:
+                idle_state = _State(
+                    start_time=now,
+                    max_waiting_queue_len=global_waiting_queue_max,
+                    last_queue_growth_time=now,
+                )
+            elif global_waiting_queue_max > idle_state.max_waiting_queue_len:
+                idle_state = idle_state.observe_waiting_queue_len(
+                    global_waiting_queue_max, now
+                )
+                global_queue_quiet_elapsed_ms = 0.0
+
             # Queue-based trigger: delay prefill until the waiting queue
             # reaches queue_min = min(running_req * ratio, max_prefill_bs),
             # capped by a wall-clock timeout to bound worst-case TTFT.
@@ -267,20 +369,46 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+                if queue_condition and global_wait_elapsed_ms >= self._max_delay_ms:
+                    queue_condition = False
+
+            # A deliberately narrow idle-only coalescing hook. It applies only
+            # to the first batch on an idle engine. The first request waits up
+            # to max_delay_ms. Once two or more requests exist, queue growth
+            # resets a short settle window, with a separate larger burst cap.
+            # This allows a concurrent burst to naturally form BS4/8/16/32
+            # without making C1 pay the burst-scale timeout.
+            # Reaching max_batch_size releases immediately; actual token/KV
+            # admission remains the ordinary scheduler's responsibility.
+            idle_coalesce_condition = (
+                self._enable_idle_coalescing
+                and global_running_batch_max == 0
+                and global_waiting_queue_max > 0
+                and global_waiting_queue_max < self._idle_coalesce_max_batch_size
+                and (
+                    (
+                        global_waiting_queue_max == 1
+                        and global_wait_elapsed_ms < self._idle_coalesce_max_delay_ms
+                    )
+                    or (
+                        global_waiting_queue_max >= 2
+                        and global_wait_elapsed_ms
+                        < self._idle_coalesce_burst_max_delay_ms
+                        and global_queue_quiet_elapsed_ms
+                        < self._idle_coalesce_settle_ms
+                    )
+                )
+            )
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
                 < global_max_prefill_bs_max
             )
 
-            if slot_condition or queue_condition:
+            if slot_condition or queue_condition or idle_coalesce_condition:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
-                if self.skip_first_delayer:
+                if self.skip_first_delayer and not idle_coalesce_condition:
                     self.skip_first_delayer = False
                     pass
                 else:
@@ -289,7 +417,11 @@ class PrefillDelayer:
                     # delay by max_delay_passes.
                     prev_delayed_count = prev_state.delayed_count if prev_state else 0
                     if prev_delayed_count < self._max_delay_passes - 1:
-                        next_state = prev_state or _State()
+                        next_state = (
+                            idle_state
+                            if idle_coalesce_condition
+                            else (local_observed_state or _State())
+                        )
                         next_state = next_state.bump_delayed_count()
                         return _NegotiateOutput(
                             next_state=next_state,
@@ -359,6 +491,8 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        wait_elapsed_us: int = 0,
+        queue_quiet_elapsed_us: int = 0,
     ):
         local_info = torch.tensor(
             [
@@ -367,6 +501,8 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                wait_elapsed_us,
+                queue_quiet_elapsed_us,
             ],
             device=self._gather_device,
             dtype=torch.int64,

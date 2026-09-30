@@ -466,6 +466,10 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+    # Reject FP8 KV-cache startup when a model did not load positive K/V
+    # dequantization scales. Calibrated checkpoints can also request this
+    # through kv_cache_scheme.require_checkpoint_scales.
+    SGLANG_REQUIRE_KV_CACHE_SCALES = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
@@ -672,6 +676,10 @@ class Envs:
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    # Minimum extend length of every request before CP-v2 shards the batch.
+    # Small requests are both slower and more fragile on highly partitioned
+    # attention layouts; zero preserves the historical cp_size * 2 threshold.
+    SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE = EnvInt(0)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
@@ -1133,6 +1141,12 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Keep DeepEP traffic off the TP communicator. This is required for
+    # partial EP groups and avoids sharing a collective ordering domain with CP.
+    SGLANG_DEEPEP_USE_MOE_EP_GROUP = EnvBool(False)
+    # Preserve asynchronous DeepEP by default while allowing synchronous
+    # completion for prefill backends and configurations that require it.
+    SGLANG_DEEPEP_ASYNC_FINISH = EnvBool(True)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
@@ -1626,12 +1640,48 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Validated gfx938 FlashMLA MSA128 Stage-3 path. The MiniMax lightning
+    # indexer remains the exact Top16 producer. The external kernels require
+    # BF16 Q/K/V, page128, and attention TP1 (64Q:4KV heads).
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 = EnvBool(False)
+    # Also replace the MiniMax score producer and exact Top16 selector with
+    # FlashMLA's MSA128 Stage-1/2 kernels. Kept separate from Stage-3 so each
+    # boundary can be differential-tested independently.
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_INDEXER = EnvBool(False)
+    # Decode has an independent gate so prefill and decode can be selected
+    # independently. The adapter is guarded by its runtime contract checks.
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_DECODE = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
+    # Validated gfx938 native E4M3FN MFMA path for MiniMax sparse main
+    # attention. Index Q/K remain BF16 so Top-K selection is unchanged.
+    SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM = EnvBool(False)
+    # Softmax-probability multiplier before the native E4M3 P x V dot. 448
+    # uses the full finite E4M3FN range and is the validated production value.
+    SGLANG_M3_TRITON_FP8_P_SCALE = EnvInt(448)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+    # MiniMax-M3 sparse decode score-kernel split-K controls. The selected
+    # number of chunks is the largest power of two no greater than
+    # min(MAX_CHUNKS, TARGET_GRID / (batch * local_index_kv_heads)).
+    SGLANG_MINIMAX_DECODE_SCORE_TARGET_GRID = EnvInt(4096)
+    SGLANG_MINIMAX_DECODE_SCORE_MAX_CHUNKS = EnvInt(256)
+    # EAGLE TARGET_VERIFY score producer. Queries from the same request share
+    # each Index-K tile load while preserving independent masks and Top-K rows.
+    SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE = EnvBool(False)
+    # Standard EP keeps the shared MLP TP-sharded and overlaps that branch
+    # with router/routed-expert work on a side stream.
+    SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # DeepEP uses a replicated TP1 shared expert; long-prefill configurations
+    # can overlap it with routed A2A/GEMMs when CU contention is favorable.
+    SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # EAGLE3-only greedy draft path: reduce Top-1 immediately after each
+    # rank-local LM-head GEMM and exchange candidates instead of full logits.
+    SGLANG_OPT_USE_EAGLE3_LM_HEAD_TOP1 = EnvBool(False)
+    # Production draft Top-1 backend.
+    SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND = EnvStr("lightop_fp8")
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)

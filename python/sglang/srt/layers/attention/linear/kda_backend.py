@@ -279,6 +279,7 @@ class KDAKernelDispatcher:
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"verify={self.verify_kernel.__class__.__name__}, "
+            f"verify_impl={getattr(self.verify_kernel, 'verify_impl_name', 'native')} "
             f"extend={self.extend_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )

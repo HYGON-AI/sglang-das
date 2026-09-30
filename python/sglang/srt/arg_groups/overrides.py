@@ -1326,9 +1326,19 @@ def _hy_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     logger.warning("Setting page size to 64 for HYV4 DSA.")
 
     # The checkpoint's config.json has "learnable_sink": true. The sink is
-    # folded in from the softmax LSE, which requires an unquantized 16-bit KV
-    # cache on the flashmla_sparse path.
-    if server_args.kv_cache_dtype in (None, "auto", "bf16"):
+    # folded in from the softmax LSE. On the bf16 flashmla_sparse path this
+    # requires an unquantized 16-bit KV cache. On HCU, however, the native
+    # flash_mla_with_kvcache decode kernel (dsa impl "flashmla_kv") accepts the
+    # per-head attn_sink argument directly while running an fp8_e4m3 KV cache,
+    # so fp8 KV is allowed there without dropping the learnable sink.
+    if is_hcu() and server_args.kv_cache_dtype == "fp8_e4m3":
+        # Keep fp8_e4m3: the HCU flashmla_kv kernel folds the learnable sink in
+        # itself (see dsa_backend._forward_flashmla_kv attn_sink plumbing).
+        logger.info(
+            "Keeping kv_cache_dtype=fp8_e4m3 for HYV4 on HCU: the flashmla_kv "
+            "kernel supports learnable attention sinks with an fp8 KV cache."
+        )
+    elif server_args.kv_cache_dtype in (None, "auto", "bf16"):
         overrides["kv_cache_dtype"] = "bfloat16"
         logger.info(
             "Setting kv_cache_dtype to bfloat16 for HYV4 learnable attention sinks."
@@ -1367,14 +1377,25 @@ def _hy_v4_overrides(server_args: Any, hf_config: Any) -> dict:
 
     # HYV4 is excluded from _DEEPSEEK_FAMILY_ARCHS, so the family DSA
     # split-backend slot pass (_dsa_split_backend_resolution) skips it and
-    # dsa_prefill_impl/dsa_decode_impl stay None, which the dsa backend's
-    # _check_attn_sink_supported rejects: the learnable sinks require the
-    # flashmla_sparse impl. On HCU that is also the correct sparse kernel.
+    # dsa_prefill_impl/dsa_decode_impl stay None. On HCU, we set backend defaults
+    # based on the KV cache dtype:
+    # - bf16 KV: use flashmla_sparse for prefill and decode (sparse kernel with
+    #   unquantized bf16 KV + learnable sink).
+    # - fp8 KV: use flashmla_sparse for prefill, but flashmla_kv for decode.
+    #   The flashmla_kv decode kernel (flash_mla_with_kvcache) accepts fp8 KV +
+    #   learnable sink natively (see dsa_backend._forward_flashmla_kv plumbing),
+    #   allowing memory savings without dropping sink functionality.
     if is_hcu():
         if server_args.dsa_prefill_backend is None:
             overrides["dsa_prefill_backend"] = "flashmla_sparse"
         if server_args.dsa_decode_backend is None:
-            overrides["dsa_decode_backend"] = "flashmla_sparse"
+            # When fp8 KV is explicitly requested, switch decode to flashmla_kv
+            # (which supports fp8 + sink). Otherwise keep flashmla_sparse (bf16).
+            kv_dtype = server_args.kv_cache_dtype
+            if kv_dtype == "fp8_e4m3":
+                overrides["dsa_decode_backend"] = "flashmla_kv"
+            else:
+                overrides["dsa_decode_backend"] = "flashmla_sparse"
 
     return overrides
 
