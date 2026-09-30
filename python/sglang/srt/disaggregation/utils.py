@@ -2382,3 +2382,16 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+EXTERNAL_KV_LOAD_ERR_TYPE = "ExternalKVLoadError"
+
+
+def is_external_kv_load_failure(req) -> bool:
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    reason = req.to_finish or req.finished_reason or req.discard_output_reason
+    return (
+        isinstance(reason, FINISH_ABORT)
+        and reason.err_type == EXTERNAL_KV_LOAD_ERR_TYPE
+    )

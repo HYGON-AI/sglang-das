@@ -257,6 +257,15 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def has_pending_operations(self) -> bool:
+        # Private loads retain request ownership through the reduced verdict;
+        # offload entries retain tree locks through completion.
+        return bool(
+            self.inflight_load_rids
+            or self.private_load_indices
+            or self.pending_offloads
+        )
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:

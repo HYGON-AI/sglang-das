@@ -26,6 +26,7 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cleanup import run_cleanup_step
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -247,7 +248,8 @@ def match_kv_cache(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            return_full_match=return_full_match or bool(tree_cache.swa_reprefill_tail_tokens()),
+            return_full_match=return_full_match
+            or bool(tree_cache.swa_reprefill_tail_tokens()),
             cow_mamba=cow_mamba,
             req=req,
         )
@@ -413,6 +415,8 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if getattr(req, "external_kv_abort_requested", False):
+        return _release_aborted_kv_cache(req, tree_cache, checkpoint=checkpoint)
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -455,6 +459,61 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     _release_donated_swa_slots(req, tree_cache)
     tree_cache.req_to_token_pool.free(req)
+    req.kv.mark_kv_released()
+
+
+def _release_aborted_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool
+):
+    """Resume abort cleanup using main's ownership API, never repeat opaque frees."""
+
+    def snapshot():
+        if not req.kv.holds_kv:
+            return None
+        return (req.owned_kv_len(), req.kv.kv_allocated_len, req.kv.cache_protected_len)
+
+    layout = run_cleanup_step(req, "kv.layout", snapshot)
+    if layout is None:
+        if req.kv.holds_mamba:
+            run_cleanup_step(
+                req,
+                "kv.early_mamba",
+                lambda: tree_cache.req_to_token_pool.mamba_allocator.free(
+                    req.kv.mamba_pool_idx.unsqueeze(-1)
+                ),
+            )
+            req.kv.mamba_pool_idx = None
+        return
+    owned, allocated, protected = layout
+    if run_cleanup_step(req, "kv.claim", lambda: tree_cache.claim_kv_row(req)):
+        return
+    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    if checkpoint:
+        req.refresh_fill_ids()
+        run_cleanup_step(
+            req, "kv.checkpoint", lambda: tree_cache.checkpoint(req, up_to=owned)
+        )
+    run_cleanup_step(
+        req, "kv.row", lambda: tree_cache.free_kv_row(req.kv, [(protected, owned)])
+    )
+    run_cleanup_step(req, "kv.unlock", lambda: tree_cache.unlock(req.lock))
+    req.lock = None
+    run_cleanup_step(
+        req,
+        "kv.overallocated",
+        lambda: _release_overallocated_kv_indices(req, owned, allocated, tree_cache),
+    )
+    run_cleanup_step(
+        req,
+        "kv.on_release",
+        lambda: tree_cache.on_release(req, checkpointed=checkpoint),
+    )
+    run_cleanup_step(
+        req, "kv.donated_swa", lambda: _release_donated_swa_slots(req, tree_cache)
+    )
+    run_cleanup_step(
+        req, "kv.request_slot", lambda: tree_cache.req_to_token_pool.free(req)
+    )
     req.kv.mark_kv_released()
 
 

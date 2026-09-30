@@ -15,7 +15,6 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
@@ -49,6 +48,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_string_list,
 )
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
@@ -315,6 +315,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            self._source_drain = SourceDrainTracker()
+            self.session_lock = threading.Lock()
             self.pd_hidden_events.init_prefill_state()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -1520,22 +1522,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _await_transfer_futures(self, futures) -> int:
-        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        """Drain every submitted write, including after failure or cancellation."""
+        futures = tuple(futures)
         ret = 0
+        first_exception = None
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception as exc:
+                if first_exception is None:
+                    first_exception = exc
+                for other in futures:
+                    other.cancel()
+                continue
             if status != 0 and ret == 0:
                 ret = status
-                for f in futures:
-                    f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+                for other in futures:
+                    other.cancel()
+        if first_exception is not None:
+            raise first_exception
         return ret
 
     def send_kvcache(
@@ -3017,6 +3024,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._source_drain.complete(kv_chunk)
                     continue
 
                 reqs_to_be_processed = list(
@@ -3075,6 +3083,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_outstanding.pop(kv_chunk.room, None)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._source_drain.complete(kv_chunk)
                     continue
                 if (
                     self.enable_staging
@@ -3224,6 +3233,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             pd_hidden_done_count += 1
 
                     if pd_hidden_failed:
+                        self._source_drain.complete(kv_chunk)
                         continue
                     if waiting_for_ack and not ack_ready:
                         # A parked chunk is only re-enqueued by ACK/abort/timeout.
@@ -3607,13 +3617,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
+                self._source_drain.complete(kv_chunk)
+
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                # Submission/event/allocator failure can have ambiguous side
+                # effects. Quarantine the room instead of asserting a drain.
                 if kv_chunk is not None:
+                    self._source_drain.poison(kv_chunk.room)
                     self.poison_deferred_ack_room(kv_chunk.room)
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                    logger.error(
+                        "Source drain is unknown for room %s; retaining resources",
+                        kv_chunk.room,
+                    )
+                    self.record_failure(kv_chunk.room, str(e))
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                # The failed chunk's request will be surfaced as failed by
+                # the normal transfer-failure path (update_status +
+                # sync_status_to_decode_endpoint above); do not let a
+                # single chunk kill the whole transfer thread, which
+                # would silently stall every other in-flight KV transfer
+                # on this prefill.
+                logger.exception(
+                    "transfer_worker chunk failed (bootstrap_port=%s): %s; "
+                    "continuing to next chunk",
+                    self.bootstrap_port,
+                    e,
                 )
+                continue
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3949,7 +3979,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
+        self._publish_source_chunk(
+            self.transfer_queues[shard_idx],
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -3965,8 +3996,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 pd_hidden_release_indices=pd_hidden_release_indices,
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
-            )
+            ),
         )
+
+    def _publish_source_chunk(self, queue, chunk):
+        self._source_drain.publish(
+            chunk,
+            queue,
+            lambda: (
+                chunk.room in self.request_status
+                and self.check_status(chunk.room) != KVPoll.Failed
+            ),
+        )
+
+    def source_transfers_drained(self, room):
+        if self.request_status.get(room) in (None, KVPoll.Failed):
+            # failure_exception() may already have removed request_status.
+            # Also covers abort racing with a worker parking after its status
+            # check. Each scheduler poll wakes any newly parked chunks.
+            self._wake_pd_hidden_ack_waiters(room)
+        return self._source_drain.drained(room)
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -4192,8 +4241,14 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
         self.trace_ctx.trace_req_start()
 
+    def is_transfer_drained(self):
+        return self.kv_mgr.source_transfers_drained(self.bootstrap_room)
+
     def abort(self):
-        super().abort()
+        # Serialize Failed publication against the final enqueue.
+        with self.kv_mgr._source_drain.lock:
+            super().abort()
+        self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
