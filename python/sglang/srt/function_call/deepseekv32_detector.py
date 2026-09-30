@@ -86,9 +86,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.eot_token = f"</{block}>"
         self.invoke_start_token = f"<{invoke}"
         self.invoke_end_token = f"</{invoke}>"
-        self.parameter_regex = (
-            rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}>'
-        )
+        self.parameter_regex = rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}[^>]*>'
         self.function_calls_regex = rf"<{block}>(.*?)</{block}>"
         # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
         # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
@@ -192,6 +190,87 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         return json.dumps(parameters, ensure_ascii=False)
 
+    @staticmethod
+    def _normalize_parameters(
+        parameters: object, func_name: str, tools: list[Tool]
+    ) -> object:
+        """Repair schema-provable DSML argument shape errors.
+
+        DeepSeek may add an ``arguments``/``input`` wrapper or emit a scalar for
+        a property declared as an array. Only apply a repair when the selected
+        tool schema makes the intended shape unambiguous.
+        """
+        if not isinstance(parameters, dict):
+            return parameters
+
+        tool = next((t for t in tools if t.function.name == func_name), None)
+        schema = tool.function.parameters if tool is not None else None
+        if not isinstance(schema, dict):
+            return parameters
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return parameters
+
+        if len(parameters) == 1:
+            wrapper = next(iter(parameters))
+            if wrapper in ("arguments", "input") and wrapper not in properties:
+                value = parameters[wrapper]
+                unwrapped_object = False
+                if isinstance(value, str):
+                    # XML string parameters may contain a second JSON encoding.
+                    try:
+                        decoded = json.loads(value)
+                    except (json.JSONDecodeError, TypeError):
+                        decoded = value
+                    if isinstance(decoded, dict):
+                        parameters = decoded
+                        unwrapped_object = True
+                    else:
+                        value = decoded
+                elif isinstance(value, dict):
+                    parameters = value
+                    unwrapped_object = True
+
+                if not unwrapped_object:
+                    required = schema.get("required")
+                    candidates = (
+                        required
+                        if isinstance(required, list) and len(required) == 1
+                        else []
+                    )
+                    if not candidates and len(properties) == 1:
+                        candidates = list(properties)
+                    if len(candidates) == 1:
+                        parameters = {candidates[0]: value}
+
+        parameters = dict(parameters)
+        for name, value in parameters.items():
+            property_schema = properties.get(name)
+            if (
+                not isinstance(property_schema, dict)
+                or property_schema.get("type") != "array"
+                or isinstance(value, list)
+            ):
+                continue
+
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except json.JSONDecodeError:
+                    decoded = value
+                if isinstance(decoded, list):
+                    parameters[name] = decoded
+                    continue
+                value = decoded
+
+            # A single JSON scalar is the only unambiguous one-element array
+            # repair. Keep objects and null unchanged rather than inventing a
+            # meaning that the schema cannot prove.
+            if not isinstance(value, (dict, list)) and value is not None:
+                parameters[name] = [value]
+
+        return parameters
+
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -233,13 +312,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         continue
                     try:
                         func_args = self._parse_parameters_from_xml(invoke_content)
+                        parameters = self._normalize_parameters(
+                            json.loads(func_args), func_name, tools
+                        )
                     except ValueError as e:
                         logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
                         continue
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
-                        "parameters": json.loads(func_args),
+                        "parameters": parameters,
                     }
                     calls.extend(self.parse_base_json(match_result, tools))
 
@@ -326,6 +408,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 try:
                     current_params = self._parse_parameters_from_xml(invoke_content)
+                    current_params = json.dumps(
+                        self._normalize_parameters(
+                            json.loads(current_params), func_name, tools
+                        ),
+                        ensure_ascii=False,
+                    )
                 except ValueError as e:
                     # Fail closed: drop this invoke, keep going for the next one.
                     logger.warning(f"Dropping malformed DeepSeek invoke: {e}")

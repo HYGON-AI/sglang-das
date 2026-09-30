@@ -24,7 +24,9 @@ from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
-    Glm4MoeDetector, GlmSpecialTokenConfig, generate_glm_grammar,
+    Glm4MoeDetector,
+    GlmSpecialTokenConfig,
+    generate_glm_grammar,
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
@@ -348,7 +350,9 @@ class FunctionCallParser:
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
 
-            if is_required or should_constrain_auto:
+            if (
+                is_required or should_constrain_auto
+            ) and self.detector.supports_structural_tag_for_tool_choice(tool_choice):
                 structural_tag_tools = self.tools
                 if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
                     structural_tag_tools = [
