@@ -83,6 +83,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
     SlimQuantW4A8Int8MarlinConfig,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -149,6 +150,22 @@ elif _is_npu:
     import torch_npu
 
 logger = logging.getLogger(__name__)
+
+
+def _is_hcu_unquantized_moe_method(quant_method) -> bool:
+    return _is_hcu and isinstance(quant_method, UnquantizedFusedMoEMethod)
+
+
+def _configure_deepep_dispatcher_quantization(
+    dispatcher, quant_config, quant_method
+) -> None:
+    if not hasattr(dispatcher, "set_quant_config"):
+        return
+
+    if _is_hcu_unquantized_moe_method(quant_method):
+        dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+    elif quant_config is None:
+        dispatcher.set_quant_config({"bf16_dispatch": True})
 
 
 def _can_use_lightop_ep_scatter(
@@ -660,8 +677,11 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
-        if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
-            self.dispatcher.set_quant_config({"bf16_dispatch": True})
+        _configure_deepep_dispatcher_quantization(
+            self.dispatcher,
+            quant_config,
+            self.quant_method,
+        )
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
@@ -813,7 +833,9 @@ class DeepEPMoE(FusedMoE):
             else:
                 raise ValueError(f"Dispatch output is not supported")
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if self.quant_config is None:
+            if self.quant_config is None or _is_hcu_unquantized_moe_method(
+                self.quant_method
+            ):
                 output = self.forward_unquantized_deepep_ll(dispatch_output)
             elif (
                 get_moe_runner_backend().is_flashinfer_cutedsl()

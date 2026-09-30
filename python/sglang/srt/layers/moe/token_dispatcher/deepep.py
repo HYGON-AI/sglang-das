@@ -850,6 +850,29 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        self._combine_input_ready_event = None
+        self._combine_input_ready_event_pending = False
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        super().set_quant_config(quant_config)
+        if (
+            _is_hcu
+            and quant_config.get("hcu_w4a8_deepep_ll_producer_event", False)
+            and self._combine_input_ready_event is None
+        ):
+            self._combine_input_ready_event = self.device_module.Event()
+
+    def record_combine_input_ready_event(self) -> None:
+        if self._combine_input_ready_event is None:
+            raise RuntimeError(
+                "Combine-input ready events are only enabled for HCU DeepEP"
+            )
+        if self._combine_input_ready_event_pending:
+            raise RuntimeError(
+                "DeepEP combine-input ready event was recorded twice before combine"
+            )
+        self._combine_input_ready_event.record(self.device_module.current_stream())
+        self._combine_input_ready_event_pending = True
 
     def dispatch_a(
         self,
@@ -948,7 +971,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif _use_marlin_w16a16_moe or _use_marlin_w4a16_moe:
+            elif (
+                self.deepep_output_dtype == DispatcherOutputDtype.BF16
+                or _use_marlin_w16a16_moe
+                or _use_marlin_w4a16_moe
+            ):
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -1082,6 +1109,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
         else:
             overlap_args_dict = {}
+
+        combine_stream = (
+            overlap_args.stream
+            if overlap_args is not None
+            else self.device_module.current_stream()
+        )
+        if self._combine_input_ready_event_pending:
+            combine_stream.wait_event(self._combine_input_ready_event)
+            self._combine_input_ready_event_pending = False
 
         with ctx:
             _deepep_precompile_tp_barrier()
@@ -1264,6 +1300,14 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def record_combine_input_ready_event(self) -> None:
+        impl = self._get_impl()
+        if not isinstance(impl, _DeepEPDispatcherImplLowLatency):
+            raise RuntimeError(
+                "Combine-input ready events require DeepEP low-latency mode"
+            )
+        impl.record_combine_input_ready_event()
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict

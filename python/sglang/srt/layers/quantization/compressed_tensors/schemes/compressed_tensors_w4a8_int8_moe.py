@@ -481,6 +481,7 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
                 {
                     "normal_dispatcher_output_dtype": "bf16",
                     "normal_expert_alignment": 256,
+                    "hcu_w4a8_deepep_ll_producer_event": True,
                 }
             )
         layer.is_hcu_w4a8_deep_gemm_converted = True
@@ -730,6 +731,7 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             dispatch_output.expected_m,
             hidden_states_scale=hidden_states_scale,
         )
+        layer.dispatcher.record_combine_input_ready_event()
         return DeepEPLLCombineInput(
             hidden_states=output,
             topk_ids=dispatch_output.topk_ids,

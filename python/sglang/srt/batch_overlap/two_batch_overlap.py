@@ -1205,6 +1205,13 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         for inner in self._inners:
             inner.set_quant_config(quant_config)
 
+    def record_combine_input_ready_event(self) -> None:
+        if len(self._inners) != 1:
+            raise RuntimeError(
+                "W4A8 DeepEP low-latency producer events do not support TBO"
+            )
+        self._inners[0].record_combine_input_ready_event()
+
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):
