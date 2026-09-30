@@ -6,10 +6,13 @@ share that storage.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
@@ -25,12 +28,35 @@ _is_hcu = is_hcu()
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
+    # CUDA (NVIDIA): fast Triton path.
     if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 
         return rope_tail_fake_quant_fp4(x, freqs, rope_dim, compressed_kv=compressed_kv)
+
+    # HIP/DCU: fused sgl-kernel AOT path.
+    if x.is_cuda and torch.version.hip is not None and x.dtype == torch.bfloat16:
+        try:
+            from sgl_kernel import rope_fp4_fake_quant as _rope_fp4_hip
+
+            # Log once per process so the dispatch path is visible in service logs.
+            if not getattr(_rope_fq4, "_hip_logged", False):
+                logger.info(
+                    "[dsv41] _rope_fq4: using HIP fused kernel (rope_fp4_fake_quant)"
+                )
+                _rope_fq4._hip_logged = True
+            return _rope_fp4_hip(x, freqs, rope_dim, compressed_kv)
+        except (ImportError, RuntimeError) as e:
+            if not getattr(_rope_fq4, "_hip_warn_logged", False):
+                logger.warning(
+                    "[dsv41] _rope_fq4: HIP kernel unavailable (%s), falling back to Python", e
+                )
+                _rope_fq4._hip_warn_logged = True
+            pass  # fall through to Python fallback
+
+    # Pure-Python fallback (other platforms or unsupported configs).
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -44,9 +70,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # rmsnorm_fp32 is a portable Triton kernel (fp32 stats + fp32 weight mul);
+        # it runs on ROCm/HIP too, so gate on is_cuda alone, not torch.version.cuda.
         if (
             x.is_cuda
-            and torch.version.cuda is not None
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)

@@ -11,9 +11,12 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_hcu, is_xpu
 
 from .utils import make_name
+
+# HCU/DCU dispatches the paged top-k to lightop's prebuilt op; other HIP to AOT.
+_IS_HCU = is_hcu()
 
 
 @cache_once
@@ -107,9 +110,18 @@ def topk_transform_paged(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     if is_hip_runtime():
-        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-        )
+        if _IS_HCU:
+            import lightop
+
+            # SGL_USE_LIGHTOP_TOPK_BACKAND unset/0 selects the exact adaptive
+            # Top512/1024; out_page_indices width must be 512 or 1024.
+            lightop.topk_transform_512(
+                scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+            )
+        else:
+            torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+                scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+            )
     elif is_xpu():
         torch.ops.sgl_kernel.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices

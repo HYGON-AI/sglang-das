@@ -295,6 +295,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/elementwise
    */
+  // rope_fp4.hip: fused RoPE-tail + FP4 fake-quant for DSV4.1 KV cache write.
+  at::Tensor rope_fp4_fake_quant_hip(
+      const at::Tensor& x, const at::Tensor& freqs,
+      int64_t rope_dim, bool compressed_kv);
+  m.def(
+      "rope_fp4_fake_quant(Tensor x, Tensor freqs, int rope_dim, bool compressed_kv) -> Tensor");
+  m.impl("rope_fp4_fake_quant", torch::kCUDA, &rope_fp4_fake_quant_hip);
+
   m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
