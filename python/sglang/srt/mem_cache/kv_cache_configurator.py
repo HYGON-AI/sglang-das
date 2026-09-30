@@ -18,6 +18,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import (
     ModelConfig,
     dsa_layer_skips_topk,
+    get_dsa_full_indexer_layer_ids,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
@@ -285,6 +286,7 @@ class KVCacheConfigurator:
     glm5_next_layer_split_scratch_source: Optional[KVCache] = None
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
+    dsa_layer_split_scratch_source: Optional[KVCache] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -1641,6 +1643,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        use_layer_split_pool = False
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -1655,8 +1658,15 @@ class KVCacheConfigurator:
             )
 
             PoolCls = LayerSplitDSATokenToKVPool
+            use_layer_split_pool = True
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            pool_kwargs["layer_shard_rank_offset"] = (
+                dsa_cp_layer_shard_size - 1 if self.is_draft_worker else 0
+            )
+            pool_kwargs["layer_split_scratch_source"] = (
+                self.dsa_layer_split_scratch_source
+            )
         else:
             PoolCls = DSATokenToKVPool
         from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
@@ -1669,13 +1679,24 @@ class KVCacheConfigurator:
 
             PoolCls = Glm5NextDSATokenToKVPool
             pool_kwargs = glm5_next_pool_kwargs(self)
+            use_layer_split_pool = False
+        full_indexer_layer_ids = get_dsa_full_indexer_layer_ids(
+            self.model_config.hf_config,
+            self.layer_info.start_layer,
+            self.layer_info.end_layer,
+        )
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
-            pool_kwargs["skip_topk_layers"] = [
-                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-                for layer_id in range(
-                    self.layer_info.start_layer, self.layer_info.end_layer
-                )
-            ]
+            indexer_layer_ids = full_indexer_layer_ids
+        else:
+            indexer_layer_ids = list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
+            )
+        if use_layer_split_pool:
+            # HiCache uses dense storage/transfer metadata, but skip-topk
+            # layers still must not enqueue an Index-K collective.
+            pool_kwargs["indexer_prefetch_layer_ids"] = full_indexer_layer_ids
+        if not get_memory().enable_hisparse:
+            pool_kwargs["indexer_layer_ids"] = indexer_layer_ids
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

@@ -1195,6 +1195,38 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
+    def test_pd_decode_radix_cache_rejects_eagle_without_experimental_dsv4(self):
+        # Upstream allows DSPARK with the decode radix cache; the experimental
+        # DSV4 gate only widens the allowed set, so EAGLE stays rejected here.
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+            speculative_algorithm="EAGLE",
+        )
+        with patch.dict(
+            os.environ,
+            {"SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE": "0"},
+        ), self.assertRaisesRegex(ValueError, "incompatible with speculative"):
+            handle_pd_disaggregation(server_args)
+
+    def test_pd_decode_radix_cache_allows_dspark_with_experimental_dsv4(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+            speculative_algorithm="DSPARK",
+        )
+        with patch.dict(
+            os.environ,
+            {"SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE": "1"},
+        ):
+            handle_pd_disaggregation(server_args)
+
+        self.assertFalse(server_args.disable_radix_cache)
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):

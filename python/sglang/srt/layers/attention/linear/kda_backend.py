@@ -19,11 +19,24 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
-# KDA always uses the triton causal_conv1d_fn (no CUDA override).
-# Only causal_conv1d_update needs platform-specific overrides for decode.
+# HCU: use the operator-library causal_conv1d (DAS/DTK build) for the plain
+# extend/decode paths. The spec-decode verify path keeps the triton
+# implementation because it needs extended kwargs (intermediate_conv_window /
+# retrieve_*) that the library's causal_conv1d_update does not provide.
+_hcu_causal_conv1d_fn = None
+_hcu_causal_conv1d_update = None
+_use_hcu_cc1d = is_hcu() and get_bool_env_var(
+    "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU", default="true"
+)
+if _use_hcu_cc1d:
+    from causal_conv1d import (
+        causal_conv1d_fn_hcu as _hcu_causal_conv1d_fn,
+        causal_conv1d_update as _hcu_causal_conv1d_update,
+    )
+
 if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
@@ -32,6 +45,75 @@ elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 
     causal_conv1d_update = causal_conv1d_update_cpu
+
+
+def _run_causal_conv1d_fn(
+    x,
+    weight,
+    bias,
+    *,
+    conv_states,
+    query_start_loc,
+    seq_lens_cpu,
+    cache_indices=None,
+    has_initial_state=None,
+    activation="silu",
+):
+    """HCU uses the operator-library varlen causal conv; other platforms keep
+    the sglang triton implementation."""
+    if _hcu_causal_conv1d_fn is not None:
+        return _hcu_causal_conv1d_fn(
+            x,
+            weight,
+            bias,
+            initial_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            seq_lens_cpu=seq_lens_cpu,
+            activation=activation,
+        )
+    return causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        seq_lens_cpu=seq_lens_cpu,
+        activation=activation,
+    )
+
+
+def _run_causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    *,
+    activation="silu",
+    conv_state_indices=None,
+):
+    """HCU uses the operator-library single-step causal conv; other platforms
+    keep the sglang triton implementation (or its NPU/CPU overrides)."""
+    if _hcu_causal_conv1d_update is not None:
+        return _hcu_causal_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+        )
+    return causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=conv_state_indices,
+    )
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -751,7 +833,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
                     )
 
-        qkv = causal_conv1d_update(
+        qkv = _run_causal_conv1d_update(
             mixed_qkv,
             conv_states.transpose(-1, -2),
             layer.conv_weights,
@@ -870,20 +952,53 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        # Depthwise conv is channel-independent, so one packed call over the
-        # full qkv width matches the decode path and saves two kernel launches.
-        qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_states=conv_states,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        if _hcu_causal_conv1d_fn is not None:
+            # The HCU library accepts each Q/K/V group separately; preserve the
+            # main packed path on other devices.
+            splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(
+                splits, dim=-2
+            )
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+            q = _run_causal_conv1d_fn(
+                q, q_conv_weight, q_bias,
+                activation="silu", conv_states=q_conv_state,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = _run_causal_conv1d_fn(
+                k, k_conv_weight, k_bias,
+                activation="silu", conv_states=k_conv_state,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = _run_causal_conv1d_fn(
+                v, v_conv_weight, v_bias,
+                activation="silu", conv_states=v_conv_state,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+        else:
+            # Depthwise conv is channel-independent, so the main path packs
+            # Q/K/V into one call and avoids two extra launches.
+            qkv = causal_conv1d_fn(
+                mixed_qkv.transpose(0, 1), layer.conv_weights, layer.bias,
+                activation="silu", conv_states=conv_states,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d

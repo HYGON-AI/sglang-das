@@ -106,6 +106,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
+from sglang.srt.layers.moe.ep_balance import make_ep_balanced_expert_ids
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -139,13 +140,14 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _is_musa = is_musa()
 _use_lightop = get_bool_env_var("SGLANG_USE_LIGHTOP")
 _use_lightop_topk_ids_postprocess = get_bool_env_var(
     "SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS", "false"
 )
-simulated_expert_balance = get_bool_env_var("SGLANG_SIMULATED_EXPERT_BALANCE")
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
+_simulated_expert_balance = envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -734,6 +736,16 @@ class TopK(BaseFusedOp):
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
+        if _simulated_expert_balance:
+            if get_exec().moe.ep_num_redundant_experts != 0:
+                raise ValueError(
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with "
+                    "redundant physical experts"
+                )
+            if self.enable_waterfill:
+                raise ValueError(
+                    "SGLANG_SIMULATED_EXPERT_BALANCE cannot be used with " "waterfill"
+                )
 
         self.waterfill_balancer = None
         if self.enable_waterfill:
@@ -841,6 +853,12 @@ class TopK(BaseFusedOp):
         else:
             output_format = TopKOutputFormat.STANDARD
 
+        if _simulated_expert_balance and output_format != TopKOutputFormat.STANDARD:
+            raise ValueError(
+                "SGLANG_SIMULATED_EXPERT_BALANCE only supports STANDARD TopK "
+                f"output, got {output_format.name}"
+            )
+
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             (
@@ -924,6 +942,12 @@ class TopK(BaseFusedOp):
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 dynamic_expert_bias=dynamic_expert_bias,
+            )
+
+        if _simulated_expert_balance:
+            raise ValueError(
+                "SGLANG_SIMULATED_EXPERT_BALANCE does not support the "
+                "NPU-specific TopK path"
             )
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
@@ -1919,10 +1943,23 @@ def _zero_topk_weights_padded_region(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _topk_ids_postprocess_torch(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if _is_hip and num_token_non_padded is not None:
+        # Keep the HIP fallback as plain torch ops inside this compiled region.
+        # Calling _fill_padded_rows here would introduce a separate explicit
+        # Triton launch after the logical-to-physical gather, while Inductor can
+        # fuse this mask with that gather just like the pre-forward-port path.
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    else:
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if output_int64 and topk_ids.dtype != torch.int64:
+        topk_ids = topk_ids.to(torch.int64)
     return topk_ids
 
 
@@ -1977,25 +2014,43 @@ def _topk_ids_postprocess(
     topk_ids: torch.Tensor,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     num_token_non_padded: Optional[torch.Tensor],
+    output_int64: bool = False,
 ) -> torch.Tensor:
-    if expert_location_dispatch_info is None and num_token_non_padded is None:
+    if (
+        expert_location_dispatch_info is None
+        and num_token_non_padded is None
+        and (not output_int64 or topk_ids.dtype == torch.int64)
+    ):
         return topk_ids
 
-    lightop_output = _try_lightop_topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
-    )
-    if lightop_output is not None:
-        return lightop_output
+    # An int32 -> int64 result must stay in the compiled fallback so Inductor
+    # can fuse it with the remap/padding work. If the input is already int64,
+    # the in-place LightOp path still satisfies the requested output dtype.
+    if not output_int64 or topk_ids.dtype == torch.int64:
+        lightop_output = _try_lightop_topk_ids_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
+        if lightop_output is not None:
+            return lightop_output
     return _topk_ids_postprocess_torch(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    output_int64: bool = False,
 ):
     return _topk_ids_postprocess(
-        topk_ids, expert_location_dispatch_info, num_token_non_padded
+        topk_ids,
+        expert_location_dispatch_info,
+        num_token_non_padded,
+        output_int64,
     )
 
 
@@ -2559,6 +2614,14 @@ def _post_process_topk_ids(
     recorder_topk_ids = None
     _fold_pad_into_append = False
     recorder_was_fused = False
+    # HCU W8A8 deployments can select DeepGEMM through the legacy env while
+    # the global runner backend remains AUTO, so recognize both selectors.
+    skip_deepep_padded_tokens = (
+        _is_hcu
+        and get_moe_a2a_backend().is_deepep()
+        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+    )
+    hip_deepep_postprocessed = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2603,24 +2666,59 @@ def _post_process_topk_ids(
             )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Always fill the padded
-        # region with 0 so every kernel sees a valid in-range expert id.
-        # Routing weights for padded tokens are zeroed below so their
-        # contribution to the hidden state is still zero regardless of the id.
+        # (negative indices cause illegal memory access). Keep their padded IDs
+        # in range and zero their weights below. HCU DeepEP + DeepGEMM instead
+        # masks the final IDs to -1 after shared-expert remapping so dispatch can
+        # omit padded tokens, matching the pre-forward-port behavior.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        #
-        # Fold: when the fused append+remap kernel runs below (aiter per-rank
-        # shared-slot path, EPLB off) it folds this padded fill itself
-        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
-        # _fill_padded_rows launch here.
-        _fold_pad_into_append = (
-            num_fused_shared_experts > 0
-            and _use_aiter
-            and use_per_rank_shared_slots
-            and not _eplb_remap_enabled()
-        )
-        if not _fold_pad_into_append:
+        remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
+        if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
+            # DeepEP disables shared-expert fusion by default. On that main HCU
+            # path no later operation can introduce another route, so remap and
+            # the final -1 padding mask can be compiled into one kernel. Emit
+            # int64 from that kernel as well because DeepEP requires int64 IDs;
+            # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
+            # the post-shared-expert mask below for the explicitly forced fused
+            # shared-expert configuration.
+            if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
+                # LP dispatch uses a separate HIP kernel. Resolve probabilities
+                # before entering the compiled padding/dtype postprocess.
+                from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+                solver = get_global_lplb_solver(layer_id)
+                if solver is None:
+                    raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
+                probabilities = solver.solve(topk_ids)
+                if hasattr(solver, "static_dispatch_map"):
+                    from sglang.kernels.ops.lplb import cuda_solver
+
+                    topk_ids = cuda_solver.dispatch_probability(
+                        topk_ids, probabilities, solver.static_dispatch_map
+                    )
+                else:
+                    topk_ids = topk_ids_logical_to_physical(
+                        topk_ids, remap_info, probabilities
+                    )
+                remap_info = None  # IDs are physical; do not remap a second time.
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids,
+                remap_info,
+                num_token_non_padded,
+                output_int64=True,
+            )
+            hip_deepep_postprocessed = True
+        else:
+            # The fused append+remap kernel can fold the padded fill into its
+            # existing launch on the aiter per-rank shared-slot path.
+            _fold_pad_into_append = (
+                not skip_deepep_padded_tokens
+                and num_fused_shared_experts > 0
+                and _use_aiter
+                and use_per_rank_shared_slots
+                and remap_info is None
+            )
+        if not skip_deepep_padded_tokens and not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             _is_hip
@@ -2649,10 +2747,8 @@ def _post_process_topk_ids(
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if not recorder_was_fused and _eplb_remap_enabled():
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
-            )
+        if remap_info is not None and not hip_deepep_postprocessed and not recorder_was_fused:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, remap_info)
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
@@ -2753,7 +2849,11 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if skip_deepep_padded_tokens and not hip_deepep_postprocessed:
+        # Apply this after shared-expert remapping so every padded route,
+        # including appended shared slots, is omitted by DeepEP dispatch.
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=-1)
+    elif _is_hip and not skip_deepep_padded_tokens and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2792,6 +2892,12 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
+    if _simulated_expert_balance and expert_location_dispatch_info is not None:
+        raise ValueError(
+            "SGLANG_SIMULATED_EXPERT_BALANCE requires contiguous expert "
+            "placement and cannot be used with EPLB"
+        )
+
     # Set by the fused-gating+pack branches below; None everywhere else.
     packed_topk = None
     # True when the router itself masked rows >= num_token_non_padded.
@@ -2799,12 +2905,24 @@ def select_experts(
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if _simulated_expert_balance and (
+        simulate_uniform_experts or simulate_round_robin_experts
+    ):
+        raise ValueError(
+            "SGLANG_SIMULATED_EXPERT_BALANCE cannot be combined with "
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS or "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+        )
     if simulate_uniform_experts and simulate_round_robin_experts:
         raise ValueError(
             "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
         )
-    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
+    routing_overridden = (
+        simulate_uniform_experts
+        or simulate_round_robin_experts
+        or _simulated_expert_balance
+    )
 
     (
         router_logits,
@@ -3056,7 +3174,34 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    if routing_overridden:
+    if routing_overridden and _simulated_expert_balance:
+        # Benchmark-only: exact per-EP-rank balanced routed ids; router weights
+        # are kept. Do NOT use in production.
+        if topk_ids.shape[1] < num_routed_topk:
+            raise ValueError(
+                f"Top-k output has {topk_ids.shape[1]} columns, but "
+                f"{num_routed_topk} routed expert columns are required"
+            )
+        parallel = get_parallel()
+        balanced_routed_ids = make_ep_balanced_expert_ids(
+            topk_ids.shape[0],
+            num_routed_topk,
+            router_logits.shape[1],
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+            device=topk_ids.device,
+            dtype=topk_ids.dtype,
+            layer_id=layer_id,
+        )
+        if topk_ids.shape[1] == num_routed_topk:
+            topk_ids = balanced_routed_ids
+        else:
+            # Keep fused shared-expert columns, if this backend appended them.
+            topk_ids = torch.cat(
+                (balanced_routed_ids, topk_ids[:, num_routed_topk:]), dim=1
+            )
+        padded_rows_masked = False
+    elif routing_overridden:
         # Benchmark-only: override gating with a balanced expert assignment (so
         # dummy/random benchmark tokens don't skew MoE load) via a single fused
         # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
@@ -3146,6 +3291,7 @@ def precomputed_topk_postprocess_is_noop(
         and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        and not envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
     )
 
 

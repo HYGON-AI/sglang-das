@@ -281,6 +281,15 @@ class DeepseekModelNextN(nn.Module):
             if use_platform_cp:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
+            # NextN owns a separate KV/page-plan namespace even when its
+            # temporary Main-KV tensor aliases the target's LayerSplit scratch.
+            # Configure it before the decoder/indexer can read historical KV.
+            if get_parallel().enable_dsa_cache_layer_split:
+                from sglang.srt.layers.communicator_dsa_cp import (
+                    maybe_prefetch_full_attention_kv as maybe_prefetch_dsa_full_kv,
+                )
+
+                maybe_prefetch_dsa_full_kv(forward_batch, 0)
             residual = None
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():

@@ -70,6 +70,10 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Match only the full-attention component. Decode-side DSV4 prompt
+    # donation intentionally leaves SWA tombstones while retaining reusable
+    # full-attention pages.
+    return_full_match: bool = False
 
 
 @dataclasses.dataclass
@@ -88,6 +92,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_branching_seqlen: Optional[int] = None
+    force_leaf_creation: bool = False
 
     # General
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(

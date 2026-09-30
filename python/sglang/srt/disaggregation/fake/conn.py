@@ -59,6 +59,12 @@ class FakeKVSender(BaseKVSender):
         self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         self.inited = False
         self.waiting_since: Optional[float] = None
+        self._source_event = None
+
+    def set_source_event(self, source_event) -> None:
+        # Fake transfers never read device memory, so no sync event is needed.
+        # The attribute must still exist: send_kv_chunk reads it directly.
+        del source_event
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -116,6 +122,7 @@ class FakeKVSender(BaseKVSender):
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         # A zero-page last chunk must still send: poll() only concludes after send().
+        # CP can leave a rank with no complete page in its final local shard.
         return num_pages > 0 or last_chunk
 
     def send(
@@ -176,6 +183,7 @@ class FakeKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(

@@ -14,6 +14,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_nvidia_driver_version,
     is_cpu,
+    is_hcu,
     is_mps,
     is_triton_kernels_available,
 )
@@ -35,7 +36,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_amx"
         elif get_platform().is_xpu:
             overrides["attention_backend"] = "intel_xpu"
-        elif get_platform().is_hip:
+        elif get_platform().is_hip and not is_hcu():
             overrides["attention_backend"] = "aiter"
         elif not (is_mps() and use_mlx()):
             # Exempt MLX only -- it owns attention in its own runner.  macOS

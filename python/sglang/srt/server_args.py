@@ -67,7 +67,6 @@ def _reasoning_parser_choices():
 
     return list(REASONING_PARSER_NAMES)
 
-
 def _tool_call_parser_choices():
     module = sys.modules.get("sglang.srt.function_call.function_call_parser")
     if module is not None:

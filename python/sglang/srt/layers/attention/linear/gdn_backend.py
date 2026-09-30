@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hcu,
+    get_bool_env_var,
     is_hip,
     is_npu,
     is_xpu,
@@ -34,6 +35,7 @@ from sglang.srt.utils.common import rank0_log
 
 _is_hcu = is_hcu()
 _is_hip = is_hip()
+_use_hcu_causal_conv1d = False
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -191,6 +193,22 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
+    try:
+        from causal_conv1d import causal_conv1d_fn_hcu
+        from causal_conv1d.causal_conv1d_interface import (
+            causal_conv1d_update as causal_conv1d_update_hcu,
+        )
+
+        _use_hcu_causal_conv1d = True
+        rank0_log("Using HCU causal_conv1d for GDN decode/prefill.")
+    except ImportError as exc:
+        rank0_log(
+            "SGLANG_USE_CAUSAL_CONV1D=1 but HCU causal_conv1d import failed "
+            f"({exc}); falling back to Triton."
+        )
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -699,7 +717,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     activation=layer.activation,
                 )
             )
-            if eligible:
+            if eligible and not _use_hcu_causal_conv1d:
                 qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
                 fused_backend = "triton_direct_oracle_exact"
                 if not _fused_decode_proj_conv_logged:
@@ -825,7 +843,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             assert isinstance(mixed_qkv, torch.Tensor)
 
         if not conv_already_applied:
-            mixed_qkv = causal_conv1d_update(
+            conv_update = (
+                causal_conv1d_update_hcu if _use_hcu_causal_conv1d else causal_conv1d_update
+            )
+            mixed_qkv = conv_update(
                 mixed_qkv,
                 conv_states,
                 layer.conv_weights,
@@ -1008,12 +1029,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
+            conv_fn = causal_conv1d_fn_hcu if _use_hcu_causal_conv1d else causal_conv1d_fn
+            conv_kwargs = (
+                {"initial_states": conv_states_contig}
+                if _use_hcu_causal_conv1d
+                else {"conv_states": conv_states_contig}
+            )
+            mixed_qkv = conv_fn(
                 mixed_qkv,
                 layer.conv_weights,
                 layer.bias,
                 activation=layer.activation,
-                conv_states=conv_states_contig,
+                **conv_kwargs,
                 has_initial_state=has_initial_states,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,

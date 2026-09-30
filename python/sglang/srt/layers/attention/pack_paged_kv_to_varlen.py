@@ -58,6 +58,10 @@ def can_pack_paged_kv_to_varlen(
         and sinks is None
         and key_cache.dtype in (torch.float16, torch.bfloat16)
         and value_cache.dtype in (torch.float16, torch.bfloat16)
+        # The packing view below is for the legacy HCU layout where K is
+        # [page, H, P, D] and V is [page, H, D, P].  HND/BHSD stores K/V as
+        # [page, H, P, D] and must stay on the direct paged-attention path.
+        and key_cache.shape != value_cache.shape
         and metadata.page_table is not None
         and metadata.cu_seqlens_k is not None
         and metadata.page_table.shape[0] >= batch_size

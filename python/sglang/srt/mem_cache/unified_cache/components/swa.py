@@ -967,6 +967,9 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
+        insert_params.force_leaf_creation = getattr(
+            req, "force_radix_leaf_creation", False
+        )
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.

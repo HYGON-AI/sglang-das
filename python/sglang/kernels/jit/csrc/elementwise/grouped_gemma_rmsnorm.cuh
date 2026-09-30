@@ -80,8 +80,9 @@ __global__ __launch_bounds__(kGroupSize / 16) void grouped_gemma_rmsnorm_kernel(
   for (uint32_t j = 0; j < kNumLoads; ++j) {
 #pragma unroll
     for (uint32_t i = 0; i < kVecLen; ++i) {
-      const auto [x, y] = cast<fp32x2_t>(input_vec[j][i]);
-      sum_of_squares += x * x + y * y;
+      // HIP vector types cannot be destructured; read .x/.y instead.
+      const auto xy = cast<fp32x2_t>(input_vec[j][i]);
+      sum_of_squares += xy.x * xy.x + xy.y * xy.y;
     }
   }
 
@@ -108,9 +109,10 @@ __global__ __launch_bounds__(kGroupSize / 16) void grouped_gemma_rmsnorm_kernel(
     Storage output_vec;
 #pragma unroll
     for (uint32_t i = 0; i < kVecLen; ++i) {
-      const auto [ix, iy] = cast<fp32x2_t>(input_vec[j][i]);
-      const auto [wx, wy] = cast<fp32x2_t>(weight_vec[j][i]);
-      output_vec[i] = cast<Float2>(fp32x2_t{ix * norm_factor * (1.0f + wx), iy * norm_factor * (1.0f + wy)});
+      const auto ixy = cast<fp32x2_t>(input_vec[j][i]);
+      const auto wxy = cast<fp32x2_t>(weight_vec[j][i]);
+      output_vec[i] =
+          cast<Float2>(fp32x2_t{ixy.x * norm_factor * (1.0f + wxy.x), ixy.y * norm_factor * (1.0f + wxy.y)});
     }
     gmem.store(output_ptr, output_vec, j);
   }

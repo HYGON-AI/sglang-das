@@ -102,6 +102,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsa_seed_metadata_dim,
     prepare_abort,
+    resolve_disagg_metadata_config,
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import bootstrap
@@ -348,6 +349,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
+    is_hcu,
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
@@ -1491,21 +1493,19 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.ps.pp_size != 1:
+            if get_parallel().pp_size != 1:
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports attn_tp_size=1 and "
-                    "attn_cp_size=1 only"
-                )
+            # if get_parallel().attn_tp_size != 1 or get_parallel().attn_cp_size != 1:
+            #     raise RuntimeError(
+            #         "PD Decode DP sync currently supports attn_tp_size=1 and "
+            #         "attn_cp_size=1 only"
+            #     )
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
-                self.server_args.dp_size
-                * self.ps.attn_tp_size
-                * self.ps.attn_cp_size
+                get_parallel().dp_size * get_parallel().attn_tp_size * get_parallel().attn_cp_size
             )
             default_world = torch.distributed.get_world_size()
             if len(tp_ranks) != expected_world or len(tp_ranks) != default_world:
@@ -1532,7 +1532,7 @@ class Scheduler(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_s),
             )
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 logger.info(
                     "PD Decode single-clock enabled: dedicated Gloo scheduler "
                     "group, world=%s timeout=%.1fs",
@@ -1579,6 +1579,29 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # DSpark PD hidden-state transfer widens the metadata buffers and adds
+        # its own receive pool. NULL mode has no PD wire to size, and resolving
+        # it there would inspect speculative workers that need not exist.
+        metadata_buffer_kwargs = {}
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            disagg_metadata_config = resolve_disagg_metadata_config(
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                disaggregation_mode=self.disaggregation_mode,
+                transfer_backend=self.transfer_backend,
+                spec_algorithm=self.spec_algorithm,
+                model_config=self.model_config,
+                server_args=self.server_args,
+                model_runner=self.tp_worker.model_runner,
+                pp_rank=get_parallel().pp_rank,
+                pp_size=get_parallel().pp_size,
+                gpu_id=get_device().gpu_id,
+                max_prefill_tokens=self.max_prefill_tokens,
+            )
+            disagg_hidden_size = disagg_metadata_config.hidden_size
+            disagg_hidden_states_dtype = disagg_metadata_config.hidden_states_dtype
+            metadata_buffer_kwargs = disagg_metadata_config.metadata_buffer_kwargs
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1603,6 +1626,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                **metadata_buffer_kwargs,
             )
 
             # The decode requests polling kv cache
@@ -1646,6 +1670,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                **metadata_buffer_kwargs,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -5644,26 +5669,27 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+            if is_hcu():
+                # PP must agree on failed requests before either rank frees KV.
+                self.disagg_decode_prealloc_queue.abort_matching(recv_req)
+                self.disagg_decode_transfer_queue.abort_matching(recv_req)
+            else:
+                # Abort requests that have not yet finished preallocation.
+                for decode_req in self.disagg_decode_prealloc_queue.queue:
+                    if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                        logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                        decode_req.kv_receiver.abort()
+                        if get_parallel().pp_size > 1:
+                            prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if decode_req.host_staged:
-                        # Keep the host destination alive until prefill stops writing.
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-                        continue
-                    # The receiver arms drain-ack accounting before sending the
-                    # ABORT (see CommonKVReceiver._send_abort_notification), so
-                    # an ack racing back is never dropped.
-                    decode_req.kv_receiver.abort()
+                # Abort requests waiting for KV cache to release tree cache.
+                for decode_req in self.disagg_decode_transfer_queue.queue:
+                    if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                        logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                        if decode_req.host_staged:
+                            prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                            continue
+                        decode_req.kv_receiver.abort()
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:

@@ -76,10 +76,12 @@ from sglang.srt.layers.communicator import (
     layer_input_buffer,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
+    maybe_configure_main_kv_page_plan,
+    maybe_prefetch_full_attention_kv,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -121,6 +123,8 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
     mla_use_prefill_cp,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -153,6 +157,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -606,6 +613,16 @@ class MoEGate(nn.Module):
                 out_dtype=torch.float32,
                 max_m=self.tiny_router_gemm_max_tokens,
             )
+        elif (
+            _is_hcu
+            and self.is_deepseek_v4
+            and envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "auto"
+        ):
+            # Route auto before the broad AITER branch so HCU DSV4 router
+            # logits use the per-shape selector.
+            from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+
+            logits = linear_bf16_fp32(hidden_states, self.weight)
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
         elif _is_hcu and self.is_deepseek_v4:
@@ -627,6 +644,37 @@ class MoEGate(nn.Module):
 # The dedicated 4 MiB push slot fits 384 rows of 5120 BF16 values.
 # The dispatch gate also checks slot capacity and available counters.
 _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
+
+
+def _mega_moe_eager_body(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global,
+) -> torch.Tensor:
+    from sglang.srt.layers.moe.mega_moe import forward_mega_moe
+
+    return forward_mega_moe(
+        moe, hidden_states, forward_batch, input_ids_global=input_ids_global
+    )
+
+
+def _mega_moe_capture_stub(
+    moe,
+    hidden_states: torch.Tensor,
+    forward_batch,
+    input_ids_global,
+) -> torch.Tensor:
+    # Capture pass only: record the bridge buffer's address and shape, skip the
+    # rank-coupled MegaMoE dispatch. Warmup and replay run the real body, which
+    # sees get_is_capture_mode() == False and therefore sizes its output by the
+    # live token count -- the shape this stub must match.
+    return torch.zeros_like(hidden_states)
+
+
+_bcg_forward_mega_moe = eager_on_graph(True, capture_stub=_mega_moe_capture_stub)(
+    _mega_moe_eager_body
+)
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1039,6 +1087,17 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
+            if is_in_breakable_cuda_graph():
+                # MegaMoE drives rank-coupled symmetric-buffer collectives whose
+                # token count and expert routing change per batch, so capturing
+                # it bakes in one batch's dispatch (garbled replay output). Run
+                # it as an eager node, same as DeepEP NORMAL.
+                return _bcg_forward_mega_moe(
+                    self,
+                    hidden_states,
+                    forward_batch,
+                    input_ids_global,
+                )
             return forward_mega_moe(
                 self,
                 hidden_states,
@@ -2293,6 +2352,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Reused DSA TopK indices were already sorted by the producing layer.
+        self.attn_mqa.reuse_topk_indices = bool(self.skip_topk and not self.is_nextn)
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
@@ -3248,6 +3309,28 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
+        # CP-v2 shards/gathers at the eager-runner boundary instead.
+        use_cp_v1 = (
+            dsa_use_prefill_cp(forward_batch)
+            or mla_use_prefill_cp(forward_batch)
+        ) and not is_cp_v2_active(forward_batch)
+
+        if use_cp_v1:
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+
+        if _is_hcu and self.start_layer < self.end_layer:
+            # A non-zero PP stage may start on a skip-topk layer and reuse the
+            # previous stage's indices, so no local indexer would trigger the
+            # first Main-KV prefetch. Start it explicitly on HCU; the normal
+            # indexer path reuses the same pending broadcast on non-skip layers.
+            maybe_prefetch_full_attention_kv(forward_batch, self.start_layer)
+        else:
+            # Install the compact mapping before the first indexer triggers the
+            # existing current-layer Main-KV prefetch.
+            maybe_configure_main_kv_page_plan(forward_batch)
+
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling: Optional[torch.Tensor] = None
@@ -3355,7 +3438,9 @@ class DeepseekV2Model(nn.Module):
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
-    packed_modules_mapping = {}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,

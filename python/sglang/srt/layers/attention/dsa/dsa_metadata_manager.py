@@ -12,7 +12,11 @@ from sglang.kernels.ops.attention.dsa_metadata import (
     fused_dsa_target_verify_metadata,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.layers.attention.dsa.flashmla_backend import (
+    can_fuse_flashmla_metadata,
+    refresh_flashmla_metadata,
+)
+from sglang.srt.utils import is_cuda, is_hcu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -25,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +89,14 @@ class DSAMetadataManagementMixin:
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
 
-        # Use fused CUDA kernel for all copy operations
-        if not _is_hip:
+        # HCU FlashMLA can carry scheduler state in an object. The tensor-only
+        # fused copy accepts FlashMLA metadata only when both sides are tensors.
+        flashmla_metadata_can_fuse = precomputed.flashmla_metadata is None or (
+            can_fuse_flashmla_metadata(
+                precomputed.flashmla_metadata, metadata.flashmla_metadata
+            )
+        )
+        if not _is_hip and flashmla_metadata_can_fuse:
             try:
                 from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
@@ -195,11 +206,28 @@ class DSAMetadataManagementMixin:
                     precomputed.real_page_table
                 )
 
-            # Copy FlashMLA metadata in fallback path
-            if precomputed.flashmla_metadata is not None:
-                size = precomputed.seqlens_expanded_size
-                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-                flashmla_metadata.copy_(precomputed.flashmla_metadata)
+        # HCU needs a fresh scheduler object for each replay; a sliced wrapper
+        # would keep stale shape-bound state. CUDA refreshes tensor buffers.
+        if precomputed.flashmla_metadata is not None and (
+            _is_hcu or not fused_kernel_succeeded
+        ):
+            size = precomputed.seqlens_expanded_size
+            flashmla_source = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=precomputed.dsa_cache_seqlens,
+                    seq_len_q=1,
+                )
+                if _is_hcu
+                else precomputed.flashmla_metadata
+            )
+            flashmla_metadata = refresh_flashmla_metadata(
+                metadata.flashmla_metadata,
+                flashmla_source,
+                slice(0, size + 1),
+                is_hcu=_is_hcu,
+            )
+            if _is_hcu:
+                object.__setattr__(metadata, "flashmla_metadata", flashmla_metadata)
 
     @staticmethod
     def _sibling_replay_metadata_compatible(dst: DSAMetadata, src: DSAMetadata) -> bool:

@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUGeluAndMul,
     NPUSitu,
     NPUSituMXFP8Quant,
+    NPUSituQuant,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
     NPUSwigluMxfp8Quant,
@@ -171,7 +172,11 @@ class AscendRunnerCore(MoeRunnerCore):
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+                # Kimi-K3 uses SiTU; do not force SiLU SwiGLU+quant.
+                if isinstance(config.activation, str) and config.activation.lower() == "situ":
+                    inner = NPUSituQuant(moe_runner_config=config)
+                else:
+                    inner = NPUSwigluQuant()
             elif config.activation == "situ":
                 # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
                 # gmm2 requantizes the activations itself, so no quant is

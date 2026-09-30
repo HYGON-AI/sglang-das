@@ -20,6 +20,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
+    get_bool_env_var,
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
@@ -405,6 +406,34 @@ def handle_environment_variables(server_args: Any):
     )
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+    # Normalize custom_all_reduce_backend: --disable-custom-all-reduce wins,
+    # else on HIP with legacy SGLANG_USE_AITER_AR=1 promote auto -> aiter.
+    if cfg.disable_custom_all_reduce:
+        if cfg.custom_all_reduce_backend != "off":
+            logger.info(
+                "--disable-custom-all-reduce overrides "
+                "--custom-all-reduce-backend=%s to 'off'.",
+                cfg.custom_all_reduce_backend,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_environment_variables",
+                custom_all_reduce_backend="off",
+            )
+    elif (
+        cfg.custom_all_reduce_backend == "auto"
+        and get_platform().is_hip
+        and get_bool_env_var("SGLANG_USE_AITER_AR", default="false")
+    ):
+        logger.info(
+            "Promoting custom_all_reduce_backend from 'auto' to 'aiter' "
+            "because SGLANG_USE_AITER_AR=1 is set on HIP."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_environment_variables",
+            custom_all_reduce_backend="aiter",
+        )
     if cfg.debug_cuda_graph:
         if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(

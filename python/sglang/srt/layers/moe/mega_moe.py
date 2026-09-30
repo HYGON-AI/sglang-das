@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_W4A8_OVERLAP_STREAMS: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
 _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT: Optional[Any] = None
 _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT_CHECKED = False
@@ -222,7 +223,11 @@ def _prepare_standalone_megamoe_inputs(
             quant_input,
             dtype=buf.x.dtype,
             out_q=buf.x[:num_tokens],
-            out_scale=buf.x_sf[:num_tokens],
+            # MegaMoE stores one FP32 scale per token as a flat buffer, while
+            # the public LightOp wrapper validates the per-token scale output
+            # as [num_tokens, 1]. The view preserves the underlying symmetric
+            # buffer layout expected by MegaMoE.
+            out_scale=buf.x_sf[:num_tokens].view(num_tokens, 1),
         )
     else:
         import megamoe
@@ -341,6 +346,7 @@ def _get_mega_moe_symm_buffer(
     *,
     runtime: str = _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM,
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
+    quant_mode: str = "fp8",
 ) -> SymmBuffer:
     if mma_type is None:
         mma_type = _mega_moe_mma_type()
@@ -367,6 +373,7 @@ def _get_mega_moe_symm_buffer(
     with num_sms_ctx:
         key = (
             package_key,
+            quant_mode,
             id(group),
             num_max_tokens_per_rank,
             cuda_graph_max_tokens_per_rank,
@@ -380,6 +387,8 @@ def _get_mega_moe_symm_buffer(
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
             kwargs = {}
+            if quant_mode != "fp8":
+                kwargs["quant_mode"] = quant_mode
             if cuda_graph_max_tokens_per_rank is not None:
                 kwargs["cuda_graph_max_tokens_per_rank"] = (
                     cuda_graph_max_tokens_per_rank
@@ -434,6 +443,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
                 "server after changing SGLANG_HCU_MEGA_MOE_RUNTIME."
             )
     if get_is_capture_mode():
+        if getattr(moe.experts, "_mega_moe_hcu_int4_weights", False):
+            raise RuntimeError("HCU INT4 MegaMoE requires --disable-cuda-graph")
         return not _IS_HCU or _is_standalone_megamoe_runtime()
 
     global_num_tokens = get_dp_global_num_tokens()
@@ -461,19 +472,43 @@ def forward_mega_moe(
         )
 
     num_tokens = hidden_states.shape[0]
+    is_w4a8 = getattr(moe.experts, "_mega_moe_hcu_w4a8_weights", False)
+    eager_w4a8_overlap = (
+        is_w4a8
+        and _IS_HCU
+        and hidden_states.is_cuda
+        and os.getenv("SGLANG_HCU_W4A8_SHARED_OVERLAP", "0") == "1"
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend()
+        and getattr(moe, "shared_experts", None) is not None
+        and not get_is_capture_mode()
+    )
+    overlap_stream = moe.alt_stream
+    if eager_w4a8_overlap:
+        device = hidden_states.device
+        if device not in _W4A8_OVERLAP_STREAMS:
+            _W4A8_OVERLAP_STREAMS[device] = torch.cuda.Stream(device=device)
+        overlap_stream = _W4A8_OVERLAP_STREAMS[device]
 
     sbo_overlap_flag = (
-        moe.alt_stream is not None
+        overlap_stream is not None
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
-        and get_is_capture_mode()
+        and (get_is_capture_mode() or eager_w4a8_overlap)
     )
 
     if sbo_overlap_flag:
         current_stream = torch.cuda.current_stream()
-        moe.alt_stream.wait_stream(current_stream)
+        overlap_stream.wait_stream(current_stream)
+        if eager_w4a8_overlap:
+            for tensor in (
+                hidden_states, input_ids_global,
+                getattr(forward_batch, "num_token_non_padded", None),
+            ):
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                    tensor.record_stream(overlap_stream)
         shared_output = moe._forward_shared_experts(hidden_states)
-        mega_stream_ctx = torch.cuda.stream(moe.alt_stream)
+        mega_stream_ctx = torch.cuda.stream(overlap_stream)
     else:
         shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = nullcontext()
@@ -484,8 +519,23 @@ def forward_mega_moe(
         )
 
     if sbo_overlap_flag:
-        current_stream.wait_stream(moe.alt_stream)
+        current_stream.wait_stream(overlap_stream)
+        if eager_w4a8_overlap:
+            y.record_stream(current_stream)
 
+    if is_w4a8:
+        topk_config = getattr(moe.topk, "topk_config", moe.topk)
+        scale = (
+            1.0
+            if topk_config.apply_routed_scaling_factor_on_output
+            else moe.routed_scaling_factor
+        )
+        if shared_output is not None:
+            # Match forward_deepep: scaling and shared addition must round once.
+            shared_output.add_(y, alpha=scale)
+            return shared_output
+        y.mul_(scale)
+        return y
     if shared_output is not None:
         y.add_(shared_output)
     return y
@@ -574,10 +624,14 @@ def run_mega_routed_experts(
 
     if _IS_HCU:
         runtime = get_hcu_mega_moe_runtime()
-        # The a2a is sized by the widest rank, not by our own row count.
+        # The a2a is sized by the widest rank, not by our own row count. CP has
+        # already split the padded prefill batch across attention ranks, so the
+        # DP-global count would size the dispatch as if each rank held it all.
         global_num_tokens = get_dp_global_num_tokens()
         dispatch_num_tokens = (
-            max(global_num_tokens) if global_num_tokens else num_tokens
+            max(global_num_tokens)
+            if global_num_tokens and not is_dsa_enable_prefill_cp()
+            else num_tokens
         )
         assert dispatch_num_tokens <= num_max_tokens_per_rank, (
             f"mega MoE: max_tokens_per_rank={dispatch_num_tokens} exceeds cap "
@@ -608,26 +662,44 @@ def run_mega_routed_experts(
         mma_type=mma_type,
         runtime=runtime,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
+        quant_mode=(
+            "w4a8"
+            if getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
+            else "fp8"
+        ),
     )
 
     if _IS_HCU:
-        run_hcu = (
-            _run_standalone_hcu_w8a8_mega_moe
-            if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
-            else _run_deep_gemm_hcu_w8a8_mega_moe
-        )
-        y = run_hcu(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            experts=experts,
-            buf=buf,
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            dispatch_num_tokens=dispatch_num_tokens,
-            activation_clamp=activation_clamp,
-        )
-        if routed_scaling_factor != 1.0:
+        is_w4a8 = getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
+        if is_w4a8:
+            y = _run_standalone_hcu_w4a8_mega_moe(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                experts,
+                buf,
+                activation_clamp=activation_clamp,
+            )
+        else:
+            run_hcu = (
+                _run_standalone_hcu_w8a8_mega_moe
+                if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+                else _run_deep_gemm_hcu_w8a8_mega_moe
+            )
+            y = run_hcu(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                experts=experts,
+                buf=buf,
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                dispatch_num_tokens=dispatch_num_tokens,
+                activation_clamp=activation_clamp,
+            )
+        # W4A8 applies the routed scale together with the shared-expert add in
+        # forward_mega_moe, so both round once.
+        if not is_w4a8 and routed_scaling_factor != 1.0:
             y.mul_(routed_scaling_factor)
         return y
 
@@ -830,6 +902,77 @@ def _run_standalone_hcu_w8a8_mega_moe(
         **api_kwargs,
     )
     return y[:num_tokens]
+
+
+def _run_standalone_hcu_w4a8_mega_moe(
+    hidden_states, topk_ids, topk_weights, experts, buf, activation_clamp=None
+):
+    from lightop.quant import per_token_quant_int8
+    from megamoe.w4a8 import w4a8_mega_moe
+
+    tokens, hidden = hidden_states.shape
+    if tokens:
+        qx, scale = per_token_quant_int8(hidden_states)
+        buf.x[:tokens].copy_(qx)
+        buf.x_sf[:tokens].copy_(scale.reshape(-1))
+        buf.topk_idx[:tokens].copy_(topk_ids)
+        buf.topk_weights[:tokens].copy_(topk_weights)
+    y = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+    # Empty ranks still participate in routing and both peer-memory barriers.
+    w4a8_mega_moe(
+        y,
+        experts.mega_l1_weights,
+        experts.mega_l2_weights,
+        buf,
+        activation_clamp=activation_clamp,
+        combine_group_map=getattr(experts, "mega_w4a8_combine_groups", None),
+    )
+    return y
+
+
+def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
+    from deepgemm import pack_w4a8_moe_hipc_weight
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if not _IS_HCU or get_hcu_mega_moe_runtime() != "megamoe":
+        raise ValueError("W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
+    if get_exec().moe.enable_eplb:
+        raise ValueError("W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported")
+    if not get_exec().graph.disable_cuda_graph:
+        raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
+    # The loader has already placed logical experts into the static physical
+    # slots. Repack each slot independently without changing expert order.
+    for name in ("w13_weight", "w2_weight"):
+        weight = getattr(experts, name)
+        setattr(experts, name, torch.nn.Parameter(
+            pack_w4a8_moe_hipc_weight(weight.data), requires_grad=False,
+        ))
+    for name in ("w13_weight_scale", "w2_weight_scale"):
+        scale = getattr(experts, name)
+        setattr(experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False))
+    experts.mega_l1_weights = (experts.w13_weight, experts.w13_weight_scale)
+    experts.mega_l2_weights = (experts.w2_weight, experts.w2_weight_scale)
+    metadata = get_global_expert_location_metadata()
+    if metadata is not None:
+        logical_experts = metadata.num_logical_experts
+        if logical_experts % 8:
+            raise ValueError("W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8")
+        groups = (
+            metadata.physical_to_logical_map[experts.layer_id] // (logical_experts // 8)
+        ).to(torch.int32).contiguous()
+        physical_groups = torch.arange(
+            groups.numel(), device=groups.device, dtype=torch.int32
+        ) // (groups.numel() // 8)
+        # Resolve the identity case once at load time so the runtime may
+        # reduce locally before sending a single BF16 partial to each peer.
+        if torch.equal(groups, physical_groups):
+            groups = None
+        experts.register_buffer("mega_w4a8_combine_groups", groups, persistent=False)
+    experts._mega_moe_hcu_runtime = "megamoe"
+    experts._mega_moe_hcu_w4a8_weights = True
+    experts._mega_moe_weights_built = True
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:

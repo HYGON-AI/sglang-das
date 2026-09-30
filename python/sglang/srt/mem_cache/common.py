@@ -185,7 +185,21 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if req.skip_radix_cache_insert:
-        return
+        # DSV4 decode radix prompt donation re-enables exactly one insert.
+        if getattr(req, "allow_radix_cache_insert_once", False):
+            req.allow_radix_cache_insert_once = False
+        else:
+            if kwargs.get("chunked", False):
+                # Fake-bootstrap warmup requests skip tree insertion, but a
+                # later chunk must still reuse this request's own computed KV.
+                # Otherwise its prefix stays empty and every scheduling pass
+                # allocates the same first chunk again. Keep these slots
+                # request-owned: cache_protected_len and tree locks are unchanged.
+                end = req.extend_range.end
+                req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :end
+                ].to(dtype=torch.int64, copy=True)
+            return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
 
@@ -346,8 +360,32 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
+    _release_donated_swa_slots(req, tree_cache)
     tree_cache.req_to_token_pool.free(req)
     req.kv.mark_kv_released()
+
+
+def _release_donated_swa_slots(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Free SWA left ownerless by a DSV4 decode-radix prompt donation.
+
+    The donated radix leaf is full-only: it keeps the full pages and tombstones
+    their SWA, and the request's own release treats that prefix as tree-owned.
+    Nobody frees the SWA underneath, so return it here, after the last decode
+    step. swa_evicted_seqlen marks what the window-aware path already took.
+    """
+    donated = int(getattr(req, "dsv4_donated_swa_len", 0) or 0)
+    if donated <= 0 or not req.kv.holds_kv:
+        return
+    # Clear first: this must run once even if the free below is a no-op.
+    req.dsv4_donated_swa_len = 0
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if not hasattr(allocator, "free_swa"):
+        return
+    # Deliberately not bounded by swa_evicted_seqlen: free_swa_out_of_window_slots
+    # raises that watermark to cache_protected_len without freeing anything, so
+    # for the donated prefix it reads as evicted while the slots are still held.
+    indices = tree_cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :donated]
+    allocator.free_swa(indices)
 
 
 def _release_overallocated_kv_indices(

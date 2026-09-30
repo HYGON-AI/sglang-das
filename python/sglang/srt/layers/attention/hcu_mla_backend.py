@@ -176,7 +176,14 @@ class HCUMLABackend(AttentionBackend):
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Original HCU MLA initialization kept for Kimi K3 bring-up comparison:
+        # self.req_to_token = model_runner.req_to_token_pool.req_to_token
+
+        # HybridLinearAttnBackend requires the full-attention backend to expose
+        # both pools; retain req_to_token as the existing fast tensor alias.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token = self.req_to_token_pool.req_to_token
 
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -944,7 +951,10 @@ class HCUMLABackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+        ):
             if not self.skip_prefill:
                 return self.flashattn_backend.forward_extend(
                     q,

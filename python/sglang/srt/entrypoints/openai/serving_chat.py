@@ -418,6 +418,40 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+        # Read by ServingDecisions (serving_decisions.py).
+        self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+
+    def _probe_prompt_text_round_trip(self) -> bool:
+        """Does rendering the chat template to text and re-encoding lose anything?
+
+        mistral_common tokenizers emit control tokens ([INST],
+        [AVAILABLE_TOOLS], ...) that have no text form. Rendering to a string
+        turns them into literal characters and re-encoding also prepends a
+        second BOS, so the model sees the letters "AVAILABLE_TOOLS" instead of
+        the control token that frames the tool block. Encoding straight to ids
+        is the only faithful route on such tokenizers, so compare the two here
+        once and remember which to trust.
+        """
+        probe = [{"role": "user", "content": "x"}]
+        try:
+            tokenizer = self.tokenizer_manager.tokenizer
+            rendered = tokenizer.apply_chat_template(
+                probe, tokenize=False, add_generation_prompt=True, return_dict=False
+            )
+            encode_kwargs = (
+                {"add_special_tokens": False}
+                if self._tokenizer_auto_adds_specials
+                else {}
+            )
+            via_text = tokenizer.encode(rendered, **encode_kwargs)
+            via_ids = tokenizer.apply_chat_template(
+                probe, tokenize=True, add_generation_prompt=True, return_dict=False
+            )
+            return list(via_text) != list(via_ids)
+        except Exception:
+            # A template that needs kwargs this probe does not supply tells us
+            # nothing; keep the long-standing text path.
+            return False
 
     def _handle_last_assistant_message(
         self,

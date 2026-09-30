@@ -31,6 +31,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
+from dataclasses import fields as dataclass_fields
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -560,6 +561,10 @@ class MoeFlags(_FlagGroupBase):
     # Draft construction/execution uses a separate one-sided A2A workspace from
     # the target model's concurrently live CUDA graphs.
     speculative_context: bool = False
+    # Set while the draft model is using its speculative A2A backend. Target
+    # and draft DeepEP instances can have different expert layouts, so their
+    # process-level communication buffers must not be shared.
+    in_speculative_a2a_scope: bool = False
 
 
 class DpFlags(_FlagGroupBase):
@@ -1208,21 +1213,19 @@ class _ServerArgsOverride:
         server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
-        unknown = {name for name in self._fields if not name.startswith("_")} - set(
-            type(server_args).__struct_fields__
-        )
+        fields = {field.name for field in dataclass_fields(server_args)}
+        unknown = {name for name in self._fields if not name.startswith("_")} - fields
         if unknown:
             raise ValueError(
                 f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
             )
         # Declare config fields even when underscore-prefixed; only non-fields seed caches.
-        fields = set(type(server_args).__struct_fields__)
         declared = {n: v for n, v in self._fields.items() if n in fields}
         if declared:
             declare_resolution(server_args, "override_server_args", **declared)
         seeds = {n: v for n, v in self._fields.items() if n not in fields}
         for name, value in seeds.items():
-            msgspec.Struct.__setattr__(server_args, name, value)
+            object.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args

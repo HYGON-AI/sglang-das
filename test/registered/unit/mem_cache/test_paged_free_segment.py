@@ -216,6 +216,7 @@ class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
         self.freed.append(free_index)
 
 
+
 class TestBaseFallbackFreeSegments(unittest.TestCase):
     def test_fallback_forwards_page_disjoint_segments(self):
         # base fallback: each segment reaches free() as-is, no cross-segment dedup

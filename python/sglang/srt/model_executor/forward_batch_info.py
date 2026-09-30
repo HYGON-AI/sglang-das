@@ -42,6 +42,7 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -79,6 +80,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.mem_cache.dsa_cache_layer_split import MainKVPagePlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -174,6 +176,11 @@ def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
         and batch.is_extend_in_batch
         and batch.forward_mode.is_idle()
     )
+
+
+def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
+    """Use pinned staging for HCU metadata copied on a busy stream."""
+    return _is_hcu and is_pin_memory_available(device)
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -622,6 +629,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    pd_hidden_capture_layer_ids: Optional[List[int]] = None
+
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -637,6 +647,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Built once from the global request table and reused by every DSA layer.
+    # Index-K metadata deliberately remains in the original physical layout.
+    dsa_layer_split_main_kv_page_plan: Optional[MainKVPagePlan] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
@@ -897,6 +910,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
+        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
+        if (
+            model_runner.server_args.disaggregation_mode == "prefill"
+            and get_parallel().attn_cp_size > 1
+        ):
+            gathered_capture_layers = [None] * get_parallel().attn_cp_size
+            torch.distributed.all_gather_object(
+                gathered_capture_layers,
+                pd_hidden_capture_layer_ids,
+                group=get_parallel().attn_cp_group.cpu_group,
+            )
+            nonempty_capture_layers = [
+                [int(x) for x in layer_ids]
+                for layer_ids in gathered_capture_layers
+                if layer_ids
+            ]
+            if nonempty_capture_layers:
+                expected_capture_layers = nonempty_capture_layers[0]
+                if any(
+                    layer_ids != expected_capture_layers
+                    for layer_ids in nonempty_capture_layers[1:]
+                ):
+                    raise RuntimeError(
+                        "PD hidden capture layers disagree across prefill CP ranks: "
+                        f"{gathered_capture_layers}"
+                    )
+                pd_hidden_capture_layer_ids = expected_capture_layers
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
@@ -908,6 +948,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     get_server_return_hidden_states_mode(),
                 )
             )
+            if pd_hidden_capture_layer_ids:
+                request_capture_hidden_mode = max(
+                    request_capture_hidden_mode, CaptureHiddenMode.FULL
+                )
             capture_hidden_mode = get_required_capture_hidden_mode(
                 request_capture_hidden_mode,
                 batch.spec_info,
@@ -992,6 +1036,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -1009,6 +1054,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        pin_host_metadata = _pin_host_metadata(device)
 
         ret.mm_token_modalities = _maybe_build_forward_token_modalities(
             model_runner.model_config,
@@ -1041,8 +1087,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if batch.extend_input_logprob_token_ids is not None:
-            ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            extend_input_logprob_token_ids = batch.extend_input_logprob_token_ids
+            if (
+                pin_host_metadata
+                and extend_input_logprob_token_ids.device.type == "cpu"
+                and not extend_input_logprob_token_ids.is_pinned()
+            ):
+                extend_input_logprob_token_ids = (
+                    extend_input_logprob_token_ids.pin_memory()
+                )
+            ret.extend_input_logprob_token_ids_gpu = extend_input_logprob_token_ids.to(
+                device, non_blocking=True
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
@@ -1919,9 +1974,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         attn_tp_context = get_attn_tp_context()
         input_scattered = attn_tp_context.use_input_scattered(self)
-        if not input_scattered:
+        model_sp = get_parallel().minimax_opt or get_parallel().hy3_sp
+
+        if not input_scattered and not model_sp:
             return
-        assert self.forward_mode.is_extend()
+
+        if model_sp and not self.forward_mode.is_extend():
+            return
+
+        if input_scattered:
+            assert self.forward_mode.is_extend()
+
         tokens = self.input_ids.shape[0]
         rank_size = get_parallel().tp_size
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
@@ -1962,6 +2025,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :num_tokens
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if getattr(logits_output, "draft_top1_token_ids", None) is not None:
+                    logits_output.draft_top1_token_ids = (
+                        logits_output.draft_top1_token_ids[:num_tokens]
+                    )
+                    logits_output.draft_top1_probs = logits_output.draft_top1_probs[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:

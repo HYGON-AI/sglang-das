@@ -589,6 +589,12 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
+        raise ValueError(
+            "--ep-static-dispatch-policy must be one of "
+            "'nearest' or 'locality_fair'."
+        )
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,
@@ -612,6 +618,16 @@ def handle_eplb_and_dispatch(server_args: Any):
             ep_dispatch_algorithm=(
                 "dynamic" if needs_rank_invariant_dispatch else "static"
             ),
+        )
+
+    if (
+        cfg.ep_static_dispatch_policy != "nearest"
+        and cfg.ep_dispatch_algorithm != "static"
+    ):
+        raise ValueError(
+            "--ep-static-dispatch-policy locality_fair requires "
+            "--ep-dispatch-algorithm static. It configures a startup-time "
+            "source-rank-to-replica map, not dynamic token balancing."
         )
 
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a

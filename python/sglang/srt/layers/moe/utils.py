@@ -5,6 +5,7 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
+from contextvars import ContextVar
 from enum import Enum, IntEnum
 from typing import NamedTuple
 
@@ -33,6 +34,62 @@ _is_npu = is_npu()
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+W4A8_TPMOE_BACKEND_AUTO = "auto"
+W4A8_TPMOE_BACKEND_LIGHTOP = "lightop"
+W4A8_TPMOE_BACKEND_AITER = "aiter"
+W4A8_TPMOE_BACKEND_TRITON = "triton"
+W4A8_TPMOE_BACKENDS = frozenset(
+    {
+        W4A8_TPMOE_BACKEND_AUTO,
+        W4A8_TPMOE_BACKEND_LIGHTOP,
+        W4A8_TPMOE_BACKEND_AITER,
+        W4A8_TPMOE_BACKEND_TRITON,
+    }
+)
+
+_dspark_w4a8_tpmoe_backend_override = ContextVar(
+    "dspark_w4a8_tpmoe_backend_override", default=None
+)
+
+
+def normalize_w4a8_tpmoe_backend(
+    requested_backend: str, *, env_name: str
+) -> str:
+    backend = requested_backend.strip().lower()
+    if backend not in W4A8_TPMOE_BACKENDS:
+        supported = ", ".join(repr(value) for value in sorted(W4A8_TPMOE_BACKENDS))
+        raise ValueError(
+            f"Unsupported {env_name}={requested_backend!r}. "
+            f"Supported values: {supported}."
+        )
+    return backend
+
+
+def _resolve_dspark_w4a8_tpmoe_backend() -> str | None:
+    requested_backend = envs.SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND.get()
+    if requested_backend is None:
+        return None
+    return normalize_w4a8_tpmoe_backend(
+        requested_backend,
+        env_name="SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND",
+    )
+
+
+def get_dspark_w4a8_tpmoe_backend_override() -> str | None:
+    return _dspark_w4a8_tpmoe_backend_override.get()
+
+
+@contextmanager
+def dspark_w4a8_tpmoe_backend_context():
+    """Apply the DSpark W4A8 TP-MoE backend to one draft build."""
+    token = _dspark_w4a8_tpmoe_backend_override.set(
+        _resolve_dspark_w4a8_tpmoe_backend()
+    )
+    try:
+        yield
+    finally:
+        _dspark_w4a8_tpmoe_backend_override.reset(token)
 
 
 class MoeA2ABackend(Enum):
@@ -122,6 +179,9 @@ class _MoeRunnerBackendPredicates:
 
     def is_triton(self):
         return self.value == MoeRunnerBackend.TRITON.value
+
+    def is_lightop(self):
+        return self.value == MoeRunnerBackend.LIGHTOP.value
 
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
@@ -249,6 +309,9 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
 
     tma_aligned: bool
     ue8m0: bool
+
+    def is_lightop(self):
+        return self == MoeRunnerBackend.LIGHTOP
 
 
 class DeepEPMode(Enum):
@@ -500,6 +563,48 @@ def get_moe_runner_backend() -> MoeRunnerBackendLike:
     if moe.runner_backend is None:
         moe.runner_backend = MoeRunnerBackend.AUTO
     return moe.runner_backend
+
+
+def will_use_aiter_moe() -> bool:
+    """Return whether the effective HIP MoE runner is AITER.
+
+    An explicit ``--moe-runner-backend aiter`` selection takes precedence
+    over the broad ``SGLANG_USE_AITER`` default. DAS also honors
+    ``SGLANG_ROCM_USE_AITER_MOE`` for the channelwise W8A8 path.
+
+    The 128-aligned AITER weight-padding rewrite from upstream #36601 is
+    intentionally not applied here: HCU Flash-Next channelwise experts use
+    N1=160 no-shuffle ASM configs.
+    """
+    from sglang.srt.utils import is_hcu
+
+    if not is_hcu():
+        return False
+    backend = get_moe_runner_backend()
+    if backend.is_aiter():
+        a2a_backend = get_moe_a2a_backend()
+        if not a2a_backend.supports_aiter():
+            raise ValueError(
+                "moe_runner_backend=aiter is incompatible with "
+                f"moe_a2a_backend={a2a_backend.value}."
+            )
+        if not a2a_backend.is_none() and not envs.SGLANG_USE_AITER.get():
+            raise ValueError(
+                "Explicit moe_runner_backend=aiter without SGLANG_USE_AITER=1 "
+                "is currently supported only with moe_a2a_backend=none; "
+                f"got moe_a2a_backend={a2a_backend.value}."
+            )
+        return True
+    if not backend.is_auto():
+        return False
+    from sglang.srt.utils import get_bool_env_var
+
+    return (
+        envs.SGLANG_USE_AITER.get()
+        or envs.SGLANG_INT4_WEIGHT.get()
+        or get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
+    ) and get_moe_a2a_backend().supports_aiter()
+
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
@@ -918,7 +1023,9 @@ def speculative_moe_a2a_backend_context():
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
     original_speculative_context = moe.speculative_context
+    original_scope = moe.in_speculative_a2a_scope
     try:
+        moe.in_speculative_a2a_scope = True
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
@@ -928,6 +1035,7 @@ def speculative_moe_a2a_backend_context():
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
         moe.speculative_context = original_speculative_context
+        moe.in_speculative_a2a_scope = original_scope
 
 
 # The type of method in top-K routing, for use in torch custom op

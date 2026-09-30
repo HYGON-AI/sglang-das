@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 )
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_hcu_fa,
     set_kv_buffer_prefix_valid_tiled,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
@@ -51,6 +52,14 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.hcu_int8_index_k_cache import (
+    IndexKCacheMode,
+    create_index_k_int8_aliases,
+    dequantize_index_k_int8_paged,
+    index_k_cache_bytes_per_token,
+    quantize_and_store_index_k_int8,
+    resolve_index_k_cache_mode,
+)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -82,7 +91,6 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_gfx95_supported,
     is_hcu,
-    is_hcu_native_fp8_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -1896,6 +1904,9 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def get_kv_layer_ids(self) -> List[int]:
+        return list(range(self.start_layer, self.end_layer))
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
@@ -2299,7 +2310,7 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        if _kv_layout_hcu_fa:
+        if _kv_layout_hcu_fa and not self.use_hnd:
             kv_buffers = [*self.k_buffer, *self.v_buffer]
             kv_strides = [
                 self.head_num
@@ -2339,7 +2350,7 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                if _kv_layout_hcu_fa:
+                if _kv_layout_hcu_fa and not self.use_hnd:
                     page_num = (self.size + self.page_size) // self.page_size
                     self.k_buffer = [
                         torch.zeros(
@@ -2522,10 +2533,8 @@ class MHATokenToKVPool(KVCache):
         """(ptrs, lens, item_lens) for PD KV transfer, derived from the descriptors.
         ``lens`` is the final span at the CURRENT serving size -- for a post-capture
         pool that is the physically-backed span, not the reserved VA upper bound."""
-        assert not self.use_hnd, (
-            "PD-disaggregation KV transfer assumes NHD slot-row layout; "
-            "HND KV cache (SGLANG_USE_HND_KVCACHE) is not supported with disagg yet."
-        )
+        if self.use_hnd:
+            assert self.kv_cache_layout == "hnd"
         tensors = self._pd_registerable_tensors()
         ptrs = [t.data_ptr() for t in tensors]
         lens = [
@@ -2546,7 +2555,7 @@ class MHATokenToKVPool(KVCache):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                if _kv_layout_hcu_fa:
+                if _kv_layout_hcu_fa and not self.use_hnd:
                     page_idxs = chunk_indices // 64
                     offsets = chunk_indices % 64
                     k_chunk = self.k_buffer[layer_id][page_idxs, :, offsets, :]
@@ -2580,7 +2589,7 @@ class MHATokenToKVPool(KVCache):
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
                 k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                if _kv_layout_hcu_fa:
+                if _kv_layout_hcu_fa and not self.use_hnd:
                     page_idxs = chunk_indices // 64
                     offsets = chunk_indices % 64
                     self.k_buffer[layer_id][page_idxs, :, offsets, :] = k_chunk
@@ -2694,7 +2703,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if _kv_layout_hcu_fa:
+        if _kv_layout_hcu_fa and not self.use_hnd:
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
             page_idxs = loc // self.page_size
@@ -3088,20 +3097,23 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+        # Tiled-kernel path only: set_kv_buffer already does scale/dtype
+        # conversion; doing it twice corrupts FP8 (integer div_ on uint8 view).
+        if not _kv_layout_hcu_fa and (_is_cuda or _is_hip):
+            if cache_k.dtype != self.dtype:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.contiguous().view(self.store_dtype)
-            cache_v = cache_v.contiguous().view(self.store_dtype)
-        else:
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.contiguous().view(self.store_dtype)
+                cache_v = cache_v.contiguous().view(self.store_dtype)
+            else:
+                cache_k = cache_k.contiguous()
+                cache_v = cache_v.contiguous()
 
         if loc_2d.device != self.k_buffer[0].device:
             loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
@@ -3114,7 +3126,40 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
-        if not (_is_cuda or _is_hip):
+        # Gate prefix rows on device instead of materializing a dynamic nonzero
+        # result. Other layouts and the default-off path retain the old behavior.
+        if (
+            envs.SGLANG_ENABLE_HCU_FA_PREFIX_VALID.get()
+            and _kv_layout_hcu_fa
+            and not self.use_hnd
+            and (_is_cuda or _is_hip)
+        ):
+            if cache_k.dtype != self.dtype:
+                # The fallback scales index-selected copies, not the input KV.
+                if k_scale is not None:
+                    cache_k = cache_k / k_scale
+                if v_scale is not None:
+                    cache_v = cache_v / v_scale
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.contiguous().view(self.store_dtype)
+                cache_v = cache_v.contiguous().view(self.store_dtype)
+
+            set_kv_buffer_prefix_valid_hcu_fa(
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                cache_k,
+                cache_v,
+                loc_2d,
+                commit_lens,
+                page_size=self.page_size,
+            )
+            return
+
+        # HND slots aren't contiguous ROW_BYTES spans — the tiled kernel's
+        # `loc * row_bytes` walks off the buffer. Fall back to set_kv_buffer.
+        if not (_is_cuda or _is_hip) or _kv_layout_hcu_fa:
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
             valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
@@ -4586,10 +4631,20 @@ class HybridLinearKVPool(KVCache):
         from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
 
         if not isinstance(self.full_kv_pool, Glm5NextDSATokenToKVPool):
+            layer_transfer_idx = layer_id - self.start_layer
+            prefetch_index = getattr(self.full_kv_pool, "prefetch_index_buffer", None)
+            if self.use_dsa and _is_hcu and prefetch_index is not None:
+                prefetch_index(
+                    full_layer_id,
+                    layer_transfer_counter=self.layer_transfer_counter,
+                    layer_transfer_idx=layer_transfer_idx,
+                    has_history=has_history,
+                )
             self.full_kv_pool.prefetch_kv_buffer(
                 full_layer_id,
                 layer_transfer_counter=self.layer_transfer_counter,
-                layer_transfer_idx=layer_id - self.start_layer,
+                layer_transfer_idx=layer_transfer_idx,
+                has_history=has_history,
             )
             return
         layer_transfer_idx = layer_id - self.start_layer
@@ -5238,6 +5293,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        indexer_layer_ids: Optional[Sequence[int]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5264,32 +5320,58 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size
+        layer_range = range(self.start_layer, self.start_layer + self.layer_num)
+        if indexer_layer_ids is None:
+            resolved_indexer_layer_ids = tuple(layer_range)
+        else:
+            if len(indexer_layer_ids) != len(set(indexer_layer_ids)):
+                raise ValueError("indexer_layer_ids must not contain duplicates")
+            resolved_indexer_layer_ids = tuple(sorted(indexer_layer_ids))
+            invalid_layer_ids = [
+                layer_id
+                for layer_id in resolved_indexer_layer_ids
+                if layer_id not in layer_range
+            ]
+            if invalid_layer_ids:
+                raise ValueError(
+                    f"indexer_layer_ids {invalid_layer_ids} are outside local layer "
+                    f"range [{self.start_layer}, "
+                    f"{self.start_layer + self.layer_num})"
+                )
+        self.indexer_layer_ids = resolved_indexer_layer_ids
+        self.indexer_layer_num = len(self.indexer_layer_ids)
+        self.indexer_layer_id_to_index = {
+            layer_id: index for index, layer_id in enumerate(self.indexer_layer_ids)
+        }
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [layer_id not in self.indexer_layer_id_to_index for layer_id in layer_range]
+        )
+        if len(self.skip_topk_layers) != self.layer_num:
+            raise ValueError("skip_topk_layers must have one entry per local layer")
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
-        if _is_hcu:
-            self.use_fp8_index_k_cache = (
-                dtype
-                in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                )
-                and is_hcu_native_fp8_supported()
-            )
-        else:
-            self.use_fp8_index_k_cache = True
+        self.index_k_cache_mode = resolve_index_k_cache_mode(
+            dtype, page_size, index_head_dim
+        )
+        self.use_fp8_index_k_cache = (
+            self.index_k_cache_mode is IndexKCacheMode.FP8_SCALED
+        )
+        self.use_int8_index_k_cache = (
+            self.index_k_cache_mode is IndexKCacheMode.INT8_SCALED
+        )
+        self.use_scaled_index_k_cache = (
+            self.index_k_cache_mode is not IndexKCacheMode.BF16
+        )
         self.index_k_buffer_dtype = (
-            torch.bfloat16 if _is_hcu and not self.use_fp8_index_k_cache else self.dtype
+            torch.bfloat16
+            if self.index_k_cache_mode is IndexKCacheMode.BF16
+            else self.dtype
         )
-
-        self.skip_topk_layers = (
-            list(skip_topk_layers)
-            if skip_topk_layers is not None
-            else [False] * layer_num
-        )
-        assert len(self.skip_topk_layers) == layer_num
 
         if _is_hip and not _is_hcu:
             if aiter_can_use_preshuffle_paged_mqa():
@@ -5317,17 +5399,73 @@ class DSATokenToKVPool(MLATokenToKVPool):
             device=device,
             max_running_requests=max_running_requests,
         )
+        self._initialize_int8_index_k_workspace()
         self._finalize_allocation_log(size)
 
+        if self.use_int8_index_k_cache:
+            persistent_bytes = sum(
+                buffer.nbytes for buffer in self.index_key_cache.buffer
+            ) + getattr(
+                getattr(self.index_key_cache, "remote_buffer", None), "nbytes", 0
+            )
+            logger.info(
+                "DSA index-K cache mode=%s, persistent bytes/token/layer=%d, "
+                "workspace_count=1, workspace_bytes=%d, page_claim_bytes=%d, "
+                "persistent_bytes=%d",
+                self.index_k_cache_mode.value,
+                index_k_cache_bytes_per_token(self.index_k_cache_mode),
+                self.index_k_dequant_workspace.nbytes,
+                self.index_k_page_claims.nbytes,
+                persistent_bytes,
+            )
+
     def _create_index_key_cache(self) -> Optional[IndexKeyCache]:
-        if _is_hcu and not self.use_fp8_index_k_cache:
+        if self.index_k_cache_mode is IndexKCacheMode.BF16:
             # The official facade only implements the quantized (FP8 data +
-            # FP32 scale) layout. HCU parts without native FP8 fall back to a
-            # plain bf16 index-K cache, which the pool owns directly.
+            # FP32 scale) layout. HCU parts without a scaled cache fall back to
+            # a plain bf16 index-K cache, which the pool owns directly.
             self._create_index_k_buffer()
             return None
         self.index_k_buffer = None
         return IndexKeyCache(self, self.index_buf_size)
+
+    def _initialize_int8_index_k_workspace(self) -> None:
+        self.index_k_int8_aliases = None
+        self.index_k_int8_remote_aliases = None
+        self.index_k_dequant_workspace = None
+        self.index_k_page_claims = None
+        if not self.use_int8_index_k_cache:
+            return
+
+        self.index_k_int8_aliases = [
+            create_index_k_int8_aliases(buffer)
+            for buffer in self.index_key_cache.buffer
+        ]
+        remote_buffer = getattr(self.index_key_cache, "remote_buffer", None)
+        if remote_buffer is not None:
+            self.index_k_int8_remote_aliases = create_index_k_int8_aliases(
+                remote_buffer
+            )
+
+        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.index_k_dequant_workspace = torch.empty(
+                (
+                    num_pages,
+                    self.page_size,
+                    1,
+                    self.index_head_dim,
+                ),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self.index_k_page_claims = torch.empty(
+                (num_pages,), dtype=torch.int32, device=self.device
+            )
 
     def _create_index_k_buffer(self):
         num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
@@ -5347,8 +5485,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_buffer_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
+                for _ in range(self.indexer_layer_num)
             ]
+
+    def _get_indexer_cache_index(self, layer_id: int) -> int:
+        try:
+            return self.indexer_layer_id_to_index[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Layer {layer_id} does not own an Index-K cache; active layers are "
+                f"{self.indexer_layer_ids}"
+            ) from exc
 
     @property
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
@@ -5500,8 +5647,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_k[idx][req_pool_idx, slots] = key_tail
             self._compress_tail_score[idx][req_pool_idx, slots] = score_tail
 
-    def _clear_buffers(self):
-        super()._clear_buffers()
+    def _clear_index_k_buffers(self) -> None:
+        self.index_k_int8_aliases = None
+        self.index_k_int8_remote_aliases = None
+        self.index_k_dequant_workspace = None
+        self.index_k_page_claims = None
         if self.index_key_cache is not None:
             self.index_key_cache.clear()
         if getattr(self, "index_k_buffer", None) is not None:
@@ -5509,6 +5659,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if hasattr(self, "_compress_tail_k") and self._compress_tail_k is not None:
             del self._compress_tail_k
             del self._compress_tail_score
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        self._clear_index_k_buffers()
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
@@ -5527,15 +5681,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
             flat_index_k[tgt_loc_flat] = flat_index_k[src_loc_flat]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
+        assert self.use_scaled_index_k_cache, "Scaled index K cache is not enabled"
         return self.index_key_cache.get_local_buffer(layer_id)
+
+    def get_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
+        assert self.use_scaled_index_k_cache, "Scaled index K cache is not enabled"
+        return self.index_key_cache.get_write_buffer(layer_id)
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        return self.index_k_buffer[layer_id - self.start_layer]
+        return self.index_k_buffer[self._get_indexer_cache_index(layer_id)]
 
     def get_index_k_continuous(
         self,
@@ -5543,13 +5701,47 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        if not self.use_fp8_index_k_cache:
+        if self.use_int8_index_k_cache:
+            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            return self.index_k_dequant_workspace[page_indices[:num_pages]].view(
+                -1, 1, self.index_head_dim
+            )[:seq_len]
+        if self.index_k_cache_mode is IndexKCacheMode.BF16:
             num_pages = (seq_len + self.page_size - 1) // self.page_size
             buf = self.get_index_k_buffer(layer_id)
             return buf[page_indices[:num_pages]].view(-1, 1, self.index_head_dim)[
                 :seq_len
             ]
         return self.index_key_cache.get_k_continuous(layer_id, seq_len, page_indices)
+
+    def dequantize_index_k_int8_paged(
+        self,
+        layer_id: int,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.use_int8_index_k_cache, "INT8 index K cache is not enabled"
+        cache_index = self._get_indexer_cache_index(layer_id)
+        packed_cache = self.index_key_cache.get_buffer(layer_id)
+        local_cache = self.index_key_cache.buffer[cache_index]
+        if packed_cache is local_cache:
+            int8_k, fp32_scales = self.index_k_int8_aliases[cache_index]
+        elif self.index_k_int8_remote_aliases is not None and packed_cache is getattr(
+            self.index_key_cache, "remote_buffer", None
+        ):
+            int8_k, fp32_scales = self.index_k_int8_remote_aliases
+        else:
+            int8_k, fp32_scales = create_index_k_int8_aliases(packed_cache)
+
+        return dequantize_index_k_int8_paged(
+            packed_cache,
+            block_tables,
+            context_lens,
+            self.index_k_dequant_workspace,
+            self.index_k_page_claims,
+            int8_k=int8_k,
+            fp32_scales=fp32_scales,
+        )
 
     def get_index_k_scale_continuous(
         self,
@@ -5595,6 +5787,24 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ) -> None:
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
+
+    def set_index_k_int8_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        assert self.use_int8_index_k_cache, "INT8 index K cache is not enabled"
+        cache_index = self._get_indexer_cache_index(layer_id)
+        int8_k, fp32_scales = self.index_k_int8_aliases[cache_index]
+        quantize_and_store_index_k_int8(
+            index_k,
+            self.index_key_cache.buffer[cache_index],
+            loc,
+            page_size=self.page_size,
+            int8_k=int8_k,
+            fp32_scales=fp32_scales,
+        )
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):
         if not self.kpool_use_compress or req_pool_index is None:
@@ -5647,7 +5857,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_cpu = []
             chunk_size = self.cpu_offloading_chunk_size
             page_chunk_size = max(1, chunk_size // self.page_size)
-            for layer_id in range(self.layer_num):
+            for layer_id in range(self.indexer_layer_num):
                 index_k_cpu.append([])
                 for i in range(0, len(page_indices), page_chunk_size):
                     chunk_page_indices = page_indices[i : i + page_chunk_size]
@@ -5689,7 +5899,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             torch.cuda.synchronize()
             chunk_size = self.cpu_offloading_chunk_size
             page_chunk_size = max(1, chunk_size // self.page_size)
-            for layer_id in range(self.layer_num):
+            for layer_id in range(self.indexer_layer_num):
                 for i in range(0, len(page_indices), page_chunk_size):
                     chunk_page_indices = page_indices[i : i + page_chunk_size]
                     idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
@@ -5717,7 +5927,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_k.dtype != self.index_k_buffer_dtype:
             index_k = index_k.to(self.index_k_buffer_dtype)
 
-        self.index_k_buffer[layer_id - self.start_layer][
+        self.index_k_buffer[self._get_indexer_cache_index(layer_id)][
             loc // self.page_size, loc % self.page_size
         ] = index_k
 
@@ -5726,20 +5936,38 @@ class DSATokenToKVPool(MLATokenToKVPool):
             return self.index_key_cache.state_buf_infos()
 
         index_cache = self.index_k_buffer
-        data_ptrs = [index_cache[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [index_cache[i].nbytes for i in range(self.layer_num)]
-        item_lens = [index_cache[i][0].nbytes for i in range(self.layer_num)]
+        data_ptrs = [buffer.data_ptr() for buffer in index_cache]
+        data_lens = [buffer.nbytes for buffer in index_cache]
+        item_lens = [buffer[0].nbytes for buffer in index_cache]
         return data_ptrs, data_lens, item_lens
+
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the MLA KV transfer buffers."""
+        return list(range(self.start_layer, self.start_layer + self.layer_num))
+
+    def get_state_layer_ids(self):
+        """Global layer ids aligned with the DSA Index-K transfer buffers."""
+        return list(self.indexer_layer_ids)
+
+    def get_index_k_cache_transfer_abi(self) -> str:
+        """Return the persistent index-K page ABI used by PD state transfer."""
+        return (
+            f"dsa-index-k-page-v1:{self.index_k_cache_mode.value}:"
+            f"page_size={self.page_size}:head_dim={self.index_head_dim}"
+        )
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
         index_cache = (
             self.index_k_with_scale_buffer
-            if self.use_fp8_index_k_cache
+            if self.use_scaled_index_k_cache
             else self.index_k_buffer
         )
         for index_k_cache in index_cache:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.use_int8_index_k_cache:
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_dequant_workspace)
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_page_claims)
         return kv_size_bytes
 
 

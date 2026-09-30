@@ -375,6 +375,12 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
 
 struct LaunchKernel {
  public:
+  struct KernelConfig {
+    bool use_pdl = false;
+    std::optional<dim3> cluster_dim = std::nullopt;
+    bool prefer_l1 = false;
+  };
+
   explicit LaunchKernel(
       dim3 grid_dim,
       dim3 block_dim,
@@ -413,6 +419,13 @@ struct LaunchKernel {
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
     // Cluster not supported in HIP
+    (void)cluster_dim;
+    return *this;
+  }
+
+  auto config(const KernelConfig& config) -> LaunchKernel& {
+    // PDL and clusters are not supported in HIP.
+    (void)config;
     return *this;
   }
 

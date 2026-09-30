@@ -67,6 +67,7 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool,
     layout: KVLayout,
     fp8_2buff: bool = False,
+    int8_store: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -77,12 +78,15 @@ def _jit_compress_norm_rope_module(
         bf16_store,
         layout.cpp_name,
         is_arch_support_pdl(),
+        int8_store,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
-        cuda_wrappers.append(
-            ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
-        )
+        # The INT8 indexer store has no FP4 variant.
+        if not int8_store:
+            cuda_wrappers.append(
+                ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
+            )
     # elif because forward_fp8_2buff cannot even instantiate at head_dim 128 -- the kernel
     # static_asserts the two-pool store is latent-only. The default latent arm skips it as
     # well, so it doesn't carry a symbol nothing calls.
@@ -519,6 +523,7 @@ def compress_norm_rope_store(
     layout: Union[KVLayout, str] = KVLayout.V4,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
+    int8_store: bool = False,
 ) -> None:
     layout = KVLayout.parse(layout)
     if layout is not KVLayout.V4:
@@ -529,6 +534,8 @@ def compress_norm_rope_store(
         assert not is_hip() or is_gfx95_supported(), (
             "V4.1 KV stores on HIP require gfx950"
         )
+    if int8_store and (kv.shape[-1] != 128 or use_fp4 or bf16_store or _is_xpu):
+        raise ValueError("INT8 compressed store requires a non-FP4 C4 indexer")
     if use_fp4:
         assert kv.shape[-1] == 128
     if is_hip() and use_fp4:
@@ -581,6 +588,7 @@ def compress_norm_rope_store(
             bf16_store,
             layout,
             fp8_2buff,
+            int8_store,
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()

@@ -627,11 +627,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Host-side mirror (maintained incrementally for plain decode) — no
             # d2h sync needed.
             max_kv_len = int(seq_lens_cpu.max().item())
-        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
-            # Fallback: a single scalar reduction d2h (cheap, per-step).
-            max_kv_len = int(forward_batch.seq_lens.max().item())
         else:
-            # No length info: be safe and use the correct-for-all sparse graph.
+            # A missing host mirror is expected for speculative relay batches.
+            # Avoid a GPU reduction followed by .item(), which synchronizes the
+            # replay stream with the host every step. The sparse graph is valid
+            # for every sequence length, so it is the safe no-sync fallback.
             return "sparse"
         return "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
 
@@ -952,7 +952,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Localize the count when this bucket is attn-TP sharded (SP on).
         attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
-        buffers.num_token_non_padded[...] = num_tokens
+        # The buffer exists only when enable_num_token_non_padded() (EP / DP
+        # gather); plain TP decode graphs have none to fill.
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
         if (
             enable_num_token_non_padded()
             and not self.enable_prefill_cp

@@ -307,6 +307,8 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # HCU QSA FP8 indexer is not ported; keep the BF16 reference path by default.
+    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -507,6 +509,8 @@ class Envs:
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
+    # Use the LightOp kernel for paged KV-cache extend allocation.
+    SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -542,10 +546,15 @@ class Envs:
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    # Benchmark-only synthetic routing; replaces routed expert IDs and must not
+    # be used for correctness or production inference.
+    SGLANG_SIMULATED_EXPERT_BALANCE = EnvBool(False)
 
     # ===================================================================
     # DSpark speculative decoding
     # ===================================================================
+    # Opt in to Qwen DSPARK checkpoint and HCU MTP compatibility fixes.
+    SGLANG_USE_QWEN_DSPARK = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -571,6 +580,12 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Force the DSpark draft's SlimQuant W4A8 MoE method to a selected backend
+    # without changing the target model's W4A8 or generic MoE backend.
+    SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND = EnvStr(None)
+    # PD hidden-state receive pool size, in tokens (-1 = derive from the
+    # decode-side chunk budget).
+    SGLANG_PD_HIDDEN_RECV_POOL_TOKENS = EnvInt(-1)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -877,6 +892,9 @@ class Envs:
     # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
+    # Avoid nonzero synchronization when committing HCU FA prefix KV rows.
+    SGLANG_ENABLE_HCU_FA_PREFIX_VALID = EnvBool(False)
+
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
@@ -884,6 +902,9 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Opt HCU CUDA graph DP padding into MAX_LEN, enabling all-gather and
+    # fused reduce-scatter for the pure TP-MoE DP-attention path.
+    SGLANG_DP_USE_MAX_LEN = EnvBool(False)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine
@@ -898,6 +919,9 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Pin the AITER MoE to the moe_c backend instead of the tuned-config
+    # priority order (asm > moe_c > triton). Default keeps autodetection.
+    SGLANG_FORCE_AITER_MOE_C = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -958,6 +982,8 @@ class Envs:
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
 
+    SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
+
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
@@ -991,6 +1017,9 @@ class Envs:
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
+    # ModelSlim W4A8 MoE ablation: drop the float *_scale_bias from the grouped
+    # matmul dequant. Read by the Ascend-op path on NPU and on the HCU Triton port.
+    SGLANG_W4A8_MOE_SKIP_SCALE_BIAS = EnvBool(False)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
@@ -1049,8 +1078,15 @@ class Envs:
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = EnvBool(False)
+    # Gather the packed FP8 DSV4 KV cache into a temporary BF16 workspace before
+    # invoking the existing HCU FlashMLA sparse-decode kernel. With the unified
+    # MLA path this covers ordinary prefill as well as decode-family forwards.
+    SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    # Use the native LightOp single/dual-cache gather+upconvert kernels instead
+    # of the Triton fallback above. This switch requires the BF16 FlashMLA path.
+    SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER = EnvBool(False)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
-    SGLANG_LIGHTOP_TOPK = EnvBool(True)
+    SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
     SGLANG_HCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
 
@@ -1066,6 +1102,8 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Global SlimQuant W4A8 TP-MoE backend selection.
+    SGLANG_W4A8_TPMOE_BACKEND = EnvStr("auto")
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
@@ -1211,6 +1249,8 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
+    # Fixed-layout replica probabilities; bypass per-forward LP and all-reduce.
+    SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS = EnvStr(None)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
@@ -1499,6 +1539,9 @@ class Envs:
     # CUDA graphs and execution buffers
     # ===================================================================
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Legacy alias of --cuda-graph-prefill-max-context (0 = unset); only read
+    # when the flag is not given.
+    SGLANG_BCG_PREFILL_MAX_CONTEXT = EnvInt(0)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -1565,6 +1608,11 @@ class Envs:
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # ===================================================================
+    # Hunyuan V4
+    # ===================================================================
+    SGLANG_OPT_HY4_IHC_TILELANG = EnvBool(False)
+
+    # ===================================================================
     # DeepSeek V4
     # ===================================================================
 
@@ -1614,7 +1662,18 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
+    # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
+    # Enabling this also requires the native LightOp INT8 Paged MQA consumer;
+    # there is intentionally no BF16 dequantization fallback.
+    SGLANG_DSV4_HCU_INT8_INDEX_K_CACHE = EnvBool(False)
+    # Opt in to the persistent INT8 Paged MQA producer on HCU gfx936.
+    SGLANG_MQA_PERSISTENT = EnvBool(False)
+    # Fuse C4 indexer Q RoPE, Hadamard, and INT8 quantization into one kernel.
+    # This is independent from the INT8 K-cache switch but requires it at runtime.
+    SGLANG_NSA_INDEX_Q_INT8 = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
@@ -1626,6 +1685,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # HCU RLC (Repartition-Local Compression); off by default.
+    SGLANG_DSV4_COMPRESS_RLC = EnvBool(False)
+    # Deprecated: DSV4 compressor V2 is always used.
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
@@ -1685,6 +1748,8 @@ class Envs:
     # DeepSeek V4 - model and quantization
     # ===================================================================
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE = EnvBool(False)
+    SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER = EnvBool(False)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
@@ -1696,8 +1761,6 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
-    # Deprecated: DSV4 compressor V2 is always used.
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
@@ -1785,7 +1848,22 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
+    # Optional legacy fixed GiB budget; unset retains the fraction policy.
+    SGLANG_NSA_MQA_LOGITS_MEMORY_BUDGET_GB = EnvFloat(None)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
+    SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"
+    )
+    SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
+    )
+    # gfx936-only: page-planar INT8 K plus one FP32 scale per token.
+    SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
+    )
+    # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
+    SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
