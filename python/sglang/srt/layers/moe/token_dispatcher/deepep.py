@@ -232,6 +232,10 @@ class DeepEPBuffer:
     ):
         state = cls._state()
         if state.buffer is not None:
+            if _is_hcu and deepep_mode.enable_low_latency():
+                cls.set_low_latency_layout(
+                    num_max_dispatch_tokens_per_rank, hidden_size, num_experts
+                )
             return state.buffer
 
         state.hidden_size = hidden_size
@@ -323,6 +327,47 @@ class DeepEPBuffer:
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
+
+    @classmethod
+    def get_low_latency_layout(cls):
+        state = cls._state()
+        if not _is_hcu or state.buffer is None or not state.buffer.low_latency_mode:
+            return None
+        return (
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
+        )
+
+    @classmethod
+    def set_low_latency_layout(
+        cls, num_max_dispatch_tokens_per_rank, hidden_size, num_experts
+    ):
+        layout = (num_max_dispatch_tokens_per_rank, hidden_size, num_experts)
+        if cls.get_low_latency_layout() == layout:
+            return
+        state = cls._state()
+        required_bytes = Buffer.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            state.buffer.group_size,
+            num_experts,
+        )
+        if required_bytes > state.buffer.num_rdma_bytes:
+            raise RuntimeError(
+                f"DeepEP low-latency layout {layout} needs {required_bytes} bytes, "
+                f"but the shared buffer has {state.buffer.num_rdma_bytes}. "
+                "Initialize the largest communication layout first."
+            )
+        # HCU LL metadata offsets depend on the expert count. In DSpark the
+        # target and draft share this allocation but use different layouts;
+        # old payload bytes must not become counters/pointers in the new one.
+        state.buffer.clean_low_latency_buffer(*layout)
+        (
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
+        ) = layout
 
     @classmethod
     def clean_buffer(cls):
