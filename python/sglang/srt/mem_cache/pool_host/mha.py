@@ -1529,7 +1529,14 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        *,
+        mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
+        pool_label: str = "kv",
     ):
+        if mtp_draft_device_pools:
+            raise ValueError(
+                "layout_hcu HiCache does not carry MTP draft KV in the host pool"
+            )
         if layout != "layout_hcu":
             raise ValueError(
                 "MHATokenToKVPoolHostHCU requires hicache_mem_layout=layout_hcu, "
@@ -1548,6 +1555,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            pool_label=pool_label,
         )
         k_by_layer = self.k_buffer.transpose(0, 1)
         v_by_layer = self.v_buffer.transpose(0, 1)
