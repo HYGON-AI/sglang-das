@@ -218,6 +218,24 @@ def topk_transform_ragged_v2(
     They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
+    from sglang.srt.utils import is_hcu
+
+    if is_hcu():
+        out_indices.fill_(-1)
+        count = min(out_indices.shape[1], scores.shape[1])
+        if not count or not scores.shape[0]:
+            return
+        columns = torch.arange(scores.shape[1], device=scores.device)[None, :]
+        starts = torch.zeros_like(seq_lens) if row_starts is None else row_starts
+        valid = (columns >= starts[:, None]) & (
+            columns < starts[:, None] + seq_lens[:, None]
+        ) & torch.isfinite(scores)
+        ranked = scores.masked_fill(~valid, -torch.inf).topk(count, dim=-1).indices
+        out_indices[:, :count] = torch.where(
+            valid.gather(1, ranked),
+            ranked - starts[:, None] + out_offsets[:, None], -1,
+        ).to(out_indices.dtype)
+        return
     if is_xpu():
         torch.ops.sgl_kernel.topk_transform_ragged(
             scores,
