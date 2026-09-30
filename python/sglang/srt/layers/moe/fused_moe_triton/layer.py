@@ -1595,7 +1595,9 @@ class FusedMoE(torch.nn.Module):
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
-        if _use_lightop_moe_sum_mul_add:
+        if _use_lightop_moe_sum_mul_add and hasattr(
+            self.quant_method, "apply_with_shared_output"
+        ):
             final_hidden_states = self.quant_method.apply_with_shared_output(
                 layer=self,
                 x=hidden_states,

@@ -275,6 +275,33 @@ def _topk_unfused(
     return topk_indices
 
 
+def _align_topk_v2_scores(logits: torch.Tensor) -> torch.Tensor:
+    """Give top-k v2 a fp32 score matrix whose row stride is a multiple of 4.
+
+    The JIT kernel vectorizes loads on a 16-byte aligned row. DeepGEMM already
+    emits that layout. The HCU MQA logits kernel returns a tight
+    ``[rows, seq_len]`` buffer, and a short warmup sequence is often not a
+    multiple of 4. Pad only in that case; an already-aligned view is unchanged.
+    """
+    if (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ):
+        return logits
+    if logits.dtype != torch.float32:
+        logits = logits.to(torch.float32)
+    rows, cols = logits.shape
+    padded_cols = (cols + 3) & ~3
+    aligned = torch.empty(
+        (rows, padded_cols), device=logits.device, dtype=torch.float32
+    )
+    aligned[:, :cols].copy_(logits)
+    if padded_cols != cols:
+        aligned[:, cols:].fill_(float("-inf"))
+    return aligned
+
+
 def _topk_transform_v2_paged(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -312,16 +339,7 @@ def _topk_transform_v2_paged(
 
     num_rows = logits.shape[0]
 
-    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
-    # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
-    # score_stride % 4 == 0 with strides {S, 1}). This holds even though the scores
-    # may be a padded view (stride(0) > width, so not `is_contiguous()`); assert the
-    # real requirement rather than force a contiguous copy of the wide score buffer.
-    assert (
-        logits.dtype == torch.float32
-        and logits.stride(1) == 1
-        and logits.stride(0) % 4 == 0
-    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    logits = _align_topk_v2_scores(logits)
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
@@ -361,6 +379,7 @@ def _topk_transform_v2_ragged(
     """
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 
+    logits = _align_topk_v2_scores(logits)
     out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
     topk_transform_ragged_v2(
         logits,

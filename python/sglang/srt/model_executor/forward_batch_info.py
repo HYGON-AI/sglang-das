@@ -454,6 +454,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: config / flags (by-value) ===
     # For logprob
     return_logprob: bool = False
+    # HCU fused RMSNorm+quant. Bailing sets this per layer; other models leave it off.
+    rms_quant_flag: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None

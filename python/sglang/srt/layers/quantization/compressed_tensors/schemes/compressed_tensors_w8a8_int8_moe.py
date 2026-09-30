@@ -465,7 +465,10 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
 
             process_weights_after_loading_aiter_w8a8_int8(layer)
             return
-        if not _use_aiter_moe:
+        # HCU DeepSeek channel W8A8 has no matching no-shuffle ASM table.
+        # The shuffled aiter_moe fallback is numerically wrong; Triton uses
+        # the checkpoint layout.
+        if _is_hcu or not _use_aiter_moe:
             return
         shuffled_w13 = self._shuffle_w8a8_gemm1(layer.w13_weight)
         layer.w13_weight = torch.nn.Parameter(
@@ -528,7 +531,8 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
                 )
             return combine_input
 
-        if _use_aiter_moe:
+        # Shuffled aiter_moe is the wrong HCU fallback; Triton is below.
+        if _use_aiter_moe and not _is_hcu:
             from aiter.moe import get_aiter_moe_config, aiter_moe, MoeQuantType
 
             E = layer.w13_weight.size(0)
