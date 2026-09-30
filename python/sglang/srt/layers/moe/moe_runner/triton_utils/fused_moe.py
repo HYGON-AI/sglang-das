@@ -135,6 +135,10 @@ deepseek_v4_moe_code_path_checker = _CodePathChecker()
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    # Inductor autotune of this epilogue hangs on HCU/HIP: benchmark
+    # synchronize never returns, and the stalled rank tears down NCCL.
+    if _is_hip:
+        return False
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
@@ -664,7 +668,11 @@ def fused_experts_impl_aiter(
             activation = "situ"
         else:
             activation = "gelu"
-    is_channelwise_w4a8_w8a8 = (quant_type == MoeQuantType.FP8_W8A8 or quant_type == MoeQuantType.W4A8) and block_shape is None
+    is_channelwise_w4a8_w8a8 = (
+        quant_type == MoeQuantType.FP8_W8A8
+        or quant_type == MoeQuantType.W8A8
+        or quant_type == MoeQuantType.W4A8
+    ) and block_shape is None
     if not is_channelwise_w4a8_w8a8 and (block_shape is None or len(block_shape) < 2):
         raise ValueError(
             "AITER MoE requires block_shape with two dimensions for this "
@@ -708,6 +716,7 @@ def fused_experts_impl_aiter(
         assert moe_cfg.quant_type in (
             MoeQuantType.W4A16,
             MoeQuantType.FP8_W8A8,
+            MoeQuantType.W8A8,
             MoeQuantType.WFP4A16,
             MoeQuantType.W4A8,
         ), f"Unexpected quant_type: {moe_cfg.quant_type}"
@@ -1369,8 +1378,8 @@ def fused_experts_impl(
             or use_int4_w4a8
             or use_mxfp4_w4a16
             or use_mxfp4_w4a8
-            or use_int8_w8a8
             or use_fp8_w8a8
+            or use_int8_w8a8
         )
         and hidden_states.dtype == torch.bfloat16
     ):
@@ -1387,6 +1396,8 @@ def fused_experts_impl(
             quant_type = MoeQuantType.W4A16
         elif use_int4_w4a8:
             quant_type = MoeQuantType.W4A8
+        elif use_int8_w8a8:
+            quant_type = MoeQuantType.W8A8
         else:
             quant_type = MoeQuantType.FP8_W8A8
         return fused_experts_impl_aiter(

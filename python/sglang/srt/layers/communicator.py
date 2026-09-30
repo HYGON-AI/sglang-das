@@ -750,10 +750,9 @@ class LayerCommunicator:
                         )
                         hidden_states = (out_fp8, out_bs)
                     else:
-                        if _use_fused_rms_quant:
-                            forward_batch.residual_rms_per_quant_int8 = None
-                        else:
-                            hidden_states = self.input_layernorm(hidden_states)
+                        # Nothing reads residual_rms_per_quant_int8. Skipping
+                        # LayerNorm here leaves attention with raw residuals.
+                        hidden_states = self.input_layernorm(hidden_states)
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
@@ -830,14 +829,11 @@ class LayerCommunicator:
                         )
                         hidden_states = (out_fp8, out_bs)
                     else:
-                        if _use_fused_rms_quant:
-                            forward_batch.residual_rms_per_quant_int8 = residual
-                        else:
-                            hidden_states, residual = self.input_layernorm(
-                                hidden_states,
-                                residual,
-                                post_residual_addition,
-                            )
+                        hidden_states, residual = self.input_layernorm(
+                            hidden_states,
+                            residual,
+                            post_residual_addition,
+                        )
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,

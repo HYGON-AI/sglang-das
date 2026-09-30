@@ -872,13 +872,28 @@ class DeepseekV2MoE(nn.Module):
                     # This path does not consume shared_experts_weight_block_size.
                     pass
                 else:
-                    assert (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    # Block FP8 stores weight_block_size on quant_config.
+                    # Channel-wise W8A8 FP8 (W8A8Fp8LinearMethod) has
+                    # quantization_config instead, and no block size.
+                    gate_up_quant_config = getattr(
+                        self.shared_experts.gate_up_proj.quant_method,
+                        "quant_config",
+                        None,
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    down_proj_quant_config = getattr(
+                        self.shared_experts.down_proj.quant_method,
+                        "quant_config",
+                        None,
                     )
+                    gate_up_block = getattr(
+                        gate_up_quant_config, "weight_block_size", None
+                    )
+                    down_block = getattr(
+                        down_proj_quant_config, "weight_block_size", None
+                    )
+                    if gate_up_block is not None or down_block is not None:
+                        assert gate_up_block == down_block
+                        self.shared_experts_weight_block_size = gate_up_block
 
         self.top_k = config.num_experts_per_tok
 
