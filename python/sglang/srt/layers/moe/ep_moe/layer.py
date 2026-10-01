@@ -1309,8 +1309,8 @@ class DeepEPMoE(FusedMoE):
         )
 
         m_grouped_fp8_gemm_nt_contiguous(
-            input_tensor,
-            w13_weight_fp8,
+            (input_tensor[0], input_tensor[1].squeeze(-1)),
+            (w13_weight_fp8[0], w13_weight_fp8[1].squeeze(-1)),
             gateup_output,
             m_indices,
         )
@@ -1337,8 +1337,8 @@ class DeepEPMoE(FusedMoE):
         )
 
         m_grouped_fp8_gemm_nt_contiguous(
-            (q_a2_all, q_a2_scale),
-            w2_weight_fp8,
+            (q_a2_all, q_a2_scale.squeeze(-1)),
+            (w2_weight_fp8[0], w2_weight_fp8[1].squeeze(-1)),
             down_output,
             m_indices,
         )
@@ -2023,9 +2023,9 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
         )
 
-        from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+        from deepgemm import m_grouped_fp8_gemm_nt_masked
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -2048,18 +2048,20 @@ class DeepEPMoE(FusedMoE):
         )
 
         enable_overlap = down_gemm_overlap_args is not None
-
         if enable_overlap:
-            down_gemm_overlap_args.start_event.record()
+            raise RuntimeError(
+                "DeepGEMM FP8 does not support down-GEMM completion "
+                "signals; disable single-batch combine/down-GEMM overlap"
+            )
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (q_a2_all, q_a2_scale),
             (w2_weight, w2_scales),
             down_output,
             masked_m,
             expected_m,
-            enable_overlap,
-            down_gemm_overlap_args.signal if enable_overlap else None,
+            enable_overlap=enable_overlap,
+            signal=down_gemm_overlap_args.signal if enable_overlap else None,
         )
 
         if meta_overlap_args is not None:
