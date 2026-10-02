@@ -137,11 +137,18 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels pack fp4 with
-    `cvt.rn.satfinite.e2m1x2`, an sm100+ instruction; the answer also fixes the
-    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    """Whether the one-launch c1/c2 decode compressor can be used.
+
+    CUDA still requires SM100 because its V4.1 cache writer uses the native
+    FP4 conversion instructions.  The HIP c1/c2 kernels use the portable
+    software FP4 path in ``fp4_utils.cuh`` and keep the HCU V4 cache layout, so
+    ROCm is eligible as well.  The index-K epilogue uses the same portable
+    encoder in its fused norm/RoPE/pack/store kernel.
+    """
+    if not torch.cuda.is_available():
         return False
+    if torch.version.hip is not None:
+        return True
     return torch.cuda.get_device_capability()[0] >= 10
 
 

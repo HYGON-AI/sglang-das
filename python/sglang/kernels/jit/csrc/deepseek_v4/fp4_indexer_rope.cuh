@@ -117,10 +117,16 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
 #pragma unroll
   for (uint32_t half = 0; half < 2; ++half) {
     const auto amax = warp::reduce_max<kHalfLanes>(fmaxf(fabsf(data[half * 2]), fabsf(data[half * 2 + 1])));
-    const auto [scale, inv_scale] = fp4::block_scale(amax);
+    const auto scale_pair = fp4::block_scale(amax);
+    const auto scale = scale_pair.x;
+    const auto inv_scale = scale_pair.y;
     const auto q = fp4::fake_quant_x2({data[half * 2], data[half * 2 + 1]}, scale, inv_scale);
-    data[half * 2 + 0] = q.x;
-    data[half * 2 + 1] = q.y;
+    // The Triton reference materializes the first fake-quant result as BF16
+    // before recomputing the second-stage pack scale. Preserve that rounding
+    // here as well; it matters when a block amax is exactly near a power of 2.
+    const auto q_bf16 = cast<fp32x2_t>(cast<bf16x2_t>(q));
+    data[half * 2 + 0] = q_bf16.x;
+    data[half * 2 + 1] = q_bf16.y;
   }
 
   // The packer's scale floor differs from fake quantization; keep both stages.
@@ -133,8 +139,13 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     // `inv_scale_ue8m0` instead of the reference's division: the scale is a
     // power of two, so both are exact except at the unreachable exponent 254.
     const auto inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(out.exponent[half]));
+#ifdef USE_ROCM
+    const auto code = fp4::fp4_e2m1_code_x2_hip(
+        fp32x2_t{data[half * 2], data[half * 2 + 1]}, inv_scale);
+#else
     const auto code = __nv_cvt_float2_to_fp4x2(
         fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale}, __NV_E2M1, cudaRoundNearest);
+#endif
     out.payload[half] = clear_negative_zero(static_cast<uint32_t>(code));
   }
   return out;
@@ -197,12 +208,20 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
 
   fp32x2_t head, tail;
   {
-    const auto [h0, h1] = cast<fp32x2_t>(head_in[0]);
-    const auto [t0, t1] = cast<fp32x2_t>(tail_in[0]);
+    const auto h = cast<fp32x2_t>(head_in[0]);
+    const auto h0 = h.x;
+    const auto h1 = h.y;
+    const auto t = cast<fp32x2_t>(tail_in[0]);
+    const auto t0 = t.x;
+    const auto t1 = t.y;
     const auto sqrsum = warp::reduce_sum(h0 * h0 + h1 * h1 + t0 * t0 + t1 * t1);
     const auto inv_rms = math::rsqrt(sqrsum * (1.0f / static_cast<float>(kHeadDim)) + params.eps);
-    const auto [wh0, wh1] = cast<fp32x2_t>(head_w[0]);
-    const auto [wt0, wt1] = cast<fp32x2_t>(tail_w[0]);
+    const auto wh = cast<fp32x2_t>(head_w[0]);
+    const auto wh0 = wh.x;
+    const auto wh1 = wh.y;
+    const auto wt = cast<fp32x2_t>(tail_w[0]);
+    const auto wt0 = wt.x;
+    const auto wt1 = wt.y;
     // `k_norm` materializes a bf16 tensor, so the norm result is rounded before
     // anything downstream sees it -- the RoPE below included.
     head = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{wh0 * (h0 * inv_rms), wh1 * (h1 * inv_rms)}));
