@@ -158,7 +158,7 @@ class TestIncrementalDecodeOffsets(unittest.TestCase):
         manager = _make_manager()
         steps = [list(CJK_BYTES) + [TEXT_TOKEN]] * 10
         s, text = _stream(manager, "rid", [TEXT_TOKEN], steps)
-        self.assertEqual(text.count("�"), 0, f"corrupted output: {text!r}")
+        self.assertEqual(text.count("\ufffd"), 0, f"corrupted output: {text!r}")
         self.assertEqual(text, "中a" * 10)
 
 

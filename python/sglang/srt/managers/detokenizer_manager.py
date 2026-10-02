@@ -440,10 +440,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if recv_obj.finished_reasons[i] is None:
                 # Streaming. Invariant: sent_offset >= decoded_text_len. The
                 # gap (`pending`) is "printable but uncommitted" text emitted
-                # in a prior "�" recovery step; we skip it from this step's
+                # in a prior U+FFFD recovery step; we skip it from this step's
                 # emission so we don't double-send.
                 pending = s.sent_offset - s.decoded_text_len
-                if new_text and not new_text.endswith("�"):
+                if new_text and not new_text.endswith("\ufffd"):
                     # Clean text: commit to decoded_text and advance offsets.
                     self._commit_stream_text(s, new_text, len(s.decode_ids))
                     output_strs.append(new_text[pending:] if pending else new_text)
@@ -536,7 +536,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 [spaces_between_special_tokens],
             )[0]
             clean_text = text[len(surr_text) :]
-            if clean_text and not clean_text.endswith("�"):
+            if clean_text and not clean_text.endswith("\ufffd"):
                 if len(clean_text) < pending:
                     return None
                 return boundary, clean_text
