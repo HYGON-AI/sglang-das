@@ -40,18 +40,25 @@ def _get_lightop_fp4_op() -> Optional[Callable]:
     # optional operator; a first invocation in capture keeps the Triton path.
     if torch.cuda.is_current_stream_capturing():
         return None
+    reason = "missing symbol"
     try:
+        from lightop import attention as lightop_attention
         from lightop import op
 
-        _lightop_fp4_op = getattr(op, "paged_mqa_logits_fp4", None)
+        # ABI 2 takes (q_fp4, q_sf) + a block table and no longer accepts slots;
+        # it serves the paged indexer (lightop_indexer.py) instead.
+        if getattr(lightop_attention, "PAGED_MQA_LOGITS_FP4_ABI", 1) >= 2:
+            reason = "paged ABI, not slot based"
+        else:
+            _lightop_fp4_op = getattr(op, "paged_mqa_logits_fp4", None)
     except (ImportError, OSError) as exc:
         logger.warning("LightOp FP4 indexer unavailable; using Triton: %s", exc)
     _lightop_fp4_op_resolved = True
     if _lightop_fp4_op is None:
         logger.warning(
-            "LightOp paged_mqa_logits_fp4 unavailable (%s); "
-            "using Triton. Install a LightOp wheel that provides the operator.",
-            "missing symbol",
+            "LightOp slot-based paged_mqa_logits_fp4 unavailable (%s); "
+            "the slot-based FP4 indexer uses Triton.",
+            reason,
         )
     else:
         logger.info(

@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
         DeepGemmCandidateIndexer,
     )
+    from sglang.srt.layers.attention.dsv4.candidate_indexer_lightop import (
+        LightopCandidateIndexer,
+    )
 
 # HIP/DCU resolves the block-level top-k to a prebuilt lightop op; NVIDIA to JIT.
 _IS_HCU = is_hcu()
@@ -47,10 +50,31 @@ class IndexerInputs:
 
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
-) -> Optional[DeepGemmCandidateIndexer]:
+) -> Optional[Union[DeepGemmCandidateIndexer, LightopCandidateIndexer]]:
     """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
-    indexer selects through masks inline."""
-    if topk_blocks <= 0 or get_platform().device_sm < 100:
+    indexer selects through masks inline. HCU uses the LightOp implementation
+    when the installed LightOp provides it, else None (slot-based path)."""
+    if topk_blocks <= 0:
+        return None
+    if block_size <= 0:
+        raise ValueError(
+            "candidate_block_size must be positive when candidate_topk_blocks is enabled"
+        )
+    from sglang.srt.utils import is_hcu
+
+    if is_hcu():
+        from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
+            lightop_paged_indexer_available,
+        )
+
+        if not lightop_paged_indexer_available():
+            return None
+        from sglang.srt.layers.attention.dsv4.candidate_indexer_lightop import (
+            LightopCandidateIndexer,
+        )
+
+        return LightopCandidateIndexer(topk_blocks, block_size)
+    if get_platform().device_sm < 100:
         return None
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
