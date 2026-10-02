@@ -3139,14 +3139,16 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
-            index_k_norm_rope_pack_store,
-        )
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c1_decode_norm_rope_store,
             c2_decode_norm_rope_store,
         )
-
+        # The JIT writer has a portable HIP FP4 encoder as well as the CUDA
+        # intrinsic path. Keep norm, RoPE, both quantization stages and the
+        # paged cache store in one launch on both backends.
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+            index_k_norm_rope_pack_store,
+        )
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         compressor = layer.compressor
