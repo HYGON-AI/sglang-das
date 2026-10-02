@@ -105,7 +105,9 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
     float local_sqrsum = 0.0f;
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize / 2; ++j) {
-      const auto [x, y] = cast<fp32x2_t>(input[j]);
+      const auto xy = cast<fp32x2_t>(input[j]);
+      const auto x = xy.x;
+      const auto y = xy.y;
       local_sqrsum += x * x;
       local_sqrsum += y * y;
       data[j * 2 + 0] = x;
@@ -125,7 +127,9 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
 
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize / 2; ++j) {
-      const auto [wx, wy] = cast<fp32x2_t>(weight[j]);
+      const auto wxy = cast<fp32x2_t>(weight[j]);
+      const auto wx = wxy.x;
+      const auto wy = wxy.y;
       const auto x = data[j * 2 + 0] * norm_factor * wx;
       const auto y = data[j * 2 + 1] * norm_factor * wy;
       latent[j] = cast<bf16x2_t>(fp32x2_t{x, y});
@@ -138,7 +142,9 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   // Match finish()'s bf16 rounding before the main-KV RoPE.
 #pragma unroll
   for (uint32_t j = 0; j < kVecSize / 2; ++j) {
-    const auto [x, y] = cast<fp32x2_t>(latent[j]);
+    const auto xy = cast<fp32x2_t>(latent[j]);
+    const auto x = xy.x;
+    const auto y = xy.y;
     data[j * 2 + 0] = x;
     data[j * 2 + 1] = y;
   }
@@ -156,7 +162,9 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
       const auto f_imag = freq[k + 1];
       const auto rotated =
           cast<bf16x2_t>(fp32x2_t{x_real * f_real - x_imag * f_imag, x_real * f_imag + x_imag * f_real});
-      const auto [r0, r1] = cast<fp32x2_t>(rotated);
+      const auto r = cast<fp32x2_t>(rotated);
+      const auto r0 = r.x;
+      const auto r1 = r.y;
       data[k + 0] = r0;
       data[k + 1] = r1;
     }
@@ -180,9 +188,10 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
     const auto scale = deepseek_v4::fp4::compressed_kv_scale(amax);
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const auto [x, y] = deepseek_v4::fp4::fake_quant_compressed_kv_x2({data[i * 2 + 0], data[i * 2 + 1]}, scale);
-      data[i * 2 + 0] = x;
-      data[i * 2 + 1] = y;
+      const auto q = deepseek_v4::fp4::fake_quant_compressed_kv_x2(
+          fp32x2_t{data[i * 2 + 0], data[i * 2 + 1]}, scale);
+      data[i * 2 + 0] = q.x;
+      data[i * 2 + 1] = q.y;
     }
   }
 
