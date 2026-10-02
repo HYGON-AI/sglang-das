@@ -1,275 +1,239 @@
-"""LightOp opt-in dispatch and eager/graph tests for the FP4 decode indexer.
+"""LightOp paged FP4 decode indexer on HCU (lightop_indexer.py).
 
-Run from the repository root:
+Run from the repository root on a DCU with a LightOp build exposing
+PAGED_MQA_LOGITS_FP4_ABI >= 2:
     python -m pytest -q test/manual/dsv4/test_lightop_fp4_indexer.py
 
-GPU cases require a CUDA/HIP device and a LightOp wheel containing
-paged_mqa_logits_fp4. CPU dispatch tests mock extension discovery only.
-The adapter is loaded directly to avoid importing unrelated attention backends.
+The pool and the queries are produced by SGLang's own writers
+(store_fp4_index_k_cache, quantize_fp4_indexer_tensor), so these tests pin the
+byte layout shared by SGLang and LightOp, not just LightOp in isolation.
 """
 
-import importlib.util
-import sys
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
-
 import pytest
+import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel, used by topk_transform_paged on HIP
 import torch
 
-pytest.importorskip("triton")
+from sglang.kernels.ops.attention.dsv4 import lightop_indexer
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    quantize_fp4_indexer_tensor,
+    store_fp4_index_k_cache,
+)
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 
-ROOT = Path(__file__).resolve().parents[3]
-FLAG = "SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4"
-
-
-def _load_module(name, path, monkeypatch):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
+PAGE = 64  # test fixture: the synthetic pool below uses 64 positions per page
+BLOCK = lightop_indexer.DEFAULT_CANDIDATE_BLOCK_SIZE
+CODES = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 
 
-@pytest.fixture
-def adapter(monkeypatch):
-    # Use the actual flag registry from this checkout, even when an older
-    # SGLang package is installed in the kernel-development environment.
-    _load_module(
-        "sglang.srt.environ", ROOT / "python/sglang/srt/environ.py", monkeypatch
-    )
-    module = _load_module(
-        "_sglang_lightop_fp4_indexer_test",
-        ROOT / "python/sglang/kernels/ops/attention/dsv4/fp4_indexer.py",
-        monkeypatch,
-    )
-    monkeypatch.delenv(FLAG, raising=False)
-    return module
-
-
-@pytest.fixture
-def discovery(adapter, monkeypatch):
-    native = Mock()
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setitem(
-        sys.modules,
-        "lightop",
-        SimpleNamespace(op=SimpleNamespace(paged_mqa_logits_fp4=native)),
-    )
-    return native
-
-
-@pytest.mark.parametrize("value", [None, "0", "false"])
-def test_disabled_bypasses_cached_native(adapter, discovery, monkeypatch, value):
-    native = discovery
-    adapter._lightop_fp4_op = native
-    adapter._lightop_fp4_op_resolved = True
-    if value is not None:
-        monkeypatch.setenv(FLAG, value)
-    assert adapter._get_lightop_fp4_op() is None
-    native.assert_not_called()
-
-
-def test_enabled_discovers_once_per_process(adapter, discovery, monkeypatch):
-    native = discovery
-    monkeypatch.setenv(FLAG, "1")
-    assert adapter._get_lightop_fp4_op() is native
-    assert adapter._get_lightop_fp4_op() is native
-    monkeypatch.setenv(FLAG, "0")
-    assert adapter._get_lightop_fp4_op() is None
-    monkeypatch.setenv(FLAG, "true")
-    assert adapter._get_lightop_fp4_op() is native
-
-
-@pytest.mark.parametrize("reason", ["missing_package", "missing_symbol"])
-def test_unavailable_native_falls_back(adapter, discovery, monkeypatch, reason):
-    _ = discovery
-    monkeypatch.setenv(FLAG, "1")
-    if reason == "missing_package":
-        monkeypatch.setitem(sys.modules, "lightop", None)
-    else:
-        monkeypatch.setitem(
-            sys.modules, "lightop", SimpleNamespace(op=SimpleNamespace())
-        )
-    assert adapter._get_lightop_fp4_op() is None
-    assert adapter._get_lightop_fp4_op() is None
-
-
-def test_capture_does_not_load_extension_or_poison_cache(
-    adapter, discovery, monkeypatch
-):
-    native = discovery
-    monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert adapter._get_lightop_fp4_op() is None
-    assert not adapter._lightop_fp4_op_resolved
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    assert adapter._get_lightop_fp4_op() is native
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert adapter._get_lightop_fp4_op() is native
-
-
-@pytest.mark.parametrize("batch,length", [(0, 32), (1, 0)])
-def test_empty_input_never_launches(adapter, monkeypatch, batch, length):
-    resolve = Mock(side_effect=AssertionError("empty input must not resolve kernels"))
-    monkeypatch.setattr(adapter, "_get_lightop_fp4_op", resolve)
-    result = adapter.fp4_index_logits_decode(
-        torch.empty(batch, 32, 128, dtype=torch.bfloat16),
-        torch.empty(batch, 32),
-        torch.empty(batch, length, dtype=torch.int64),
-        torch.zeros(batch, dtype=torch.int64),
-        torch.zeros(1, 64 * 68, dtype=torch.uint8),
-        64,
-    )
-    assert result.shape == (batch, length)
-    assert result.dtype == torch.float32
-    resolve.assert_not_called()
-
-
-@pytest.fixture
-def native(adapter, monkeypatch):
+@pytest.fixture(scope="module", autouse=True)
+def require_lightop():
     if not torch.cuda.is_available():
         pytest.skip("requires a DCU")
-    monkeypatch.setenv(FLAG, "1")
-    operator = adapter._get_lightop_fp4_op()
-    if operator is None:
-        pytest.skip("install a LightOp wheel with paged_mqa_logits_fp4")
-    return operator
+    if not lightop_indexer.lightop_paged_indexer_available():
+        pytest.skip("LightOp paged FP4 indexer unavailable")
 
 
-def _case(heads=32, length=65, span=2):
-    torch.manual_seed(29)
-    device = "cuda:0"
-    page_size, pages, batch = 64, 4, 2
-    # All Q values are exactly representable as FP4, so large H32 cases also
-    # exercise LightOp's FP8 path. The public input remains BF16.
-    grid = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
-    q = grid[torch.randint(0, 8, (batch, heads, 128), device=device)].bfloat16()
-    weights = torch.rand(batch, heads, device=device).bfloat16()
-    table = torch.randint(
-        0, 256, (pages, page_size * 68), dtype=torch.uint8, device=device
+def dequantize(payload, scale_bytes):
+    lut = torch.tensor(CODES, device=payload.device, dtype=torch.float64)
+    codes = torch.stack((payload & 15, payload >> 4), dim=-1).flatten(-2).long()
+    return lut[codes] * torch.exp2(scale_bytes.double() - 127).repeat_interleave(32, -1)
+
+
+def make_case(batch, heads, lens, seed=0):
+    """A pool written by SGLang, one shuffled page table per row, quantized Q."""
+    torch.manual_seed(seed)
+    device = "cuda"
+    pages_per_row = max((n + PAGE - 1) // PAGE for n in lens)
+    pool_pages = batch * pages_per_row + 3
+    page_table = (
+        torch.randperm(pool_pages, device=device)[: batch * pages_per_row]
+        .reshape(batch, pages_per_row)
+        .int()
     )
-    scales = torch.tensor([127, 127 + span, 127, 127], dtype=torch.uint8, device=device)
-    table[:, page_size * 64 :] = scales.repeat(pages, page_size)
-    slots = torch.randint(0, pages * page_size, (batch, length), device=device)
-    lens = torch.tensor([max(0, length - 5), length], device=device)
-    slots[0, lens[0] :] = -123456  # masked slots must never be dereferenced
-    return q, weights, slots, lens, table, page_size
-
-
-def _reference(case, bf16_rounding=False):
-    q, weights, slots, lens, table, page_size = case
-    grid = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=q.device)
-    payload = table[:, : page_size * 64].reshape(-1, 64)
-    code = torch.stack((payload & 15, payload >> 4), dim=-1).reshape(-1, 128).long()
-    k = grid[code & 7] * torch.where(code < 8, 1, -1)
-    scale = torch.exp2(table[:, page_size * 64 :].reshape(-1, 4).float() - 127)
-    k = (k.reshape(-1, 4, 32) * scale[:, :, None]).reshape(-1, 128)
-    k = k[slots.clamp_min(0)]
-    dot = torch.einsum("bhd,bld->bhl", q.float(), k)
-    if bf16_rounding:
-        dot = dot.bfloat16().float()
-    weighted = dot.relu() * weights.float()[:, :, None]
-    if bf16_rounding:
-        weighted = weighted.bfloat16().float()
-    result = weighted.sum(1)
-    if bf16_rounding:
-        result = result.bfloat16().float()
-    return result.masked_fill(
-        torch.arange(slots.shape[1], device=q.device)[None] >= lens[:, None], -torch.inf
+    cache = torch.zeros(pool_pages, PAGE * 68, device=device, dtype=torch.uint8)
+    kv = torch.randn(pool_pages * PAGE, 128, device=device, dtype=torch.bfloat16)
+    kv *= torch.exp2(torch.randint(-4, 5, (pool_pages * PAGE, 1), device=device))
+    store_fp4_index_k_cache(
+        kv, cache, torch.arange(pool_pages * PAGE, device=device), page_size=PAGE, rne=True
+    )
+    q = torch.randn(batch * heads, 128, device=device, dtype=torch.bfloat16)
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q, rne=True)
+    return dict(
+        q=(q_fp4.view(batch, 1, heads, 64), q_sf.view(batch, 1, heads)),
+        k_cache=cache.view(pool_pages, PAGE, 1, 68),
+        weights=torch.randn(batch, heads, device=device),
+        lens=torch.tensor(lens, device=device, dtype=torch.int32),
+        page_table=page_table,
     )
 
 
-@pytest.mark.parametrize(
-    "heads,length,span",
-    [
-        (8, 65, 2),
-        (16, 65, 2),
-        (32, 31, 2),
-        (32, 4096, 2),
-        (32, 24576, 2),
-        (32, 24576, 11),
-        (32, 24576, 12),
-        (64, 65, 2),
-    ],
-)
-def test_native_dispatch_and_fp32_reference(
-    adapter, native, monkeypatch, heads, length, span
-):
-    case = _case(heads, length, span)
-    spy = Mock(wraps=native)
-    adapter._lightop_fp4_op = spy
-    adapter._lightop_fp4_op_resolved = True
-    got = adapter.fp4_index_logits_decode(*case)
-    spy.assert_called_once()
-    assert spy.call_args.args[0].dtype == torch.bfloat16
-    assert spy.call_args.args[3] is case[3]
-    torch.testing.assert_close(got, native(*case), rtol=0, atol=0)
-    torch.testing.assert_close(got, _reference(case), rtol=2e-5, atol=1e-4)
+def reference_logits(case, lens, table, table_block_size, width):
+    """FP64 logits of column t = slot table[b, t // TB] * TB + t % TB."""
+    q_fp4, q_sf = case["q"]
+    batch, _, heads, _ = q_fp4.shape
+    qd = dequantize(
+        q_fp4.view(torch.uint8).reshape(batch, heads, 64),
+        q_sf.view(torch.uint8).reshape(batch, heads, 4),
+    )
+    pool = case["k_cache"].reshape(case["k_cache"].shape[0], PAGE * 68)
+    payload = pool[:, : PAGE * 64].unflatten(1, (PAGE, 64))
+    scales = pool[:, PAGE * 64 :].unflatten(1, (PAGE, 4))
+    out = torch.full((batch, width), float("nan"), device=pool.device, dtype=torch.float64)
+    for b in range(batch):
+        n = int(lens[b])
+        t = torch.arange(n, device=pool.device)
+        slot = table[b, t // table_block_size].long() * table_block_size + t % table_block_size
+        k = dequantize(payload[slot // PAGE, slot % PAGE], scales[slot // PAGE, slot % PAGE])
+        w = case["weights"][b].double()
+        out[b, :n] = ((qd[b] @ k.T).relu() * w[:, None]).sum(0)
+    return out
 
 
-@pytest.mark.parametrize(
-    "fallback",
-    ["disabled", "missing_symbol"],
-)
-def test_triton_fallback(adapter, native, monkeypatch, fallback):
-    case = list(_case())
-    if fallback == "disabled":
-        monkeypatch.setenv(FLAG, "0")
-    elif fallback == "missing_symbol":
-        adapter._lightop_fp4_op = None
-        adapter._lightop_fp4_op_resolved = False
-        monkeypatch.setitem(
-            sys.modules, "lightop", SimpleNamespace(op=SimpleNamespace())
+def assert_prefix_close(got, expected, lens):
+    for b, n in enumerate(lens.tolist()):
+        torch.testing.assert_close(
+            got[b, :n].double(), expected[b, :n], rtol=2e-5, atol=1e-4
         )
-    spy = Mock(side_effect=AssertionError("must not call LightOp"))
-    if fallback != "missing_symbol":
-        adapter._lightop_fp4_op = spy
-        adapter._lightop_fp4_op_resolved = True
-    got = adapter.fp4_index_logits_decode(*case)
-    spy.assert_not_called()
-    torch.testing.assert_close(
-        got, _reference(case, bf16_rounding=True), rtol=0, atol=0
+
+
+@pytest.mark.parametrize("with_schedule", [False, True])
+@pytest.mark.parametrize("heads", [32, 64])
+def test_dense_logits_match_reference(with_schedule, heads):
+    lens = [0, 1, 777, 8192]
+    case = make_case(len(lens), heads, lens, seed=heads)
+    schedule = (
+        lightop_indexer.get_paged_mqa_logits_schedule(case["lens"]) if with_schedule else None
     )
+    width = max(lens)
+    got = lightop_indexer.paged_mqa_logits_fp4(
+        case["q"], case["k_cache"], case["weights"], case["lens"],
+        case["page_table"], schedule, width, table_block_size=PAGE,
+    )
+    expected = reference_logits(case, case["lens"], case["page_table"], PAGE, width)
+    assert_prefix_close(got, expected, case["lens"])
 
 
-def test_native_error_is_not_silently_retried(adapter, native):
-    adapter._lightop_fp4_op = Mock(side_effect=RuntimeError("native launch failed"))
-    adapter._lightop_fp4_op_resolved = True
-    with pytest.raises(RuntimeError, match="native launch failed"):
-        adapter.fp4_index_logits_decode(*_case())
+@pytest.mark.parametrize("requests", [4, 8])
+@pytest.mark.parametrize("draft", [2, 3, 6])
+def test_verify_rows_paired_bit_identical(draft, requests):
+    """Non-ragged verify: a request's rows share one page-table row and see
+    lengths L..L+draft-1; pairing them (8 requests, past LightOp's gate) or
+    falling back below the gate (4) must leave every logit bit unchanged."""
+    if not lightop_indexer.lightop_paired_rows_available():
+        pytest.skip("LightOp build predates rows_per_request")
+    heads = 32  # DSV4.1 index_n_heads; LightOp pairs only H <= 32
+    starts = [0, 1, 700, 8192 - draft + 1, 1500, 3000, 4500, 6000][:requests]
+    lens = [s + i for s in starts for i in range(draft)]
+    case = make_case(len(lens), heads, lens, seed=draft * 10 + requests)
+    table = case["page_table"].view(len(starts), draft, -1)[:, :1].expand(-1, draft, -1)
+    table = table.reshape(len(lens), -1).contiguous()
+    width = table.shape[1] * PAGE
+
+    def logits(rows_per_request):
+        schedule = lightop_indexer.get_paged_mqa_logits_schedule(
+            case["lens"], rows_per_request=rows_per_request
+        )
+        return lightop_indexer.paged_mqa_logits_fp4(
+            case["q"], case["k_cache"], case["weights"], case["lens"], table,
+            schedule, width, table_block_size=PAGE, rows_per_request=rows_per_request,
+        )
+
+    want, got = logits(1), logits(draft)
+    for b, n in enumerate(lens):
+        assert torch.equal(got[b, :n].view(torch.int32), want[b, :n].view(torch.int32)), b
+    expected = reference_logits(case, case["lens"], table, PAGE, width)
+    assert_prefix_close(got, expected, case["lens"])
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_graph_replay_reads_updated_inputs(adapter, native, monkeypatch, enabled):
-    monkeypatch.setenv(FLAG, "1" if enabled else "0")
-    case = list(_case(length=24576))
-    spy = Mock(wraps=native)
-    adapter._lightop_fp4_op = spy
-    adapter._lightop_fp4_op_resolved = True
+def reference_candidate_table(logits, lens, page_table, topk_blocks, block):
+    """Level one: top blocks by block max, newest kept, ascending, as slots / 8."""
+    per_page = PAGE // block
+    phys, valid = [], []
+    for b, length in enumerate(lens.tolist()):
+        n = (length + block - 1) // block
+        if n <= topk_blocks:
+            kept = torch.arange(n)
+        else:
+            keys = logits[b, : (n - 1) * block].cpu().reshape(n - 1, block).amax(1)
+            keys = torch.cat((keys, torch.tensor([float("inf")])))
+            kept = torch.sort(keys, descending=True, stable=True).indices[:topk_blocks].sort().values
+        pt = page_table[b].cpu().long()
+        phys.append(pt[kept // per_page] * per_page + kept % per_page)
+        valid.append(block * (len(kept) - 1) + (length - 1) % block + 1 if length else 0)
+    return phys, valid
+
+
+def test_two_level_candidate_path():
+    """publish (dense logits -> block table) then select (sparse logits -> top-k)."""
+    topk_blocks, topk = 256, 512
+    lens = [300, 2048, 5000, 30000]
+    case = make_case(len(lens), 64, lens, seed=7)
+    width = max(lens)
+    dense = lightop_indexer.paged_mqa_logits_fp4(
+        case["q"], case["k_cache"], case["weights"], case["lens"],
+        case["page_table"], lightop_indexer.get_paged_mqa_logits_schedule(case["lens"]), width,
+        table_block_size=PAGE,
+    )
+    phys, valid = lightop_indexer.candidate_block_table(
+        dense, case["lens"], case["page_table"], PAGE, topk_blocks, BLOCK
+    )
+    ref_phys, ref_valid = reference_candidate_table(
+        dense, case["lens"], case["page_table"], topk_blocks, BLOCK
+    )
+    assert valid.tolist() == ref_valid
+    for b, blocks in enumerate(ref_phys):
+        assert phys[b, : len(blocks)].cpu().tolist() == blocks.tolist()
+
+    sparse_width = topk_blocks * BLOCK
+    sparse = lightop_indexer.paged_mqa_logits_fp4(
+        case["q"], case["k_cache"], case["weights"], valid, phys,
+        lightop_indexer.get_paged_mqa_logits_schedule(valid), sparse_width,
+        table_block_size=BLOCK,
+    )
+    expected = reference_logits(case, valid, phys, BLOCK, sparse_width)
+    assert_prefix_close(sparse, expected, valid)
+
+    # The second level returns pool slots; every one must be a kept position.
+    page_indices = torch.empty(len(lens), topk, device="cuda", dtype=torch.int32)
+    topk_transform_paged(sparse, valid, phys, page_indices, BLOCK, None)
+    for b, n in enumerate(valid.tolist()):
+        t = torch.arange(n, device="cuda")
+        allowed = set((phys[b, t // BLOCK].long() * BLOCK + t % BLOCK).tolist())
+        picked = [s for s in page_indices[b].tolist() if s >= 0]
+        assert len(picked) == min(n, topk)
+        assert set(picked) <= allowed
+
+
+def test_graph_replay_follows_live_inputs():
+    lens = [512, 4096, 9000]
+    case = make_case(len(lens), 64, lens, seed=3)
+    width = 16384
+    schedule = lightop_indexer.get_paged_mqa_logits_schedule(case["lens"])
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        for _ in range(3):
-            adapter.fp4_index_logits_decode(*case)
+        for _ in range(2):
+            lightop_indexer.paged_mqa_logits_fp4(
+                case["q"], case["k_cache"], case["weights"], case["lens"],
+                case["page_table"], schedule, width, table_block_size=PAGE,
+            )
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        got = adapter.fp4_index_logits_decode(*case)
-    address = got.data_ptr()
-    for step in range(2):
-        # Q conversion, weights, cache data, slots and visibility must be read
-        # afresh on replay, not frozen during capture. All storage stays fixed.
-        case[0].mul_(0.5)
-        case[1].mul_(0.5)
-        case[2].fill_(step + 1)
-        case[3].fill_(128 + step)
-        case[4][:, : 64 * 64].fill_(0x22 + step)
+        got = lightop_indexer.paged_mqa_logits_fp4(
+            case["q"], case["k_cache"], case["weights"], case["lens"],
+            case["page_table"], schedule, width, table_block_size=PAGE,
+        )
+    for seed, new_lens in ((11, [9000, 1, 700]), (13, [100, 8192, 0])):
+        new = make_case(len(lens), 64, [9000] * 3, seed=seed)
+        case["q"][0].copy_(new["q"][0])
+        case["q"][1].copy_(new["q"][1])
+        case["weights"].copy_(new["weights"])
+        case["k_cache"][: new["k_cache"].shape[0]].copy_(new["k_cache"][: case["k_cache"].shape[0]])
+        case["lens"].copy_(torch.tensor(new_lens, device="cuda", dtype=torch.int32))
+        # The schedule is a function of lens; metadata refreshes it in place.
+        schedule.copy_(lightop_indexer.get_paged_mqa_logits_schedule(case["lens"]))
         graph.replay()
         torch.cuda.synchronize()
-        assert got.data_ptr() == address
-        expected = _reference(case, bf16_rounding=not enabled)
-        torch.testing.assert_close(
-            got, expected, rtol=2e-5 if enabled else 0, atol=1e-4 if enabled else 0
-        )
-    assert spy.call_count == (4 if enabled else 0)
+        expected = reference_logits(case, case["lens"], case["page_table"], PAGE, width)
+        assert_prefix_close(got, expected, case["lens"])

@@ -1015,6 +1015,9 @@ class Envs:
     SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = EnvBool(False)
        # LightOp FP4 indexer logits on gfx928/936/938,Set to 0 to fall back to Triton.
     SGLANG_USE_LIGHTOP_PAGED_MQA_LOGITS_FP4 = EnvBool(True)
+    # DSV4.1 low-ratio decode/verify indexer on HCU via the paged path on LightOp;
+    # falls back to the slot-based path when LightOp lacks the paged operators.
+    SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER = EnvBool(True)
     SGLANG_USE_FAST_HADAMARD_TRANSFORM = EnvBool(False)
     SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = EnvBool(False)
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
