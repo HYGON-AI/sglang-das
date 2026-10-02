@@ -83,6 +83,15 @@ def _use_deep_gemm_prefill() -> bool:
     )
 
 
+def _use_lightop_decode() -> bool:
+    if not is_hcu():
+        return False
+    from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
+        lightop_paged_indexer_available,
+    )
+    return lightop_paged_indexer_available()
+
+
 def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
@@ -92,7 +101,9 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=(
+            is_sm100_or_newer() or _use_lightop_decode()
+        ),
     )
 
 
@@ -116,6 +127,14 @@ def make_candidate_indexer(
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
+    if _use_lightop_decode() and candidate_topk_blocks > 0:
+        from sglang.srt.layers.attention.dsv4.candidate_indexer_lightop import (
+            LightopDecodeCandidates,
+        )
+        return dense_blocks, LightopDecodeCandidates(
+            pool=token_to_kv_pool, topk_blocks=candidate_topk_blocks,
+            block_size=candidate_block_size,
+        )
     # Without candidate blocks no layer is a candidate source or consumer.
     if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks

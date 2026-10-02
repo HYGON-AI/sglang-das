@@ -123,6 +123,8 @@ class FullTopKIndexer:
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            table_block_size=metadata.compressed_page_size,
+            rows_per_request=metadata.rows_per_request,
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(

@@ -136,6 +136,7 @@ def get_deep_gemm_decode_data(
         layer_id=inputs.layer_id,
         page_size=inputs.paged_metadata.compressed_page_size,
     )
+    inputs.paged_metadata.wait_for_schedule()
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
