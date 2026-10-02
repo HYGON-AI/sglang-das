@@ -463,8 +463,26 @@ def deep_gemm_fp4_paged_mqa_logits(
     page_table: torch.Tensor,
     deep_gemm_metadata,
     max_seq_len: int,
+    table_block_size: int = 64,
+    rows_per_request: int = 1,
 ) -> torch.Tensor:
-    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
+    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one.
+    On HCU the same contract runs on LightOp (``lightop_indexer``), where
+    ``rows_per_request`` pairs verify rows; DeepGEMM ignores it."""
+    if _is_hcu:
+        from sglang.kernels.ops.attention.dsv4 import lightop_indexer
+
+        return lightop_indexer.paged_mqa_logits_fp4(
+            q_fp4,
+            k_cache,
+            weights,
+            seq_lens,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            table_block_size=table_block_size,
+            rows_per_request=rows_per_request,
+        )
     from deep_gemm import fp8_fp4_paged_mqa_logits
 
     sl = seq_lens.to(torch.int32)

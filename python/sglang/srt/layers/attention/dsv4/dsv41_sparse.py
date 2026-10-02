@@ -28,8 +28,10 @@ _is_hcu = is_hcu()
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    # CUDA (NVIDIA): fast Triton path.
-    if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
+    # Both CUDA and HIP tensors report ``is_cuda``.  Select the backend from
+    # the runtime rather than treating ``torch.version.cuda`` as the device
+    # capability gate: ROCm uses the AOT path below, CUDA uses Triton.
+    if x.is_cuda and torch.version.hip is None and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )

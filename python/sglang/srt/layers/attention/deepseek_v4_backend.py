@@ -45,6 +45,10 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     q8kv8_padded_num_heads,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
+    lightop_paged_indexer_available,
+    lightop_paired_rows_available,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -185,6 +189,31 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 def _is_sm100_or_newer() -> bool:
     # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper takes the torch indexer.
     return torch.cuda.get_device_capability()[0] >= 10
+
+
+def _supports_index_k_rope_pack() -> bool:
+    """Whether the Triton index-K RoPE/FP4/cache-store path may be used.
+
+    This is separate from ``_is_sm100_or_newer``: the latter is a DeepGEMM
+    capability check, while ``index_k_rope_pack`` is a Triton kernel that is
+    also available on HIP.  Using ``torch.version.cuda`` here incorrectly
+    disabled the path on ROCm.
+    """
+    return torch.cuda.is_available()
+
+
+def _supports_index_q_rope_pack() -> bool:
+    """Whether the fused C++ index-Q packer can be JIT compiled safely.
+
+    The index-K packer used above is a Triton kernel and supports both CUDA and
+    HIP. ``index_q_rope_pack_weights`` is a separate C++ JIT module whose
+    implementation currently includes CUDA FP4 intrinsics (``cuda_fp4.h`` and
+    ``__nv_cvt_*``). PyTorch exposes ROCm through ``torch.cuda`` as well, so
+    ``torch.cuda.is_available()`` alone would send HIP into that CUDA-only
+    compiler path. Keep the query fusion on CUDA until the HIP implementation
+    is ported; HIP uses the portable query + Triton quantization fallback.
+    """
+    return torch.cuda.is_available() and torch.version.hip is None
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1295,9 +1324,18 @@ class DeepseekV4AttnBackend(
         # Two-level low-ratio indexer (dsv4/candidate_indexer.py).
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        candidate_topk_blocks = getattr(cfg, "candidate_topk_blocks", 0)
         self.candidate_indexer = make_candidate_indexer(
-            getattr(cfg, "candidate_topk_blocks", 0),
+            candidate_topk_blocks,
             getattr(cfg, "candidate_block_size", 0),
+        )
+        # HCU runs the paged (page_table + context_lens + schedule) decode indexer
+        # on LightOp when it provides every kernel the model needs; otherwise it
+        # keeps the slot-based path.
+        self.use_lightop_paged_indexer: bool = (
+            _is_hcu
+            and lightop_paged_indexer_available()
+            and (candidate_topk_blocks <= 0 or self.candidate_indexer is not None)
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
@@ -1333,6 +1371,18 @@ class DeepseekV4AttnBackend(
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
+        # Rows per request of a non-ragged verify, told to the LightOp low-ratio
+        # indexer so it reads each request's KV once per pair of rows. LightOp
+        # pairs only H <= 32 (two rows' Q in VGPRs) and skips pairing itself for
+        # batches with too few requests to fill the CUs.
+        self.lightop_verify_rows_per_request: int = (
+            self.speculative_num_draft_tokens
+            if self.use_lightop_paged_indexer
+            and self.speculative_num_draft_tokens is not None
+            and int(getattr(cfg, "index_n_heads", 64)) <= 32
+            and lightop_paired_rows_available()
+            else 1
+        )
         if self.speculative_num_draft_tokens is not None:
             # Persistent target-verify metadata buffers. Allocated here (not
             # lazily) so they are ordinary tensors: the first touch of a lazy
@@ -1443,6 +1493,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        rows_per_request: int = 1,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1480,6 +1531,7 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            rows_per_request=rows_per_request,
         )
 
     def init_forward_metadata_decode(
@@ -2058,18 +2110,20 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
+        # Ragged verify rows vary per request, so only uniform rows are paired.
+        low_ratio_indexer = functools.partial(
+            self.init_forward_metadata_indexer,
+            core_attn_metadata,
+            rows_per_request=1 if is_ragged else self.lightop_verify_rows_per_request,
+        )
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
-                if 1 in low
-                else None
+                low_ratio_indexer(compress_ratio=1) if 1 in low else None
             ),
             c2_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
-                if 2 in low
-                else None
+                low_ratio_indexer(compress_ratio=2) if 2 in low else None
             ),
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
             c128_compress_metadata=c128_compress_metadata,
@@ -3051,12 +3105,11 @@ class DeepseekV4AttnBackend(
                 pos,
                 fuse_index_store=(
                     x.is_cuda
-                    and torch.version.cuda is not None
-                    and _is_sm100_or_newer()
+                    and _supports_index_k_rope_pack()
                 ),
             )
             return
-        if not (x.is_cuda and torch.version.cuda):
+        if not x.is_cuda:
             self._low_ratio_compress_torch(layer, x, req, pos)
             return
 
@@ -3082,7 +3135,7 @@ class DeepseekV4AttnBackend(
             pooled,
             slots,
             group_pos,
-            fuse_index_store=_is_sm100_or_newer(),
+            fuse_index_store=_supports_index_k_rope_pack(),
         )
 
     def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
@@ -3247,7 +3300,7 @@ class DeepseekV4AttnBackend(
             if (
                 fuse_index_store
                 and latent.is_cuda
-                and torch.version.cuda is not None
+                and _supports_index_k_rope_pack()
                 and latent.dtype == torch.bfloat16
                 and layer.indexer.index_head_dim == 128
             ):
@@ -3289,7 +3342,7 @@ class DeepseekV4AttnBackend(
             or forward_batch.forward_mode.is_target_verify()
         )
         if is_decode_or_verify:
-            if _is_sm100_or_newer():
+            if _is_sm100_or_newer() or self.use_lightop_paged_indexer:
                 # DeepGEMM pairs verify rows by request id; decode has one row each.
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
@@ -3504,6 +3557,7 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
+        metadata.wait_for_schedule()
         assert indexer.n_local_heads == indexer.n_heads
         width = metadata.max_compressed_seq_len
         if indexer.uses_candidates or indexer.is_candidate_source:
@@ -3539,6 +3593,7 @@ class DeepseekV4AttnBackend(
                 page_table[rows],
                 plan,
                 width,
+                table_block_size=metadata.compressed_page_size,
             )
             lens_c = lens[rows].unsqueeze(-1)
             # Columns past a row's length hold garbage.
@@ -3581,7 +3636,7 @@ class DeepseekV4AttnBackend(
         assert indexer.n_local_heads == indexer.n_heads
         if (
             x.is_cuda
-            and torch.version.cuda is not None
+            and _supports_index_q_rope_pack()
             and x.dtype == torch.bfloat16
             and indexer.index_head_dim == 128
         ):
@@ -3625,6 +3680,10 @@ class DeepseekV4AttnBackend(
             metadata,
             request_ids=req,  # one per query row; verify rows of a request share one
         )
+        # Let LightOp's metadata planner run while the main stream builds the
+        # query payload and head weights.  The dependency is inserted only at
+        # the first consumer, after all query preparation is queued.
+        metadata.wait_for_schedule()
         candidate_layer = not _every_request_fits()
         # use special selection for candidate layers
         if indexer.uses_candidates and candidate_layer:
@@ -3647,6 +3706,8 @@ class DeepseekV4AttnBackend(
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            table_block_size=metadata.compressed_page_size,
+            rows_per_request=metadata.rows_per_request,
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
