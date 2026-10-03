@@ -79,6 +79,7 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
+    get_int_env_var,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -4059,6 +4060,10 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
+        # Keep the opt-in HCU H16 FlashMLA decode profile within the graph and
+        # request budgets validated for the TP8/CP8 deployment topology.
+        self._handle_hcu_flashmla_decode_h16_memory_budget()
+
         # Set kernel backends.
         self._handle_sampling_backend()
         # Must run before _handle_attention_backend_compatibility so the
@@ -6459,6 +6464,65 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _sampling_backend_default)
+
+    def _handle_hcu_flashmla_decode_h16_memory_budget(self):
+        """Bound graph metadata for the opt-in GLM TP8/CP8 H16 profile."""
+
+        if not (
+            is_hcu()
+            and get_bool_env_var("SGLANG_HCU_FLASHMLA_DECODE_H16")
+            and self.enable_cp_decode_attn_tp
+            and self.tp_size == 8
+            and self._resolved().attn_cp_size == 8
+        ):
+            return
+
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            return
+        model_arch = self.get_model_config().hf_config.architectures[0]
+        if not model_arch.startswith("GlmMoeDsaForCausalLM"):
+            return
+
+        graph_limit = get_int_env_var(
+            "SGLANG_HCU_MLA_DECODE_TP_SHARD_GRAPH_LIMIT", 16
+        )
+        if graph_limit <= 0:
+            raise ValueError(
+                "SGLANG_HCU_MLA_DECODE_TP_SHARD_GRAPH_LIMIT must be positive"
+            )
+
+        decode_config = self.cuda_graph_config.decode
+        old_graph_max_bs = decode_config.max_bs
+        old_max_running_requests = self.max_running_requests
+        decode_config.max_bs = min(decode_config.max_bs, graph_limit)
+        decode_config.bs = sorted(
+            {bs for bs in decode_config.bs if 0 < bs <= decode_config.max_bs}
+        )
+        if decode_config.max_bs not in decode_config.bs:
+            decode_config.bs.append(decode_config.max_bs)
+
+        request_limit = 64
+        if (
+            self.max_running_requests is None
+            or self.max_running_requests > request_limit
+        ):
+            self._declare(
+                "_handle_hcu_flashmla_decode_h16_memory_budget",
+                max_running_requests=request_limit,
+            )
+
+        if (
+            decode_config.max_bs != old_graph_max_bs
+            or self.max_running_requests != old_max_running_requests
+        ):
+            logger.warning(
+                "HCU H16 FlashMLA decode memory budget: graph max_bs %s -> %s, "
+                "max_running_requests %s -> %s",
+                old_graph_max_bs,
+                decode_config.max_bs,
+                old_max_running_requests,
+                self.max_running_requests,
+            )
 
     def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
         """

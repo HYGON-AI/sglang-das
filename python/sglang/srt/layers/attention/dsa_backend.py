@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -104,6 +106,37 @@ _is_hcu = is_hcu()
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+
+
+def _accepts_keyword(function, keyword: str) -> bool:
+    """Return whether a Python runtime entry point exposes an expected ABI."""
+
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _hcu_flashmla_decode_h16_available() -> bool:
+    """Probe the installed FlashMLA symbols needed by H16 dispatch."""
+
+    if not _is_hcu:
+        return False
+    try:
+        flash_mla_with_kvcache = get_flashmla_op(
+            "flash_mla_with_kvcache", is_hcu=True
+        )
+        get_mla_metadata = get_flashmla_op("get_mla_metadata", is_hcu=True)
+    except (ImportError, AttributeError, OSError):
+        return False
+    return callable(flash_mla_with_kvcache) and _accepts_keyword(
+        get_mla_metadata, "num_heads_q"
+    )
 
 if is_cuda():
     import deep_gemm
@@ -375,7 +408,37 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
-        if self.num_q_heads <= 64:
+        model_architectures = (
+            getattr(model_runner.model_config.hf_config, "architectures", None) or []
+        )
+        h16_requested = (
+            _is_hcu
+            and os.getenv("SGLANG_HCU_FLASHMLA_DECODE_H16", "0") == "1"
+            and self.num_q_heads == 64
+            and self.dsa_decode_impl == "flashmla_kv"
+            and model_runner.server_args.tp_size == 8
+            and getattr(get_parallel(), "enable_cp_decode_attn_tp", False)
+            and any(
+                arch.startswith("GlmMoeDsaForCausalLM")
+                for arch in model_architectures
+            )
+        )
+        self._hcu_flashmla_decode_h16_enabled = (
+            h16_requested and _hcu_flashmla_decode_h16_available()
+        )
+        self._hcu_flashmla_decode_h16_runtime_logged = False
+        if h16_requested and not self._hcu_flashmla_decode_h16_enabled:
+            logger.warning(
+                "HCU FlashMLA decode H16 requested but its runtime ABI is "
+                "unavailable; falling back to H64"
+            )
+        if self._hcu_flashmla_decode_h16_enabled:
+            self.flashmla_kv_num_q_heads = 16
+            logger.info(
+                "HCU FlashMLA decode H16 enabled for %s",
+                model_architectures[0],
+            )
+        elif self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
             self.flashmla_kv_num_q_heads = 128
@@ -1133,6 +1196,9 @@ class DeepseekSparseAttnBackend(
                 self._compute_flashmla_metadata(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
+                    num_heads_q=self._flashmla_kv_target_q_heads_for_mode(
+                        forward_mode
+                    ),
                 )
                 if use_flashmla_kv
                 else None
@@ -3013,7 +3079,20 @@ class DeepseekSparseAttnBackend(
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
-        target_q_heads = self.flashmla_kv_num_q_heads
+        target_q_heads = self._flashmla_kv_target_q_heads_for_runtime(num_q_heads)
+        if (
+            self._hcu_flashmla_decode_h16_enabled
+            and not self._hcu_flashmla_decode_h16_runtime_logged
+            and target_q_heads == 16
+        ):
+            assert num_q_heads == 8, (
+                "HCU FlashMLA decode H16 requires exactly eight sharded heads, "
+                f"got {num_q_heads}"
+            )
+            logger.info(
+                "HCU FlashMLA decode H16 active: runtime_heads=%d", num_q_heads
+            )
+            self._hcu_flashmla_decode_h16_runtime_logged = True
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
@@ -3050,6 +3129,7 @@ class DeepseekSparseAttnBackend(
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=cache_seqlens,
                     seq_len_q=1,
+                    num_heads_q=target_q_heads,
                 )
 
         if needs_repad and num_valid == 0:
@@ -3639,10 +3719,33 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
-    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+    def _flashmla_kv_target_q_heads_for_mode(self, forward_mode: ForwardMode) -> int:
+        if (
+            self._hcu_flashmla_decode_h16_enabled
+            and forward_mode.is_extend_without_speculative()
+        ):
+            return 64
+        return self.flashmla_kv_num_q_heads
+
+    def _flashmla_kv_target_q_heads_for_runtime(self, num_q_heads: int) -> int:
+        if num_q_heads <= self.flashmla_kv_num_q_heads:
+            return self.flashmla_kv_num_q_heads
+        if num_q_heads <= 64:
+            return 64
+        if num_q_heads <= 128:
+            return 128
+        return num_q_heads
+
+    def _compute_flashmla_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        seq_len_q: int,
+        num_heads_q: Optional[int] = None,
+    ):
         get_mla_metadata = get_flashmla_op("get_mla_metadata", is_hcu=_is_hcu)
 
-        num_heads_q = self.flashmla_kv_num_q_heads
+        if num_heads_q is None:
+            num_heads_q = self.flashmla_kv_num_q_heads
 
         return wrap_flashmla_metadata_result(
             get_mla_metadata(

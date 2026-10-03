@@ -174,6 +174,7 @@ def test_interleave_cp_v2_respects_per_sequence_minimum():
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True),
         extend_seq_lens_cpu=[128] * 16,
+        seq_lens_cpu=torch.tensor([128] * 16),
     )
 
     with envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.override(0):
@@ -182,9 +183,33 @@ def test_interleave_cp_v2_respects_per_sequence_minimum():
     with envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.override(256):
         assert not strategy.can_apply(2048, forward_batch)
         forward_batch.extend_seq_lens_cpu = [128, 512]
+        forward_batch.seq_lens_cpu = torch.tensor([128, 512])
         assert not strategy.can_apply(640, forward_batch)
         forward_batch.extend_seq_lens_cpu = [256, 512]
+        forward_batch.seq_lens_cpu = torch.tensor([256, 512])
         assert strategy.can_apply(768, forward_batch)
+
+
+def test_interleave_cp_v2_keeps_long_cached_tail_eligible():
+    strategy = InterleaveCPStrategy(8)
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True),
+        extend_seq_lens_cpu=[64, 7680],
+        seq_lens_cpu=torch.tensor([8192, 8192]),
+    )
+
+    with envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.override(256):
+        assert strategy.can_apply(7744, forward_batch)
+
+        # A genuinely short request still prevents the whole batch from
+        # entering CP, even when it is paired with a long cached request.
+        forward_batch.seq_lens_cpu = torch.tensor([128, 8192])
+        assert not strategy.can_apply(7744, forward_batch)
+
+        # Keep the original per-extend fallback for callers without a
+        # corresponding host-side full sequence length.
+        forward_batch.seq_lens_cpu = None
+        assert not strategy.can_apply(7744, forward_batch)
 
 
 def test_interleave_cp_v2_keeps_full_tp_dp_buffer_length():

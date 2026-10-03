@@ -393,6 +393,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             + time.perf_counter()
             - tic
         )
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            release_hcu_flashmla_decode_h16_capture_cache,
+        )
+
+        release_hcu_flashmla_decode_h16_capture_cache(
+            self.target_worker.model_runner
+        )
         logger.info("Capture Frozen-KV MTP draft cuda graph end.")
 
     def _select_last_extend_hidden(
