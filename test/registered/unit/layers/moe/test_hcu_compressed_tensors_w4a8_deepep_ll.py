@@ -1,6 +1,7 @@
 """CPU regression tests for HCU W4A8 DeepEP low-latency dispatch."""
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -216,6 +217,192 @@ class TestHCUCompressedTensorsW4A8DeepEPLL(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "requires INT8"):
             self.method.apply_weights(SimpleNamespace(), dispatch_output)
+
+    def test_masked_gemm_releases_first_quantization_before_activation(self):
+        self.method.moe_runner_config = SimpleNamespace(
+            activation="silu", swiglu_limit=10.0
+        )
+        hidden_states = torch.zeros((2, 8, 16), dtype=torch.bfloat16)
+        layer = SimpleNamespace(
+            w13_weight_packed=torch.empty((2, 32, 8), dtype=torch.int8),
+            w13_weight_scale=torch.ones((2, 32, 1), dtype=torch.float32),
+            w2_weight_packed=torch.empty((2, 16, 8), dtype=torch.int8),
+            w2_weight_scale=torch.ones((2, 16, 1), dtype=torch.float32),
+            w4a8_padded_intermediate_size=16,
+        )
+        first_quantization_refs = []
+        gemm_calls = 0
+        activation_calls = 0
+
+        def quantize(input):
+            return (
+                torch.zeros_like(input, dtype=torch.int8),
+                torch.ones((*input.shape[:2], 1), dtype=torch.float32),
+            )
+
+        def assert_first_quantization_released():
+            self.assertEqual(len(first_quantization_refs), 2)
+            for tensor_ref in first_quantization_refs:
+                self.assertIsNone(
+                    tensor_ref(), "GEMM1 quantization survives into GEMM2"
+                )
+
+        def grouped_gemm(input, scale, weight, weight_scale, output, *args):
+            nonlocal gemm_calls
+            gemm_calls += 1
+            if gemm_calls == 1:
+                first_quantization_refs.extend((weakref.ref(input), weakref.ref(scale)))
+            else:
+                assert_first_quantization_released()
+            output.zero_()
+
+        def fused_activation(input, limit, mask_m, expect_m):
+            nonlocal activation_calls
+            activation_calls += 1
+            assert_first_quantization_released()
+            return (
+                torch.zeros((2, 8, 16), dtype=torch.int8),
+                torch.ones((2, 8, 1), dtype=torch.float32),
+            )
+
+        with (
+            patch("lightop.quant.per_token_quant_int8", new=quantize),
+            patch("lightop.fuse_silu_mul_clamp_quant_ep", new=fused_activation),
+            patch.object(
+                torch.ops.sglang,
+                "m_grouped_w4a8_gemm_nt_masked",
+                new=grouped_gemm,
+                create=True,
+            ),
+        ):
+            output = self.method._run_deep_gemm_masked(
+                layer,
+                hidden_states,
+                self.masked_m,
+                expected_m=8,
+                guard_activation_scales=True,
+            )
+
+        self.assertEqual(gemm_calls, 2)
+        self.assertEqual(activation_calls, 1)
+        self.assertEqual(output.shape, hidden_states.shape)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(output.count_nonzero().item(), 0)
+
+    def test_masked_gemm_guards_both_normal_activation_scales(self):
+        self.method.moe_runner_config = SimpleNamespace(
+            activation="silu", swiglu_limit=10.0
+        )
+        hidden_states = torch.zeros((2, 8, 16), dtype=torch.bfloat16)
+        q_a1 = torch.zeros_like(hidden_states, dtype=torch.int8)
+        q_a1_scale = torch.arange(16, dtype=torch.float32).view(2, 8, 1)
+        q_a2 = torch.zeros((2, 8, 16), dtype=torch.int8)
+        q_a2_scale = q_a1_scale + 1
+        layer = SimpleNamespace(
+            w13_weight_packed=torch.empty((2, 32, 8), dtype=torch.int8),
+            w13_weight_scale=torch.ones((2, 32, 1), dtype=torch.float32),
+            w2_weight_packed=torch.empty((2, 16, 8), dtype=torch.int8),
+            w2_weight_scale=torch.ones((2, 16, 1), dtype=torch.float32),
+            w4a8_padded_intermediate_size=16,
+        )
+        with (
+            patch(
+                "lightop.quant.per_token_quant_int8",
+                return_value=(q_a1, q_a1_scale),
+            ),
+            patch(
+                "lightop.fuse_silu_mul_clamp_quant_ep",
+                return_value=(q_a2, q_a2_scale),
+            ),
+            patch.object(
+                torch.ops.sglang,
+                "m_grouped_w4a8_gemm_nt_masked",
+                create=True,
+            ) as grouped_gemm,
+        ):
+            output = self.method._run_deep_gemm_masked(
+                layer,
+                hidden_states,
+                self.masked_m,
+                expected_m=8,
+                guard_activation_scales=True,
+            )
+
+        self.assertEqual(grouped_gemm.call_count, 2)
+        for invocation, original in zip(
+            grouped_gemm.call_args_list, (q_a1_scale, q_a2_scale)
+        ):
+            guarded = invocation.args[1]
+            torch.testing.assert_close(guarded, original, atol=0, rtol=0)
+            self.assertEqual(guarded.shape, original.shape)
+            self.assertNotEqual(guarded.data_ptr(), original.data_ptr())
+            self.assertGreaterEqual(
+                guarded.untyped_storage().nbytes()
+                - guarded.numel() * guarded.element_size(),
+                2 * 1024 * 1024,
+            )
+        self.assertEqual(output.shape, hidden_states.shape)
+        self.assertEqual(output.dtype, torch.bfloat16)
+
+    def test_normal_enables_scale_guard_without_splitting_expert_compute(self):
+        x = torch.arange(32, dtype=torch.bfloat16).view(2, 16)
+        topk_ids = torch.tensor([[0, 1], [1, -1]], dtype=torch.int64)
+        topk_weights = torch.tensor([[0.25, 0.75], [1.0, 0.0]])
+        layer = SimpleNamespace(w13_weight_scale=torch.ones((2, 32, 1)))
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            hidden_states_scale=None,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            num_recv_tokens_per_expert=[1, 2],
+        )
+
+        def scatter(x, ids, counts, starts, padded, offsets, indices, **kwargs):
+            positions = [0, 0]
+            for token in range(ids.shape[0]):
+                for slot in range(ids.shape[1]):
+                    expert = int(ids[token, slot])
+                    if expert >= 0:
+                        row = int(starts[expert]) + positions[expert]
+                        padded[row].copy_(x[token])
+                        indices[token, slot] = row
+                        positions[expert] += 1
+
+        def gemm(layer, padded, counts, expected_m, guard_activation_scales=False):
+            self.assertTrue(guard_activation_scales)
+            self.assertEqual(padded.shape, (2, 256, 16))
+            self.assertEqual(counts.tolist(), [1, 2])
+            self.assertEqual(expected_m, 2)
+            return padded * 2
+
+        def gather(padded, ids, weights, indices, output):
+            output.zero_()
+            for token in range(ids.shape[0]):
+                for slot in range(ids.shape[1]):
+                    if ids[token, slot] >= 0:
+                        output[token].add_(
+                            padded[indices[token, slot]] * weights[token, slot]
+                        )
+
+        with (
+            patch(
+                "sglang.kernels.ops.moe.ep_moe_kernels.ep_scatter_no_scale",
+                side_effect=scatter,
+            ),
+            patch(
+                "sglang.kernels.ops.moe.ep_moe_kernels.ep_gather",
+                side_effect=gather,
+            ),
+            patch.object(
+                self.method, "_run_deep_gemm_masked", side_effect=gemm
+            ) as grouped_compute,
+        ):
+            result = self.method._apply_deepep_normal_deep_gemm(layer, dispatch_output)
+
+        self.assertEqual(grouped_compute.call_count, 1)
+        torch.testing.assert_close(result.hidden_states, x * 2, atol=0, rtol=0)
+        self.assertIs(result.topk_ids, topk_ids)
+        self.assertIs(result.topk_weights, topk_weights)
 
     def test_low_latency_rejects_invalid_scale_shape(self):
         dispatch_output = self.make_dispatch_output(

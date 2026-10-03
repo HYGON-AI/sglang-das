@@ -493,6 +493,7 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         masked_m: torch.Tensor,
         expected_m: int,
         hidden_states_scale: Optional[torch.Tensor] = None,
+        guard_activation_scales: bool = False,
     ) -> torch.Tensor:
         from lightop import (
             fuse_silu_mul_clamp_quant_ep,
@@ -507,6 +508,8 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             q_a1, q_a1_scale = per_token_quant_int8(hidden_states)
         else:
             q_a1, q_a1_scale = hidden_states, hidden_states_scale
+        if guard_activation_scales:
+            q_a1_scale = self._guard_deep_gemm_scale_storage(q_a1_scale)
         expected_m = min(hidden_states.shape[1], expected_m)
         gate_up = torch.empty(
             (
@@ -526,6 +529,8 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             masked_m,
             expected_m,
         )
+        # GEMM1-only temporaries are no longer needed by activation or GEMM2.
+        del q_a1, q_a1_scale
 
         swiglu_limit = self.moe_runner_config.swiglu_limit
         if swiglu_limit is None:
@@ -542,6 +547,8 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
                 expect_m=expected_m,
             )
         del gate_up
+        if guard_activation_scales:
+            q_a2_scale = self._guard_deep_gemm_scale_storage(q_a2_scale)
 
         padded_intermediate_size = layer.w4a8_padded_intermediate_size
         if q_a2.shape[-1] != padded_intermediate_size:
@@ -644,7 +651,7 @@ class HCUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         )
 
         masked_output = self._run_deep_gemm_masked(
-            layer, masked_x, masked_m, expected_m
+            layer, masked_x, masked_m, expected_m, guard_activation_scales=True
         )
         output = torch.empty_like(x)
         ep_gather(
