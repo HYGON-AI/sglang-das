@@ -74,6 +74,7 @@ def make_candidate_indexer(
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    request_block_ids: Optional[List[torch.Tensor]] = None  # HCU prefill: [rows_b, K]
 
 
 def published_masks(candidate) -> CandidateMasks:
@@ -230,7 +231,9 @@ def _select_candidate_blocks_fused(
     logits: torch.Tensor,
     compress_lens: torch.Tensor,
     topk_blocks: int,
-) -> torch.Tensor:
+    *,
+    return_block_ids: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Fast path for block_size==8: replaces the block-level ``torch.topk`` (which
     lowers to the multi-kernel mbtopk radix reduction) with a fused top-k, then
     expands the selected block ids to a position-level bool mask.
@@ -272,7 +275,7 @@ def _select_candidate_blocks_fused(
         valid.stride(0),
         BLOCK_K=triton.next_power_of_2(k),
     )
-    return mask
+    return (mask, block_ids) if return_block_ids else mask
 
 
 @triton.jit
@@ -307,7 +310,9 @@ def select_candidate_blocks(
     compress_lens: Union[torch.Tensor, int],
     topk_blocks: int,
     block_size: int,
-) -> torch.Tensor:
+    *,
+    return_block_ids: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Level one of the two-level top-k: a bool mask over positions keeping the
     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
     in logits, so an all -inf block means not reachable yet; the block holding the
@@ -321,7 +326,9 @@ def select_candidate_blocks(
         and logits.ndim == 2
         and isinstance(compress_lens, torch.Tensor)
     ):
-        return _select_candidate_blocks_fused(logits, compress_lens, topk_blocks)
+        return _select_candidate_blocks_fused(
+            logits, compress_lens, topk_blocks, return_block_ids=return_block_ids
+        )
 
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
@@ -337,4 +344,8 @@ def select_candidate_blocks(
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    mask = keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    if return_block_ids:
+        block_ids = top.indices.masked_fill(top.values <= -torch.inf, -1)
+        return mask, block_ids.to(torch.int32)
+    return mask
