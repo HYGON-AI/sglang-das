@@ -3491,23 +3491,9 @@ class DeepseekV4AttnBackend(
             )
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        if _is_hcu:
-            # topk_v2 has no HCU kernel. Keep the CUDA path unchanged and use
-            # the correctness fallback for both normal and LayerSplit pools.
-            columns = torch.arange(logits.shape[1], device=device)[None, :]
-            valid = columns < compress_lens[:, None]
-            count = min(topk, logits.shape[1])
-            ranked = logits.masked_fill(~valid, -torch.inf).topk(
-                count, dim=-1
-            ).indices
-            selected.fill_(-1)
-            selected[:, :count] = torch.where(
-                valid.gather(1, ranked), ranked + ks[:, None], -1
-            ).to(torch.int32)
-        else:
-            topk_transform_ragged_v2(
-                logits, compress_lens, out_offsets=ks, out_indices=selected
-            )
+        topk_transform_ragged_v2(
+            logits, compress_lens, out_offsets=ks, out_indices=selected
+        )
         if indexer.uses_candidates and not indexer.is_candidate_source:
             selected = mask_topk_scores(logits, selected, ks)
         # ascending positions, padding last: the layout the consumers expect
