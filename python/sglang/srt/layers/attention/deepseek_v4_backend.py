@@ -86,6 +86,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMasks,
     CandidateMetadata,
     IndexerInputs,
+    init_candidate_stream,
     make_candidate_indexer,
     mask_topk_scores,
     published_masks,
@@ -1325,6 +1326,8 @@ class DeepseekV4AttnBackend(
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
         candidate_topk_blocks = getattr(cfg, "candidate_topk_blocks", 0)
+        if candidate_topk_blocks > 0:
+            init_candidate_stream()
         self.candidate_indexer = make_candidate_indexer(
             candidate_topk_blocks,
             getattr(cfg, "candidate_block_size", 0),
@@ -3559,7 +3562,6 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
-        metadata.wait_for_schedule()
         assert indexer.n_local_heads == indexer.n_heads
         width = metadata.max_compressed_seq_len
         if indexer.uses_candidates or indexer.is_candidate_source:
@@ -3682,10 +3684,6 @@ class DeepseekV4AttnBackend(
             metadata,
             request_ids=req,  # one per query row; verify rows of a request share one
         )
-        # Let LightOp's metadata planner run while the main stream builds the
-        # query payload and head weights.  The dependency is inserted only at
-        # the first consumer, after all query preparation is queued.
-        metadata.wait_for_schedule()
         candidate_layer = not _every_request_fits()
         # use special selection for candidate layers
         if indexer.uses_candidates and candidate_layer:

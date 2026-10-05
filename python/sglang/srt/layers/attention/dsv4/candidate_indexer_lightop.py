@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
+    get_candidate_stream,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     deep_gemm_fp4_paged_mqa_logits,
@@ -42,8 +43,6 @@ class LightopBlockTable(CandidateMetadata):
     valid_lens: torch.Tensor
     # split-KV schedule of the sparse rows, None past the planner's row limit
     schedule: Optional[torch.Tensor]
-    # recorded on the side stream once the fields above are complete
-    ready: torch.cuda.Event
 
 
 def _int32_lens(seq_lens: torch.Tensor) -> torch.Tensor:
@@ -62,7 +61,7 @@ class LightopCandidateIndexer:
             )
         self.topk_blocks = topk_blocks
         self.block_size = block_size
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_candidate_stream()
 
     def publish_decode(
         self,
@@ -71,7 +70,6 @@ class LightopCandidateIndexer:
         raw_indices: Optional[torch.Tensor] = None,
     ) -> LightopBlockTable:
         metadata = inputs.metadata
-        metadata.wait_for_schedule()
         seq_lens = _int32_lens(metadata.compressed_seq_lens)
         logits = deep_gemm_fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
@@ -85,9 +83,28 @@ class LightopCandidateIndexer:
             rows_per_request=metadata.rows_per_request,
         )
         main_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(main_stream)
-        # The block-table kernel reads logits after the main stream moves on.
+        # The block-table chain reads logits and nothing else, so it forks off
+        # the dense logits launch and runs beside the layer's own top-k.
+        producer_ready = torch.cuda.Event()
+        producer_ready.record(main_stream)
         logits.record_stream(self.alt_stream)
+        self._dense_topk(logits, seq_lens, metadata, page_indices, raw_indices)
+        with torch.cuda.stream(self.alt_stream):
+            self.alt_stream.wait_event(producer_ready)
+            table = self._block_table(logits, seq_lens, metadata)
+            # select_decode reads these on the main stream
+            for t in (table.phys_blocks, table.valid_lens, table.schedule):
+                if t is not None:
+                    t.record_stream(main_stream)
+            join = torch.cuda.Event()
+            join.record(self.alt_stream)
+        # Close the fork here; one left open to the first consumer spans the
+        # layers in between, which a replayed graph may put on the side stream.
+        main_stream.wait_event(join)
+        return table
+
+    @staticmethod
+    def _dense_topk(logits, seq_lens, metadata, page_indices, raw_indices) -> None:
         topk_transform_paged(
             logits,
             seq_lens,
@@ -96,31 +113,31 @@ class LightopCandidateIndexer:
             metadata.compressed_page_size,
             raw_indices,
         )
-        with torch.cuda.stream(self.alt_stream):
-            phys_blocks, valid_lens = lightop_indexer.candidate_block_table(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                metadata.compressed_page_size,
-                self.topk_blocks,
-                self.block_size,
-            )
-            schedule = None
-            if 0 < valid_lens.numel() <= lightop_indexer.MAX_SCHEDULE_ROWS:
-                schedule = lightop_indexer.get_paged_mqa_logits_schedule(
-                    context_lens=valid_lens
-                )
-            # select_decode reads these on the main stream
-            for t in (phys_blocks, valid_lens, schedule):
-                if t is not None:
-                    t.record_stream(main_stream)
-            ready = torch.cuda.Event()
-            ready.record(self.alt_stream)
+
+    def _block_table(
+        self,
+        logits: torch.Tensor,
+        seq_lens: torch.Tensor,
+        metadata,
+    ) -> LightopBlockTable:
+        phys_blocks, valid_lens = lightop_indexer.candidate_block_table(
+            logits,
+            seq_lens,
+            metadata.page_table,
+            metadata.compressed_page_size,
+            self.topk_blocks,
+            self.block_size,
+        )
+        schedule = None
+        if lightop_indexer.schedule_rows_supported(valid_lens.numel()):
+            # One route per row: select_decode's TB=8 kernel never pairs
+            # verify rows. The planner reads valid_lens on device, so a
+            # captured graph replans on every replay.
+            schedule = lightop_indexer.get_paged_mqa_logits_schedule(valid_lens)
         return LightopBlockTable(
             phys_blocks=phys_blocks,
             valid_lens=valid_lens,
             schedule=schedule,
-            ready=ready,
         )
 
     def select_decode(
@@ -133,7 +150,6 @@ class LightopCandidateIndexer:
         assert raw_indices is None
         table = candidate_metadata
         assert isinstance(table, LightopBlockTable), type(table)
-        torch.cuda.current_stream().wait_event(table.ready)
         logits = lightop_indexer.paged_mqa_logits_fp4(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,

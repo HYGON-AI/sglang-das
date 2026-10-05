@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
+    get_candidate_stream,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     deep_gemm_fp4_paged_mqa_logits,
@@ -148,7 +149,7 @@ class DeepGemmCandidateIndexer:
             )
         self.topk_blocks = topk_blocks
         self.block_size = block_size
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_candidate_stream()
         self._row_ids: Optional[torch.Tensor] = None
         self._retired_row_ids: list = []  # captured graphs keep reading the buffers they saw
 
@@ -194,9 +195,12 @@ class DeepGemmCandidateIndexer:
             table_block_size=metadata.compressed_page_size,
         )
         main_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(main_stream)
-        # The block-selection chain reads logits after the main stream moves on.
+        # The block-selection chain depends only on the dense logits launch.
+        # Record that boundary before the independent dense top-k so the
+        # candidate metadata chain can overlap later main-stream work.
         logits.record_stream(self.alt_stream)
+        producer_ready = torch.cuda.Event()
+        producer_ready.record(main_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
         topk_transform_paged_v2(
             logits,
@@ -209,6 +213,7 @@ class DeepGemmCandidateIndexer:
         )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
+            self.alt_stream.wait_event(producer_ready)
             nblocks, row_valid_lens = candidate_row_lens(
                 seq_lens, self.topk_blocks, self.block_size
             )
