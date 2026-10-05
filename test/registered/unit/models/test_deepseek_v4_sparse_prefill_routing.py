@@ -1,10 +1,11 @@
 import os
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import topk as dsv4_topk
 from sglang.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend
@@ -15,6 +16,141 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
+    @staticmethod
+    def _ragged_topk_reference(
+        scores, seq_lens, *, out_offsets, out_indices, row_starts=None
+    ):
+        out_indices.fill_(-1)
+        for row, length in enumerate(seq_lens.tolist()):
+            start = 0 if row_starts is None else row_starts[row].item()
+            count = min(length, out_indices.shape[1])
+            if count:
+                selected = scores[row, start : start + length].topk(count).indices
+                out_indices[row, :count].copy_(
+                    (selected + out_offsets[row]).to(torch.int32)
+                )
+
+    def test_hcu_ragged_topk_forwards_metadata_and_writes_preallocated_output(self):
+        scores = torch.tensor(
+            [[9, 1, 7, 3, 100, 2, 4, 8], [5] * 8, [8, 6, 4, 2, 7, 1, 9, 3]],
+            dtype=torch.float32,
+        )
+        lengths = torch.tensor([3, 0, 2], dtype=torch.int32)
+        offsets = torch.tensor([11, 31, 41], dtype=torch.int32)
+        original_scores = scores.clone()
+        for starts in (None, torch.tensor([2, 0, 4], dtype=torch.int32)):
+            with self.subTest(row_starts=starts is not None):
+                selected = torch.full((3, 512), -2, dtype=torch.int32)
+                output_ptr = selected.data_ptr()
+                lightop = ModuleType("lightop")
+                lightop.topk_transform_ragged_v2 = Mock(
+                    side_effect=self._ragged_topk_reference
+                )
+                with (
+                    patch.dict("sys.modules", {"lightop": lightop}),
+                    patch.object(dsv4_topk, "_IS_HCU", True),
+                    patch.object(
+                        dsv4_topk,
+                        "_jit_topk_v2_module",
+                        side_effect=AssertionError("HCU must not load CUDA JIT"),
+                    ),
+                    patch.object(
+                        dsv4_topk,
+                        "is_xpu",
+                        side_effect=AssertionError("HCU must return before XPU routing"),
+                    ),
+                ):
+                    result = dsv4_topk.topk_transform_ragged_v2(
+                        scores,
+                        lengths,
+                        out_offsets=offsets,
+                        out_indices=selected,
+                        row_starts=starts,
+                    )
+                self.assertIsNone(result)
+                self.assertEqual(selected.data_ptr(), output_ptr)
+                lightop.topk_transform_ragged_v2.assert_called_once_with(
+                    scores,
+                    lengths,
+                    out_offsets=offsets,
+                    out_indices=selected,
+                    row_starts=starts,
+                )
+                self.assertEqual(selected[0, :3].sort().values.tolist(), [11, 12, 13])
+                self.assertEqual(selected[2, :2].sort().values.tolist(), [41, 42])
+                self.assertTrue((selected[0, 3:] == -1).all())
+                self.assertTrue((selected[1] == -1).all())
+                self.assertTrue((selected[2, 2:] == -1).all())
+                torch.testing.assert_close(scores, original_scores)
+
+    def test_non_hcu_ragged_topk_preserves_cuda_and_xpu_routing(self):
+        scores = torch.tensor([[9, 4, 7, 1]], dtype=torch.float32)
+        lengths = torch.tensor([3], dtype=torch.int32)
+        starts = torch.tensor([1], dtype=torch.int32)
+        offsets = torch.tensor([20], dtype=torch.int32)
+        for use_xpu in (False, True):
+            with self.subTest(xpu=use_xpu):
+                selected = torch.full((1, 2), -2, dtype=torch.int32)
+                cuda_transform = Mock(
+                    side_effect=lambda scores, lengths, starts, offsets, selected: (
+                        self._ragged_topk_reference(
+                            scores,
+                            lengths,
+                            out_offsets=offsets,
+                            out_indices=selected,
+                            row_starts=starts,
+                        )
+                    )
+                )
+                xpu_transform = Mock(
+                    side_effect=lambda scores, lengths, selected, offsets, starts: (
+                        self._ragged_topk_reference(
+                            scores,
+                            lengths,
+                            out_offsets=offsets,
+                            out_indices=selected,
+                            row_starts=starts,
+                        )
+                    )
+                )
+                with (
+                    patch.object(dsv4_topk, "_IS_HCU", False),
+                    patch.object(dsv4_topk, "is_xpu", return_value=use_xpu),
+                    patch.object(
+                        dsv4_topk,
+                        "_jit_topk_v2_module",
+                        return_value=SimpleNamespace(
+                            topk_transform_ragged=cuda_transform
+                        ),
+                    ) as jit,
+                    patch.object(
+                        torch.ops.sgl_kernel,
+                        "topk_transform_ragged",
+                        xpu_transform,
+                        create=True,
+                    ),
+                ):
+                    dsv4_topk.topk_transform_ragged_v2(
+                        scores,
+                        lengths,
+                        out_offsets=offsets,
+                        out_indices=selected,
+                        row_starts=starts,
+                    )
+                self.assertEqual(selected.sort().values.tolist(), [[20, 21]])
+                if use_xpu:
+                    jit.assert_not_called()
+                    cuda_transform.assert_not_called()
+                    xpu_transform.assert_called_once_with(
+                        scores, lengths, selected, offsets, starts
+                    )
+                else:
+                    jit.assert_called_once_with()
+                    cuda_transform.assert_called_once_with(
+                        scores, lengths, starts, offsets, selected
+                    )
+                    xpu_transform.assert_not_called()
+
     def _apply_hip_defaults(self):
         cfg = SimpleNamespace(
             dsv4_attn_backend="auto",
@@ -599,6 +735,10 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         pos = torch.tensor([1, 65535], dtype=torch.int64)
         results = []
         for flag, available in (("0", True), ("1", True), ("1", False)):
+            lightop = ModuleType("lightop")
+            lightop.topk_transform_ragged_v2 = Mock(
+                side_effect=self._ragged_topk_reference
+            )
 
             def logits_boundary(q, k, weights, ks, ke, width, **kwargs):
                 logits = torch.full((2, width), -torch.inf)
@@ -611,6 +751,13 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
 
             with (
                 patch.object(deepseek_v4_backend, "_is_hcu", True),
+                patch.object(dsv4_topk, "_IS_HCU", True),
+                patch.object(
+                    dsv4_topk,
+                    "_jit_topk_v2_module",
+                    side_effect=AssertionError("HCU must not load CUDA JIT"),
+                ),
+                patch.dict("sys.modules", {"lightop": lightop}),
                 patch.object(
                     deepseek_v4_backend,
                     "_hcu_candidate_logits_available",
@@ -641,6 +788,14 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 publish.call_args.kwargs["logits_already_masked"],
                 flag == "1" and available,
             )
+            fused = lightop.topk_transform_ragged_v2
+            fused.assert_called_once()
+            self.assertEqual(fused.call_args.args[1].tolist(), [2, 65536])
+            self.assertEqual(fused.call_args.kwargs["out_offsets"].tolist(), [0, 11])
+            self.assertEqual(
+                tuple(fused.call_args.kwargs["out_indices"].shape), (2, 12)
+            )
+            self.assertIsNone(fused.call_args.kwargs["row_starts"])
             results.append((pages.clone(), raw.clone()))
         for result in results[1:]:
             for actual, expected in zip(result, results[0]):
