@@ -40,13 +40,28 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
-def _aiter_enable_register_for_capturing(tms_cudagraph: bool) -> bool:
+def _aiter_enable_register_for_capturing(
+    tms_cudagraph: bool, hf_config: Optional[Any] = None
+) -> bool:
     """Resolve AITER's direct graph-input registration mode.
 
     Memory-saver graphs require copy-in mode.  Outside memory-saver mode,
     honor AITER's documented environment switch instead of forcing direct
     registration unconditionally.
     """
+    # The GLM-5.2 DSA checkpoint shares TopK every four layers. Its raw
+    # head_dim=192 is normalized to 64 by HF config loading, so identify it
+    # by the indexer topology instead. On HCU, registering the
+    # AITER all-reduce input directly into its decode graph changes generated
+    # tokens, while AITER's copy-in mode and eager execution agree. Preserve
+    # direct registration for other models and use copy-in for this layout.
+    if (
+        _is_hcu
+        and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+        and getattr(hf_config, "index_topk_freq", None) == 4
+        and getattr(hf_config, "index_skip_topk_offset", None) == 3
+    ):
+        return False
     return not tms_cudagraph and get_bool_env_var(
         "AITER_AR_ENABLE_REG_CAPTURE", default="true"
     )
@@ -493,8 +508,13 @@ def dispatch_custom_allreduce(
 
         transport = os.environ.get("AITER_AR_TRANSPORT", "ipc").lower()
         if transport == "ipc":
+            hf_config = None
+            if _is_hcu:
+                from sglang.srt.runtime_context import get_server_args
+
+                hf_config = get_server_args().get_model_config().hf_config
             enable_reg = _aiter_enable_register_for_capturing(
-                envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get(), hf_config
             )
         elif transport in ("fabric", "auto"):
             # Fabric cannot register arbitrary graph allocations; auto may

@@ -734,7 +734,7 @@ class DeepseekSparseAttnBackend(
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
         # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
-        if not self.dsa_topk_backend.should_use_topk_v2():
+        if not self.dsa_topk_backend.should_use_topk_v2_paged():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -1265,7 +1265,7 @@ class DeepseekSparseAttnBackend(
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             and self.use_fused_topk
-            and self.dsa_topk_backend.should_use_topk_v2()
+            and self.dsa_topk_backend.should_use_topk_v2_paged()
             and self.dsa_index_topk is not None
             and 0 < self.dsa_index_topk <= 2048
         )

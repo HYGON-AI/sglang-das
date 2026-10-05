@@ -324,11 +324,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
         )
-        # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
-        # (last verified token), not draft-decode step 0.
+        # Carrying draft-extend's indexer top-k into GLM DSA's first draft
+        # step lowers EAGLE acceptance on HCU. Recompute that first top-k and
+        # still share it across the remaining draft steps.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration
+            and self.dsa_index_topk is not None
+            and not (_is_hcu and getattr(hf_config, "model_type", None) == "glm_moe_dsa")
         )
 
     def init_token_map(self):
