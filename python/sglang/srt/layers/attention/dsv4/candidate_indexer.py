@@ -23,6 +23,45 @@ if TYPE_CHECKING:
 # HIP/DCU resolves the block-level top-k to a prebuilt lightop op; NVIDIA to JIT.
 _IS_HCU = is_hcu()
 
+# Each GPU has its own worker process. The shared candidate stream is created
+# once at backend init, after device selection and before any capture, so that
+# no layer ever creates a stream from inside a captured region.
+_CANDIDATE_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def init_candidate_stream() -> None:
+    """Create the shared candidate stream for this worker's device.
+
+    Call from backend init, before capture. Idempotent, so the eager and the
+    capture paths both observe the same stream object.
+    """
+    global _CANDIDATE_STREAM
+    if _CANDIDATE_STREAM is None:
+        # Each SGLang worker owns one device, so one process-wide stream is
+        # enough for every candidate indexer instance in that worker.
+        _CANDIDATE_STREAM = torch.cuda.Stream()
+
+
+def get_candidate_stream() -> torch.cuda.Stream:
+    """The shared candidate stream, creating it on first use.
+
+    Callers that run inside capture must not reach the creating path; the
+    backend calls ``init_candidate_stream`` before capture so this only ever
+    returns the stream that was created at init.
+    """
+    if _CANDIDATE_STREAM is None:
+        init_candidate_stream()
+    return _CANDIDATE_STREAM
+
+
+def get_candidate_stream_if_initialized() -> Optional[torch.cuda.Stream]:
+    """The shared candidate stream, or None when it was never created.
+
+    Lets the scheduler avoid allocating a colliding side stream without
+    forcing the candidate stream into existence on workers that never use it.
+    """
+    return _CANDIDATE_STREAM
+
 
 class CandidateMetadata:
     """Base of an implementation's published state on
@@ -49,7 +88,8 @@ class IndexerInputs:
 
 
 def make_candidate_indexer(
-    topk_blocks: int, block_size: int
+    topk_blocks: int,
+    block_size: int,
 ) -> Optional[Union[DeepGemmCandidateIndexer, LightopCandidateIndexer]]:
     """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
     indexer selects through masks inline. HCU uses the LightOp implementation

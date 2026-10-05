@@ -110,6 +110,44 @@ def _int32_lens(lens: torch.Tensor) -> torch.Tensor:
 # scores 256-position splits whatever the pool page or table block size.
 _SCHEDULE_BLOCK_KV = 64
 
+# The legacy planner is a compile-time dispatch table.  Keep its exact aligned
+# row set here so an odd batch (for example 1088) falls back to the grid path
+# instead of reaching the native unreachable branch.  The FP4 planner is
+# dynamic and uses the larger LDS-backed limit exported by the extension.
+_LEGACY_SCHEDULE_ALIGNED_ROWS = frozenset(
+    list(range(64, 1025, 64)) + [2048, 4096, 8192]
+)
+MAX_SCHEDULE_ROWS = 16384
+
+
+def _fp4_schedule_rows(context_rows: int, rows_per_request: int) -> int:
+    if rows_per_request <= 1:
+        return context_rows
+    if context_rows % rows_per_request:
+        return context_rows
+    requests = context_rows // rows_per_request
+    if requests < 8:
+        return context_rows
+    return requests * ((rows_per_request + 1) // 2)
+
+
+def schedule_rows_supported(num_rows: int, rows_per_request: int = 1) -> bool:
+    """Whether the installed planner can safely make metadata for this batch."""
+    if num_rows <= 0 or rows_per_request <= 0 or num_rows % rows_per_request:
+        return False
+    routes = _fp4_schedule_rows(num_rows, rows_per_request)
+    modules = _lightop_modules()
+    if modules is None:
+        return False
+    op, _ = modules
+    if hasattr(op, "get_paged_mqa_logits_fp4_metadata"):
+        max_rows = int(
+            getattr(op, "PAGED_MQA_LOGITS_FP4_MAX_SCHEDULE_ROWS", MAX_SCHEDULE_ROWS)
+        )
+        return routes <= max_rows
+    aligned = ((routes + 63) // 64) * 64
+    return aligned in _LEGACY_SCHEDULE_ALIGNED_ROWS
+
 
 def get_paged_mqa_logits_schedule(
     context_lens: torch.Tensor, rows_per_request: int = 1
@@ -120,15 +158,18 @@ def get_paged_mqa_logits_schedule(
     and only valid for paged_mqa_logits_fp4 called with the same value."""
     op, attention = _lightop_modules()
     lens = _int32_lens(context_lens)
+    if hasattr(op, "get_paged_mqa_logits_fp4_metadata"):
+        return op.get_paged_mqa_logits_fp4_metadata(
+            lens,
+            _SCHEDULE_BLOCK_KV,
+            _num_cus(lens.device.index),
+            rows_per_request,
+        )
     if rows_per_request > 1:
         lens = attention.paged_mqa_logits_route_lens(lens, rows_per_request)
     return op.get_paged_mqa_logits_metadata(
         lens, _SCHEDULE_BLOCK_KV, _num_cus(lens.device.index)
     )
-
-
-# The planner kernel covers up to this many rows (aligned-batch dispatch table).
-MAX_SCHEDULE_ROWS = 8192
 
 
 def paged_mqa_logits_fp4(
