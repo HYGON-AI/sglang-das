@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import warnings
-from functools import lru_cache
 from dataclasses import dataclass, field, fields
 from typing import Any, Iterator, List, Optional
 
@@ -69,18 +68,6 @@ _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 # DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this on
 # SM120 (shared-memory cap), so SM120 always splits larger batches.
 _SM120_INDEXER_M_CHUNK = 4096
-
-
-@lru_cache(maxsize=None)
-def _lightop_planner_stream(device_index: int) -> torch.cuda.Stream:
-    """Reuse the auxiliary stream used for eager LightOp schedule planning.
-
-    Creating a CUDA stream for every metadata object adds a host-side launch
-    cost and leaves the stream lifetime tied to a single forward.  The event
-    dependency still orders each plan against the caller stream, so sharing one
-    planner stream per device is safe across forwards.
-    """
-    return torch.cuda.Stream(device=device_index)
 
 
 def plan_indexer_row_chunks(
@@ -218,13 +205,6 @@ class PagedIndexerMetadata:
     topk_metadata_chunks: Optional[List[torch.Tensor]] = field(
         init=False, repr=False, default=None
     )
-    # On HCU eager decode, LightOp's schedule planner can run while the main
-    # stream prepares Q/K.  The consumer waits on this event immediately before
-    # launching paged MQA logits.
-    schedule_ready_event: Optional[torch.cuda.Event] = field(
-        init=False, repr=False, default=None
-    )
-
     def __post_init__(self):
         if _is_hcu:
             self.deep_gemm_metadata = self._lightop_schedule()
@@ -337,37 +317,19 @@ class PagedIndexerMetadata:
             self.compress_ratio not in (1, 2)
             or self.row_chunk > 0
             or self.use_prefill_cuda_graph
-            or torch.cuda.is_current_stream_capturing()
             or not lightop_indexer.lightop_paged_indexer_available()
-            or not 0 < self.compressed_seq_lens.numel()
-            <= lightop_indexer.MAX_SCHEDULE_ROWS
+            or not lightop_indexer.schedule_rows_supported(
+                self.compressed_seq_lens.numel(), self.rows_per_request
+            )
         ):
             return None
-        current = torch.cuda.current_stream(self.compressed_seq_lens.device)
-        planner_stream = _lightop_planner_stream(
-            self.compressed_seq_lens.device.index
+        # Planned on the caller stream, in capture and eager alike: the planner is
+        # one tiny kernel, and a forked capture lets the HIP graph move the rest
+        # of the forward onto the side stream.
+        return lightop_indexer.get_paged_mqa_logits_schedule(
+            context_lens=self.compressed_seq_lens,
+            rows_per_request=self.rows_per_request,
         )
-        planner_stream.wait_stream(current)
-        with torch.cuda.stream(planner_stream):
-            schedule = lightop_indexer.get_paged_mqa_logits_schedule(
-                context_lens=self.compressed_seq_lens,
-                rows_per_request=self.rows_per_request,
-            )
-            if schedule is not None:
-                schedule.record_stream(current)
-            ready = torch.cuda.Event()
-            ready.record(planner_stream)
-        self.schedule_ready_event = ready
-        return schedule
-
-    def wait_for_schedule(self) -> None:
-        """Make an asynchronously planned LightOp schedule visible to this stream."""
-        if self.schedule_ready_event is None:
-            return
-        torch.cuda.current_stream(self.compressed_seq_lens.device).wait_event(
-            self.schedule_ready_event
-        )
-        self.schedule_ready_event = None
 
     def _mqa_logits_budget(self, *, num_rows: int) -> Optional[int]:
         """Free-memory budget for this forward's logits; None disables chunking.
@@ -426,7 +388,6 @@ class PagedIndexerMetadata:
             "rows_per_chunk",
             "mqa_logits_budget_bytes",
             "topk_metadata_chunks",
-            "schedule_ready_event",
         ]
         copy_metadata(
             src=other,
