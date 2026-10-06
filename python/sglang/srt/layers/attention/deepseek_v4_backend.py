@@ -2985,7 +2985,12 @@ class DeepseekV4AttnBackend(
             _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
-                    layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                    layer,
+                    x,
+                    req,
+                    pos,
+                    projected=(bufs["kv"], bufs.get("score")),
+                    fuse_index_store=(x.is_cuda and _supports_index_k_rope_pack()),
                 )
             if run_indexer and layer.indexer is not None:
                 self._low_ratio_index_topk_prefill_graph(
@@ -3020,7 +3025,15 @@ class DeepseekV4AttnBackend(
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            self._low_ratio_compress_torch(
+                layer,
+                x_global,
+                req_global,
+                pos_global,
+                fuse_index_store=(
+                    x_global.is_cuda and _supports_index_k_rope_pack()
+                ),
+            )
         if run_indexer and layer.indexer is not None:
             q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device)
             x_local = x[:num_local]
@@ -3078,8 +3091,15 @@ class DeepseekV4AttnBackend(
                 req,
                 pos,
                 fuse_index_store=(
-                    forward_batch.forward_mode.is_target_verify()
-                    and layer.compressor.use_fused_compress
+                    x.is_cuda
+                    and _supports_index_k_rope_pack()
+                    and (
+                        forward_batch.forward_mode.is_extend()
+                        or (
+                            forward_batch.forward_mode.is_target_verify()
+                            and layer.compressor.use_fused_compress
+                        )
+                    )
                 ),
             )
 
