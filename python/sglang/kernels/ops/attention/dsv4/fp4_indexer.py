@@ -381,13 +381,23 @@ def _index_k_rope_pack_kernel(
     byte_offsets = tl.arange(0, 64)
     if STORE_CACHE:
         location = tl.load(Loc + token)
+        # Slot 0 is the reserved dummy row. Prefill ratio-2 batches also use
+        # it for an incomplete final group, so the fused writer must preserve
+        # the same no-publish behavior as the reference cache writer.
+        valid = location > 0
+        location = tl.maximum(location, 0)
         page = location // PAGE_SIZE
         slot = location % PAGE_SIZE
-        tl.store(Cache + page * CACHE_STRIDE + slot * 64 + byte_offsets, payload)
+        tl.store(
+            Cache + page * CACHE_STRIDE + slot * 64 + byte_offsets,
+            payload,
+            mask=valid,
+        )
         scale_bytes = (sf >> (tl.arange(0, 4) * 8)) & 0xFF
         tl.store(
             Cache + page * CACHE_STRIDE + PAGE_SIZE * 64 + slot * 4 + tl.arange(0, 4),
             scale_bytes,
+            mask=valid,
         )
     else:
         tl.store(Payload + row * 64 + byte_offsets, payload)
@@ -405,7 +415,8 @@ def index_k_rope_pack(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """RoPE, fake fp4 quantization and the indexer pack in one launch: packed
     ``[T*heads, 64]`` / ``[T*heads]`` when ``cache`` is None, else the paged index-K
-    cache write. Without positions, freqs is already gathered per token; otherwise
+    cache write. ``loc<=0`` is treated as the reserved dummy slot and is not written.
+    Without positions, freqs is already gathered per token; otherwise
     the kernel reads freqs[positions] directly, removing the gather launch.
 
     Both quantization stages stay: the indexer packer has a different scale floor
