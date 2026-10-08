@@ -87,3 +87,10 @@ jobs:
     with:
       docker_image: ${{ needs.build.outputs.docker_image }}
     secrets: inherit
+
+  test-operator:
+    needs: build
+    uses: ./.github/workflows/nightly-test-operator-hcu.yml
+    with:
+      docker_image: ${{ needs.build.outputs.docker_image }}
+    secrets: inherit
