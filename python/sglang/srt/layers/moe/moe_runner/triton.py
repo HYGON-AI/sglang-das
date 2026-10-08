@@ -59,6 +59,9 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     use_int8_w8a8: bool = False
     use_int8_w8a16: bool = False
     use_int4_w4a16: bool = False
+    use_int4_w4a8: bool = False
+    use_mxfp4_w4a16: bool = False
+    use_mxfp4_w4a8: bool = False
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
@@ -70,6 +73,11 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
+
+
+def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
+    # only expert parallelism can route a token to an expert this rank does not hold
+    return config.num_experts is None or config.num_experts != config.num_local_experts
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -108,6 +116,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
+                sanitize_topk_ids=_topk_ids_may_be_nonlocal(self.config),
             )
             return TritonRunnerOutput(hidden_states=out)
 
@@ -145,6 +154,9 @@ class TritonRunnerCore(MoeRunnerCore):
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
             use_int4_w4a16=quant_info.use_int4_w4a16,
+            use_int4_w4a8=quant_info.use_int4_w4a8,
+            use_mxfp4_w4a16=quant_info.use_mxfp4_w4a16,
+            use_mxfp4_w4a8=quant_info.use_mxfp4_w4a8,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
@@ -208,6 +220,7 @@ def fused_experts_none_to_triton(
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
             gate_up_interleaved=runner_config.gate_up_interleaved,
+            sanitize_topk_ids=_topk_ids_may_be_nonlocal(runner_config),
         )
     else:
         if quant_info.use_mxfp8 and is_cuda():
@@ -240,6 +253,9 @@ def fused_experts_none_to_triton(
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
             use_int4_w4a16=quant_info.use_int4_w4a16,
+            use_int4_w4a8=quant_info.use_int4_w4a8,
+            use_mxfp4_w4a16=quant_info.use_mxfp4_w4a16,
+            use_mxfp4_w4a8=quant_info.use_mxfp4_w4a8,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
@@ -296,6 +312,9 @@ def pre_permute_standard_to_triton(
         use_int8_w8a8=quant_info.use_int8_w8a8,
         use_int8_w8a16=quant_info.use_int8_w8a16,
         use_int4_w4a16=quant_info.use_int4_w4a16,
+        use_int4_w4a8=quant_info.use_int4_w4a8,
+        use_mxfp4_w4a16=quant_info.use_mxfp4_w4a16,
+        use_mxfp4_w4a8=quant_info.use_mxfp4_w4a8,
         per_channel_quant=quant_info.per_channel_quant,
         block_shape=quant_info.block_shape,
     )

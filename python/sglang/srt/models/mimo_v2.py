@@ -18,6 +18,7 @@
 import logging
 import math
 import re
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -26,9 +27,6 @@ from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -39,8 +37,7 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
+    LayerFacts,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -56,7 +53,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -78,20 +75,31 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+# from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend, get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
+    is_hcu,
     ceil_align,
     is_non_idle_and_non_empty,
     make_layers,
 )
+_is_hcu = is_hcu()
+if _is_hcu:
+    from lightop.attention import mimo_v2_split_rope_vscale_kv_store
+
+    _use_lightop_rotary_embedding_fuse = get_bool_env_var(
+        "SGLANG_USE_FUSED_RMSNORM_ROPE"
+    )
 
 MiMoV2Config = None
 
@@ -352,7 +360,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -362,7 +370,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -371,9 +379,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
@@ -430,6 +444,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -495,10 +510,7 @@ class MiMoV2MoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states
 
@@ -511,7 +523,7 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -544,7 +556,7 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -693,6 +705,42 @@ class MiMoV2Attention(nn.Module):
             if attention_sink_bias
             else None
         )
+        if get_model().kv_cache_dtype == "fp8_e4m3":
+            self.kv_cache_dtype = torch.float8_e4m3fn
+        elif get_model().kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_dtype = torch.float8_e5m2
+        elif get_model().kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
+        else:
+            self.kv_cache_dtype = torch.bfloat16
+        self.page_size = get_schedule().page_size
+        self.layer_id = layer_id
+
+    def _get_lightop_mha_kv_args(self, forward_batch: ForwardBatch):
+        # v0.5.18 adaptation: KV pool is provided by the forward context.
+        # pool = forward_batch.token_to_kv_pool
+        pool = get_token_to_kv_pool()
+        loc = forward_batch.out_cache_loc
+
+        if hasattr(pool, "layers_mapping"):
+            layer_id_pool, is_swa_layer = pool.layers_mapping[self.layer_id]
+            if is_swa_layer:
+                # v0.5.18 adaptation: SWA write locations live in attention metadata.
+                # if pool.swa_loc is not None:
+                #     loc = pool.swa_loc
+                # else:
+                #     if pool.full_to_swa_index_mapping is not None:
+                #         loc = pool.translate_loc_from_full_to_swa(loc)
+                swa_loc = get_attn_backend().forward_metadata.swa_out_cache_loc
+                assert swa_loc is not None, "MiMo SWA write locations are missing"
+                loc = swa_loc[: loc.shape[0]]
+                k_buffer, v_buffer = pool.swa_kv_pool.get_kv_buffer(layer_id_pool)
+            else:
+                k_buffer, v_buffer = pool.full_kv_pool.get_kv_buffer(layer_id_pool)
+        else:
+            logger.error("mimo v2 kv pool is not healthy: missing layers_mapping")
+            return None
+        return k_buffer, v_buffer, loc
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -742,14 +790,46 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        if _is_hcu and _use_lightop_rotary_embedding_fuse:
+            kv_args = self._get_lightop_mha_kv_args(forward_batch)
+            if kv_args is None:
+                return None
+            k_buffer, v_buffer, kv_cache_loc = kv_args
 
-        # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
-        # [t, h, d]
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            if cos_sin_cache.device != qkv.device or cos_sin_cache.dtype != qkv.dtype:
+                cos_sin_cache = cos_sin_cache.to(
+                    qkv.device, dtype=qkv.dtype, non_blocking=True
+                )
+                self.rotary_emb.cos_sin_cache = cos_sin_cache
 
-        if self.v_scale is not None:
-            v = v * self.v_scale
+            q, k, v = mimo_v2_split_rope_vscale_kv_store(
+                positions,
+                qkv,
+                self.q_size,
+                self.k_size,
+                self.v_size,
+                cos_sin_cache,
+                head_dim=self.head_dim,
+                v_head_dim=self.v_head_dim,
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                kv_cache_loc=kv_cache_loc,
+                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                value_scale=self.v_scale if self.v_scale is not None else 1.0,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=self.attn.k_scale,
+                v_cache_scale=self.attn.v_scale,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+
+            # [t, h, dr]
+            q, k = self.rotary_emb(positions, q, k)
+            # [t, h, d]
+
+            if self.v_scale is not None:
+                v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output
@@ -858,7 +938,7 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -866,11 +946,10 @@ class MiMoV2DecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -902,29 +981,9 @@ class MiMoV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -1082,13 +1141,6 @@ class MiMoV2Model(nn.Module):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[tbo_start_layer:tbo_end_layer],
                 enable_tbo=True,
-                input_data_scatter_mode=(
-                    ScatterMode.model_input_output()
-                    if tbo_start_layer == self.start_layer
-                    else self.layers[
-                        tbo_start_layer - 1
-                    ].layer_scatter_modes.layer_output_mode
-                ),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
@@ -1106,6 +1158,11 @@ class MiMoV2Model(nn.Module):
                         aux_hidden_states if i in self.layers_to_capture else None
                     ),
                 )
+
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
 
         # A draft targeting the final layer ("after layer
         # num_hidden_layers-1") maps to capture index num_hidden_layers,
@@ -1269,7 +1326,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
         return self.model.get_input_embedding(input_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1593,6 +1650,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     )
                     skipped_mtp_weights = True
                 continue
+
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:

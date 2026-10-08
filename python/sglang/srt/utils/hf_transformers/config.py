@@ -26,12 +26,14 @@ from sglang.srt.configs.deepseek_v41 import (
     DeepseekV41Config,
     normalize_deepseek_v41_config,
 )
+from sglang.srt.configs.dspark import normalize_dspark_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
     register_model_config_parser,
 )
 from sglang.srt.connector import create_remote_connector
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
 from ..hf_transformers_patches import _ensure_gguf_version
@@ -66,6 +68,28 @@ _LONGCAT_ARCHS = {
     "LongcatFlashForCausalLM",
     "LongcatFlashNgramForCausalLM",
 }
+
+_GLM_MOE_DSA_ARCHS = {
+    "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
+}
+
+
+def _restore_glm_moe_dsa_raw_config_fields(
+    config, model, revision: Optional[str], **kwargs
+):
+    """Restore GLM DSA fields clobbered by incompatible Transformers versions."""
+    architectures = getattr(config, "architectures", None) or []
+    if not any(arch in _GLM_MOE_DSA_ARCHS for arch in architectures):
+        return
+
+    raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision, **kwargs)
+    for key in ("qk_rope_head_dim", "index_topk_freq"):
+        if key in raw_config and getattr(config, key, None) != raw_config[key]:
+            setattr(config, key, raw_config[key])
+
+    if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
+        config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
 
 def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
@@ -120,6 +144,19 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
         residual_in_fp32=config_dict.get("residual_in_fp32", True),
         architectures=["MambaForCausalLM"],
     )
+def _try_load_dspark_config(model, revision: Optional[str], **kwargs):
+    if not envs.SGLANG_USE_QWEN_DSPARK.get():
+        return None
+    raw_config, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    config_dict = normalize_dspark_config(raw_config)
+    if config_dict is None:
+        return None
+    model_type = config_dict.pop("model_type")
+    config = AutoConfig.for_model(model_type, **config_dict)
+    config._name_or_path = str(model)
+    return config
 
 
 @register_model_config_parser("hf")
@@ -131,7 +168,9 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_dspark_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
@@ -141,6 +180,10 @@ class HfModelConfigParser(ModelConfigParserBase):
                 revision=revision,
                 **kwargs,
             )
+
+        _restore_glm_moe_dsa_raw_config_fields(
+            config, model, revision=revision, **kwargs
+        )
 
         if (
             config.architectures is not None
@@ -223,6 +266,7 @@ class HfModelConfigParser(ModelConfigParserBase):
             "gemma4_assistant",
             "gemma4_unified",
             "gemma4_unified_assistant",
+            "diffusion_gemma",
         ):
             # Gemma4 configs use base attributes for SWA layers and `global_*`
             # variants for full-attention layers.  SGLang expects the opposite:
@@ -335,6 +379,18 @@ def get_config(
                 current.update(value)
             else:
                 setattr(config, key, value)
+
+    if (
+        model_override_args
+        and (text_config := getattr(config, "text_config", None)) is not None
+    ):
+        for key in (
+            "index_kpool",
+            "index_kpool_compress",
+            "index_share_for_mtp_iteration",
+        ):
+            if key in model_override_args and hasattr(text_config, key):
+                setattr(text_config, key, model_override_args[key])
 
     if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

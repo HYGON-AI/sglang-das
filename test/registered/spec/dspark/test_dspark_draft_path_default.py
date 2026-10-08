@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -44,6 +45,19 @@ def _make_dspark_server_args(
     server_args.speculative_dspark_block_size = 5
     server_args._model_config = SimpleNamespace(hf_config=hf_config)
     return server_args
+
+
+def _enable_pd_prefill_cp(server_args: ServerArgs) -> None:
+    server_args.disaggregation_mode = "prefill"
+    server_args.disaggregation_transfer_backend = "mooncake"
+    server_args.tp_size = 4
+    server_args.dp_size = 1
+    server_args.pp_size = 1
+    server_args.attn_cp_size = 4
+    server_args.enable_prefill_cp = True
+    server_args.cp_strategy = "interleave"
+    server_args.enable_dp_attention = True
+    server_args.enable_dp_lm_head = False
 
 
 class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
@@ -92,6 +106,43 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             "deepseek-ai/some-other-dspark-draft",
         )
 
+    def test_pd_prefill_cp_does_not_require_dp_lm_head(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        _enable_pd_prefill_cp(server_args)
+
+        _handle_dspark(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "speculative_draft_model_path"),
+            _BUNDLED_MODEL_PATH,
+        )
+
+    def test_context_parallel_remains_rejected_outside_pd_prefill(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        _enable_pd_prefill_cp(server_args)
+        server_args.disaggregation_mode = "decode"
+
+        with self.assertRaisesRegex(
+            ValueError, "only supported for DeepSeek-V4 PD prefill"
+        ):
+            _handle_dspark(server_args)
+
+    def test_decode_target_deepep_allows_draft_none(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.moe_a2a_backend = "deepep"
+        server_args.moe_runner_backend = "deep_gemm"
+        server_args.speculative_moe_a2a_backend = "none"
+
+        _handle_dspark(server_args)
+
 
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
@@ -109,11 +160,24 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
 
     def test_only_megamoe_is_admitted(self):
         """Both sides of the allowlist: megamoe passes, others raise by name."""
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch("sglang.srt.utils.common.is_hcu", return_value=False),
+        ):
             _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_hcu_admits_deepep_with_its_own_runners(self):
+        """HCU serves DeepEP with its own MoE runners, so the gate admits it."""
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch("sglang.srt.utils.common.is_hcu", return_value=True),
+        ):
+            _handle_dspark(self._dp_server_args(moe_a2a_backend="deepep"))
+            with self.assertRaisesRegex(ValueError, "pplx"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend="pplx"))
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")

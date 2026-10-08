@@ -23,7 +23,7 @@ from lightop._lmslim_native.vllm_compat.fused_moe_cache import get_moe_cache
 from lightop.quant import per_token_quant_int8
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.parameter import (
@@ -244,9 +244,11 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoE,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+        # Experts-only slimquant ckpt: dense Linear stays BF16.
         if isinstance(layer, LinearBase):
-            return SlimQuantW4A8Int8LinearMethod(self)
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             return SlimQuantW4A8Int8MoEMethod(self)
         return None

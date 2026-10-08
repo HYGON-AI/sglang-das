@@ -335,21 +335,20 @@ class TreeComponent(ABC):
         root_node: UnifiedTreeNode,
     ) -> None:
         ct = self.component_type
-        match phase:
-            case LRURefreshPhase.WALKDOWN:
-                if node.component_data[ct].value is None:
-                    return
-                self.tree_core.lru_lists[ct].reset_node_mru(node)
-            case LRURefreshPhase.MATCH_END:
-                self.tree_core.lru_lists[ct].reset_node_and_parents_mru(
-                    node, root_node, self.node_has_component_data
-                )
-            case LRURefreshPhase.INSERT_END:
-                # WALKDOWN already refreshed every node on the insert path
-                # (including the new leaf), so there is nothing more to do.
+        if phase == LRURefreshPhase.WALKDOWN:
+            if node.component_data[ct].value is None:
                 return
-            case _:
-                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+            self.tree_core.lru_lists[ct].reset_node_mru(node)
+        elif phase == LRURefreshPhase.MATCH_END:
+            self.tree_core.lru_lists[ct].reset_node_and_parents_mru(
+                node, root_node, self.node_has_component_data
+            )
+        elif phase == LRURefreshPhase.INSERT_END:
+            # WALKDOWN already refreshed every node on the insert path
+            # (including the new leaf), so there is nothing more to do.
+            return
+        else:
+            raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     @abstractmethod
     def create_match_validator(
@@ -615,7 +614,8 @@ class TreeComponent(ABC):
         Return None for no truncation opinion (use full length);
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
-        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - SWA: copies its eviction cursor into insert_params for finished and
+          unfinished requests; may return a branching boundary.
         - Mamba: prepares mamba_value (finished from ping-pong buffer,
           unfinished fork from req); returns mamba_last_track_seqlen."""
         return None

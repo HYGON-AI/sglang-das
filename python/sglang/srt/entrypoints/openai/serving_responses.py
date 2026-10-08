@@ -453,7 +453,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
                     elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
+                        prompt_length = len(
+                            await self.tokenizer_manager.run_tokenizer_offload(
+                                tokenizer.encode, engine_prompt
+                            )
+                        )
                     else:
                         prompt_length = 0
 
@@ -698,7 +702,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             raise _MediaInputValidationError(media_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self._process_messages(chat_request, is_multimodal)
+        processed_messages = await self.tokenizer_manager.run_tokenizer_offload(
+            self._process_messages, chat_request, is_multimodal
+        )
         # ``_process_messages`` merges server defaults into the temporary Chat
         # request before rendering. Response parsing happens later from the
         # original request, so carry over the exact template kwargs that selected

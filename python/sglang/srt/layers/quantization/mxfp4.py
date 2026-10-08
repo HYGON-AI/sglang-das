@@ -204,6 +204,7 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_hcu = is_hcu()
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_mxfp4_w4a8 = get_bool_env_var("SGLANG_USE_MXFP4_W4A8") and _is_hcu
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -258,6 +259,10 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         opt_flags.update_opt_flags_constraints(constraints)
         k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
         scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+    elif get_platform().is_cuda and get_platform().device_capability < (9, 0):
+        # No scale layout carries the warp count below Hopper, and the tile
+        # formula gives the batch-1 decode tile a single warp.
+        opt_flags.update_opt_flags_constraints({"num_warps": num_warps})
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -375,6 +380,53 @@ class Mxfp4Config(QuantizationConfig):
         return []
 
 
+def _read_mxfp4_group_size() -> int:
+    """从模型 config 读取 MXFP4 group_size。
+
+    Kimi-K3 config.json 里路径为
+    text_config.quantization_config.config_groups.<group>.weights.group_size
+    （也兼容 group_size 直接出现在顶层 quantization_config 的情况）。
+    读取失败回退 32。
+    """
+    try:
+        from sglang.srt.runtime_context import process_model_config
+
+        hf = process_model_config().hf_config
+    except Exception:
+        return 32
+    qc = getattr(hf, "quantization_config", None)
+    if qc is None:
+        text_cfg = getattr(hf, "text_config", None)
+        qc = (
+            getattr(text_cfg, "quantization_config", None)
+            if text_cfg is not None
+            else None
+        )
+    if qc is None:
+        return 32
+    groups = (
+        qc.get("config_groups", {})
+        if isinstance(qc, dict)
+        else getattr(qc, "config_groups", {})
+    )
+    for g in groups.values():
+        w = (
+            g.get("weights", {})
+            if isinstance(g, dict)
+            else getattr(g, "weights", None)
+        )
+        if w is None:
+            continue
+        gs = (
+            w.get("group_size")
+            if isinstance(w, dict)
+            else getattr(w, "group_size", None)
+        )
+        if gs is not None:
+            return int(gs)
+    return 32
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(
         self,
@@ -431,6 +483,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
                     "or SM120."
                 )
+        self.group_size = _read_mxfp4_group_size()
 
     def create_weights(
         self,
@@ -633,7 +686,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if (
+            # HCU runs the MXFP4 Marlin path without the SM90+ requirement.
+            if not _is_hcu and (
                 not get_platform().is_sm90
                 and not get_platform().is_sm100
                 and not get_platform().is_sm120
@@ -1097,7 +1151,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the kernel accumulates them). Crucially there is no bf16 upcast of
             # the weights -- the whole point of MXFP4 on XPU.
             return
-        else:
+        elif not _is_hcu:
+            # HCU keeps the packed MXFP4 checkpoint layout: its Triton MoE
+            # kernels decode E2M1 in-register (use_mxfp4_w4a16 / use_mxfp4_w4a8).
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
             w13_weight = upcast_from_mxfp(
@@ -1730,6 +1786,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                use_mxfp4_w4a16=not _use_mxfp4_w4a8,
+                use_mxfp4_w4a8=_use_mxfp4_w4a8,
+                block_shape=[0, self.group_size],
             )
         return self.runner.run(dispatch_output, quant_info)
 

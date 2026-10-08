@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hcu, is_hip, is_musa, is_xpu, round_up
@@ -45,6 +46,119 @@ if _is_cuda:
 # Where the CUDA kernel's own small-batch single-block path stops: its
 # per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
 _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+
+
+@triton.jit
+def _hcu_moe_align_stage1(
+    topk_ids_ptr,
+    tokens_cnts_ptr,
+    num_experts: tl.constexpr,
+    numel: tl.constexpr,
+    tokens_per_thread: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    start_idx = pid * tokens_per_thread
+    off_c = (pid + 1) * num_experts
+    for i in range(tokens_per_thread):
+        if start_idx + i < numel:
+            expert_id = tl.load(topk_ids_ptr + start_idx + i)
+            token_cnt = tl.load(tokens_cnts_ptr + off_c + expert_id)
+            tl.store(tokens_cnts_ptr + off_c + expert_id, token_cnt + 1)
+
+
+@triton.jit
+def _hcu_moe_align_stage2(tokens_cnts_ptr, num_experts: tl.constexpr):
+    expert_id = tl.program_id(0)
+    last_cnt = 0
+    for i in range(1, num_experts + 1):
+        token_cnt = tl.load(tokens_cnts_ptr + i * num_experts + expert_id)
+        last_cnt += token_cnt
+        tl.store(tokens_cnts_ptr + i * num_experts + expert_id, last_cnt)
+
+
+@triton.jit
+def _hcu_moe_align_stage3(
+    num_tokens_post_pad_ptr,
+    tokens_cnts_ptr,
+    cumsum_ptr,
+    num_experts: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    last_cumsum = 0
+    final_counts = num_experts * num_experts
+    for i in range(1, num_experts + 1):
+        token_cnt = tl.load(tokens_cnts_ptr + final_counts + i - 1)
+        last_cumsum += tl.cdiv(token_cnt, block_size) * block_size
+        tl.store(cumsum_ptr + i, last_cumsum)
+    tl.store(num_tokens_post_pad_ptr, last_cumsum)
+
+
+@triton.jit
+def _hcu_moe_align_stage4(
+    topk_ids_ptr,
+    sorted_ids_ptr,
+    expert_ids_ptr,
+    tokens_cnts_ptr,
+    cumsum_ptr,
+    num_experts: tl.constexpr,
+    block_size: tl.constexpr,
+    numel: tl.constexpr,
+    tokens_per_thread: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    expert_begin = tl.load(cumsum_ptr + pid)
+    expert_end = tl.load(cumsum_ptr + pid + 1)
+    for i in range(expert_begin, expert_end, block_size):
+        tl.store(expert_ids_ptr + i // block_size, pid)
+
+    token_begin = pid * tokens_per_thread
+    thread_counts = pid * num_experts
+    for i in range(token_begin, tl.minimum(token_begin + tokens_per_thread, numel)):
+        expert_id = tl.load(topk_ids_ptr + i)
+        token_cnt = tl.load(tokens_cnts_ptr + thread_counts + expert_id)
+        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
+        tl.store(sorted_ids_ptr + rank_post_pad, i)
+        tl.store(tokens_cnts_ptr + thread_counts + expert_id, token_cnt + 1)
+
+
+def _hcu_moe_align_block_size_triton(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    """Portable HCU align which avoids LightOp's corrupt count/sort scratch."""
+    numel = topk_ids.numel()
+    tokens_per_thread = triton.cdiv(numel, num_experts)
+    tokens_cnts = torch.zeros(
+        (num_experts + 1, num_experts),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    cumsum = torch.zeros(
+        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+    )
+    grid = (num_experts,)
+    _hcu_moe_align_stage1[grid](
+        topk_ids, tokens_cnts, num_experts, numel, tokens_per_thread
+    )
+    _hcu_moe_align_stage2[grid](tokens_cnts, num_experts)
+    _hcu_moe_align_stage3[(1,)](
+        num_tokens_post_pad, tokens_cnts, cumsum, num_experts, block_size
+    )
+    _hcu_moe_align_stage4[grid](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        tokens_cnts,
+        cumsum,
+        num_experts,
+        block_size,
+        numel,
+        tokens_per_thread,
+    )
 
 
 def moe_align_block_size(
@@ -169,18 +283,14 @@ def moe_align_block_size(
             torch.full_like(topk_ids, invalid_expert),
             topk_ids,
         )
-        op.moe_align_block_size(
+        # LightOp's count/sort scratch overflows for batched decode shapes.
+        _hcu_moe_align_block_size_triton(
             hcu_topk_ids,
             num_experts + 1,
             block_size,
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
-            None,
-            None,
-            None,
-            False,
-            True,
         )
         expert_ids.masked_fill_(expert_ids == invalid_expert, -1)
     elif use_jit_align:
@@ -304,35 +414,31 @@ def hcu_moe_align_block_size(
         )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    if expert_mask is not None:
-        op.moe_align_block_size_out(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            expert_map=expert_map,
-            expert_mask=expert_mask,
-            num_local_tokens=None,
-            is_ep=False,
-            is_fuse_fill=True,
-        )
-    else:
-        op.moe_align_block_size_out(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            expert_map=None,
-            expert_mask=None,
-            num_local_tokens=None,
-            is_ep=False,
-            is_fuse_fill=True,
-        )
-        if expert_map is not None:
-            expert_ids = expert_map[expert_ids]
+    # Newer LightOP builds expose the preallocated-output API with an ``_out``
+    # suffix, while the HCU runtime image still provides the same ABI under the
+    # original name. Use positional optional arguments because their keyword
+    # spelling also changed between the two builds (``Is_EP`` vs ``is_ep``).
+    align_op = getattr(op, "moe_align_block_size_out", None)
+    if align_op is None:
+        # Newer LightOP moved the wrapper into its public MoE API.
+        try:
+            from lightop.moe import moe_align_block_size_out as align_op
+        except ImportError:
+            align_op = op.moe_align_block_size
+    align_op(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map if expert_mask is not None else None,
+        expert_mask,
+        None,
+        False,
+        True,
+    )
+    if expert_mask is None and expert_map is not None:
+        expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad

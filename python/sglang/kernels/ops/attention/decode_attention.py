@@ -31,6 +31,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_device_core_count,
     is_gfx95_supported,
     is_gfx1250_supported,
@@ -39,6 +40,10 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+# Mirrors the allocator gate in memory_pool.py. When on, MHATokenToKVPool
+# builds HND-order buffers with V's D stride == page_size (not 1); kernels
+# take an explicit d_stride to handle either layout without a copy.
+_kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 
 logger = logging.getLogger(__name__)
 
@@ -200,20 +205,59 @@ def _mla_launch_plan(
     return True, splits
 
 
-def _extract_kv_strides(buf, page_size: int):
-    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a 3-D
-    ``[max_slots, head_num, head_dim]`` KV buffer.
-
-    Returns a 4-tuple of ints suitable for passing as ``stride_buf_*bs``,
-    ``stride_buf_*h``, ``stride_buf_*page``, ``stride_buf_*tok``.
+def _extract_kv_strides(buf, page_size: int, is_value: bool = False):
+    """Extract (slot, head, page, tok, d) strides for a KV buffer in any of:
+      - 3-D ``[N, head, dim]`` (legacy).
+      - 4-D page-major ``[pages, ps, head, dim]`` (shared pool).
+      - 4-D HND K ``[pages, head, ps, dim]`` (SGLANG_KV_LAYOUT_HCU_FA).
+      - 4-D HND V ``[pages, head, dim, ps]`` — page_size innermost, so
+        d_stride == page_size instead of 1.
     """
-    if buf.ndim != 3:
+    if buf.ndim == 4:
+        if _kv_layout_hcu_fa and is_value:
+            page_stride = buf.stride(0)
+            head_stride = buf.stride(1)
+            d_stride = buf.stride(2)
+            tok_stride = buf.stride(3)
+            slot_stride = page_stride // page_size
+            assert buf.shape[3] == page_size, (
+                f"HND 4-D V buffer's dim-3 must equal page_size; got "
+                f"shape={tuple(buf.shape)}, page_size={page_size}."
+            )
+        elif _kv_layout_hcu_fa:
+            page_stride = buf.stride(0)
+            head_stride = buf.stride(1)
+            tok_stride = buf.stride(2)
+            d_stride = buf.stride(3)
+            slot_stride = page_stride // page_size
+            assert buf.shape[2] == page_size, (
+                f"HND 4-D K buffer's dim-2 must equal page_size; got "
+                f"shape={tuple(buf.shape)}, page_size={page_size}."
+            )
+        else:
+            # slot_stride must be page_stride // page_size (per-entry bytes),
+            # not tok_stride — the PAGE_SIZE==1 branch uses it as
+            # `kv_loc * slot_stride` and one page holds one slot there.
+            page_stride = buf.stride(0)
+            tok_stride = buf.stride(1)
+            head_stride = buf.stride(2)
+            d_stride = buf.stride(3)
+            slot_stride = page_stride // page_size
+            assert buf.shape[1] == page_size, (
+                f"4-D KV buffer's dim-1 must equal page_size; got "
+                f"shape[1]={buf.shape[1]}, page_size={page_size}"
+            )
+    elif buf.ndim == 3:
+        # Synthesize page/tok so PAGE_SIZE>1 math collapses to
+        # `kv_loc * slot_stride` — lets the same kernel handle non-shared bufs.
+        slot_stride = buf.stride(0)
+        head_stride = buf.stride(1)
+        d_stride = buf.stride(2)
+        page_stride = slot_stride * page_size
+        tok_stride = slot_stride
+    else:  # pragma: no cover
         raise ValueError(f"unexpected KV buffer ndim={buf.ndim}, shape={buf.shape}")
-    slot_stride = buf.stride(0)
-    head_stride = buf.stride(1)
-    page_stride = slot_stride * page_size
-    tok_stride = slot_stride
-    return slot_stride, head_stride, page_stride, tok_stride
+    return slot_stride, head_stride, page_stride, tok_stride, d_stride
 
 
 @triton.jit
@@ -246,6 +290,9 @@ def _fwd_kernel_stage1(
     stride_buf_ktok,
     stride_buf_vpage,
     stride_buf_vtok,
+    # V's per-D step: 1 everywhere except HND V where it's page_size.
+    # K's D is always innermost (stride=1), so no stride_buf_kd is needed.
+    stride_buf_vd,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -361,14 +408,14 @@ def _fwd_kernel_stage1(
                 offs_buf_v = (
                     kv_loc[:, None] * stride_buf_vbs
                     + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
+                    + offs_dv[None, :] * stride_buf_vd
                 )
             else:
                 offs_buf_v = (
                     page_id[:, None] * stride_buf_vpage
                     + tok_in_p[:, None] * stride_buf_vtok
                     + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
+                    + offs_dv[None, :] * stride_buf_vd
                 )
             v = tl.load(
                 V_Buffer + offs_buf_v,
@@ -433,9 +480,17 @@ def _decode_att_m_fwd(
         BLOCK = 8
     MAX_KV_SPLITS = max_kv_splits
     Lk = k_buffer.shape[-1]
-    Lv = v_buffer.shape[-1]
+    # Under HND V ([pages, H, D, ps]) D is at dim -2 (dim -1 is page_size).
+    if _kv_layout_hcu_fa and v_buffer.ndim == 4:
+        Lv = v_buffer.shape[-2]
+    else:
+        Lv = v_buffer.shape[-1]
 
-    kv_head_num = k_buffer.shape[-2]
+    # Under HND K ([pages, H, ps, D]) head_num is at dim -3.
+    if _kv_layout_hcu_fa and k_buffer.ndim == 4:
+        kv_head_num = k_buffer.shape[-3]
+    else:
+        kv_head_num = k_buffer.shape[-2]
 
     batch, head_num = q.shape[0], q.shape[1]
 
@@ -452,11 +507,11 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
-        k_buffer, page_size
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
+        _extract_kv_strides(k_buffer, page_size, is_value=False)
     )
-    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
-        v_buffer, page_size
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
+        _extract_kv_strides(v_buffer, page_size, is_value=True)
     )
 
     aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
@@ -483,6 +538,7 @@ def _decode_att_m_fwd(
         k_tok_stride,
         v_page_stride,
         v_tok_stride,
+        v_d_stride,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -528,6 +584,9 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_ktok,
     stride_buf_vpage,
     stride_buf_vtok,
+    # V's per-D step: 1 everywhere except HND V where it's page_size.
+    # K's D is always innermost (stride=1), so no stride_buf_kd is needed.
+    stride_buf_vd,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -611,12 +670,13 @@ def _fwd_grouped_kernel_stage1(
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
-    # Hoist loop-invariant base offsets
+    # Hoist loop-invariant base offsets. `* stride_buf_vd` handles HND V's
+    # non-1 D-stride; K's D is always innermost (stride=1).
     base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
     if BLOCK_DPE > 0:
         base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
     if not HAS_MLA:
-        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :] * stride_buf_vd
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
@@ -788,7 +848,11 @@ def _decode_grouped_att_m_fwd(
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
-    Lv = v_buffer.shape[-1]
+    # Under HND V ([pages, H, D, ps]) D is at dim -2 (dim -1 is page_size).
+    if _kv_layout_hcu_fa and v_buffer.ndim == 4:
+        Lv = v_buffer.shape[-2]
+    else:
+        Lv = v_buffer.shape[-1]
 
     # [TODO] work around shmem limit on MI3xx
     is_fp8 = k_buffer.dtype in (
@@ -809,9 +873,11 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    # 4-D view exposes head_num at dim 2; legacy 3-D exposes
-    # it at dim 1.
-    kv_head_num = k_buffer.shape[-2]
+    # Under HND K ([pages, H, ps, D]) head_num is at dim -3.
+    if _kv_layout_hcu_fa and k_buffer.ndim == 4:
+        kv_head_num = k_buffer.shape[-3]
+    else:
+        kv_head_num = k_buffer.shape[-2]
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // kv_head_num
 
@@ -841,11 +907,11 @@ def _decode_grouped_att_m_fwd(
     # Blocks at or above the split count return immediately, so the grid shrinks too.
     grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
-        k_buffer, page_size
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
+        _extract_kv_strides(k_buffer, page_size, is_value=False)
     )
-    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
-        v_buffer, page_size
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
+        _extract_kv_strides(v_buffer, page_size, is_value=True)
     )
 
     aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
@@ -872,6 +938,7 @@ def _decode_grouped_att_m_fwd(
         k_tok_stride,
         v_page_stride,
         v_tok_stride,
+        v_d_stride,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -1006,7 +1073,11 @@ def _decode_softmax_reducev_fwd(
     forced_kv_splits: int = 0,
 ):
     batch, head_num = q.shape[0], q.shape[1]
-    Lv = v_buffer.shape[-1]
+    # Under HND V ([pages, H, D, ps]) D is at dim -2 (dim -1 is page_size).
+    if _kv_layout_hcu_fa and v_buffer.ndim == 4:
+        Lv = v_buffer.shape[-2]
+    else:
+        Lv = v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     MAX_KV_SPLITS = max_kv_splits
@@ -1189,8 +1260,12 @@ def decode_attention_fwd(
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
 
-    # head_num lives at dim 1 (3-D) or dim 2 (4-D shared view).
-    kv_head_num = v_buffer.shape[-2]
+    # head_num lives at dim 1 (3-D) or dim 2 (4-D shared page-major view).
+    # Under HND V ([pages, H, D, ps]) head_num is at dim -3.
+    if _kv_layout_hcu_fa and v_buffer.ndim == 4:
+        kv_head_num = v_buffer.shape[-3]
+    else:
+        kv_head_num = v_buffer.shape[-2]
     kv_group_num = q.shape[1] // kv_head_num
 
     # Work-Centric (Lean) Attention: a persistent-CTA + work-stealing decode kernel
@@ -2010,8 +2085,16 @@ def _decode_lean_attention_fwd(
     # Page-aware KV strides. For a 3-D buffer these synthesize page/tok strides so the
     # PAGE_SIZE>1 math collapses to the contiguous slot address; for a 4-D paged buffer they
     # come from the real page/token strides. (See _extract_kv_strides.)
-    k_bs, k_h, k_page, k_tok = _extract_kv_strides(k_buffer, page_size)
-    v_bs, v_h, v_page, v_tok = _extract_kv_strides(v_buffer, page_size)
+    k_bs, k_h, k_page, k_tok, k_d = _extract_kv_strides(k_buffer, page_size)
+    v_bs, v_h, v_page, v_tok, v_d = _extract_kv_strides(
+        v_buffer, page_size, is_value=True
+    )
+    # The lean kernel addresses head_dim contiguously; HND V (d_stride ==
+    # page_size) would be read with the wrong layout.
+    if k_d != 1 or v_d != 1:
+        raise NotImplementedError(
+            "lean attention decode does not support the HCU FA HND KV layout"
+        )
 
     _lean_attention_decode_kernel[(total_programs,)](
         q,

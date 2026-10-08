@@ -5,6 +5,7 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
+from contextvars import ContextVar
 from enum import Enum, IntEnum
 from typing import NamedTuple
 
@@ -20,6 +21,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
+    get_lora,
     get_model,
     get_parallel,
     get_server_args,
@@ -32,6 +34,62 @@ _is_npu = is_npu()
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+W4A8_TPMOE_BACKEND_AUTO = "auto"
+W4A8_TPMOE_BACKEND_LIGHTOP = "lightop"
+W4A8_TPMOE_BACKEND_AITER = "aiter"
+W4A8_TPMOE_BACKEND_TRITON = "triton"
+W4A8_TPMOE_BACKENDS = frozenset(
+    {
+        W4A8_TPMOE_BACKEND_AUTO,
+        W4A8_TPMOE_BACKEND_LIGHTOP,
+        W4A8_TPMOE_BACKEND_AITER,
+        W4A8_TPMOE_BACKEND_TRITON,
+    }
+)
+
+_dspark_w4a8_tpmoe_backend_override = ContextVar(
+    "dspark_w4a8_tpmoe_backend_override", default=None
+)
+
+
+def normalize_w4a8_tpmoe_backend(
+    requested_backend: str, *, env_name: str
+) -> str:
+    backend = requested_backend.strip().lower()
+    if backend not in W4A8_TPMOE_BACKENDS:
+        supported = ", ".join(repr(value) for value in sorted(W4A8_TPMOE_BACKENDS))
+        raise ValueError(
+            f"Unsupported {env_name}={requested_backend!r}. "
+            f"Supported values: {supported}."
+        )
+    return backend
+
+
+def _resolve_dspark_w4a8_tpmoe_backend() -> str | None:
+    requested_backend = envs.SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND.get()
+    if requested_backend is None:
+        return None
+    return normalize_w4a8_tpmoe_backend(
+        requested_backend,
+        env_name="SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND",
+    )
+
+
+def get_dspark_w4a8_tpmoe_backend_override() -> str | None:
+    return _dspark_w4a8_tpmoe_backend_override.get()
+
+
+@contextmanager
+def dspark_w4a8_tpmoe_backend_context():
+    """Apply the DSpark W4A8 TP-MoE backend to one draft build."""
+    token = _dspark_w4a8_tpmoe_backend_override.set(
+        _resolve_dspark_w4a8_tpmoe_backend()
+    )
+    try:
+        yield
+    finally:
+        _dspark_w4a8_tpmoe_backend_override.reset(token)
 
 
 class MoeA2ABackend(Enum):
@@ -121,6 +179,9 @@ class _MoeRunnerBackendPredicates:
 
     def is_triton(self):
         return self.value == MoeRunnerBackend.TRITON.value
+
+    def is_lightop(self):
+        return self.value == MoeRunnerBackend.LIGHTOP.value
 
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
@@ -248,6 +309,9 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
 
     tma_aligned: bool
     ue8m0: bool
+
+    def is_lightop(self):
+        return self == MoeRunnerBackend.LIGHTOP
 
 
 class DeepEPMode(Enum):
@@ -501,6 +565,48 @@ def get_moe_runner_backend() -> MoeRunnerBackendLike:
     return moe.runner_backend
 
 
+def will_use_aiter_moe() -> bool:
+    """Return whether the effective HIP MoE runner is AITER.
+
+    An explicit ``--moe-runner-backend aiter`` selection takes precedence
+    over the broad ``SGLANG_USE_AITER`` default. DAS also honors
+    ``SGLANG_ROCM_USE_AITER_MOE`` for the channelwise W8A8 path.
+
+    The 128-aligned AITER weight-padding rewrite from upstream #36601 is
+    intentionally not applied here: HCU Flash-Next channelwise experts use
+    N1=160 no-shuffle ASM configs.
+    """
+    from sglang.srt.utils import is_hcu
+
+    if not is_hcu():
+        return False
+    backend = get_moe_runner_backend()
+    if backend.is_aiter():
+        a2a_backend = get_moe_a2a_backend()
+        if not a2a_backend.supports_aiter():
+            raise ValueError(
+                "moe_runner_backend=aiter is incompatible with "
+                f"moe_a2a_backend={a2a_backend.value}."
+            )
+        if not a2a_backend.is_none() and not envs.SGLANG_USE_AITER.get():
+            raise ValueError(
+                "Explicit moe_runner_backend=aiter without SGLANG_USE_AITER=1 "
+                "is currently supported only with moe_a2a_backend=none; "
+                f"got moe_a2a_backend={a2a_backend.value}."
+            )
+        return True
+    if not backend.is_auto():
+        return False
+    from sglang.srt.utils import get_bool_env_var
+
+    return (
+        envs.SGLANG_USE_AITER.get()
+        or envs.SGLANG_INT4_WEIGHT.get()
+        or get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
+    ) and get_moe_a2a_backend().supports_aiter()
+
+
+
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
     moe = get_flags().moe
     if moe.speculative_runner_backend is None:
@@ -744,31 +850,65 @@ def should_skip_mlp_all_reduce() -> bool:
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
 
 
+def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
+    """Whether the experts' output owes no sum over the MoE-TP group
+    (``is_tp_path=True``) or the EP group: the combine already summed it, or each
+    rank computed its own tokens in full.
+
+    This is a property of the MoE configuration. Whether the MoE block or a later
+    step runs a sum that is still owed is decided separately.
+    """
+    if get_parallel().dwdp_size > 1:
+        return True
+    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The combine reduce-scatters back to the local tokens.
+        return True
+    a2a = get_moe_a2a_backend()
+    # The flashinfer and pplx combines, and the megamoe kernel's internal
+    # combine, sum each token's expert outputs back to its source rank.
+    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+
+
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
-    """Whether a downstream component will fuse, replace, or absorb the post-experts all-reduce.
+    """Whether the MoE block should leave out its post-experts all-reduce: a later
+    step runs it (fused into the next norm, or as the reduce-scatter back to the
+    local tokens), or there is nothing to sum.
 
     Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
-    if should_skip_mlp_all_reduce():
-        return True
-    if get_parallel().dwdp_size > 1:
-        return True
-    if should_use_dp_reduce_scatterv():
-        return True
-    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
-        return True
-    if get_moe_a2a_backend().is_flashinfer():
-        return True
-    if get_moe_a2a_backend().is_pplx():
-        # pplx's AllToAll.combine already sums each token's expert outputs back
-        # to the source rank
-        return True
-    if get_moe_a2a_backend().is_flashinfer_megamoe():
-        # The mega kernel does its EP all-to-all + combine internally and
-        # returns per-rank outputs, so any further EP/TP all-reduce would
-        # double-count. Same opt-in as the flashinfer a2a dispatcher.
-        return True
-    return False
+    return (
+        should_skip_mlp_all_reduce()
+        or should_use_dp_reduce_scatterv()
+        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    )
+
+
+def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """All-reduce a MoE block's output (routed plus shared experts) over TP,
+    unless a later step does it or there is nothing to sum."""
+    from sglang.srt.distributed.communication_op import (
+        tensor_model_parallel_all_reduce,
+    )
+
+    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ):
+        return tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
 
 
 def can_merge_post_experts_all_reduce() -> bool:
@@ -816,23 +956,45 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
+def post_experts_sum_is_one_all_reduce() -> bool:
+    """Whether the sum an FFN leaves out when it skips its post-experts (or
+    down-projection) all-reduce is one full-precision all-reduce over the TP
+    group itself, on a plain partial sum: the all-reduce a later step can run
+    instead. Not when the combine already summed the output, the reduction is
+    quantized, a replicated shared expert is added after it, LoRA-B runs on
+    the unreduced activations, or the EP and MoE-TP sums run in two steps or
+    over another group."""
+    parallel = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and not post_experts_output_is_complete(is_tp_path=True)
+        and not get_exec().comm.enable_quant_communications
+        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
+        and not get_lora().enable_lora
+        # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
+        and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+        and post_experts_reduction_group() is parallel.tp_group
+    )
+
+
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     """Run the post-experts reduction that was deferred to allreduce fusion.
 
-    Called when the fused residual+LN kernel cannot service the shape. Reduces
-    over the same group ``resolve_fusion_group`` builds the workspace on.
+    Called when the fused residual+LN kernel cannot service the shape.
     """
-    from sglang.srt.distributed.communication_op import (
-        moe_expert_parallel_all_reduce,
-        moe_tensor_model_parallel_all_reduce,
-        tensor_model_parallel_all_reduce,
-    )
-
-    if can_merge_post_experts_all_reduce():
-        return tensor_model_parallel_all_reduce(hidden_states)
-    if get_parallel().moe_ep_size > 1:
-        return moe_expert_parallel_all_reduce(hidden_states)
-    return moe_tensor_model_parallel_all_reduce(hidden_states)
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager
@@ -861,7 +1023,9 @@ def speculative_moe_a2a_backend_context():
     original_backend = moe.a2a_backend
     original_disable_fp4_allgather = moe.disable_fp4_allgather
     original_speculative_context = moe.speculative_context
+    original_scope = moe.in_speculative_a2a_scope
     try:
+        moe.in_speculative_a2a_scope = True
         moe.a2a_backend = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         moe.disable_fp4_allgather = True
@@ -871,6 +1035,7 @@ def speculative_moe_a2a_backend_context():
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
         moe.speculative_context = original_speculative_context
+        moe.in_speculative_a2a_scope = original_scope
 
 
 # The type of method in top-K routing, for use in torch custom op

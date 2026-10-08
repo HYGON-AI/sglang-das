@@ -397,21 +397,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -538,16 +523,37 @@ def handle_elastic_ep(server_args: Any):
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
 
-        decode_cuda_graph_disabled = (
-            cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+        decode_backend = cfg.cuda_graph_config.decode.backend
+        assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+            "Elastic EP runtime scale-up supports decode CUDA graph backend "
+            f"'full' or 'disabled' (got {decode_backend!r})."
         )
-        prefill_cuda_graph_disabled = (
-            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be disabled."
         )
-        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-            "Elastic EP runtime scale-up requires decode and prefill CUDA "
-            "graphs to be disabled."
-        )
+        if decode_backend == Backend.FULL:
+            assert cfg.device == "cuda", (
+                "Elastic EP CUDA graph recapture requires CUDA "
+                f"(got device={cfg.device!r})."
+            )
+            assert cfg.speculative_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support speculative decoding."
+            )
+            assert not cfg.is_embedding, (
+                "Elastic EP CUDA graph recapture does not support embedding models."
+            )
+            assert cfg.dllm_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support diffusion models."
+            )
+            assert not cfg.encoder_only, (
+                "Elastic EP CUDA graph recapture does not support encoder-only models."
+            )
+            assert not cfg.forward_hooks, (
+                "Elastic EP CUDA graph recapture does not support forward hooks."
+            )
+            assert not cfg.enable_pdmux, (
+                "Elastic EP CUDA graph recapture does not support PDMux."
+            )
         assert resolved.enable_dp_attention, (
             "Elastic EP scale-up requires --enable-dp-attention; without it "
             "the TP group is not equivalent to WORLD and the post-scale "
@@ -582,6 +588,11 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
+        raise ValueError(
+            "--ep-static-dispatch-policy must be one of 'nearest' or 'locality_fair'."
+        )
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,
@@ -607,6 +618,16 @@ def handle_eplb_and_dispatch(server_args: Any):
             ),
         )
 
+    if (
+        cfg.ep_static_dispatch_policy != "nearest"
+        and cfg.ep_dispatch_algorithm != "static"
+    ):
+        raise ValueError(
+            "--ep-static-dispatch-policy locality_fair requires "
+            "--ep-dispatch-algorithm static. It configures a startup-time "
+            "source-rank-to-replica map, not dynamic token balancing."
+        )
+
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a
     # per-rank table and `lp` samples inside its kernel.
     if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
@@ -624,15 +645,100 @@ def handle_eplb_and_dispatch(server_args: Any):
         assert resolved_view(server_args).ep_size > 1
 
 
-def handle_expert_distribution_metrics(server_args: Any):
+def handle_platform_cp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
+    platform = get_platform()
+    is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
+    if not is_protected_platform:
+        if (
+            cfg.enable_prefill_context_parallel
+            or cfg.enable_dsa_prefill_context_parallel
+        ):
+            raise ValueError(
+                "Legacy prefill context-parallel options are supported only "
+                "by protected HIP, Ascend NPU, or MUSA paths. Use "
+                "--enable-prefill-cp with --cp-strategy."
+            )
+        return
+
+    legacy_mode_to_strategy = {
+        "in-seq-split": "zigzag",
+        "round-robin-split": "interleave",
+    }
+
+    if cfg.enable_prefill_context_parallel or cfg.enable_dsa_prefill_context_parallel:
+        declare_resolution(
+            server_args,
+            "_handle_platform_cp_compatibility",
+            enable_prefill_cp=True,
         )
 
+    if cfg.enable_prefill_context_parallel and cfg.cp_strategy is None:
+        declare_resolution(
+            server_args,
+            "_handle_platform_cp_compatibility",
+            cp_strategy=legacy_mode_to_strategy[cfg.prefill_cp_mode],
+        )
+    if cfg.enable_dsa_prefill_context_parallel and cfg.cp_strategy is None:
+        declare_resolution(
+            server_args,
+            "_handle_platform_cp_compatibility",
+            cp_strategy=legacy_mode_to_strategy[cfg.dsa_prefill_cp_mode],
+        )
+
+
+def handle_legacy_cp_runtime_compatibility(server_args: Any):
+    """Project canonical CP settings only for protected platform runtimes."""
+    platform = get_platform()
+    if not (platform.is_hip or platform.is_npu or platform.is_musa):
+        return
+    cfg = resolving_view(server_args)
+
+    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
+        return
+
+    if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
+        return
+
+    strategy_to_legacy_mode = {
+        "zigzag": "in-seq-split",
+        "interleave": "round-robin-split",
+    }
+    mode = strategy_to_legacy_mode[cfg.cp_strategy]
+    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
+        resolved_view(server_args), "attention_backend", None
+    ) in ("dsa", "dsv4")
+    if use_dsa_legacy_aliases:
+        declare_resolution(
+            server_args,
+            "_handle_legacy_cp_runtime_compatibility",
+            enable_dsa_prefill_context_parallel=True,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_legacy_cp_runtime_compatibility",
+            enable_prefill_context_parallel=False,
+        )
+    else:
+        declare_resolution(
+            server_args,
+            "_handle_legacy_cp_runtime_compatibility",
+            enable_prefill_context_parallel=True,
+        )
+    declare_resolution(
+        server_args,
+        "_handle_legacy_cp_runtime_compatibility",
+        dsa_prefill_cp_mode=mode,
+    )
+    declare_resolution(
+        server_args,
+        "_handle_legacy_cp_runtime_compatibility",
+        prefill_cp_mode=mode,
+    )
+
+
+def handle_expert_distribution_metrics(server_args: Any):
+    cfg = resolving_view(server_args)
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
@@ -661,12 +767,12 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (
-        (platform.is_hip and not platform.is_hcu)
-        or platform.is_npu
-        or platform.is_musa
+    if (
+        cfg.enable_prefill_cp
+        and (platform.is_hip or platform.is_musa)
+        and not platform.is_hcu
     ):
         raise ValueError(
-            "Prefill CP on non-HCU HIP/NPU/MUSA is deprecated; "
+            "Prefill CP on non-HCU HIP/MUSA is deprecated; "
             "CP support will be refactored soon."
         )

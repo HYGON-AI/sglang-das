@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.environ import envs
+
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -46,6 +48,45 @@ def draft_is_deepseek_v4() -> bool:
         model_config_parser=get_model().model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+
+
+def resolve_single_owner_pp_rank(
+    *, target_layer_ids: List[int], num_hidden_layers: int, pp_size: int
+) -> Optional[int]:
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    if not target_layer_ids:
+        return None
+    for pp_rank in range(pp_size):
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers=num_hidden_layers,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
+        if all(start_layer <= layer_id < end_layer for layer_id in target_layer_ids):
+            return pp_rank
+    return None
+
+
+def use_empty_draft_model_for_pp_prefill(
+    *,
+    disaggregation_mode: str,
+    pp_rank: int,
+    pp_size: int,
+    target_layer_ids: List[int],
+    num_hidden_layers: int,
+) -> bool:
+    owner_pp_rank = resolve_single_owner_pp_rank(
+        target_layer_ids=target_layer_ids,
+        num_hidden_layers=num_hidden_layers,
+        pp_size=pp_size,
+    )
+    return (
+        disaggregation_mode == "prefill"
+        and pp_size > 1
+        and owner_pp_rank == pp_size - 1
+        and pp_rank != owner_pp_rank
+    )
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
@@ -206,7 +247,10 @@ def _get_dspark_config(config: Any) -> dict:
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
-    base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    base = parse_dflash_draft_config(
+        draft_hf_config=draft_hf_config,
+        use_qwen_dspark_config=envs.SGLANG_USE_QWEN_DSPARK.get(),
+    )
 
     dspark_cfg = _get_dspark_config(draft_hf_config)
     text_config = _get_text_config(draft_hf_config)

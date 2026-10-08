@@ -24,7 +24,10 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, is_npu
+
+if is_hcu():
+    from boltops.generic.triton import attn_res
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -32,6 +35,7 @@ _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
+_USE_HCU_ATTN_RES = is_hcu() and get_bool_env_var("SGLANG_K3_ATTN_RESIDUAL_HCU", default="true")
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
     """Return whether the device is eligible for the TMA fast path."""
@@ -39,9 +43,17 @@ def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
     return major >= 10 and major != 12
 
 
+def _use_hcu_aggregate(num_tokens: int, nvb: int) -> bool:
+    """Route aggregation to the boltops HCU single-kernel mix when it beats
+    the official HIP kernel. Benchmark (H=7168): boltops attn_res wins for
+    nvb >= 5 and T >= 256 (its online softmax avoids the official kernel's
+    next_pow2(nvb) x 8192 register tile); official wins at small T, so keep
+    the official path there. Requires the HCU env switch."""
+    return _USE_HCU_ATTN_RES # and num_tokens >= 256 and nvb >= 5
+
+
 def _use_fast(hidden_size: int) -> bool:
-    """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
-    and its H=7168 template; everything else takes the triton pipeline."""
+    """The TMA kernel needs SM100+ except SM12x and its H=7168 template."""
     global _FAST_SUPPORTED
     if is_npu():
         return False
@@ -57,7 +69,7 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
         return False
     global _HIP_SHAPE_GATE
     if _HIP_SHAPE_GATE is None:
-        from sglang.kernels.ops.kimi_k3.attn_res_hip import supports_attn_res_hip
+        from sglang.kernels.ops.attention.attn_res_hip import supports_attn_res_hip
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
@@ -97,7 +109,7 @@ def _aggregate_fast(
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
-    from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
+    from sglang.kernels.ops.attention.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
@@ -294,7 +306,7 @@ def _aggregate_hip(
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
     pre-norm mixture instead. Returns (result, prefix)."""
-    from sglang.kernels.ops.kimi_k3.attn_res_hip import attn_res_hip
+    from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
@@ -312,6 +324,44 @@ def _aggregate_hip(
         prefix_out=prefix,
         write_prefix=write_bank_row,
     )
+    return out, prefix
+
+
+def _aggregate_hcu(
+    prefix_a: torch.Tensor,
+    prefix_b: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: Optional[RMSNorm],
+    write_bank_row: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HCU branch: boltops single-kernel mix + separate out-norm / bank write.
+
+    Same contract as ``_aggregate_hip``: returns ``(out, prefix)`` with
+    ``prefix = prefix_a + prefix_b`` (rounded to the storage dtype) and
+    ``out = out_norm(mix)`` or the pre-norm mixture when ``out_norm`` is None.
+    Used when boltops ``attn_res`` beats the official HIP kernel (T >= 256,
+    nvb >= 5); the extra out-norm launch is already included in the bench's
+    ``B_full`` numbers.
+    """
+    if prefix_b is None:
+        prefix = prefix_a
+    else:
+        prefix = (prefix_a.float() + prefix_b.float()).to(prefix_a.dtype)
+    if write_bank_row:
+        assert bank.shape[1] > nvb, "write_bank_row requires NB > nvb"
+        bank[:, nvb, :] = prefix
+    mix = attn_res(
+        prefix,
+        bank,
+        norm_weight=score_norm.weight,
+        qk_weight=score_proj.weight.squeeze(),
+        num_blocks=nvb,
+        eps=score_norm.variance_epsilon,
+    )
+    out = out_norm(mix) if out_norm is not None else mix
     return out, prefix
 
 
@@ -348,6 +398,10 @@ def aggregate_stream(
     raw wire only carries the current block's running prefix."""
     if nvb == 0:
         return prefix_sum
+    if _use_hcu_aggregate(prefix_sum.shape[0], nvb):
+        return _aggregate_hcu(
+            prefix_sum, None, bank, nvb, score_proj, score_norm, None
+        )[0]
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
             prefix_sum, None, bank, nvb, score_proj, score_norm, None
@@ -370,6 +424,17 @@ def _aggregate_fused_add(
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
     write_bank_row rides _aggregate (fast path only)."""
+    if _use_hcu_aggregate(prefix_a.shape[0], nvb):
+        return _aggregate_hcu(
+            prefix_a,
+            prefix_b,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        )
     if _use_hip_fused(prefix_a.shape[1], nvb):
         # The hip kernel reads the prefix row anyway, so the add folds into it.
         return _aggregate_hip(
@@ -425,6 +490,17 @@ def _aggregate(
             out_norm,
             write_bank_row=write_bank_row,
         )
+    if _use_hcu_aggregate(prefix_sum.shape[0], nvb):
+        return _aggregate_hcu(
+            prefix_sum,
+            None,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        )[0]
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
             prefix_sum,
@@ -558,7 +634,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         normed = k3_sp_collective.attn_res_all_gather(
             prefix,
@@ -595,7 +671,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         return k3_sp_collective.reduce_scatter_attn_res(
             hidden_states,

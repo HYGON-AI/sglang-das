@@ -156,7 +156,7 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
+        if self.logits_output is not None and return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
                     self.logits_output.next_token_logprobs
@@ -180,11 +180,16 @@ class GenerationBatchResult:
                     _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
+        if (
+            self.logits_output is not None
+            and return_hidden_states
+            and self.logits_output.hidden_states is not None
+        ):
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        if self.next_token_ids is not None:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
@@ -304,6 +309,11 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
             if sampling_mask_output is None
             else sampling_mask_output.selected_logprobs
         ),
+        "sampling_mask_support_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.support_logprobs
+        ),
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
         ),
@@ -325,6 +335,7 @@ def get_logprob_from_pp_outputs(
             token_ids=next_pp_outputs["sampling_mask_token_ids"],
             lengths=next_pp_outputs["sampling_mask_lengths"],
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+            support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
         )
     logits_output = LogitsProcessorOutput(

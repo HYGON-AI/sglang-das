@@ -18,14 +18,15 @@
 // Templated on (MAX_COPIES, BLOCK_DIM). MAX_COPIES is small (typically 2-3)
 // so the per-row prefix sum unrolls into a few instructions per thread.
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher and SymbolicDevice
+#include <sgl_kernel/utils.h>   // For host validation
 
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel and device helpers
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "platform.cuh"
 #include <cstdint>
 
 namespace sglang {
@@ -42,6 +43,10 @@ __global__ void dispatch_probability_kernel(
   if (idx >= N) return;
 
   const int32_t logical_id = in_topk_ids[idx];
+  if (logical_id < 0) {
+    out_topk_ids[idx] = logical_id;
+    return;
+  }
   const int32_t* row_map = log2phy_map + logical_id * MAX_COPIES;
   const float* row_prob = log2phy_prob + logical_id * MAX_COPIES;
 
@@ -97,12 +102,23 @@ void dispatch_probability(
   SymbolicSize NUM_LOGICAL{"num_logical"};
   SymbolicDevice device_;
 
-  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(out_topk_ids).verify(in_topk_ids);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(log2phy_prob);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(log2phy_map);
-  TensorMatcher({N}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(random_vals);
+  TensorMatcher({N})
+      .with_dtype<int32_t>()
+      .with_device<lplb::kDeviceType>(device_)
+      .verify(out_topk_ids)
+      .verify(in_topk_ids);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES})
+      .with_dtype<float>()
+      .with_device<lplb::kDeviceType>(device_)
+      .verify(log2phy_prob);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES})
+      .with_dtype<int32_t>()
+      .with_device<lplb::kDeviceType>(device_)
+      .verify(log2phy_map);
+  TensorMatcher({N}).with_dtype<float>().with_device<lplb::kDeviceType>(device_).verify(random_vals);
 
   const int n = static_cast<int>(N.unwrap());
+  if (n == 0) return;
   const int grid = (n + BLOCK_DIM - 1) / BLOCK_DIM;
   const DLDevice device = device_.unwrap();
 

@@ -1,7 +1,4 @@
-"""Config-time override declarations for llama4.
-
-Architectures: Llama4ForCausalLM, Llama4ForConditionalGeneration.
-"""
+"""Config-time override declarations for llama4."""
 
 import logging
 from typing import Any, Dict
@@ -11,6 +8,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import is_hcu
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +26,7 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
             backend, platform = "trtllm_mha", "sm100"
         elif get_platform().is_sm90:
             backend, platform = "fa3", "sm90"
-        elif get_platform().is_hip:
+        elif get_platform().is_hip and not is_hcu():
             backend, platform = "aiter", "hip"
         elif cfg.device == "xpu":
             backend, platform = "intel_xpu", "xpu"

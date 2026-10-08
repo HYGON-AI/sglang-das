@@ -57,6 +57,154 @@ def set_kv_buffer_prefix_valid_tiled(
     tl.store(dst_v_row_ptr, v_val, mask=mask_byte)
 
 
+# This path handles the HCU FA page-major layout:
+# K is [page, head, token-in-page, dim], while V is [page, head, dim,
+# token-in-page]. Each head therefore needs its own grid axis.
+@triton.jit
+def set_kv_buffer_prefix_valid_hcu_fa_kernel(
+    src_ptr,
+    dst_ptr,
+    loc_2d_ptr,
+    commit_len_ptr,
+    src_row_stride,
+    src_head_stride,
+    src_dim_stride,
+    dst_page_stride,
+    dst_head_stride,
+    dst_token_stride,
+    dst_dim_stride,
+    block_size,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    row = tl.program_id(1)
+    head_tile = tl.program_id(2)
+    head = head_tile // NUM_TILES
+    tile = head_tile % NUM_TILES
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    valid_row = row < commit_len
+    row_idx = bid * block_size + row
+    loc = tl.load(loc_2d_ptr + row_idx, mask=valid_row, other=0).to(tl.int64)
+    page_id = loc // PAGE_SIZE
+    tok_in_page = loc % PAGE_SIZE
+
+    dim_offset = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = valid_row & (dim_offset < HEAD_DIM)
+    src_row_ptr = (
+        src_ptr
+        + row_idx * src_row_stride
+        + head * src_head_stride
+        + dim_offset * src_dim_stride
+    )
+    dst_row_ptr = (
+        dst_ptr
+        + page_id * dst_page_stride
+        + head * dst_head_stride
+        + tok_in_page * dst_token_stride
+        + dim_offset * dst_dim_stride
+    )
+    values = tl.load(src_row_ptr, mask=mask, other=0)
+    tl.store(dst_row_ptr, values, mask=mask)
+
+
+def set_kv_buffer_prefix_valid_hcu_fa(
+    k_view: torch.Tensor,
+    v_view: torch.Tensor,
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Scatter committed rows into the HCU FA K/V page layout.
+
+    The rectangular launch gates rows in the kernel with ``commit_lens``. It
+    avoids materializing a dynamic ``nonzero`` result and its implicit DtoH
+    synchronization on the scheduler thread.
+    """
+    if loc_2d.numel() == 0:
+        return
+    if k_view.ndim != 4 or v_view.ndim != 4:
+        raise ValueError(
+            "HCU FA KV views must be rank-4, got "
+            f"{k_view.ndim}/{v_view.ndim}."
+        )
+    if cache_k.ndim != 3 or cache_v.ndim != 3:
+        raise ValueError(
+            "HCU FA source KV tensors must be rank-3, got "
+            f"{cache_k.ndim}/{cache_v.ndim}."
+        )
+    if loc_2d.ndim != 2 or commit_lens.ndim != 1:
+        raise ValueError(
+            "HCU FA prefix metadata must be loc_2d=[B, W] and commit_lens=[B]."
+        )
+    # The kernel linearizes both metadata tensors; normalize only their layout,
+    # never their values, so non-contiguous scheduler views stay asynchronous.
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+    batch_size, block_size = loc_2d.shape
+    if commit_lens.shape[0] != batch_size:
+        raise ValueError(
+            "HCU FA commit_lens batch size mismatch: "
+            f"{commit_lens.shape[0]} != {batch_size}."
+        )
+    num_rows = batch_size * block_size
+    if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+        raise ValueError(
+            "HCU FA source KV rows must match loc_2d: "
+            f"{cache_k.shape[0]}/{cache_v.shape[0]} != {num_rows}."
+        )
+    if k_view.dtype != cache_k.dtype or v_view.dtype != cache_v.dtype:
+        raise ValueError(
+            "HCU FA source/destination dtype mismatch: "
+            f"K {cache_k.dtype}/{k_view.dtype}, V {cache_v.dtype}/{v_view.dtype}."
+        )
+
+    block = 128
+    for src, dst, token_axis, dim_axis in (
+        (cache_k, k_view, 2, 3),
+        (cache_v, v_view, 3, 2),
+    ):
+        head_num = dst.shape[1]
+        head_dim = src.shape[2]
+        if src.shape[1] != head_num or dst.shape[dim_axis] != head_dim:
+            raise ValueError(
+                "HCU FA source/destination shape mismatch: "
+                f"src={tuple(src.shape)}, dst={tuple(dst.shape)}."
+            )
+        grid = (
+            batch_size,
+            block_size,
+            head_num * triton.cdiv(head_dim, block),
+        )
+        set_kv_buffer_prefix_valid_hcu_fa_kernel[grid](
+            src,
+            dst,
+            loc_2d,
+            commit_lens,
+            src.stride(0),
+            src.stride(1),
+            src.stride(2),
+            dst.stride(0),
+            dst.stride(1),
+            dst.stride(token_axis),
+            dst.stride(dim_axis),
+            block_size,
+            HEAD_DIM=head_dim,
+            PAGE_SIZE=page_size,
+            NUM_TILES=triton.cdiv(head_dim, block),
+            BLOCK=block,
+            num_warps=4,
+            num_stages=2,
+        )
+
+
 @triton.jit
 def copy_all_layer_kv_cache_tiled(
     data_ptrs,

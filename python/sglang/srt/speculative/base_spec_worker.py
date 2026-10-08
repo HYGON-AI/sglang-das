@@ -14,10 +14,6 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import (
-        UpdateWeightFromDiskReqInput,
-        UpdateWeightsFromIPCReqInput,
-    )
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
@@ -162,6 +158,13 @@ class BaseSpecWorker(ABC):
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
 
+    def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
+        # NGRAM and UNO have no draft model
+        if self.draft_worker is None:
+            return []
+        return [("draft", runner) for runner in self.draft_worker.draft_runners]
+
     def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
         spec_algorithm = self.target_worker.model_runner.spec_algorithm
         draft_worker = self.draft_worker
@@ -271,6 +274,15 @@ class BaseSpecWorker(ABC):
             )
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            # Single-layer draft LayerSplit has persistent KV only on its CP
+            # owner. Non-owners must not allocate or restore a packed host
+            # entry pointing at the draft's zero-row placeholder.
+            draft_pools = tuple(
+                pool
+                for pool in draft_pools
+                if not getattr(pool, "layer_shard_enabled", False)
+                or pool.get_kv_layer_ids()
+            )
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
@@ -314,24 +326,6 @@ class BaseSpecWorker(ABC):
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for runner in self.draft_worker.draft_runners:
-            success, message = runner.weight_updater.update_weights_from_disk(
-                recv_req.model_path,
-                recv_req.load_format,
-                recapture_cuda_graph=recv_req.recapture_cuda_graph,
-            )
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        for runner in self.draft_worker.draft_runners:
-            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
-            if not success:
-                return success, message
-        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0

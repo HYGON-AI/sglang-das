@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hcu = is_hcu()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 
 
 def _is_moe_prefill_or_normal() -> bool:
@@ -329,6 +330,61 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                     "channelwise W8A8 checkpoint"
                 )
             build_hcu_w8a8_mega_moe_experts_weights(layer)
+            return
+
+        if _is_hcu and self.use_deepep and _use_deepgemm_moe:
+            # DeepEP + DeepGEMM MoE path (used by GLM-5.3-Flash FP8 d.sh, p.sh):
+            # forward_groupgemm_w8a8_fp8_masked / forward_groupgemm_w8a8_fp8_contiguous
+            # read layer.w13_weight_deepgemm / layer.w2_weight_deepgemm, produced by
+            # pack_int8_weight_enk_to_w6_low_latency. The compressed_tensors W8A8-FP8
+            # scheme does this in _prepare_dsv4_channel_fp8_deepgemm_weights, but the
+            # --quantization w8a8_fp8 route reaches this method instead, so publish
+            # the same aliases here.
+            from torch.nn.parameter import Parameter as _Parameter
+
+            layer.w13_weight = _Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = _Parameter(layer.w2_weight, requires_grad=False)
+            layer.w13_weight_scale = _Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            layer.w2_weight_scale = _Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
+
+            from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+
+            w13 = layer.w13_weight
+            w2 = layer.w2_weight
+            with torch.no_grad():
+                w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
+                w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+
+            # Save shapes so DeepEPMoE.forward_groupgemm_w8a8_fp8_contiguous can infer
+            # the N dimension via _dsv4_w13_weight_shape.
+            layer._dsv4_w13_weight_shape = tuple(w13.shape)
+            layer._dsv4_w2_weight_shape = tuple(w2.shape)
+
+            if "w13_weight_deepgemm" in layer._buffers:
+                layer._buffers["w13_weight_deepgemm"] = w13_deepgemm
+                layer._non_persistent_buffers_set.add("w13_weight_deepgemm")
+            else:
+                layer.register_buffer(
+                    "w13_weight_deepgemm", w13_deepgemm, persistent=False
+                )
+            if "w2_weight_deepgemm" in layer._buffers:
+                layer._buffers["w2_weight_deepgemm"] = w2_deepgemm
+                layer._non_persistent_buffers_set.add("w2_weight_deepgemm")
+            else:
+                layer.register_buffer(
+                    "w2_weight_deepgemm", w2_deepgemm, persistent=False
+                )
+            # The low-latency/contiguous DeepGEMM kernels consume only the
+            # packed buffers. Drop the source tensors to avoid retaining two
+            # full copies of every expert weight.
+            del layer.w13_weight
+            del layer.w2_weight
+            torch.cuda.empty_cache()
+            layer._dsv4_channel_fp8_deepgemm_repacked = True
             return
 
         if _is_hcu and _use_fp8_w8a8_moe:
