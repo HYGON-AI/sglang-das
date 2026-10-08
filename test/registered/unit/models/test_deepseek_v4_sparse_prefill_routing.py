@@ -49,9 +49,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         q = SimpleNamespace(shape=(128, 1, 8, 512))
         with (
             patch.object(deepseek_v4_backend, "_is_sm120", False),
-            patch.object(
-                deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True
-            ),
+            patch.object(deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True),
             envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
         ):
             self.assertTrue(
@@ -60,16 +58,14 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 )
             )
 
-    def test_legacy_v4_sparse_prefill_still_rejects_cp(self):
+    def test_explicit_sparse_prefill_override_allows_cp(self):
         q = SimpleNamespace(shape=(128, 1, 8, 512))
         with (
             patch.object(deepseek_v4_backend, "_is_sm120", False),
-            patch.object(
-                deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True
-            ),
+            patch.object(deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True),
             envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
         ):
-            self.assertFalse(
+            self.assertTrue(
                 deepseek_v4_backend._should_use_sparse_prefill(
                     q, SimpleNamespace(), allow_cp=False
                 )

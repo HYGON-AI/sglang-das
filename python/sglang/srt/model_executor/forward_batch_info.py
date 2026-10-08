@@ -302,8 +302,6 @@ class ForwardMode(IntEnum):
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
 
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
 
 
 @total_ordering

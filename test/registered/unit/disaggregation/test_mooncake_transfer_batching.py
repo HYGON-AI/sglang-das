@@ -410,6 +410,7 @@ class TestDcpPackLifetime(CustomTestCase):
             self.assertEqual(future.result(timeout=10), 17)
         self.assertEqual(observed, [11])
 
+
 class TestMooncakeBatchRegistration(unittest.TestCase):
     @staticmethod
     def _make_engine(return_value=0, side_effect=None):

@@ -24,7 +24,6 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_hcu
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -591,8 +590,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.ep_static_dispatch_policy not in ("nearest", "locality_fair"):
         raise ValueError(
-            "--ep-static-dispatch-policy must be one of "
-            "'nearest' or 'locality_fair'."
+            "--ep-static-dispatch-policy must be one of 'nearest' or 'locality_fair'."
         )
 
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
@@ -650,9 +648,7 @@ def handle_eplb_and_dispatch(server_args: Any):
 def handle_platform_cp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     platform = get_platform()
-    is_protected_platform = (
-        platform.is_hip or platform.is_npu or platform.is_musa
-    )
+    is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
     if not is_protected_platform:
         if (
             cfg.enable_prefill_context_parallel
@@ -774,7 +770,7 @@ def validate_prefill_cp_platform(server_args: Any):
     if (
         cfg.enable_prefill_cp
         and (platform.is_hip or platform.is_musa)
-        and not is_hcu()
+        and not platform.is_hcu
     ):
         raise ValueError(
             "Prefill CP on non-HCU HIP/MUSA is deprecated; "

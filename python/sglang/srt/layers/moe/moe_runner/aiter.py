@@ -941,7 +941,6 @@ def pre_permute_standard_to_aiter(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
-        topk_ids=topk_ids,
         quant_type=quant_info.quant_type,
     )
 
