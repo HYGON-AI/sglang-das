@@ -146,9 +146,6 @@ SGL_DEVICE float compressed_kv_scale(float amax) {
   return compressed_kv_scale_hip(amax);
 #else
   const auto raw = fminf(fmaxf(amax * (1.0f / kMax), 0x1p-9f), 448.0f);
-#ifdef USE_ROCM
-  return e4m3_round_rn(raw);
-#else
   return static_cast<float>(__nv_fp8_e4m3(raw));
 #endif
 }
@@ -159,12 +156,8 @@ SGL_DEVICE fp32x2_t fake_quant_compressed_kv_x2(fp32x2_t x, float scale) {
   return fake_quant_compressed_kv_x2_hip(x, scale);
 #else
   const fp32x2_t scaled{__fdiv_rn(x.x, scale) + 0.0f, __fdiv_rn(x.y, scale) + 0.0f};
-#ifdef USE_ROCM
-  const fp32x2_t grid{e2m1_value(e2m1_code(scaled.x)), e2m1_value(e2m1_code(scaled.y))};
-#else
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
   const auto grid = device::cast<fp32x2_t>(fp16x2_t{__nv_cvt_fp4x2_to_halfraw2(code, __NV_E2M1)});
-#endif
   return {grid.x * scale, grid.y * scale};
 #endif
 }
@@ -184,12 +177,8 @@ SGL_DEVICE fp32x2_t fake_quant_x2(fp32x2_t x, float scale, float inv_scale) {
   return fake_quant_x2_hip(x, scale, inv_scale);
 #else
   const fp32x2_t scaled{__fmaf_rn(x.x, inv_scale, 0.0f), __fmaf_rn(x.y, inv_scale, 0.0f)};
-#ifdef USE_ROCM
-  const fp32x2_t grid{e2m1_value(e2m1_code(scaled.x)), e2m1_value(e2m1_code(scaled.y))};
-#else
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
   const auto grid = device::cast<fp32x2_t>(fp16x2_t{__nv_cvt_fp4x2_to_halfraw2(code, __NV_E2M1)});
-#endif
   return {grid.x * scale, grid.y * scale};
 #endif
 }
