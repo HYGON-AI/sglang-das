@@ -382,8 +382,11 @@ class DraftBackendFactory:
             HCUMLAMultiStepDraftBackend,
         )
 
-        return HCUMLAMultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+        return (
+            "hcu_mla",
+            HCUMLAMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
         )
 
     def _create_trtllm_mha_decode_backend(self):

@@ -175,7 +175,10 @@ def flash_attn_with_kvcache(
                 device=q.device,
             )
         cu_seqlens_k = torch.cat(
-            [cache_seqlens.new_zeros(1), torch.cumsum(cache_seqlens, dim=0)]
+            [
+                cache_seqlens.new_zeros(1),
+                torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
+            ]
         )
         k_cache = k_cache.to(q.dtype) if not is_nmz_fp8(k_cache.dtype) else k_cache
         v_cache = v_cache.to(q.dtype) if not is_nmz_fp8(v_cache.dtype) else v_cache
