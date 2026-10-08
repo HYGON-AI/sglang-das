@@ -1379,6 +1379,18 @@ class Req(ReqDllmMixin):
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
 
+        # PP0 owns the canonical external-cache boundary. Apply it only while
+        # admitting the request; cache insertion performs its own rematch and
+        # must be allowed to see KV computed after that original boundary.
+        if (
+            tree_cache is not None
+            and self.external_cache_hit_length is not None
+            and getattr(tree_cache, "linker", None) is not None
+            and getattr(tree_cache, "pp_size", 1) > 1
+        ):
+            capped = min(input_len, self.external_cache_hit_length)
+            key_limit = capped if key_limit is None else min(key_limit, capped)
+
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:

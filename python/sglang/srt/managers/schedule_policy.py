@@ -30,6 +30,7 @@ import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
@@ -152,6 +153,18 @@ def match_prefix_for_req(
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+
+    # Keep cache-aware admission consistent with the canonical boundary found
+    # by PP0. This must not be implemented in the cache's generic match path:
+    # cache_unfinished_req rematches immediately after inserting newly computed KV.
+    if (
+        include_req
+        and req.external_cache_hit_length is not None
+        and getattr(tree_cache, "linker", None) is not None
+        and getattr(tree_cache, "pp_size", 1) > 1
+    ):
+        capped = min(len(token_ids), req.external_cache_hit_length)
+        key_limit = capped if key_limit is None else min(key_limit, capped)
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -507,6 +520,14 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefillAdmission:
+    prefix_len: int
+    extend_len: int
+    max_new_tokens: int
+    is_chunked: bool
 
 
 class PrefillAdder:
@@ -1234,75 +1255,19 @@ class PrefillAdder:
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
-
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = cand_extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
-        prefix_len = len(req.prefix_indices)
-
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
-
-        chunk_tokens_limit = self.rem_chunk_tokens
-        if self.is_hybrid_swa:
-            # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
-            # driven only by the freshly-prefilled tail (the loaded window is
-            # charged separately via swa_host_hit_length).
-            swa_needed = self._swa_budget_for_req(
-                real_input_tokens,
-                self._swa_new_tokens(req),
-                swa_host_hit_length=req.swa_host_hit_length,
-            )
-            if swa_needed >= self.rem_swa_tokens:
-                if not self._swa_req_never_fits(
-                    real_input_tokens,
-                    self._swa_new_tokens(req),
-                    req.swa_host_hit_length,
-                ):
-                    return AddReqResult.NO_TOKEN
-                swa_cap = self._swa_chunk_cap(
-                    self._swa_new_tokens(req), req.swa_host_hit_length
-                )
-                if self.rem_chunk_tokens is None or swa_cap <= 0:
-                    return AddReqResult.NO_TOKEN
-                chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
-
-        if (
-            self.rem_chunk_tokens is None
-            and len(self.can_run_list) != 0
-            and real_input_tokens >= self.rem_input_tokens
-        ):
-            # If without chunked prefill:
-            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
-            # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+        mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
+        total_tokens += mamba_gap_reserve
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
-
-            if self.is_hybrid_swa:
-                # self.rem_swa_tokens may decrease after the lock acquisition
-                swa_needed = self._swa_budget_for_req(
-                    real_input_tokens,
-                    self._swa_new_tokens(req),
-                    swa_host_hit_length=req.swa_host_hit_length,
-                )
-                if swa_needed >= self.rem_swa_tokens:
-                    if not self._swa_req_never_fits(
-                        real_input_tokens,
-                        self._swa_new_tokens(req),
-                        req.swa_host_hit_length,
-                    ):
-                        return AddReqResult.NO_TOKEN
-                    swa_cap = self._swa_chunk_cap(
-                        self._swa_new_tokens(req), req.swa_host_hit_length
-                    )
-                    if self.rem_chunk_tokens is None or swa_cap <= 0:
-                        return AddReqResult.NO_TOKEN
-                    chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+            admission = self._select_prefill_admission(
+                req,
+                total_tokens=total_tokens,
+                host_hit_length=req.host_hit_length,
+                swa_host_hit_length=req.swa_host_hit_length,
+                truncation_align_size=truncation_align_size,
+            )
+            if isinstance(admission, AddReqResult):
+                return admission
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
@@ -1319,124 +1284,170 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                promised_host_hit = req.host_hit_length
+                loaded = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
+                if loaded is None:
+                    return AddReqResult.OTHER
+                new_indices, req.last_node = loaded
                 req.host_loaded_length = len(new_indices)
+                if 0 < req.host_loaded_length < promised_host_hit:
+                    raise RuntimeError(
+                        "HiCache load-back must commit all promised FULL tokens or none: "
+                        f"req={req.rid} promised={promised_host_hit} "
+                        f"loaded={req.host_loaded_length}"
+                    )
+                if req.host_loaded_length > promised_host_hit:
+                    prefix_len = len(req.prefix_indices) + req.host_loaded_length
+                    extend_len = admission.extend_len
+                    if self.dllm_config is None:
+                        extend_len = min(
+                            extend_len,
+                            len(req.full_untruncated_fill_ids) - prefix_len,
+                        )
+                    is_chunked = admission.is_chunked and (
+                        prefix_len + extend_len < len(req.full_untruncated_fill_ids)
+                    )
+                    max_new_tokens = admission.max_new_tokens
+                    if admission.is_chunked and not is_chunked:
+                        max_new_tokens = min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        )
+                    admission = _PrefillAdmission(
+                        prefix_len, extend_len, max_new_tokens, is_chunked
+                    )
+                elif req.host_loaded_length < promised_host_hit:
+                    # A zero-token load allocates no FULL slots, so it is safe to
+                    # re-run admission for recomputation.
+                    admission = self._select_prefill_admission(
+                        req,
+                        total_tokens=total_tokens,
+                        host_hit_length=0,
+                        swa_host_hit_length=0,
+                        truncation_align_size=truncation_align_size,
+                    )
+                    if isinstance(admission, AddReqResult):
+                        return admission
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                prefix_len = len(req.prefix_indices)
                 # PP linker slots remain request-owned until post-prefill insert.
                 if req.external_cache_hit_length is None:
-                    req.cache_protected_len = prefix_len
+                    req.cache_protected_len = len(req.prefix_indices)
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-            )
-
-            if (
-                self.rem_chunk_tokens is None
-                and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
-            ):
-                # If without chunked prefill:
-                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
-                # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
-
-            if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
-
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
-                self._add_dllm_req(req, prefix_len)
-                self._req_inc_lock_ref(req)
-            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
-                # Non-chunked prefill — the whole sequence is committed this iter.
-                req.set_extend_range(
-                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-                )
-                self.can_run_list.append(req)
-
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(
-                    prefix_len,
-                    input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
-                    req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    host_hit_len=req.host_hit_length,
-                    storage_hit_len=req.storage_hit_length,
-                )
-            else:
-                # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
-
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(trunc_len)
-                ) is not None:
-                    return tile_stop
-
-                # Chunked prefill
-                req.set_extend_range(
-                    len(req.prefix_indices), len(req.prefix_indices) + trunc_len
-                )
-
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
-
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(
-                    prefix_len,
-                    trunc_len,
-                    0,
-                    req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    host_hit_len=req.host_hit_length,
-                    storage_hit_len=req.storage_hit_length,
-                )
+            # Successful materialization has no remaining admission gates.
+            self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
         return self.budget_state()
+
+    def _select_prefill_admission(
+        self,
+        req: Req,
+        *,
+        total_tokens: int,
+        host_hit_length: int,
+        swa_host_hit_length: int,
+        truncation_align_size: Optional[int],
+    ) -> _PrefillAdmission | AddReqResult:
+        """Select a prefill shape without allocating or publishing cached KV."""
+        prefix_len = len(req.prefix_indices) + host_hit_length
+        extend_len = len(req.full_untruncated_fill_ids) - prefix_len
+        input_tokens = self.ceil_paged_tokens(extend_len)
+
+        if total_tokens >= self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
+
+        chunk_tokens_limit = self.rem_chunk_tokens
+        if self.is_hybrid_swa:
+            swa_needed = self._swa_budget_for_req(
+                input_tokens,
+                self._swa_new_tokens(req),
+                swa_host_hit_length=swa_host_hit_length,
+            )
+            if swa_needed >= self.rem_swa_tokens:
+                if not self._swa_req_never_fits(
+                    input_tokens,
+                    self._swa_new_tokens(req),
+                    swa_host_hit_length,
+                ):
+                    return AddReqResult.NO_TOKEN
+                swa_cap = self._swa_chunk_cap(
+                    self._swa_new_tokens(req), swa_host_hit_length
+                )
+                if self.rem_chunk_tokens is None or swa_cap <= 0:
+                    return AddReqResult.NO_TOKEN
+                chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+        if (
+            self.rem_chunk_tokens is None
+            and self.can_run_list
+            and input_tokens >= self.rem_input_tokens
+        ):
+            return AddReqResult.OTHER
+
+        is_chunked = False
+        max_new_tokens = min(
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+        )
+        tile_tokens = input_tokens
+        if self.dllm_config is not None:
+            if self.rem_dllm_tokens <= 0:
+                return AddReqResult.OTHER
+            assert truncation_align_size is None, (
+                "truncation_align_size is not supported for dllm prefill"
+            )
+            extend_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
+            if extend_len <= 0:
+                return AddReqResult.OTHER
+            max_new_tokens = 0
+            tile_tokens = extend_len
+        elif chunk_tokens_limit is not None and input_tokens > chunk_tokens_limit:
+            extend_len = chunk_tokens_limit // self.page_size * self.page_size
+            if truncation_align_size is not None:
+                extend_len = (
+                    extend_len // truncation_align_size * truncation_align_size
+                )
+            end = (prefix_len + extend_len) // self.page_size * self.page_size
+            extend_len = end - prefix_len
+            if extend_len <= 0:
+                return AddReqResult.OTHER
+            is_chunked = True
+            max_new_tokens = 0
+            tile_tokens = extend_len
+
+        if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
+            return verdict
+
+        return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, is_chunked)
+
+    def _commit_prefill_admission(
+        self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
+    ) -> None:
+        assert len(req.prefix_indices) == admission.prefix_len
+        req.set_extend_range(
+            admission.prefix_len, admission.prefix_len + admission.extend_len
+        )
+        self.can_run_list.append(req)
+        if admission.is_chunked:
+            self.new_chunked_req = req
+        self._req_inc_lock_ref(req)
+        self._update_prefill_budget(
+            admission.prefix_len,
+            admission.extend_len,
+            admission.max_new_tokens,
+            req.retracted_stain,
+            mamba_gap_reserve=mamba_gap_reserve,
+            host_hit_len=req.host_hit_length,
+            storage_hit_len=req.storage_hit_length,
+        )
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """

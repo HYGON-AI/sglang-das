@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    PreparedHostPrefetch,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -537,6 +538,126 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
+
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        """Rank-consistent switch resolved when the linker was built."""
+        return (
+            self.linker is not None
+            and self.linker.cache_linker.waiting_queue_prefetch_enabled()
+        )
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        if self.linker is not None:
+            self.linker.cache_linker.disable_waiting_queue_prefetch()
+
+    def prefetch_external_linker_to_host(self, req) -> bool:
+        if self.linker is None:
+            return False
+        return self.linker.prefetch_to_host(req)
+
+    def prepare_external_linker_prefetch(
+        self, req
+    ) -> Optional[PreparedHostPrefetch]:
+        if self.linker is None:
+            return None
+        return self.linker.prepare_host_prefetch(req)
+
+    def complete_external_linker_prefetch(
+        self, job: PreparedHostPrefetch, submitted: bool
+    ) -> bool:
+        if self.linker is None:
+            if submitted:
+                job.cache_linker.cancel_host_prefetch(job.rid)
+            return False
+        return self.linker.complete_host_prefetch_submission(job, submitted)
+
+    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
+        """Return one rank-wide admission state for a queued DFS prefetch."""
+        return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
+
+    def get_waiting_queue_prefetch_admission_states(
+        self, rids: Sequence[str]
+    ) -> dict[str, str]:
+        """Resolve variable local request lists in one fixed-shape collective round.
+
+        The request-id union and state matrix make this safe when ranks have
+        different waiting-queue lengths, including an empty queue on some
+        ranks. This method remains scheduler-thread only.
+        """
+        groups = []
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                groups.append(group)
+        if not groups and self.tp_world_size > 1:
+            groups.append(self.tp_group)
+
+        all_rids = list(dict.fromkeys(rids))
+        has_rids = torch.tensor([int(bool(all_rids))], dtype=torch.int)
+        self._all_reduce_attn_groups(
+            has_rids, torch.distributed.ReduceOp.MAX
+        )
+        if int(has_rids.item()) == 0:
+            return {}
+
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, all_rids, group=group)
+            all_rids = sorted(
+                {rid for rank_rids in gathered for rid in rank_rids}
+            )
+
+        if not all_rids:
+            return {}
+
+        state_names = (
+            "not_tracked",
+            "pending",
+            "dfs_prefetched",
+            "no_prefetch_needed",
+            "terminal",
+        )
+        local_states = [
+            "not_tracked"
+            if self.linker is None
+            else self.linker.get_host_prefetch_admission_state(rid)
+            for rid in all_rids
+        ]
+        counts = torch.tensor(
+            [
+                [int(local_state == state) for state in state_names]
+                for local_state in local_states
+            ],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+
+        def state_from_counts(row) -> str:
+            not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
+                int(value) for value in row
+            )
+            # PENDING wins: an in-flight native read owns its private session
+            # and must finish before any rank can fall back to normal load.
+            if pending:
+                return "pending"
+            completed = dfs_prefetched + no_prefetch_needed
+            if terminal or (not_tracked and completed):
+                return "terminal"
+            if dfs_prefetched:
+                return "dfs_prefetched"
+            if no_prefetch_needed:
+                return "no_prefetch_needed"
+            if not_tracked:
+                return "not_tracked"
+            return "terminal"
+
+        return {
+            rid: state_from_counts(counts[index])
+            for index, rid in enumerate(all_rids)
+        }
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.cancel_waiting_queue_prefetch(rid)
 
     def is_chunk_cache(self) -> bool:
         return self.disable

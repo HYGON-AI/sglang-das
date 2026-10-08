@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from array import array
 from collections import deque
@@ -96,6 +97,30 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
+
+DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
+    "SGLANG_DAS_PREFETCH_TRACE", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def trace_disagg_prefill(
+    event: str, rid, bootstrap_room, rank, **state
+) -> None:
+    """Emit an opt-in, content-free timestamp for a disagg prefill request."""
+    if not DAS_PREFETCH_TRACE_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in state.items())
+    logger.info(
+        "DAS_PREFETCH_TRACE phase=%s rid=%s bootstrap_room=%s rank=%s "
+        "wall_ns=%d monotonic_ns=%d%s",
+        event,
+        rid if rid is not None else "-",
+        bootstrap_room if bootstrap_room is not None else "-",
+        rank if rank is not None else "-",
+        time.time_ns(),
+        time.monotonic_ns(),
+        f" {details}" if details else "",
+    )
 
 _is_npu = is_npu()
 
@@ -897,10 +922,11 @@ class PrefillBootstrapQueue:
         pd_hidden_state(req).owner_direct_sent = False
         return True
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def add(self, req: Req, num_kv_heads: int) -> bool:
         if not self.create_sender(req, num_kv_heads):
-            return
+            return False
         self.queue.append(req)
+        return True
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -1112,6 +1138,112 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def _admit_prefill_bootstrapped_reqs(self: Scheduler) -> None:
+        """Move requests whose bootstrap is ready into the waiting queue."""
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        bootstrapped_reqs = bootstrap_queue.pop_bootstrapped()
+        if DAS_PREFETCH_TRACE_ENABLED:
+            for req in bootstrapped_reqs:
+                trace_disagg_prefill(
+                    "bootstrap_ready",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    bootstrap_pending=getattr(req, "pending_bootstrap", False),
+                    prefill_attempt=req.prefill_attempt_count,
+                    bootstrap_queue_size=len(bootstrap_queue.queue),
+                )
+        self.waiting_queue.extend(bootstrapped_reqs)
+        if DAS_PREFETCH_TRACE_ENABLED:
+            for req in bootstrapped_reqs:
+                trace_disagg_prefill(
+                    "waiting_queue_admit",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    waiting_queue_size=len(self.waiting_queue),
+                    bootstrap_queue_size=len(bootstrap_queue.queue),
+                    bootstrap_pending=getattr(req, "pending_bootstrap", False),
+                )
+
+    def maybe_supplemental_poll_final_chunks(self: Scheduler) -> List[Req]:
+        """Give newly submitted final chunks one bounded chance to finish."""
+        final_rooms = getattr(self, "_disagg_final_chunk_rooms", set())
+        self._disagg_final_chunk_rooms = set()
+        timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
+        if timeout_ms <= 0 or not final_rooms:
+            return []
+
+        remaining_rooms = {
+            req.bootstrap_room
+            for req in self.disagg_prefill_inflight_queue
+            if req.bootstrap_room in final_rooms
+        }
+        if not remaining_rooms:
+            return []
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        wait_for_rooms = getattr(kv_mgr, "wait_for_transfer_rooms", None)
+        if wait_for_rooms is None:
+            return []
+
+        start = time.perf_counter()
+        all_done = wait_for_rooms(remaining_rooms, timeout_ms / 1000.0)
+        waited = time.perf_counter()
+        done_reqs = self.process_disagg_prefill_inflight_queue()
+        self._record_final_poll_wait(
+            len(remaining_rooms),
+            len(done_reqs),
+            waited - start,
+            time.perf_counter() - waited,
+            all_done,
+        )
+        return done_reqs
+
+    def _record_final_poll_wait(
+        self: Scheduler,
+        num_rooms: int,
+        num_done: int,
+        wait_s: float,
+        poll_s: float,
+        all_done: bool,
+    ) -> None:
+        """Accumulate final-chunk wait stats and log a summary every minute.
+
+        wait_ms is this rank's local wait; poll_ms is the extra all-reduced poll,
+        which includes waiting for slower ranks. Their sum is the added
+        scheduler stall per round.
+        """
+        now = time.monotonic()
+        stats = getattr(self, "_final_poll_wait_stats", None)
+        if stats is None:
+            stats = self._final_poll_wait_stats = {"start": now}
+        stats["rounds"] = stats.get("rounds", 0) + 1
+        stats["rooms"] = stats.get("rooms", 0) + num_rooms
+        stats["done"] = stats.get("done", 0) + num_done
+        stats["wait_s"] = stats.get("wait_s", 0.0) + wait_s
+        stats["poll_s"] = stats.get("poll_s", 0.0) + poll_s
+        stats["max_s"] = max(stats.get("max_s", 0.0), wait_s + poll_s)
+        stats["timeouts"] = stats.get("timeouts", 0) + (not all_done)
+        if now - stats["start"] < 60.0:
+            return
+        rounds = stats["rounds"]
+        logger.info(
+            "Final KV chunk poll (last %.0f s): rounds=%d rooms=%d done=%d "
+            "local_wait_ms avg=%.1f extra_poll_ms avg=%.1f stall_ms total=%.0f "
+            "max=%.1f timeouts=%d",
+            now - stats["start"],
+            rounds,
+            stats["rooms"],
+            stats["done"],
+            stats["wait_s"] * 1000 / rounds,
+            stats["poll_s"] * 1000 / rounds,
+            (stats["wait_s"] + stats["poll_s"]) * 1000,
+            stats["max_s"] * 1000,
+            stats["timeouts"],
+        )
+        self._final_poll_wait_stats = {"start": now}
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -1159,6 +1291,7 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -1171,6 +1304,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
+        if DAS_PREFETCH_TRACE_ENABLED and batch is not None:
+            for req in batch.reqs:
+                trace_disagg_prefill(
+                    "prefill_batch_scheduled",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    batch_size=len(batch.reqs),
+                    waiting_queue_size=len(self.waiting_queue),
+                    prefill_attempt=req.prefill_attempt_count,
+                )
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
@@ -1183,14 +1327,14 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            self._process_deferred_reqs()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            self._admit_prefill_bootstrapped_reqs()
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -1213,6 +1357,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_supplemental_poll_final_chunks()
 
             # Update last_batch
             self.last_batch = batch
@@ -1227,9 +1372,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            self._admit_prefill_bootstrapped_reqs()
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -1261,6 +1404,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_supplemental_poll_final_chunks()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2204,6 +2348,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
+        # Also covers the external KV linker: a waiting-queue prefetch taken
+        # at arrival would otherwise keep its budget slot and pinned session.
+        self._release_aborted_request(req.rid)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -2334,6 +2481,18 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        # Only the non-PP event loops drain these rooms, so do not collect them
+        # otherwise (or when the supplemental poll is disabled).
+        if (
+            last_chunk
+            and self.ps.pp_size == 1
+            and envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+        ):
+            final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+            if final_rooms is None:
+                final_rooms = self._disagg_final_chunk_rooms = set()
+            final_rooms.add(req.bootstrap_room)
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
