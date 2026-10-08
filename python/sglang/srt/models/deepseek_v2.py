@@ -857,7 +857,9 @@ class DeepseekV2MoE(nn.Module):
                 # generic HF config, that compatibility view intentionally has
                 # no quantization_config attribute.  Identify compressed-tensors
                 # from either source before accessing its block-size metadata.
-                config_quantization = getattr(config, "quantization_config", None)
+                config_quantization = getattr(
+                    config, "quantization_config", None
+                ) or getattr(config, "compression_config", None)
                 is_compressed_tensors = (
                     isinstance(config_quantization, dict)
                     and config_quantization.get("quant_method") == "compressed-tensors"
