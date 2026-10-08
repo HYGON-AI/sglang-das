@@ -763,7 +763,7 @@ def fused_experts_impl_aiter(
     #     w1, w2 = aiter_moe_shfl_weight(w1, w2, moe_cfg)
     # if status and getattr(moe_cfg, "need_shuffle_scale", False):
     #     w1_scale, w2_scale = aiter_moe_shfl_scale(w1_scale, w2_scale, moe_cfg)
-    
+
     return aiter_moe(
         hidden_states,
         w1,

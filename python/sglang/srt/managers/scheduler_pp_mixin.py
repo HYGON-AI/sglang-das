@@ -2165,4 +2165,3 @@ class SchedulerPPMixin:
                 self.hisparse_coordinator.admit_request_direct(req)
         self.waiting_queue.extend(released_reqs)
         return [req.rid for req in released_reqs]
-

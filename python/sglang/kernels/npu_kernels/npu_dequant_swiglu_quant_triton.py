@@ -271,4 +271,3 @@ def dequant_swiglu_quant_golden(
         torch.int8
     )
     return y, s.to(torch.float32)
-

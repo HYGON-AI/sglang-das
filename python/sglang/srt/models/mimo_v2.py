@@ -741,7 +741,7 @@ class MiMoV2Attention(nn.Module):
             logger.error("mimo v2 kv pool is not healthy: missing layers_mapping")
             return None
         return k_buffer, v_buffer, loc
-    
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,

@@ -372,4 +372,3 @@ def grouped_matmul_golden(
     if split_item in (0, 1):
         return [y[starts[g] : ends[g]] for g in range(e)]
     return [y]
-

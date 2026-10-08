@@ -39,5 +39,3 @@ def get_candidate_stream_if_initialized() -> Optional[torch.cuda.Stream]:
     forcing the candidate stream into existence on workers that never use it.
     """
     return _CANDIDATE_STREAM
-
-
