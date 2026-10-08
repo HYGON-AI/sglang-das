@@ -2959,6 +2959,32 @@ class ServerArgs:
         "count threshold.",
         NS("memory"),
     ] = False
+    mooncake_enable_waiting_queue_dfs_prefetch: A[
+        bool,
+        "Prefetch Mooncake DFS objects into its pinned session cache while "
+        "requests wait in the FCFS scheduler queue. Hold admission until "
+        "the prefetch is ready on all ranks; failures use the normal external "
+        "load path.",
+        NS("memory"),
+    ] = False
+    mooncake_waiting_queue_dfs_prefetch_max_requests: A[
+        int,
+        "Maximum number of preparing, queued, reading, or ready Mooncake "
+        "waiting-queue DFS-prefetch requests retained per scheduler rank.",
+        NS("memory"),
+    ] = 8
+    mooncake_waiting_queue_dfs_prefetch_workers: A[
+        int,
+        "Maximum number of background workers reading Mooncake DFS objects "
+        "for waiting-queue prefetch. Capped by the request limit.",
+        NS("memory"),
+    ] = 2
+    mooncake_waiting_queue_dfs_prefetch_max_bytes: A[
+        int,
+        "Maximum estimated active pinned-buffer capacity for waiting-queue "
+        "DFS prefetch per scheduler rank.",
+        NS("memory"),
+    ] = 1073741824
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------

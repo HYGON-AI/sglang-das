@@ -1,5 +1,7 @@
+import threading
 import types
 import unittest
+from queue import Queue
 from unittest.mock import Mock
 
 import torch
@@ -71,7 +73,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
             host_indices=torch.tensor([4, 5]),
             keys=["page-0"],
         )
-        layouts = linker._prepare_read_plan_layouts([[transfer]])
+        layouts = linker._prepare_read_plan_layouts([("rid", [transfer])])
 
         self.assertEqual(len(layouts), 1)
         keys, locations, packed, layers = layouts[0]
@@ -91,6 +93,29 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
                 [],
             ],
         )
+
+    def test_host_prefetch_submission_does_not_prepare_inline(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.host_prefetch_enabled = True
+        linker.host_prefetch_limit = 8
+        linker.host_prefetch_max_pages = 1024
+        linker.host_prefetch_lock = threading.Lock()
+        linker.host_prefetch_entries = {}
+        linker.host_prefetch_queue = Queue()
+        linker.prepare_load = Mock(
+            side_effect=AssertionError(
+                "session preparation must run on the prefetch worker"
+            )
+        )
+        transfer = PoolTransfer(name=PoolName.KV, keys=["page-a"])
+
+        self.assertTrue(linker.submit_host_prefetch("rid", [transfer]))
+        linker.prepare_load.assert_not_called()
+        self.assertEqual(linker.get_host_prefetch_status("rid"), "queued")
+        queued_rid, queued_transfers = linker.host_prefetch_queue.get_nowait()
+        self.assertEqual(queued_rid, "rid")
+        self.assertEqual(queued_transfers, [transfer])
+        linker.host_prefetch_queue.task_done()
 
 
 if __name__ == "__main__":

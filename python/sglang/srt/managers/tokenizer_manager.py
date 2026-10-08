@@ -173,6 +173,30 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
+    "SGLANG_DAS_PREFETCH_TRACE", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trace_disagg_prefill_dispatch(event: str, obj: Any) -> None:
+    if not _DAS_PREFETCH_TRACE_ENABLED:
+        return
+    requests = getattr(obj, "batch", None)
+    if requests is None:
+        requests = (obj,)
+    for req in requests:
+        if not isinstance(req, TokenizedGenerateReqInput):
+            continue
+        logger.info(
+            "DAS_PREFETCH_TRACE phase=%s rid=%s bootstrap_room=%s rank=tokenizer "
+            "wall_ns=%d monotonic_ns=%d",
+            event,
+            req.rid if req.rid is not None else "-",
+            req.bootstrap_room if req.bootstrap_room is not None else "-",
+            time.time_ns(),
+            time.monotonic_ns(),
+        )
+
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
@@ -569,12 +593,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
+        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
+        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     def init_running_status(self):
         # Request states
