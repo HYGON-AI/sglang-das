@@ -198,16 +198,8 @@ def _set_kv_buffer_impl(
 
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    if get_is_capture_mode() and alt_stream is not None:
-        current_stream = device_module.current_stream()
-        alt_stream.wait_stream(current_stream)
-        k_cache[indices] = k
-        with device_module.stream(alt_stream):
-            v_cache[indices] = v
-        current_stream.wait_stream(alt_stream)
-    else:  # fallback to naive implementation
-        k_cache[indices] = k
-        v_cache[indices] = v
+    k_cache[indices] = k
+    v_cache[indices] = v
 
 
 @triton.jit
@@ -2707,25 +2699,12 @@ class MHATokenToKVPool(KVCache):
 
             page_idxs = loc // self.page_size
             offsets = loc % self.page_size
-            if get_is_capture_mode() and self.alt_stream is not None:
-                # Overlap the copy of K and V cache for small batch size
-                current_stream = self.device_module.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
-                with self.device_module.stream(self.alt_stream):
-                    self.v_buffer[layer_id - self.start_layer][
-                        page_idxs, :, :, offsets
-                    ] = cache_v
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                self.k_buffer[layer_id - self.start_layer][
-                    page_idxs, :, offsets, :
-                ] = cache_k
-                self.v_buffer[layer_id - self.start_layer][
-                    page_idxs, :, :, offsets
-                ] = cache_v
+            self.k_buffer[layer_id - self.start_layer][
+                page_idxs, :, offsets, :
+            ] = cache_k
+            self.v_buffer[layer_id - self.start_layer][
+                page_idxs, :, :, offsets
+            ] = cache_v
             return
 
         if dcp_kv_mask is not None:
