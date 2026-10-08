@@ -749,12 +749,16 @@ class DeepSeekV4IndexerPool(KVCache):
         )
 
     def get_index_k_fp4(
-        self, layer_id: int, slots: torch.Tensor
+        self, layer_id: int, slots: torch.Tensor, *, use_hcu_fused_gather: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if use_hcu_fused_gather:
+            from lightop import dsv41_gather_index_k_fp4
+
+            return dsv41_gather_index_k_fp4(buf, slots, self.page_size)
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
@@ -2071,11 +2075,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def get_low_ratio_index_k_fp4(
-        self, layer_id: int, slots: torch.Tensor
+        self, layer_id: int, slots: torch.Tensor, *, use_hcu_fused_gather: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Packed fp4 index-K rows at `slots`: (payload int8 [n, 64], ue8m0 scales
         packed int32 [n]), the input layout of quantize_fp4_indexer_tensor."""
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        if use_hcu_fused_gather:
+            return self._indexer_pool(compress_ratio).get_index_k_fp4(
+                compress_layer_id, slots, use_hcu_fused_gather=True
+            )
         return self._indexer_pool(compress_ratio).get_index_k_fp4(
             compress_layer_id, slots
         )

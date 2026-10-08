@@ -460,6 +460,22 @@ def _hcu_candidate_logits_available() -> bool:
     return getattr(fp8_fp4_mqa_logits, "supports_candidate_blocks", False)
 
 
+def _hcu_mqa_prep_available() -> bool:
+    try:
+        import lightop
+    except ImportError:
+        return False
+    op = getattr(lightop, "op", None)
+    return all(
+        callable(getattr(lightop, name, None)) and hasattr(op, name)
+        for name in (
+            "dsv41_mqa_query_lens",
+            "dsv41_mqa_prefill_metadata",
+            "dsv41_gather_index_k_fp4",
+        )
+    )
+
+
 @functools.cache
 def _log_lightop_candidate_fp4_indexer_once() -> None:
     logger.info("Using LightOp candidate-only BF16-Q/FP4-K prefill indexer logits")
@@ -1110,6 +1126,7 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     pad_rows: int = 0
     cp_metadata: Optional[InterleaveContextParallelMetadata] = None
     local_lens_cpu: Optional[List[int]] = None
+    local_lens: Optional[torch.Tensor] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
 
@@ -1144,6 +1161,14 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
 
 
+@dataclass(frozen=True)
+class _LowRatioDenseMetadata:
+    ks: torch.Tensor
+    ke: torch.Tensor
+    compress_lens: torch.Tensor
+    k_slots: torch.Tensor
+
+
 @dataclass
 class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
@@ -1159,6 +1184,11 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # Eager CP indexer scratch, owned by this forward's full or tail metadata.
+    low_ratio_query_lens: Optional[torch.Tensor] = None
+    low_ratio_dense_metadata: Dict[int, _LowRatioDenseMetadata] = field(
+        default_factory=dict
+    )
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1191,6 +1221,8 @@ class DSV4Metadata:
         )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.low_ratio_query_lens = None
+        self.low_ratio_dense_metadata.clear()
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -1223,6 +1255,8 @@ class DSV4Metadata:
             )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.low_ratio_query_lens = None
+        self.low_ratio_dense_metadata.clear()
 
 
 @dataclass
@@ -1840,6 +1874,7 @@ class DeepseekV4AttnBackend(
                 pad_rows=cp_tail["pad_rows"],
                 cp_metadata=cp_tail["cp_metadata"],
                 local_lens_cpu=cp_tail["local_lens_cpu"],
+                local_lens=cp_tail["local_lens"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
             )
@@ -1900,13 +1935,15 @@ class DeepseekV4AttnBackend(
             gather_index=gather_index,
             local_index=local_metadata_rows,
         )
+        local_lens = torch.bincount(
+            tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
+        )
         return dict(
             cp_metadata=cp_metadata,
             local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
             local_positions=local_positions,
-            local_lens_cpu=torch.bincount(
-                tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
-            ).tolist(),
+            local_lens_cpu=local_lens.tolist(),
+            local_lens=local_lens,
             pad_rows=pad_rows,
         )
 
@@ -3067,10 +3104,14 @@ class DeepseekV4AttnBackend(
                 ),
             )
         if run_indexer and layer.indexer is not None:
-            q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device)
             x_local = x[:num_local]
             q_lora_local = q_lora[:num_local]
             pos_local = positions[:num_local].to(torch.int64)
+            q_lens = self._low_ratio_hcu_query_lens(
+                forward_batch, pos_local, q_lens_cpu
+            )
+            if q_lens is None:
+                q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device)
             if self._use_dense_fp4_prefill_indexer(forward_batch):
                 self._low_ratio_index_topk_extend(
                     layer,
@@ -3096,6 +3137,98 @@ class DeepseekV4AttnBackend(
                     pos_local,
                     req_order=req_order,
                 )
+
+    def _low_ratio_hcu_query_lens(self, forward_batch, pos, q_lens_cpu):
+        if (
+            not _is_hcu
+            or os.environ.get("SGLANG_HCU_OPT_DSV41_MQA_PREP", "0") != "1"
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or getattr(forward_batch, "_original_forward_mode", None)
+            not in (None, ForwardMode.EXTEND)
+            or getattr(forward_batch, "actual_forward_mode", ForwardMode.EXTEND)
+            != ForwardMode.EXTEND
+            or not isinstance(self.forward_metadata, DSV4Metadata)
+            or not isinstance(
+                forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+            )
+            or not self._use_dense_fp4_prefill_indexer(forward_batch)
+            or not _hcu_mqa_prep_available()
+        ):
+            return None
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            is_in_breakable_cuda_graph,
+        )
+
+        if is_in_breakable_cuda_graph() or torch.cuda.is_current_stream_capturing():
+            return None
+        bs = len(q_lens_cpu)
+        if pos.ndim != 1 or pos.dtype != torch.int64 or not pos.is_contiguous():
+            return None
+        if sum(q_lens_cpu) != pos.shape[0]:
+            return None
+        inputs = (
+            (forward_batch.seq_lens, (torch.int32, torch.int64)),
+            (forward_batch.req_pool_indices, (torch.int64,)),
+        )
+        if any(
+            value is None
+            or value.ndim != 1
+            or value.shape[0] != bs
+            or value.dtype not in dtypes
+            or value.device != pos.device
+            or not value.is_contiguous()
+            for value, dtypes in inputs
+        ):
+            return None
+        if (
+            self.req_to_token.ndim != 2
+            or self.req_to_token.dtype != torch.int32
+            or self.req_to_token.device != pos.device
+            or not self.req_to_token.is_contiguous()
+        ):
+            return None
+        metadata = self.forward_metadata
+        tail = metadata.late_layer_tail
+        if tail is not None:
+            query_lens = tail.local_lens
+            if (
+                query_lens is None
+                or query_lens.shape != (bs,)
+                or query_lens.dtype not in (torch.int32, torch.int64)
+                or query_lens.device != pos.device
+                or not query_lens.is_contiguous()
+            ):
+                return None
+        else:
+            if forward_batch.attn_cp_metadata.local_index is not None:
+                return None
+            for value in (
+                forward_batch.extend_start_loc,
+                forward_batch.extend_seq_lens,
+            ):
+                if (
+                    value is None
+                    or value.shape != (bs,)
+                    or value.dtype != torch.int32
+                    or value.device != pos.device
+                    or not value.is_contiguous()
+                ):
+                    return None
+        if metadata.low_ratio_query_lens is None:
+            if tail is None:
+                from lightop import dsv41_mqa_query_lens
+
+                parallel = get_parallel()
+                query_lens = dsv41_mqa_query_lens(
+                    forward_batch.extend_start_loc,
+                    forward_batch.extend_seq_lens,
+                    parallel.attn_cp_size,
+                    parallel.attn_cp_rank,
+                )
+            else:
+                query_lens = query_lens.to(torch.int32)
+            metadata.low_ratio_query_lens = query_lens
+        return metadata.low_ratio_query_lens
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
@@ -3493,41 +3626,77 @@ class DeepseekV4AttnBackend(
         # Visible compressed positions per request at its newest token; the
         # per-token count (pos + 1) // ratio bounds each row below.
         lc_per_req = [s // ratio for s in seq_lens_cpu]
-        req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
-        slot_chunks, starts, start = [], [], 0
-        for r, lc in enumerate(lc_per_req):
-            starts.append(start)
-            if lc == 0:
-                continue
-            j = torch.arange(lc, device=device)
-            slot_chunks.append(
-                self.req_to_token[req_pool_indices[r], j * ratio].to(torch.int64)
-                // ratio
-            )
-            start += lc
         empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=device)
         num_tokens = pos.shape[0]
         # TODO(candidate): move this to candidate indexer
-        if not slot_chunks or num_tokens == 0:
+        if not any(lc_per_req) or num_tokens == 0:
             if indexer.is_candidate_source:
                 self.forward_metadata.candidate_metadata = CandidateMasks(
                     request_masks=[empty_mask for _ in lc_per_req]
                 )
             return
-        k_slots = torch.cat(slot_chunks)
-        k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
+        use_hcu_prep = (
+            isinstance(self.forward_metadata, DSV4Metadata)
+            and self.forward_metadata.low_ratio_query_lens is not None
+            and q_lens is self.forward_metadata.low_ratio_query_lens
+        )
+        if use_hcu_prep:
+            metadata = self.forward_metadata.low_ratio_dense_metadata.get(ratio)
+            if metadata is None:
+                from lightop import dsv41_mqa_prefill_metadata
+
+                metadata = _LowRatioDenseMetadata(
+                    *dsv41_mqa_prefill_metadata(
+                        forward_batch.seq_lens,
+                        q_lens,
+                        pos,
+                        forward_batch.req_pool_indices,
+                        self.req_to_token,
+                        ratio,
+                        sum(lc_per_req),
+                        max(max(q_lens_cpu, default=0), max(lc_per_req)),
+                    )
+                )
+                self.forward_metadata.low_ratio_dense_metadata[ratio] = metadata
+            k_slots = metadata.k_slots
+            ks, ke, compress_lens = (
+                metadata.ks,
+                metadata.ke,
+                metadata.compress_lens,
+            )
+            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(
+                layer.layer_id, k_slots, use_hcu_fused_gather=True
+            )
+        else:
+            req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
+            slot_chunks, starts, start = [], [], 0
+            for r, lc in enumerate(lc_per_req):
+                starts.append(start)
+                if lc == 0:
+                    continue
+                j = torch.arange(lc, device=device)
+                slot_chunks.append(
+                    self.req_to_token[req_pool_indices[r], j * ratio].to(torch.int64)
+                    // ratio
+                )
+                start += lc
+            k_slots = torch.cat(slot_chunks)
+            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
 
         q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
-        compress_lens = ((pos + 1) // ratio).to(torch.int32)
-        ks = torch.repeat_interleave(
-            torch.tensor(starts, dtype=torch.int32, device=device),
-            q_lens.to(torch.int64),
-            output_size=num_tokens,
-        )
+        if not use_hcu_prep:
+            compress_lens = ((pos + 1) // ratio).to(torch.int32)
+            ks = torch.repeat_interleave(
+                torch.tensor(starts, dtype=torch.int32, device=device),
+                q_lens.to(torch.int64),
+                output_size=num_tokens,
+            )
+
         candidate_blocks = None
         if _is_hcu:
             weights = indexer.head_weights(x).float().contiguous()
-            ke = ks + compress_lens
+            if not use_hcu_prep:
+                ke = ks + compress_lens
             candidate_blocks = self._hcu_prefill_candidate_blocks(
                 indexer, lc_per_req, q_lens_cpu
             )
