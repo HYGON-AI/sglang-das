@@ -5,6 +5,9 @@ import torch
 
 from sglang.srt.layers.cp.cp_decode_attn_tp import CpDecodeAttnTpContext
 
+from sglang.test.ci.ci_register import register_hcu_ci
+register_hcu_ci(est_time=5, suite="stage-b-test-1-hcu-small")
+
 
 def _context() -> CpDecodeAttnTpContext:
     context = CpDecodeAttnTpContext.__new__(CpDecodeAttnTpContext)
@@ -139,3 +142,7 @@ def test_transposed_row_weight_repacks_reduced_input_stride():
 
     context._restore(linear, "weight")
     assert linear.weight is original
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

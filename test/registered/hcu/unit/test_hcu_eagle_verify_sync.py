@@ -16,6 +16,9 @@ import ast
 import unittest
 from pathlib import Path
 
+from sglang.test.ci.ci_register import register_hcu_ci
+register_hcu_ci(est_time=5, suite="stage-b-test-1-hcu-small")
+
 
 REPO_ROOT = Path(__file__).parents[4]
 EAGLE_UTILS_PATH = REPO_ROOT / "python/sglang/srt/speculative/eagle_utils.py"
