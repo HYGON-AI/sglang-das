@@ -1,7 +1,7 @@
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
-from typing import Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -9,7 +9,6 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.layers.moe.utils import (
@@ -47,6 +46,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
     resolve_runtime_config,
+    resolve_single_owner_pp_rank,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
@@ -85,13 +85,18 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hcu,
     is_npu,
     is_pin_memory_available,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 
 @runtime_checkable
@@ -128,6 +133,11 @@ def _configure_target_hidden_projection(
         )
     )
 
+def _is_context_only_pp_prefill_rank(
+    *, disaggregation_mode: str, pp_rank: int, pp_size: int
+) -> bool:
+    return disaggregation_mode == "prefill" and pp_size > 1 and pp_rank < pp_size - 1
+
 
 @contextmanager
 def _dspark_draft_context(tp_context):
@@ -141,11 +151,19 @@ def _dspark_draft_context(tp_context):
 
 
 class DSparkWorkerV2(BaseSpecWorker):
+    """Non-last PP stages run only the target; draft state belongs to the last stage."""
+
+    def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        return (
+            [("draft", self.draft_model_runner)]
+            if self._hosts_draft and not self._is_lifecycle_only_pp_prefill_rank
+            else []
+        )
+
     def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
         draft_worker_cls: type[TpModelWorker] = TpModelWorker,
@@ -154,18 +172,51 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
-
+        self._draft_worker = None
+        self.ps = ps = get_parallel()
         self._draft_is_moe = draft_is_deepseek_v4()
-        self._draft_dp_context_enabled = (
-            get_parallel().enable_dp_attention and not self._draft_is_moe
+        disaggregation_mode = get_disagg().disaggregation_mode
+        self._is_pd_prefill = disaggregation_mode == "prefill"
+        self._is_context_only_pp_prefill_rank = (
+            _is_hcu
+            and self._draft_is_moe
+            and _is_context_only_pp_prefill_rank(
+                disaggregation_mode=disaggregation_mode,
+                pp_rank=ps.pp_rank,
+                pp_size=ps.pp_size,
+            )
         )
-        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
+        self._hosts_draft = ps.pp_group.is_last_rank or (
+            self._is_context_only_pp_prefill_rank
+        )
+        self._is_lifecycle_only_pp_prefill_rank = False
+        if not self._hosts_draft:
+            return
+
+        self._draft_dp_context_enabled = (
+            ps.enable_dp_attention and not self._draft_is_moe
+        )
+        self._use_full_projection_prefill = False
+        if self._is_pd_prefill and self._draft_is_moe and ps.pp_size > 1:
+            target_layer_ids = [
+                int(layer_id)
+                for layer_id in (
+                    self.model_runner.spec_aux_config.dflash_target_layer_ids or []
+                )
+            ]
+            owner_pp_rank = resolve_single_owner_pp_rank(
+                target_layer_ids=target_layer_ids,
+                num_hidden_layers=self.model_runner.model_config.num_hidden_layers,
+                pp_size=ps.pp_size,
+            )
+            self._use_full_projection_prefill = (
+                owner_pp_rank == ps.pp_size - 1 and ps.pp_rank == owner_pp_rank
+            )
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -173,7 +224,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             get_parallel().enable_dp_attention
             and self._draft_is_moe
-            and ps.attn_tp_size > 1
+            and get_parallel().attn_tp_size > 1
         ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
@@ -181,11 +232,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
-        with draft_pp_context(), self._draft_context():
+        # HCU context-only ranks must retain their original PP placement so
+        # the draft model can decide whether it owns target features.
+        draft_pp_scope = (
+            nullcontext()
+            if self._is_context_only_pp_prefill_rank
+            else draft_pp_context()
+        )
+        with draft_pp_scope, self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -193,11 +250,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
                 draft_worker_cls=draft_worker_cls,
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._is_lifecycle_only_pp_prefill_rank = (
+            self._draft_is_moe and self.draft_model.is_lifecycle_only
+        )
+        self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -225,6 +287,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        self._pp_context_feature_indices: Optional[list[int]] = None
+        self._next_pp_proxy_tensors = None
+
+        if self._is_lifecycle_only_pp_prefill_rank:
+            self._init_lifecycle_only_prefill()
+            return
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(
@@ -238,7 +306,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else parallel.tp_group
         )
 
-        if self.ps.tp_rank == 0:
+        if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
@@ -260,24 +328,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.query_token_num), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
-            if self.ps.tp_rank == 0:
-                logger.info(
-                    "DSpark draft uses its checkpoint-local embedding and LM head."
-                )
-        else:
-            target_model = self.target_worker.model_runner.model
-            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
-            if lm_head is None or not hasattr(lm_head, "weight"):
-                raise RuntimeError(
-                    "DSpark requires the target model to expose `lm_head` with `weight`."
-                )
-            self.draft_model.attach_shared_modules(
-                embed_tokens=unwrap_lora_layer(
-                    self._resolve_target_embed_tokens(target_model)
-                ),
-                lm_head=lm_head,
-            )
+        self._attach_shared_modules()
         self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -285,7 +336,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             model_runner=self.model_runner,
             device=self.device,
-            tp_rank=self.ps.tp_rank,
+            tp_rank=self.model_runner.tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
@@ -333,7 +384,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
             and not get_parallel().enable_dp_attention
-            and self.ps.pp_size == 1
+            and self.model_runner.pp_size == 1
         )
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
@@ -397,25 +448,124 @@ class DSparkWorkerV2(BaseSpecWorker):
             planner=self._verify_planner,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.ps.tp_rank,
+            tp_rank=self.model_runner.tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
 
-        if self._is_pd_prefill and not self._draft_is_moe:
-            self.draft_model.prune_to_ctx_kv_injection()
+        if self._is_pd_prefill:
+            if self._draft_is_moe and self._is_context_only_pp_prefill_rank:
+                self.draft_model.prune_to_ctx_projection()
+            elif not self._draft_is_moe:
+                self.draft_model.prune_to_ctx_kv_injection()
+            if _is_hcu and self._draft_is_moe:
+                self._init_pp_context_feature_indices()
+
+    def _init_lifecycle_only_prefill(self) -> None:
+        self._verify_planner = None
+        self._kv_injector = None
+        self._proposer = None
+        self._verify_epilogue = None
+        self._verify_executor = None
+        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._forced_budget_frac = None
+        self._need_mamba_verify_commit = False
+        self._observers = None
+
+    def _attach_shared_modules(self) -> None:
+        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DSpark draft uses its checkpoint-local embedding and LM head."
+                )
+            return
+
+        # Non-final PP prefill ranks only compute their partial context
+        # projection. They do not own the target embedding or LM head.
+        if self._is_context_only_pp_prefill_rank:
+            return
+
+        target_model = self.target_worker.model_runner.model
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise RuntimeError(
+                "DSpark requires the target model to expose `lm_head` with `weight`."
+            )
+        self.draft_model.attach_shared_modules(
+            embed_tokens=unwrap_lora_layer(
+                self._resolve_target_embed_tokens(target_model)
+            ),
+            lm_head=lm_head,
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
 
+    def _init_pp_context_feature_indices(self) -> None:
+        if not (_is_hcu and self._is_pd_prefill and self._draft_is_moe):
+            return
+        if self.ps.pp_size <= 1:
+            return
+
+        target_layer_ids = self.model_runner.spec_aux_config.dflash_target_layer_ids
+        if not target_layer_ids:
+            return
+
+        target_model = self.target_worker.model_runner.model
+        start_layer = int(target_model.start_layer)
+        end_layer = int(target_model.end_layer)
+        target_layer_to_feature = {
+            int(layer_id): idx for idx, layer_id in enumerate(target_layer_ids)
+        }
+        local_feature_indices = [
+            target_layer_to_feature[layer_id]
+            for layer_id in range(start_layer, end_layer)
+            if layer_id in target_layer_to_feature
+        ]
+        if not local_feature_indices:
+            return
+
+        self._pp_context_feature_indices = local_feature_indices
+        if self._draft_is_moe and not self._use_full_projection_prefill:
+            self.draft_model.prepare_target_hidden_partial(local_feature_indices)
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark PP-local context projection will accumulate feature indices %s "
+                "from target layers %s for PP rank %s local layers [%s, %s).",
+                local_feature_indices,
+                list(target_layer_ids),
+                self.ps.pp_rank,
+                start_layer,
+                end_layer,
+            )
+
     @property
     def carries_confidence(self) -> bool:
+        if (
+            not self._hosts_draft
+            or self._is_context_only_pp_prefill_rank
+            or self._is_lifecycle_only_pp_prefill_rank
+        ):
+            return False
         return self._verify_planner.carries_confidence
 
     @property
+    def is_lifecycle_only_pp_prefill_rank(self) -> bool:
+        return self._is_lifecycle_only_pp_prefill_rank
+
+    def _draft_model_runners(self) -> tuple:
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return ()
+        return super()._draft_model_runners()
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
+        if not self._hosts_draft:
+            return super().spec_v2_attn_backends
+        if self._is_context_only_pp_prefill_rank:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -426,13 +576,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        tp_context = (
-            draft_tp_context(get_parallel().attn_tp_group)
-            if self._draft_dp_context_enabled
-            else nullcontext()
-        )
-        return _dspark_draft_context(tp_context)
+        with ExitStack() as stack:
+            if self._draft_dp_context_enabled:
+                stack.enter_context(
+                    draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
+                )
+            stack.enter_context(speculative_moe_backend_context())
+            stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
@@ -440,6 +593,26 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return
+        if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
+            page_size = int(self.page_size)
+
+            def _minimal_capacity(capacity):
+                if capacity is None or capacity == 0:
+                    return capacity
+                return page_size
+
+            memory_pool_config = replace(
+                memory_pool_config,
+                max_total_num_tokens=page_size,
+                full_max_total_num_tokens=_minimal_capacity(
+                    memory_pool_config.full_max_total_num_tokens
+                ),
+                swa_max_total_num_tokens=_minimal_capacity(
+                    memory_pool_config.swa_max_total_num_tokens
+                ),
+            )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -447,6 +620,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if not self._hosts_draft or self._is_context_only_pp_prefill_rank:
+            return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
@@ -454,7 +629,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_model=self.draft_model,
             is_deepseek_v4_draft=self._draft_is_moe,
         )
-        if self._target_hidden_projection_enabled and self.ps.tp_rank == 0:
+        if self._target_hidden_projection_enabled and self.model_runner.tp_rank == 0:
             logger.info(
                 "DSpark prefill target-hidden projection runs before "
                 "sequence-parallel gather."
@@ -467,6 +642,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if (
+            not self._hosts_draft
+            or self._is_context_only_pp_prefill_rank
+            or self._is_lifecycle_only_pp_prefill_rank
+        ):
+            return
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
@@ -513,7 +694,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
-            tp_rank=self.ps.tp_rank,
+            tp_rank=self.model_runner.tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
             confidence_fn=(
@@ -531,61 +712,155 @@ class DSparkWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         pass
 
+    def _refresh_partial_projection(self) -> None:
+        if (
+            self._draft_is_moe
+            and not self._is_lifecycle_only_pp_prefill_rank
+            and not self._use_full_projection_prefill
+            and self._pp_context_feature_indices is not None
+        ):
+            self.draft_model.prepare_target_hidden_partial(
+                self._pp_context_feature_indices
+            )
+
+    def update_weights_from_disk(self, recv_req):
+        success, message = super().update_weights_from_disk(recv_req)
+        if success:
+            self._refresh_partial_projection()
+        return success, message
+
+    def update_weights_from_ipc(self, recv_req):
+        success, message = super().update_weights_from_ipc(recv_req)
+        if success:
+            self._refresh_partial_projection()
+        return success, message
+
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        if not self._hosts_draft:
+            return
         self._forced_budget_frac = frac
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return
         self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+
+    def set_pp_proxy_tensors_for_next_forward(self, pp_proxy_tensors) -> None:
+        self._next_pp_proxy_tensors = pp_proxy_tensors
 
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
-        *,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        # The non-overlap scheduler passes this keyword even when PP=1.
-        assert pp_proxy_tensors is None, "DSpark does not support pipeline parallelism"
+        if pp_proxy_tensors is None:
+            pp_proxy_tensors = getattr(self, "_next_pp_proxy_tensors", None)
+        self._next_pp_proxy_tensors = None
+        if not self._hosts_draft:
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
+
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return self._forward_lifecycle_only_prefill(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
-    def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+    def _forward_lifecycle_only_prefill(
+        self, *, batch: ScheduleBatch, on_publish, pp_proxy_tensors
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if get_parallel().enable_dp_attention:
-                self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
-                )
-            return self._decode_idle_result(on_publish=on_publish)
+            return self._forward_idle_prefill(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+        if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
+            raise RuntimeError(
+                "Lifecycle-only DSpark worker only supports prefill batches."
+            )
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
-        target_hidden_is_projected = (
-            self._target_hidden_projection_enabled
-            and self.target_worker.model_runner.model.should_project_dspark_target_hidden(
-                forward_mode=batch.forward_mode,
+        batch_output.new_seq_lens = batch.seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        if batch_output.logits_output is not None:
+            batch_output.logits_output.hidden_states = None
+        incoming_ctx = (
+            pp_proxy_tensors.tensors.get("dspark_ctx_acc")
+            if pp_proxy_tensors is not None
+            else None
+        )
+        outgoing_proxy = batch_output.pp_hidden_states_proxy_tensors
+        if incoming_ctx is not None and outgoing_proxy is not None:
+            outgoing_proxy.tensors["dspark_ctx_acc"] = incoming_ctx
+        return batch_output
+
+    def _forward_prefill(
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_idle():
+            return self._forward_idle_prefill(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
+
+        batch_output = self.target_worker.forward_batch_generation(
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         logits_output = batch_output.logits_output
+        output_pp_proxy_tensors = batch_output.pp_hidden_states_proxy_tensors
+        target_hidden = (
+            logits_output.hidden_states if logits_output is not None else None
+        )
+        if target_hidden is None and output_pp_proxy_tensors is not None:
+            target_hidden = output_pp_proxy_tensors.tensors.get(
+                "dspark_aux_hidden_states"
+            )
         next_token_ids = batch_output.next_token_ids
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = batch.seq_lens
@@ -593,11 +868,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
-        if logits_output.hidden_states is None:
+        if target_hidden is None and self.ps.pp_size <= 1:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
+        has_local_target_hidden = (
+            target_hidden is not None and target_hidden.numel() > 0
+        )
+
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
@@ -607,7 +886,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        device = next_token_ids.device
+        device = self.device
         pin_memory = is_pin_memory_available(device)
         ctx_lens = torch.tensor(
             batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
@@ -621,44 +900,150 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
-        # thread the per-token state_slot + the req's final position so the
-        # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
         state_slot = final_pos = None
         if is_unified_kv_triton():
             repeats = ctx_lens.to(torch.int64)
+            num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
-                batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
+                batch.req_pool_indices.to(device=device, dtype=torch.int64),
+                repeats,
+                output_size=num_tokens,
             )
             final_pos = torch.repeat_interleave(
-                (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64),
+                repeats,
+                output_size=num_tokens,
             )
+        target_hidden_is_projected = (
+            self._target_hidden_projection_enabled
+            and self.target_worker.model_runner.model.should_project_dspark_target_hidden(
+                forward_mode=batch.forward_mode,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+        )
         cache_loc = batch.out_cache_loc
-        token_indices = logits_output.hidden_states_token_indices
+        token_indices = (
+            logits_output.hidden_states_token_indices
+            if logits_output is not None
+            else None
+        )
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
             positions = positions[token_indices]
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=cache_loc,
-            positions=positions,
-            state_slot=state_slot,
-            final_pos=final_pos,
-            target_hidden_is_projected=target_hidden_is_projected,
-        )
-        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
-        logits_output.hidden_states_token_indices = None
 
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=new_seq_lens,
+        hcu_pp_context = (
+            _is_hcu and self._is_pd_prefill and self._draft_is_moe and self.ps.pp_size > 1
         )
+        if not hcu_pp_context:
+            if not has_local_target_hidden:
+                raise RuntimeError("DSpark prefill requires target hidden states.")
+            self._kv_injector.inject_target_hidden(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+                target_hidden_is_projected=target_hidden_is_projected,
+            )
+        elif self._use_full_projection_prefill:
+            if not has_local_target_hidden or output_pp_proxy_tensors is not None:
+                raise RuntimeError(
+                    "Single-owner DSpark prefill requires target hidden states "
+                    "on the final PP rank."
+                )
+            self._kv_injector.inject_target_hidden(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+        else:
+            incoming_ctx = (
+                pp_proxy_tensors.tensors.get("dspark_ctx_acc")
+                if pp_proxy_tensors is not None
+                else None
+            )
+            local_ctx = None
+            if (
+                self.ps.pp_size > 1
+                and has_local_target_hidden
+                and self._pp_context_feature_indices is not None
+            ):
+                local_ctx = self.draft_model.project_target_hidden_partial(
+                    target_hidden, self._pp_context_feature_indices
+                )
+            if output_pp_proxy_tensors is not None:
+                output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
+            ctx_acc = None
+            if incoming_ctx is not None and local_ctx is not None:
+                ctx_acc = (
+                    incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
+                    + local_ctx
+                )
+            elif incoming_ctx is not None:
+                ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
+            elif local_ctx is not None:
+                ctx_acc = local_ctx
+
+            if output_pp_proxy_tensors is not None:
+                if ctx_acc is not None:
+                    output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
+            elif ctx_acc is not None:
+                self._kv_injector.inject_projected_context(
+                    projected_context=ctx_acc,
+                    cache_loc=cache_loc,
+                    positions=positions,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
+                )
+            elif has_local_target_hidden and not (
+                self.ps.pp_size > 1 and not self._draft_is_moe
+            ):
+                self._kv_injector.inject_target_hidden(
+                    target_hidden=target_hidden,
+                    cache_loc=cache_loc,
+                    positions=positions,
+                    state_slot=state_slot,
+                    final_pos=final_pos,
+                )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        if logits_output is not None:
+            logits_output.hidden_states = None
+            logits_output.hidden_states_token_indices = None
+
+        if next_token_ids is not None:
+            batch_output.next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
         return batch_output
+
+    def _forward_idle_prefill(
+        self,
+        *,
+        batch: ScheduleBatch,
+        on_publish,
+        pp_proxy_tensors,
+        capture_hidden_mode: CaptureHiddenMode,
+    ) -> GenerationBatchResult:
+        expert_distribution_metrics = None
+        if get_parallel().enable_dp_attention:
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=capture_hidden_mode,
+            )
+            if self._is_context_only_pp_prefill_rank:
+                return batch_output
+            expert_distribution_metrics = batch_output.expert_distribution_metrics
+        return self._decode_idle_result(
+            on_publish=on_publish,
+            expert_distribution_metrics=expert_distribution_metrics,
+        )
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
@@ -686,10 +1071,34 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
+    def inject_pd_hidden_chunk(
+        self,
+        req,
+        hidden: torch.Tensor,
+        hidden_start: int,
+    ) -> Optional[torch.cuda.Event]:
+        if hidden is None or hidden.numel() == 0:
+            return None
+        row_len = int(hidden.shape[0])
+        pos = torch.arange(
+            int(hidden_start),
+            int(hidden_start) + row_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        req_pool_idx = int(req.kv.req_pool_idx)
+        cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
+        return self._kv_injector.inject_target_hidden(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=pos,
+        )
+
     def _decode_idle_result(
         self,
         *,
         on_publish,
+        expert_distribution_metrics=None,
     ) -> GenerationBatchResult:
         next_draft_input = make_next_draft_input(
             bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
@@ -698,6 +1107,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(next_draft_input.new_seq_lens)
         return GenerationBatchResult(
+            expert_distribution_metrics=expert_distribution_metrics,
             logits_output=None,
             next_token_ids=torch.empty((0,), dtype=torch.int64, device=self.device),
             accept_lens=torch.empty((0,), dtype=torch.int32, device=self.device),
@@ -721,14 +1131,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
+            expert_distribution_metrics = None
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
                     with self._draft_context():
                         self._proposer.run_idle_participation(batch)
-                self._verify_executor.run_idle_participation(
+                target_verify = self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
-            return self._decode_idle_result(on_publish=on_publish)
+                expert_distribution_metrics = target_verify.expert_distribution_metrics
+            return self._decode_idle_result(
+                on_publish=on_publish,
+                expert_distribution_metrics=expert_distribution_metrics,
+            )
 
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -948,6 +1363,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
         return GenerationBatchResult(
+            expert_distribution_metrics=target_verify.expert_distribution_metrics,
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
@@ -1033,4 +1449,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
+        if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
+            return None
         return self._verify_planner.confidence_budget_prepare()

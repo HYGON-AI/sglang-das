@@ -5,11 +5,15 @@ from sglang.kernels.ops.elementwise.fast_topk import fast_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
-    """fast_topk leaves order and tie-breaking unspecified,
-    so compare the sorted top-k values rather than index sets."""
+    """The returned indices must select exactly the top-k value multiset.
+
+    Order is unspecified and tie-breaking may differ from torch.topk, so we
+    compare sorted score values, not index sets.
+    """
     for b in range(score.shape[0]):
         start = int(row_starts[b]) if row_starts is not None else 0
         length = int(lengths[b])
@@ -17,9 +21,7 @@ def _check_topk_values(score, lengths, indices, topk, row_starts):
         row = indices[b]
         if length <= topk:
             # naive path: identity indices, then -1 fill
-            assert torch.equal(
-                row[:length].cpu(), torch.arange(length, dtype=torch.int32)
-            )
+            assert torch.equal(row[:length].cpu(), torch.arange(length, dtype=torch.int32))
             assert (row[length:] == -1).all()
             continue
         assert (row >= 0).all(), "long rows must fill every slot"

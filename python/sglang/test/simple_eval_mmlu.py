@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Retain this legacy scorer for HCU accuracy tests and downstream eval imports.
+# Keep its source-branch scoring semantics while run_eval migrates to sgl-eval.
+
 # Adapted from https://github.com/openai/simple-evals/
 
 """

@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -164,6 +165,9 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int4_w4a8: tl.constexpr,
+    use_native_int4_w4a8: tl.constexpr,
+    use_mxfp4_w4a8: tl.constexpr,
+    use_mxfp4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
@@ -244,7 +248,7 @@ def fused_moe_kernel_gptq_awq(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -260,7 +264,7 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bn
         )
 
-    if not has_zp and use_int4_w4a16:
+    if not has_zp and (use_int4_w4a16 or use_int4_w4a8):
         b_zp_num = 8
     if not has_zp and use_int8_w8a16:
         b_zp_num = 128
@@ -272,17 +276,14 @@ def fused_moe_kernel_gptq_awq(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    if use_int4_w4a8:
+    if use_native_int4_w4a8:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
         a_scale = tl.load(
             a_scale_ptr + (offs_token // top_k) * stride_asm,
-            mask=token_mask,
-            other=0.0,
+            mask=token_mask, other=0.0,
         )[:, None]
         channel_scale = tl.load(
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[None, :] * stride_bsn
+            b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
         )
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -302,16 +303,42 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        if use_int4_w4a8 and not even_Ks:
-            # Native compressed-tensors weights are not K-padded. 0x88 is
-            # packed (q + 8) zero for both nibbles, so masked lanes decode to 0.
-            b = tl.load(b_ptrs, mask=k_mask, other=0x88)
+        # Packed INT4 B is K/2 bytes wide. When K is not a multiple of
+        # BLOCK_SIZE_K (e.g. TP4 down_proj K=160, BLOCK_SIZE_K=64) an
+        # unmasked load overruns the last packed K tile.
+        if not even_Ks:
+            b = tl.load(b_ptrs, mask=k_mask, other=0x88 if use_native_int4_w4a8 else 0)
         else:
             b = tl.load(b_ptrs)
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
             b = (b >> b_shifter) & 0xF
+            if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+                # MXFP4 stores two E2M1 values per byte.  Its nibble is not a
+                # signed/zero-point INT4 value:
+                #   magnitude codes 0..7 -> 0, .5, 1, 1.5, 2, 3, 4, 6
+                #   bit 3                   -> sign
+                # Decode only the current GEMM tile so packed weights remain
+                # resident and no model-wide BF16 expansion is needed.  Every
+                # magnitude is exactly representable in BF16 (and FP8), so the
+                # lookup runs directly in BF16 without an FP32 intermediate.
+                b_magnitude_code = b & 0x7
+                b_magnitude = tl.where(
+                    b_magnitude_code <= 4,
+                    b_magnitude_code.to(tl.bfloat16)
+                    * tl.full((), 0.5, tl.bfloat16),
+                    tl.where(
+                        b_magnitude_code == 5,
+                        tl.full((), 3.0, tl.bfloat16),
+                        tl.where(
+                            b_magnitude_code == 6,
+                            tl.full((), 4.0, tl.bfloat16),
+                            tl.full((), 6.0, tl.bfloat16),
+                        ),
+                    ),
+                )
+                b = tl.where((b & 0x8) == 0, b_magnitude, -b_magnitude)
 
-        if not use_int4_w4a8:
+        if not use_native_int4_w4a8:
             b_scale_ptrs = (
                 b_scale_ptr
                 + off_experts * stride_bse
@@ -319,7 +346,17 @@ def fused_moe_kernel_gptq_awq(
                 + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
             )
             b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-            b_scale = b_scale.to(tl.float32)
+            if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+                # The checkpoint scale byte is OCP UE8M0 with exponent bias 127.
+                # 2^(E-127) is exactly the BF16 bit pattern E << 7 (sign 0,
+                # exponent E, mantissa 0), so a single shift + bitcast replaces
+                # exp2 without an FP32 intermediate.  Scale code 255 is reserved
+                # and does not occur in valid weights.
+                b_scale = (
+                    (b_scale.to(tl.uint16) << 7).to(tl.bfloat16, bitcast=True)
+                )
+            else:
+                b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
@@ -343,27 +380,80 @@ def fused_moe_kernel_gptq_awq(
             b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
             b_zp = b_zp.to(tl.float32)
 
-        # We accumulate along the K dimension.
-        if use_int4_w4a8:
+        if use_native_int4_w4a8:
             b = (b.to(tl.int16) - 8).to(tl.int8)
-            accumulator = tl.dot(
-                a, b, acc=accumulator, out_dtype=tl.int32
-            )
-        elif has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
-            accumulator = tl.dot(a, b, acc=accumulator)
+            accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.int32)
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-            accumulator = tl.dot(a, b, acc=accumulator)
+            # We accumulate along the K dimension.
+            if has_zp:
+                b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            elif use_mxfp4_w4a16:
+                # WFP4 A16: dequantize E2M1 x UE8M0 directly in BF16.
+                b = b * b_scale
+            elif use_mxfp4_w4a8:
+                # WFP4 A8: keep the BF16 E2M1 magnitude; the UE8M0 group scale is
+                # applied after the FP8 MMAC below.
+                pass
+            elif use_int4_w4a8:
+                # INT4 W4A8 route: keep the raw signed INT4 tile (offset-8 is
+                # already applied by the checkpoint layout transform); the
+                # per-channel weight scale is applied after the int8 MMAC.
+                b = (b - b_zp_num).to(tl.int8)
+            else:
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+
+            if use_int4_w4a8:
+                # INT4 W4A8: per-token int8 activation quant, int8 x int8 tensor
+                # core, then per-token activation scale and per-channel weight
+                # scale on the fp32 accumulator.  Activation quantization runs in
+                # BF16 (no FP32 intermediate).
+                a_absmax = tl.maximum(
+                    tl.max(tl.abs(a), axis=1), 1.0e-10
+                )
+                a_qscale = a_absmax / 127.0
+                a_int8 = libdevice.round(a / a_qscale[:, None]).to(tl.int8)
+                # b_scale is repeated along K for the per-channel layout; reduce
+                # it to the per-output-column scale.
+                b_channel_scale = tl.max(b_scale, axis=0)
+                accumulator += (
+                    tl.dot(a_int8, b) * a_qscale[:, None] * b_channel_scale[None, :]
+                )
+            elif use_mxfp4_w4a8:
+                # WFP4 A8: quantize the BF16 activation tile per token to FP8
+                # (E4M3) in BF16 arithmetic, cast the decoded E2M1 magnitude to
+                # FP8 (exact), run FP8 x FP8 tensor core, then apply the per-token
+                # activation scale and the UE8M0 weight group scale on the FP32
+                # accumulator.  One FP8 MMAC covers exactly one MXFP4 scale group
+                # (BLOCK_SIZE_K == group_size is enforced at launch).
+                fp8_max: tl.constexpr = 448.0
+                a_absmax = tl.maximum(
+                    tl.max(tl.abs(a), axis=1), 1.0e-10
+                )
+                a_qscale = a_absmax / fp8_max
+                a_fp8 = tl.clamp(
+                    a / a_qscale[:, None], -fp8_max, fp8_max
+                ).to(tl.float8e4nv)
+                b_fp8 = b.to(tl.float8e4nv)
+                # b_scale is repeated along the K rows within one MXFP4 group.
+                # Reduce that repeated view to the per-output-column group scale.
+                b_group_scale = tl.max(b_scale, axis=0)
+                accumulator += (
+                    tl.dot(a_fp8, b_fp8)
+                    * a_qscale[:, None]
+                    * b_group_scale[None, :]
+                )
+            else:
+                # Original WFP4A16 route: decoded weights and activations use BF16.
+                accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if use_int4_w4a8:
+    if use_native_int4_w4a8:
         accumulator = accumulator.to(tl.float32) * a_scale * channel_scale
 
     if MUL_ROUTED_WEIGHT:
@@ -810,9 +900,11 @@ def clear_b_tma_desc_cache() -> None:
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
-    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    Keyed by tensor identity + storage ptr + shape/stride/dtype + tile shape.
     """
     key = (
+        # offload can rebind a Parameter while another tensor reuses its address
+        id(B),
         int(B.data_ptr()),
         tuple(B.shape),
         tuple(B.stride()),
@@ -863,6 +955,8 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_mxfp4_w4a16: bool,
+    use_mxfp4_w4a8: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
@@ -877,6 +971,7 @@ def invoke_fused_moe_kernel(
     mask_output: bool = False,
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
+    use_int4_w4a8: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -886,12 +981,19 @@ def invoke_fused_moe_kernel(
         # plain half-width output; every other output flavor is out of scope.
         # In particular the LoRA output paths (fuse_add_to_output / mask_output)
         # address C at full width N and would corrupt the half-width buffer.
-        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8)
         assert bias is None
         assert not mul_routed_weight
         assert not (fuse_add_to_output or mask_output or fuse_sum_all_reduce)
         assert not lora_preserve_base
         assert compute_type == tl.bfloat16
+
+    # Native per-channel compressed-tensors W4A8 quantizes the full token once;
+    # keep the existing tile-wise INT4 and MXFP4 modes separate.
+    use_native_int4_w4a8 = _is_hcu and use_int4_w4a16 and per_channel_quant
+    if use_native_int4_w4a8:
+        assert B_zp is None, "dynamic W4A8 requires symmetric INT4 weights"
+        A, A_scale = per_token_quant_int8(A)
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -944,12 +1046,9 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
-        if use_int4_w4a16 and per_channel_quant:
-            assert B_zp is None, "dynamic W4A8 requires symmetric INT4 weights"
-            A, A_scale = per_token_quant_int8(A)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -987,23 +1086,41 @@ def invoke_fused_moe_kernel(
         )
     # ===== END TO BE REFACTORED ====
 
-    use_int4_w4a8 = use_int4_w4a16 and per_channel_quant
     if (
-        use_int4_w4a8
-        or (
-            (use_int8_w8a16 or use_int4_w4a16)
+        use_native_int4_w4a8
+        or ((use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8 or use_mxfp4_w4a16 or use_mxfp4_w4a8)
             and block_shape is not None
-            and block_shape[1] > 0
-        )
+            and block_shape[1] > 0)
     ):
-        assert not fuse_sum_all_reduce, (
-            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
-        )
+        # Kimi-K3 checkpoint weights use packed E2M1 values plus uint8 UE8M0
+        # group scales.  On HCU, keep the packed tensors resident and select
+        # native tile-wise decode instead of treating them as affine INT4.
+        # Other platforms and ordinary INT4 checkpoints preserve the existing
+        # GPTQ/AWQ behavior.
+        if use_mxfp4_w4a16 or use_mxfp4_w4a8:
+            assert _is_hcu, "MXFP4 Triton MoE is only supported on HCU"
+            assert not use_int4_w4a16 and not use_int4_w4a8, (
+                "MXFP4 and affine INT4 modes are exclusive"
+            )
+            assert B_scale is not None and B_scale.dtype == torch.uint8, (
+                "MXFP4 requires uint8 UE8M0 scales"
+            )
+            assert B_zp is None, "MXFP4 E2M1 does not use an affine zero point"
+        if use_int4_w4a8:
+            assert B_zp is None, "INT4 W4A8 does not use an affine zero point"
+        if use_mxfp4_w4a8:
+            # One FP8 MMAC must cover exactly one MXFP4 scale group so that
+            # its UE8M0 scale can be applied after the MMAC.  Copy the config
+            # to keep the caller's cached/default config immutable.
+            config = dict(config)
+            config["BLOCK_SIZE_K"] = block_shape[1]
+            even_Ks = K % config["BLOCK_SIZE_K"] == 0
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
-        if use_int4_w4a8:
-            assert A_scale is not None and A_scale.ndim == 2
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
@@ -1033,13 +1150,16 @@ def invoke_fused_moe_kernel(
             B_zp.stride(0) if B_zp is not None else 0,
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
-            group_size=A.shape[1] if use_int4_w4a8 else block_shape[1],
+            group_size=A.shape[1] if use_native_int4_w4a8 else block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
             use_int4_w4a8=use_int4_w4a8,
+            use_native_int4_w4a8=use_native_int4_w4a8,
+            use_mxfp4_w4a8=use_mxfp4_w4a8,
+            use_mxfp4_w4a16=use_mxfp4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,

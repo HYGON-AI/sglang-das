@@ -135,9 +135,11 @@ class SchedulerStats:
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    pre_allocated_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -166,6 +168,9 @@ class SchedulerStats:
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
     routing_key_all_req_counts: List[int] = field(default_factory=list)
+
+    num_grammar_cache_entries: int = 0
+    grammar_backend_cache_bytes: int = 0
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
@@ -519,6 +524,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.num_decode_host_receive_queue_reqs = Gauge(
+            name="sglang:num_decode_host_receive_queue_reqs",
+            documentation="Requests in the decode transfer queue receiving into host memory or waiting for device admission.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_reqs = Counter(
+            name="sglang:num_decode_host_receive_reqs_total",
+            documentation="Total requests admitted to receive prefill KV in host memory.",
+            labelnames=labels.keys(),
+        )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
             documentation="Histogram of KV cache transfer speed in GB/s.",
@@ -534,6 +550,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.pre_allocated_token_usage = Gauge(
+            name="sglang:pre_allocated_token_usage",
+            documentation="The token usage for pre-allocated tokens (already allocated, transferring KV).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1098,21 +1120,57 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             multiprocess_mode="mostrecent",
         )
 
+        self.num_grammar_cache_entries = Gauge(
+            name="sglang:num_grammar_cache_entries",
+            documentation="Entries in the per-rank grammar object cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.grammar_backend_cache_bytes = Gauge(
+            name="sglang:grammar_backend_cache_bytes",
+            documentation=(
+                "Bytes held by the xgrammar compiler caches "
+                "(grammar-level + rule-level)."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.grammar_first_mask_fill_time = Histogram(
+            name="sglang:grammar_first_mask_fill_seconds",
+            documentation="Duration of a request's first grammar vocab-mask fill "
+            "(where the deferred cost of dynamic compilation lands).",
+            labelnames=labels.keys(),
+            buckets=[
+                0.0,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1,
+                2,
+                5,
+            ],
+        )
+
     @classmethod
     def init_new(
         cls,
         *,
         server_args: ServerArgs,
-        ps: Any,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        parallel = get_parallel()
+        is_stats_logging_rank = parallel.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
@@ -1120,8 +1178,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_kv_cache_events = bool(
             get_observability().kv_events_config
             and get_parallel().pp_rank == 0
-            and ps.attn_tp_rank == 0
-            and ps.attn_cp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
@@ -1134,14 +1192,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labels = {
                 "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-                "moe_ep_rank": ps.moe_ep_rank,
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
+                "moe_ep_rank": parallel.moe_ep_rank,
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
+            if parallel.dp_rank is not None:
+                labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
@@ -1188,6 +1246,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_decode_host_receive_reqs(self) -> None:
+        self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
 
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
@@ -1417,9 +1478,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
+        self._log_gauge_queue_count(
+            self.num_decode_host_receive_queue_reqs,
+            stats.num_decode_host_receive_queue_reqs,
+        )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        self._log_gauge(self.pre_allocated_token_usage, stats.pre_allocated_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1466,6 +1532,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         self.last_log_time = time.perf_counter()
 
+        self._log_gauge(self.num_grammar_cache_entries, stats.num_grammar_cache_entries)
+        self._log_gauge(
+            self.grammar_backend_cache_bytes, stats.grammar_backend_cache_bytes
+        )
+
     def log_grammar_stats(self, grammar_stats) -> None:
         if grammar_stats.compilation_time is not None:
             self._log_histogram(
@@ -1490,6 +1561,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 grammar_stats.num_timeout
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def observe_grammar_first_mask_fill(self, duration: float) -> None:
+        self._log_histogram(self.grammar_first_mask_fill_time, duration)
 
     def emit_constants(
         self,
@@ -1744,6 +1818,34 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 8.000,
             ]
 
+        self.histogram_outbound_latency = Histogram(
+            name="sglang:outbound_latency_seconds",
+            documentation=(
+                "Latency from scheduler output-batch emit to first-token "
+                "observation in the API server (detokenizer + router + http "
+                "worker event loop)."
+            ),
+            labelnames=labels.keys(),
+            buckets=[
+                0.001,
+                0.002,
+                0.005,
+                0.010,
+                0.020,
+                0.050,
+                0.100,
+                0.200,
+                0.500,
+                1.000,
+                2.000,
+                5.000,
+                10.000,
+                20.000,
+                40.000,
+                60.000,
+            ],
+        )
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
@@ -1843,31 +1945,15 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             float(generation_tokens)
         )
 
+    def observe_outbound_latency(self, labels: Dict[str, str], value: float):
+        self.histogram_outbound_latency.labels(**labels).observe(value)
+
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool
     ):
         self.histogram_time_to_first_token.labels(
             **labels, is_streaming="true" if stream else "false"
         ).observe(value)
-
-    def check_time_to_first_token_straggler(self, value: float) -> bool:
-        # Injected backends (e.g. Ray) route metrics out of process and can't
-        # introspect prometheus_client buckets here.
-        if self._histogram_cls is not None:
-            return False
-        his = self.histogram_time_to_first_token.labels(
-            **self.labels, is_streaming="true"
-        )
-        total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 100:
-            return False
-        p99_threshold = total_observations * 0.99
-        cumulative_count = 0
-        for i, bucket in enumerate(his._buckets):
-            cumulative_count += bucket._value
-            if cumulative_count > p99_threshold:
-                return value >= his._upper_bounds[i]
-        return False
 
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int

@@ -25,6 +25,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
+    _is_hcu,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
 if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+elif _is_hcu:
+    from sgl_kernel import merge_state_v2
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
@@ -613,6 +616,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
@@ -622,6 +626,10 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            # HCU's dense FlashMLA cache may pad no-rope rows from 512 to 576.
+            latent_cache = latent_cache[
+                ..., : self.kv_lora_rank + self.qk_rope_head_dim
+            ]
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

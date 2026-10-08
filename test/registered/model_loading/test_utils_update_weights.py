@@ -22,6 +22,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
+)
 from sglang.srt.weight_sync.utils import update_weights
 from sglang.test.ci.ci_register import register_cuda_ci, register_hcu_ci
 
@@ -45,6 +49,16 @@ class AsyncEngine(Engine):
     async def update_weights_from_tensor(self, update_weights_request):
         return await self.tokenizer_manager.update_weights_from_tensor(
             update_weights_request, None
+        )
+
+    async def begin_weight_update(self):
+        return await self.tokenizer_manager.begin_weight_update(
+            BeginWeightUpdateReqInput(), None
+        )
+
+    async def end_weight_update(self):
+        return await self.tokenizer_manager.end_weight_update(
+            EndWeightUpdateReqInput(), None
         )
 
 
@@ -178,6 +192,7 @@ class TestUtilsUpdateWeights(unittest.TestCase):
             params_batch = self.create_test_params_batch(self.model, num_params=2)
 
             # Test the utils.update_weights function
+            await self.engine.begin_weight_update()
             result = await update_weights(
                 engine=self.engine,
                 params_batch=params_batch,
@@ -185,6 +200,7 @@ class TestUtilsUpdateWeights(unittest.TestCase):
                 device_mesh=self.mesh,
                 load_format=None,
             )
+            await self.engine.end_weight_update()
 
             self.assertIn("Success", result)
 

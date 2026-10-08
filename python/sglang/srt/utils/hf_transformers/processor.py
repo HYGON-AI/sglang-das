@@ -13,7 +13,9 @@
 # ==============================================================================
 """Processor loading utilities."""
 
+import inspect
 import json
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -209,6 +211,100 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _escape_processor_special_tokens(processor) -> None:
+    """Synchronize processor-owned strings after its tokenizer is escaped."""
+    from sglang.srt.constrained.glm.escape import (
+        escape_token,
+        get_global_escaped_special_tokens,
+    )
+    from sglang.srt.utils.tokenizer_escape import escape_chat_template
+
+    processor_template = getattr(processor, "chat_template", None)
+    if isinstance(processor_template, str):
+        processor.chat_template = escape_chat_template(processor_template)
+    elif isinstance(processor_template, dict):
+        processor.chat_template = {
+            key: escape_chat_template(value)
+            for key, value in processor_template.items()
+        }
+
+    escaped_tokens = get_global_escaped_special_tokens()
+    for attr in (
+        "image_token",
+        "video_token",
+        "audio_token",
+        "glm_image_start_token",
+        "glm_image_end_token",
+    ):
+        value = getattr(processor, attr, None)
+        if isinstance(value, str):
+            escaped = escaped_tokens.get(value)
+            if escaped != value:
+                try:
+                    setattr(processor, attr, escaped)
+                except Exception as exc:
+                    logger.warning("Failed to setattr %s on processor: %s", attr, exc)
+
+    if escaped_tokens.enabled and hasattr(processor, "glm_image_placeholder_token"):
+        try:
+            processor.glm_image_placeholder_token = escape_token(
+                escaped_tokens.seed, "<|placeholder|>"
+            )
+        except Exception as exc:
+            logger.warning("Failed to escape glm_image_placeholder_token: %s", exc)
+
+
+def adapt_glm5next_image_processor(processor):
+    """Keep checkpoint fast preprocessing compatible with HF's resample API."""
+    image_processor = getattr(processor, "image_processor", processor)
+    if type(image_processor).__name__ != "Glm5nextImageProcessorFast":
+        return
+    cls = type(image_processor)
+    original = cls._preprocess
+    if not getattr(original, "_sglang_resample_compat", False) and (
+        "interpolation" in inspect.signature(original).parameters
+    ):
+
+        @wraps(original)
+        def preprocess(self, *args, **kwargs):
+            if "interpolation" not in kwargs:
+                from transformers.image_utils import pil_torch_interpolation_mapping
+
+                resample = kwargs.get("resample", self.resample)
+                kwargs["interpolation"] = pil_torch_interpolation_mapping.get(
+                    resample, resample
+                )
+            return original(self, *args, **kwargs)
+
+        preprocess._sglang_resample_compat = True
+        cls._preprocess = preprocess
+
+    # Glm5nextImageProcessorFast was written against the old HF fast backend,
+    # whose resize keyword is ``interpolation``. Transformers 5.12's
+    # TorchvisionBackend renamed that keyword to ``resample``. Without this
+    # shim the keyword is swallowed by **kwargs and resize silently falls back
+    # to bilinear interpolation, changing the image tensor while remaining on
+    # the fast path.
+    resize = getattr(cls, "resize", None)
+    if resize is not None:
+        resize_signature = inspect.signature(resize)
+        if (
+            "resample" in resize_signature.parameters
+            and "interpolation" not in resize_signature.parameters
+            and not getattr(resize, "_sglang_resize_compat", False)
+        ):
+            resize_method = resize
+
+            @wraps(resize_method)
+            def resize_compat(self, *args, **kwargs):
+                if "interpolation" in kwargs and "resample" not in kwargs:
+                    kwargs["resample"] = kwargs.pop("interpolation")
+                return resize_method(self, *args, **kwargs)
+
+            resize_compat._sglang_resize_compat = True
+            cls.resize = resize_compat
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -219,6 +315,7 @@ def get_processor(
     image_processor_backend: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
     model_name: Optional[str] = None,
+    glm_special_token_escape_seed: Optional[int] = None,
     **kwargs,
 ):
     if tokenizer_backend == "fastokens":
@@ -355,6 +452,7 @@ def get_processor(
     ):
         processor = wrap_as_pixtral(processor, config)
 
+    adapt_glm5next_image_processor(processor)
     tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
@@ -392,4 +490,9 @@ def get_processor(
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
+    if glm_special_token_escape_seed is not None:
+        from sglang.srt.utils.tokenizer_escape import escape_tokenizer_special_tokens
+
+        escape_tokenizer_special_tokens(tokenizer, glm_special_token_escape_seed)
+        _escape_processor_special_tokens(processor)
     return processor

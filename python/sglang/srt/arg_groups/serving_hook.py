@@ -20,6 +20,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
+    get_bool_env_var,
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
@@ -334,6 +335,9 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=cfg.port + 10000,
         )
 
+    if cfg.grpc_response_timeout_secs <= 0:
+        raise ValueError("--grpc-response-timeout-secs must be positive")
+
     if cfg.grpc_port is not None:
         if not (1 <= cfg.grpc_port <= 65535):
             raise ValueError(
@@ -402,6 +406,34 @@ def handle_environment_variables(server_args: Any):
     )
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+    # Normalize custom_all_reduce_backend: --disable-custom-all-reduce wins,
+    # else on HIP with legacy SGLANG_USE_AITER_AR=1 promote auto -> aiter.
+    if cfg.disable_custom_all_reduce:
+        if cfg.custom_all_reduce_backend != "off":
+            logger.info(
+                "--disable-custom-all-reduce overrides "
+                "--custom-all-reduce-backend=%s to 'off'.",
+                cfg.custom_all_reduce_backend,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_environment_variables",
+                custom_all_reduce_backend="off",
+            )
+    elif (
+        cfg.custom_all_reduce_backend == "auto"
+        and get_platform().is_hip
+        and get_bool_env_var("SGLANG_USE_AITER_AR", default="false")
+    ):
+        logger.info(
+            "Promoting custom_all_reduce_backend from 'auto' to 'aiter' "
+            "because SGLANG_USE_AITER_AR=1 is set on HIP."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_environment_variables",
+            custom_all_reduce_backend="aiter",
+        )
     if cfg.debug_cuda_graph:
         if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(
@@ -468,7 +500,7 @@ def handle_other_validations(server_args: Any):
         elif cfg.enable_hierarchical_cache and not (
             (
                 cfg.hicache_storage_backend is None
-                and cfg.hicache_write_policy == "write_back"
+                and cfg.hicache_write_policy in ("write_back", "write_through")
             )
             or (
                 cfg.hicache_storage_backend is not None
@@ -477,8 +509,8 @@ def handle_other_validations(server_args: Any):
             )
         ):
             logger.warning(
-                "Optimistic prefill supports L2 write-back or L3 buffer-only "
-                "write-through hierarchical cache"
+                "Optimistic prefill supports L2 write-back/write-through or "
+                "L3 buffer-only write-through hierarchical cache"
             )
             declare_resolution(
                 server_args,
@@ -742,27 +774,14 @@ def handle_multimodal_feature_transport(server_args: Any):
 
     CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
     memory left for model/KV-cache allocations. Multi-node MNNVL deployments
-    may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
-    variable remain supported so existing deployments map to this policy.
+    may still auto-select CUDA VMM. The legacy CUDA IPC environment variable
+    remains supported so existing deployments map to this policy.
     """
 
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
     legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
     legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
-
-    if cfg.keep_mm_feature_on_device:
-        if requested_transport not in (None, "cuda_ipc"):
-            raise ValueError(
-                "--keep-mm-feature-on-device conflicts with "
-                f"--mm-feature-transport={requested_transport}. Use only "
-                "--mm-feature-transport=cuda_ipc."
-            )
-        requested_transport = "cuda_ipc"
-        logger.warning(
-            "--keep-mm-feature-on-device is deprecated; using "
-            "--mm-feature-transport=cuda_ipc instead."
-        )
 
     if requested_transport is None:
         if legacy_ipc_is_set:
@@ -889,13 +908,6 @@ def handle_multimodal_feature_transport(server_args: Any):
         server_args,
         "_handle_multimodal_feature_transport",
         mm_feature_transport=requested_transport,
-    )
-    # The bounded IPC pool owns device residency. Do not retain unpooled
-    # tensors after a pool miss, which would make HBM use request-dependent.
-    declare_resolution(
-        server_args,
-        "_handle_multimodal_feature_transport",
-        keep_mm_feature_on_device=False,
     )
     envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
         "1" if requested_transport == "cuda_ipc" else "0"

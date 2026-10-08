@@ -487,6 +487,46 @@ def get_rope_index_qwen3_omni(
         return position_ids, mrope_position_deltas
 
 
+_GLM4V_MODALITY_NAMES = ("text", "image", "video")
+
+
+def _glm4v_token_type_groups(
+    ids: torch.Tensor,
+    image_token_id: int,
+    video_start_token_id: int,
+    video_end_token_id: int,
+) -> List[Tuple[str, int, int]]:
+    """Split token IDs into contiguous text, image, and video runs."""
+    n = ids.numel()
+    if n == 0:
+        return []
+
+    device = ids.device
+    is_image = ids == image_token_id
+    is_start = ids == video_start_token_id
+    is_end = ids == video_end_token_id
+
+    # Match the old last-writer-wins video toggle exactly. Forward-fill the
+    # nearest start/end marker instead of using a nesting counter, which
+    # differs for malformed sequences such as start,start,end.
+    offsets = torch.arange(1, n + 1, dtype=torch.long, device=device)
+    last_marker = torch.cummax(torch.where(is_start | is_end, offsets, 0), 0).values
+    in_video = (last_marker > 0) & is_start[(last_marker - 1).clamp(min=0)]
+
+    code = torch.zeros(n, dtype=torch.long, device=device)
+    code[is_image] = 1
+    code[is_image & in_video] = 2
+
+    is_run_start = torch.ones(n, dtype=torch.bool, device=device)
+    is_run_start[1:] = code[1:] != code[:-1]
+    starts = is_run_start.nonzero().flatten()
+    ends = torch.cat([starts[1:], torch.full((1,), n, dtype=torch.long, device=device)])
+    return [
+        (_GLM4V_MODALITY_NAMES[c], start, end)
+        for c, start, end in zip(code[starts].tolist(), starts.tolist(), ends.tolist())
+    ]
+
+
 def get_rope_index_glm4v(
     input_ids: torch.Tensor,
     hf_config: Any,
@@ -526,32 +566,12 @@ def get_rope_index_glm4v(
         for i, ids in enumerate(total_input_ids):
             curr_mask = attention_mask[i]
             ids_masked = ids[curr_mask == 1]
-
-            input_tokens = ids_masked.tolist()
-            input_token_type = [""] * len(input_tokens)
-
-            video_check_flg = False
-            for j, token in enumerate(input_tokens):
-                if token == video_start_token_id:
-                    video_check_flg = True
-                elif token == video_end_token_id:
-                    video_check_flg = False
-
-                if token == image_token_id and not video_check_flg:
-                    input_token_type[j] = "image"
-                elif token == image_token_id and video_check_flg:
-                    input_token_type[j] = "video"
-                else:
-                    input_token_type[j] = "text"
-
-            input_type_group = []
-            for key, group in itertools.groupby(
-                enumerate(input_token_type), lambda x: x[1]
-            ):
-                group = list(group)
-                start_index = group[0][0]
-                end_index = group[-1][0] + 1
-                input_type_group.append((key, start_index, end_index))
+            input_type_group = _glm4v_token_type_groups(
+                ids_masked,
+                image_token_id,
+                video_start_token_id,
+                video_end_token_id,
+            )
 
             llm_pos_ids_list = []
             video_frame_num = 1

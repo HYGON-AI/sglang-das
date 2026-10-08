@@ -19,11 +19,24 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hcu, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
-# KDA always uses the triton causal_conv1d_fn (no CUDA override).
-# Only causal_conv1d_update needs platform-specific overrides for decode.
+# HCU: use the operator-library causal_conv1d (DAS/DTK build) for the plain
+# extend/decode paths. The spec-decode verify path keeps the triton
+# implementation because it needs extended kwargs (intermediate_conv_window /
+# retrieve_*) that the library's causal_conv1d_update does not provide.
+_hcu_causal_conv1d_fn = None
+_hcu_causal_conv1d_update = None
+_use_hcu_cc1d = is_hcu() and get_bool_env_var(
+    "SGLANG_KDA_USE_CAUSAL_CONV1D_HCU", default="true"
+)
+if _use_hcu_cc1d:
+    from causal_conv1d import (
+        causal_conv1d_fn_hcu as _hcu_causal_conv1d_fn,
+        causal_conv1d_update as _hcu_causal_conv1d_update,
+    )
+
 if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
@@ -32,6 +45,75 @@ elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 
     causal_conv1d_update = causal_conv1d_update_cpu
+
+
+def _run_causal_conv1d_fn(
+    x,
+    weight,
+    bias,
+    *,
+    conv_states,
+    query_start_loc,
+    seq_lens_cpu,
+    cache_indices=None,
+    has_initial_state=None,
+    activation="silu",
+):
+    """HCU uses the operator-library varlen causal conv; other platforms keep
+    the sglang triton implementation."""
+    if _hcu_causal_conv1d_fn is not None:
+        return _hcu_causal_conv1d_fn(
+            x,
+            weight,
+            bias,
+            initial_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            seq_lens_cpu=seq_lens_cpu,
+            activation=activation,
+        )
+    return causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        seq_lens_cpu=seq_lens_cpu,
+        activation=activation,
+    )
+
+
+def _run_causal_conv1d_update(
+    x,
+    conv_state,
+    weight,
+    bias=None,
+    *,
+    activation="silu",
+    conv_state_indices=None,
+):
+    """HCU uses the operator-library single-step causal conv; other platforms
+    keep the sglang triton implementation (or its NPU/CPU overrides)."""
+    if _hcu_causal_conv1d_update is not None:
+        return _hcu_causal_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+        )
+    return causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=conv_state_indices,
+    )
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -411,6 +493,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             .transpose(-1, -2)
             .shape
         )
+        self.use_hcu_kda = self.req_to_token_pool.mamba_pool.use_hcu_kda
+        self.hcu_kernel = None
+        if self.use_hcu_kda:
+            from sglang.srt.layers.attention.linear.kernels.kda_hcu import HcuKDAKernel
+
+            self.hcu_kernel = HcuKDAKernel()
+            self.supports_ragged_verify_graph = False
+
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode
         prefill_backend = backends.prefill
@@ -425,9 +515,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(
-            decode_backend, prefill_backend, verify_backend
-        )
+        if self.use_hcu_kda:
+            if not all(
+                backend.is_triton()
+                for backend in (decode_backend, prefill_backend, verify_backend)
+            ):
+                raise ValueError(
+                    "HCU KDA uses the source Triton decode, prefill and verify kernels"
+                )
+            self.kernel_dispatcher = None
+        else:
+            self.kernel_dispatcher = KDAKernelDispatcher(
+                decode_backend, prefill_backend, verify_backend
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -436,7 +536,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         self._fused_chain_verify_fn = None
         if (
-            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            not self.use_hcu_kda
+            and envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
@@ -461,7 +562,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # accept_lens_pool holds last round's accept length per mamba slot;
         # extend stages fresh requests with 1 (read slot 0). Its presence is the
         # signal that switches the post-verify commit to conv-only.
-        if self._can_fuse_accept_state(verify_backend):
+        if not self.use_hcu_kda and self._can_fuse_accept_state(verify_backend):
             self.accept_lens_pool = torch.ones(
                 self.req_to_token_pool.size + 1,
                 dtype=torch.int32,
@@ -533,11 +634,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
+            if self.forward_metadata.mamba_track_mask_indices is None:
+                self.forward_metadata.mamba_track_mask_indices = (
+                    forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                )
             self.forward_metadata.conv_states_mask_indices = (
-                forward_batch.mamba_track_indices[
+                self._translate_mamba_indices(forward_batch.mamba_track_indices)[
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
@@ -551,6 +653,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if self.use_hcu_kda:
+            return self._hcu_forward_decode(
+                layer, forward_batch, mixed_qkv, a, b, **kwargs
+            )
+
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -644,7 +751,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # The model deferred f_b only after publishing static fallback
             # weights. Materialize the original gate before entering the
             # unchanged conv + packed-KDA fallback chain.
-            from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 
             if fused_static is None:
                 raise RuntimeError("K3 deferred f_b is missing fallback weights")
@@ -726,7 +833,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
                     )
 
-        qkv = causal_conv1d_update(
+        qkv = _run_causal_conv1d_update(
             mixed_qkv,
             conv_states.transpose(-1, -2),
             layer.conv_weights,
@@ -803,6 +910,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ):
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
+        if self.use_hcu_kda:
+            return self._hcu_forward_extend(
+                layer, forward_batch, mixed_qkv, a, b, **kwargs
+            )
+
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
@@ -822,7 +934,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         physical_num_tokens = mixed_qkv.shape[0]
-        logical_num_tokens = int(query_start_loc[-1])
+        logical_num_tokens = self.forward_metadata.logical_num_tokens
+        if logical_num_tokens is None:
+            logical_num_tokens = int(query_start_loc[-1])
         if logical_num_tokens < physical_num_tokens:
             mixed_qkv = mixed_qkv[:logical_num_tokens]
             a = a[:, :logical_num_tokens]
@@ -838,20 +952,53 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        # Depthwise conv is channel-independent, so one packed call over the
-        # full qkv width matches the decode path and saves two kernel launches.
-        qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_states=conv_states,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        if _hcu_causal_conv1d_fn is not None:
+            # The HCU library accepts each Q/K/V group separately; preserve the
+            # main packed path on other devices.
+            splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(
+                splits, dim=-2
+            )
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+            q = _run_causal_conv1d_fn(
+                q, q_conv_weight, q_bias,
+                activation="silu", conv_states=q_conv_state,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = _run_causal_conv1d_fn(
+                k, k_conv_weight, k_bias,
+                activation="silu", conv_states=k_conv_state,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = _run_causal_conv1d_fn(
+                v, v_conv_weight, v_bias,
+                activation="silu", conv_states=v_conv_state,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+        else:
+            # Depthwise conv is channel-independent, so the main path packs
+            # Q/K/V into one call and avoids two extra launches.
+            qkv = causal_conv1d_fn(
+                mixed_qkv.transpose(0, 1), layer.conv_weights, layer.bias,
+                activation="silu", conv_states=conv_states,
+                has_initial_state=has_initial_state, cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1541,7 +1688,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 
@@ -1580,6 +1727,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_eps = None
             onorm_gate = None
 
+        a = a.reshape(1, seq_len, h, layer.head_k_dim)
         out = fused_kda_decode_mtp_dspark(
             x_q=x_q,
             x_k=x_k,
@@ -1615,3 +1763,293 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out
+
+    def _hcu_forward_decode(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = layer_cache.conv[0]
+        ssm_states = layer_cache.temporal
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_states.transpose(-1, -2),
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+        )
+        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+
+        output = self.hcu_kernel.decode(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            beta_scale=getattr(layer, "beta_scale", 1.0),
+            lower_bound=(
+                getattr(layer, "lower_bound", None)
+                if getattr(layer, "safe_gate", True)
+                else None
+            ),
+        )
+
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+        )
+        return output
+
+    def _hcu_forward_extend(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        # Under input_scattered or dp-attention, the model passes [N_pad, ...]
+        # tensors but query_start_loc still describes only [0, n_valid). The
+        # Triton kernels (causal_conv1d / chunk_kda) only schedule thread blocks
+        # for rows covered by query_start_loc, so output rows [n_valid, N_pad)
+        # are never written and keep whatever bit pattern torch.empty() left in
+        # GPU memory — often NaN/Inf. Strip to valid rows here, run the kernels
+        # on a smaller tensor, then re-pad core_attn_out with zeros so the
+        # caller sees the [N_pad, ...] shape it expects.
+        n_total = mixed_qkv.shape[0]
+        n_valid = (
+            (
+                sum(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.extend_seq_lens_cpu is not None
+                else forward_batch.extend_num_tokens
+            )
+            if not forward_batch.forward_mode.is_target_verify()
+            else None
+        )
+        needs_repad = n_valid is not None and n_valid < n_total
+        if needs_repad:
+            mixed_qkv = mixed_qkv[:n_valid]
+
+        if n_valid is not None:
+            # Main's linear-attention wrapper may already trim mixed_qkv while
+            # leaving the [1, N, ...] gates padded. Align their token dimension
+            # even when mixed_qkv no longer needs trimming here.
+            num_tokens = mixed_qkv.shape[0]
+            a = a[:, :num_tokens] if a.ndim in (3, 4) else a[:num_tokens]
+            b = b[:, :num_tokens] if b.ndim == 3 else b[:num_tokens]
+
+        forward_metadata = self.forward_metadata
+        # Match hybrid_linear_attn_backend._forward_metadata: read the CURRENT
+        # forward_mode. DP max-length padding rewrites TARGET_VERIFY into
+        # EXTEND and reshapes the batch into single-token rows, and the
+        # metadata layer already prepared the EXTEND-shape query_start_loc
+        # ([0,1,2,...,bs]) for it. Taking the target_verify branch on that
+        # padded batch would divide seq_len by draft_token_num and reshape
+        # the flat token stream into a tree layout that no longer matches
+        # what the caller passes in.
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
+        retrieve_next_token = forward_metadata.retrieve_next_token
+        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
+
+        ssm_states = mamba_cache_params.temporal
+
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+
+        if is_target_verify:
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            seq_len = mixed_qkv.shape[0]
+            batch_size = seq_len // draft_token_num
+            intermediate_state_indices = self.verify_intermediate_state_indices[
+                :batch_size
+            ]
+            mixed_qkv = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2)
+            mixed_qkv = (
+                causal_conv1d_update(
+                    mixed_qkv,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation="silu",
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=mamba_cache_params.intermediate_conv_window[
+                        0
+                    ].transpose(-1, -2),
+                    intermediate_state_indices=intermediate_state_indices,
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+                .transpose(1, 2)
+                .reshape(seq_len, -1)
+            )
+            q, k, v = mixed_qkv.split(splits, dim=-1)
+        else:
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+            mixed_qkv = mixed_qkv.transpose(0, 1)
+            if forward_metadata.has_mamba_track_mask:
+                mixed_qkv_to_track = mixed_qkv[
+                    :, forward_metadata.track_conv_indices
+                ].transpose(0, 1)
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
+
+            q, k, v = mixed_qkv.split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+
+            q = causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+
+        if is_target_verify:
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            replayssm_on = mamba_pool.use_hcu_kda_replayssm
+            if not replayssm_on:
+                assert mamba_cache_params.intermediate_ssm is not None
+            replayssm_kwargs = {}
+            if replayssm_on:
+                replayssm_kwargs = dict(
+                    cache_replayssm_inputs=True,
+                    replayssm_rawv=mamba_cache_params.replayssm_rawv,
+                    replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                    replayssm_g=mamba_cache_params.replayssm_g,
+                    replayssm_beta=mamba_cache_params.replayssm_beta,
+                )
+            core_attn_out = self.hcu_kernel.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+                beta_scale=getattr(layer, "beta_scale", 1.0),
+                lower_bound=(
+                    getattr(layer, "lower_bound", None)
+                    if getattr(layer, "safe_gate", True)
+                    else None
+                ),
+                **replayssm_kwargs,
+            )
+        else:
+            # Main models may supply raw flattened gate/beta; GLM already supplies
+            # [1, T, H, K] gates and activated beta on extend.
+            if a.ndim != 4:
+                a = a.reshape(1, q.shape[1], -1, layer.head_k_dim)
+                b = b.reshape(1, q.shape[1], -1).float().sigmoid() * getattr(
+                    layer, "beta_scale", 1.0
+                )
+            core_attn_out = self.hcu_kernel.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                beta_scale=getattr(layer, "beta_scale", 1.0),
+                lower_bound=(
+                    getattr(layer, "lower_bound", None)
+                    if getattr(layer, "safe_gate", True)
+                    else None
+                ),
+                return_intermediate_state=forward_metadata.has_mamba_track_mask,
+            )
+
+            if forward_metadata.has_mamba_track_mask:
+                core_attn_out, h = core_attn_out
+                if h is not None:
+                    self._track_mamba_state_extend(
+                        forward_batch, h, ssm_states, forward_metadata
+                    )
+
+        if needs_repad:
+            # core_attn_out comes back from the kernel as [1, n_valid, h, d]
+            # (token dim is dim 1 due to the unsqueeze(0) above). Re-pad along
+            # the token dim so the caller's `.squeeze(0).flatten(-2)` gives
+            # [n_total, h*d] as expected.
+            full = core_attn_out.new_zeros(
+                (
+                    core_attn_out.shape[0],
+                    n_total,
+                    *core_attn_out.shape[2:],
+                )
+            )
+            full[:, :n_valid] = core_attn_out
+            core_attn_out = full
+
+        return core_attn_out

@@ -128,6 +128,24 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
+    # FP8 K/V tiles halve the pipelined LDS footprint.
+    kv_is_fp8 = k.element_size() == 1
+    device_arch = getattr(
+        torch.cuda.get_device_properties(q.device), "gcnArchName", ""
+    ).split(":", 1)[0]
+    if (
+        device_arch == "gfx936"
+        and head_dim == 256
+        and not kv_is_fp8
+        and block_n == 64
+        and stages == 2
+    ):
+        # The non-chunked prefill path has the same gfx936 LDS requirement as
+        # chunk prefill, so apply the same measured size-dependent fallback.
+        if total_q <= 64:
+            stages = 1
+        else:
+            block_n = 32
     out = torch.empty_like(q)
     _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
         q,
@@ -278,8 +296,79 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
+    # FP8 K/V tiles halve the pipelined LDS footprint.
+    kv_is_fp8 = k.element_size() == 1
+    device_arch = getattr(
+        torch.cuda.get_device_properties(q.device), "gcnArchName", ""
+    ).split(":", 1)[0]
+    if (
+        device_arch == "gfx936"
+        and head_dim == 256
+        and not kv_is_fp8
+        and block_n == 64
+        and stages == 2
+    ):
+        # BLOCK_N=64/stages=2 needs 67584 bytes of LDS on gfx936, exceeding
+        # its 65536-byte limit. Keep the faster 64/1 config through 64 query
+        # rows; with more rows the measured 32/2 config is faster.
+        if total_q <= 64:
+            stages = 1
+        else:
+            block_n = 32
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
+        q,
+        k,
+        v,
+        out,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        indices.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    """Run one packed sparse-attention row per request without a host sync.
+
+    Reuses the chunk-prefill kernel at a fixed query length of one, so graph
+    capture never hits the ``.item()`` that the general interface needs to
+    derive ``max_q``.
+    """
+
+    k, v = k.contiguous(), v.contiguous()
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    out = torch.empty_like(q)
+    _sparse_gqa_chunk_prefill[(1, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
         k,
         v,
@@ -512,10 +601,148 @@ def qwen_sparse_kv_extraction_compact_triton(
     )
 
 
+@triton.jit
+def _compact_kv_hcu_fa(
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    topk: tl.constexpr,
+    heads: tl.constexpr,
+    dim: tl.constexpr,
+    page_size: tl.constexpr,
+    req_stride: tl.constexpr,
+    idx_stride: tl.constexpr,
+    k_sp,
+    k_sh,
+    k_so,
+    k_sd,
+    v_sp,
+    v_sh,
+    v_so,
+    v_sd,
+    ok0,
+    ok1,
+    ok2,
+    ov0,
+    ov1,
+    ov2,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather selected tokens from HCU FA paged KV into packed NHD rows.
+
+    K is (pages, heads, page, dim); V is (pages, heads, dim, page). Physical
+    slots are page * page_size + offset, matching MHATokenToKVPool.set_kv_buffer
+    under SGLANG_KV_LAYOUT_HCU_FA. This does not change the pool layout.
+    """
+    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    dims = tl.arange(0, BLOCK_D)
+    length = tl.load(seq_lens + batch)
+    req = tl.load(req_indices + batch)
+    pack_start = tl.load(cu_k + batch)
+    valid_count = tl.load(cu_k + batch + 1) - pack_start
+    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
+    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
+    slots = tl.load(
+        req_to_token + req * req_stride + tl.where(valid, positions, 0),
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    page = slots // page_size
+    off = slots % page_size
+    k_ptrs = (
+        k
+        + page[:, None] * k_sp
+        + head * k_sh
+        + off[:, None] * k_so
+        + dims[None, :] * k_sd
+    )
+    v_ptrs = (
+        v
+        + page[:, None] * v_sp
+        + head * v_sh
+        + off[:, None] * v_so
+        + dims[None, :] * v_sd
+    )
+    dst = (pack_start + cols)[:, None]
+    mask = valid[:, None] & (dims[None, :] < dim)
+    k_dst = out_k + dst * ok0 + head * ok1 + dims[None, :] * ok2
+    v_dst = out_v + dst * ov0 + head * ov1 + dims[None, :] * ov2
+    k_values = tl.load(k_ptrs, mask=mask, other=0.0)
+    v_values = tl.load(v_ptrs, mask=mask, other=0.0)
+    tl.store(k_dst, k_values.to(out_k.dtype.element_ty), mask=mask)
+    tl.store(v_dst, v_values.to(out_v.dtype.element_ty), mask=mask)
+
+
+def qwen_sparse_kv_extraction_compact_hcu_fa_triton(
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    batch,
+    topk,
+    page_size: int,
+):
+    """QSA-only compact from HCU FA paged KV. Pool layout is left unchanged."""
+    if k.dtype != v.dtype or out_k.dtype != out_v.dtype:
+        raise ValueError("QSA compact K/V input and output dtype pairs must match")
+    heads = k.shape[1]
+    dim = k.shape[3]
+    block_topk = 16
+    _compact_kv_hcu_fa[(batch, heads, triton.cdiv(topk, block_topk))](
+        k,
+        v,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        cu_k,
+        out_k,
+        out_v,
+        topk,
+        heads,
+        dim,
+        page_size,
+        req_to_token.stride(0),
+        indices.stride(0),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(3),
+        v.stride(2),
+        out_k.stride(0),
+        out_k.stride(1),
+        out_k.stride(2),
+        out_v.stride(0),
+        out_v.stride(1),
+        out_v.stride(2),
+        BLOCK_TOPK=block_topk,
+        BLOCK_D=triton.next_power_of_2(dim),
+        num_warps=8,
+    )
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
+    "qwen_sparse_kv_extraction_compact_hcu_fa_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
+    "sparse_gqa_packed_decode_triton",
 ]

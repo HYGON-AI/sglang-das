@@ -199,6 +199,8 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
             "Glm5NextForConditionalGenerationNextN",
+            "Glm5NextForCausalLMNextN",
+            "Glm5NextForCausalLM",
             "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
@@ -389,6 +391,24 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
         return max(layer_id - offset + 1, 0) % freq != 0
 
     return max(layer_id - 1, 0) % freq != 0
+
+
+def get_dsa_full_indexer_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
+) -> List[int]:
+    """Return DSA layers that run an indexer instead of reusing top-k."""
+    if end_layer is None:
+        end_layer = config.num_hidden_layers
+    assert 0 <= start_layer <= end_layer
+    if not is_deepseek_dsa(config):
+        return list(range(start_layer, end_layer))
+    return [
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    ]
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
@@ -897,11 +917,11 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ):
-            self.hf_config.architectures[0] = "Glm5NextForConditionalGenerationNextN"
+            self.hf_config.architectures[0] += "NextN"
             self.hf_text_config.architectures = list(self.hf_config.architectures)
             self.hf_text_config.num_nextn_predict_layers = 1
             self.hf_text_config.linear_attn_config = None
@@ -930,6 +950,11 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
@@ -1031,6 +1056,9 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
+        # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
+        self.swa_attention_layer_ids: Optional[List[int]] = None
+        self.full_attention_layer_ids: Optional[List[int]] = None
 
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
@@ -1063,6 +1091,7 @@ class ModelConfig:
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
+            "DiffusionGemmaForBlockDiffusion",
         ]
 
     @cached_property
@@ -1177,6 +1206,8 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
+            or "Glm5NextForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForCausalLMNextN" in self.hf_config.architectures
             or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
             or "Glm5NextForConditionalGenerationNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -1194,6 +1225,8 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1275,9 +1308,12 @@ class ModelConfig:
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
-        elif (
-            "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
-            or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+        elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
+            # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
+            # the MLA ones (V2.5 and V3) carry kv_lora_rank, V2 keeps its GQA
+            # shapes.
+            "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+            and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
         ):
             self.head_dim = self.hf_text_config.head_dim
             self.attention_arch = AttentionArch.MLA
@@ -1303,6 +1339,8 @@ class ModelConfig:
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif (
             "SarvamMLAForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForCausalLMNextN" in self.hf_config.architectures
             or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = (
@@ -1364,8 +1402,14 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        is_glm5_next = getattr(self.hf_config, "model_type", None) == "glm5_next" or (
-            getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
+        is_glm5_next = getattr(self.hf_config, "model_type", None) in (
+            "glm5_next",
+            "glm5v_next",
+            "glm5next_text",
+            "glm5_next_text",
+        ) or (
+            getattr(self.hf_text_config, "model_type", None)
+            in ("glm5next_text", "glm5_next_text")
         )
         if is_glm5_next and not getattr(self.hf_text_config, "mhc", False):
             hc_mult = 1
@@ -2200,6 +2244,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
     "Gemma4UnifiedForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "Glm5NextForConditionalGeneration",
@@ -2395,6 +2440,20 @@ def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
     return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
 
 
+# SequenceClassification models whose forward routes the head through
+# score_and_pool (per-position pooling); only these support setwise readout
+# (token_indices_to_pool). Keep in sync with callers of layers.pooler.score_and_pool.
+_score_and_pool_archs = [
+    "LlamaForSequenceClassification",
+    "Qwen2ForSequenceClassification",
+    "Qwen3ForSequenceClassification",
+]
+
+
+def is_score_and_pool_model(model_architectures: List[str]) -> bool:
+    return any(arch in _score_and_pool_archs for arch in model_architectures)
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
@@ -2447,6 +2506,7 @@ def is_hybrid_swa_model(
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
+        "DiffusionGemmaForBlockDiffusion",
         "LagunaForCausalLM",
         "MellumForCausalLM",
         "MuseGlimmerForCausalLM",
@@ -2527,6 +2587,7 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
+        or "DiffusionGemmaForBlockDiffusion" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
         or "MuseGlimmerForCausalLM" in model_architectures

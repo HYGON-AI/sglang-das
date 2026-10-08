@@ -153,6 +153,14 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
+    from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+    if is_glm5_next_hcu(runner.model_config.hf_config):
+        from sglang.srt.layers.attention.glm5_next.dsa_backend import (
+            NativeSparseAttnBackend,
+        )
+
+        return NativeSparseAttnBackend(runner)
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     return DeepseekSparseAttnBackend(runner)
@@ -544,8 +552,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         else:
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
-                spec, _ = spec_result
-                cfg = runner.model_config
+                spec, cfg = spec_result
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
                 if spec.hybrid_backend_class_name is not None:

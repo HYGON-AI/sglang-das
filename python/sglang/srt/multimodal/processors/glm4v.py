@@ -1,13 +1,19 @@
 import asyncio
 import json
+import logging
 import math
 from typing import List, Tuple, Union
 
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -28,6 +34,8 @@ try:
     from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 except ImportError:
     Glm5NextForConditionalGeneration = None
+
+logger = logging.getLogger(__name__)
 
 GLM_VIDEO_DEFAULT_FPS = 2.0
 GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
@@ -272,10 +280,44 @@ def _resize_frames_to_max_tokens(frames, max_tokens_per_frame):
     return nchw.permute(0, 2, 3, 1).contiguous()
 
 
+def _metadata_from_video_frame_list(frame_list):
+    """Use Chamber's source timeline when it is present on a frame list."""
+    if not envs.SGLANG_SKIP_VIDEO_PREPROCESS.get():
+        return None
+
+    first = frame_list[0]
+    source_fps = first.get("source_fps")
+    source_total = first.get("source_total_num_frames")
+    sampled_indices = [frame.get("sampled_index") for frame in frame_list]
+    if (
+        source_fps is None
+        or source_fps <= 0
+        or source_total is None
+        or source_total <= 0
+        or any(index is None for index in sampled_indices)
+    ):
+        return None
+
+    return _glm_video_metadata(
+        source_total,
+        source_fps,
+        source_total / source_fps,
+        sampled_indices,
+    )
+
+
 def preprocess_video_frames_sync(frame_list: List[dict]):
     total_num_frames = len(frame_list)
     if total_num_frames == 0:
         raise ValueError("GLM video frame list must not be empty")
+    metadata = _metadata_from_video_frame_list(frame_list)
+    if metadata is not None:
+        images = [frame["frame_image"] for frame in frame_list]
+        if isinstance(images[0], torch.Tensor):
+            images = torch.stack(images).permute(0, 2, 3, 1).contiguous()
+        else:
+            images = [np.asarray(image) for image in images]
+        return images, metadata
     duration = 0.0
     if frame_list[0].get("detail") is not None:
         details = json.loads(frame_list[0]["detail"])
@@ -435,6 +477,7 @@ def _passthrough_video_metadata(video, video_config):
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
+    tokenizes_input_text = True
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [
@@ -451,13 +494,16 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        escaped_tokens = get_global_escaped_special_tokens()
         # GLM-V specific tokens
-        self.IMAGE_TOKEN = "<|image|>"
-        self.VIDEO_TOKEN = "<|video|>"
-        self.IMAGE_START_TOKEN = "<|begin_of_image|>"
-        self.IMAGE_END_TOKEN = "<|end_of_image|>"
-        self.VIDEO_START_TOKEN = "<|begin_of_video|>"
-        self.VIDEO_END_TOKEN = "<|end_of_video|>"
+        self.IMAGE_TOKEN = escaped_tokens.get("<|image|>")
+        self.VIDEO_TOKEN = escaped_tokens.get("<|video|>")
+        self.IMAGE_START_TOKEN = escaped_tokens.get("<|begin_of_image|>")
+        self.IMAGE_END_TOKEN = escaped_tokens.get("<|end_of_image|>")
+        self.VIDEO_START_TOKEN = escaped_tokens.get("<|begin_of_video|>")
+        self.VIDEO_END_TOKEN = escaped_tokens.get("<|end_of_video|>")
 
         # Token IDs
         self.IM_TOKEN_ID = hf_config.image_token_id
@@ -481,6 +527,190 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def build_input_ids_with_timestamps(
+        self,
+        prompt: Union[str, List[int]],
+        embeddings: torch.Tensor,
+        img_grid_thw: Union[List[List[int]], torch.Tensor],
+        video_grid_thw: Union[List[List[int]], torch.Tensor],
+        video_timestamps: List[list],
+    ):
+        """Reconstruct GLM-V input_ids on the EPD language side."""
+        if isinstance(prompt, str):
+            prompt = self._tokenizer.encode(prompt)
+        else:
+            prompt = list(prompt)
+
+        img_token_id = getattr(self, "IM_TOKEN_ID", None)
+        video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
+        spatial_merge_size = getattr(self, "spatial_merge_size", 1)
+        image_start_token_id = getattr(self, "IMAGE_START_TOKEN_ID", None)
+        image_end_token_id = getattr(self, "IMAGE_END_TOKEN_ID", None)
+
+        input_ids = []
+        offsets = []
+        modality_list = []
+        cur_idx = 0
+
+        vision_start_indices = []
+        for i in range(len(prompt) - 1):
+            if img_token_id is not None and prompt[i + 1] == img_token_id:
+                vision_start_indices.append((i, Modality.IMAGE))
+            elif video_token_id is not None and prompt[i + 1] == video_token_id:
+                vision_start_indices.append((i, Modality.VIDEO))
+
+        img_idx = 0
+        video_idx = 0
+        for mm_start_idx, modality in vision_start_indices:
+            modality_list.append(modality)
+            assert cur_idx <= mm_start_idx
+            input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
+
+            if modality == Modality.IMAGE:
+                mm_token_num = int(
+                    img_grid_thw[img_idx].prod() // (spatial_merge_size**2)
+                )
+                mm_offset_start = len(input_ids)
+                input_ids.extend([img_token_id] * mm_token_num)
+                offsets.append((mm_offset_start, len(input_ids) - 1))
+                img_idx += 1
+            elif modality == Modality.VIDEO:
+                curr_timestamps = video_timestamps[video_idx]
+                num_frames = int(video_grid_thw[video_idx][0])
+                frame_seqlen = int(video_grid_thw[video_idx][1:].prod()) // (
+                    spatial_merge_size**2
+                )
+                for frame_idx in range(num_frames):
+                    if image_start_token_id is not None:
+                        input_ids.append(image_start_token_id)
+                    mm_offset_start = len(input_ids)
+                    input_ids.extend([img_token_id] * frame_seqlen)
+                    offsets.append((mm_offset_start, len(input_ids) - 1))
+                    if image_end_token_id is not None:
+                        input_ids.append(image_end_token_id)
+                    timestamp_sec = curr_timestamps[frame_idx]
+                    timestamp_tokens = self._tokenizer.encode(
+                        f"{float(timestamp_sec):.1f} seconds",
+                        add_special_tokens=False,
+                    )
+                    input_ids.extend(timestamp_tokens)
+                video_idx += 1
+            else:
+                logger.warning(f"{modality} modality is not supported for GLM-V EPD.")
+                continue
+            cur_idx = mm_start_idx + 2
+        else:
+            input_ids.extend(prompt[cur_idx:])
+
+        return input_ids, offsets, modality_list
+
+    @staticmethod
+    def _group_offsets_by_modality(offsets, modality_list, video_grid_thw):
+        image_runs = []
+        video_frame_runs = []
+        offset_index = 0
+        video_index = 0
+        for modality in modality_list:
+            if modality == Modality.IMAGE:
+                image_runs.append(offsets[offset_index])
+                offset_index += 1
+            elif modality == Modality.VIDEO:
+                num_frames = int(video_grid_thw[video_index][0])
+                video_frame_runs.extend(
+                    offsets[offset_index : offset_index + num_frames]
+                )
+                offset_index += num_frames
+                video_index += 1
+        return image_runs, video_frame_runs
+
+    @staticmethod
+    def _build_epd_mm_items(embeddings, image_runs, video_frame_runs):
+        mm_items = []
+        image_embeddings = embeddings.get(Modality.IMAGE) if embeddings else None
+        image_embedding_offset = 0
+
+        for image_offset in image_runs:
+            image_embedding = None
+            if image_embeddings is not None:
+                num_tokens = image_offset[1] - image_offset[0] + 1
+                # Compact CPU payloads for IPC; preserve main's GPU pool views
+                # whose allocation lifetime is bound to the assembled mm_inputs.
+                image_embedding = image_embeddings[
+                    image_embedding_offset : image_embedding_offset + num_tokens
+                ]
+                if image_embedding.device.type == "cpu":
+                    image_embedding = image_embedding.clone()
+                image_embedding_offset += num_tokens
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[image_offset],
+                    precomputed_embeddings=image_embedding,
+                )
+            )
+
+        if image_embeddings is not None and image_embedding_offset != len(
+            image_embeddings
+        ):
+            raise ValueError(
+                "GLM4V image embedding length does not match image offsets: "
+                f"consumed {image_embedding_offset}, got {len(image_embeddings)}"
+            )
+
+        if video_frame_runs:
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.VIDEO,
+                    offsets=video_frame_runs,
+                    precomputed_embeddings=(
+                        embeddings[Modality.VIDEO][:]
+                        if embeddings and Modality.VIDEO in embeddings
+                        else None
+                    ),
+                )
+            )
+
+        mm_items.sort(key=lambda item: item.offsets[0][0])
+        return mm_items
+
+    def get_mm_data(self, prompt, embeddings, **kwargs):
+        """EPD language side: rebuild mm_inputs from precomputed embeddings."""
+        img_grid_thw = kwargs.get("img_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        video_timestamps = kwargs.get("video_timestamps", None)
+
+        input_ids, offsets, modality_list = self.build_input_ids_with_timestamps(
+            prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
+        )
+        assert all(isinstance(modality, Modality) for modality in modality_list)
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids_tensor,
+            hf_config=self.hf_config,
+            image_grid_thw=img_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=None,
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        # Split the flat per-image / per-frame offsets by modality. Images remain
+        # separate cache items while all video frames stay in one aggregate item.
+        image_runs, video_frame_runs = self._group_offsets_by_modality(
+            offsets, modality_list, video_grid_thw
+        )
+        mm_items = self._build_epd_mm_items(embeddings, image_runs, video_frame_runs)
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
 
     def get_mm_item_offsets(
         self,

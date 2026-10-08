@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import torch
 from torch.nn.parameter import Parameter
 
+_SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
+
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -36,7 +38,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hcu
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_gfx95_supported,
+    is_hcu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -104,10 +111,32 @@ _AITER_ACTIVATIONS = {
 }
 
 
-def _aiter_activation(activation: str):
+# aiter's ActivationType.Swiglu is SwiGLU-OAI with alpha and the (up + beta) bias baked in
+_AITER_SWIGLU_OAI_ALPHA = 1.702
+_AITER_SWIGLU_OAI_BETA = 1.0
+
+
+def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
+    """Return the clamp limit for matching SwiGLU-OAI configs on gfx95."""
+    if not is_gfx95_supported():
+        return None
+    if config.activation != "silu" or not config.is_gated:
+        return None
+    if config.gemm1_alpha != _AITER_SWIGLU_OAI_ALPHA:
+        return None
+    if config.gemm1_beta not in (None, _AITER_SWIGLU_OAI_BETA):
+        return None
+    if config.gemm1_clamp_limit is None:
+        return None
+    return float(config.gemm1_clamp_limit)
+
+
+def _aiter_activation(config: MoeRunnerConfig):
     from aiter import ActivationType
 
-    return getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+    if aiter_swiglu_oai_limit(config) is not None:
+        return ActivationType.Swiglu
+    return getattr(ActivationType, _AITER_ACTIVATIONS.get(config.activation, "Gelu"))
 
 
 def _aiter_quant_type(quant_type: AiterQuantType):
@@ -154,6 +183,15 @@ def process_weights_after_loading_aiter_w8a8_int8(layer: torch.nn.Module) -> Non
     setattr(layer, "_aiter_w8a8_int8_original_w2_shape", tuple(layer.w2_weight.shape))
     setattr(layer, "_aiter_w8a8_int8_moe_config_cache", {})
     setattr(layer, "_aiter_w8a8_int8_moe_c_weight_layout", False)
+    layer.register_buffer(
+        "_aiter_w8a8_int8_local_expert_mask",
+        torch.ones(
+            layer.w13_weight.shape[0],
+            dtype=torch.int32,
+            device=layer.w13_weight.device,
+        ),
+        persistent=False,
+    )
 
 
 def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None:
@@ -170,6 +208,15 @@ def process_weights_after_loading_aiter_w8a8_fp8(layer: torch.nn.Module) -> None
     setattr(layer, "_aiter_w8a8_fp8_original_w2_shape", tuple(layer.w2_weight.shape))
     setattr(layer, "_aiter_w8a8_fp8_moe_config_cache", {})
     setattr(layer, "_aiter_w8a8_fp8_moe_c_weight_layout", False)
+    layer.register_buffer(
+        "_aiter_w8a8_fp8_local_expert_mask",
+        torch.ones(
+            layer.w13_weight.shape[0],
+            dtype=torch.int32,
+            device=layer.w13_weight.device,
+        ),
+        persistent=False,
+    )
 
 
 def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
@@ -206,6 +253,7 @@ def get_aiter_w8a8_int8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
         use_int8_w8a8=True,
         global_num_experts=getattr(layer, "num_experts", None),
         expert_map=expert_map,
+        expert_mask=getattr(layer, "_aiter_w8a8_int8_local_expert_mask", None),
         moe_config_cache=getattr(layer, "_aiter_w8a8_int8_moe_config_cache", None),
         moe_c_weight_layout=getattr(
             layer, "_aiter_w8a8_int8_moe_c_weight_layout", False
@@ -254,6 +302,7 @@ def get_aiter_w8a8_fp8_quant_info(layer: torch.nn.Module) -> AiterMoeQuantInfo:
         use_fp8_w8a8=True,
         global_num_experts=getattr(layer, "num_experts", None),
         expert_map=expert_map,
+        expert_mask=getattr(layer, "_aiter_w8a8_fp8_local_expert_mask", None),
         moe_config_cache=getattr(layer, "_aiter_w8a8_fp8_moe_config_cache", None),
         moe_c_weight_layout=getattr(
             layer, "_aiter_w8a8_fp8_moe_c_weight_layout", False
@@ -311,6 +360,7 @@ def _get_aiter_w8a8_moe_config(
     quant_info: AiterMoeQuantInfo,
 ):
     from aiter.moe import MoeSolutionType, get_aiter_moe_config
+    from sglang.srt.environ import envs
 
     if hidden_states.dim() != 2:
         raise RuntimeError(
@@ -344,6 +394,9 @@ def _get_aiter_w8a8_moe_config(
         quant_type=quant_type,
         activation=activation,
     )
+
+    if envs.SGLANG_FORCE_AITER_MOE_C.get():
+        config_kwargs["spec_sol_type"] = MoeSolutionType.MOE_C
 
     try:
         status, moe_config = get_aiter_moe_config(**config_kwargs)
@@ -412,6 +465,10 @@ def _get_aiter_w8a8_weights_for_solution(
     layer = quant_info.layer
 
     with torch.no_grad():
+        # w13 must use moe_layout_shuffle_gemm2: the AITER MOE_C w8a8 kernel
+        # expects the gemm2 tile layout for both GEMMs, and gemm1 shuffling
+        # produces garbage output (cos_sim 0.038 vs 0.9998, tuned E=256 N=256
+        # int8_w8a8 config on gfx936). Do not "fix" this to gemm1 by name.
         w1_moe_c = moe_layout_shuffle_gemm2(quant_info.w13_weight).view(
             *quant_info.w13_weight.shape
         )
@@ -427,6 +484,31 @@ def _get_aiter_w8a8_weights_for_solution(
     quant_info.w2_weight = layer.w2_weight if layer is not None else w2_moe_c
     quant_info.moe_c_weight_layout = True
     return quant_info.w13_weight, quant_info.w2_weight
+
+
+def _remap_aiter_ep_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_map: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map global expert ids to local ids without allowing an OOB GPU index.
+
+    Some HCU fused top-k implementations can leave an invalid id behind when a
+    routing row is non-finite.  Indexing ``expert_map`` with that value causes a
+    device VMFault before the MoE kernel can reject it.  Clamp only for the
+    lookup, then mask both invalid-global and non-local routes out.
+    """
+    if expert_map.numel() == 0:
+        raise ValueError("AITER EP expert_map must not be empty")
+
+    topk_ids_i64 = topk_ids.to(torch.int64)
+    valid_global = (topk_ids_i64 >= 0) & (topk_ids_i64 < expert_map.numel())
+    safe_global_ids = topk_ids_i64.clamp(0, expert_map.numel() - 1)
+    topk_ids_local = expert_map[safe_global_ids].to(torch.int32)
+    valid_local = valid_global & (topk_ids_local >= 0)
+    topk_ids_local = topk_ids_local.masked_fill(~valid_local, 0)
+    topk_weights = topk_weights.masked_fill(~valid_local, 0)
+    return topk_ids_local, topk_weights
 
 
 def _run_aiter_w8a8(
@@ -463,8 +545,43 @@ def _run_aiter_w8a8(
         if runner_config.routed_scaling_factor is not None
         else 1.0
     )
-    if quant_info.expert_map is not None:
+    expert_map_arg = quant_info.expert_map
+    if quant_info.expert_map is not None and not _is_hcu:
         global_num_experts = quant_info.global_num_experts or w1.shape[0]
+    elif quant_info.expert_map is not None:
+        # HCU EP: the AITER ck sorting operator (moe_sorting_fwd) does not support
+        # the expert_map format the framework passes down.  Remap global
+        # topk_ids to the local expert space here (triton-style python-layer
+        # conversion) and pass a binary all-ones mask to aiter_moe.
+        #
+        # Non-local expert assignments become -1 after mapping; AITER cannot
+        # accept negative ids, so reroute them to expert 0 and zero their
+        # topk_weights.  The zeroed slots contribute nothing on this rank; the
+        # post-MoE all-reduce combines the partial results from every EP rank
+        # to produce the correct output.
+        #
+        # We pass a binary all-ones mask (instead of None) so that
+        # fused_experts_asm_impl takes the EP code path that zero-initializes
+        # d_w2_out via torch.zeros, avoiding reads of uninitialized memory in
+        # triton_moe_sum.
+        topk_ids, topk_weights = _remap_aiter_ep_topk(
+            topk_ids,
+            topk_weights,
+            quant_info.expert_map,
+        )
+        global_num_experts = w1.shape[0]
+        expert_map_arg = quant_info.expert_mask
+        if expert_map_arg is None:
+            # Compatibility fallback for callers that bypass the normal weight
+            # post-processing hook. Production layers use the registered mask.
+            expert_map_arg = torch.ones(
+                global_num_experts, dtype=torch.int32, device=hidden_states.device
+            )
+        elif expert_map_arg.numel() != global_num_experts:
+            raise ValueError(
+                "AITER EP local expert mask size does not match local weights: "
+                f"{expert_map_arg.numel()} != {global_num_experts}"
+            )
     else:
         global_num_experts = w1.shape[0]
 
@@ -485,7 +602,7 @@ def _run_aiter_w8a8(
         a2_scale=quant_info.a2_scale,
         block_shape=None,
         global_num_experts=global_num_experts,
-        expert_map=quant_info.expert_map,
+        expert_map=expert_map_arg,
         routed_scaling_factor=float(routed_scaling_factor),
         output_dtype=hidden_states.dtype,
         gemm1_alpha=runner_config.gemm1_alpha,
@@ -640,6 +757,14 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
 
 
 class AiterRunnerCore(MoeRunnerCore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from sglang.kernels.ops.moe.moe_sorting_small import (
+            apply_aiter_small_moe_sort_patch,
+        )
+
+        apply_aiter_small_moe_sort_patch()
+
     def run(
         self,
         runner_input: AiterRunnerInput,
@@ -688,6 +813,7 @@ class AiterRunnerCore(MoeRunnerCore):
             else quant_info.a13_scale
         )
 
+        is_gfx95 = is_gfx95_supported()
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
@@ -703,6 +829,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+        elif is_gfx95 and quant_info.swiglu_limit > 0 and "gate_mode" in extra:
+            extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
@@ -710,19 +838,58 @@ class AiterRunnerCore(MoeRunnerCore):
             # lives elsewhere / is absent.
             from aiter.ops.flydsl.moe_common import GateMode
 
-            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
-            # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
-            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+            # a gate_mode from fused_moe_kwargs wins; else gfx95 honors the weight layout,
+            # and SGLANG_USE_AITER_MOE_GU_ITLV=0 selects SEPARATED (gpt-oss MXFP4 layout)
+            extra.setdefault(
+                "gate_mode",
+                (
+                    GateMode.INTERLEAVE.value
+                    if (not is_gfx95 or self.config.gate_up_interleaved)
+                    and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                ),
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
+        if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
+            from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
+
+            try:
+                if (
+                    _smallm.smallm_moe_supported(
+                        runner_input.hidden_states,
+                        quant_info.w13_weight,
+                        quant_info.w2_weight,
+                        runner_input.topk_ids,
+                        quant_info.expert_mask,
+                        quant_info.doweight_stage1,
+                        self.config.activation == "silu",
+                        quant_info.b13 is not None or quant_info.b2 is not None,
+                        a1_scale,
+                    )
+                    and not extra.get("no_combine")
+                    and runner_input.num_local_tokens is None
+                ):
+                    out = _smallm.smallm_moe_fwd(
+                        runner_input.hidden_states,
+                        quant_info.w13_weight,
+                        quant_info.w2_weight,
+                        runner_input.topk_weights,
+                        runner_input.topk_ids,
+                        quant_info.w13_scale,
+                        quant_info.w2_scale,
+                    )
+                    if out is not None:
+                        return AiterRunnerOutput(hidden_states=out)
+            except _smallm.SmallMMoeUnavailable:
+                pass
+
+        activation = extra.pop("activation", None) if is_gfx95 else None
+        if activation is None:
+            activation = _aiter_activation(self.config)
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -731,7 +898,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
@@ -772,8 +939,8 @@ def pre_permute_standard_to_aiter(
 
     return AiterRunnerInput(
         hidden_states=hidden_states,
-        topk_weights=topk_weights,
         topk_ids=topk_ids,
+        topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
     )
 

@@ -77,7 +77,8 @@ class OllamaServing:
         ]
 
         # Apply chat template using tokenizer
-        prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+        prompt_ids = await self.tokenizer_manager.run_tokenizer_offload(
+            self.tokenizer_manager.tokenizer.apply_chat_template,
             messages,
             tokenize=True,
             add_generation_prompt=True,

@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
-
+from sglang.kernels.npu_kernels.npu_dynamic_quant_triton import npu_dynamic_quant_triton
 
 class BaseHiddenStatesQuant(ABC):
     """Abstract base for NPU hidden state quantisation."""
@@ -40,7 +40,8 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
         if use_mx_quant or quant_dtype == torch.float8_e4m3fn:
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
-            self._op = torch.ops.npu.npu_dynamic_quant
+            # self._op = torch.ops.npu.npu_dynamic_quant
+            self._op = npu_dynamic_quant_triton
         else:
             raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
 
