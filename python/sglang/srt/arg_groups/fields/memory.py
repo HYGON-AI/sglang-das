@@ -223,6 +223,40 @@ class Memory(msgspec.Struct):
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
     ] = False
 
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+    ] = 10
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+    ] = False
+    mooncake_enable_waiting_queue_dfs_prefetch: A[
+        bool,
+        "Prefetch Mooncake DFS objects into its pinned session cache while "
+        "requests wait in the FCFS scheduler queue. Hold admission until "
+        "the prefetch is ready on all ranks; failures use the normal external "
+        "load path.",
+    ] = False
+    mooncake_waiting_queue_dfs_prefetch_max_requests: A[
+        int,
+        "Maximum number of preparing, queued, reading, or ready Mooncake "
+        "waiting-queue DFS-prefetch requests retained per scheduler rank.",
+    ] = 8
+    mooncake_waiting_queue_dfs_prefetch_workers: A[
+        int,
+        "Maximum number of background workers reading Mooncake DFS objects "
+        "for waiting-queue prefetch. Capped by the request limit.",
+    ] = 2
+    mooncake_waiting_queue_dfs_prefetch_max_bytes: A[
+        int,
+        "Maximum estimated active pinned-buffer capacity for waiting-queue "
+        "DFS prefetch per scheduler rank.",
+    ] = 1073741824
+
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------

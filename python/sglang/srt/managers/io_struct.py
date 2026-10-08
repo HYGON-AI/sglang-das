@@ -1200,6 +1200,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
 
+    # Internal PP handoff: the absolute external-cache boundary selected by PP0.
+    external_cache_hit_length: Optional[int] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 

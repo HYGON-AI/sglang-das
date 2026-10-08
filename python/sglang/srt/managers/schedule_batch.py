@@ -1275,6 +1275,8 @@ class Req(ReqDllmMixin):
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).
         self.host_loaded_length = 0
+        # Absolute external-cache hit boundary shared by PP0; None outside PP.
+        self.external_cache_hit_length: Optional[int] = None
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
         self.storage_prefetch_retry_attempts = 0
@@ -1763,6 +1765,18 @@ class Req(ReqDllmMixin):
         # avoiding an O(context) copy per prefill-batch build.
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+
+        # PP0 owns the canonical external-cache boundary. Apply it only while
+        # admitting the request; cache insertion performs its own rematch and
+        # must be allowed to see KV computed after that original boundary.
+        if (
+            tree_cache is not None
+            and self.external_cache_hit_length is not None
+            and getattr(tree_cache, "linker", None) is not None
+            and getattr(tree_cache, "pp_size", 1) > 1
+        ):
+            capped = min(input_len, self.external_cache_hit_length)
+            key_limit = capped if key_limit is None else min(key_limit, capped)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.

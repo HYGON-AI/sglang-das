@@ -17,7 +17,6 @@ import zmq
 from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
-from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -70,6 +69,48 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    ingress_tp_cpu_group: Any = None
+    ingress_attn_tp_cpu_group: Any = None
+    ingress_attn_cp_cpu_group: Any = None
+
+    @staticmethod
+    def _local_control_broadcast() -> bool:
+        return (
+            get_parallel().enable_dp_attention_local_control_broadcast
+            or get_exec().moe.is_ep_scale_joiner
+        )
+
+    def _cpu_group(self, kind):
+        override = getattr(self, "ingress_" + kind + "_cpu_group")
+        return (
+            override
+            if override is not None
+            else getattr(get_parallel(), kind + "_group").cpu_group
+        )
+
+    def ingress_sync_groups(self) -> List[Any]:
+        parallel = get_parallel()
+        if parallel.attn_dp_enabled and self._local_control_broadcast():
+            return [
+                self._cpu_group(kind)
+                for kind in ("attn_tp", "attn_cp")
+                if getattr(parallel, kind + "_size") != 1
+            ]
+        return [self._cpu_group("tp")] if parallel.tp_size != 1 else []
+
+    def _broadcast_attn(self, data):
+        # Preserve main's CP-then-TP fan-out; only swap the CPU process groups.
+        parallel = get_parallel()
+        cp_group, tp_group = parallel.attn_cp_group, parallel.attn_tp_group
+        if parallel.attn_cp_size > 1 and parallel.attn_tp_rank == 0:
+            data = broadcast_pyobj(
+                data, cp_group.rank, self._cpu_group("attn_cp"), src=cp_group.ranks[0]
+            )
+        if parallel.attn_tp_size > 1:
+            data = broadcast_pyobj(
+                data, tp_group.rank, self._cpu_group("attn_tp"), src=tp_group.ranks[0]
+            )
+        return data
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -176,7 +217,7 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
+            work_reqs = self._broadcast_attn(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -188,13 +229,13 @@ class SchedulerRequestReceiver:
                 or get_exec().moe.is_ep_scale_joiner
             )
             if _local_ctrl:
-                control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
+                control_reqs = self._broadcast_attn(control_reqs)
             elif get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     tp_group.rank,
-                    tp_group.cpu_group,
+                    self._cpu_group("tp"),
                     src=tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
@@ -206,7 +247,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = broadcast_pyobj(
                     recv_reqs,
                     tp_group.rank,
-                    tp_group.cpu_group,
+                    self._cpu_group("tp"),
                     src=tp_group.ranks[0],
                 )
         return recv_reqs
