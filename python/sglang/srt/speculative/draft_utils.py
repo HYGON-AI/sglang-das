@@ -77,7 +77,11 @@ class DraftBackendFactory:
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 
-        stamp, backend = backend_map[backend_type]()
+        created = backend_map[backend_type]()
+        if isinstance(created, tuple):
+            stamp, backend = created
+        else:
+            stamp, backend = backend_type, created
         if backend is not None:
             if stamps_children:
                 from sglang.srt.layers.attention.attention_registry import (
@@ -362,8 +366,11 @@ class DraftBackendFactory:
             HCUMLAMultiStepDraftBackend,
         )
 
-        return HCUMLAMultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+        return (
+            "hcu_mla",
+            HCUMLAMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
         )
 
     def _create_trtllm_mha_decode_backend(self):
