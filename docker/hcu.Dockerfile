@@ -112,7 +112,8 @@ RUN pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip install --no-cache-dir setuptools==79.0.1 \
     && pip install --no-cache-dir ai-dynamo==1.4.1 \
-    && pip install --no-cache-dir ai-dynamo-runtime==1.4.1
+    && pip install --no-cache-dir ai-dynamo-runtime==1.4.1 \ 
+    && pip install --no-cache-dir ${PYPI_URL}/customer/dtk2604-rc4/+f/54a/8f81d80d02c94/megamoe-0.1+dtk2604.torch2110.2610081421.g2dee1d.mlnx-cp310-cp310-linux_x86_64.whl#sha256=54a8f81d80d02c94aa591417d0a60f52b39e0414246bf2e2500b7a93fb32c1e5
 
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
