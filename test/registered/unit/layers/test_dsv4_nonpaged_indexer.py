@@ -43,6 +43,23 @@ _ISSUE_ALIGNED_COLS = 93184
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
+    def setUp(self):
+        # These fixtures exercise the CUDA/JIT path, independent of the host
+        # hardware. HCU dispatch has its own runtime and operator tests.
+        for module, attr in (
+            (_METADATA, "_is_hcu"),
+            (_METADATA, "is_hip"),
+            (_INDEXER, "_is_hcu"),
+            ("sglang.srt.layers.attention.dsa.dsa_topk_backend", "_is_hcu"),
+        ):
+            mock = (
+                patch(module + "." + attr, return_value=False)
+                if attr == "is_hip"
+                else patch(module + "." + attr, False)
+            )
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
@@ -227,6 +244,23 @@ class TestDSV4FlashInferTopK(CustomTestCase):
 
 
 class TestDSV4TopKDispatch(CustomTestCase):
+    def setUp(self):
+        # These fixtures exercise the CUDA/JIT path, independent of the host
+        # hardware. HCU dispatch has its own runtime and operator tests.
+        for module, attr in (
+            (_METADATA, "_is_hcu"),
+            (_METADATA, "is_hip"),
+            (_INDEXER, "_is_hcu"),
+            ("sglang.srt.layers.attention.dsa.dsa_topk_backend", "_is_hcu"),
+        ):
+            mock = (
+                patch(module + "." + attr, return_value=False)
+                if attr == "is_hip"
+                else patch(module + "." + attr, False)
+            )
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_v2_raw_output_uses_sparse_prefill_buffer_with_capture(self):
         page_table = torch.zeros((1, 1), dtype=torch.int32)
         compressed_seq_lens = torch.ones(1, dtype=torch.int32)
@@ -285,7 +319,9 @@ class TestDSV4TopKDispatch(CustomTestCase):
             backend.forward_c4_indexer(
                 x=torch.empty((1, 1)),
                 q_lora=torch.empty((1, 1)),
-                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+                c4_indexer=SimpleNamespace(
+                    use_fp4_indexer=False, use_direct_int8_indexer_q=False, layer_id=0
+                ),
                 forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
             )
 
@@ -748,6 +784,23 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
 
 
 class TestPagedIndexerMetadataChunking(CustomTestCase):
+    def setUp(self):
+        # These fixtures exercise the CUDA/JIT path, independent of the host
+        # hardware. HCU dispatch has its own runtime and operator tests.
+        for module, attr in (
+            (_METADATA, "_is_hcu"),
+            (_METADATA, "is_hip"),
+            (_INDEXER, "_is_hcu"),
+            ("sglang.srt.layers.attention.dsa.dsa_topk_backend", "_is_hcu"),
+        ):
+            mock = (
+                patch(module + "." + attr, return_value=False)
+                if attr == "is_hip"
+                else patch(module + "." + attr, False)
+            )
+            mock.start()
+            self.addCleanup(mock.stop)
+
     """The schedule list and the top-k plan list must be built over the exact
     row chunks the indexer loops over; a mismatch would silently score rows
     with another chunk's schedule."""
